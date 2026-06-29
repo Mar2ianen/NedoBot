@@ -109,7 +109,7 @@ ssh vps-153 'podman ps'
 Ручной redeploy из локальной папки:
 
 ```bash
-rsync -az --delete --exclude target --exclude .git ./ vps-153:/opt/tg-ai-bot-teloxide/
+rsync -az --delete --exclude target --exclude .git --exclude .env ./ vps-153:/opt/tg-ai-bot-teloxide/
 ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release && systemctl restart tg-ai-bot-teloxide'
 ```
 
@@ -152,8 +152,10 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 ## Prompt
 
 Основной prompt лежит в [prompts/first_comment.md](prompts/first_comment.md).
+Короткий факт-чек/RAG для защиты от устаревших утверждений лежит в [prompts/tech_rag.md](prompts/tech_rag.md).
 
 Важно: модель должна вернуть текст с плейсхолдером `{CHAT_LINK}`. Код сам заменяет его на HTML-ссылку и не даёт модели портить URL.
+RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
 ## Custom Emoji
 
