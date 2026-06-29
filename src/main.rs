@@ -549,14 +549,17 @@ async fn get_chat_member_count(
 
 fn build_llm_prompt(post_text: &str, chat_member_count: Option<u32>) -> String {
     let system_prompt = include_str!("../prompts/first_comment.md");
+    let tech_rag = include_str!("../prompts/tech_rag.md");
     let chat_context = match chat_member_count {
         Some(count) => format!(
-            "В чате сейчас {count} участников. Это реальное число из Telegram API, его можно использовать в приглашении."
+            "В чате сейчас {count} участников. Это реальное число из Telegram API, но используй его редко."
         ),
         None => "Число участников чата неизвестно, не называй конкретное количество.".to_string(),
     };
 
-    format!("{system_prompt}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}")
+    format!(
+        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
+    )
 }
 
 #[derive(Serialize)]
@@ -607,8 +610,8 @@ async fn generate_with_ollama(
         }],
         stream: false,
         options: OllamaOptions {
-            temperature: 0.55,
-            num_predict: 180,
+            temperature: 0.45,
+            num_predict: 140,
         },
     };
 
