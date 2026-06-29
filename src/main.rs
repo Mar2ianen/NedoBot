@@ -25,6 +25,8 @@ enum Command {
     EmojiIds,
     #[command(description = "проверить формат первого комментария")]
     FormatTest(String),
+    #[command(description = "показать последние заметки памяти")]
+    Memory,
 }
 
 #[derive(Clone)]
@@ -50,6 +52,14 @@ struct CommentCandidate<'a> {
     source_channel_id: i64,
     source_message_id: MessageId,
     post_text: &'a str,
+}
+
+#[derive(Debug)]
+struct MemoryNote {
+    title: String,
+    summary: String,
+    cautions: String,
+    keywords: Vec<String>,
 }
 
 #[tokio::main]
@@ -191,6 +201,9 @@ async fn handle_command(
             let text = build_comment_html(&clean_post, &config);
             send_html(&bot, msg.chat.id, text).await?;
         }
+        Command::Memory => {
+            send_memory_notes(&bot, msg.chat.id, &pool).await?;
+        }
     }
 
     Ok(())
@@ -256,8 +269,10 @@ async fn maybe_comment_post(
     // photo sizes, use the largest one so charts and small text stay readable.
     let image_base64 = download_largest_photo_base64(bot, msg).await?;
     let chat_member_count = get_chat_member_count(bot, config).await;
-    let prompt = build_llm_prompt(&clean_post, chat_member_count);
-    let llm_body = generate_with_ollama(config, &prompt, image_base64.as_deref()).await?;
+    let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
+    let prompt = build_llm_prompt(&clean_post, chat_member_count, &memory_notes);
+    let llm_body =
+        generate_with_ollama(config, &prompt, image_base64.as_deref(), 0.45, 140).await?;
     let final_html = build_comment_html(&llm_body, config);
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
@@ -292,6 +307,18 @@ async fn maybe_comment_post(
 
     if let Some(owner_id) = owner_preview_chat(config) {
         send_owner_preview(bot, owner_id, &final_html, candidate.source_message_id).await;
+    }
+
+    if let Err(err) = remember_post(
+        pool,
+        config,
+        candidate.source_channel_id,
+        candidate.source_message_id.0,
+        &clean_post,
+    )
+    .await
+    {
+        tracing::warn!(%err, "failed to save post memory note");
     }
 
     Ok(())
@@ -366,6 +393,49 @@ async fn send_custom_emoji_ids(
         format!("Нашёл custom_emoji_id:\n{}", lines),
     )
     .await?;
+
+    Ok(())
+}
+
+async fn send_memory_notes(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+) -> ResponseResult<()> {
+    let notes = sqlx::query_as::<_, (String, String, String)>(
+        r#"
+        select title, summary, array_to_string(keywords, ', ')
+        from post_memory_notes
+        order by created_at desc
+        limit 5
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|err| {
+        tracing::error!(%err, "failed to load memory notes");
+        teloxide::RequestError::Io(std::io::Error::other("memory check failed"))
+    })?;
+
+    if notes.is_empty() {
+        bot.send_message(chat_id, "Память пока пустая.").await?;
+        return Ok(());
+    }
+
+    let text = notes
+        .into_iter()
+        .map(|(title, summary, keywords)| {
+            format!(
+                "<b>{}</b>\n{}\n<code>{}</code>",
+                escape_html(&title),
+                escape_html(&summary),
+                escape_html(&keywords)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    send_html(bot, chat_id, text).await?;
 
     Ok(())
 }
@@ -547,7 +617,11 @@ async fn get_chat_member_count(
     }
 }
 
-fn build_llm_prompt(post_text: &str, chat_member_count: Option<u32>) -> String {
+fn build_llm_prompt(
+    post_text: &str,
+    chat_member_count: Option<u32>,
+    memory_notes: &[MemoryNote],
+) -> String {
     let system_prompt = include_str!("../prompts/first_comment.md");
     let tech_rag = include_str!("../prompts/tech_rag.md");
     let chat_context = match chat_member_count {
@@ -556,10 +630,35 @@ fn build_llm_prompt(post_text: &str, chat_member_count: Option<u32>) -> String {
         ),
         None => "Число участников чата неизвестно, не называй конкретное количество.".to_string(),
     };
+    let memory_context = render_memory_context(memory_notes);
 
     format!(
-        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
+        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}\n\nПамять прошлых новостей, использовать только если релевантно:\n{memory_context}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
     )
+}
+
+fn render_memory_context(memory_notes: &[MemoryNote]) -> String {
+    if memory_notes.is_empty() {
+        return "Нет релевантных заметок.".to_string();
+    }
+
+    memory_notes
+        .iter()
+        .take(5)
+        .map(|note| {
+            format!(
+                "- {}: {}{}",
+                note.title,
+                note.summary,
+                if note.cautions.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" Осторожно: {}", note.cautions)
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Serialize)]
@@ -599,6 +698,8 @@ async fn generate_with_ollama(
     config: &Config,
     prompt: &str,
     image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
 ) -> anyhow::Result<String> {
     let images = image_base64.into_iter().collect::<Vec<_>>();
     let request = OllamaChatRequest {
@@ -610,8 +711,8 @@ async fn generate_with_ollama(
         }],
         stream: false,
         options: OllamaOptions {
-            temperature: 0.45,
-            num_predict: 140,
+            temperature,
+            num_predict,
         },
     };
 
@@ -643,6 +744,265 @@ async fn generate_with_ollama(
     }
 
     Ok(content)
+}
+
+async fn load_relevant_memory_notes(
+    pool: &PgPool,
+    post_text: &str,
+) -> anyhow::Result<Vec<MemoryNote>> {
+    let post_keywords = extract_keywords(post_text);
+    if post_keywords.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query_as::<_, (String, String, String, Vec<String>)>(
+        r#"
+        select title, summary, cautions, keywords
+        from post_memory_notes
+        order by created_at desc
+        limit 80
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut scored = rows
+        .into_iter()
+        .filter_map(|(title, summary, cautions, keywords)| {
+            let score = keywords
+                .iter()
+                .filter(|keyword| post_keywords.contains(keyword))
+                .count();
+
+            (score > 0).then_some((
+                score,
+                MemoryNote {
+                    title,
+                    summary,
+                    cautions,
+                    keywords,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|(left_score, _), (right_score, _)| right_score.cmp(left_score));
+
+    Ok(scored.into_iter().take(5).map(|(_, note)| note).collect())
+}
+
+async fn remember_post(
+    pool: &PgPool,
+    config: &Config,
+    source_channel_id: i64,
+    source_message_id: i32,
+    post_text: &str,
+) -> anyhow::Result<()> {
+    let note_prompt = build_memory_note_prompt(post_text);
+    let raw_note = generate_with_ollama(config, &note_prompt, None, 0.2, 220).await?;
+    let mut note = parse_memory_note(&raw_note, post_text);
+    note.keywords = merge_keywords(note.keywords, extract_keywords(post_text));
+
+    sqlx::query(
+        r#"
+        insert into post_memory_notes
+            (source_channel_id, source_message_id, title, summary, cautions, keywords, raw_note)
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (source_channel_id, source_message_id) do update set
+            title = excluded.title,
+            summary = excluded.summary,
+            cautions = excluded.cautions,
+            keywords = excluded.keywords,
+            raw_note = excluded.raw_note,
+            updated_at = now()
+        "#,
+    )
+    .bind(source_channel_id)
+    .bind(source_message_id)
+    .bind(&note.title)
+    .bind(&note.summary)
+    .bind(&note.cautions)
+    .bind(&note.keywords)
+    .bind(&raw_note)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn build_memory_note_prompt(post_text: &str) -> String {
+    format!(
+        r#"Сделай короткую заметку памяти для будущих комментариев под техно-новостями.
+Не добавляй факты, которых нет в посте. Не пересказывай рекламный хвост. Не пиши стиль комментария.
+
+Формат строго такой:
+TITLE: короткая тема до 80 символов
+KEYWORDS: 5-10 ключей через запятую, нижний регистр
+SUMMARY: 1-2 коротких факта из поста
+CAUTIONS: что нельзя утверждать без данных, одной фразой
+
+Пост:
+{post_text}"#
+    )
+}
+
+fn parse_memory_note(raw_note: &str, post_text: &str) -> MemoryNote {
+    let title = field_value(raw_note, "TITLE").unwrap_or_else(|| fallback_title(post_text));
+    let keywords = field_value(raw_note, "KEYWORDS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(normalize_keyword)
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let summary =
+        field_value(raw_note, "SUMMARY").unwrap_or_else(|| first_text_chars(post_text, 220));
+    let cautions = field_value(raw_note, "CAUTIONS").unwrap_or_default();
+
+    MemoryNote {
+        title,
+        summary,
+        cautions,
+        keywords,
+    }
+}
+
+fn field_value(raw_note: &str, field: &str) -> Option<String> {
+    raw_note.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(field)
+            .then(|| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn fallback_title(post_text: &str) -> String {
+    post_text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| first_text_chars(line, 80))
+        .unwrap_or_else(|| "Без темы".to_string())
+}
+
+fn first_text_chars(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+
+    trimmed.chars().take(limit).collect::<String>()
+}
+
+fn merge_keywords(mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    for keyword in right {
+        if !left.contains(&keyword) {
+            left.push(keyword);
+        }
+    }
+
+    left.truncate(16);
+    left
+}
+
+fn extract_keywords(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut keywords = Vec::new();
+
+    for phrase in [
+        "switch 2",
+        "playstation 5 pro",
+        "ps5 pro",
+        "xbox series",
+        "gta 6",
+        "rtx 50",
+        "radeon",
+        "rx 9000",
+        "rx 9070",
+        "ryzen",
+        "windows 10",
+        "windows 11",
+        "smart access memory",
+        "sam",
+        "amd",
+        "nvidia",
+        "intel",
+        "apple",
+        "microsoft",
+        "xbox",
+        "playstation",
+        "nintendo",
+        "драйвер",
+        "fps",
+        "предзаказ",
+        "цена",
+        "память",
+        "видеокарта",
+    ] {
+        if lower.contains(phrase) {
+            keywords.push(phrase.to_string());
+        }
+    }
+
+    for token in lower
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(normalize_keyword)
+        .filter(|token| token.chars().count() >= 4)
+    {
+        if !is_stop_keyword(&token) && !keywords.contains(&token) {
+            keywords.push(token);
+        }
+    }
+
+    keywords.truncate(24);
+    keywords
+}
+
+fn normalize_keyword(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .trim()
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_lowercase()
+}
+
+fn is_stop_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "это"
+            | "что"
+            | "как"
+            | "для"
+            | "или"
+            | "еще"
+            | "уже"
+            | "если"
+            | "также"
+            | "которые"
+            | "после"
+            | "сейчас"
+            | "будет"
+            | "стало"
+            | "стали"
+            | "может"
+            | "около"
+            | "ранее"
+            | "не"
+            | "на"
+            | "по"
+            | "из"
+            | "под"
+            | "над"
+            | "без"
+            | "при"
+            | "все"
+            | "the"
+            | "and"
+            | "with"
+            | "from"
+    )
 }
 
 fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
