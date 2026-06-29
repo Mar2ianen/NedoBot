@@ -46,6 +46,12 @@ struct Config {
     ryzen_custom_emoji_id: Option<String>,
 }
 
+struct CommentCandidate<'a> {
+    source_channel_id: i64,
+    source_message_id: MessageId,
+    post_text: &'a str,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -89,26 +95,17 @@ impl Config {
             post_signature_marker: env_or("POST_SIGNATURE_MARKER", "Не теряем связь"),
             ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
             ollama_api_key: env_or("OLLAMA_API_KEY", ""),
-            vision_model: env_or("VISION_MODEL", &env_or("OLLAMA_MODEL", "gemma4:31b")),
-            owner_telegram_id: std::env::var("OWNER_TELEGRAM_ID")
-                .ok()
+            vision_model: env_optional("VISION_MODEL")
+                .or_else(|| env_optional("OLLAMA_MODEL"))
+                .unwrap_or_else(|| "gemma4:31b".to_string()),
+            owner_telegram_id: env_optional("OWNER_TELEGRAM_ID")
                 .and_then(|value| value.parse().ok()),
             send_owner_preview: env_or("SEND_OWNER_PREVIEW", "true") == "true",
-            comment_custom_emoji_id: std::env::var("COMMENT_CUSTOM_EMOJI_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            tech_custom_emoji_id: std::env::var("TECH_CUSTOM_EMOJI_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            amd_custom_emoji_id: std::env::var("AMD_CUSTOM_EMOJI_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            radeon_custom_emoji_id: std::env::var("RADEON_CUSTOM_EMOJI_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            ryzen_custom_emoji_id: std::env::var("RYZEN_CUSTOM_EMOJI_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
+            comment_custom_emoji_id: env_optional("COMMENT_CUSTOM_EMOJI_ID"),
+            tech_custom_emoji_id: env_optional("TECH_CUSTOM_EMOJI_ID"),
+            amd_custom_emoji_id: env_optional("AMD_CUSTOM_EMOJI_ID"),
+            radeon_custom_emoji_id: env_optional("RADEON_CUSTOM_EMOJI_ID"),
+            ryzen_custom_emoji_id: env_optional("RYZEN_CUSTOM_EMOJI_ID"),
         }
     }
 }
@@ -122,6 +119,13 @@ fn env_i64(key: &str, default: i64) -> i64 {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_optional(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn build_pool() -> anyhow::Result<PgPool> {
@@ -219,25 +223,13 @@ async fn maybe_comment_post(
 
     // The bot should never react to random chat messages. A valid target is only
     // Telegram's automatic channel post copy in the linked discussion chat.
-    if msg.chat.id.0 != config.discussion_chat_id || !msg.is_automatic_forward() {
-        return Ok(());
-    }
-
-    let Some((source_channel_id, source_message_id)) = forwarded_channel_post(msg) else {
-        return Ok(());
-    };
-
-    if source_channel_id != config.source_channel_id {
-        return Ok(());
-    }
-
-    let Some(post_text) = message_text(msg) else {
+    let Some(candidate) = comment_candidate(msg, config) else {
         return Ok(());
     };
 
     // Editorial posts carry the VK/MAX footer. Ads usually do not, so the marker
     // doubles as a cheap allowlist and keeps promotional posts out of the chat CTA.
-    if !should_generate_comment(post_text, config) {
+    if !should_generate_comment(candidate.post_text, config) {
         tracing::info!(
             discussion_message_id = msg.id.0,
             "skip post without signature marker"
@@ -245,13 +237,13 @@ async fn maybe_comment_post(
         return Ok(());
     }
 
-    let clean_post = clean_post_for_llm(post_text, config);
+    let clean_post = clean_post_for_llm(candidate.post_text, config);
     let job_id = create_post_comment_job(
         pool,
         config.discussion_chat_id,
         msg.id.0,
-        source_channel_id,
-        source_message_id.0,
+        candidate.source_channel_id,
+        candidate.source_message_id.0,
         &clean_post,
     )
     .await?;
@@ -301,17 +293,53 @@ async fn maybe_comment_post(
     .execute(pool)
     .await?;
 
-    if config.send_owner_preview {
-        if let Some(owner_id) = config.owner_telegram_id {
-            let preview = format!(
-                "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>",
-                final_html, source_message_id.0
-            );
-            let _ = send_html(bot, ChatId(owner_id), preview).await;
-        }
+    if let Some(owner_id) = owner_preview_chat(config) {
+        send_owner_preview(bot, owner_id, &final_html, candidate.source_message_id).await;
     }
 
     Ok(())
+}
+
+fn owner_preview_chat(config: &Config) -> Option<i64> {
+    config
+        .send_owner_preview
+        .then_some(config.owner_telegram_id)?
+}
+
+async fn send_owner_preview(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    owner_id: i64,
+    final_html: &str,
+    source_message_id: MessageId,
+) {
+    let preview = format!(
+        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>",
+        final_html, source_message_id.0
+    );
+
+    if let Err(err) = send_html(bot, ChatId(owner_id), preview).await {
+        tracing::warn!(%err, "failed to send owner preview");
+    }
+}
+
+fn comment_candidate<'a>(msg: &'a Message, config: &Config) -> Option<CommentCandidate<'a>> {
+    match (
+        msg.chat.id.0 == config.discussion_chat_id,
+        msg.is_automatic_forward(),
+        forwarded_channel_post(msg),
+        message_text(msg),
+    ) {
+        (true, true, Some((source_channel_id, source_message_id)), Some(post_text))
+            if source_channel_id == config.source_channel_id =>
+        {
+            Some(CommentCandidate {
+                source_channel_id,
+                source_message_id,
+                post_text,
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn send_custom_emoji_ids(
@@ -639,10 +667,8 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
 }
 
 fn normalize_ai_markers(text: &str) -> String {
-    text.replace('—', "-")
-        .replace('–', "-")
-        .replace('«', "\"")
-        .replace('»', "\"")
+    text.replace(['—', '–'], "-")
+        .replace(['«', '»'], "\"")
         .replace("Вот вариант:", "")
         .replace("Вариант:", "")
         .trim()
@@ -660,12 +686,9 @@ fn render_chat_link_placeholder(text: &str, config: &Config) -> String {
         escape_html(text).replace("{CHAT_LINK}", &link)
     } else {
         format!(
-            "{} {}",
+            r#"{} <a href="{}">в чате</a>"#,
             escape_html(text),
-            format!(
-                r#"<a href="{}">в чате</a>"#,
-                escape_html(&config.chat_invite_url)
-            )
+            escape_html(&config.chat_invite_url)
         )
     }
 }
