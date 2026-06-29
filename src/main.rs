@@ -202,10 +202,6 @@ async fn handle_message(
     pool: PgPool,
     config: Config,
 ) -> ResponseResult<()> {
-    if !custom_emoji_ids(&msg).is_empty() {
-        send_custom_emoji_ids(&bot, &msg).await?;
-    }
-
     if let Err(err) = maybe_comment_post(&bot, &msg, &pool, &config).await {
         tracing::error!(%err, "failed to process message");
     }
