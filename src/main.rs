@@ -255,7 +255,8 @@ async fn maybe_comment_post(
     // Gemma handles text and vision in one request. If Telegram attached several
     // photo sizes, use the largest one so charts and small text stay readable.
     let image_base64 = download_largest_photo_base64(bot, msg).await?;
-    let prompt = build_llm_prompt(&clean_post);
+    let chat_member_count = get_chat_member_count(bot, config).await;
+    let prompt = build_llm_prompt(&clean_post, chat_member_count);
     let llm_body = generate_with_ollama(config, &prompt, image_base64.as_deref()).await?;
     let final_html = build_comment_html(&llm_body, config);
 
@@ -530,9 +531,32 @@ async fn download_largest_photo_base64(
     Ok(Some(BASE64.encode(bytes)))
 }
 
-fn build_llm_prompt(post_text: &str) -> String {
+async fn get_chat_member_count(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> Option<u32> {
+    match bot
+        .get_chat_member_count(ChatId(config.discussion_chat_id))
+        .await
+    {
+        Ok(count) => Some(count),
+        Err(err) => {
+            tracing::warn!(%err, "failed to get chat member count");
+            None
+        }
+    }
+}
+
+fn build_llm_prompt(post_text: &str, chat_member_count: Option<u32>) -> String {
     let system_prompt = include_str!("../prompts/first_comment.md");
-    format!("{system_prompt}\n\nПост:\n{post_text}")
+    let chat_context = match chat_member_count {
+        Some(count) => format!(
+            "В чате сейчас {count} участников. Это реальное число из Telegram API, его можно использовать в приглашении."
+        ),
+        None => "Число участников чата неизвестно, не называй конкретное количество.".to_string(),
+    };
+
+    format!("{system_prompt}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}")
 }
 
 #[derive(Serialize)]
