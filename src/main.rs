@@ -382,26 +382,26 @@ fn custom_emoji_ids(msg: &Message) -> Vec<String> {
 }
 
 fn build_comment_html(llm_body: &str, config: &Config) -> String {
-    let mut parts = Vec::new();
-
-    let emoji_id = pick_comment_emoji(llm_body, config);
-    if let Some(custom_emoji_id) = emoji_id {
-        parts.push(format!(
-            r#"<tg-emoji emoji-id="{}">😎</tg-emoji>"#,
-            escape_html(custom_emoji_id)
-        ));
-    }
-
     // The model is instructed to use {CHAT_LINK}; code owns the actual HTML
     // anchor so the URL is stable and link preview can stay disabled.
     let clean_body = normalize_ai_markers(&strip_links(llm_body))
         .trim()
         .to_string();
-    if !clean_body.is_empty() {
-        parts.push(render_chat_link_placeholder(&clean_body, config));
+
+    if clean_body.is_empty() {
+        return String::new();
     }
 
-    parts.join("\n\n")
+    let body = render_chat_link_placeholder(&clean_body, config);
+
+    match pick_comment_emoji(llm_body, config) {
+        Some(custom_emoji_id) => format!(
+            r#"<tg-emoji emoji-id="{}">😎</tg-emoji> {}"#,
+            escape_html(custom_emoji_id),
+            body
+        ),
+        None => body,
+    }
 }
 
 async fn send_html(
