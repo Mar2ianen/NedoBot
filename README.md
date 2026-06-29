@@ -16,6 +16,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Отключает link preview.
 - Подставляет premium/custom emoji по тематике, включая канал/AMD/Radeon/Ryzen.
 - Пишет задачи и результаты генерации в Postgres.
+- Автоматически конспектирует обычные новости в память и подмешивает релевантные заметки в следующие генерации.
 
 ## Важный Нюанс Telegram
 
@@ -120,6 +121,7 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `telegram_messages` - входящие сообщения и raw Telegram JSON.
 - `post_comment_jobs` - дедупликация и статус комментария под постом.
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
+- `post_memory_notes` - короткие конспекты прошлых новостей, keywords и осторожные ограничения для будущих комментариев.
 - `bot_settings`, `telegram_users`, `telegram_chats`, `admin_events` - задел под админку.
 
 Посмотреть последние сообщения:
@@ -134,6 +136,12 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select * from post_comment_jobs order by id desc limit 20;\""
 ```
 
+Посмотреть память:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select title, summary, keywords, created_at from post_memory_notes order by id desc limit 20;\""
+```
+
 ## Команды Бота
 
 ```text
@@ -141,6 +149,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /db
 /emojiids
 /format_test <текст поста>
+/memory
 ```
 
 В группах лучше писать с username:
@@ -156,6 +165,13 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 Важно: модель должна вернуть текст с плейсхолдером `{CHAT_LINK}`. Код сам заменяет его на HTML-ссылку и не даёт модели портить URL.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
+
+Автоматическая память работает поверх RAG:
+
+- после отправки первого комментария бот просит LLM сделать короткую заметку по посту;
+- заметка сохраняется в `post_memory_notes` с keywords;
+- перед новой генерацией бот достаёт до 5 похожих заметок по пересечению keywords;
+- память используется только как контекст, если она релевантна текущему посту.
 
 ## Custom Emoji
 
