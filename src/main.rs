@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use sqlx::PgPool;
 use sqlx::types::chrono::{DateTime, Utc};
-use sqlx::{PgPool, postgres::PgPoolOptions};
 use teloxide::{
     dispatching::UpdateFilterExt,
     net::Download,
@@ -14,12 +14,14 @@ use teloxide::{
 };
 
 mod config;
+mod db;
 mod features;
 mod llm;
 mod state;
 mod telegram;
 
 use config::Config;
+use db::{build_pool, migrate};
 use features::first_comment::candidate::comment_candidate;
 use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use features::stats::types::{ChatStatsSummary, StatsPeriod, UserPresentation, display_name};
@@ -101,21 +103,6 @@ async fn main() -> anyhow::Result<()> {
         .dispatch()
         .await;
 
-    Ok(())
-}
-
-async fn build_pool() -> anyhow::Result<PgPool> {
-    let database_url = std::env::var("DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
-
-    Ok(pool)
-}
-
-async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())
 }
 
