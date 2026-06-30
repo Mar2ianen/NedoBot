@@ -15,6 +15,12 @@ use teloxide::{
     utils::command::BotCommands,
 };
 
+mod config;
+mod state;
+
+use config::Config;
+use state::AppState;
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "snake_case")]
 enum Command {
@@ -41,25 +47,6 @@ enum Command {
         description = "статистика пользователя: /userstats <id|@username>"
     )]
     UserStats(String),
-}
-
-#[derive(Clone)]
-struct Config {
-    source_channel_id: i64,
-    discussion_chat_id: i64,
-    chat_invite_url: String,
-    chat_invite_label: String,
-    post_signature_marker: String,
-    ollama_base_url: String,
-    ollama_api_key: String,
-    vision_model: String,
-    owner_telegram_id: Option<i64>,
-    send_owner_preview: bool,
-    comment_custom_emoji_id: Option<String>,
-    tech_custom_emoji_id: Option<String>,
-    amd_custom_emoji_id: Option<String>,
-    radeon_custom_emoji_id: Option<String>,
-    ryzen_custom_emoji_id: Option<String>,
 }
 
 struct CommentCandidate<'a> {
@@ -243,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
         tracing::warn!(%err, "failed to refresh member snapshots");
     }
+    let state = AppState::new(pool, config);
 
     let handler = dptree::entry()
         .branch(
@@ -261,56 +249,13 @@ async fn main() -> anyhow::Result<()> {
         .branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![pool, config])
+        .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
 
     Ok(())
-}
-
-impl Config {
-    fn from_env() -> Self {
-        Self {
-            source_channel_id: env_i64("SOURCE_CHANNEL_ID", -1001575496091),
-            discussion_chat_id: env_i64("DISCUSSION_CHAT_ID", -1001932061163),
-            chat_invite_url: env_or("CHAT_INVITE_URL", "https://t.me/+RxmPtw7Bs-IxNzEy"),
-            chat_invite_label: env_or("CHAT_INVITE_LABEL", "Присоединяйтесь к чату"),
-            post_signature_marker: env_or("POST_SIGNATURE_MARKER", "Не теряем связь"),
-            ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
-            ollama_api_key: env_or("OLLAMA_API_KEY", ""),
-            vision_model: env_optional("VISION_MODEL")
-                .or_else(|| env_optional("OLLAMA_MODEL"))
-                .unwrap_or_else(|| "gemma4:31b".to_string()),
-            owner_telegram_id: env_optional("OWNER_TELEGRAM_ID")
-                .and_then(|value| value.parse().ok()),
-            send_owner_preview: env_or("SEND_OWNER_PREVIEW", "true") == "true",
-            comment_custom_emoji_id: env_optional("COMMENT_CUSTOM_EMOJI_ID"),
-            tech_custom_emoji_id: env_optional("TECH_CUSTOM_EMOJI_ID"),
-            amd_custom_emoji_id: env_optional("AMD_CUSTOM_EMOJI_ID"),
-            radeon_custom_emoji_id: env_optional("RADEON_CUSTOM_EMOJI_ID"),
-            ryzen_custom_emoji_id: env_optional("RYZEN_CUSTOM_EMOJI_ID"),
-        }
-    }
-}
-
-fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn env_optional(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 async fn build_pool() -> anyhow::Result<PgPool> {
@@ -332,10 +277,12 @@ async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     msg: Message,
     cmd: Command,
-    pool: PgPool,
-    config: Config,
+    state: AppState,
 ) -> ResponseResult<()> {
-    if let Err(err) = save_telegram_message(&pool, &msg).await {
+    let pool = &state.pool;
+    let config = &state.config;
+
+    if let Err(err) = save_telegram_message(pool, &msg).await {
         tracing::error!(%err, "failed to save command message");
     }
 
@@ -349,7 +296,7 @@ async fn handle_command(
         }
         Command::Db => {
             let row: (i64,) = sqlx::query_as("select 1")
-                .fetch_one(&pool)
+                .fetch_one(pool)
                 .await
                 .map_err(|err| {
                     tracing::error!(%err, "database check failed");
@@ -363,7 +310,7 @@ async fn handle_command(
             send_custom_emoji_ids(&bot, &msg).await?;
         }
         Command::FormatTest(post_text) => {
-            if !should_generate_comment(&post_text, &config) {
+            if !should_generate_comment(&post_text, config) {
                 bot.send_message(
                     msg.chat.id,
                     "Пропускаю: в посте нет сигнатуры обычного поста, похоже на рекламу или служебный пост.",
@@ -372,24 +319,24 @@ async fn handle_command(
                 return Ok(());
             }
 
-            let clean_post = clean_post_for_llm(&post_text, &config);
-            let text = build_comment_html(&clean_post, &config);
+            let clean_post = clean_post_for_llm(&post_text, config);
+            let text = build_comment_html(&clean_post, config);
             send_html(&bot, msg.chat.id, text).await?;
         }
         Command::Memory => {
-            send_memory_notes(&bot, msg.chat.id, &pool).await?;
+            send_memory_notes(&bot, msg.chat.id, pool).await?;
         }
         Command::StatsDay => {
-            send_chat_stats(&bot, msg.chat.id, &pool, &config, StatsPeriod::Day).await?;
+            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Day).await?;
         }
         Command::StatsWeek => {
-            send_chat_stats(&bot, msg.chat.id, &pool, &config, StatsPeriod::Week).await?;
+            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Week).await?;
         }
         Command::StatsMonth => {
-            send_chat_stats(&bot, msg.chat.id, &pool, &config, StatsPeriod::Month).await?;
+            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month).await?;
         }
         Command::UserStats(target) => {
-            send_user_stats(&bot, msg.chat.id, &pool, &config, &target).await?;
+            send_user_stats(&bot, msg.chat.id, pool, config, &target).await?;
         }
     }
 
@@ -399,10 +346,9 @@ async fn handle_command(
 async fn handle_message(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     msg: Message,
-    pool: PgPool,
-    config: Config,
+    state: AppState,
 ) -> ResponseResult<()> {
-    if let Err(err) = maybe_comment_post(&bot, &msg, &pool, &config).await {
+    if let Err(err) = maybe_comment_post(&bot, &msg, &state.pool, &state.config).await {
         tracing::error!(%err, "failed to process message");
     }
 
@@ -411,9 +357,9 @@ async fn handle_message(
 
 async fn handle_message_reaction(
     reaction: MessageReactionUpdated,
-    pool: PgPool,
+    state: AppState,
 ) -> ResponseResult<()> {
-    if let Err(err) = save_message_reaction(&pool, &reaction).await {
+    if let Err(err) = save_message_reaction(&state.pool, &reaction).await {
         tracing::error!(%err, "failed to save message reaction");
     }
 
@@ -422,17 +368,17 @@ async fn handle_message_reaction(
 
 async fn handle_message_reaction_count(
     reaction_count: MessageReactionCountUpdated,
-    pool: PgPool,
+    state: AppState,
 ) -> ResponseResult<()> {
-    if let Err(err) = save_message_reaction_count(&pool, &reaction_count).await {
+    if let Err(err) = save_message_reaction_count(&state.pool, &reaction_count).await {
         tracing::error!(%err, "failed to save message reaction count");
     }
 
     Ok(())
 }
 
-async fn handle_chat_member(member: ChatMemberUpdated, pool: PgPool) -> ResponseResult<()> {
-    if let Err(err) = save_chat_member_event(&pool, &member).await {
+async fn handle_chat_member(member: ChatMemberUpdated, state: AppState) -> ResponseResult<()> {
+    if let Err(err) = save_chat_member_event(&state.pool, &member).await {
         tracing::error!(%err, "failed to save chat member event");
     }
 
