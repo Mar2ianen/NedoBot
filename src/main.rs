@@ -14,11 +14,14 @@ use teloxide::{
 };
 
 mod config;
+mod features;
 mod llm;
 mod state;
 mod telegram;
 
 use config::Config;
+use features::first_comment::candidate::comment_candidate;
+use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use llm::ollama::OllamaClient;
 use llm::openai_compat::OpenAiCompatClient;
 use llm::types::{LlmClient, LlmRequest};
@@ -54,12 +57,6 @@ enum Command {
         description = "статистика пользователя: /userstats <id|@username>"
     )]
     UserStats(String),
-}
-
-struct CommentCandidate<'a> {
-    source_channel_id: i64,
-    source_message_id: MessageId,
-    post_text: &'a str,
 }
 
 #[derive(Debug)]
@@ -518,26 +515,6 @@ async fn send_owner_preview(
 
     if let Err(err) = send_html(bot, ChatId(owner_id), preview).await {
         tracing::warn!(%err, "failed to send owner preview");
-    }
-}
-
-fn comment_candidate<'a>(msg: &'a Message, config: &Config) -> Option<CommentCandidate<'a>> {
-    match (
-        msg.chat.id.0 == config.discussion_chat_id,
-        msg.is_automatic_forward(),
-        forwarded_channel_post(msg),
-        message_text(msg),
-    ) {
-        (true, true, Some((source_channel_id, source_message_id)), Some(post_text))
-            if source_channel_id == config.source_channel_id =>
-        {
-            Some(CommentCandidate {
-                source_channel_id,
-                source_message_id,
-                post_text,
-            })
-        }
-        _ => None,
     }
 }
 
@@ -2477,19 +2454,6 @@ fn render_chat_link_placeholder(text: &str, config: &Config) -> String {
             escape_html(&config.chat_invite_url)
         )
     }
-}
-
-fn should_generate_comment(post_text: &str, config: &Config) -> bool {
-    post_text.contains(&config.post_signature_marker)
-}
-
-fn clean_post_for_llm(post_text: &str, config: &Config) -> String {
-    let without_signature = match post_text.find(&config.post_signature_marker) {
-        Some(index) => &post_text[..index],
-        None => post_text,
-    };
-
-    without_signature.trim().to_string()
 }
 
 fn strip_links(text: &str) -> String {
