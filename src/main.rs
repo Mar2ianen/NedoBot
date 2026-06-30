@@ -896,7 +896,7 @@ async fn find_merge_candidate(
                 .filter(|keyword| new_keywords.contains(keyword))
                 .count();
 
-            (score >= 2).then_some(MergeCandidate {
+            (score >= 3).then_some(MergeCandidate {
                 id,
                 note: MemoryNote {
                     title,
@@ -1068,7 +1068,7 @@ fn extract_keywords(text: &str) -> Vec<String> {
         "память",
         "видеокарта",
     ] {
-        if lower.contains(phrase) {
+        if keyword_phrase_matches(&lower, phrase) {
             keywords.push(phrase.to_string());
         }
     }
@@ -1085,6 +1085,16 @@ fn extract_keywords(text: &str) -> Vec<String> {
 
     keywords.truncate(24);
     keywords
+}
+
+fn keyword_phrase_matches(text: &str, phrase: &str) -> bool {
+    if phrase.chars().count() <= 3 && phrase.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return text
+            .split(|ch: char| !ch.is_alphanumeric())
+            .any(|token| token == phrase);
+    }
+
+    text.contains(phrase)
 }
 
 fn normalize_keyword(value: impl AsRef<str>) -> String {
