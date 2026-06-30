@@ -7,22 +7,23 @@ pub enum StatsPeriod {
     Month,
 }
 
-pub type ChatStatsSummary = (
-    String,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-);
+#[derive(sqlx::FromRow)]
+pub struct ChatStatsSummary {
+    pub start_label: String,
+    pub messages: i64,
+    pub active_users: i64,
+    pub replies: i64,
+    pub links: i64,
+    pub media: i64,
+    pub channel_posts: i64,
+    pub bot_comments: i64,
+    pub replies_to_bot: i64,
+    pub reaction_events: i64,
+    pub reaction_count_updates: i64,
+    pub bot_comment_reactions: i64,
+    pub joins: i64,
+    pub leaves: i64,
+}
 
 pub struct UserPresentation {
     pub user_id: i64,
