@@ -7,6 +7,11 @@ pub struct Config {
     pub post_signature_marker: String,
     pub llm_provider: String,
     pub llm_model: Option<String>,
+    pub llm_supports_images: Option<bool>,
+    pub llm_temperature: f32,
+    pub llm_max_tokens: u32,
+    pub memory_llm_temperature: f32,
+    pub memory_llm_max_tokens: u32,
     pub groq_api_key: String,
     pub openrouter_api_key: String,
     pub ollama_base_url: String,
@@ -34,6 +39,12 @@ impl Config {
             post_signature_marker: env_or("POST_SIGNATURE_MARKER", "Не теряем связь"),
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_model: env_optional("LLM_MODEL"),
+            llm_supports_images: env_optional("LLM_SUPPORTS_IMAGES")
+                .and_then(|value| value.parse().ok()),
+            llm_temperature: env_f32("LLM_TEMPERATURE", 0.45),
+            llm_max_tokens: env_u32("LLM_MAX_TOKENS", 140),
+            memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2),
+            memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220),
             groq_api_key: env_or("GROQ_API_KEY", ""),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
             ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
@@ -57,6 +68,20 @@ impl Config {
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_f32(key: &str, default: f32) -> f32 {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse().ok())

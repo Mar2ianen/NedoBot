@@ -24,7 +24,7 @@ use features::first_comment::candidate::comment_candidate;
 use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use llm::ollama::OllamaClient;
 use llm::openai_compat::OpenAiCompatClient;
-use llm::types::{LlmClient, LlmRequest};
+use llm::types::{GeneratedText, LlmClient, LlmRequest};
 use state::AppState;
 use telegram::entities::{
     custom_emoji_ids, forwarded_channel_post, message_has_links, message_text,
@@ -432,8 +432,8 @@ async fn maybe_comment_post(
         return Ok(());
     };
 
-    // Gemma handles text and vision in one request. If Telegram attached several
-    // photo sizes, use the largest one so charts and small text stay readable.
+    // Download the best available image once; LLM routing decides whether the
+    // selected provider/model can actually receive it.
     let image_base64 = download_largest_photo_base64(bot, msg).await?;
     let chat_member_count = get_chat_member_count(bot, config).await;
     let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
@@ -444,8 +444,15 @@ async fn maybe_comment_post(
         &memory_notes,
         &recent_comments,
     );
-    let llm_body = generate_with_llm(config, &prompt, image_base64.as_deref(), 0.45, 140).await?;
-    let final_html = build_comment_html(&llm_body, config);
+    let generation = generate_with_llm(
+        config,
+        &prompt,
+        image_base64.as_deref(),
+        config.llm_temperature,
+        config.llm_max_tokens,
+    )
+    .await?;
+    let final_html = build_comment_html(&generation.content, config);
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
 
@@ -465,14 +472,15 @@ async fn maybe_comment_post(
         r#"
         insert into llm_generations
             (post_comment_job_id, provider, model, prompt, image_used, response, final_html)
-        values ($1, 'ollama', $2, $3, $4, $5, $6)
+        values ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
     .bind(job_id)
-    .bind(&config.vision_model)
+    .bind(&generation.provider)
+    .bind(&generation.model)
     .bind(&prompt)
-    .bind(image_base64.is_some())
-    .bind(&llm_body)
+    .bind(generation.image_used)
+    .bind(&generation.content)
     .bind(&final_html)
     .execute(pool)
     .await?;
@@ -1903,7 +1911,7 @@ async fn generate_with_llm(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GeneratedText> {
     let provider = config.llm_provider.trim().to_lowercase();
     let model = match provider.as_str() {
         "groq" | "openrouter" => config.llm_model.as_deref().unwrap_or(&config.vision_model),
@@ -1914,6 +1922,8 @@ async fn generate_with_llm(
             .unwrap_or(&config.vision_model),
         _ => &config.vision_model,
     };
+    let supports_images = llm_supports_images(config, &provider, model);
+    let image_base64 = image_base64.filter(|_| supports_images);
     let request = LlmRequest {
         model,
         prompt,
@@ -1950,7 +1960,27 @@ async fn generate_with_llm(
         }
     };
 
-    Ok(response.content)
+    Ok(GeneratedText {
+        provider,
+        model: model.to_string(),
+        content: response.content,
+        image_used: image_base64.is_some(),
+    })
+}
+
+fn llm_supports_images(config: &Config, provider: &str, model: &str) -> bool {
+    if let Some(supports_images) = config.llm_supports_images {
+        return supports_images;
+    }
+
+    let model = model.to_lowercase();
+    matches!(provider, "ollama")
+        || model.contains("vision")
+        || model.contains("llama-4")
+        || model.contains("gpt-4o")
+        || model.contains("gemma4")
+        || model.contains("gemini")
+        || model.contains("pixtral")
 }
 
 async fn load_relevant_memory_notes(
@@ -2042,8 +2072,15 @@ async fn remember_post(
     post_text: &str,
 ) -> anyhow::Result<()> {
     let note_prompt = build_memory_note_prompt(post_text);
-    let raw_note = generate_with_llm(config, &note_prompt, None, 0.2, 220).await?;
-    let mut note = parse_memory_note(&raw_note, post_text);
+    let raw_note = generate_with_llm(
+        config,
+        &note_prompt,
+        None,
+        config.memory_llm_temperature,
+        config.memory_llm_max_tokens,
+    )
+    .await?;
+    let mut note = parse_memory_note(&raw_note.content, post_text);
     note.keywords = merge_keywords(note.keywords, extract_keywords(post_text));
 
     if let Some(existing) = find_merge_candidate(pool, &note.keywords).await? {
@@ -2068,7 +2105,7 @@ async fn remember_post(
         .bind(&merged.note.summary)
         .bind(&merged.note.cautions)
         .bind(&merged.note.keywords)
-        .bind(&raw_note)
+        .bind(&raw_note.content)
         .bind(source_channel_id)
         .bind(source_message_id)
         .execute(pool)
@@ -2097,7 +2134,7 @@ async fn remember_post(
     .bind(&note.summary)
     .bind(&note.cautions)
     .bind(&note.keywords)
-    .bind(&raw_note)
+    .bind(&raw_note.content)
     .execute(pool)
     .await?;
 
