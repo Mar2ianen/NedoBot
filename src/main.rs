@@ -1,5 +1,4 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::{Deserialize, Serialize};
 use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use teloxide::{
@@ -15,10 +14,13 @@ use teloxide::{
 };
 
 mod config;
+mod llm;
 mod state;
 mod telegram;
 
 use config::Config;
+use llm::ollama::OllamaClient;
+use llm::types::{LlmClient, LlmRequest};
 use state::AppState;
 use telegram::entities::{
     custom_emoji_ids, forwarded_channel_post, message_has_links, message_text,
@@ -1918,39 +1920,6 @@ fn render_recent_comment_context(recent_comments: &[String]) -> String {
         .join("\n")
 }
 
-#[derive(Serialize)]
-struct OllamaChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<OllamaMessage<'a>>,
-    stream: bool,
-    options: OllamaOptions,
-}
-
-#[derive(Serialize)]
-struct OllamaMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    images: Vec<&'a str>,
-}
-
-#[derive(Serialize)]
-struct OllamaOptions {
-    temperature: f32,
-    num_predict: u32,
-}
-
-#[derive(Deserialize)]
-struct OllamaChatResponse {
-    message: Option<OllamaResponseMessage>,
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OllamaResponseMessage {
-    content: String,
-}
-
 async fn generate_with_ollama(
     config: &Config,
     prompt: &str,
@@ -1958,49 +1927,16 @@ async fn generate_with_ollama(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<String> {
-    let images = image_base64.into_iter().collect::<Vec<_>>();
-    let request = OllamaChatRequest {
-        model: &config.vision_model,
-        messages: vec![OllamaMessage {
-            role: "user",
-            content: prompt,
-            images,
-        }],
-        stream: false,
-        options: OllamaOptions {
+    let response = OllamaClient::new(config)
+        .generate(LlmRequest {
+            prompt,
+            image_base64,
             temperature,
             num_predict,
-        },
-    };
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!(
-            "{}/api/chat",
-            config.ollama_base_url.trim_end_matches('/')
-        ))
-        .bearer_auth(&config.ollama_api_key)
-        .json(&request)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<OllamaChatResponse>()
+        })
         .await?;
 
-    if let Some(error) = response.error {
-        anyhow::bail!(error);
-    }
-
-    let content = response
-        .message
-        .map(|message| message.content)
-        .unwrap_or_default();
-
-    if content.trim().is_empty() {
-        anyhow::bail!("empty Ollama response");
-    }
-
-    Ok(content)
+    Ok(response.content)
 }
 
 async fn load_relevant_memory_notes(
