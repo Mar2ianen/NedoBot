@@ -19,6 +19,8 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Автоматически конспектирует обычные новости в память и подмешивает релевантные заметки в следующие генерации.
 - Объединяет похожие заметки памяти, чтобы не плодить дубли.
 - Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
+- Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
+- Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
 
 ## Важный Нюанс Telegram
 
@@ -124,6 +126,11 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `post_comment_jobs` - дедупликация и статус комментария под постом.
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
 - `post_memory_notes` - короткие конспекты прошлых новостей, keywords и осторожные ограничения для будущих комментариев.
+- `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium.
+- `telegram_chat_member_snapshots` - последний известный статус пользователя в чате.
+- `telegram_chat_member_events` - входы, выходы и изменения статусов, если Telegram прислал update.
+- `telegram_message_reactions` - персональные изменения реакций.
+- `telegram_message_reaction_counts` - последние известные счётчики реакций по сообщению.
 - `bot_settings`, `telegram_users`, `telegram_chats`, `admin_events` - задел под админку.
 
 Посмотреть последние сообщения:
@@ -152,6 +159,10 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /emojiids
 /format_test <текст поста>
 /memory
+/stats_day
+/stats_week
+/stats_month
+/userstats <id|@username>
 ```
 
 В группах лучше писать с username:
@@ -186,6 +197,12 @@ RAG не предназначен для пересказа новости: по
 
 ## Метрики И Отладка
 
+Отсечки периодов:
+
+- день: сегодня с `05:00` по Москве;
+- неделя: понедельник `05:00` по Москве;
+- месяц: первое число месяца `05:00` по Москве.
+
 Сводка по сообщениям:
 
 ```bash
@@ -202,6 +219,12 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 ```bash
 ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"with metrics as (select j.source_message_id, count(m.*) filter (where m.created_at <= j.created_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as msg_5m, count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as msg_30m, count(distinct m.user_id) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m from post_comment_jobs j left join telegram_messages m on m.chat_id = j.discussion_chat_id and m.created_at > j.created_at and m.created_at <= j.created_at + interval '30 minutes' and m.message_id <> j.bot_comment_message_id and m.user_id is distinct from 8907803505 and m.source_channel_id is null group by j.source_message_id, j.created_at, j.bot_comment_message_id) select round(avg(msg_5m)::numeric, 2) as avg_msg_5m, round(avg(msg_30m)::numeric, 2) as avg_msg_30m, round(avg(users_30m)::numeric, 2) as avg_users_30m from metrics;\""
+```
+
+Реакции на комментарии бота:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select j.source_message_id, j.bot_comment_message_id, coalesce(rc.total_count, 0) as reactions, rc.reactions from post_comment_jobs j left join telegram_message_reaction_counts rc on rc.chat_id = j.discussion_chat_id and rc.message_id = j.bot_comment_message_id order by j.created_at desc limit 20;\""
 ```
 
 ## Custom Emoji
@@ -225,6 +248,8 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 
 - Поиск памяти keyword-based, без embeddings/pgvector.
 - Merge памяти эвристический; за качеством заметок надо иногда смотреть через `/memory` или SQL.
+- Реакции считаются только с момента включения reaction updates; старые реакции Telegram Bot API задним числом не отдаёт.
+- Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если Ollama Cloud вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; настройки меняются через `.env` и рестарт сервиса.

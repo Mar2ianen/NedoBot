@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
+use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use teloxide::{
     dispatching::UpdateFilterExt,
@@ -7,7 +8,9 @@ use teloxide::{
     prelude::*,
     requests::RequesterExt,
     types::{
-        LinkPreviewOptions, MessageEntityKind, MessageId, MessageOrigin, ParseMode, ReplyParameters,
+        ChatMemberKind, ChatMemberUpdated, LinkPreviewOptions, MessageEntityKind, MessageId,
+        MessageOrigin, MessageReactionCountUpdated, MessageReactionUpdated, ParseMode,
+        ReplyParameters, User,
     },
     utils::command::BotCommands,
 };
@@ -27,6 +30,14 @@ enum Command {
     FormatTest(String),
     #[command(description = "показать последние заметки памяти")]
     Memory,
+    #[command(description = "статистика за текущий день с 05:00 МСК")]
+    StatsDay,
+    #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК")]
+    StatsWeek,
+    #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК")]
+    StatsMonth,
+    #[command(description = "статистика пользователя: /userstats <id|@username>")]
+    UserStats(String),
 }
 
 #[derive(Clone)]
@@ -62,6 +73,64 @@ struct MemoryNote {
     keywords: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum StatsPeriod {
+    Day,
+    Week,
+    Month,
+}
+
+type ChatStatsSummary = (
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+struct MemberSnapshot {
+    chat_id: i64,
+    user_id: i64,
+    status: String,
+    is_admin: bool,
+    is_present: bool,
+    raw_json: serde_json::Value,
+    observed_at: DateTime<Utc>,
+}
+
+impl StatsPeriod {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Day => "день",
+            Self::Week => "неделю",
+            Self::Month => "месяц",
+        }
+    }
+
+    fn start_sql(self) -> &'static str {
+        match self {
+            Self::Day => {
+                "(date_trunc('day', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+            }
+            Self::Week => {
+                "(date_trunc('week', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+            }
+            Self::Month => {
+                "(date_trunc('month', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -76,14 +145,25 @@ async fn main() -> anyhow::Result<()> {
     let pool = build_pool().await?;
     migrate(&pool).await?;
     let config = Config::from_env();
+    if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
+        tracing::warn!(%err, "failed to refresh member snapshots");
+    }
 
-    let handler = Update::filter_message()
+    let handler = dptree::entry()
         .branch(
-            dptree::entry()
-                .filter_command::<Command>()
-                .endpoint(handle_command),
+            Update::filter_message()
+                .branch(
+                    dptree::entry()
+                        .filter_command::<Command>()
+                        .endpoint(handle_command),
+                )
+                .branch(dptree::endpoint(handle_message)),
         )
-        .branch(dptree::endpoint(handle_message));
+        .branch(Update::filter_message_reaction_updated().endpoint(handle_message_reaction))
+        .branch(
+            Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
+        )
+        .branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![pool, config])
@@ -204,6 +284,18 @@ async fn handle_command(
         Command::Memory => {
             send_memory_notes(&bot, msg.chat.id, &pool).await?;
         }
+        Command::StatsDay => {
+            send_chat_stats(&bot, msg.chat.id, &pool, &config, StatsPeriod::Day).await?;
+        }
+        Command::StatsWeek => {
+            send_chat_stats(&bot, msg.chat.id, &pool, &config, StatsPeriod::Week).await?;
+        }
+        Command::StatsMonth => {
+            send_chat_stats(&bot, msg.chat.id, &pool, &config, StatsPeriod::Month).await?;
+        }
+        Command::UserStats(target) => {
+            send_user_stats(&bot, msg.chat.id, &pool, &config, &target).await?;
+        }
     }
 
     Ok(())
@@ -217,6 +309,36 @@ async fn handle_message(
 ) -> ResponseResult<()> {
     if let Err(err) = maybe_comment_post(&bot, &msg, &pool, &config).await {
         tracing::error!(%err, "failed to process message");
+    }
+
+    Ok(())
+}
+
+async fn handle_message_reaction(
+    reaction: MessageReactionUpdated,
+    pool: PgPool,
+) -> ResponseResult<()> {
+    if let Err(err) = save_message_reaction(&pool, &reaction).await {
+        tracing::error!(%err, "failed to save message reaction");
+    }
+
+    Ok(())
+}
+
+async fn handle_message_reaction_count(
+    reaction_count: MessageReactionCountUpdated,
+    pool: PgPool,
+) -> ResponseResult<()> {
+    if let Err(err) = save_message_reaction_count(&pool, &reaction_count).await {
+        tracing::error!(%err, "failed to save message reaction count");
+    }
+
+    Ok(())
+}
+
+async fn handle_chat_member(member: ChatMemberUpdated, pool: PgPool) -> ResponseResult<()> {
+    if let Err(err) = save_chat_member_event(&pool, &member).await {
+        tracing::error!(%err, "failed to save chat member event");
     }
 
     Ok(())
@@ -446,6 +568,468 @@ async fn send_memory_notes(
     Ok(())
 }
 
+async fn send_chat_stats(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+    config: &Config,
+    period: StatsPeriod,
+) -> ResponseResult<()> {
+    let report = build_chat_stats_report(pool, config, period)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "failed to build chat stats");
+            teloxide::RequestError::Io(std::io::Error::other("stats failed"))
+        })?;
+
+    send_html(bot, chat_id, report).await?;
+
+    Ok(())
+}
+
+async fn send_user_stats(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+    config: &Config,
+    target: &str,
+) -> ResponseResult<()> {
+    let report = build_user_stats_report(pool, config, target)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "failed to build user stats");
+            teloxide::RequestError::Io(std::io::Error::other("user stats failed"))
+        })?;
+
+    send_html(bot, chat_id, report).await?;
+
+    Ok(())
+}
+
+async fn build_chat_stats_report(
+    pool: &PgPool,
+    config: &Config,
+    period: StatsPeriod,
+) -> anyhow::Result<String> {
+    let start_sql = period.start_sql();
+    let summary_sql = format!(
+        r#"
+        with bounds as (
+            select {start_sql} as start_at, now() as end_at
+        ),
+        messages as (
+            select m.*
+            from telegram_messages m, bounds b
+            where m.chat_id = $1
+              and m.created_at >= b.start_at
+              and m.created_at < b.end_at
+        ),
+        bot_comments as (
+            select j.*
+            from post_comment_jobs j, bounds b
+            where j.discussion_chat_id = $1
+              and j.created_at >= b.start_at
+              and j.created_at < b.end_at
+        ),
+        reactions as (
+            select r.*
+            from telegram_message_reactions r, bounds b
+            where r.chat_id = $1
+              and r.event_at >= b.start_at
+              and r.event_at < b.end_at
+        ),
+        reaction_counts as (
+            select rc.*
+            from telegram_message_reaction_counts rc, bounds b
+            where rc.chat_id = $1
+              and rc.event_at >= b.start_at
+              and rc.event_at < b.end_at
+        ),
+        member_events as (
+            select e.*
+            from telegram_chat_member_events e, bounds b
+            where e.chat_id = $1
+              and e.event_at >= b.start_at
+              and e.event_at < b.end_at
+        )
+        select
+            to_char((select start_at from bounds) at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as start_label,
+            count(*)::bigint as messages,
+            count(distinct user_id) filter (where source_channel_id is null and coalesce(user_id, 0) <> 777000)::bigint as active_users,
+            count(*) filter (where reply_to_message_id is not null)::bigint as replies,
+            count(*) filter (where has_links)::bigint as links,
+            count(*) filter (where has_photo or has_video or has_document or has_audio or has_voice or has_sticker or has_animation)::bigint as media,
+            count(*) filter (where is_automatic_forward)::bigint as channel_posts,
+            (select count(*) from bot_comments)::bigint as bot_comments,
+            (select count(*) from messages m join bot_comments j on m.reply_to_message_id = j.bot_comment_message_id)::bigint as replies_to_bot,
+            (select count(*) from reactions)::bigint as reaction_events,
+            (select count(*) from reaction_counts)::bigint as reaction_count_updates,
+            (select coalesce(sum(rc.total_count), 0)::bigint from reaction_counts rc join post_comment_jobs j on j.discussion_chat_id = rc.chat_id and j.bot_comment_message_id = rc.message_id)::bigint as bot_comment_reactions,
+            (select count(*) from member_events where old_status in ('left', 'banned') and new_status not in ('left', 'banned'))::bigint as joins,
+            (select count(*) from member_events where old_status not in ('left', 'banned') and new_status in ('left', 'banned'))::bigint as leaves
+        from messages
+        "#
+    );
+
+    let summary: ChatStatsSummary = sqlx::query_as(&summary_sql)
+        .bind(config.discussion_chat_id)
+        .fetch_one(pool)
+        .await?;
+
+    let attraction_sql = format!(
+        r#"
+        with bounds as (
+            select {start_sql} as start_at, now() as end_at
+        ),
+        metrics as (
+            select j.source_message_id,
+                   count(m.*) filter (where m.created_at <= j.created_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as msg_5m,
+                   count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as msg_30m,
+                   count(distinct m.user_id) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m
+            from post_comment_jobs j
+            left join telegram_messages m
+              on m.chat_id = j.discussion_chat_id
+             and m.created_at > j.created_at
+             and m.created_at <= j.created_at + interval '30 minutes'
+             and m.message_id <> j.bot_comment_message_id
+             and m.source_channel_id is null
+            where j.discussion_chat_id = $1
+              and j.created_at >= (select start_at from bounds)
+              and j.created_at < (select end_at from bounds)
+            group by j.source_message_id, j.created_at, j.bot_comment_message_id
+        )
+        select
+            coalesce(round(avg(msg_5m)::numeric, 2), 0)::text,
+            coalesce(round(avg(msg_30m)::numeric, 2), 0)::text,
+            coalesce(round(avg(users_30m)::numeric, 2), 0)::text
+        from metrics
+        "#
+    );
+    let attraction: (String, String, String) = sqlx::query_as(&attraction_sql)
+        .bind(config.discussion_chat_id)
+        .fetch_one(pool)
+        .await?;
+
+    let top_users = top_users_for_period(pool, config, period).await?;
+    let top_bot_comments = top_bot_comments_for_period(pool, config, period).await?;
+
+    let mut report = format!(
+        "<b>Статистика за {}</b>\nПериод с <code>{}</code> МСК\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, людей 30м <b>{}</b>",
+        period.title(),
+        escape_html(&summary.0),
+        summary.1,
+        summary.2,
+        summary.3,
+        summary.4,
+        summary.5,
+        summary.6,
+        summary.7,
+        summary.8,
+        summary.9,
+        summary.10,
+        summary.11,
+        summary.12,
+        summary.13,
+        attraction.0,
+        attraction.1,
+        attraction.2,
+    );
+
+    if !top_users.is_empty() {
+        report.push_str("\n\n<b>Топ пользователей</b>\n");
+        report.push_str(&top_users.join("\n"));
+    }
+
+    if !top_bot_comments.is_empty() {
+        report.push_str("\n\n<b>Комменты бота</b>\n");
+        report.push_str(&top_bot_comments.join("\n"));
+    }
+
+    Ok(report)
+}
+
+async fn top_users_for_period(
+    pool: &PgPool,
+    config: &Config,
+    period: StatsPeriod,
+) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        r#"
+        with bounds as (
+            select {} as start_at, now() as end_at
+        )
+        select m.user_id,
+               coalesce('@' || p.username, nullif(trim(coalesce(p.first_name, '') || ' ' || coalesce(p.last_name, '')), ''), m.user_id::text) as name,
+               count(*)::bigint as messages,
+               count(*) filter (where m.reply_to_message_id is not null)::bigint as replies,
+               count(*) filter (where m.has_links)::bigint as links,
+               count(*) filter (where m.has_photo or m.has_video or m.has_document or m.has_audio or m.has_voice or m.has_sticker or m.has_animation)::bigint as media,
+               coalesce(s.status, 'unknown') as status,
+               coalesce(s.is_admin, false) as is_admin
+        from telegram_messages m
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
+        where m.chat_id = $1
+          and m.user_id is not null
+          and m.source_channel_id is null
+          and m.user_id <> 777000
+          and coalesce(p.is_bot, false) = false
+          and m.created_at >= (select start_at from bounds)
+          and m.created_at < (select end_at from bounds)
+        group by m.user_id, p.username, p.first_name, p.last_name, s.status, s.is_admin
+        order by messages desc
+        limit 8
+        "#,
+        period.start_sql()
+    );
+
+    let rows = sqlx::query_as::<_, (i64, String, i64, i64, i64, i64, String, bool)>(&sql)
+        .bind(config.discussion_chat_id)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(user_id, name, messages, replies, links, media, status, is_admin)| {
+                let admin = if is_admin { ", admin" } else { "" };
+                format!(
+                    "{}: <b>{}</b> соо, {} reply, {} links, {} media, <code>{}</code>{}",
+                    escape_html(&name),
+                    messages,
+                    replies,
+                    links,
+                    media,
+                    escape_html(&format!("{status}:{user_id}")),
+                    admin
+                )
+            },
+        )
+        .collect())
+}
+
+async fn top_bot_comments_for_period(
+    pool: &PgPool,
+    config: &Config,
+    period: StatsPeriod,
+) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        r#"
+        with bounds as (
+            select {} as start_at, now() as end_at
+        )
+        select j.source_message_id,
+               coalesce(g.response, '') as response,
+               count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/')::bigint as msg_30m,
+               count(m.*) filter (where m.reply_to_message_id = j.bot_comment_message_id)::bigint as direct_replies,
+               coalesce(max(rc.total_count), 0)::bigint as reactions
+        from post_comment_jobs j
+        left join llm_generations g on g.post_comment_job_id = j.id
+        left join telegram_messages m
+          on m.chat_id = j.discussion_chat_id
+         and m.created_at > j.created_at
+         and m.created_at <= j.created_at + interval '30 minutes'
+         and m.message_id <> j.bot_comment_message_id
+         and m.source_channel_id is null
+        left join telegram_message_reaction_counts rc
+          on rc.chat_id = j.discussion_chat_id
+         and rc.message_id = j.bot_comment_message_id
+        where j.discussion_chat_id = $1
+          and j.created_at >= (select start_at from bounds)
+          and j.created_at < (select end_at from bounds)
+        group by j.source_message_id, g.response
+        order by msg_30m desc, direct_replies desc, reactions desc
+        limit 5
+        "#,
+        period.start_sql()
+    );
+
+    let rows = sqlx::query_as::<_, (i32, String, i64, i64, i64)>(&sql)
+        .bind(config.discussion_chat_id)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(source_message_id, response, msg_30m, direct_replies, reactions)| {
+                format!(
+                    "#{}: {} соо/30м, {} replies, {} reactions - {}",
+                    source_message_id,
+                    msg_30m,
+                    direct_replies,
+                    reactions,
+                    escape_html(&first_text_chars(&response, 90))
+                )
+            },
+        )
+        .collect())
+}
+
+async fn build_user_stats_report(
+    pool: &PgPool,
+    config: &Config,
+    target: &str,
+) -> anyhow::Result<String> {
+    let Some(user_id) = resolve_user_id(pool, target).await? else {
+        return Ok(format!(
+            "Не нашёл пользователя <code>{}</code>. Используй id или @username из уже виденных ботом пользователей.",
+            escape_html(target)
+        ));
+    };
+
+    let profile = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, bool)>(
+        r#"
+        select username, first_name, last_name, is_bot
+        from telegram_user_profiles
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let member = sqlx::query_as::<_, (String, bool, bool, Option<String>)>(
+        r#"
+        select status, is_admin, is_present, to_char(observed_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI')
+        from telegram_chat_member_snapshots
+        where chat_id = $1 and telegram_user_id = $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let totals = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+        r#"
+        select count(*)::bigint as messages,
+               count(*) filter (where reply_to_message_id is not null)::bigint as replies,
+               count(*) filter (where has_links)::bigint as links,
+               count(*) filter (where has_photo or has_video or has_document or has_audio or has_voice or has_sticker or has_animation)::bigint as media,
+               count(*) filter (where reply_to_message_id in (select discussion_message_id from post_comment_jobs))::bigint as replies_to_channel_posts,
+               count(*) filter (where reply_to_message_id in (select bot_comment_message_id from post_comment_jobs))::bigint as replies_to_bot,
+               count(distinct date_trunc('day', created_at at time zone 'Europe/Moscow' - interval '5 hours'))::bigint as active_days
+        from telegram_messages
+        where chat_id = $1 and user_id = $2 and source_channel_id is null
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let reactions_given = sqlx::query_as::<_, (i64,)>(
+        r#"
+        select count(*)::bigint
+        from telegram_message_reactions
+        where chat_id = $1 and user_id = $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?
+    .0;
+
+    let reactions_received = sqlx::query_as::<_, (i64,)>(
+        r#"
+        select coalesce(sum(rc.total_count), 0)::bigint
+        from telegram_messages m
+        join telegram_message_reaction_counts rc on rc.chat_id = m.chat_id and rc.message_id = m.message_id
+        where m.chat_id = $1 and m.user_id = $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?
+    .0;
+
+    let name = profile
+        .as_ref()
+        .map(|(username, first_name, last_name, is_bot)| {
+            let display = username
+                .as_ref()
+                .map(|username| format!("@{username}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} {}",
+                        first_name.clone().unwrap_or_default(),
+                        last_name.clone().unwrap_or_default()
+                    )
+                    .trim()
+                    .to_string()
+                });
+            if *is_bot {
+                format!("{display} (bot)")
+            } else {
+                display
+            }
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| user_id.to_string());
+
+    let member_line = member
+        .map(|(status, is_admin, is_present, observed_at)| {
+            format!(
+                "{}{}{}, seen {}",
+                status,
+                if is_admin { ", admin" } else { "" },
+                if is_present {
+                    ", in chat"
+                } else {
+                    ", not present"
+                },
+                observed_at.unwrap_or_else(|| "unknown".to_string())
+            )
+        })
+        .unwrap_or_else(|| "membership unknown".to_string());
+
+    Ok(format!(
+        "<b>Статистика пользователя</b>\n{} <code>{}</code>\n{}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
+        escape_html(&name),
+        user_id,
+        escape_html(&member_line),
+        totals.0,
+        totals.1,
+        totals.4,
+        totals.5,
+        totals.2,
+        totals.3,
+        totals.6,
+        reactions_given,
+        reactions_received,
+    ))
+}
+
+async fn resolve_user_id(pool: &PgPool, target: &str) -> anyhow::Result<Option<i64>> {
+    let clean = target.trim();
+    if clean.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(user_id) = clean.parse::<i64>() {
+        return Ok(Some(user_id));
+    }
+
+    let username = clean.trim_start_matches('@').to_lowercase();
+    let row = sqlx::query_as::<_, (i64,)>(
+        r#"
+        select telegram_user_id
+        from telegram_user_profiles
+        where lower(username) = $1
+        order by updated_at desc
+        limit 1
+        "#,
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(user_id,)| user_id))
+}
+
 fn custom_emoji_ids(msg: &Message) -> Vec<String> {
     msg.entities()
         .into_iter()
@@ -533,6 +1117,21 @@ async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<(
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
         .unwrap_or((None, None));
     let user_id = msg.from.as_ref().map(|user| user.id.0 as i64);
+    if let Some(user) = msg.from.as_ref() {
+        upsert_user_profile(pool, user).await?;
+    }
+
+    if let Some(reply_user) = msg.reply_to_message().and_then(|reply| reply.from.as_ref()) {
+        upsert_user_profile(pool, reply_user).await?;
+    }
+
+    let reply_to_message_id = msg.reply_to_message().map(|reply| reply.id.0);
+    let reply_to_user_id = msg
+        .reply_to_message()
+        .and_then(|reply| reply.from.as_ref())
+        .map(|user| user.id.0 as i64);
+    let sender_chat_id = msg.sender_chat.as_ref().map(|chat| chat.id.0);
+    let via_bot_id = msg.via_bot.as_ref().map(|bot| bot.id.0 as i64);
     // Keep the raw payload while the bot is young: Telegram update shapes vary,
     // and raw_json makes production debugging much faster.
     let raw_json = serde_json::to_value(msg)?;
@@ -540,11 +1139,29 @@ async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<(
     sqlx::query(
         r#"
         insert into telegram_messages
-            (chat_id, message_id, user_id, source_channel_id, source_message_id, is_automatic_forward, text, raw_json)
-        values ($1, $2, $3, $4, $5, $6, $7, $8)
+            (
+                chat_id, message_id, user_id, source_channel_id, source_message_id,
+                is_automatic_forward, text, raw_json, reply_to_message_id,
+                reply_to_user_id, sender_chat_id, via_bot_id, has_photo, has_video,
+                has_document, has_audio, has_voice, has_sticker, has_animation,
+                has_links
+            )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         on conflict (chat_id, message_id) do update set
             text = excluded.text,
-            raw_json = excluded.raw_json
+            raw_json = excluded.raw_json,
+            reply_to_message_id = excluded.reply_to_message_id,
+            reply_to_user_id = excluded.reply_to_user_id,
+            sender_chat_id = excluded.sender_chat_id,
+            via_bot_id = excluded.via_bot_id,
+            has_photo = excluded.has_photo,
+            has_video = excluded.has_video,
+            has_document = excluded.has_document,
+            has_audio = excluded.has_audio,
+            has_voice = excluded.has_voice,
+            has_sticker = excluded.has_sticker,
+            has_animation = excluded.has_animation,
+            has_links = excluded.has_links
         "#,
     )
     .bind(msg.chat.id.0)
@@ -555,10 +1172,275 @@ async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<(
     .bind(msg.is_automatic_forward())
     .bind(message_text(msg))
     .bind(raw_json)
+    .bind(reply_to_message_id)
+    .bind(reply_to_user_id)
+    .bind(sender_chat_id)
+    .bind(via_bot_id)
+    .bind(msg.photo().is_some())
+    .bind(msg.video().is_some())
+    .bind(msg.document().is_some())
+    .bind(msg.audio().is_some())
+    .bind(msg.voice().is_some())
+    .bind(msg.sticker().is_some())
+    .bind(msg.animation().is_some())
+    .bind(message_has_links(msg))
     .execute(pool)
     .await?;
 
     Ok(())
+}
+
+async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into telegram_user_profiles
+            (telegram_user_id, username, first_name, last_name, is_bot, is_premium, language_code)
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (telegram_user_id) do update set
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            is_bot = excluded.is_bot,
+            is_premium = excluded.is_premium,
+            language_code = excluded.language_code,
+            last_seen_at = now(),
+            updated_at = now()
+        "#,
+    )
+    .bind(user.id.0 as i64)
+    .bind(&user.username)
+    .bind(&user.first_name)
+    .bind(&user.last_name)
+    .bind(user.is_bot)
+    .bind(user.is_premium)
+    .bind(&user.language_code)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn message_has_links(msg: &Message) -> bool {
+    let text_has_links = message_text(msg)
+        .map(|text| text.contains("http://") || text.contains("https://") || text.contains("t.me/"))
+        .unwrap_or(false);
+
+    text_has_links
+        || msg
+            .entities()
+            .into_iter()
+            .flatten()
+            .chain(msg.caption_entities().into_iter().flatten())
+            .any(|entity| {
+                matches!(
+                    entity.kind,
+                    MessageEntityKind::Url | MessageEntityKind::TextLink { .. }
+                )
+            })
+}
+
+async fn save_message_reaction(
+    pool: &PgPool,
+    reaction: &MessageReactionUpdated,
+) -> anyhow::Result<()> {
+    if let Some(user) = reaction.user.as_ref() {
+        upsert_user_profile(pool, user).await?;
+    }
+
+    let raw_json = serde_json::to_value(reaction)?;
+    let old_reactions = serde_json::to_value(&reaction.old_reaction)?;
+    let new_reactions = serde_json::to_value(&reaction.new_reaction)?;
+
+    sqlx::query(
+        r#"
+        insert into telegram_message_reactions
+            (chat_id, message_id, user_id, actor_chat_id, old_reactions, new_reactions, raw_json, event_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(reaction.chat.id.0)
+    .bind(reaction.message_id.0)
+    .bind(reaction.user.as_ref().map(|user| user.id.0 as i64))
+    .bind(reaction.actor_chat.as_ref().map(|chat| chat.id.0))
+    .bind(old_reactions)
+    .bind(new_reactions)
+    .bind(raw_json)
+    .bind(reaction.date)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn save_message_reaction_count(
+    pool: &PgPool,
+    reaction_count: &MessageReactionCountUpdated,
+) -> anyhow::Result<()> {
+    let raw_json = serde_json::to_value(reaction_count)?;
+    let reactions = serde_json::to_value(&reaction_count.reactions)?;
+    let total_count = reaction_count
+        .reactions
+        .iter()
+        .map(|reaction| reaction.total_count as i64)
+        .sum::<i64>();
+
+    sqlx::query(
+        r#"
+        insert into telegram_message_reaction_counts
+            (chat_id, message_id, reactions, total_count, raw_json, event_at)
+        values ($1, $2, $3, $4, $5, $6)
+        on conflict (chat_id, message_id) do update set
+            reactions = excluded.reactions,
+            total_count = excluded.total_count,
+            raw_json = excluded.raw_json,
+            event_at = excluded.event_at,
+            updated_at = now()
+        "#,
+    )
+    .bind(reaction_count.chat.id.0)
+    .bind(reaction_count.message_id.0)
+    .bind(reactions)
+    .bind(total_count as i32)
+    .bind(raw_json)
+    .bind(reaction_count.date)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn save_chat_member_event(pool: &PgPool, member: &ChatMemberUpdated) -> anyhow::Result<()> {
+    upsert_user_profile(pool, &member.from).await?;
+    upsert_user_profile(pool, &member.new_chat_member.user).await?;
+
+    let raw_json = serde_json::to_value(member)?;
+    let old_status = chat_member_status(&member.old_chat_member.kind);
+    let new_status = chat_member_status(&member.new_chat_member.kind);
+    let is_admin = member.new_chat_member.kind.is_privileged();
+    let is_present = member.new_chat_member.kind.is_present();
+
+    sqlx::query(
+        r#"
+        insert into telegram_chat_member_events
+            (
+                chat_id, telegram_user_id, actor_user_id, old_status, new_status,
+                invite_link, via_chat_folder_invite_link, raw_json, event_at
+            )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(member.chat.id.0)
+    .bind(member.new_chat_member.user.id.0 as i64)
+    .bind(member.from.id.0 as i64)
+    .bind(&old_status)
+    .bind(&new_status)
+    .bind(
+        member
+            .invite_link
+            .as_ref()
+            .map(|link| link.invite_link.clone()),
+    )
+    .bind(member.via_chat_folder_invite_link)
+    .bind(raw_json.clone())
+    .bind(member.date)
+    .execute(pool)
+    .await?;
+
+    upsert_member_snapshot(
+        pool,
+        MemberSnapshot {
+            chat_id: member.chat.id.0,
+            user_id: member.new_chat_member.user.id.0 as i64,
+            status: new_status,
+            is_admin,
+            is_present,
+            raw_json,
+            observed_at: member.date,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn refresh_known_member_snapshots(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &PgPool,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let users = sqlx::query_as::<_, (i64,)>(
+        r#"
+        select distinct user_id
+        from telegram_messages
+        where chat_id = $1 and user_id is not null
+        order by user_id
+        limit 250
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .fetch_all(pool)
+    .await?;
+
+    for (user_id,) in users {
+        match bot
+            .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id as u64))
+            .await
+        {
+            Ok(member) => {
+                upsert_user_profile(pool, &member.user).await?;
+                let raw_json = serde_json::to_value(&member)?;
+                upsert_member_snapshot(
+                    pool,
+                    MemberSnapshot {
+                        chat_id: config.discussion_chat_id,
+                        user_id,
+                        status: chat_member_status(&member.kind),
+                        is_admin: member.kind.is_privileged(),
+                        is_present: member.kind.is_present(),
+                        raw_json,
+                        observed_at: Utc::now(),
+                    },
+                )
+                .await?;
+            }
+            Err(err) => {
+                tracing::debug!(%err, user_id, "failed to refresh chat member");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn upsert_member_snapshot(pool: &PgPool, snapshot: MemberSnapshot) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into telegram_chat_member_snapshots
+            (chat_id, telegram_user_id, status, is_admin, is_present, raw_json, observed_at)
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (chat_id, telegram_user_id) do update set
+            status = excluded.status,
+            is_admin = excluded.is_admin,
+            is_present = excluded.is_present,
+            raw_json = excluded.raw_json,
+            observed_at = excluded.observed_at
+        "#,
+    )
+    .bind(snapshot.chat_id)
+    .bind(snapshot.user_id)
+    .bind(&snapshot.status)
+    .bind(snapshot.is_admin)
+    .bind(snapshot.is_present)
+    .bind(snapshot.raw_json)
+    .bind(snapshot.observed_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn chat_member_status(kind: &ChatMemberKind) -> String {
+    format!("{:?}", kind.status()).to_lowercase()
 }
 
 async fn create_post_comment_job(
