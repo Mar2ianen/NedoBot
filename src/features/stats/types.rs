@@ -1,0 +1,143 @@
+use crate::telegram::render::escape_html;
+
+#[derive(Clone, Copy)]
+pub enum StatsPeriod {
+    Day,
+    Week,
+    Month,
+}
+
+pub type ChatStatsSummary = (
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+pub struct UserPresentation {
+    pub user_id: i64,
+    pub display_name: String,
+    pub is_bot: bool,
+    pub status: Option<String>,
+    pub is_admin: bool,
+    pub is_present: Option<bool>,
+}
+
+impl UserPresentation {
+    // Keep Telegram HTML user formatting in one place so stats reports do not
+    // expose raw IDs or drift into several slightly different formats.
+    pub fn linked_name(&self) -> String {
+        let visible = if self.display_name.trim().is_empty() {
+            "пользователь"
+        } else {
+            self.display_name.trim()
+        };
+
+        format!(
+            r#"<a href="tg://user?id={}">{}</a>"#,
+            self.user_id,
+            escape_html(visible)
+        )
+    }
+
+    fn badges(&self) -> String {
+        let mut parts = Vec::new();
+
+        if self.is_bot {
+            parts.push("бот");
+        }
+
+        if self.is_admin {
+            parts.push("админ");
+        } else if let Some(status) = self.status.as_deref() {
+            parts.push(human_member_status(status));
+        } else if self.is_present == Some(true) {
+            parts.push("в чате");
+        } else if self.is_present == Some(false) {
+            parts.push("не в чате");
+        }
+
+        if parts.is_empty() {
+            "статус неизвестен".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    pub fn linked_with_badges(&self) -> String {
+        format!("{} ({})", self.linked_name(), self.badges())
+    }
+}
+
+pub fn display_name(
+    username: Option<&str>,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+    fallback_user_id: i64,
+) -> String {
+    if let Some(username) = username.filter(|value| !value.trim().is_empty()) {
+        return format!("@{username}");
+    }
+
+    let full_name = format!(
+        "{} {}",
+        first_name.unwrap_or_default(),
+        last_name.unwrap_or_default()
+    )
+    .trim()
+    .to_string();
+
+    if full_name.is_empty() {
+        fallback_user_id.to_string()
+    } else {
+        full_name
+    }
+}
+
+impl StatsPeriod {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Day => "день",
+            Self::Week => "неделю",
+            Self::Month => "месяц",
+        }
+    }
+
+    pub fn start_sql(self) -> &'static str {
+        // The chat day is editorial, not calendar: 05:00 Moscow time is the
+        // boundary for day/week/month reports.
+        match self {
+            Self::Day => {
+                "(date_trunc('day', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+            }
+            Self::Week => {
+                "(date_trunc('week', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+            }
+            Self::Month => {
+                "(date_trunc('month', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+            }
+        }
+    }
+}
+
+fn human_member_status(status: &str) -> &'static str {
+    match status {
+        "administrator" => "админ",
+        "owner" => "владелец",
+        "member" => "в чате",
+        "restricted" => "ограничен",
+        "left" => "не в чате",
+        "banned" => "забанен",
+        _ => "статус неизвестен",
+    }
+}
