@@ -255,9 +255,13 @@ async fn maybe_comment_post(
         return Ok(());
     };
 
-    // Download the best available image once; LLM routing decides whether the
-    // selected provider/model can actually receive it.
-    let image_base64 = download_largest_photo_base64(bot, msg).await?;
+    let image_base64 = match download_largest_photo_base64(bot, msg).await {
+        Ok(image) => image,
+        Err(err) => {
+            tracing::warn!(%err, "failed to download post image, continue text-only");
+            None
+        }
+    };
     let chat_member_count = get_chat_member_count(bot, config).await;
     let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
@@ -540,20 +544,20 @@ async fn build_chat_stats_report(
     let mut report = format!(
         "<b>Статистика за {}</b>\nПериод с <code>{}</code> МСК\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, людей 30м <b>{}</b>",
         period.title(),
-        escape_html(&summary.0),
-        summary.1,
-        summary.2,
-        summary.3,
-        summary.4,
-        summary.5,
-        summary.6,
-        summary.7,
-        summary.8,
-        summary.9,
-        summary.10,
-        summary.11,
-        summary.12,
-        summary.13,
+        escape_html(&summary.start_label),
+        summary.messages,
+        summary.active_users,
+        summary.replies,
+        summary.links,
+        summary.media,
+        summary.channel_posts,
+        summary.bot_comments,
+        summary.replies_to_bot,
+        summary.reaction_events,
+        summary.reaction_count_updates,
+        summary.bot_comment_reactions,
+        summary.joins,
+        summary.leaves,
         attraction.0,
         attraction.1,
         attraction.2,

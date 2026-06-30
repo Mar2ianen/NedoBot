@@ -13,9 +13,9 @@ pub async fn generate_text(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<GeneratedText> {
-    let provider = config.llm_provider.trim().to_lowercase();
-    let model = model_for_provider(config, &provider);
-    let image_base64 = image_base64.filter(|_| supports_images(config, &provider, model));
+    let provider = normalize_provider(&config.llm_provider)?;
+    let model = model_for_provider(config, provider);
+    let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
         model,
         prompt,
@@ -23,7 +23,7 @@ pub async fn generate_text(
         temperature,
         num_predict,
     };
-    let response = match provider.as_str() {
+    let response = match provider {
         "groq" => {
             OpenAiCompatClient::new(GROQ_OPENAI_BASE_URL, &config.groq_api_key)
                 .generate(request)
@@ -43,11 +43,21 @@ pub async fn generate_text(
     };
 
     Ok(GeneratedText {
-        provider,
+        provider: provider.to_string(),
         model: model.to_string(),
         content: response.content,
         image_used: image_base64.is_some(),
     })
+}
+
+fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
+    match provider.trim().to_lowercase().as_str() {
+        "" | "ollama" => Ok("ollama"),
+        "groq" => Ok("groq"),
+        "openrouter" => Ok("openrouter"),
+        "openai_compat" => Ok("openai_compat"),
+        other => anyhow::bail!("unknown LLM_PROVIDER: {other}"),
+    }
 }
 
 fn model_for_provider<'a>(config: &'a Config, provider: &str) -> &'a str {
