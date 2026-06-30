@@ -110,6 +110,16 @@ struct MemberSnapshot {
     observed_at: DateTime<Utc>,
 }
 
+struct ChatUserMemberEvent<'a> {
+    chat_id: i64,
+    user_id: i64,
+    old_status: &'a str,
+    new_status: &'a str,
+    invite_link: Option<&'a str>,
+    via_chat_folder_invite_link: bool,
+    event_at: DateTime<Utc>,
+}
+
 struct UserPresentation {
     user_id: i64,
     display_name: String,
@@ -1047,6 +1057,41 @@ async fn build_user_stats_report(
     .fetch_optional(pool)
     .await?;
 
+    let user_data = sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            Option<i32>,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ),
+    >(
+        r#"
+        select to_char(first_seen_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI'),
+               to_char(last_seen_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI'),
+               first_message_id,
+               last_message_id,
+               message_count,
+               reply_count,
+               link_count,
+               media_count,
+               reply_to_channel_post_count,
+               reply_to_bot_count
+        from telegram_chat_users
+        where chat_id = $1 and telegram_user_id = $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
     let totals = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
         r#"
         select count(*)::bigint as messages,
@@ -1145,16 +1190,78 @@ async fn build_user_stats_report(
         .and_then(|(_, _, _, observed_at)| observed_at.as_deref())
         .unwrap_or("нет данных");
 
+    let (
+        first_seen_at,
+        last_seen_at,
+        first_message_id,
+        last_message_id,
+        messages,
+        replies,
+        links,
+        media,
+        replies_to_channel_posts,
+        replies_to_bot,
+    ) = user_data
+        .map(
+            |(
+                first_seen_at,
+                last_seen_at,
+                first_message_id,
+                last_message_id,
+                messages,
+                replies,
+                links,
+                media,
+                replies_to_channel_posts,
+                replies_to_bot,
+            )| {
+                (
+                    first_seen_at.unwrap_or_else(|| "нет данных".to_string()),
+                    last_seen_at.unwrap_or_else(|| "нет данных".to_string()),
+                    first_message_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "нет данных".to_string()),
+                    last_message_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "нет данных".to_string()),
+                    messages,
+                    replies,
+                    links,
+                    media,
+                    replies_to_channel_posts,
+                    replies_to_bot,
+                )
+            },
+        )
+        .unwrap_or_else(|| {
+            (
+                "нет данных".to_string(),
+                "нет данных".to_string(),
+                "нет данных".to_string(),
+                "нет данных".to_string(),
+                totals.0,
+                totals.1,
+                totals.2,
+                totals.3,
+                totals.4,
+                totals.5,
+            )
+        });
+
     Ok(format!(
-        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
+        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: <code>{}</code> (#<code>{}</code>)\nПоследнее сообщение: <code>{}</code> (#<code>{}</code>)\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
         user.linked_with_badges(),
         escape_html(observed_at),
-        totals.0,
-        totals.1,
-        totals.4,
-        totals.5,
-        totals.2,
-        totals.3,
+        escape_html(&first_seen_at),
+        escape_html(&first_message_id),
+        escape_html(&last_seen_at),
+        escape_html(&last_message_id),
+        messages,
+        replies,
+        replies_to_channel_posts,
+        replies_to_bot,
+        links,
+        media,
         totals.6,
         reactions_given,
         reactions_received,
@@ -1294,7 +1401,7 @@ async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<(
     // and raw_json makes production debugging much faster.
     let raw_json = serde_json::to_value(msg)?;
 
-    sqlx::query(
+    let (inserted,): (bool,) = sqlx::query_as(
         r#"
         insert into telegram_messages
             (
@@ -1320,6 +1427,7 @@ async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<(
             has_sticker = excluded.has_sticker,
             has_animation = excluded.has_animation,
             has_links = excluded.has_links
+        returning (xmax = 0) as inserted
         "#,
     )
     .bind(msg.chat.id.0)
@@ -1342,6 +1450,118 @@ async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<(
     .bind(msg.sticker().is_some())
     .bind(msg.animation().is_some())
     .bind(message_has_links(msg))
+    .fetch_one(pool)
+    .await?;
+
+    if inserted {
+        upsert_chat_user_activity(pool, msg, source_channel_id).await?;
+    }
+
+    Ok(())
+}
+
+async fn upsert_chat_user_activity(
+    pool: &PgPool,
+    msg: &Message,
+    source_channel_id: Option<i64>,
+) -> anyhow::Result<()> {
+    if source_channel_id.is_some() {
+        return Ok(());
+    }
+
+    let Some(user_id) = msg.from.as_ref().map(|user| user.id.0 as i64) else {
+        return Ok(());
+    };
+
+    let reply_to_message_id = msg.reply_to_message().map(|reply| reply.id.0);
+    let has_media = msg.photo().is_some()
+        || msg.video().is_some()
+        || msg.document().is_some()
+        || msg.audio().is_some()
+        || msg.voice().is_some()
+        || msg.sticker().is_some()
+        || msg.animation().is_some();
+
+    sqlx::query(
+        r#"
+        with flags as (
+            select
+                exists (
+                    select 1
+                    from post_comment_jobs
+                    where discussion_chat_id = $1
+                      and discussion_message_id = $5
+                ) as reply_to_channel_post,
+                exists (
+                    select 1
+                    from post_comment_jobs
+                    where discussion_chat_id = $1
+                      and bot_comment_message_id = $5
+                ) as reply_to_bot
+        )
+        insert into telegram_chat_users
+            (
+                chat_id, telegram_user_id, first_seen_at, last_seen_at,
+                first_message_id, last_message_id, message_count, reply_count,
+                link_count, media_count, reply_to_channel_post_count,
+                reply_to_bot_count, updated_at
+            )
+        select
+            $1,
+            $2,
+            $3,
+            $3,
+            $4,
+            $4,
+            1,
+            case when $5 is null then 0 else 1 end,
+            case when $6 then 1 else 0 end,
+            case when $7 then 1 else 0 end,
+            case when flags.reply_to_channel_post then 1 else 0 end,
+            case when flags.reply_to_bot then 1 else 0 end,
+            now()
+        from flags
+        on conflict (chat_id, telegram_user_id) do update set
+            first_seen_at = case
+                when telegram_chat_users.first_seen_at is null
+                  or excluded.first_seen_at < telegram_chat_users.first_seen_at
+                then excluded.first_seen_at
+                else telegram_chat_users.first_seen_at
+            end,
+            last_seen_at = case
+                when telegram_chat_users.last_seen_at is null
+                  or excluded.last_seen_at > telegram_chat_users.last_seen_at
+                then excluded.last_seen_at
+                else telegram_chat_users.last_seen_at
+            end,
+            first_message_id = case
+                when telegram_chat_users.first_seen_at is null
+                  or excluded.first_seen_at < telegram_chat_users.first_seen_at
+                then excluded.first_message_id
+                else telegram_chat_users.first_message_id
+            end,
+            last_message_id = case
+                when telegram_chat_users.last_seen_at is null
+                  or excluded.last_seen_at > telegram_chat_users.last_seen_at
+                then excluded.last_message_id
+                else telegram_chat_users.last_message_id
+            end,
+            message_count = telegram_chat_users.message_count + excluded.message_count,
+            reply_count = telegram_chat_users.reply_count + excluded.reply_count,
+            link_count = telegram_chat_users.link_count + excluded.link_count,
+            media_count = telegram_chat_users.media_count + excluded.media_count,
+            reply_to_channel_post_count = telegram_chat_users.reply_to_channel_post_count + excluded.reply_to_channel_post_count,
+            reply_to_bot_count = telegram_chat_users.reply_to_bot_count + excluded.reply_to_bot_count,
+            updated_at = now()
+        "#,
+    )
+    .bind(msg.chat.id.0)
+    .bind(user_id)
+    .bind(msg.date)
+    .bind(msg.id.0)
+    .bind(reply_to_message_id)
+    .bind(message_has_links(msg))
+    .bind(has_media)
     .execute(pool)
     .await?;
 
@@ -1511,11 +1731,28 @@ async fn save_chat_member_event(pool: &PgPool, member: &ChatMemberUpdated) -> an
         MemberSnapshot {
             chat_id: member.chat.id.0,
             user_id: member.new_chat_member.user.id.0 as i64,
-            status: new_status,
+            status: new_status.clone(),
             is_admin,
             is_present,
             raw_json,
             observed_at: member.date,
+        },
+    )
+    .await?;
+
+    update_chat_user_member_event(
+        pool,
+        ChatUserMemberEvent {
+            chat_id: member.chat.id.0,
+            user_id: member.new_chat_member.user.id.0 as i64,
+            old_status: &old_status,
+            new_status: &new_status,
+            invite_link: member
+                .invite_link
+                .as_ref()
+                .map(|link| link.invite_link.as_str()),
+            via_chat_folder_invite_link: member.via_chat_folder_invite_link,
+            event_at: member.date,
         },
     )
     .await?;
@@ -1595,6 +1832,89 @@ async fn upsert_member_snapshot(pool: &PgPool, snapshot: MemberSnapshot) -> anyh
     .bind(snapshot.is_present)
     .bind(snapshot.raw_json)
     .bind(snapshot.observed_at)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        insert into telegram_chat_users
+            (
+                chat_id, telegram_user_id, member_status, is_admin,
+                is_present, member_observed_at, updated_at
+            )
+        values ($1, $2, $3, $4, $5, $6, now())
+        on conflict (chat_id, telegram_user_id) do update set
+            member_status = excluded.member_status,
+            is_admin = excluded.is_admin,
+            is_present = excluded.is_present,
+            member_observed_at = excluded.member_observed_at,
+            updated_at = now()
+        "#,
+    )
+    .bind(snapshot.chat_id)
+    .bind(snapshot.user_id)
+    .bind(&snapshot.status)
+    .bind(snapshot.is_admin)
+    .bind(snapshot.is_present)
+    .bind(snapshot.observed_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn update_chat_user_member_event(
+    pool: &PgPool,
+    event: ChatUserMemberEvent<'_>,
+) -> anyhow::Result<()> {
+    let was_present = !matches!(event.old_status, "left" | "banned");
+    let is_present = !matches!(event.new_status, "left" | "banned");
+    let is_join = !was_present && is_present;
+    let is_leave = was_present && !is_present;
+
+    sqlx::query(
+        r#"
+        insert into telegram_chat_users
+            (
+                chat_id, telegram_user_id, first_joined_at, last_joined_at,
+                last_left_at, last_invite_link, via_chat_folder_invite_link,
+                updated_at
+            )
+        values (
+            $1,
+            $2,
+            case when $3 then $4 else null end,
+            case when $3 then $4 else null end,
+            case when $7 then $4 else null end,
+            $5,
+            $6,
+            now()
+        )
+        on conflict (chat_id, telegram_user_id) do update set
+            first_joined_at = case
+                when $3 and telegram_chat_users.first_joined_at is null then $4
+                else telegram_chat_users.first_joined_at
+            end,
+            last_joined_at = case
+                when $3 then $4
+                else telegram_chat_users.last_joined_at
+            end,
+            last_left_at = case
+                when $7 then $4
+                else telegram_chat_users.last_left_at
+            end,
+            last_invite_link = coalesce(excluded.last_invite_link, telegram_chat_users.last_invite_link),
+            via_chat_folder_invite_link = excluded.via_chat_folder_invite_link,
+            updated_at = now()
+        "#,
+    )
+    .bind(event.chat_id)
+    .bind(event.user_id)
+    .bind(is_join)
+    .bind(event.event_at)
+    .bind(event.invite_link)
+    .bind(event.via_chat_folder_invite_link)
+    .bind(is_leave)
     .execute(pool)
     .await?;
 

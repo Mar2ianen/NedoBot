@@ -128,6 +128,7 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
 - `post_memory_notes` - короткие конспекты прошлых новостей, keywords и осторожные ограничения для будущих комментариев.
 - `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium.
+- `telegram_chat_users` - явная расширяемая карточка пользователя в конкретном чате: первое/последнее сообщение, счётчики сообщений/реплаев/ссылок/медиа, статус в чате, админство, join/leave/invite-link поля.
 - `telegram_chat_member_snapshots` - последний известный статус пользователя в чате.
 - `telegram_chat_member_events` - входы, выходы и изменения статусов, если Telegram прислал update.
 - `telegram_message_reactions` - персональные изменения реакций.
@@ -174,7 +175,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 `/stats_day`, `/stats_week` и `/stats_month` показывают имена пользователей как скрытые ссылки на Telegram-профиль, без видимого ID. Рядом выводятся короткие бейджи: `админ`, `в чате`, `не в чате`, `бот` или `статус неизвестен`.
 
-`/userstats` принимает числовой Telegram ID или уже виденный ботом `@username`. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages` и `telegram_user_profiles`.
+`/userstats` принимает числовой Telegram ID или уже виденный ботом `@username`. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
 
 ## Prompt
 
@@ -237,6 +238,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 - `Топ пользователей` исключает служебного авто-форвард пользователя Telegram `777000`, ботов и сами посты канала.
 - Пользователь выводится как кликабельное имя с HTML-ссылкой `tg://user?id=...`; видимый ID не печатается, чтобы отчёт читался нормально в чате.
 - Статус берётся из `telegram_chat_member_snapshots`: Telegram `administrator/owner` показываются как админские статусы, `member` как `в чате`, `left/banned` как отсутствие в чате.
+- `/userstats` дополнительно показывает первое и последнее увиденное ботом сообщение пользователя по `telegram_chat_users`.
 - `Завлечение после коммента` считает среднее число некомандных сообщений после комментария бота за 5 и 30 минут, плюс среднее число уникальных людей за 30 минут.
 - `Комменты бота` сортируются по обсуждению за 30 минут, прямым реплаям и реакциям. Текст очищается от HTML/AI-маркеров и обрезается до короткого превью.
 
