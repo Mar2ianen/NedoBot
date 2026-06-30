@@ -1,5 +1,7 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
+pub mod telegram;
+
 pub async fn build_pool() -> anyhow::Result<PgPool> {
     let database_url = std::env::var("DATABASE_URL")?;
     let pool = PgPoolOptions::new()
