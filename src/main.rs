@@ -120,6 +120,8 @@ struct UserPresentation {
 }
 
 impl UserPresentation {
+    // Keep Telegram HTML user formatting in one place so stats reports do not
+    // expose raw IDs or drift into several slightly different formats.
     fn linked_name(&self) -> String {
         let visible = if self.display_name.trim().is_empty() {
             "пользователь"
@@ -198,6 +200,8 @@ impl StatsPeriod {
     }
 
     fn start_sql(self) -> &'static str {
+        // The chat day is editorial, not calendar: 05:00 Moscow time is the
+        // boundary for day/week/month reports.
         match self {
             Self::Day => {
                 "(date_trunc('day', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
@@ -1397,6 +1401,8 @@ async fn save_message_reaction(
     pool: &PgPool,
     reaction: &MessageReactionUpdated,
 ) -> anyhow::Result<()> {
+    // Telegram only sends these updates when bot permissions and allowed
+    // updates line up; old reactions cannot be backfilled through Bot API.
     if let Some(user) = reaction.user.as_ref() {
         upsert_user_profile(pool, user).await?;
     }
@@ -1522,6 +1528,8 @@ async fn refresh_known_member_snapshots(
     pool: &PgPool,
     config: &Config,
 ) -> anyhow::Result<()> {
+    // chat_member updates are sparse without admin rights, so startup refresh
+    // improves reports for already-seen users without blocking the bot.
     let users = sqlx::query_as::<_, (i64,)>(
         r#"
         select distinct user_id
