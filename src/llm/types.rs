@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+#[derive(Clone, Copy)]
 pub struct LlmRequest<'a> {
     pub model: &'a str,
     pub prompt: &'a str,
@@ -10,6 +11,13 @@ pub struct LlmRequest<'a> {
 
 pub struct LlmResponse {
     pub content: String,
+}
+
+pub struct GeneratedText {
+    pub provider: String,
+    pub model: String,
+    pub content: String,
+    pub image_used: bool,
 }
 
 #[async_trait]
