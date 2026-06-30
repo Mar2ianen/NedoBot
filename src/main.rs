@@ -24,6 +24,7 @@ use config::Config;
 use db::{build_pool, migrate};
 use features::first_comment::candidate::comment_candidate;
 use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+use features::first_comment::render::build_comment_html;
 use features::memory::service::{MemoryNote, load_relevant_memory_notes, remember_post};
 use features::stats::types::{ChatStatsSummary, StatsPeriod, UserPresentation, display_name};
 use llm::service::generate_text;
@@ -32,7 +33,7 @@ use telegram::command_handler::handle_command;
 use telegram::commands::Command;
 use telegram::entities::{forwarded_channel_post, message_has_links, message_text};
 use telegram::render::{escape_html, send_html, send_html_reply};
-use text::first_text_chars;
+use text::{first_text_chars, normalize_ai_markers, strip_links};
 
 struct MemberSnapshot {
     chat_id: i64,
@@ -902,29 +903,6 @@ async fn resolve_user_id(pool: &PgPool, target: &str) -> anyhow::Result<Option<i
     Ok(row.map(|(user_id,)| user_id))
 }
 
-pub(crate) fn build_comment_html(llm_body: &str, config: &Config) -> String {
-    // The model is instructed to use {CHAT_LINK}; code owns the actual HTML
-    // anchor so the URL is stable and link preview can stay disabled.
-    let clean_body = normalize_ai_markers(&strip_links(llm_body))
-        .trim()
-        .to_string();
-
-    if clean_body.is_empty() {
-        return String::new();
-    }
-
-    let body = render_chat_link_placeholder(&clean_body, config);
-
-    match pick_comment_emoji(llm_body, config) {
-        Some(custom_emoji_id) => format!(
-            r#"<tg-emoji emoji-id="{}">😎</tg-emoji> {}"#,
-            escape_html(custom_emoji_id),
-            body
-        ),
-        None => body,
-    }
-}
-
 pub(crate) async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
     let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
@@ -1609,82 +1587,4 @@ fn strip_html_tags(text: &str) -> String {
     }
 
     result
-}
-
-fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
-    let lower = text.to_lowercase();
-    // Brand emoji are custom stickers from the channel pack. Prefer exact
-    // matches over the generic channel logo when the post topic is obvious.
-    if lower.contains("radeon") || lower.contains("видеокарт") {
-        return config
-            .radeon_custom_emoji_id
-            .as_deref()
-            .or(config.amd_custom_emoji_id.as_deref())
-            .or(config.comment_custom_emoji_id.as_deref());
-    }
-
-    if lower.contains("ryzen") {
-        return config
-            .ryzen_custom_emoji_id
-            .as_deref()
-            .or(config.amd_custom_emoji_id.as_deref())
-            .or(config.comment_custom_emoji_id.as_deref());
-    }
-
-    if lower.contains("amd") {
-        return config
-            .amd_custom_emoji_id
-            .as_deref()
-            .or(config.comment_custom_emoji_id.as_deref());
-    }
-
-    let is_tech = lower.contains("amd")
-        || lower.contains("windows")
-        || lower.contains("драйвер")
-        || lower.contains("fps")
-        || lower.contains("пк")
-        || lower.contains("видеокарт");
-
-    if is_tech {
-        config
-            .tech_custom_emoji_id
-            .as_deref()
-            .or(config.comment_custom_emoji_id.as_deref())
-    } else {
-        config.comment_custom_emoji_id.as_deref()
-    }
-}
-
-fn normalize_ai_markers(text: &str) -> String {
-    text.replace(['—', '–'], "-")
-        .replace(['«', '»'], "\"")
-        .replace("Вот вариант:", "")
-        .replace("Вариант:", "")
-        .trim()
-        .to_string()
-}
-
-fn render_chat_link_placeholder(text: &str, config: &Config) -> String {
-    let link = format!(
-        r#"<a href="{}">{}</a>"#,
-        escape_html(&config.chat_invite_url),
-        escape_html(&config.chat_invite_label),
-    );
-
-    if text.contains("{CHAT_LINK}") {
-        escape_html(text).replace("{CHAT_LINK}", &link)
-    } else {
-        format!(
-            r#"{} <a href="{}">в чате</a>"#,
-            escape_html(text),
-            escape_html(&config.chat_invite_url)
-        )
-    }
-}
-
-fn strip_links(text: &str) -> String {
-    text.split_whitespace()
-        .filter(|word| !word.starts_with("http://") && !word.starts_with("https://"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

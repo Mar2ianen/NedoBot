@@ -1,13 +1,14 @@
 use teloxide::{prelude::*, utils::command::BotCommands};
 
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::types::StatsPeriod;
 use crate::state::AppState;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::render::send_html;
-use crate::{build_comment_html, save_telegram_message, send_chat_stats, send_user_stats};
+use crate::{save_telegram_message, send_chat_stats, send_user_stats};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
