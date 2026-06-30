@@ -11,6 +11,9 @@
   <a href="docs/TECHNICAL.md">
     <img alt="Technical docs" src="https://img.shields.io/badge/docs-technical-8A2BE2?style=for-the-badge&logo=readthedocs&logoColor=white">
   </a>
+  <a href="LICENSE">
+    <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-F5C542?style=for-the-badge">
+  </a>
   <img alt="Project status" src="https://img.shields.io/badge/status-live_mvp-00A67E?style=for-the-badge">
 </p>
 
@@ -30,6 +33,8 @@
   <a href="prompts/first_comment.md">Prompt первого комментария</a>
   ·
   <a href="prompts/tech_rag.md">Tech RAG</a>
+  ·
+  <a href="LICENSE">MIT</a>
 </p>
 
 </div>
@@ -107,27 +112,19 @@
 <details>
 <summary>Показать команды</summary>
 
-### Для чата
-
 | Команда | Что делает |
 | --- | --- |
-| `/help` | Показывает меню команд, которое teloxide собирает из описаний в коде. |
-| `/ping` | Быстрый health-check: бот отвечает `pong`. |
-| `/db` | Проверяет подключение к PostgreSQL через простой `select 1` и отвечает `db ok`. |
-| `/memory` | Показывает 5 последних заметок памяти: заголовок, краткий конспект и keywords. |
+| `/help` | Показывает меню доступных команд. |
+| `/ping` | Быстро проверяет, что бот жив. |
+| `/memory` | Показывает последние заметки памяти: заголовок, краткий конспект и keywords. |
 | `/stats_day` | Статистика за текущий день чата, где день начинается в 05:00 по Москве. |
 | `/stats_week` | Статистика за текущую неделю с понедельника 05:00 по Москве. |
 | `/stats_month` | Статистика за текущий месяц с 1 числа 05:00 по Москве. |
 | `/userstats <id\|@username>` | Карточка пользователя: статус, первые/последние сообщения, активные дни, реплаи, ссылки, медиа и реакции. Работает по числовому ID или уже виденному ботом username. |
 
-### Служебное
-
-| Команда | Что делает |
-| --- | --- |
-| `/emojiids` | Достаёт `custom_emoji_id` из premium/custom emoji entities в сообщении с командой. Нужно для настройки тематических emoji. |
-| `/format_test <текст поста>` | Проверяет, прошёл бы пост фильтр обычной новости, чистит служебный хвост и показывает, как будет собран HTML-комментарий. |
-
 Статистические отчёты показывают пользователей человекочитаемо: имя кликабельно через Telegram-ссылку, а сырой ID не торчит в тексте. Рядом выводятся короткие бейджи вроде `админ`, `в чате`, `не в чате`, `бот` или `статус неизвестен`.
+
+Служебные команды настройки и диагностики не вынесены в лендинг; они описаны в технической документации.
 
 </details>
 
@@ -136,6 +133,10 @@
 Rust, teloxide, PostgreSQL, LLM/Vision, prompt-файлы, память, RAG и деплой на VPS.
 
 README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
+
+## Лицензия
+
+MIT. См. [`LICENSE`](LICENSE).
 
 ## Принцип
 
