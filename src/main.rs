@@ -8,8 +8,8 @@ use teloxide::{
     prelude::*,
     requests::RequesterExt,
     types::{
-        ChatMemberKind, ChatMemberUpdated, MessageEntityKind, MessageId, MessageOrigin,
-        MessageReactionCountUpdated, MessageReactionUpdated, ParseMode, User,
+        ChatMemberKind, ChatMemberUpdated, MessageId, MessageReactionCountUpdated,
+        MessageReactionUpdated, ParseMode, User,
     },
     utils::command::BotCommands,
 };
@@ -20,6 +20,9 @@ mod telegram;
 
 use config::Config;
 use state::AppState;
+use telegram::entities::{
+    custom_emoji_ids, forwarded_channel_post, message_has_links, message_text,
+};
 use telegram::render::{escape_html, send_html, send_html_reply};
 
 #[derive(BotCommands, Clone)]
@@ -1242,18 +1245,6 @@ async fn resolve_user_id(pool: &PgPool, target: &str) -> anyhow::Result<Option<i
     Ok(row.map(|(user_id,)| user_id))
 }
 
-fn custom_emoji_ids(msg: &Message) -> Vec<String> {
-    msg.entities()
-        .into_iter()
-        .flatten()
-        .chain(msg.caption_entities().into_iter().flatten())
-        .filter_map(|entity| match &entity.kind {
-            MessageEntityKind::CustomEmoji { custom_emoji_id } => Some(custom_emoji_id.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn build_comment_html(llm_body: &str, config: &Config) -> String {
     // The model is instructed to use {CHAT_LINK}; code owns the actual HTML
     // anchor so the URL is stable and link preview can stay disabled.
@@ -1275,19 +1266,6 @@ fn build_comment_html(llm_body: &str, config: &Config) -> String {
         ),
         None => body,
     }
-}
-
-fn forwarded_channel_post(msg: &Message) -> Option<(i64, MessageId)> {
-    match msg.forward_origin()? {
-        MessageOrigin::Channel {
-            chat, message_id, ..
-        } => Some((chat.id.0, *message_id)),
-        _ => None,
-    }
-}
-
-fn message_text(msg: &Message) -> Option<&str> {
-    msg.text().or_else(|| msg.caption())
 }
 
 async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
@@ -1509,25 +1487,6 @@ async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
-}
-
-fn message_has_links(msg: &Message) -> bool {
-    let text_has_links = message_text(msg)
-        .map(|text| text.contains("http://") || text.contains("https://") || text.contains("t.me/"))
-        .unwrap_or(false);
-
-    text_has_links
-        || msg
-            .entities()
-            .into_iter()
-            .flatten()
-            .chain(msg.caption_entities().into_iter().flatten())
-            .any(|entity| {
-                matches!(
-                    entity.kind,
-                    MessageEntityKind::Url | MessageEntityKind::TextLink { .. }
-                )
-            })
 }
 
 async fn save_message_reaction(
