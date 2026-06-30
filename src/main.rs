@@ -16,7 +16,7 @@ use teloxide::{
 };
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase")]
+#[command(rename_rule = "snake_case")]
 enum Command {
     #[command(description = "показать это меню")]
     Help,
@@ -36,7 +36,10 @@ enum Command {
     StatsWeek,
     #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК")]
     StatsMonth,
-    #[command(description = "статистика пользователя: /userstats <id|@username>")]
+    #[command(
+        rename = "userstats",
+        description = "статистика пользователя: /userstats <id|@username>"
+    )]
     UserStats(String),
 }
 
