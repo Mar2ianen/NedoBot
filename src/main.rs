@@ -20,6 +20,7 @@ mod telegram;
 
 use config::Config;
 use llm::ollama::OllamaClient;
+use llm::openai_compat::OpenAiCompatClient;
 use llm::types::{LlmClient, LlmRequest};
 use state::AppState;
 use telegram::entities::{
@@ -446,8 +447,7 @@ async fn maybe_comment_post(
         &memory_notes,
         &recent_comments,
     );
-    let llm_body =
-        generate_with_ollama(config, &prompt, image_base64.as_deref(), 0.45, 140).await?;
+    let llm_body = generate_with_llm(config, &prompt, image_base64.as_deref(), 0.45, 140).await?;
     let final_html = build_comment_html(&llm_body, config);
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
@@ -1920,21 +1920,42 @@ fn render_recent_comment_context(recent_comments: &[String]) -> String {
         .join("\n")
 }
 
-async fn generate_with_ollama(
+async fn generate_with_llm(
     config: &Config,
     prompt: &str,
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<String> {
-    let response = OllamaClient::new(config)
-        .generate(LlmRequest {
-            prompt,
-            image_base64,
-            temperature,
-            num_predict,
-        })
-        .await?;
+    let provider = config.llm_provider.trim().to_lowercase();
+    let model = match provider.as_str() {
+        "openai_compat" => config
+            .openai_compat_model
+            .as_deref()
+            .unwrap_or(&config.vision_model),
+        _ => &config.vision_model,
+    };
+    let request = LlmRequest {
+        model,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+    };
+    let response = match provider.as_str() {
+        "openai_compat" => OpenAiCompatClient::new(config).generate(request).await?,
+        _ => {
+            OllamaClient::new(config)
+                .generate(LlmRequest {
+                    model,
+                    prompt,
+                    image_base64,
+                    temperature,
+                    num_predict,
+                })
+                .await?
+        }
+    };
 
     Ok(response.content)
 }
@@ -2028,7 +2049,7 @@ async fn remember_post(
     post_text: &str,
 ) -> anyhow::Result<()> {
     let note_prompt = build_memory_note_prompt(post_text);
-    let raw_note = generate_with_ollama(config, &note_prompt, None, 0.2, 220).await?;
+    let raw_note = generate_with_llm(config, &note_prompt, None, 0.2, 220).await?;
     let mut note = parse_memory_note(&raw_note, post_text);
     note.keywords = merge_keywords(note.keywords, extract_keywords(post_text));
 

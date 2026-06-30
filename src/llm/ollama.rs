@@ -19,7 +19,7 @@ impl LlmClient for OllamaClient<'_> {
     async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
         let images = request.image_base64.into_iter().collect::<Vec<_>>();
         let body = OllamaChatRequest {
-            model: &self.config.vision_model,
+            model: request.model,
             messages: vec![OllamaMessage {
                 role: "user",
                 content: request.prompt,
