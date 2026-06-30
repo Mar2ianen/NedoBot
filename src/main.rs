@@ -30,9 +30,8 @@ use features::stats::types::{ChatStatsSummary, StatsPeriod, UserPresentation, di
 use llm::service::generate_text;
 use state::AppState;
 use telegram::commands::Command;
-use telegram::entities::{
-    custom_emoji_ids, forwarded_channel_post, message_has_links, message_text,
-};
+use telegram::custom_emoji::send_custom_emoji_ids;
+use telegram::entities::{forwarded_channel_post, message_has_links, message_text};
 use telegram::render::{escape_html, send_html, send_html_reply};
 use text::first_text_chars;
 
@@ -348,37 +347,6 @@ async fn send_owner_preview(
     if let Err(err) = send_html(bot, ChatId(owner_id), preview).await {
         tracing::warn!(%err, "failed to send owner preview");
     }
-}
-
-async fn send_custom_emoji_ids(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
-) -> ResponseResult<()> {
-    let ids = custom_emoji_ids(msg);
-    if ids.is_empty() {
-        send_html(
-            bot,
-            msg.chat.id,
-            "В этом сообщении нет premium/custom emoji entities.",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let lines = ids
-        .iter()
-        .map(|id| format!("<code>{}</code>", escape_html(id)))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    send_html(
-        bot,
-        msg.chat.id,
-        format!("Нашёл custom_emoji_id:\n{}", lines),
-    )
-    .await?;
-
-    Ok(())
 }
 
 async fn send_memory_notes(
