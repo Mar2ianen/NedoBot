@@ -795,15 +795,19 @@ async fn top_users_for_period(
         .into_iter()
         .map(
             |(user_id, name, messages, replies, links, media, status, is_admin)| {
-                let admin = if is_admin { ", admin" } else { "" };
+                let admin = if is_admin {
+                    ", права админа"
+                } else {
+                    ""
+                };
                 format!(
-                    "{}: <b>{}</b> соо, {} reply, {} links, {} media, <code>{}</code>{}",
-                    escape_html(&name),
+                    "{}: <b>{}</b> соо, {} реплаев, {} ссылок, {} медиа, {}{}",
+                    user_link(user_id, &name),
                     messages,
                     replies,
                     links,
                     media,
-                    escape_html(&format!("{status}:{user_id}")),
+                    human_member_status(&status),
                     admin
                 )
             },
@@ -856,17 +860,53 @@ async fn top_bot_comments_for_period(
         .into_iter()
         .map(
             |(source_message_id, response, msg_30m, direct_replies, reactions)| {
+                let clean_response = human_comment_preview(&response);
                 format!(
-                    "#{}: {} соо/30м, {} replies, {} reactions - {}",
+                    "#{}: {} соо за 30м, {} реплаев, {} реакций - {}",
                     source_message_id,
                     msg_30m,
                     direct_replies,
                     reactions,
-                    escape_html(&first_text_chars(&response, 90))
+                    escape_html(&first_text_chars(&clean_response, 110))
                 )
             },
         )
         .collect())
+}
+
+fn user_link(user_id: i64, display_name: &str) -> String {
+    let clean_name = display_name.trim();
+    let visible = if clean_name.is_empty() {
+        "пользователь"
+    } else {
+        clean_name
+    };
+
+    format!(
+        r#"<a href="tg://user?id={}">{}</a>"#,
+        user_id,
+        escape_html(visible)
+    )
+}
+
+fn human_member_status(status: &str) -> &'static str {
+    match status {
+        "administrator" => "админ",
+        "owner" => "владелец",
+        "member" => "в чате",
+        "restricted" => "ограничен",
+        "left" => "не в чате",
+        "banned" => "забанен",
+        _ => "статус неизвестен",
+    }
+}
+
+fn human_comment_preview(text: &str) -> String {
+    normalize_ai_markers(text)
+        .replace("{CHAT_LINK}", "чат")
+        .replace("  ", " ")
+        .trim()
+        .to_string()
 }
 
 async fn build_user_stats_report(
