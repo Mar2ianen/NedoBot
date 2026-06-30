@@ -24,38 +24,11 @@ use features::first_comment::candidate::comment_candidate;
 use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use llm::service::generate_text;
 use state::AppState;
+use telegram::commands::Command;
 use telegram::entities::{
     custom_emoji_ids, forwarded_channel_post, message_has_links, message_text,
 };
 use telegram::render::{escape_html, send_html, send_html_reply};
-
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "snake_case")]
-enum Command {
-    #[command(description = "показать это меню")]
-    Help,
-    #[command(description = "проверить, что бот жив")]
-    Ping,
-    #[command(description = "проверить подключение к базе")]
-    Db,
-    #[command(description = "показать custom_emoji_id из сообщения")]
-    EmojiIds,
-    #[command(description = "проверить формат первого комментария")]
-    FormatTest(String),
-    #[command(description = "показать последние заметки памяти")]
-    Memory,
-    #[command(description = "статистика за текущий день с 05:00 МСК")]
-    StatsDay,
-    #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК")]
-    StatsWeek,
-    #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК")]
-    StatsMonth,
-    #[command(
-        rename = "userstats",
-        description = "статистика пользователя: /userstats <id|@username>"
-    )]
-    UserStats(String),
-}
 
 #[derive(Debug)]
 struct MemoryNote {
