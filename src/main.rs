@@ -8,18 +8,19 @@ use teloxide::{
     prelude::*,
     requests::RequesterExt,
     types::{
-        ChatMemberKind, ChatMemberUpdated, LinkPreviewOptions, MessageEntityKind, MessageId,
-        MessageOrigin, MessageReactionCountUpdated, MessageReactionUpdated, ParseMode,
-        ReplyParameters, User,
+        ChatMemberKind, ChatMemberUpdated, MessageEntityKind, MessageId, MessageOrigin,
+        MessageReactionCountUpdated, MessageReactionUpdated, ParseMode, User,
     },
     utils::command::BotCommands,
 };
 
 mod config;
 mod state;
+mod telegram;
 
 use config::Config;
 use state::AppState;
+use telegram::render::{escape_html, send_html, send_html_reply};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "snake_case")]
@@ -1274,40 +1275,6 @@ fn build_comment_html(llm_body: &str, config: &Config) -> String {
         ),
         None => body,
     }
-}
-
-async fn send_html(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    chat_id: ChatId,
-    text: impl Into<String>,
-) -> ResponseResult<Message> {
-    bot.send_message(chat_id, text.into())
-        .link_preview_options(LinkPreviewOptions {
-            is_disabled: true,
-            url: None,
-            prefer_small_media: false,
-            prefer_large_media: false,
-            show_above_text: false,
-        })
-        .await
-}
-
-async fn send_html_reply(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    chat_id: ChatId,
-    reply_to_message_id: MessageId,
-    text: impl Into<String>,
-) -> ResponseResult<Message> {
-    bot.send_message(chat_id, text.into())
-        .reply_parameters(ReplyParameters::new(reply_to_message_id).allow_sending_without_reply())
-        .link_preview_options(LinkPreviewOptions {
-            is_disabled: true,
-            url: None,
-            prefer_small_media: false,
-            prefer_large_media: false,
-            show_above_text: false,
-        })
-        .await
 }
 
 fn forwarded_channel_post(msg: &Message) -> Option<(i64, MessageId)> {
@@ -2598,11 +2565,4 @@ fn strip_links(text: &str) -> String {
         .filter(|word| !word.starts_with("http://") && !word.starts_with("https://"))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
