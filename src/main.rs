@@ -110,6 +110,84 @@ struct MemberSnapshot {
     observed_at: DateTime<Utc>,
 }
 
+struct UserPresentation {
+    user_id: i64,
+    display_name: String,
+    is_bot: bool,
+    status: Option<String>,
+    is_admin: bool,
+    is_present: Option<bool>,
+}
+
+impl UserPresentation {
+    fn linked_name(&self) -> String {
+        let visible = if self.display_name.trim().is_empty() {
+            "пользователь"
+        } else {
+            self.display_name.trim()
+        };
+
+        format!(
+            r#"<a href="tg://user?id={}">{}</a>"#,
+            self.user_id,
+            escape_html(visible)
+        )
+    }
+
+    fn badges(&self) -> String {
+        let mut parts = Vec::new();
+
+        if self.is_bot {
+            parts.push("бот");
+        }
+
+        if self.is_admin {
+            parts.push("админ");
+        } else if let Some(status) = self.status.as_deref() {
+            parts.push(human_member_status(status));
+        } else if self.is_present == Some(true) {
+            parts.push("в чате");
+        } else if self.is_present == Some(false) {
+            parts.push("не в чате");
+        }
+
+        if parts.is_empty() {
+            "статус неизвестен".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    fn linked_with_badges(&self) -> String {
+        format!("{} ({})", self.linked_name(), self.badges())
+    }
+}
+
+fn display_name(
+    username: Option<&str>,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+    fallback_user_id: i64,
+) -> String {
+    if let Some(username) = username.filter(|value| !value.trim().is_empty()) {
+        return format!("@{username}");
+    }
+
+    let full_name = format!(
+        "{} {}",
+        first_name.unwrap_or_default(),
+        last_name.unwrap_or_default()
+    )
+    .trim()
+    .to_string();
+
+    if full_name.is_empty() {
+        fallback_user_id.to_string()
+    } else {
+        full_name
+    }
+}
+
 impl StatsPeriod {
     fn title(self) -> &'static str {
         match self {
@@ -762,13 +840,16 @@ async fn top_users_for_period(
             select {} as start_at, now() as end_at
         )
         select m.user_id,
-               coalesce('@' || p.username, nullif(trim(coalesce(p.first_name, '') || ' ' || coalesce(p.last_name, '')), ''), m.user_id::text) as name,
+               p.username,
+               p.first_name,
+               p.last_name,
                count(*)::bigint as messages,
                count(*) filter (where m.reply_to_message_id is not null)::bigint as replies,
                count(*) filter (where m.has_links)::bigint as links,
                count(*) filter (where m.has_photo or m.has_video or m.has_document or m.has_audio or m.has_voice or m.has_sticker or m.has_animation)::bigint as media,
                coalesce(s.status, 'unknown') as status,
-               coalesce(s.is_admin, false) as is_admin
+               coalesce(s.is_admin, false) as is_admin,
+               coalesce(s.is_present, false) as is_present
         from telegram_messages m
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
@@ -779,36 +860,69 @@ async fn top_users_for_period(
           and coalesce(p.is_bot, false) = false
           and m.created_at >= (select start_at from bounds)
           and m.created_at < (select end_at from bounds)
-        group by m.user_id, p.username, p.first_name, p.last_name, s.status, s.is_admin
+        group by m.user_id, p.username, p.first_name, p.last_name, s.status, s.is_admin, s.is_present
         order by messages desc
         limit 8
         "#,
         period.start_sql()
     );
 
-    let rows = sqlx::query_as::<_, (i64, String, i64, i64, i64, i64, String, bool)>(&sql)
-        .bind(config.discussion_chat_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            bool,
+            bool,
+        ),
+    >(&sql)
+    .bind(config.discussion_chat_id)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .into_iter()
         .map(
-            |(user_id, name, messages, replies, links, media, status, is_admin)| {
-                let admin = if is_admin {
-                    ", права админа"
-                } else {
-                    ""
+            |(
+                user_id,
+                username,
+                first_name,
+                last_name,
+                messages,
+                replies,
+                links,
+                media,
+                status,
+                is_admin,
+                is_present,
+            )| {
+                let user = UserPresentation {
+                    user_id,
+                    display_name: display_name(
+                        username.as_deref(),
+                        first_name.as_deref(),
+                        last_name.as_deref(),
+                        user_id,
+                    ),
+                    is_bot: false,
+                    status: Some(status),
+                    is_admin,
+                    is_present: Some(is_present),
                 };
                 format!(
-                    "{}: <b>{}</b> соо, {} реплаев, {} ссылок, {} медиа, {}{}",
-                    user_link(user_id, &name),
+                    "{}: <b>{}</b> соо, {} реплаев, {} ссылок, {} медиа",
+                    user.linked_with_badges(),
                     messages,
                     replies,
                     links,
-                    media,
-                    human_member_status(&status),
-                    admin
+                    media
                 )
             },
         )
@@ -872,21 +986,6 @@ async fn top_bot_comments_for_period(
             },
         )
         .collect())
-}
-
-fn user_link(user_id: i64, display_name: &str) -> String {
-    let clean_name = display_name.trim();
-    let visible = if clean_name.is_empty() {
-        "пользователь"
-    } else {
-        clean_name
-    };
-
-    format!(
-        r#"<a href="tg://user?id={}">{}</a>"#,
-        user_id,
-        escape_html(visible)
-    )
 }
 
 fn human_member_status(status: &str) -> &'static str {
@@ -989,51 +1088,63 @@ async fn build_user_stats_report(
     .await?
     .0;
 
-    let name = profile
-        .as_ref()
-        .map(|(username, first_name, last_name, is_bot)| {
-            let display = username
-                .as_ref()
-                .map(|username| format!("@{username}"))
-                .unwrap_or_else(|| {
-                    format!(
-                        "{} {}",
-                        first_name.clone().unwrap_or_default(),
-                        last_name.clone().unwrap_or_default()
-                    )
-                    .trim()
-                    .to_string()
-                });
-            if *is_bot {
-                format!("{display} (bot)")
-            } else {
-                display
-            }
-        })
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| user_id.to_string());
+    let user = match (profile.as_ref(), member.as_ref()) {
+        (
+            Some((username, first_name, last_name, is_bot)),
+            Some((status, is_admin, is_present, _)),
+        ) => UserPresentation {
+            user_id,
+            display_name: display_name(
+                username.as_deref(),
+                first_name.as_deref(),
+                last_name.as_deref(),
+                user_id,
+            ),
+            is_bot: *is_bot,
+            status: Some(status.clone()),
+            is_admin: *is_admin,
+            is_present: Some(*is_present),
+        },
+        (Some((username, first_name, last_name, is_bot)), None) => UserPresentation {
+            user_id,
+            display_name: display_name(
+                username.as_deref(),
+                first_name.as_deref(),
+                last_name.as_deref(),
+                user_id,
+            ),
+            is_bot: *is_bot,
+            status: None,
+            is_admin: false,
+            is_present: None,
+        },
+        (None, Some((status, is_admin, is_present, _))) => UserPresentation {
+            user_id,
+            display_name: user_id.to_string(),
+            is_bot: false,
+            status: Some(status.clone()),
+            is_admin: *is_admin,
+            is_present: Some(*is_present),
+        },
+        (None, None) => UserPresentation {
+            user_id,
+            display_name: user_id.to_string(),
+            is_bot: false,
+            status: None,
+            is_admin: false,
+            is_present: None,
+        },
+    };
 
-    let member_line = member
-        .map(|(status, is_admin, is_present, observed_at)| {
-            format!(
-                "{}{}{}, seen {}",
-                status,
-                if is_admin { ", admin" } else { "" },
-                if is_present {
-                    ", in chat"
-                } else {
-                    ", not present"
-                },
-                observed_at.unwrap_or_else(|| "unknown".to_string())
-            )
-        })
-        .unwrap_or_else(|| "membership unknown".to_string());
+    let observed_at = member
+        .as_ref()
+        .and_then(|(_, _, _, observed_at)| observed_at.as_deref())
+        .unwrap_or("нет данных");
 
     Ok(format!(
-        "<b>Статистика пользователя</b>\n{} <code>{}</code>\n{}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
-        escape_html(&name),
-        user_id,
-        escape_html(&member_line),
+        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
+        user.linked_with_badges(),
+        escape_html(observed_at),
         totals.0,
         totals.1,
         totals.4,
