@@ -22,9 +22,7 @@ mod telegram;
 use config::Config;
 use features::first_comment::candidate::comment_candidate;
 use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
-use llm::ollama::OllamaClient;
-use llm::openai_compat::OpenAiCompatClient;
-use llm::types::{GeneratedText, LlmClient, LlmRequest};
+use llm::service::generate_text;
 use state::AppState;
 use telegram::entities::{
     custom_emoji_ids, forwarded_channel_post, message_has_links, message_text,
@@ -444,7 +442,7 @@ async fn maybe_comment_post(
         &memory_notes,
         &recent_comments,
     );
-    let generation = generate_with_llm(
+    let generation = generate_text(
         config,
         &prompt,
         image_base64.as_deref(),
@@ -1905,84 +1903,6 @@ fn render_recent_comment_context(recent_comments: &[String]) -> String {
         .join("\n")
 }
 
-async fn generate_with_llm(
-    config: &Config,
-    prompt: &str,
-    image_base64: Option<&str>,
-    temperature: f32,
-    num_predict: u32,
-) -> anyhow::Result<GeneratedText> {
-    let provider = config.llm_provider.trim().to_lowercase();
-    let model = match provider.as_str() {
-        "groq" | "openrouter" => config.llm_model.as_deref().unwrap_or(&config.vision_model),
-        "openai_compat" => config
-            .openai_compat_model
-            .as_deref()
-            .or(config.llm_model.as_deref())
-            .unwrap_or(&config.vision_model),
-        _ => &config.vision_model,
-    };
-    let supports_images = llm_supports_images(config, &provider, model);
-    let image_base64 = image_base64.filter(|_| supports_images);
-    let request = LlmRequest {
-        model,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-    };
-    let response = match provider.as_str() {
-        "groq" => {
-            OpenAiCompatClient::new("https://api.groq.com/openai/v1", &config.groq_api_key)
-                .generate(request)
-                .await?
-        }
-        "openrouter" => {
-            OpenAiCompatClient::new("https://openrouter.ai/api/v1", &config.openrouter_api_key)
-                .generate(request)
-                .await?
-        }
-        "openai_compat" => {
-            OpenAiCompatClient::from_config(config)
-                .generate(request)
-                .await?
-        }
-        _ => {
-            OllamaClient::new(config)
-                .generate(LlmRequest {
-                    model,
-                    prompt,
-                    image_base64,
-                    temperature,
-                    num_predict,
-                })
-                .await?
-        }
-    };
-
-    Ok(GeneratedText {
-        provider,
-        model: model.to_string(),
-        content: response.content,
-        image_used: image_base64.is_some(),
-    })
-}
-
-fn llm_supports_images(config: &Config, provider: &str, model: &str) -> bool {
-    if let Some(supports_images) = config.llm_supports_images {
-        return supports_images;
-    }
-
-    let model = model.to_lowercase();
-    matches!(provider, "ollama")
-        || model.contains("vision")
-        || model.contains("llama-4")
-        || model.contains("gpt-4o")
-        || model.contains("gemma4")
-        || model.contains("gemini")
-        || model.contains("pixtral")
-}
-
 async fn load_relevant_memory_notes(
     pool: &PgPool,
     post_text: &str,
@@ -2072,7 +1992,7 @@ async fn remember_post(
     post_text: &str,
 ) -> anyhow::Result<()> {
     let note_prompt = build_memory_note_prompt(post_text);
-    let raw_note = generate_with_llm(
+    let raw_note = generate_text(
         config,
         &note_prompt,
         None,
