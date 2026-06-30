@@ -2,7 +2,7 @@
 
 Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 
-Текущая MVP-задача: бот ждёт авто-форвард поста из канала в привязанном чате, проверяет что это обычный пост с подписью `Не теряем связь`, вырезает VK/MAX-хвост, отдаёт текст и фото в Ollama Gemma, затем отвечает первым комментарием под постом.
+Текущая MVP-задача: бот ждёт авто-форвард поста из канала в привязанном чате, проверяет что это обычный пост с подписью `Не теряем связь`, вырезает VK/MAX-хвост, отдаёт текст, фото, RAG, память и последние ответы в Ollama Gemma, затем отвечает первым комментарием под постом.
 
 ## Что Уже Работает
 
@@ -17,6 +17,8 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Подставляет premium/custom emoji по тематике, включая канал/AMD/Radeon/Ryzen.
 - Пишет задачи и результаты генерации в Postgres.
 - Автоматически конспектирует обычные новости в память и подмешивает релевантные заметки в следующие генерации.
+- Объединяет похожие заметки памяти, чтобы не плодить дубли.
+- Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
 
 ## Важный Нюанс Telegram
 
@@ -171,8 +173,36 @@ RAG не предназначен для пересказа новости: по
 - после отправки первого комментария бот просит LLM сделать короткую заметку по посту;
 - заметка сохраняется в `post_memory_notes` с keywords;
 - если уже есть похожая заметка, бот обновляет её вместо создания дубля;
+- похожесть сейчас считается по пересечению keywords, минимум 3 общих ключа;
+- короткие ключи вроде `sam` матчятся только как отдельное слово, чтобы не склеивать `SAM` и `Samsung`;
 - перед новой генерацией бот достаёт до 5 похожих заметок по пересечению keywords;
 - память используется только как контекст, если она релевантна текущему посту.
+
+Антиповтор CTA:
+
+- перед генерацией бот достаёт последние 6 ответов из `llm_generations`;
+- prompt просит не повторять их начало, глаголы CTA и общий рисунок фразы;
+- это снижает повторы вроде `залетайте`, `заходите`, `сравним`, `обсудим`.
+
+## Метрики И Отладка
+
+Сводка по сообщениям:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select count(*) as messages, count(*) filter (where is_automatic_forward) as auto_forwards, count(*) filter (where source_channel_id is not null) as from_channel, min(created_at) as first_seen, max(created_at) as last_seen from telegram_messages;\""
+```
+
+Скорость отправки комментариев:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select source_message_id, round(extract(epoch from updated_at - created_at)::numeric, 2) as send_pipeline_sec, status, bot_comment_message_id from post_comment_jobs order by source_message_id desc limit 20;\""
+```
+
+Реакция людей за 30 минут после комментария:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"with metrics as (select j.source_message_id, count(m.*) filter (where m.created_at <= j.created_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as msg_5m, count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as msg_30m, count(distinct m.user_id) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m from post_comment_jobs j left join telegram_messages m on m.chat_id = j.discussion_chat_id and m.created_at > j.created_at and m.created_at <= j.created_at + interval '30 minutes' and m.message_id <> j.bot_comment_message_id and m.user_id is distinct from 8907803505 and m.source_channel_id is null group by j.source_message_id, j.created_at, j.bot_comment_message_id) select round(avg(msg_5m)::numeric, 2) as avg_msg_5m, round(avg(msg_30m)::numeric, 2) as avg_msg_30m, round(avg(users_30m)::numeric, 2) as avg_users_30m from metrics;\""
+```
 
 ## Custom Emoji
 
@@ -185,6 +215,7 @@ RAG не предназначен для пересказа новости: по
 
 ```env
 COMMENT_CUSTOM_EMOJI_ID=5445092965875729965
+TECH_CUSTOM_EMOJI_ID=
 AMD_CUSTOM_EMOJI_ID=5442995600201106682
 RADEON_CUSTOM_EMOJI_ID=5442853853395436819
 RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
@@ -192,6 +223,8 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 
 ## Ограничения MVP
 
-- Автокоммент проверен инфраструктурно, но ждёт реальный новый пост канала.
-- Если Ollama Cloud вернёт ошибку/subscription limit, задача останется без комментария до ручного вмешательства.
+- Поиск памяти keyword-based, без embeddings/pgvector.
+- Merge памяти эвристический; за качеством заметок надо иногда смотреть через `/memory` или SQL.
+- Если Ollama Cloud вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
+- Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; настройки меняются через `.env` и рестарт сервиса.
