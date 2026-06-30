@@ -13,26 +13,33 @@ use crate::config::Config;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
 
 pub struct OpenAiCompatClient<'a> {
-    config: &'a Config,
+    api_base: &'a str,
+    api_key: &'a str,
 }
 
 impl<'a> OpenAiCompatClient<'a> {
-    pub fn new(config: &'a Config) -> Self {
-        Self { config }
+    pub fn new(api_base: &'a str, api_key: &'a str) -> Self {
+        Self { api_base, api_key }
+    }
+
+    pub fn from_config(config: &'a Config) -> Self {
+        Self::new(
+            config.openai_compat_base_url.trim_end_matches('/'),
+            config.openai_compat_api_key.trim(),
+        )
     }
 }
 
 #[async_trait]
 impl LlmClient for OpenAiCompatClient<'_> {
     async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
-        let api_key = self.config.openai_compat_api_key.trim();
-        if api_key.is_empty() {
-            anyhow::bail!("OPENAI_COMPAT_API_KEY is empty");
+        if self.api_key.is_empty() {
+            anyhow::bail!("OpenAI-compatible API key is empty");
         }
 
         let config = OpenAIConfig::new()
-            .with_api_base(self.config.openai_compat_base_url.trim_end_matches('/'))
-            .with_api_key(api_key);
+            .with_api_base(self.api_base)
+            .with_api_key(self.api_key);
         let client = Client::with_config(config);
         let message = ChatCompletionRequestUserMessageArgs::default()
             .content(user_content(request.prompt, request.image_base64))

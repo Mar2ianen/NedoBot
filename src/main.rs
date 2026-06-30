@@ -1929,9 +1929,11 @@ async fn generate_with_llm(
 ) -> anyhow::Result<String> {
     let provider = config.llm_provider.trim().to_lowercase();
     let model = match provider.as_str() {
+        "groq" | "openrouter" => config.llm_model.as_deref().unwrap_or(&config.vision_model),
         "openai_compat" => config
             .openai_compat_model
             .as_deref()
+            .or(config.llm_model.as_deref())
             .unwrap_or(&config.vision_model),
         _ => &config.vision_model,
     };
@@ -1943,7 +1945,21 @@ async fn generate_with_llm(
         num_predict,
     };
     let response = match provider.as_str() {
-        "openai_compat" => OpenAiCompatClient::new(config).generate(request).await?,
+        "groq" => {
+            OpenAiCompatClient::new("https://api.groq.com/openai/v1", &config.groq_api_key)
+                .generate(request)
+                .await?
+        }
+        "openrouter" => {
+            OpenAiCompatClient::new("https://openrouter.ai/api/v1", &config.openrouter_api_key)
+                .generate(request)
+                .await?
+        }
+        "openai_compat" => {
+            OpenAiCompatClient::from_config(config)
+                .generate(request)
+                .await?
+        }
         _ => {
             OllamaClient::new(config)
                 .generate(LlmRequest {
