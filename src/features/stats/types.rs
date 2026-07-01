@@ -1,4 +1,4 @@
-use crate::telegram::render::escape_html;
+use crate::telegram::html::Html;
 
 #[derive(Clone, Copy)]
 pub enum StatsPeriod {
@@ -44,11 +44,7 @@ impl UserPresentation {
             self.display_name.trim()
         };
 
-        format!(
-            r#"<a href="tg://user?id={}">{}</a>"#,
-            self.user_id,
-            escape_html(visible)
-        )
+        Html::link(visible, format!("tg://user?id={}", self.user_id)).into_string()
     }
 
     fn badges(&self) -> String {
