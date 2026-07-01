@@ -46,6 +46,28 @@ struct ExportMessage {
     forwarded_from: Option<String>,
     forwarded_from_id: Option<String>,
     via_bot: Option<String>,
+    reactions: Option<Vec<ExportReaction>>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ExportReaction {
+    #[serde(rename = "type")]
+    reaction_type: String,
+    count: i64,
+    emoji: Option<String>,
+    document_id: Option<String>,
+    recent: Option<Vec<ExportRecentReaction>>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ExportRecentReaction {
+    from: Option<String>,
+    from_id: Option<String>,
+    date: String,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
 }
@@ -65,6 +87,9 @@ struct ImportStats {
     skipped_messages: usize,
     user_profiles: usize,
     channel_messages: usize,
+    reaction_messages: usize,
+    reaction_counts: usize,
+    recent_reaction_events: usize,
 }
 
 #[tokio::main]
@@ -94,12 +119,15 @@ async fn main() -> anyhow::Result<()> {
 
     let (stats, profiles) = scan_export(&root.messages, bot_user_id);
     println!(
-        "scan: seen={} importable={} skipped={} channel_messages={} user_profiles={}",
+        "scan: seen={} importable={} skipped={} channel_messages={} user_profiles={} reaction_messages={} reaction_counts={} recent_reaction_events={}",
         stats.seen,
         stats.imported_messages,
         stats.skipped_messages,
         stats.channel_messages,
-        stats.user_profiles
+        stats.user_profiles,
+        stats.reaction_messages,
+        stats.reaction_counts,
+        stats.recent_reaction_events
     );
 
     if args.dry_run {
@@ -109,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = PgPool::connect(&database_url).await?;
     import_messages(&pool, chat_id, &root.messages, args.batch_size).await?;
+    import_reactions(&pool, chat_id, &root.messages, args.batch_size).await?;
     upsert_profiles(&pool, profiles).await?;
     rebuild_chat_users(&pool, chat_id).await?;
 
@@ -178,6 +207,14 @@ fn scan_export(
         }
 
         stats.imported_messages += 1;
+        if let Some(reactions) = message.reactions.as_ref() {
+            stats.reaction_messages += 1;
+            stats.reaction_counts += reactions.len();
+            stats.recent_reaction_events += reactions
+                .iter()
+                .map(|reaction| reaction.recent.as_ref().map_or(0, Vec::len))
+                .sum::<usize>();
+        }
 
         let Some(timestamp) = message_timestamp(message) else {
             continue;
@@ -215,6 +252,42 @@ fn scan_export(
                 is_bot,
                 last_seen_at: timestamp,
             });
+
+        for recent in message
+            .reactions
+            .iter()
+            .flatten()
+            .filter_map(|reaction| reaction.recent.as_ref())
+            .flatten()
+        {
+            let Some(user_id) = parse_prefixed_id(recent.from_id.as_deref(), "user") else {
+                continue;
+            };
+            let Some(timestamp) = parse_export_datetime(&recent.date) else {
+                continue;
+            };
+            let first_name = recent
+                .from
+                .as_deref()
+                .unwrap_or("пользователь")
+                .trim()
+                .to_string();
+
+            profiles
+                .entry(user_id)
+                .and_modify(|profile| {
+                    if timestamp > profile.last_seen_at {
+                        profile.first_name = first_name.clone();
+                        profile.last_seen_at = timestamp;
+                    }
+                })
+                .or_insert(UserProfile {
+                    user_id,
+                    first_name,
+                    is_bot: false,
+                    last_seen_at: timestamp,
+                });
+        }
     }
 
     stats.user_profiles = profiles.len();
@@ -300,6 +373,97 @@ async fn import_messages(
         }
         tx.commit().await?;
         println!("messages imported/upserted: {imported}");
+    }
+
+    Ok(())
+}
+
+async fn import_reactions(
+    pool: &PgPool,
+    chat_id: i64,
+    messages: &[ExportMessage],
+    batch_size: usize,
+) -> anyhow::Result<()> {
+    let mut count_rows = 0usize;
+    let mut event_rows = 0usize;
+
+    for chunk in messages.chunks(batch_size) {
+        let mut tx = pool.begin().await?;
+        for message in chunk {
+            let Some(reactions) = message.reactions.as_ref().filter(|items| !items.is_empty())
+            else {
+                continue;
+            };
+            let Some(message_at) = message_timestamp(message) else {
+                continue;
+            };
+
+            let reactions_json = serde_json::to_value(reactions)?;
+            let total_count = reactions
+                .iter()
+                .map(|reaction| reaction.count.max(0))
+                .sum::<i64>();
+
+            sqlx::query(
+                r#"
+                insert into telegram_message_reaction_counts
+                    (chat_id, message_id, reactions, total_count, raw_json, event_at)
+                values ($1, $2, $3, $4, $5, $6)
+                on conflict (chat_id, message_id) do update set
+                    reactions = excluded.reactions,
+                    total_count = excluded.total_count,
+                    raw_json = excluded.raw_json,
+                    event_at = excluded.event_at,
+                    updated_at = now()
+                "#,
+            )
+            .bind(chat_id)
+            .bind(message.id)
+            .bind(&reactions_json)
+            .bind(total_count as i32)
+            .bind(serde_json::json!({
+                "source": "telegram_export",
+                "reactions": reactions,
+            }))
+            .bind(message_at)
+            .execute(&mut *tx)
+            .await?;
+            count_rows += 1;
+
+            for reaction in reactions {
+                let new_reactions = serde_json::json!([reaction_identity(reaction)]);
+                for recent in reaction.recent.iter().flatten() {
+                    let event_at = parse_export_datetime(&recent.date).unwrap_or(message_at);
+                    let raw_json = serde_json::json!({
+                        "source": "telegram_export_recent",
+                        "reaction": reaction,
+                        "recent": recent,
+                    });
+
+                    sqlx::query(
+                        r#"
+                        insert into telegram_message_reactions
+                            (chat_id, message_id, user_id, actor_chat_id, old_reactions, new_reactions, raw_json, event_at)
+                        values ($1, $2, $3, null, '[]'::jsonb, $4, $5, $6)
+                        on conflict do nothing
+                        "#,
+                    )
+                    .bind(chat_id)
+                    .bind(message.id)
+                    .bind(parse_prefixed_id(recent.from_id.as_deref(), "user"))
+                    .bind(&new_reactions)
+                    .bind(raw_json)
+                    .bind(event_at)
+                    .execute(&mut *tx)
+                    .await?;
+                    event_rows += 1;
+                }
+            }
+        }
+        tx.commit().await?;
+        println!(
+            "reaction counts upserted: {count_rows}, recent reaction events seen: {event_rows}"
+        );
     }
 
     Ok(())
@@ -436,6 +600,18 @@ fn message_timestamp(message: &ExportMessage) -> Option<DateTime<Utc>> {
         .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
 }
 
+fn parse_export_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|date| date.to_utc())
+        .ok()
+        .or_else(|| {
+            let value = format!("{value}+00:00");
+            DateTime::parse_from_rfc3339(&value)
+                .map(|date| date.to_utc())
+                .ok()
+        })
+}
+
 fn message_user_id(message: &ExportMessage) -> Option<i64> {
     parse_prefixed_id(message.from_id.as_deref(), "user")
         .or_else(|| parse_prefixed_id(message.actor_id.as_deref(), "user"))
@@ -492,6 +668,24 @@ fn value_has_link_entity(value: &Value) -> bool {
             .is_some_and(|kind| matches!(kind, "link" | "text_link" | "url")),
         _ => false,
     }
+}
+
+fn reaction_identity(reaction: &ExportReaction) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "type".to_string(),
+        Value::String(reaction.reaction_type.clone()),
+    );
+    if let Some(emoji) = reaction.emoji.as_ref() {
+        object.insert("emoji".to_string(), Value::String(emoji.clone()));
+    }
+    if let Some(document_id) = reaction.document_id.as_ref() {
+        object.insert(
+            "document_id".to_string(),
+            Value::String(document_id.clone()),
+        );
+    }
+    Value::Object(object)
 }
 
 #[cfg(test)]
