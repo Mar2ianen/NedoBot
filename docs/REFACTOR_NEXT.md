@@ -1,265 +1,577 @@
-# Current state and next steps
+# Voice transcription integration plan
 
-Рабочая карта после большого прохода по рефактору, импорту истории и статистике. Старый план `telegram/html.rs -> first_comment/pipeline.rs -> import later` уже в основном выполнен, поэтому этот документ фиксирует текущее состояние и ближайшие безопасные шаги.
+Активный следующий проход: добавить расшифровку голосовых сообщений в бота без возврата к огромному `main.rs`.
 
-## Текущий статус
+Уже закрытый рефактор вынесен в [`REFACTOR_DONE.md`](REFACTOR_DONE.md). В этом файле остаётся только план новой фичи.
 
-Проект уже не выглядит как один большой `main.rs`. Сейчас это нормальный MVP-монолит с понятными контурами:
+## Цель
 
-- `main.rs` отвечает за init, migrations, dispatcher wiring и маленькие update handlers.
-- `config.rs` читает `.env` и держит runtime-настройки.
-- `state.rs` прокидывает `PgPool` и `Config` в handlers.
-- `db/telegram.rs` сохраняет live Telegram updates, профили, реакции, member snapshots и activity counters.
-- `telegram/html.rs` отвечает за безопасную сборку Telegram HTML.
-- `telegram/render.rs` отвечает за отправку HTML, отключение previews, empty fallback и hard-limit `4096` chars.
-- `telegram/command_handler.rs` держит команды и делегирует в features.
-- `features/first_comment/*` держит candidate detection, cleaning, prompt, renderer, repository и pipeline первого комментария.
-- `features/memory/*` держит память новостей и отчёт `/memory`.
-- `features/stats/*` держит отчёты, user stats, top messages и top reactions.
-- `llm/*` держит Ollama и OpenAI-compatible routing.
-- `src/bin/import_telegram_export.rs` импортирует Telegram Desktop/AyuGram export.
-- `src/bin/retry_pending_comments.rs` ретраит зависшие first-comment jobs.
-- `src/bin/refresh_chat_members.rs` добивает профили и member snapshots через `getChatMember`.
+Бот должен уметь принимать `voice`, `audio` и позже `video_note`, получать расшифровку через Groq Whisper, прогонять результат через LLM-cleanup и отвечать в чат аккуратным Telegram HTML.
 
-## Последние важные изменения
-
-После исходного рефактор-плана добавлены:
-
-- безопасный HTML builder и централизованная отправка HTML;
-- hard-fail для Telegram HTML длиннее `4096` символов;
-- защита от пустого first-comment HTML, чтобы бот не отправлял `Пустой ответ.` под постом;
-- retry tool для pending comment jobs;
-- lib target `src/lib.rs`, чтобы maintenance binaries могли переиспользовать модули основного бота;
-- импорт Telegram export в `telegram_messages`, `telegram_user_profiles`, `telegram_chat_users`, reaction counts и recent reaction events;
-- dedup для reaction events;
-- refresh tool для user profiles/member snapshots;
-- `/userstats` без аргумента выбирает отправителя, а reply выбирает автора сообщения;
-- `/topmsg` и `/topreact` для исторической статистики;
-- улучшенное разрешение имён пользователей из profiles и raw export JSON;
-- дефолтный LLM provider возвращён к Ollama/Gemma.
-
-## Инварианты
-
-Не ломать эти свойства без отдельного осознанного коммита:
-
-- Бот не отвечает на обычные сообщения чата первым комментарием.
-- First-comment candidate только для auto-forward из `SOURCE_CHANNEL_ID` в `DISCUSSION_CHAT_ID`.
-- Реклама/служебные посты без `POST_SIGNATURE_MARKER` пропускаются.
-- Модель не владеет HTML-ссылкой на чат: `{CHAT_LINK}` или fallback заменяются кодом.
-- Любой пользовательский или модельный текст перед HTML должен проходить через `Html::text`, `Html::bold`, `Html::code`, `Html::link` или `escape_html`.
-- `raw_trusted` использовать только для тегов, собранных кодом.
-- Длинные сообщения не отправлять в Telegram вслепую.
-- Исторический импорт должен быть повторяемым: повторный запуск не должен раздувать счётчики.
-
-## Operational smoke checks
-
-После деплоя:
-
-```bash
-ssh vps-153 'systemctl status tg-ai-bot-teloxide --no-pager'
-ssh vps-153 'journalctl -u tg-ai-bot-teloxide -n 120 --no-pager'
-```
-
-Проверить последние сообщения:
-
-```bash
-ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select chat_id, message_id, source_channel_id, source_message_id, is_automatic_forward, left(coalesce(text, ''), 160) as text, created_at from telegram_messages order by id desc limit 20;\""
-```
-
-Проверить first-comment jobs:
-
-```bash
-ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select id, status, source_message_id, discussion_message_id, bot_comment_message_id, error, created_at, updated_at from post_comment_jobs order by id desc limit 20;\""
-```
-
-Проверить LLM generations:
-
-```bash
-ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select post_comment_job_id, provider, model, image_used, left(response, 120) as response, left(final_html, 120) as final_html, created_at from llm_generations order by id desc limit 10;\""
-```
-
-## Maintenance commands
-
-Импорт истории:
-
-```bash
-cargo run --bin import_telegram_export -- "/path/to/ChatExport/result.json" --dry-run
-cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.json"
-```
-
-Если нужны username aliases из реального Telegram ID:
-
-```bash
-cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.json" --user-alias username:123456789
-```
-
-Ретрай зависших комментариев:
-
-```bash
-cargo run --release --bin retry_pending_comments -- --limit 10
-```
-
-Обновление профилей и member snapshots:
-
-```bash
-cargo run --release --bin refresh_chat_members -- --limit 200
-cargo run --release --bin refresh_chat_members -- --all --limit 500 --sleep-ms 80
-```
-
-## Current command surface
-
-Публичные/полупубличные команды:
+Желаемый результат для пользователя:
 
 ```text
-/help
-/ping
-/db
-/emojiids
-/format_test <текст поста>
-/memory
-/stats_day
-/stats_week
-/stats_month
-/topmsg
-/topreact
-/userstats <id|username>
+Расшифровка голосового
+
+0:00 Начали обсуждать драйверы AMD и почему опять всё отвалилось.
+0:28 Перешли к Linux/Proton и спору, насколько это массовая проблема.
+1:10 Итог: надо проверить версию Mesa и свежие багрепорты.
 ```
 
-Поведение:
+Если текст не влезает в безопасный лимит Telegram, бот отправляет короткий preview в чат и полный transcript файлом.
 
-- `/userstats` без аргумента показывает отправителя команды.
-- `/userstats` reply на сообщение показывает автора reply.
-- `/topmsg` показывает топ пишущих пользователей за всё время.
-- `/topreact` показывает топ сообщений по reaction counts со ссылками на сообщения.
-- В группах команды лучше писать с username бота, если Telegram ambiguity мешает dispatch.
+## Внешние ограничения
 
-## Known caveats
+Telegram `sendMessage` принимает 0-4096 символов после entities parsing. В коде уже есть hard-limit `TELEGRAM_TEXT_LIMIT = 4096` и safe warning около `3900`. Для voice нельзя просто надеяться, что LLM уложится в лимит: renderer обязан сам выбирать single message, chunks или file fallback.
 
-### Migrations and reaction dedup
+Обычный cloud Bot API через `getFile` скачивает файлы до 20 MB. Для больших аудио нужен local Bot API server, где файл доступен локальным путём. На MVP держать консервативный лимит и явно писать пользователю, что файл слишком большой.
 
-Есть две миграции вокруг reaction-event dedup:
+Groq Speech-to-Text использует OpenAI-compatible endpoint:
 
 ```text
-20260701123000_reaction_event_dedup.sql
-20260701133000_deduplicate_reaction_events.sql
+POST https://api.groq.com/openai/v1/audio/transcriptions
 ```
 
-Если база уже успешно прошла первую миграцию, всё нормально. Если продовая база падала именно на создании unique index из-за дублей, более поздняя dedup-миграция сама по себе не выполнится, потому что SQLx остановится на первой неприменённой миграции. В таком случае нужно руками выполнить dedup SQL или аккуратно чинить историю миграций на этой конкретной базе.
+Для MVP:
 
-Проверка дублей:
-
-```sql
-select chat_id, message_id, coalesce(user_id,0), coalesce(actor_chat_id,0), event_at, new_reactions, count(*)
-from telegram_message_reactions
-group by 1,2,3,4,5,6
-having count(*) > 1;
+```text
+model = whisper-large-v3-turbo
+response_format = verbose_json
+timestamp_granularities[] = segment
+language = ru
+temperature = 0
 ```
 
-### Pending comment jobs
+`whisper-large-v3` оставить как более точный, но более дорогой/медленный fallback. Groq сейчас поддерживает `flac`, `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `ogg`, `wav`, `webm`; Telegram voice обычно `ogg/opus`, поэтому первый MVP может обойтись без ffmpeg для обычных ГС.
 
-Основной pipeline создаёт `post_comment_jobs` до LLM/send. Если LLM, HTML render или Telegram send упали, job может остаться `pending`. Для этого есть `retry_pending_comments`, но на будущее лучше вынести общий `mark_post_comment_failed` в `features/first_comment/repo.rs` и использовать его и в live pipeline, и в retry tool.
+Ссылки для проверки перед деплоем:
 
-### Reaction metrics
+- Groq Speech-to-Text: <https://console.groq.com/docs/speech-to-text>
+- Groq API reference: <https://console.groq.com/docs/api-reference>
+- Telegram Bot API `getFile`: <https://core.telegram.org/bots/api#getfile>
+- Telegram Bot API `sendMessage`: <https://core.telegram.org/bots/api#sendmessage>
 
-`telegram_message_reaction_counts` хорошо показывает сумму реакций на сообщение. `telegram_message_reactions` из export содержит только `recent`, поэтому пользовательская метрика `реакций поставил` по старой истории неполная. Для live updates она становится точнее только после того, как Telegram начал присылать `message_reaction` updates боту.
+## UX policy
 
-### Telegram export service messages
+Рекомендуемый MVP:
 
-Importer сейчас принимает и `message`, и `service`. Это полезно для части истории, но может загрязнять общие счётчики сообщений/active users, если service events не нужно считать как пользовательскую активность. Если статистика начнёт выглядеть странно, следующий шаг — хранить `message_type` отдельной колонкой или фильтровать service records при построении отчётов.
+- Автоматически расшифровывать `voice` в `DISCUSSION_CHAT_ID`, если `VOICE_AUTO_TRANSCRIBE=true`.
+- Не трогать сообщения бота, команды и auto-forward посты канала.
+- Не расшифровывать файлы больше `VOICE_MAX_FILE_MB` и дольше `VOICE_MAX_DURATION_SEC`.
+- На слишком длинное или большое аудио отвечать коротким HTML-сообщением с причиной отказа.
+- Для `audio` включить поддержку после `voice`: там чаще бывают длинные файлы, музыка и мусор.
+- Для `video_note` включить третьим шагом: нужно решить, хотим ли выдирать аудио через ffmpeg.
 
-### HTML length
+Опциональная ручная команда позже:
 
-`send_html` теперь не отправляет сообщения длиннее `4096` символов. Для stats это обычно нормально, но для будущей voice transcription нужен splitter: preview в чат + полный `.txt/.md` файлом.
-
-## Near-term TODO
-
-### 1. First-comment failure accounting
-
-Сейчас empty HTML защищён через `ensure_comment_html`, но failure не всегда попадает в БД как явный `failed`. Желательно:
-
-```rust
-pub async fn mark_post_comment_failed(
-    pool: &PgPool,
-    job_id: i64,
-    error: &str,
-) -> anyhow::Result<()>;
+```text
+/transcribe
 ```
 
-И использовать в live pipeline вокруг LLM/render/send.
+Она полезна как безопасный режим, если auto-transcribe начнёт шуметь. Команду можно сделать reply-only: пользователь отвечает `/transcribe` на voice/audio, бот расшифровывает именно reply message.
 
-### 2. Telegram HTML splitter
+## Архитектура
 
-Нужен общий renderer для длинных ответов:
-
-```rust
-RenderedMessage::Single(Html)
-RenderedMessage::Chunks(Vec<Html>)
-RenderedMessage::PreviewAndFile { preview: Html, full_text: String }
-```
-
-Это понадобится для voice transcription и длинных stats.
-
-### 3. Importer hardening
-
-Следующие улучшения импортёра:
-
-- добавить явное хранение `message_type`, если service messages останутся в `telegram_messages`;
-- лучше документировать неполноту `recent` reactions;
-- добавить summary после импорта: сколько сообщений, users, reaction counts, recent events реально upserted;
-- добавить команду проверки дублей перед миграцией/импортом.
-
-### 4. Voice transcription
-
-Будущая структура:
+Новая структура:
 
 ```text
 src/features/voice/
   mod.rs
   pipeline.rs
-  asr.rs
-  render.rs
   types.rs
+  download.rs
+  asr.rs
+  cleanup.rs
+  render.rs
+  repo.rs
+
+prompts/voice_cleanup.md
 ```
 
-Пайплайн:
+Ответственность модулей:
 
-1. принять `voice`/`audio`/`video_note`;
-2. скачать файл через Bot API или local Bot API;
-3. нормализовать audio через ffmpeg при необходимости;
-4. отправить в Groq Whisper `verbose_json` с segment timestamps;
-5. отдать segments в LLM на чистку ASR;
-6. отправить preview в чат, полный текст файлом при превышении лимита.
+| Модуль | Ответственность |
+| --- | --- |
+| `pipeline.rs` | Оркестрация: определить media, создать job, скачать, ASR, cleanup, render, send, mark status. |
+| `types.rs` | `VoiceMedia`, `AsrSegment`, `AsrTranscript`, `CleanTranscript`, `RenderedTranscript`. |
+| `download.rs` | `getFile`, проверка размера, скачивание в temp path, cleanup temp files. |
+| `asr.rs` | Groq multipart request, парсинг `verbose_json`, нормализация timestamps. |
+| `cleanup.rs` | LLM prompt для исправления ASR и разбивки на смысловые фрагменты. |
+| `render.rs` | Telegram HTML preview, file body, fallback для длинного текста. |
+| `repo.rs` | SQL для `voice_transcription_jobs`. |
 
-### 5. Tests
+`main.rs` должен получить только один новый делегат в `handle_message`:
 
-Минимальный следующий набор:
+```rust
+if maybe_transcribe_voice(&bot, &msg, &state).await? {
+    return Ok(());
+}
+```
+
+Порядок в `handle_message`:
+
+1. reply-only command hacks, которые уже есть;
+2. voice transcription;
+3. first-comment pipeline.
+
+Voice не должен мешать first-comment pipeline: auto-forward посты из канала не являются `voice`, а обычные voice/audio не являются first-comment candidates.
+
+## Config
+
+Добавить в `Config` и `.env.example`:
+
+```env
+VOICE_TRANSCRIPTION_ENABLED=true
+VOICE_AUTO_TRANSCRIBE=true
+VOICE_MAX_DURATION_SEC=600
+VOICE_MAX_FILE_MB=20
+VOICE_LANGUAGE=ru
+VOICE_ASR_PROVIDER=groq
+VOICE_ASR_MODEL=whisper-large-v3-turbo
+VOICE_ASR_TEMPERATURE=0
+VOICE_CLEANUP_PROVIDER=
+VOICE_CLEANUP_MODEL=
+VOICE_CLEANUP_TEMPERATURE=0.2
+VOICE_CLEANUP_MAX_TOKENS=1800
+VOICE_SEND_FULL_FILE=true
+```
+
+Правила:
+
+- `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
+- `VOICE_CLEANUP_MODEL` пустой значит использовать обычную модель provider-а.
+- `VOICE_MAX_FILE_MB=20` выбран из-за cloud Bot API `getFile`; если поднимешь local Bot API server, можно увеличивать отдельно.
+- `VOICE_SEND_FULL_FILE=true` значит длинная расшифровка уходит preview + `.md`/`.txt` файлом.
+
+## Database
+
+Добавить миграцию без Postgres enum, чтобы проще менять статусы:
+
+```sql
+create table voice_transcription_jobs (
+    id bigserial primary key,
+    chat_id bigint not null,
+    message_id integer not null,
+    user_id bigint,
+    file_id text not null,
+    file_unique_id text,
+    media_kind text not null,
+    duration_sec integer,
+    file_size bigint,
+    mime_type text,
+    status text not null default 'pending',
+    error text,
+    asr_provider text,
+    asr_model text,
+    asr_request_id text,
+    cleanup_provider text,
+    cleanup_model text,
+    raw_transcript text,
+    cleaned_text text,
+    segments_json jsonb,
+    raw_asr_json jsonb,
+    final_html text,
+    full_text_file_id text,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    unique (chat_id, message_id),
+    check (status in ('pending', 'downloading', 'transcribing', 'cleaning', 'sent', 'failed', 'skipped'))
+);
+
+create index voice_transcription_jobs_status_idx on voice_transcription_jobs(status);
+create index voice_transcription_jobs_created_at_idx on voice_transcription_jobs(created_at desc);
+```
+
+`repo.rs` API:
+
+```rust
+pub async fn create_voice_job(
+    pool: &PgPool,
+    media: &VoiceMedia,
+) -> anyhow::Result<Option<i64>>;
+
+pub async fn mark_voice_job_status(
+    pool: &PgPool,
+    job_id: i64,
+    status: &str,
+) -> anyhow::Result<()>;
+
+pub async fn mark_voice_job_failed(
+    pool: &PgPool,
+    job_id: i64,
+    error: &str,
+) -> anyhow::Result<()>;
+
+pub async fn save_asr_result(
+    pool: &PgPool,
+    job_id: i64,
+    transcript: &AsrTranscript,
+) -> anyhow::Result<()>;
+
+pub async fn save_voice_result(
+    pool: &PgPool,
+    job_id: i64,
+    result: &CleanTranscript,
+    final_html: &str,
+    full_text_file_id: Option<&str>,
+) -> anyhow::Result<()>;
+```
+
+## Types
+
+Минимальные типы:
+
+```rust
+pub enum VoiceMediaKind {
+    Voice,
+    Audio,
+    VideoNote,
+}
+
+pub struct VoiceMedia {
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub user_id: Option<i64>,
+    pub kind: VoiceMediaKind,
+    pub file_id: String,
+    pub file_unique_id: Option<String>,
+    pub duration_sec: Option<u32>,
+    pub file_size: Option<u64>,
+    pub mime_type: Option<String>,
+}
+
+pub struct AsrSegment {
+    pub start_sec: f32,
+    pub end_sec: f32,
+    pub text: String,
+}
+
+pub struct AsrTranscript {
+    pub provider: String,
+    pub model: String,
+    pub request_id: Option<String>,
+    pub text: String,
+    pub segments: Vec<AsrSegment>,
+    pub raw_json: serde_json::Value,
+}
+
+pub struct CleanTranscript {
+    pub text: String,
+    pub topics: Vec<String>,
+    pub short_summary: Option<String>,
+}
+```
+
+Не хранить Telegram HTML как единственный источник истины. `cleaned_text` должен быть plain text/Markdown-like, а HTML собирать отдельно.
+
+## Download layer
+
+`download.rs` должен:
+
+1. выбрать `file_id` из `msg.voice()`, `msg.audio()`, позже `msg.video_note()`;
+2. проверить duration/file_size из Telegram metadata до скачивания;
+3. вызвать `bot.get_file(file_id.clone()).await?`;
+4. скачать файл во временную директорию;
+5. вернуть `DownloadedVoice { path, original_ext, mime_type, size }`;
+6. удалить temp-файл после ASR.
+
+Зависимости, которые могут понадобиться:
+
+```toml
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
+```
+
+Если включишь ffmpeg preprocessing позже, добавить `tokio/process` и отдельный helper:
+
+```rust
+async fn normalize_audio_for_asr(input: &Path) -> anyhow::Result<PathBuf>;
+```
+
+Для MVP не надо ffmpeg для обычного Telegram voice: `ogg` поддерживается Groq.
+
+## Groq ASR client
+
+Не смешивать ASR с `llm/service.rs`: это другой тип API и другой контракт. Сделать отдельный `features/voice/asr.rs`.
+
+Примерная функция:
+
+```rust
+pub async fn transcribe_with_groq(
+    config: &Config,
+    audio_path: &Path,
+    prompt: Option<&str>,
+) -> anyhow::Result<AsrTranscript>;
+```
+
+Запрос:
+
+```rust
+let form = reqwest::multipart::Form::new()
+    .text("model", config.voice_asr_model.clone())
+    .text("response_format", "verbose_json")
+    .text("language", config.voice_language.clone())
+    .text("temperature", config.voice_asr_temperature.to_string())
+    .text("timestamp_granularities[]", "segment")
+    .part("file", file_part);
+```
+
+Headers:
 
 ```text
-telegram::html::escape/link/code/custom_emoji
-telegram::render::normalize_send_text over 4096
-first_comment::render placeholder/fallback/strip links
-first_comment::pipeline empty html guard
-stats::message_url
-import_telegram_export id conversion / rich text / alias parsing
+Authorization: Bearer $GROQ_API_KEY
+Content-Type: multipart/form-data
 ```
 
-## Done checklist
+Парсить минимум:
 
-- [x] `telegram/html.rs` добавлен.
-- [x] `telegram/render.rs` централизует HTML send и link preview disable.
-- [x] First-comment renderer переведён на `Html`.
-- [x] Memory report переведён на `Html`.
-- [x] Stats partially переведён на безопасный HTML.
-- [x] First-comment prompt/repo/pipeline вынесены из `main.rs`.
-- [x] Telegram persistence вынесен из `main.rs`.
-- [x] LLM routing вынесен и нормализует provider/model/image_used.
-- [x] Telegram export importer добавлен.
-- [x] Pending comment retry tool добавлен.
-- [x] Member refresh tool добавлен.
-- [x] `/topmsg` и `/topreact` добавлены.
+```json
+{
+  "text": "...",
+  "segments": [
+    { "start": 0.0, "end": 12.4, "text": "..." }
+  ],
+  "x_groq": { "id": "..." }
+}
+```
 
-Контрольный вопрос сейчас:
+`x_groq.id` сохранить в `asr_request_id`, если есть.
 
-> Можно ли добавить `features/voice` без правок на 300 строк в `main.rs`?
+## Cleanup prompt
 
-Да. Следующий риск уже не в `main.rs`, а в аккуратном API для длинного Telegram output и в хранении voice transcript artifacts.
+Создать `prompts/voice_cleanup.md`.
+
+Задача cleanup LLM:
+
+- исправить явные ошибки ASR;
+- восстановить пунктуацию;
+- убрать слова-паразиты и бессмысленные повторы;
+- не выдумывать факты;
+- сохранить смысл, стиль и важные формулировки;
+- сохранить/поправить технические термины;
+- заменить длинные числительные цифрами, где это улучшает читаемость;
+- разбить на смысловые фрагменты;
+- поставить timestamps в формате `0:30` в начале фрагментов;
+- если кусок неразборчив, писать `[неразборчиво]`, а не фантазировать.
+
+Пример prompt:
+
+```text
+Ты чистишь расшифровку голосового сообщения из Telegram-чата.
+
+На входе ASR segments с таймкодами. Исправь ошибки распознавания, восстанови пунктуацию, убери слова-паразиты и бессмысленные повторы. Не добавляй новых фактов и не меняй позицию говорящего.
+
+Формат ответа:
+0:00 Первый смысловой фрагмент.
+0:30 Второй смысловой фрагмент.
+1:10 Третий смысловой фрагмент.
+
+Правила:
+- таймкод бери из начала соответствующего ASR segment;
+- объединяй соседние segments, если это одна мысль;
+- не делай фрагменты длиннее 3-5 предложений;
+- технические термины сохраняй точно;
+- если не уверен в слове, выбери наиболее вероятный вариант по контексту;
+- если фрагмент реально неразборчив, напиши [неразборчиво];
+- не используй Telegram HTML;
+- верни только готовую расшифровку.
+```
+
+Контекст для модели лучше передавать как compact list segments:
+
+```text
+[0:00-0:12] ну короче амд опять что то с драйверами
+[0:12-0:24] на линуксе вроде норм но в протоне...
+```
+
+## Rendering
+
+`voice/render.rs` должен работать от plain cleaned text.
+
+MVP-правило:
+
+1. собрать HTML title + cleaned transcript;
+2. если `chars <= SAFE_TEXT_LIMIT`, отправить одним reply;
+3. если длиннее, отправить preview reply и полный `.md`/`.txt` через `send_document`;
+4. если даже preview внезапно > 4096, обрезать preview через `truncate_text` до `SAFE_TEXT_LIMIT`.
+
+Пример типа:
+
+```rust
+pub enum RenderedTranscript {
+    Single { html: String },
+    PreviewAndFile { html: String, filename: String, body: String },
+}
+```
+
+Для single message можно подсветить timestamp:
+
+```text
+0:30 -> <code>0:30</code>
+```
+
+Но только если renderer сам экранирует весь остальной текст. Не отдавать LLM право писать Telegram HTML.
+
+Для file body использовать plain Markdown-like text:
+
+```text
+# Расшифровка голосового
+
+Чат: ...
+Сообщение: ...
+
+0:00 ...
+0:30 ...
+```
+
+## Pipeline skeleton
+
+```rust
+pub async fn maybe_transcribe_voice(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+) -> anyhow::Result<bool> {
+    if !state.config.voice_transcription_enabled {
+        return Ok(false);
+    }
+
+    let Some(media) = VoiceMedia::from_message(msg) else {
+        return Ok(false);
+    };
+
+    if !state.config.voice_auto_transcribe {
+        return Ok(false);
+    }
+
+    if should_skip_voice(&media, &state.config) {
+        return Ok(true);
+    }
+
+    let Some(job_id) = repo::create_voice_job(&state.pool, &media).await? else {
+        return Ok(true);
+    };
+
+    let result = run_voice_job(bot, &state.config, &state.pool, job_id, media).await;
+    if let Err(err) = result {
+        repo::mark_voice_job_failed(&state.pool, job_id, &err.to_string()).await?;
+        return Err(err);
+    }
+
+    Ok(true)
+}
+```
+
+`run_voice_job`:
+
+1. `mark status = downloading`;
+2. download;
+3. `mark status = transcribing`;
+4. Groq ASR;
+5. save raw ASR;
+6. `mark status = cleaning`;
+7. cleanup via LLM;
+8. render;
+9. send reply or preview + document;
+10. save final result and `status = sent`.
+
+## Sending document fallback
+
+Для длинной расшифровки:
+
+```rust
+bot.send_document(chat_id, InputFile::memory(body.into_bytes()).file_name(filename))
+    .caption("Полная расшифровка")
+    .reply_parameters(ReplyParameters::new(original_message_id).allow_sending_without_reply())
+    .await?;
+```
+
+Хранить `full_text_file_id`, если Telegram вернул document with file_id. Это позволит потом не генерировать файл повторно при retry/report.
+
+## Error policy
+
+Не спамить чат внутренними ошибками.
+
+Пользовательские ответы:
+
+- файл слишком большой;
+- голосовое слишком длинное;
+- Telegram не дал скачать файл;
+- ASR временно недоступен;
+- расшифровка получилась пустой.
+
+Внутренние детали писать в `voice_transcription_jobs.error` и logs.
+
+Для transient ошибок Groq/Telegram можно оставить job `failed` и позже добавить retry tool:
+
+```bash
+cargo run --release --bin retry_voice_transcriptions -- --limit 10
+```
+
+Но retry tool не тащить в первый commit, если MVP ещё не стабилен.
+
+## Security and privacy
+
+- Не логировать полный transcript на info level.
+- Не логировать download URL: он содержит bot token.
+- Temp files удалять после ASR даже при ошибке.
+- Не сохранять audio bytes в Postgres.
+- Сохранять только `file_id`, `file_unique_id`, ASR JSON и cleaned text.
+- Для owner preview voice не нужен.
+
+## Порядок коммитов
+
+Оптимальный порядок:
+
+1. `config: add voice transcription settings`.
+2. `db: add voice transcription jobs table`.
+3. `voice: add media detection and types`.
+4. `voice: add telegram file download layer`.
+5. `voice: add groq transcription client`.
+6. `voice: add cleanup prompt and renderer`.
+7. `voice: wire pipeline into message handler`.
+8. `voice: add document fallback for long transcripts`.
+9. `docs: document voice transcription`.
+
+После каждого шага:
+
+```bash
+cargo fmt
+cargo check
+```
+
+После pipeline wiring проверить в живом чате на коротком voice до 10 секунд.
+
+## Tests
+
+Минимальные unit tests:
+
+```text
+voice::types::VoiceMedia::from_message ignores non-voice
+voice::render single short transcript
+voice::render preview + file for long transcript
+voice::render escapes raw HTML from cleanup model
+voice::cleanup prompt contains segment timestamps
+voice::asr parses verbose_json segments
+config parses voice env defaults
+```
+
+Integration smoke без реального Groq:
+
+- fake `AsrClient` возвращает segments;
+- fake cleanup возвращает cleaned text;
+- renderer отправляет one-message path;
+- long text уходит в `PreviewAndFile`.
+
+## Что не делать в первом voice PR
+
+- Не делать VAD/chunking длинных аудио.
+- Не делать diarization.
+- Не делать speaker labels.
+- Не делать embeddings по transcript.
+- Не делать summary по всей истории голосовых.
+- Не делать local Whisper/Ollama audio.
+- Не переписывать весь Telegram renderer под entities.
+
+Первый PR должен дать рабочий вертикальный срез: voice -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit.
