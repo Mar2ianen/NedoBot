@@ -23,7 +23,7 @@ pub async fn maybe_transcribe_voice(
         return Ok(false);
     }
 
-    if msg.chat.id.0 != state.config.discussion_chat_id
+    if (!msg.chat.is_private() && msg.chat.id.0 != state.config.discussion_chat_id)
         || msg.from.as_ref().is_some_and(|user| user.is_bot)
         || msg
             .text()
