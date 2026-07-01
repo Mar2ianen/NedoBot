@@ -37,6 +37,27 @@ struct StoredMessageSnapshot {
     raw_json: serde_json::Value,
 }
 
+#[allow(dead_code)]
+pub struct UserProfileDetails {
+    pub telegram_user_id: i64,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub bio: Option<String>,
+    pub small_photo_file_id: Option<String>,
+    pub small_photo_file_unique_id: Option<String>,
+    pub big_photo_file_id: Option<String>,
+    pub big_photo_file_unique_id: Option<String>,
+    pub profile_photo_file_id: Option<String>,
+    pub profile_photo_file_unique_id: Option<String>,
+    pub profile_photo_width: Option<i32>,
+    pub profile_photo_height: Option<i32>,
+    pub profile_photo_count: Option<i32>,
+    pub emoji_status_custom_emoji_id: Option<String>,
+    pub profile_accent_color_id: Option<i16>,
+    pub raw_json: serde_json::Value,
+}
+
 pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
     let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
@@ -376,6 +397,100 @@ pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<(
     .bind(user.is_bot)
     .bind(user.is_premium)
     .bind(&user.language_code)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn update_user_profile_details(
+    pool: &PgPool,
+    details: UserProfileDetails,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into telegram_user_profiles
+            (
+                telegram_user_id, username, first_name, last_name, bio,
+                profile_photo_small_file_id, profile_photo_small_file_unique_id,
+                profile_photo_big_file_id, profile_photo_big_file_unique_id,
+                profile_photo_file_id, profile_photo_file_unique_id,
+                profile_photo_width, profile_photo_height, profile_photo_count,
+                emoji_status_custom_emoji_id, profile_accent_color_id,
+                profile_raw_json, profile_refreshed_at, profile_refresh_error,
+                updated_at
+            )
+        values (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, $12, $13, $14,
+            $15, $16, $17, now(), null, now()
+        )
+        on conflict (telegram_user_id) do update set
+            username = coalesce(excluded.username, telegram_user_profiles.username),
+            first_name = coalesce(excluded.first_name, telegram_user_profiles.first_name),
+            last_name = coalesce(excluded.last_name, telegram_user_profiles.last_name),
+            bio = excluded.bio,
+            profile_photo_small_file_id = excluded.profile_photo_small_file_id,
+            profile_photo_small_file_unique_id = excluded.profile_photo_small_file_unique_id,
+            profile_photo_big_file_id = excluded.profile_photo_big_file_id,
+            profile_photo_big_file_unique_id = excluded.profile_photo_big_file_unique_id,
+            profile_photo_file_id = excluded.profile_photo_file_id,
+            profile_photo_file_unique_id = excluded.profile_photo_file_unique_id,
+            profile_photo_width = excluded.profile_photo_width,
+            profile_photo_height = excluded.profile_photo_height,
+            profile_photo_count = excluded.profile_photo_count,
+            emoji_status_custom_emoji_id = excluded.emoji_status_custom_emoji_id,
+            profile_accent_color_id = excluded.profile_accent_color_id,
+            profile_raw_json = excluded.profile_raw_json,
+            profile_refreshed_at = excluded.profile_refreshed_at,
+            profile_refresh_error = null,
+            updated_at = now()
+        "#,
+    )
+    .bind(details.telegram_user_id)
+    .bind(details.username)
+    .bind(details.first_name)
+    .bind(details.last_name)
+    .bind(details.bio)
+    .bind(details.small_photo_file_id)
+    .bind(details.small_photo_file_unique_id)
+    .bind(details.big_photo_file_id)
+    .bind(details.big_photo_file_unique_id)
+    .bind(details.profile_photo_file_id)
+    .bind(details.profile_photo_file_unique_id)
+    .bind(details.profile_photo_width)
+    .bind(details.profile_photo_height)
+    .bind(details.profile_photo_count)
+    .bind(details.emoji_status_custom_emoji_id)
+    .bind(details.profile_accent_color_id)
+    .bind(details.raw_json)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn mark_user_profile_refresh_error(
+    pool: &PgPool,
+    telegram_user_id: i64,
+    error: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into telegram_user_profiles
+            (telegram_user_id, profile_refreshed_at, profile_refresh_error, updated_at)
+        values ($1, now(), $2, now())
+        on conflict (telegram_user_id) do update set
+            profile_refreshed_at = excluded.profile_refreshed_at,
+            profile_refresh_error = excluded.profile_refresh_error,
+            updated_at = now()
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(error)
     .execute(pool)
     .await?;
 
