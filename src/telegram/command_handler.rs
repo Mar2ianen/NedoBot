@@ -9,7 +9,7 @@ use crate::features::stats::types::StatsPeriod;
 use crate::state::AppState;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
-use crate::telegram::render::send_html;
+use crate::telegram::render::{escape_html, send_html};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -26,14 +26,18 @@ pub async fn handle_command(
 
     match cmd {
         Command::Help => {
-            bot.send_message(msg.chat.id, Command::descriptions().to_string())
-                .await?;
+            send_html(
+                &bot,
+                msg.chat.id,
+                escape_html(&Command::descriptions().to_string()),
+            )
+            .await?;
         }
         Command::Ping => {
             bot.send_message(msg.chat.id, "pong").await?;
         }
         Command::Db => {
-            let row: (i64,) = sqlx::query_as("select 1")
+            let row: (i64,) = sqlx::query_as("select 1::bigint")
                 .fetch_one(pool)
                 .await
                 .map_err(|err| {
