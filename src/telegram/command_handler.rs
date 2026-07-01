@@ -4,7 +4,9 @@ use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
-use crate::features::stats::report::{send_chat_stats, send_user_stats};
+use crate::features::stats::report::{
+    send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
+};
 use crate::features::stats::types::StatsPeriod;
 use crate::state::AppState;
 use crate::telegram::commands::Command;
@@ -76,6 +78,12 @@ pub async fn handle_command(
         }
         Command::StatsMonth => {
             send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month).await?;
+        }
+        Command::TopMsg => {
+            send_top_messages(&bot, msg.chat.id, pool, config).await?;
+        }
+        Command::TopReact => {
+            send_top_reacted(&bot, msg.chat.id, pool, config).await?;
         }
         Command::UserStats(target) => {
             let target = target.trim();
