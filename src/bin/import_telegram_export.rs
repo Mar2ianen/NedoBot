@@ -357,7 +357,7 @@ async fn rebuild_chat_users(pool: &PgPool, chat_id: i64) -> anyhow::Result<()> {
             count(*) filter (where m.reply_to_message_id is not null)::bigint as reply_count,
             count(*) filter (where m.has_links)::bigint as link_count,
             count(*) filter (where m.has_photo or m.has_video or m.has_document or m.has_audio or m.has_voice or m.has_sticker or m.has_animation)::bigint as media_count,
-            count(*) filter (where m.reply_to_message_id in (select discussion_message_id from post_comment_jobs where discussion_chat_id = m.chat_id))::bigint as reply_to_channel_post_count,
+            count(*) filter (where m.reply_to_message_id in (select message_id from telegram_messages where chat_id = $1 and source_channel_id is not null))::bigint as reply_to_channel_post_count,
             count(*) filter (where m.reply_to_message_id in (select bot_comment_message_id from post_comment_jobs where discussion_chat_id = m.chat_id))::bigint as reply_to_bot_count,
             s.status,
             coalesce(s.is_admin, false),

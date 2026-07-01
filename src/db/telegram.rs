@@ -142,9 +142,10 @@ async fn upsert_chat_user_activity(
             select
                 exists (
                     select 1
-                    from post_comment_jobs
-                    where discussion_chat_id = $1
-                      and discussion_message_id = $5
+                    from telegram_messages
+                    where chat_id = $1
+                      and message_id = $5
+                      and source_channel_id is not null
                 ) as reply_to_channel_post,
                 exists (
                     select 1
