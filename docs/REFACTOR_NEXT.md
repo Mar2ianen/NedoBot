@@ -13,16 +13,35 @@
 ```text
 Расшифровка голосового
 
-0:00 Начали обсуждать драйверы AMD и почему опять всё отвалилось.
-0:28 Перешли к Linux/Proton и спору, насколько это массовая проблема.
-1:10 Итог: надо проверить версию Mesa и свежие багрепорты.
+Обсуждение AMD 0:00
+[свернутый текст расшифровки до следующей главы]
+
+Linux и Proton 0:28
+[свернутый текст расшифровки до следующей главы]
+
+Итог 1:10
+[свернутый текст расшифровки]
 ```
 
-Если текст не влезает в безопасный лимит Telegram, бот отправляет короткий preview в чат и полный transcript файлом.
+В Telegram это рендерится как видимые главы и раскрываемые блоки:
+
+```html
+<b>Расшифровка голосового</b>
+
+<b>Обсуждение AMD</b> <code>0:00</code>
+<blockquote expandable>Начали обсуждать драйверы AMD и почему опять всё отвалилось...</blockquote>
+
+<b>Linux и Proton</b> <code>0:28</code>
+<blockquote expandable>Перешли к Linux/Proton и спору, насколько это массовая проблема...</blockquote>
+```
+
+Если итоговый HTML не влезает в безопасный лимит Telegram, бот отправляет короткий preview в чат и полный transcript файлом.
 
 ## Внешние ограничения
 
 Telegram `sendMessage` принимает 0-4096 символов после entities parsing. В коде уже есть hard-limit `TELEGRAM_TEXT_LIMIT = 4096` и safe warning около `3900`. Для voice нельзя просто надеяться, что LLM уложится в лимит: renderer обязан сам выбирать single message, chunks или file fallback.
+
+Telegram HTML поддерживает раскрываемые цитаты через `<blockquote expandable>...</blockquote>`. Это хороший формат для voice chapters: заголовок главы остаётся видимым, подробная расшифровка свёрнута. `blockquote` и `expandable_blockquote` нельзя вкладывать друг в друга, поэтому renderer должен собирать главы плоским списком.
 
 Обычный cloud Bot API через `getFile` скачивает файлы до 20 MB. Для больших аудио нужен local Bot API server, где файл доступен локальным путём. На MVP держать консервативный лимит и явно писать пользователю, что файл слишком большой.
 
@@ -50,6 +69,7 @@ temperature = 0
 - Groq API reference: <https://console.groq.com/docs/api-reference>
 - Telegram Bot API `getFile`: <https://core.telegram.org/bots/api#getfile>
 - Telegram Bot API `sendMessage`: <https://core.telegram.org/bots/api#sendmessage>
+- Telegram Bot API formatting options: <https://core.telegram.org/bots/api#formatting-options>
 
 ## UX policy
 
@@ -59,6 +79,8 @@ temperature = 0
 - Не трогать сообщения бота, команды и auto-forward посты канала.
 - Не расшифровывать файлы больше `VOICE_MAX_FILE_MB` и дольше `VOICE_MAX_DURATION_SEC`.
 - На слишком длинное или большое аудио отвечать коротким HTML-сообщением с причиной отказа.
+- Короткие и средние расшифровки отправлять как главы + expandable blockquotes.
+- Полный файл отправлять только если главы не влезают в `SAFE_TEXT_LIMIT` или пользователь явно попросил файл.
 - Для `audio` включить поддержку после `voice`: там чаще бывают длинные файлы, музыка и мусор.
 - Для `video_note` включить третьим шагом: нужно решить, хотим ли выдирать аудио через ffmpeg.
 
@@ -93,11 +115,11 @@ prompts/voice_cleanup.md
 | Модуль | Ответственность |
 | --- | --- |
 | `pipeline.rs` | Оркестрация: определить media, создать job, скачать, ASR, cleanup, render, send, mark status. |
-| `types.rs` | `VoiceMedia`, `AsrSegment`, `AsrTranscript`, `CleanTranscript`, `RenderedTranscript`. |
+| `types.rs` | `VoiceMedia`, `AsrSegment`, `AsrTranscript`, `TranscriptChapter`, `CleanTranscript`, `RenderedTranscript`. |
 | `download.rs` | `getFile`, проверка размера, скачивание в temp path, cleanup temp files. |
 | `asr.rs` | Groq multipart request, парсинг `verbose_json`, нормализация timestamps. |
-| `cleanup.rs` | LLM prompt для исправления ASR и разбивки на смысловые фрагменты. |
-| `render.rs` | Telegram HTML preview, file body, fallback для длинного текста. |
+| `cleanup.rs` | LLM prompt для исправления ASR и разбивки на главы/смысловые фрагменты. |
+| `render.rs` | Telegram HTML chapters, expandable blockquotes, preview, file body, fallback для длинного текста. |
 | `repo.rs` | SQL для `voice_transcription_jobs`. |
 
 `main.rs` должен получить только один новый делегат в `handle_message`:
@@ -133,6 +155,7 @@ VOICE_CLEANUP_PROVIDER=
 VOICE_CLEANUP_MODEL=
 VOICE_CLEANUP_TEMPERATURE=0.2
 VOICE_CLEANUP_MAX_TOKENS=1800
+VOICE_RENDER_EXPANDABLE_CHAPTERS=true
 VOICE_SEND_FULL_FILE=true
 ```
 
@@ -141,6 +164,7 @@ VOICE_SEND_FULL_FILE=true
 - `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
 - `VOICE_CLEANUP_MODEL` пустой значит использовать обычную модель provider-а.
 - `VOICE_MAX_FILE_MB=20` выбран из-за cloud Bot API `getFile`; если поднимешь local Bot API server, можно увеличивать отдельно.
+- `VOICE_RENDER_EXPANDABLE_CHAPTERS=true` значит использовать видимые заголовки глав и `<blockquote expandable>` для тела главы.
 - `VOICE_SEND_FULL_FILE=true` значит длинная расшифровка уходит preview + `.md`/`.txt` файлом.
 
 ## Database
@@ -168,6 +192,7 @@ create table voice_transcription_jobs (
     cleanup_model text,
     raw_transcript text,
     cleaned_text text,
+    chapters_json jsonb,
     segments_json jsonb,
     raw_asr_json jsonb,
     final_html text,
@@ -255,14 +280,21 @@ pub struct AsrTranscript {
     pub raw_json: serde_json::Value,
 }
 
+pub struct TranscriptChapter {
+    pub title: String,
+    pub start_sec: f32,
+    pub end_sec: Option<f32>,
+    pub text: String,
+}
+
 pub struct CleanTranscript {
     pub text: String,
-    pub topics: Vec<String>,
+    pub chapters: Vec<TranscriptChapter>,
     pub short_summary: Option<String>,
 }
 ```
 
-Не хранить Telegram HTML как единственный источник истины. `cleaned_text` должен быть plain text/Markdown-like, а HTML собирать отдельно.
+Не хранить Telegram HTML как единственный источник истины. `cleaned_text` должен быть plain text/Markdown-like, `chapters_json` должен хранить структурные главы, а HTML собирать отдельно.
 
 ## Download layer
 
@@ -351,9 +383,30 @@ Content-Type: multipart/form-data
 - сохранить смысл, стиль и важные формулировки;
 - сохранить/поправить технические термины;
 - заменить длинные числительные цифрами, где это улучшает читаемость;
-- разбить на смысловые фрагменты;
-- поставить timestamps в формате `0:30` в начале фрагментов;
+- разбить на главы/смысловые фрагменты;
+- дать каждой главе короткий заголовок и timestamp в формате `0:30`;
+- тело главы должно покрывать расшифровку до следующей главы;
 - если кусок неразборчив, писать `[неразборчиво]`, а не фантазировать.
+
+Лучше просить модель вернуть JSON, а не сразу текст:
+
+```json
+{
+  "chapters": [
+    {
+      "title": "Обсуждение AMD",
+      "start": "0:00",
+      "text": "Начали обсуждать драйверы AMD и почему опять всё отвалилось. ..."
+    },
+    {
+      "title": "Linux и Proton",
+      "start": "0:28",
+      "text": "Перешли к Linux/Proton и спору, насколько это массовая проблема. ..."
+    }
+  ],
+  "short_summary": "Коротко обсудили AMD, Linux/Proton и проверку Mesa."
+}
+```
 
 Пример prompt:
 
@@ -362,20 +415,25 @@ Content-Type: multipart/form-data
 
 На входе ASR segments с таймкодами. Исправь ошибки распознавания, восстанови пунктуацию, убери слова-паразиты и бессмысленные повторы. Не добавляй новых фактов и не меняй позицию говорящего.
 
-Формат ответа:
-0:00 Первый смысловой фрагмент.
-0:30 Второй смысловой фрагмент.
-1:10 Третий смысловой фрагмент.
+Верни JSON строго такого вида:
+{
+  "chapters": [
+    { "title": "Короткий заголовок", "start": "0:00", "text": "Текст главы до следующей главы." }
+  ],
+  "short_summary": "Одна короткая фраза о голосовом."
+}
 
 Правила:
-- таймкод бери из начала соответствующего ASR segment;
+- timestamp бери из начала соответствующего ASR segment;
 - объединяй соседние segments, если это одна мысль;
-- не делай фрагменты длиннее 3-5 предложений;
+- глава должна быть смысловым блоком, а не каждым ASR segment;
+- title должен быть коротким: 2-5 слов;
+- text главы не должен повторять title;
 - технические термины сохраняй точно;
 - если не уверен в слове, выбери наиболее вероятный вариант по контексту;
 - если фрагмент реально неразборчив, напиши [неразборчиво];
 - не используй Telegram HTML;
-- верни только готовую расшифровку.
+- не оборачивай JSON в markdown.
 ```
 
 Контекст для модели лучше передавать как compact list segments:
@@ -385,16 +443,20 @@ Content-Type: multipart/form-data
 [0:12-0:24] на линуксе вроде норм но в протоне...
 ```
 
+Если JSON parse упал, fallback: взять plain `content`, разбить по строкам с timestamps и отрендерить без chapters.
+
 ## Rendering
 
-`voice/render.rs` должен работать от plain cleaned text.
+`voice/render.rs` должен работать от structured `chapters`, а не от HTML, придуманного моделью.
 
 MVP-правило:
 
-1. собрать HTML title + cleaned transcript;
-2. если `chars <= SAFE_TEXT_LIMIT`, отправить одним reply;
-3. если длиннее, отправить preview reply и полный `.md`/`.txt` через `send_document`;
-4. если даже preview внезапно > 4096, обрезать preview через `truncate_text` до `SAFE_TEXT_LIMIT`.
+1. собрать HTML title;
+2. для каждой главы вывести видимый заголовок `title + timestamp`;
+3. тело главы положить в `<blockquote expandable>`;
+4. если `chars <= SAFE_TEXT_LIMIT`, отправить одним reply;
+5. если длиннее, отправить preview с первыми главами и полный `.md`/`.txt` через `send_document`;
+6. если даже preview внезапно > 4096, обрезать preview через `truncate_text` до `SAFE_TEXT_LIMIT`.
 
 Пример типа:
 
@@ -405,24 +467,58 @@ pub enum RenderedTranscript {
 }
 ```
 
-Для single message можно подсветить timestamp:
+Добавить helper в `telegram/html.rs`:
 
-```text
-0:30 -> <code>0:30</code>
+```rust
+pub fn expandable_blockquote(text: impl AsRef<str>) -> Html {
+    Html::raw_trusted(format!(
+        "<blockquote expandable>{}</blockquote>",
+        escape(text.as_ref())
+    ))
+}
 ```
 
-Но только если renderer сам экранирует весь остальной текст. Не отдавать LLM право писать Telegram HTML.
+И helper для timestamp:
+
+```rust
+pub fn format_timestamp(seconds: f32) -> String {
+    let total = seconds.max(0.0).round() as u32;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+```
+
+Пример сборки главы:
+
+```rust
+let mut html = Html::empty();
+html.line(Html::bold("Расшифровка голосового"));
+html.blank_line();
+
+for chapter in &transcript.chapters {
+    html.line(Html::raw_trusted(format!(
+        "{} {}",
+        Html::bold(&chapter.title).into_string(),
+        Html::code(format_timestamp(chapter.start_sec)).into_string(),
+    )));
+    html.line(html::expandable_blockquote(&chapter.text));
+    html.blank_line();
+}
+```
+
+В реальном коде лучше не собирать `raw_trusted(format!(...))` вокруг внешнего текста. Заголовок и timestamp должны быть уже безопасными `Html`, а raw использовать только для пробела/перевода строки или самого тега blockquote.
 
 Для file body использовать plain Markdown-like text:
 
 ```text
 # Расшифровка голосового
 
-Чат: ...
-Сообщение: ...
+## Обсуждение AMD 0:00
 
-0:00 ...
-0:30 ...
+Начали обсуждать драйверы AMD и почему опять всё отвалилось.
+
+## Linux и Proton 0:28
+
+Перешли к Linux/Proton и спору, насколько это массовая проблема.
 ```
 
 ## Pipeline skeleton
@@ -550,19 +646,22 @@ cargo check
 ```text
 voice::types::VoiceMedia::from_message ignores non-voice
 voice::render single short transcript
+voice::render expandable chapters escape title/body
 voice::render preview + file for long transcript
 voice::render escapes raw HTML from cleanup model
-voice::cleanup prompt contains segment timestamps
+voice::cleanup parses chapter JSON
+voice::cleanup falls back when JSON is invalid
 voice::asr parses verbose_json segments
+telegram::html::expandable_blockquote escapes body
 config parses voice env defaults
 ```
 
 Integration smoke без реального Groq:
 
 - fake `AsrClient` возвращает segments;
-- fake cleanup возвращает cleaned text;
-- renderer отправляет one-message path;
-- long text уходит в `PreviewAndFile`.
+- fake cleanup возвращает chapters;
+- renderer отправляет one-message path with expandable blockquotes;
+- long chapters уходят в `PreviewAndFile`.
 
 ## Что не делать в первом voice PR
 
