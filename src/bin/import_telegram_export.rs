@@ -14,6 +14,13 @@ struct Args {
     chat_id: Option<i64>,
     batch_size: usize,
     dry_run: bool,
+    user_aliases: Vec<UserAlias>,
+}
+
+#[derive(Debug, Clone)]
+struct UserAlias {
+    username: String,
+    user_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     import_messages(&pool, chat_id, &root.messages, args.batch_size).await?;
     import_reactions(&pool, chat_id, &root.messages, args.batch_size).await?;
     upsert_profiles(&pool, profiles).await?;
+    upsert_user_aliases(&pool, &args.user_aliases).await?;
     rebuild_chat_users(&pool, chat_id).await?;
 
     println!("import complete");
@@ -150,11 +158,16 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut chat_id = None;
     let mut batch_size = 1000usize;
     let mut dry_run = false;
+    let mut user_aliases = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--user-alias" => {
+                let value = args.next().context("--user-alias requires username:id")?;
+                user_aliases.push(parse_user_alias(&value)?);
+            }
             "--chat-id" => {
                 let value = args.next().context("--chat-id requires value")?;
                 chat_id = Some(value.parse().context("invalid --chat-id")?);
@@ -168,7 +181,7 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             "-h" | "--help" => {
                 println!(
-                    "Usage: import_telegram_export <result.json> [--chat-id -100...] [--batch-size 1000] [--dry-run]"
+                    "Usage: import_telegram_export <result.json> [--chat-id -100...] [--batch-size 1000] [--user-alias username:id] [--dry-run]"
                 );
                 std::process::exit(0);
             }
@@ -189,6 +202,22 @@ fn parse_args() -> anyhow::Result<Args> {
         chat_id,
         batch_size,
         dry_run,
+        user_aliases,
+    })
+}
+
+fn parse_user_alias(value: &str) -> anyhow::Result<UserAlias> {
+    let (username, user_id) = value
+        .split_once(':')
+        .context("--user-alias must be username:id")?;
+    let username = username.trim().trim_start_matches('@').to_lowercase();
+    if username.is_empty() {
+        bail!("--user-alias username must not be empty");
+    }
+
+    Ok(UserAlias {
+        username,
+        user_id: user_id.trim().parse().context("invalid --user-alias id")?,
     })
 }
 
@@ -500,6 +529,34 @@ async fn upsert_profiles(pool: &PgPool, profiles: HashMap<i64, UserProfile>) -> 
     Ok(())
 }
 
+async fn upsert_user_aliases(pool: &PgPool, aliases: &[UserAlias]) -> anyhow::Result<()> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for alias in aliases {
+        sqlx::query(
+            r#"
+            insert into telegram_user_profiles
+                (telegram_user_id, username, first_name, last_name, is_bot, last_seen_at, updated_at)
+            values ($1, $2, null, null, false, now(), now())
+            on conflict (telegram_user_id) do update set
+                username = excluded.username,
+                updated_at = now()
+            "#,
+        )
+        .bind(alias.user_id)
+        .bind(&alias.username)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    println!("user aliases upserted: {}", aliases.len());
+    Ok(())
+}
+
 async fn rebuild_chat_users(pool: &PgPool, chat_id: i64) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -701,5 +758,13 @@ mod tests {
     fn flattens_rich_text() {
         let text = serde_json::json!(["hello ", {"type": "link", "text": "https://t.me/x"}]);
         assert_eq!(message_text(&text), "hello https://t.me/x");
+    }
+
+    #[test]
+    fn parses_user_alias() {
+        let alias = parse_user_alias("@JustSay8:968515039").unwrap();
+
+        assert_eq!(alias.username, "justsay8");
+        assert_eq!(alias.user_id, 968515039);
     }
 }
