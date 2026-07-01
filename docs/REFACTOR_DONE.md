@@ -138,6 +138,8 @@ cargo run --release --bin refresh_user_profiles -- --only-spammers --limit 200
 cargo run --release --bin refresh_user_profiles -- --all --limit 500 --sleep-ms 100
 ```
 
+Новые авторы сообщений в основном чате профилируются сразу при первом увиденном сообщении, если `profile_refreshed_at` ещё пустой. CLI остаётся для добивки старой истории и ручного прохода по спамерам.
+
 Telegram отдаёт bio и фото best-effort: часть пользователей может иметь пустой bio, закрытый профиль или ноль публичных фото. Ошибка API пишется в `telegram_user_profiles.profile_refresh_error`.
 
 ## Known caveats
