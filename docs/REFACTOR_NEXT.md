@@ -8,7 +8,13 @@
 
 Бот должен уметь принимать `voice`, `audio` и позже `video_note`, получать расшифровку через Groq Whisper, прогонять результат через LLM-cleanup и отвечать в чат аккуратным Telegram HTML.
 
-Желаемый результат для пользователя:
+Короткие голосовые не надо превращать в протокол. Если после cleanup текст меньше `VOICE_SHORT_TEXT_MAX_CHARS` 300-400 символов, бот отправляет только исправленный текст без глав, таймкодов и раскрываемых блоков:
+
+```text
+Да, у AMD опять странная история с драйверами: на Windows жалуются на отвал, а на Linux часть людей пишет, что через свежую Mesa всё нормально. Надо смотреть конкретную версию и багрепорты.
+```
+
+Для средних и длинных голосовых желаемый результат:
 
 ```text
 Расшифровка голосового
@@ -39,7 +45,7 @@ Linux и Proton 0:28
 
 ## Внешние ограничения
 
-Telegram `sendMessage` принимает 0-4096 символов после entities parsing. В коде уже есть hard-limit `TELEGRAM_TEXT_LIMIT = 4096` и safe warning около `3900`. Для voice нельзя просто надеяться, что LLM уложится в лимит: renderer обязан сам выбирать single message, chunks или file fallback.
+Telegram `sendMessage` принимает 0-4096 символов после entities parsing. В коде уже есть hard-limit `TELEGRAM_TEXT_LIMIT = 4096` и safe warning около `3900`. Для voice нельзя просто надеяться, что LLM уложится в лимит: renderer обязан сам выбирать short text, expandable chapters, chunks или file fallback.
 
 Telegram HTML поддерживает раскрываемые цитаты через `<blockquote expandable>...</blockquote>`. Это хороший формат для voice chapters: заголовок главы остаётся видимым, подробная расшифровка свёрнута. `blockquote` и `expandable_blockquote` нельзя вкладывать друг в друга, поэтому renderer должен собирать главы плоским списком.
 
@@ -79,7 +85,8 @@ temperature = 0
 - Не трогать сообщения бота, команды и auto-forward посты канала.
 - Не расшифровывать файлы больше `VOICE_MAX_FILE_MB` и дольше `VOICE_MAX_DURATION_SEC`.
 - На слишком длинное или большое аудио отвечать коротким HTML-сообщением с причиной отказа.
-- Короткие и средние расшифровки отправлять как главы + expandable blockquotes.
+- Короткие расшифровки до `VOICE_SHORT_TEXT_MAX_CHARS` отправлять обычным исправленным текстом без глав и времени.
+- Средние расшифровки отправлять как главы + expandable blockquotes.
 - Полный файл отправлять только если главы не влезают в `SAFE_TEXT_LIMIT` или пользователь явно попросил файл.
 - Для `audio` включить поддержку после `voice`: там чаще бывают длинные файлы, музыка и мусор.
 - Для `video_note` включить третьим шагом: нужно решить, хотим ли выдирать аудио через ffmpeg.
@@ -118,8 +125,8 @@ prompts/voice_cleanup.md
 | `types.rs` | `VoiceMedia`, `AsrSegment`, `AsrTranscript`, `TranscriptChapter`, `CleanTranscript`, `RenderedTranscript`. |
 | `download.rs` | `getFile`, проверка размера, скачивание в temp path, cleanup temp files. |
 | `asr.rs` | Groq multipart request, парсинг `verbose_json`, нормализация timestamps. |
-| `cleanup.rs` | LLM prompt для исправления ASR и разбивки на главы/смысловые фрагменты. |
-| `render.rs` | Telegram HTML chapters, expandable blockquotes, preview, file body, fallback для длинного текста. |
+| `cleanup.rs` | LLM prompt для short/chapter cleanup. |
+| `render.rs` | Short text, Telegram HTML chapters, expandable blockquotes, preview, file body, fallback для длинного текста. |
 | `repo.rs` | SQL для `voice_transcription_jobs`. |
 
 `main.rs` должен получить только один новый делегат в `handle_message`:
@@ -147,6 +154,7 @@ VOICE_TRANSCRIPTION_ENABLED=true
 VOICE_AUTO_TRANSCRIBE=true
 VOICE_MAX_DURATION_SEC=600
 VOICE_MAX_FILE_MB=20
+VOICE_SHORT_TEXT_MAX_CHARS=400
 VOICE_LANGUAGE=ru
 VOICE_ASR_PROVIDER=groq
 VOICE_ASR_MODEL=whisper-large-v3-turbo
@@ -164,6 +172,7 @@ VOICE_SEND_FULL_FILE=true
 - `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
 - `VOICE_CLEANUP_MODEL` пустой значит использовать обычную модель provider-а.
 - `VOICE_MAX_FILE_MB=20` выбран из-за cloud Bot API `getFile`; если поднимешь local Bot API server, можно увеличивать отдельно.
+- `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткие ГС после cleanup отправляются простым текстом без глав и timestamps.
 - `VOICE_RENDER_EXPANDABLE_CHAPTERS=true` значит использовать видимые заголовки глав и `<blockquote expandable>` для тела главы.
 - `VOICE_SEND_FULL_FILE=true` значит длинная расшифровка уходит preview + `.md`/`.txt` файлом.
 
@@ -192,6 +201,7 @@ create table voice_transcription_jobs (
     cleanup_model text,
     raw_transcript text,
     cleaned_text text,
+    render_mode text,
     chapters_json jsonb,
     segments_json jsonb,
     raw_asr_json jsonb,
@@ -205,6 +215,14 @@ create table voice_transcription_jobs (
 
 create index voice_transcription_jobs_status_idx on voice_transcription_jobs(status);
 create index voice_transcription_jobs_created_at_idx on voice_transcription_jobs(created_at desc);
+```
+
+`render_mode` значения для MVP:
+
+```text
+short
+chapters
+file
 ```
 
 `repo.rs` API:
@@ -253,6 +271,12 @@ pub enum VoiceMediaKind {
     VideoNote,
 }
 
+pub enum TranscriptRenderMode {
+    Short,
+    Chapters,
+    File,
+}
+
 pub struct VoiceMedia {
     pub chat_id: i64,
     pub message_id: i32,
@@ -288,6 +312,7 @@ pub struct TranscriptChapter {
 }
 
 pub struct CleanTranscript {
+    pub mode: TranscriptRenderMode,
     pub text: String,
     pub chapters: Vec<TranscriptChapter>,
     pub short_summary: Option<String>,
@@ -383,7 +408,8 @@ Content-Type: multipart/form-data
 - сохранить смысл, стиль и важные формулировки;
 - сохранить/поправить технические термины;
 - заменить длинные числительные цифрами, где это улучшает читаемость;
-- разбить на главы/смысловые фрагменты;
+- для коротких сообщений вернуть только исправленный текст;
+- для средних/длинных сообщений разбить на главы/смысловые фрагменты;
 - дать каждой главе короткий заголовок и timestamp в формате `0:30`;
 - тело главы должно покрывать расшифровку до следующей главы;
 - если кусок неразборчив, писать `[неразборчиво]`, а не фантазировать.
@@ -392,6 +418,19 @@ Content-Type: multipart/form-data
 
 ```json
 {
+  "mode": "short",
+  "text": "Исправленный короткий текст без таймкодов и глав.",
+  "chapters": [],
+  "short_summary": null
+}
+```
+
+Или для длинного:
+
+```json
+{
+  "mode": "chapters",
+  "text": "Полная очищенная расшифровка plain text.",
   "chapters": [
     {
       "title": "Обсуждение AMD",
@@ -417,13 +456,17 @@ Content-Type: multipart/form-data
 
 Верни JSON строго такого вида:
 {
+  "mode": "short" | "chapters",
+  "text": "Полный очищенный текст без Telegram HTML.",
   "chapters": [
     { "title": "Короткий заголовок", "start": "0:00", "text": "Текст главы до следующей главы." }
   ],
-  "short_summary": "Одна короткая фраза о голосовом."
+  "short_summary": "Одна короткая фраза о голосовом или null."
 }
 
 Правила:
+- если очищенный текст короче 300-400 символов, верни mode = "short", chapters = [] и не добавляй timestamps;
+- если текст длиннее, верни mode = "chapters" и разбей его на смысловые главы;
 - timestamp бери из начала соответствующего ASR segment;
 - объединяй соседние segments, если это одна мысль;
 - глава должна быть смысловым блоком, а не каждым ASR segment;
@@ -443,25 +486,27 @@ Content-Type: multipart/form-data
 [0:12-0:24] на линуксе вроде норм но в протоне...
 ```
 
-Если JSON parse упал, fallback: взять plain `content`, разбить по строкам с timestamps и отрендерить без chapters.
+Если JSON parse упал, fallback: взять plain `content`; если текст короткий, отрендерить как short, иначе разбить по строкам с timestamps и отрендерить без chapters.
 
 ## Rendering
 
-`voice/render.rs` должен работать от structured `chapters`, а не от HTML, придуманного моделью.
+`voice/render.rs` должен работать от structured `CleanTranscript`, а не от HTML, придуманного моделью.
 
 MVP-правило:
 
-1. собрать HTML title;
-2. для каждой главы вывести видимый заголовок `title + timestamp`;
-3. тело главы положить в `<blockquote expandable>`;
-4. если `chars <= SAFE_TEXT_LIMIT`, отправить одним reply;
-5. если длиннее, отправить preview с первыми главами и полный `.md`/`.txt` через `send_document`;
-6. если даже preview внезапно > 4096, обрезать preview через `truncate_text` до `SAFE_TEXT_LIMIT`.
+1. если `mode = Short` или `text.chars().count() <= VOICE_SHORT_TEXT_MAX_CHARS`, отправить только исправленный текст через `Html::text`, без заголовка, timestamps и blockquote;
+2. если `mode = Chapters`, собрать HTML title;
+3. для каждой главы вывести видимый заголовок `title + timestamp`;
+4. тело главы положить в `<blockquote expandable>`;
+5. если `chars <= SAFE_TEXT_LIMIT`, отправить одним reply;
+6. если длиннее, отправить preview с первыми главами и полный `.md`/`.txt` через `send_document`;
+7. если даже preview внезапно > 4096, обрезать preview через `truncate_text` до `SAFE_TEXT_LIMIT`.
 
 Пример типа:
 
 ```rust
 pub enum RenderedTranscript {
+    Short { html: String },
     Single { html: String },
     PreviewAndFile { html: String, filename: String, body: String },
 }
@@ -645,10 +690,11 @@ cargo check
 
 ```text
 voice::types::VoiceMedia::from_message ignores non-voice
-voice::render single short transcript
+voice::render short transcript has no title/timestamp/blockquote
 voice::render expandable chapters escape title/body
 voice::render preview + file for long transcript
 voice::render escapes raw HTML from cleanup model
+voice::cleanup parses short JSON
 voice::cleanup parses chapter JSON
 voice::cleanup falls back when JSON is invalid
 voice::asr parses verbose_json segments
@@ -659,7 +705,9 @@ config parses voice env defaults
 Integration smoke без реального Groq:
 
 - fake `AsrClient` возвращает segments;
+- fake cleanup возвращает short text;
 - fake cleanup возвращает chapters;
+- renderer отправляет short one-message path без timestamps;
 - renderer отправляет one-message path with expandable blockquotes;
 - long chapters уходят в `PreviewAndFile`.
 
