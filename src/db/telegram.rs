@@ -141,11 +141,22 @@ async fn upsert_chat_user_activity(
         with flags as (
             select
                 exists (
+                    with recursive ancestors as (
+                        select message_id, reply_to_message_id, source_channel_id
+                        from telegram_messages
+                        where chat_id = $1 and message_id = $5
+
+                        union
+
+                        select parent.message_id, parent.reply_to_message_id, parent.source_channel_id
+                        from telegram_messages parent
+                        join ancestors child
+                          on parent.chat_id = $1
+                         and parent.message_id = child.reply_to_message_id
+                    )
                     select 1
-                    from telegram_messages
-                    where chat_id = $1
-                      and message_id = $5
-                      and source_channel_id is not null
+                    from ancestors
+                    where source_channel_id is not null
                 ) as reply_to_channel_post,
                 exists (
                     select 1
