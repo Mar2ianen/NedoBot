@@ -64,6 +64,7 @@ pub struct UserProfileDetails {
     pub personal_channel_last_text: Option<String>,
     pub personal_channel_has_adult_links: bool,
     pub personal_channel_raw_json: Option<serde_json::Value>,
+    pub personal_channel_refreshed_at: Option<DateTime<Utc>>,
     pub personal_channel_fetch_error: Option<String>,
     pub raw_json: serde_json::Value,
 }
@@ -441,8 +442,8 @@ pub async fn update_user_profile_details(
             $6, $7, $8, $9,
             $10, $11, $12, $13, $14,
             $15, $16,
-            $17, $18, $19, $20, $21, $22, $23, $24, $25, now(), $26,
-            $27, now(), null, now()
+            $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+            $28, now(), null, now()
         )
         on conflict (telegram_user_id) do update set
             username = coalesce(excluded.username, telegram_user_profiles.username),
@@ -502,6 +503,7 @@ pub async fn update_user_profile_details(
     .bind(details.personal_channel_last_text)
     .bind(details.personal_channel_has_adult_links)
     .bind(details.personal_channel_raw_json)
+    .bind(details.personal_channel_refreshed_at)
     .bind(details.personal_channel_fetch_error)
     .bind(details.raw_json)
     .execute(pool)
@@ -543,7 +545,11 @@ pub async fn user_profile_needs_refresh(
         r#"
         select coalesce(
             (
-                select not is_bot and profile_refreshed_at is null
+                select not is_bot
+                   and (
+                        profile_refreshed_at is null
+                        or personal_channel_refreshed_at is null
+                   )
                 from telegram_user_profiles
                 where telegram_user_id = $1
             ),

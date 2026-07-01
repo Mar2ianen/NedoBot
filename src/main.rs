@@ -83,9 +83,7 @@ async fn handle_message(
     msg: Message,
     state: AppState,
 ) -> ResponseResult<()> {
-    if let Err(err) = maybe_refresh_message_author_profile(&bot, &msg, &state).await {
-        tracing::warn!(%err, "failed to refresh message author profile");
-    }
+    spawn_message_author_profile_refresh(&bot, &msg, &state);
 
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
         return Ok(());
@@ -104,34 +102,43 @@ async fn handle_message(
     Ok(())
 }
 
-async fn maybe_refresh_message_author_profile(
+fn spawn_message_author_profile_refresh(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
-) -> anyhow::Result<()> {
+) {
     if msg.chat.id.0 != state.config.discussion_chat_id || msg.is_automatic_forward() {
-        return Ok(());
+        return;
     }
 
     let Some(user) = msg.from.as_ref() else {
-        return Ok(());
+        return;
     };
     if user.is_bot {
-        return Ok(());
+        return;
     }
 
     let user_id = user.id.0 as i64;
-    if !user_profile_needs_refresh(&state.pool, user_id).await? {
-        return Ok(());
-    }
+    let bot = bot.inner().clone();
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        match user_profile_needs_refresh(&pool, user_id).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::warn!(%err, user_id, "failed to check user profile refresh state");
+                return;
+            }
+        }
 
-    if let Err(err) = refresh_profile(bot.inner(), &state.pool, user_id).await {
-        let message = err.to_string();
-        mark_user_profile_refresh_error(&state.pool, user_id, &message).await?;
-        anyhow::bail!(err);
-    }
-
-    Ok(())
+        if let Err(err) = refresh_profile(&bot, &pool, user_id).await {
+            let message = err.to_string();
+            if let Err(save_err) = mark_user_profile_refresh_error(&pool, user_id, &message).await {
+                tracing::warn!(%save_err, user_id, "failed to save profile refresh error");
+            }
+            tracing::warn!(%err, user_id, "failed to refresh message author profile");
+        }
+    });
 }
 
 async fn handle_message_reaction(

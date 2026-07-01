@@ -3,7 +3,7 @@ use std::time::Duration;
 use teloxide::prelude::*;
 use tg_ai_bot_teloxide::{
     config::Config,
-    db::{build_pool, migrate},
+    db::{build_pool, migrate, telegram::mark_user_profile_refresh_error},
     features::user_profiles::service::{RefreshUserProfilesQuery, load_user_ids, refresh_profile},
 };
 use tokio::time::sleep;
@@ -59,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(()) => refreshed += 1,
             Err(err) => {
                 failed += 1;
+                let message = err.to_string();
+                mark_user_profile_refresh_error(&pool, user_id, &message).await?;
                 println!("failed user_id={user_id}: {err:#}");
             }
         }

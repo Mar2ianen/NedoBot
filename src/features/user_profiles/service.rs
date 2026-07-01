@@ -4,6 +4,7 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::types::chrono::Utc;
 use teloxide::{
     payloads::GetUserProfilePhotosSetters,
     prelude::*,
@@ -41,7 +42,11 @@ pub async fn load_user_ids(
         from telegram_chat_users cu
         left join telegram_user_profiles p on p.telegram_user_id = cu.telegram_user_id
         where cu.chat_id = $1
-          and ($2 or p.profile_refreshed_at is null)
+          and (
+              $2
+              or p.profile_refreshed_at is null
+              or p.personal_channel_refreshed_at is null
+          )
           and (not $3 or cu.is_spammer)
           and not coalesce(p.is_bot, false)
         order by
@@ -150,6 +155,15 @@ fn build_details(
     let profile_photo = photos
         .and_then(|photos| photos.photos.first())
         .and_then(|sizes| sizes.iter().max_by_key(|photo| photo.width * photo.height));
+    let personal_channel_refreshed_at = if personal_channel.is_some()
+        || personal_channel_error
+            .as_deref()
+            .is_some_and(is_definitive_personal_channel_error)
+    {
+        Some(Utc::now())
+    } else {
+        None
+    };
 
     UserProfileDetails {
         telegram_user_id,
@@ -182,6 +196,7 @@ fn build_details(
         personal_channel_has_adult_links: personal_channel
             .is_some_and(|channel| channel.has_adult_links),
         personal_channel_raw_json: personal_channel.map(|channel| channel.raw_json.clone()),
+        personal_channel_refreshed_at,
         personal_channel_fetch_error: personal_channel_error,
         raw_json: json!({
             "chat": chat,
@@ -237,7 +252,10 @@ struct PersonalChannelChat {
 async fn fetch_personal_channel_messages(user_id: i64) -> anyhow::Result<PersonalChannelData> {
     let token = std::env::var("TELOXIDE_TOKEN").or_else(|_| std::env::var("BOT_TOKEN"))?;
     let url = format!("https://api.telegram.org/bot{token}/getUserPersonalChatMessages");
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let response = client
         .post(url)
         .json(&json!({
             "user_id": user_id,
@@ -297,4 +315,8 @@ fn build_personal_channel_data(
         has_adult_links,
         raw_json,
     }
+}
+
+fn is_definitive_personal_channel_error(error: &str) -> bool {
+    error.contains("USER_PERSONAL_CHANNEL_MISSING")
 }

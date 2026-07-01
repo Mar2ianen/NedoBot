@@ -138,7 +138,7 @@ cargo run --release --bin refresh_user_profiles -- --only-spammers --limit 200
 cargo run --release --bin refresh_user_profiles -- --all --limit 500 --sleep-ms 100
 ```
 
-Новые авторы сообщений в основном чате профилируются сразу при первом увиденном сообщении, если `profile_refreshed_at` ещё пустой. CLI остаётся для добивки старой истории и ручного прохода по спамерам.
+Новые авторы сообщений в основном чате профилируются сразу при первом увиденном сообщении, если `profile_refreshed_at` или `personal_channel_refreshed_at` ещё пустой. Live handler запускает profile refresh через `tokio::spawn`, поэтому voice/first-comment/обычная обработка не ждут внешние Telegram API. Raw `getUserPersonalChatMessages` имеет 5-секундный timeout; временная ошибка personal channel не закрывает retry, а `USER_PERSONAL_CHANNEL_MISSING` считается окончательной проверкой. CLI остаётся для добивки старой истории и ручного прохода по спамерам.
 
 Telegram отдаёт bio и фото best-effort: часть пользователей может иметь пустой bio, закрытый профиль или ноль публичных фото. Ошибка API пишется в `telegram_user_profiles.profile_refresh_error`.
 
