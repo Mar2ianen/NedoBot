@@ -86,6 +86,7 @@ pub async fn maybe_comment_post(
     )
     .await?;
     let final_html = build_comment_html(&generation.content, config);
+    ensure_comment_html(&final_html, &generation.content)?;
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
 
@@ -118,6 +119,17 @@ pub async fn maybe_comment_post(
     .await
     {
         tracing::warn!(%err, "failed to save post memory note");
+    }
+
+    Ok(())
+}
+
+fn ensure_comment_html(final_html: &str, raw_response: &str) -> anyhow::Result<()> {
+    if final_html.trim().is_empty() {
+        anyhow::bail!(
+            "empty rendered comment from LLM response: {}",
+            raw_response.chars().take(120).collect::<String>()
+        );
     }
 
     Ok(())
