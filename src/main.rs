@@ -17,8 +17,8 @@ mod text;
 
 use config::Config;
 use db::telegram::{
-    refresh_known_member_snapshots, save_chat_member_event, save_message_reaction,
-    save_message_reaction_count,
+    refresh_known_member_snapshots, save_chat_member_event, save_edited_telegram_message,
+    save_message_reaction, save_message_reaction_count,
 };
 use db::{build_pool, migrate};
 use features::first_comment::pipeline::maybe_comment_post;
@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .branch(
             Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
         )
+        .branch(Update::filter_edited_message().endpoint(handle_edited_message))
         .branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
@@ -114,6 +115,14 @@ async fn handle_message_reaction_count(
 ) -> ResponseResult<()> {
     if let Err(err) = save_message_reaction_count(&state.pool, &reaction_count).await {
         tracing::error!(%err, "failed to save message reaction count");
+    }
+
+    Ok(())
+}
+
+async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<()> {
+    if let Err(err) = save_edited_telegram_message(&state.pool, &msg).await {
+        tracing::error!(%err, "failed to save edited message");
     }
 
     Ok(())

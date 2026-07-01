@@ -31,6 +31,12 @@ struct ChatUserMemberEvent<'a> {
     event_at: DateTime<Utc>,
 }
 
+struct StoredMessageSnapshot {
+    user_id: Option<i64>,
+    text: Option<String>,
+    raw_json: serde_json::Value,
+}
+
 pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
     let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
@@ -110,6 +116,117 @@ pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Resu
     if inserted {
         upsert_chat_user_activity(pool, msg, source_channel_id).await?;
     }
+
+    Ok(())
+}
+
+pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
+    let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
+    let new_text = message_text(msg);
+    let new_raw_json = serde_json::to_value(msg)?;
+    let changed = old.as_ref().is_none_or(|old| {
+        old.text.as_deref() != new_text.as_deref() || old.raw_json != new_raw_json
+    });
+
+    save_telegram_message(pool, msg).await?;
+
+    if !changed {
+        return Ok(());
+    }
+
+    let edited_at = msg.edit_date().cloned().unwrap_or_else(Utc::now);
+    sqlx::query(
+        r#"
+        insert into telegram_message_edits
+            (
+                chat_id, message_id, user_id, old_text, new_text,
+                old_raw_json, new_raw_json, edited_at
+            )
+        values ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(msg.chat.id.0)
+    .bind(msg.id.0)
+    .bind(
+        msg.from
+            .as_ref()
+            .map(|user| user.id.0 as i64)
+            .or_else(|| old.as_ref().and_then(|old| old.user_id)),
+    )
+    .bind(old.as_ref().and_then(|old| old.text.as_deref()))
+    .bind(new_text.as_deref())
+    .bind(old.as_ref().map(|old| &old.raw_json))
+    .bind(new_raw_json)
+    .bind(edited_at)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        update telegram_messages
+        set edited_at = $3,
+            edit_count = edit_count + 1,
+            updated_at = now()
+        where chat_id = $1 and message_id = $2
+        "#,
+    )
+    .bind(msg.chat.id.0)
+    .bind(msg.id.0)
+    .bind(edited_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn load_message_snapshot(
+    pool: &PgPool,
+    chat_id: i64,
+    message_id: i32,
+) -> anyhow::Result<Option<StoredMessageSnapshot>> {
+    let row = sqlx::query_as::<_, (Option<i64>, Option<String>, serde_json::Value)>(
+        r#"
+        select user_id, text, raw_json
+        from telegram_messages
+        where chat_id = $1 and message_id = $2
+        "#,
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(user_id, text, raw_json)| StoredMessageSnapshot {
+        user_id,
+        text,
+        raw_json,
+    }))
+}
+
+#[allow(dead_code)]
+pub async fn mark_message_deleted_by_bot(
+    pool: &PgPool,
+    chat_id: i64,
+    message_id: i32,
+    actor_user_id: Option<i64>,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update telegram_messages
+        set deleted_by_bot_at = now(),
+            deleted_by_bot_actor_id = $3,
+            deleted_by_bot_reason = $4,
+            updated_at = now()
+        where chat_id = $1 and message_id = $2
+        "#,
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .bind(actor_user_id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
