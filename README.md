@@ -5,27 +5,7 @@
 **AI-инфраструктура для `НедоNews Chat`: первый комментарий под постом, память контекста, статистика и немного магии вокруг живого Telegram-чата.**
 
 <p>
-  <a href="https://t.me/ned0news">
-    <img alt="Telegram channel" src="https://img.shields.io/badge/Telegram-ned0news-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
-  </a>
-  <a href="https://t.me/+RxmPtw7Bs-IxNzEy">
-    <img alt="Telegram chat" src="https://img.shields.io/badge/Telegram-chat-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
-  </a>
-  <a href="docs/TECHNICAL.md">
-    <img alt="Technical docs" src="https://img.shields.io/badge/docs-technical-8A2BE2?style=for-the-badge&logo=readthedocs&logoColor=white">
-  </a>
-  <a href="LICENSE">
-    <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-F5C542?style=for-the-badge">
-  </a>
-  <img alt="Project status" src="https://img.shields.io/badge/status-live_mvp-00A67E?style=for-the-badge">
-</p>
-
-<p>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white">
-  <img alt="Telegram Bot API" src="https://img.shields.io/badge/Telegram_Bot_API-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
-  <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white">
-  <img alt="Ollama" src="https://img.shields.io/badge/Ollama-LLM-111111?style=for-the-badge">
-  <img alt="Podman" src="https://img.shields.io/badge/Podman-892CA0?style=for-the-badge&logo=podman&logoColor=white">
 </p>
 
 <p>
