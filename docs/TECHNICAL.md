@@ -249,6 +249,35 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 - Join/leave и точные member-status события зависят от того, какие `chat_member` updates Telegram реально отдаёт боту. На старте бот дополнительно делает best-effort `getChatMember` по последним виденным пользователям.
 - Автоматическая конверсия по отдельной invite-ссылке пока не считается; входы через конкретную ссылку можно будет выделить, когда Telegram начнёт отдавать invite link в member events.
 
+## Импорт Telegram Export
+
+Для старой истории чата используется отдельная CLI-команда, не polling-бот:
+
+```bash
+cargo run --bin import_telegram_export -- "/path/to/ChatExport/result.json" --dry-run
+cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.json"
+```
+
+Импорт читает `result.json` из Telegram/AyuGram Desktop export, вычисляет Bot API chat id из export id (`1932061163` -> `-1001932061163`) и пишет данные в текущие таблицы:
+
+- `telegram_messages`;
+- `telegram_user_profiles`;
+- `telegram_chat_users`.
+
+Дедупликация:
+
+- сообщения пишутся через `telegram_messages unique(chat_id, message_id)`;
+- профили пишутся через `telegram_user_profiles primary key (telegram_user_id)`;
+- пользовательская статистика пересобирается из `telegram_messages` в `telegram_chat_users`, поэтому повторный импорт не увеличивает счётчики;
+- live Bot API `raw_json` не затирается экспортным JSON при конфликте, импорт только дополняет отсутствующие поля и флаги.
+
+Перед импортом на VPS лучше сделать backup:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres pg_dump -U tg_ai_bot -d tg_ai_bot -Fc -f /tmp/tg_ai_bot_before_export_import.dump"
+ssh vps-153 "podman cp tg-ai-bot-postgres:/tmp/tg_ai_bot_before_export_import.dump /opt/tg-ai-bot-teloxide/tg_ai_bot_before_export_import.dump"
+```
+
 ## Custom Emoji
 
 Список считанных premium/custom emoji:
