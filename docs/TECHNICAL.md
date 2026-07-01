@@ -186,6 +186,16 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `telegram_message_reaction_counts` - последние известные счётчики реакций по сообщению.
 - `bot_settings`, `telegram_users`, `telegram_chats`, `admin_events` - задел под админку.
 
+Спам-разметка:
+
+- `telegram_messages.spam_type` - нормализованный тип спама для конкретного сообщения.
+- `telegram_chat_users.spam_type` - основной тип спамера.
+- `telegram_chat_users.spam_types` - JSON-счётчик типов по пользователю.
+- `telegram_chat_users.spam_profile_labels` - признаки профиля: generic avatar/persona, подозрительный ник, повторяемый пол/образ и т.п.
+- текущие seed-типы: `llm_generic_comment`, `promo_dm_bait`.
+- `llm_generic_comment` - безобидно выглядящий LLM-коммент по теме поста, часто с одинаковым восторженным тоном.
+- `promo_dm_bait` - промо через “могу отправить/поделиться/пишите в личку”, тематика может быть разная, но механика одна.
+
 Посмотреть последние сообщения:
 
 ```bash
