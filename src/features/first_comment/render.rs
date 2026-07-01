@@ -164,6 +164,21 @@ mod tests {
             amd_custom_emoji_id: None,
             radeon_custom_emoji_id: None,
             ryzen_custom_emoji_id: None,
+            voice_transcription_enabled: false,
+            voice_auto_transcribe: false,
+            voice_max_duration_sec: 600,
+            voice_max_file_mb: 20,
+            voice_short_text_max_chars: 400,
+            voice_language: "ru".to_string(),
+            voice_asr_provider: "groq".to_string(),
+            voice_asr_model: "whisper-large-v3-turbo".to_string(),
+            voice_asr_temperature: 0.0,
+            voice_cleanup_provider: None,
+            voice_cleanup_model: None,
+            voice_cleanup_temperature: 0.2,
+            voice_cleanup_max_tokens: 1800,
+            voice_render_expandable_chapters: true,
+            voice_send_full_file: true,
         }
     }
 
