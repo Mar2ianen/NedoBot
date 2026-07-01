@@ -24,13 +24,19 @@ pub async fn cleanup_transcript(
     )
     .await?;
 
-    parse_cleanup_json(&generated.content).or_else(|err| {
+    let clean = parse_cleanup_json(&generated.content).or_else(|err| {
         tracing::warn!(%err, "failed to parse voice cleanup JSON, using plain LLM text");
-        Ok(plain_cleanup(
+        Ok::<CleanTranscript, anyhow::Error>(plain_cleanup(
             &generated.content,
             config.voice_short_text_max_chars,
         ))
-    })
+    })?;
+
+    Ok(normalize_cleanup(
+        clean,
+        transcript,
+        config.voice_short_text_max_chars,
+    ))
 }
 
 fn build_prompt(config: &Config, transcript: &AsrTranscript) -> String {
@@ -104,6 +110,113 @@ fn plain_cleanup(value: &str, short_limit: usize) -> CleanTranscript {
     }
 }
 
+fn normalize_cleanup(
+    mut clean: CleanTranscript,
+    transcript: &AsrTranscript,
+    short_limit: usize,
+) -> CleanTranscript {
+    if clean.text.chars().count() <= short_limit {
+        clean.mode = TranscriptRenderMode::Short;
+        clean.chapters.clear();
+        return clean;
+    }
+
+    if clean.mode == TranscriptRenderMode::Short || clean.chapters.is_empty() {
+        clean.mode = TranscriptRenderMode::Chapters;
+        clean.chapters = fallback_chapters(transcript, &clean.text);
+    }
+
+    clean
+}
+
+fn fallback_chapters(transcript: &AsrTranscript, clean_text: &str) -> Vec<TranscriptChapter> {
+    if transcript.segments.is_empty() {
+        return vec![TranscriptChapter {
+            title: fallback_title(clean_text),
+            start_sec: 0.0,
+            end_sec: None,
+            text: clean_text.trim().to_string(),
+        }];
+    }
+
+    let mut chapters = Vec::new();
+    let mut current = String::new();
+    let mut start_sec = transcript
+        .segments
+        .first()
+        .map(|segment| segment.start_sec)
+        .unwrap_or(0.0);
+    let mut end_sec = None;
+
+    for segment in &transcript.segments {
+        if current.is_empty() {
+            start_sec = segment.start_sec;
+        }
+
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(segment.text.trim());
+        end_sec = Some(segment.end_sec);
+
+        if current.chars().count() >= 220 {
+            chapters.push(TranscriptChapter {
+                title: fallback_title(&current),
+                start_sec,
+                end_sec,
+                text: current.trim().to_string(),
+            });
+            current.clear();
+            end_sec = None;
+        }
+    }
+
+    if !current.trim().is_empty() {
+        chapters.push(TranscriptChapter {
+            title: fallback_title(&current),
+            start_sec,
+            end_sec,
+            text: current.trim().to_string(),
+        });
+    }
+
+    chapters
+}
+
+fn fallback_title(text: &str) -> String {
+    let stop_words = [
+        "так",
+        "вообще",
+        "короче",
+        "вот",
+        "ну",
+        "типа",
+        "значит",
+        "по",
+        "идее",
+    ];
+    let words = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| {
+                ch.is_ascii_punctuation() || matches!(ch, '«' | '»' | '“' | '”')
+            })
+        })
+        .filter(|word| !word.is_empty())
+        .filter(|word| {
+            let lower = word.to_lowercase();
+            !stop_words.contains(&lower.as_str())
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+
+    if words.is_empty() {
+        "Фрагмент".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
 fn strip_code_fence(value: &str) -> &str {
     let value = value.trim();
     let Some(rest) = value.strip_prefix("```") else {
@@ -156,4 +269,43 @@ struct CleanupChapter {
     start: String,
     end: Option<String>,
     text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::voice::types::AsrSegment;
+
+    #[test]
+    fn long_short_cleanup_is_forced_into_chapters() {
+        let transcript = AsrTranscript {
+            provider: "groq".to_string(),
+            model: "whisper".to_string(),
+            request_id: None,
+            text: "Первый фрагмент про проверку. Второй фрагмент про разметку.".to_string(),
+            segments: vec![
+                AsrSegment {
+                    start_sec: 0.0,
+                    end_sec: 3.0,
+                    text: "Первый фрагмент про проверку.".to_string(),
+                },
+                AsrSegment {
+                    start_sec: 3.0,
+                    end_sec: 6.0,
+                    text: "Второй фрагмент про разметку.".to_string(),
+                },
+            ],
+            raw_json: serde_json::json!({}),
+        };
+        let clean = CleanTranscript {
+            mode: TranscriptRenderMode::Short,
+            text: "Первый фрагмент про проверку. Второй фрагмент про разметку.".to_string(),
+            chapters: Vec::new(),
+            short_summary: None,
+        };
+
+        let normalized = normalize_cleanup(clean, &transcript, 20);
+        assert_eq!(normalized.mode, TranscriptRenderMode::Chapters);
+        assert!(!normalized.chapters.is_empty());
+    }
 }
