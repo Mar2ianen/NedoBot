@@ -94,32 +94,7 @@ limit 20;
 
 ## Ближайшие фиксы
 
-### 1. Вернуть timestamp в заголовки глав
-
-Запрошенный UX был таким:
-
-```text
-Обсуждение AMD 0:00
-[свернутый текст до следующей главы]
-```
-
-Текущий `src/features/voice/render.rs` выводит только `chapter.title`, без `chapter.start_sec`.
-
-Нужно:
-
-- добавить `format_timestamp(seconds: f32) -> String` в `voice/render.rs` или общий helper;
-- в `render_chapters`, `render_one_chapter` и `render_file_body` писать `title + timestamp`;
-- timestamp рендерить через `Html::code(...)` или plain text рядом с title;
-- добавить тест, что chapter title содержит `0:00`.
-
-Критерий готовности:
-
-```text
-<b>Обсуждение AMD</b> <code>0:00</code>
-<blockquote expandable>...</blockquote>
-```
-
-### 2. Сохранять cleanup provider/model в БД
+### 1. Сохранять cleanup provider/model в БД
 
 Миграция уже содержит поля:
 
@@ -142,7 +117,7 @@ pub struct CleanupResult {
 
 Или минимально расширить `CleanTranscript`, если не хочется отдельный тип.
 
-### 3. User-facing ошибки для ASR/cleanup/download
+### 2. User-facing ошибки для ASR/cleanup/download
 
 Сейчас validate errors отвечают пользователю, а ошибки download/ASR/cleanup в основном уходят в logs + `voice_transcription_jobs.error`.
 
@@ -154,7 +129,7 @@ pub struct CleanupResult {
 
 Практичный MVP: отвечать пользователю только на понятные recoverable ошибки, внутренние stack details не показывать.
 
-### 4. Manual `/transcribe` reply command
+### 3. Manual `/transcribe` reply command
 
 Auto mode уже есть, но ручной режим полезен, если auto-transcribe начнёт шуметь.
 
@@ -166,7 +141,7 @@ Auto mode уже есть, но ручной режим полезен, если
 
 Не нужно делать свободный аргумент с message id на первом проходе.
 
-### 5. `video_note` через ffmpeg
+### 4. `video_note` через ffmpeg
 
 Сейчас `video_note` определяется, но `download.rs` возвращает `UnsupportedVideoNote`.
 
@@ -179,7 +154,7 @@ Auto mode уже есть, но ручной режим полезен, если
 
 Не тащить это до стабилизации обычных voice/audio.
 
-### 6. Тесты, которых не хватает
+### 5. Тесты, которых не хватает
 
 Уже есть тесты для:
 
@@ -192,7 +167,7 @@ Auto mode уже есть, но ручной режим полезен, если
 Добавить:
 
 ```text
-voice::render chapter title includes timestamp
+voice::render chapter title has no timestamp
 voice::render long chapters produce MessageAndFile when over SAFE_TEXT_LIMIT
 voice::cleanup parses valid chapter JSON
 voice::cleanup invalid JSON falls back to plain text
@@ -223,9 +198,8 @@ voice::asr parses Groq verbose_json with segments
 
 ## Следующий порядок работы
 
-1. Timestamp в chapter headings + тест.
-2. Cleanup provider/model persistence.
-3. User-facing error policy для ASR/download failures.
-4. Manual `/transcribe` reply command.
-5. Smoke в живом чате на коротком и длинном voice.
-6. Только потом думать про `video_note`/ffmpeg.
+1. Cleanup provider/model persistence.
+2. User-facing error policy для ASR/download failures.
+3. Manual `/transcribe` reply command.
+4. Smoke в живом чате на коротком и длинном voice.
+5. Только потом думать про `video_note`/ffmpeg.
