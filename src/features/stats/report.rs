@@ -366,7 +366,7 @@ async fn build_user_stats_report(
     let Some(user_id) = resolve_user_id(pool, target, reply_user_id).await? else {
         let hint = match target.map(str::trim).filter(|value| !value.is_empty()) {
             Some(_) => "Не нашёл пользователя. Используй id, username из уже виденных ботом пользователей или reply на сообщение.".to_string(),
-            None => "Не понял, кого смотреть. Ответь командой на сообщение пользователя или передай id/username.".to_string(),
+            None => "Не понял, кого смотреть. Отправь команду обычным сообщением, ответь ей на сообщение пользователя или передай id/username.".to_string(),
         };
         return Ok(hint);
     };
