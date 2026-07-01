@@ -1,7 +1,10 @@
 use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
-    types::{ChatMemberUpdated, MessageReactionCountUpdated, MessageReactionUpdated, ParseMode},
+    types::{
+        ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
+        MessageReactionUpdated, ParseMode,
+    },
 };
 
 mod config;
@@ -39,6 +42,9 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env();
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
         tracing::warn!(%err, "failed to refresh member snapshots");
+    }
+    if let Err(err) = warn_if_reaction_updates_unavailable(&bot, &config).await {
+        tracing::warn!(%err, "failed to check reaction update availability");
     }
     let state = AppState::new(pool, config);
 
@@ -109,6 +115,28 @@ async fn handle_message_reaction_count(
 async fn handle_chat_member(member: ChatMemberUpdated, state: AppState) -> ResponseResult<()> {
     if let Err(err) = save_chat_member_event(&state.pool, &member).await {
         tracing::error!(%err, "failed to save chat member event");
+    }
+
+    Ok(())
+}
+
+async fn warn_if_reaction_updates_unavailable(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let me = bot.get_me().await?;
+    let member = bot
+        .get_chat_member(ChatId(config.discussion_chat_id), me.id)
+        .await?;
+
+    if !matches!(
+        member.kind,
+        ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
+    ) {
+        tracing::warn!(
+            status = ?member.kind,
+            "bot is not chat administrator; Telegram will not send message_reaction updates"
+        );
     }
 
     Ok(())
