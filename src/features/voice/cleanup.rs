@@ -96,14 +96,10 @@ fn parse_cleanup_json(value: &str) -> anyhow::Result<CleanTranscript> {
     })
 }
 
-fn plain_cleanup(value: &str, short_limit: usize) -> CleanTranscript {
+fn plain_cleanup(value: &str, _short_limit: usize) -> CleanTranscript {
     let text = value.trim().to_string();
     CleanTranscript {
-        mode: if text.chars().count() <= short_limit {
-            TranscriptRenderMode::Short
-        } else {
-            TranscriptRenderMode::Chapters
-        },
+        mode: TranscriptRenderMode::Short,
         text,
         chapters: Vec::new(),
         short_summary: None,
@@ -112,7 +108,7 @@ fn plain_cleanup(value: &str, short_limit: usize) -> CleanTranscript {
 
 fn normalize_cleanup(
     mut clean: CleanTranscript,
-    transcript: &AsrTranscript,
+    _transcript: &AsrTranscript,
     short_limit: usize,
 ) -> CleanTranscript {
     clean.text = normalize_terms(&clean.text);
@@ -121,182 +117,17 @@ fn normalize_cleanup(
         chapter.text = normalize_terms(&chapter.text);
     }
 
-    if clean.text.chars().count() <= short_limit {
+    if clean.text.chars().count() <= short_limit || clean.chapters.is_empty() {
         clean.mode = TranscriptRenderMode::Short;
         clean.chapters.clear();
         return clean;
     }
 
-    if clean.mode == TranscriptRenderMode::Short || clean.chapters.is_empty() {
+    if clean.mode == TranscriptRenderMode::Short {
         clean.mode = TranscriptRenderMode::Chapters;
-        clean.chapters = fallback_chapters(transcript, &clean.text);
     }
 
     clean
-}
-
-fn fallback_chapters(transcript: &AsrTranscript, clean_text: &str) -> Vec<TranscriptChapter> {
-    let chunks = split_clean_chunks(clean_text, 260);
-    if chunks.is_empty() {
-        return vec![TranscriptChapter {
-            title: fallback_title(clean_text),
-            start_sec: 0.0,
-            end_sec: None,
-            text: clean_text.trim().to_string(),
-        }];
-    }
-
-    let total_start = transcript
-        .segments
-        .first()
-        .map(|segment| segment.start_sec)
-        .unwrap_or(0.0);
-    let total_end = transcript
-        .segments
-        .last()
-        .map(|segment| segment.end_sec)
-        .unwrap_or(total_start);
-    let span = (total_end - total_start).max(0.0);
-    let count = chunks.len().max(1) as f32;
-
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| {
-            let start_sec = total_start + span * index as f32 / count;
-            let end_sec = Some(total_start + span * (index + 1) as f32 / count);
-            TranscriptChapter {
-                title: fallback_title(&text),
-                start_sec,
-                end_sec,
-                text,
-            }
-        })
-        .collect()
-}
-
-fn split_clean_chunks(text: &str, max_chars: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for sentence in split_sentences(text) {
-        let needs_space = !current.is_empty();
-        let projected_len =
-            current.chars().count() + sentence.chars().count() + usize::from(needs_space);
-        if projected_len > max_chars && !current.is_empty() {
-            chunks.push(current.trim().to_string());
-            current.clear();
-        }
-
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(sentence);
-    }
-
-    if !current.trim().is_empty() {
-        chunks.push(current.trim().to_string());
-    }
-
-    chunks
-}
-
-fn split_sentences(text: &str) -> Vec<&str> {
-    let mut sentences = Vec::new();
-    let mut start = 0;
-    for (index, ch) in text.char_indices() {
-        if matches!(ch, '.' | '!' | '?') {
-            let end = index + ch.len_utf8();
-            let sentence = text[start..end].trim();
-            if !sentence.is_empty() {
-                sentences.push(sentence);
-            }
-            start = end;
-        }
-    }
-
-    let rest = text[start..].trim();
-    if !rest.is_empty() {
-        sentences.push(rest);
-    }
-    sentences
-}
-
-fn fallback_title(text: &str) -> String {
-    if let Some(title) = keyword_title(text) {
-        return title.to_string();
-    }
-
-    let stop_words = [
-        "так",
-        "вообще",
-        "короче",
-        "вот",
-        "ну",
-        "типа",
-        "значит",
-        "по",
-        "идее",
-        "мне",
-        "надо",
-        "что-то",
-        "чего-то",
-        "наговорить",
-        "приколу",
-        "сейчас",
-        "это",
-        "вот",
-        "этих",
-    ];
-    let words = text
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|ch: char| {
-                ch.is_ascii_punctuation() || matches!(ch, '«' | '»' | '“' | '”')
-            })
-        })
-        .filter(|word| !word.is_empty())
-        .filter(|word| {
-            let lower = word.to_lowercase();
-            !stop_words.contains(&lower.as_str())
-        })
-        .take(5)
-        .collect::<Vec<_>>();
-
-    if words.is_empty() {
-        "Фрагмент".to_string()
-    } else {
-        words.join(" ")
-    }
-}
-
-fn keyword_title(text: &str) -> Option<&'static str> {
-    let lower = text.to_lowercase();
-    let contains_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
-
-    if contains_any(&["размет", "размеч", "размещ", "глав", "блок"]) {
-        return Some("Разметка текста");
-    }
-    if contains_any(&["cleanup", "clean up", "клинап", "чистить", "очищ"]) {
-        return Some("Cleanup текста");
-    }
-    if contains_any(&["слова-параз", "паразит"]) {
-        return Some("Слова-паразиты");
-    }
-    if contains_any(&["памят"]) {
-        return Some("Память и нагрузка");
-    }
-    if contains_any(&["groq", "грок", "whisper", "asr", "транскрип"]) {
-        return Some("ASR и расшифровка");
-    }
-    if contains_any(&["нейрон", "модель", "llm"]) {
-        return Some("LLM-обработка");
-    }
-    if contains_any(&["провер"]) {
-        return Some("Проверка расшифровки");
-    }
-
-    None
 }
 
 fn normalize_terms(text: &str) -> String {
@@ -383,62 +214,47 @@ struct CleanupChapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::voice::types::AsrSegment;
 
     #[test]
-    fn long_short_cleanup_is_forced_into_chapters() {
+    fn long_cleanup_without_model_chapters_stays_plain_text() {
         let transcript = AsrTranscript {
             provider: "groq".to_string(),
             model: "whisper".to_string(),
             request_id: None,
-            text: "Первый фрагмент про проверку. Второй фрагмент про разметку.".to_string(),
-            segments: vec![
-                AsrSegment {
-                    start_sec: 0.0,
-                    end_sec: 3.0,
-                    text: "Первый фрагмент про проверку.".to_string(),
-                },
-                AsrSegment {
-                    start_sec: 3.0,
-                    end_sec: 6.0,
-                    text: "Второй фрагмент про разметку.".to_string(),
-                },
-            ],
+            text: "Длинный текст без явного деления на темы.".to_string(),
+            segments: Vec::new(),
             raw_json: serde_json::json!({}),
         };
         let clean = CleanTranscript {
             mode: TranscriptRenderMode::Short,
-            text: "Первый фрагмент про проверку. Второй фрагмент про разметку.".to_string(),
+            text: "Длинный текст без явного деления на темы.".to_string(),
             chapters: Vec::new(),
             short_summary: None,
         };
 
         let normalized = normalize_cleanup(clean, &transcript, 20);
-        assert_eq!(normalized.mode, TranscriptRenderMode::Chapters);
-        assert!(!normalized.chapters.is_empty());
+        assert_eq!(normalized.mode, TranscriptRenderMode::Short);
+        assert!(normalized.chapters.is_empty());
     }
 
     #[test]
-    fn fallback_chapters_use_clean_text_not_raw_segments() {
+    fn normalize_terms_keeps_provider_names_latin() {
         let transcript = AsrTranscript {
             provider: "groq".to_string(),
             model: "whisper".to_string(),
             request_id: None,
-            text: "так короче сырой текст".to_string(),
-            segments: vec![AsrSegment {
-                start_sec: 0.0,
-                end_sec: 24.0,
-                text: "так короче сырой текст".to_string(),
-            }],
+            text: "грок и клинап".to_string(),
+            segments: Vec::new(),
             raw_json: serde_json::json!({}),
         };
-        let chapters = fallback_chapters(
-            &transcript,
-            "Система должна нормально размечать текст. Cleanup должен убрать слова-паразиты.",
-        );
+        let clean = CleanTranscript {
+            mode: TranscriptRenderMode::Short,
+            text: "Грок и клинап через гемма.".to_string(),
+            chapters: Vec::new(),
+            short_summary: None,
+        };
 
-        assert_eq!(chapters[0].title, "Разметка текста");
-        assert!(chapters[0].text.contains("Cleanup"));
-        assert!(!chapters[0].text.contains("сырой текст"));
+        let normalized = normalize_cleanup(clean, &transcript, 400);
+        assert_eq!(normalized.text, "groq и cleanup через Gemma.");
     }
 }

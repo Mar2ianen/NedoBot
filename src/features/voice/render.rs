@@ -25,9 +25,7 @@ pub fn render_transcript(clean: &CleanTranscript, config: &Config) -> RenderedTr
     if clean.mode == TranscriptRenderMode::Short
         || clean.text.chars().count() <= config.voice_short_text_max_chars
     {
-        return RenderedTranscript::Message {
-            html: Html::text(&clean.text).into_string(),
-        };
+        return render_plain_text(&clean.text, config);
     }
 
     let chapters = effective_chapters(clean);
@@ -43,6 +41,28 @@ pub fn render_transcript(clean: &CleanTranscript, config: &Config) -> RenderedTr
             html: preview,
             filename: "voice-transcript.txt".to_string(),
             body,
+        }
+    } else {
+        RenderedTranscript::Message { html: preview }
+    }
+}
+
+fn render_plain_text(text: &str, config: &Config) -> RenderedTranscript {
+    let html = Html::text(text).into_string();
+    if html::is_safe_len(&html) {
+        return RenderedTranscript::Message { html };
+    }
+
+    let preview_text = format!(
+        "{}\n\nПолная расшифровка в файле.",
+        html::truncate_text(text, 1200)
+    );
+    let preview = Html::text(preview_text).into_string();
+    if config.voice_send_full_file {
+        RenderedTranscript::MessageAndFile {
+            html: preview,
+            filename: "voice-transcript.txt".to_string(),
+            body: text.to_string(),
         }
     } else {
         RenderedTranscript::Message { html: preview }
@@ -69,8 +89,6 @@ fn render_chapters(chapters: &[TranscriptChapter], expandable: bool) -> String {
         out.blank_line();
         let mut title = Html::empty();
         title.push(Html::bold(&chapter.title));
-        title.push(Html::text(" "));
-        title.push(Html::code(format_timestamp(chapter.start_sec)));
         out.line(title);
         if expandable {
             out.line(html::expandable_blockquote(&chapter.text));
@@ -119,8 +137,6 @@ fn render_one_chapter(chapter: &TranscriptChapter, body: &str, expandable: bool)
     let mut out = Html::empty();
     let mut title = Html::empty();
     title.push(Html::bold(&chapter.title));
-    title.push(Html::text(" "));
-    title.push(Html::code(format_timestamp(chapter.start_sec)));
     out.line(title);
     if expandable {
         out.line(html::expandable_blockquote(body));
@@ -141,19 +157,9 @@ fn render_file_body(clean: &CleanTranscript, chapters: &[TranscriptChapter]) -> 
         body.push_str("\n\n");
     }
     for chapter in chapters {
-        body.push_str(&format!(
-            "{} {}\n{}\n\n",
-            format_timestamp(chapter.start_sec),
-            chapter.title,
-            chapter.text
-        ));
+        body.push_str(&format!("{}\n{}\n\n", chapter.title, chapter.text));
     }
     body
-}
-
-fn format_timestamp(seconds: f32) -> String {
-    let seconds = seconds.max(0.0).round() as u32;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 #[cfg(test)]
