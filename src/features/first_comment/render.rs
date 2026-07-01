@@ -70,20 +70,64 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
 }
 
 fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
-    if text.contains("{CHAT_LINK}") {
-        let mut html = Html::empty();
-        for (index, part) in text.split("{CHAT_LINK}").enumerate() {
-            if index > 0 {
-                html.push(link(&config.chat_invite_label, &config.chat_invite_url));
-            }
-            html.push(Html::text(part));
+    let mut html = Html::empty();
+    let mut rest = text;
+    let mut rendered_link = false;
+
+    while let Some(start) = rest.find("{CHAT_LINK") {
+        let (before, after_start) = rest.split_at(start);
+        html.push(Html::text(before));
+
+        let Some(end) = after_start.find('}') else {
+            html.push(Html::text(after_start));
+            return html;
+        };
+
+        let token = &after_start[..=end];
+        if let Some(label) = chat_link_label(token, config) {
+            html.push(link(&label, &config.chat_invite_url));
+            rendered_link = true;
+        } else {
+            html.push(Html::text(token));
         }
-        html
-    } else {
-        let mut html = Html::text(text);
+
+        rest = &after_start[end + 1..];
+    }
+
+    html.push(Html::text(rest));
+
+    if !rendered_link {
         html.push(Html::raw_trusted(" "));
         html.push(link("в чате", &config.chat_invite_url));
-        html
+    }
+
+    html
+}
+
+fn chat_link_label(token: &str, config: &Config) -> Option<String> {
+    if token == "{CHAT_LINK}" {
+        return Some(config.chat_invite_label.clone());
+    }
+
+    let label = token
+        .strip_prefix("{CHAT_LINK:")
+        .and_then(|value| value.strip_suffix('}'))?
+        .trim();
+
+    allowed_chat_link_label(label).map(str::to_string)
+}
+
+fn allowed_chat_link_label(label: &str) -> Option<&'static str> {
+    match label.to_lowercase().as_str() {
+        "чат" => Some("чат"),
+        "чате" => Some("чате"),
+        "чатик" => Some("чатик"),
+        "чатике" => Some("чатике"),
+        "обсуждение" => Some("обсуждение"),
+        "обсуждении" => Some("обсуждении"),
+        "комменты" => Some("комменты"),
+        "комментах" => Some("комментах"),
+        _ => None,
     }
 }
 
@@ -129,6 +173,24 @@ mod tests {
 
         assert!(html.contains(r#"<a href="https://t.me/+test">чате</a>"#));
         assert!(!html.contains("{CHAT_LINK}"));
+    }
+
+    #[test]
+    fn replaces_chat_placeholder_with_custom_safe_label() {
+        let html = build_comment_html("Несите частоты в {CHAT_LINK:чатик}", &config());
+
+        assert_eq!(
+            html,
+            r#"Несите частоты в <a href="https://t.me/+test">чатик</a>"#
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_chat_placeholder_label_and_adds_fallback() {
+        let html = build_comment_html("Несите частоты в {CHAT_LINK:<b>ловушку</b>}", &config());
+
+        assert!(html.contains("{CHAT_LINK:&lt;b&gt;ловушку&lt;/b&gt;}"));
+        assert!(html.ends_with(r#"<a href="https://t.me/+test">в чате</a>"#));
     }
 
     #[test]
