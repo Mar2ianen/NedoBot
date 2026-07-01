@@ -83,16 +83,14 @@ pub async fn send_top_reacted(
 ) -> ResponseResult<()> {
     refresh_top_reacted_users(bot, pool, config).await;
 
-    let reports = build_top_reacted_reports(pool, config)
+    let report = build_top_reacted_report(pool, config)
         .await
         .map_err(|err| {
             tracing::error!(%err, "failed to build top reacted report");
             teloxide::RequestError::Io(std::io::Error::other("top reacted failed"))
         })?;
 
-    for report in reports {
-        send_html(bot, chat_id, report).await?;
-    }
+    send_html(bot, chat_id, report).await?;
 
     Ok(())
 }
@@ -238,7 +236,7 @@ async fn build_top_messages_report(pool: &PgPool, config: &Config) -> anyhow::Re
         report.push_str(&format!(
             "\n{}. {}: <b>{}</b> соо, {} reply, {} медиа, {} голосовых, {} ссылок, {} реакций",
             index + 1,
-            user.linked_with_badges(),
+            user.linked_with_known_badges(),
             messages,
             replies,
             media,
@@ -251,7 +249,7 @@ async fn build_top_messages_report(pool: &PgPool, config: &Config) -> anyhow::Re
     Ok(report)
 }
 
-async fn build_top_reacted_reports(pool: &PgPool, config: &Config) -> anyhow::Result<Vec<String>> {
+async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Result<String> {
     let rows = sqlx::query_as::<_, TopReactedRow>(
         r#"
         select m.message_id,
@@ -277,7 +275,7 @@ async fn build_top_reacted_reports(pool: &PgPool, config: &Config) -> anyhow::Re
                m.has_animation,
                rc.total_count,
                rc.reactions,
-               to_char(m.created_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as created_at
+               to_char(m.created_at at time zone 'Europe/Moscow', 'DD.MM.YY') as created_at
         from telegram_message_reaction_counts rc
         join telegram_messages m on m.chat_id = rc.chat_id and m.message_id = rc.message_id
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
@@ -312,20 +310,14 @@ async fn build_top_reacted_reports(pool: &PgPool, config: &Config) -> anyhow::Re
     .fetch_all(pool)
     .await?;
 
-    let mut reports = Vec::new();
-    let mut report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время, 1/2\n");
+    let mut report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время\n");
 
     if rows.is_empty() {
         report.push_str("\nНет данных.");
-        return Ok(vec![report]);
+        return Ok(report);
     }
 
     for (index, row) in rows.into_iter().enumerate() {
-        if index == 10 {
-            reports.push(report);
-            report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время, 2/2\n");
-        }
-
         let user = UserPresentation {
             user_id: row.user_id,
             display_name: display_name(
@@ -355,21 +347,21 @@ async fn build_top_reacted_reports(pool: &PgPool, config: &Config) -> anyhow::Re
         )
         .into_string();
         let reaction_summary = reaction_summary(&row.reactions, 4);
+        let preview = truncate_text(&preview, 48);
 
         report.push_str(&format!(
-            "\n{}. {}: <b>{}</b> реакций{} от {}, <code>{}</code>\n{}",
+            "\n{}. {}: <b>{}</b>{} - {}, <code>{}</code>: {}",
             index + 1,
             message_link,
             row.total_count,
             reaction_summary,
-            user.linked_with_badges(),
+            user.linked_name(),
             escape_html(&row.created_at),
-            Html::text(truncate_text(&preview, 80)).into_string()
+            Html::text(preview).into_string()
         ));
     }
 
-    reports.push(report);
-    Ok(reports)
+    Ok(report)
 }
 
 async fn refresh_user_profile_from_telegram(
@@ -706,7 +698,7 @@ async fn top_users_for_period(
                 };
                 format!(
                     "{}: <b>{}</b> соо, {} реплаев, {} ссылок, {} медиа",
-                    user.linked_with_badges(),
+                    user.linked_with_known_badges(),
                     messages,
                     replies,
                     links,
@@ -836,8 +828,13 @@ fn reaction_summary(reactions: &serde_json::Value, limit: usize) -> String {
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| item.get("type").and_then(serde_json::Value::as_str))
                 .unwrap_or("reaction");
+            let label = match label {
+                "custom_emoji" => "⭐",
+                "emoji" | "paid" | "reaction" => "•",
+                other => other,
+            };
 
-            Some(format!("{label} {count}"))
+            Some(format!("{label}{count}"))
         })
         .take(limit)
         .collect::<Vec<_>>();
@@ -1221,7 +1218,7 @@ mod tests {
             {"type": "emoji", "emoji": "👍", "count": 1}
         ]);
 
-        assert_eq!(reaction_summary(&reactions, 2), " (🤣 67, 😢 8)");
+        assert_eq!(reaction_summary(&reactions, 2), " (🤣67, 😢8)");
     }
 
     #[test]
