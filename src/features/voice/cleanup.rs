@@ -115,6 +115,12 @@ fn normalize_cleanup(
     transcript: &AsrTranscript,
     short_limit: usize,
 ) -> CleanTranscript {
+    clean.text = normalize_terms(&clean.text);
+    for chapter in &mut clean.chapters {
+        chapter.title = normalize_terms(&chapter.title);
+        chapter.text = normalize_terms(&chapter.text);
+    }
+
     if clean.text.chars().count() <= short_limit {
         clean.mode = TranscriptRenderMode::Short;
         clean.chapters.clear();
@@ -130,7 +136,8 @@ fn normalize_cleanup(
 }
 
 fn fallback_chapters(transcript: &AsrTranscript, clean_text: &str) -> Vec<TranscriptChapter> {
-    if transcript.segments.is_empty() {
+    let chunks = split_clean_chunks(clean_text, 260);
+    if chunks.is_empty() {
         return vec![TranscriptChapter {
             title: fallback_title(clean_text),
             start_sec: 0.0,
@@ -139,51 +146,87 @@ fn fallback_chapters(transcript: &AsrTranscript, clean_text: &str) -> Vec<Transc
         }];
     }
 
-    let mut chapters = Vec::new();
-    let mut current = String::new();
-    let mut start_sec = transcript
+    let total_start = transcript
         .segments
         .first()
         .map(|segment| segment.start_sec)
         .unwrap_or(0.0);
-    let mut end_sec = None;
+    let total_end = transcript
+        .segments
+        .last()
+        .map(|segment| segment.end_sec)
+        .unwrap_or(total_start);
+    let span = (total_end - total_start).max(0.0);
+    let count = chunks.len().max(1) as f32;
 
-    for segment in &transcript.segments {
-        if current.is_empty() {
-            start_sec = segment.start_sec;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let start_sec = total_start + span * index as f32 / count;
+            let end_sec = Some(total_start + span * (index + 1) as f32 / count);
+            TranscriptChapter {
+                title: fallback_title(&text),
+                start_sec,
+                end_sec,
+                text,
+            }
+        })
+        .collect()
+}
+
+fn split_clean_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for sentence in split_sentences(text) {
+        let needs_space = !current.is_empty();
+        let projected_len =
+            current.chars().count() + sentence.chars().count() + usize::from(needs_space);
+        if projected_len > max_chars && !current.is_empty() {
+            chunks.push(current.trim().to_string());
+            current.clear();
         }
 
         if !current.is_empty() {
             current.push(' ');
         }
-        current.push_str(segment.text.trim());
-        end_sec = Some(segment.end_sec);
-
-        if current.chars().count() >= 220 {
-            chapters.push(TranscriptChapter {
-                title: fallback_title(&current),
-                start_sec,
-                end_sec,
-                text: current.trim().to_string(),
-            });
-            current.clear();
-            end_sec = None;
-        }
+        current.push_str(sentence);
     }
 
     if !current.trim().is_empty() {
-        chapters.push(TranscriptChapter {
-            title: fallback_title(&current),
-            start_sec,
-            end_sec,
-            text: current.trim().to_string(),
-        });
+        chunks.push(current.trim().to_string());
     }
 
-    chapters
+    chunks
+}
+
+fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let end = index + ch.len_utf8();
+            let sentence = text[start..end].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            start = end;
+        }
+    }
+
+    let rest = text[start..].trim();
+    if !rest.is_empty() {
+        sentences.push(rest);
+    }
+    sentences
 }
 
 fn fallback_title(text: &str) -> String {
+    if let Some(title) = keyword_title(text) {
+        return title.to_string();
+    }
+
     let stop_words = [
         "так",
         "вообще",
@@ -194,6 +237,16 @@ fn fallback_title(text: &str) -> String {
         "значит",
         "по",
         "идее",
+        "мне",
+        "надо",
+        "что-то",
+        "чего-то",
+        "наговорить",
+        "приколу",
+        "сейчас",
+        "это",
+        "вот",
+        "этих",
     ];
     let words = text
         .split_whitespace()
@@ -215,6 +268,62 @@ fn fallback_title(text: &str) -> String {
     } else {
         words.join(" ")
     }
+}
+
+fn keyword_title(text: &str) -> Option<&'static str> {
+    let lower = text.to_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+
+    if contains_any(&["размет", "размеч", "размещ", "глав", "блок"]) {
+        return Some("Разметка текста");
+    }
+    if contains_any(&["cleanup", "clean up", "клинап", "чистить", "очищ"]) {
+        return Some("Cleanup текста");
+    }
+    if contains_any(&["слова-параз", "паразит"]) {
+        return Some("Слова-паразиты");
+    }
+    if contains_any(&["памят"]) {
+        return Some("Память и нагрузка");
+    }
+    if contains_any(&["groq", "грок", "whisper", "asr", "транскрип"]) {
+        return Some("ASR и расшифровка");
+    }
+    if contains_any(&["нейрон", "модель", "llm"]) {
+        return Some("LLM-обработка");
+    }
+    if contains_any(&["провер"]) {
+        return Some("Проверка расшифровки");
+    }
+
+    None
+}
+
+fn normalize_terms(text: &str) -> String {
+    let replacements = [
+        ("Грок", "groq"),
+        ("грок", "groq"),
+        ("Groq", "groq"),
+        ("Clean up", "cleanup"),
+        ("clean up", "cleanup"),
+        ("Clean Up", "cleanup"),
+        ("клин ап", "cleanup"),
+        ("клинап", "cleanup"),
+        ("LLM", "LLM"),
+        ("Оллама", "ollama"),
+        ("оллама", "ollama"),
+        ("Гемма", "Gemma"),
+        ("гемма", "Gemma"),
+        ("Церебрас", "Cerebras"),
+        ("церебрас", "Cerebras"),
+        ("салфразиты", "слова-паразиты"),
+    ];
+
+    replacements
+        .into_iter()
+        .fold(text.trim().to_string(), |acc, (from, to)| {
+            acc.replace(from, to)
+        })
 }
 
 fn strip_code_fence(value: &str) -> &str {
@@ -307,5 +416,29 @@ mod tests {
         let normalized = normalize_cleanup(clean, &transcript, 20);
         assert_eq!(normalized.mode, TranscriptRenderMode::Chapters);
         assert!(!normalized.chapters.is_empty());
+    }
+
+    #[test]
+    fn fallback_chapters_use_clean_text_not_raw_segments() {
+        let transcript = AsrTranscript {
+            provider: "groq".to_string(),
+            model: "whisper".to_string(),
+            request_id: None,
+            text: "так короче сырой текст".to_string(),
+            segments: vec![AsrSegment {
+                start_sec: 0.0,
+                end_sec: 24.0,
+                text: "так короче сырой текст".to_string(),
+            }],
+            raw_json: serde_json::json!({}),
+        };
+        let chapters = fallback_chapters(
+            &transcript,
+            "Система должна нормально размечать текст. Cleanup должен убрать слова-паразиты.",
+        );
+
+        assert_eq!(chapters[0].title, "Разметка текста");
+        assert!(chapters[0].text.contains("Cleanup"));
+        assert!(!chapters[0].text.contains("сырой текст"));
     }
 }
