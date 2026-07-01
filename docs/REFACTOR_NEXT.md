@@ -4,6 +4,21 @@
 
 ## Текущее состояние
 
+Статус на конец прохода:
+
+- `main.rs` сокращён до wiring, dispatcher и маленьких update handlers;
+- `telegram/html.rs` добавлен и используется для безопасной сборки Telegram HTML;
+- `telegram/render.rs` отвечает за отправку HTML, отключение preview и guard пустых сообщений;
+- first-comment pipeline вынесен в `features/first_comment/pipeline.rs`;
+- prompt builder вынесен в `features/first_comment/prompt.rs`;
+- SQL для `post_comment_jobs`, `llm_generations` и последних комментариев бота вынесен в `features/first_comment/repo.rs`;
+- `features/first_comment/render.rs` переведён на `Html`;
+- `features/memory/report.rs` переведён на `Html`;
+- пользовательские ссылки в stats переведены на `Html::link`;
+- добавлены unit-тесты для escaping, link/code/custom emoji и placeholder `{CHAT_LINK}`.
+
+Исторический контекст перед проходом:
+
 После последнего распила проект уже стал нормальным MVP-монолитом:
 
 - `main.rs` в основном отвечает за wiring и first-comment pipeline;
@@ -15,12 +30,12 @@
 - first-comment renderer вынесен в `features/first_comment/render.rs`;
 - LLM routing живёт в `llm/service.rs`.
 
-Оставшиеся проблемные зоны:
+Проблемные зоны, которые закрывались этим проходом:
 
-1. HTML собирается вручную в разных местах.
-2. First-comment pipeline всё ещё частично сидит в `main.rs`.
-3. SQL для `post_comment_jobs` и последних комментариев бота всё ещё рядом с pipeline-кодом.
-4. Нет общего слоя для безопасного Telegram HTML и лимитов сообщений.
+1. HTML собирался вручную в разных местах.
+2. First-comment pipeline частично сидел в `main.rs`.
+3. SQL для `post_comment_jobs` и последних комментариев бота был рядом с pipeline-кодом.
+4. Не было общего слоя для безопасного Telegram HTML и лимитов сообщений.
 
 ## Инварианты рефактора
 
@@ -559,13 +574,13 @@ assert!(!html.contains("{CHAT_LINK}"));
 
 Оптимальный порядок:
 
-1. `telegram/html.rs` + `pub mod html`.
-2. Guard от пустого текста в `telegram/render.rs`.
-3. Перевести `first_comment/render.rs` на `Html`.
-4. Перевести `memory/report.rs` на `Html`.
-5. Частично перевести `stats/types.rs` и самые простые места `stats/report.rs`.
-6. Вынести `first_comment/prompt.rs`.
-7. Вынести `first_comment/repo.rs`.
-8. Вынести `first_comment/pipeline.rs`.
-9. `cargo fmt && cargo check`.
+1. [x] `telegram/html.rs` + `pub mod html`.
+2. [x] Guard от пустого текста в `telegram/render.rs`.
+3. [x] Перевести `first_comment/render.rs` на `Html`.
+4. [x] Перевести `memory/report.rs` на `Html`.
+5. [x] Частично перевести `stats/types.rs` и самые простые места `stats/report.rs`.
+6. [x] Вынести `first_comment/prompt.rs`.
+7. [x] Вынести `first_comment/repo.rs`.
+8. [x] Вынести `first_comment/pipeline.rs`.
+9. [x] `cargo fmt && cargo check`.
 10. Только после этого думать о voice/import.
