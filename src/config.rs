@@ -1,4 +1,5 @@
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct Config {
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
@@ -27,6 +28,21 @@ pub struct Config {
     pub amd_custom_emoji_id: Option<String>,
     pub radeon_custom_emoji_id: Option<String>,
     pub ryzen_custom_emoji_id: Option<String>,
+    pub voice_transcription_enabled: bool,
+    pub voice_auto_transcribe: bool,
+    pub voice_max_duration_sec: u32,
+    pub voice_max_file_mb: u32,
+    pub voice_short_text_max_chars: usize,
+    pub voice_language: String,
+    pub voice_asr_provider: String,
+    pub voice_asr_model: String,
+    pub voice_asr_temperature: f32,
+    pub voice_cleanup_provider: Option<String>,
+    pub voice_cleanup_model: Option<String>,
+    pub voice_cleanup_temperature: f32,
+    pub voice_cleanup_max_tokens: u32,
+    pub voice_render_expandable_chapters: bool,
+    pub voice_send_full_file: bool,
 }
 
 impl Config {
@@ -63,8 +79,30 @@ impl Config {
             amd_custom_emoji_id: env_optional("AMD_CUSTOM_EMOJI_ID"),
             radeon_custom_emoji_id: env_optional("RADEON_CUSTOM_EMOJI_ID"),
             ryzen_custom_emoji_id: env_optional("RYZEN_CUSTOM_EMOJI_ID"),
+            voice_transcription_enabled: env_bool("VOICE_TRANSCRIPTION_ENABLED", false),
+            voice_auto_transcribe: env_bool("VOICE_AUTO_TRANSCRIBE", false),
+            voice_max_duration_sec: env_u32("VOICE_MAX_DURATION_SEC", 600),
+            voice_max_file_mb: env_u32("VOICE_MAX_FILE_MB", 20),
+            voice_short_text_max_chars: env_usize("VOICE_SHORT_TEXT_MAX_CHARS", 400),
+            voice_language: env_or("VOICE_LANGUAGE", "ru"),
+            voice_asr_provider: env_or("VOICE_ASR_PROVIDER", "groq"),
+            voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3-turbo"),
+            voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0),
+            voice_cleanup_provider: env_optional("VOICE_CLEANUP_PROVIDER"),
+            voice_cleanup_model: env_optional("VOICE_CLEANUP_MODEL"),
+            voice_cleanup_temperature: env_f32("VOICE_CLEANUP_TEMPERATURE", 0.2),
+            voice_cleanup_max_tokens: env_u32("VOICE_CLEANUP_MAX_TOKENS", 1800),
+            voice_render_expandable_chapters: env_bool("VOICE_RENDER_EXPANDABLE_CHAPTERS", true),
+            voice_send_full_file: env_bool("VOICE_SEND_FULL_FILE", true),
         }
     }
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
@@ -75,6 +113,13 @@ fn env_i64(key: &str, default: i64) -> i64 {
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse().ok())
