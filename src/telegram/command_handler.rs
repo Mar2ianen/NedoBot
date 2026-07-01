@@ -74,13 +74,17 @@ pub async fn handle_command(
             send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month).await?;
         }
         Command::UserStats(target) => {
+            let target = target.trim();
+            let explicit_target = (!target.is_empty()).then_some(target);
+            let fallback_user_id = reply_user_id(&msg).or_else(|| sender_user_id(&msg));
+
             send_user_stats(
                 &bot,
                 msg.chat.id,
                 pool,
                 config,
-                Some(&target),
-                reply_user_id(&msg),
+                explicit_target,
+                fallback_user_id,
             )
             .await?;
         }
