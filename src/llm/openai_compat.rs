@@ -1,13 +1,5 @@
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::chat::{
-        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
-        ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequestArgs, ImageUrl,
-    },
-};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
@@ -37,30 +29,34 @@ impl LlmClient for OpenAiCompatClient<'_> {
             anyhow::bail!("OpenAI-compatible API key is empty");
         }
 
-        let config = OpenAIConfig::new()
-            .with_api_base(self.api_base)
-            .with_api_key(self.api_key);
-        let client = Client::with_config(config);
-        let message = ChatCompletionRequestUserMessageArgs::default()
-            .content(user_content(request.prompt, request.image_base64))
-            .build()?;
-        let response = client
-            .chat()
-            .create(
-                CreateChatCompletionRequestArgs::default()
-                    .model(request.model)
-                    .messages([message.into()])
-                    .temperature(request.temperature)
-                    .max_completion_tokens(request.num_predict)
-                    .build()?,
-            )
+        let body = ChatCompletionRequest {
+            model: request.model,
+            messages: vec![ChatMessage {
+                role: "user",
+                content: user_content(request.prompt, request.image_base64),
+            }],
+            temperature: request.temperature,
+            max_completion_tokens: request.num_predict,
+        };
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/chat/completions",
+                self.api_base.trim_end_matches('/')
+            ))
+            .bearer_auth(self.api_key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ChatCompletionResponse>()
             .await?;
 
         let content = response
             .choices
             .into_iter()
             .next()
-            .and_then(|choice| choice.message.content)
+            .map(|choice| choice.message.content)
             .unwrap_or_default();
 
         if content.trim().is_empty() {
@@ -71,27 +67,66 @@ impl LlmClient for OpenAiCompatClient<'_> {
     }
 }
 
-fn user_content(
-    prompt: &str,
-    image_base64: Option<&str>,
-) -> ChatCompletionRequestUserMessageContent {
+#[derive(Serialize)]
+struct ChatCompletionRequest<'a> {
+    model: &'a str,
+    messages: Vec<ChatMessage<'a>>,
+    temperature: f32,
+    max_completion_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct ChatMessage<'a> {
+    role: &'a str,
+    content: MessageContent<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MessageContent<'a> {
+    Text(&'a str),
+    Parts(Vec<MessageContentPart<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessageContentPart<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    message: ChatResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatResponseMessage {
+    #[serde(default)]
+    content: String,
+}
+
+fn user_content<'a>(prompt: &'a str, image_base64: Option<&'a str>) -> MessageContent<'a> {
     let Some(image_base64) = image_base64 else {
-        return prompt.into();
+        return MessageContent::Text(prompt);
     };
 
-    vec![
-        ChatCompletionRequestMessageContentPartText {
-            text: prompt.to_string(),
-        }
-        .into(),
-        ChatCompletionRequestUserMessageContentPart::ImageUrl(
-            ChatCompletionRequestMessageContentPartImage {
-                image_url: ImageUrl {
-                    url: format!("data:image/jpeg;base64,{image_base64}"),
-                    detail: None,
-                },
+    MessageContent::Parts(vec![
+        MessageContentPart::Text { text: prompt },
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: format!("data:image/jpeg;base64,{image_base64}"),
             },
-        ),
-    ]
-    .into()
+        },
+    ])
 }

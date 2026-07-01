@@ -31,7 +31,7 @@ struct ChatUserMemberEvent<'a> {
     event_at: DateTime<Utc>,
 }
 
-pub(crate) async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
+pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
     let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
         .unwrap_or((None, None));
@@ -234,7 +234,7 @@ async fn upsert_chat_user_activity(
     Ok(())
 }
 
-async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
+pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         insert into telegram_user_profiles
@@ -264,7 +264,7 @@ async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn save_message_reaction(
+pub async fn save_message_reaction(
     pool: &PgPool,
     reaction: &MessageReactionUpdated,
 ) -> anyhow::Result<()> {
@@ -299,7 +299,7 @@ pub(crate) async fn save_message_reaction(
     Ok(())
 }
 
-pub(crate) async fn save_message_reaction_count(
+pub async fn save_message_reaction_count(
     pool: &PgPool,
     reaction_count: &MessageReactionCountUpdated,
 ) -> anyhow::Result<()> {
@@ -336,7 +336,7 @@ pub(crate) async fn save_message_reaction_count(
     Ok(())
 }
 
-pub(crate) async fn save_chat_member_event(
+pub async fn save_chat_member_event(
     pool: &PgPool,
     member: &ChatMemberUpdated,
 ) -> anyhow::Result<()> {
@@ -410,7 +410,7 @@ pub(crate) async fn save_chat_member_event(
     Ok(())
 }
 
-pub(crate) async fn refresh_known_member_snapshots(
+pub async fn refresh_known_member_snapshots(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
     config: &Config,
