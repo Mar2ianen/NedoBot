@@ -130,6 +130,16 @@ cargo run --release --bin refresh_chat_members -- --limit 200
 cargo run --release --bin refresh_chat_members -- --all --limit 500 --sleep-ms 80
 ```
 
+Обновление аватарок, bio и raw profile details:
+
+```bash
+cargo run --release --bin refresh_user_profiles -- --limit 200
+cargo run --release --bin refresh_user_profiles -- --only-spammers --limit 200
+cargo run --release --bin refresh_user_profiles -- --all --limit 500 --sleep-ms 100
+```
+
+Telegram отдаёт bio и фото best-effort: часть пользователей может иметь пустой bio, закрытый профиль или ноль публичных фото. Ошибка API пишется в `telegram_user_profiles.profile_refresh_error`.
+
 ## Known caveats
 
 ### Migrations and reaction dedup

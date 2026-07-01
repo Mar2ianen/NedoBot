@@ -178,7 +178,7 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
 - `post_memory_notes` - короткие конспекты прошлых новостей, keywords и осторожные ограничения для будущих комментариев.
 - `voice_transcription_jobs` - job/status/raw ASR/segments/cleaned transcript/final HTML/file id для расшифровки голосовых.
-- `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium.
+- `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium, а также best-effort детали из `getChat(user_id)` и `getUserProfilePhotos`: bio, avatar file ids, emoji status/accent и raw JSON.
 - `telegram_chat_users` - явная расширяемая карточка пользователя в конкретном чате: первое/последнее сообщение, счётчики сообщений/реплаев/ссылок/медиа, статус в чате, админство, join/leave/invite-link поля.
 - `telegram_chat_member_snapshots` - последний известный статус пользователя в чате.
 - `telegram_chat_member_events` - входы, выходы и изменения статусов, если Telegram прислал update.
