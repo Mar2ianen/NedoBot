@@ -192,9 +192,10 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `telegram_chat_users.spam_type` - основной тип спамера.
 - `telegram_chat_users.spam_types` - JSON-счётчик типов по пользователю.
 - `telegram_chat_users.spam_profile_labels` - признаки профиля: generic female avatar/persona и другие сильные контекстные маркеры именно этого чата. Рандомный username сам по себе не считать сильной метрикой: в чате это частая норма.
-- текущие seed-типы: `llm_generic_comment`, `promo_dm_bait`.
+- текущие seed-типы: `llm_generic_comment`, `promo_dm_bait`, `adult_personal_channel_promo`.
 - `llm_generic_comment` - безобидно выглядящий LLM-коммент по теме поста, часто с одинаковым восторженным тоном.
 - `promo_dm_bait` - промо через “могу отправить/поделиться/пишите в личку”, тематика может быть разная, но механика одна.
+- `adult_personal_channel_promo` - личный/personal channel пользователя ведёт на adult-промо, инвайт-ссылки или схожий funnel.
 
 Посмотреть последние сообщения:
 
