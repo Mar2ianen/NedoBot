@@ -1,7 +1,9 @@
 use sqlx::PgPool;
 use teloxide::prelude::*;
+use teloxide::types::UserId;
 
 use crate::config::Config;
+use crate::db::telegram::upsert_user_profile;
 use crate::features::stats::types::{
     ChatStatsSummary, StatsPeriod, UserPresentation, display_name,
 };
@@ -36,6 +38,10 @@ pub async fn send_user_stats(
     target: Option<&str>,
     reply_user_id: Option<i64>,
 ) -> ResponseResult<()> {
+    if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
+        refresh_user_profile_from_telegram(bot, pool, config, user_id).await;
+    }
+
     let report = build_user_stats_report(pool, config, target, reply_user_id)
         .await
         .map_err(|err| {
@@ -46,6 +52,35 @@ pub async fn send_user_stats(
     send_html(bot, chat_id, report).await?;
 
     Ok(())
+}
+
+async fn refresh_user_profile_from_telegram(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &PgPool,
+    config: &Config,
+    user_id: i64,
+) {
+    let Ok(user_id) = u64::try_from(user_id) else {
+        return;
+    };
+
+    match bot
+        .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id))
+        .await
+    {
+        Ok(member) => {
+            if let Err(err) = upsert_user_profile(pool, &member.user).await {
+                tracing::warn!(%err, "failed to save refreshed user profile");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(%err, user_id, "failed to refresh user profile from Telegram");
+        }
+    }
+}
+
+fn numeric_target_user_id(target: Option<&str>) -> Option<i64> {
+    target?.trim().parse().ok()
 }
 
 async fn build_chat_stats_report(
