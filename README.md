@@ -5,7 +5,7 @@
 **AI-инфраструктура для `НедоNews Chat`: первый комментарий под постом, память контекста, статистика и немного магии вокруг живого Telegram-чата.**
 
 <p>
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white">
+  <sub><strong>Rust</strong> · teloxide · PostgreSQL · LLM/Vision</sub>
 </p>
 
 <p>
@@ -13,9 +13,9 @@
   ·
   <a href="https://t.me/+RxmPtw7Bs-IxNzEy">Чат</a>
   ·
-  <a href="docs/TECHNICAL.md">Техническая документация</a>
+  <a href="docs/TECHNICAL.md">Docs</a>
   ·
-  <a href="prompts/first_comment.md">Prompt первого комментария</a>
+  <a href="prompts/first_comment.md">Prompt</a>
   ·
   <a href="prompts/tech_rag.md">Tech RAG</a>
   ·
