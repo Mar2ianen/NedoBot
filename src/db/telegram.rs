@@ -86,7 +86,8 @@ pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Resu
             has_voice = excluded.has_voice,
             has_sticker = excluded.has_sticker,
             has_animation = excluded.has_animation,
-            has_links = excluded.has_links
+            has_links = excluded.has_links,
+            updated_at = now()
         returning (xmax = 0) as inserted
         "#,
     )
