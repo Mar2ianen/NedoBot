@@ -29,13 +29,16 @@ use features::first_comment::candidate::comment_candidate;
 use features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use features::first_comment::prompt::build_llm_prompt;
 use features::first_comment::render::build_comment_html;
+use features::first_comment::repo::{
+    LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
+    mark_post_comment_sent,
+};
 use features::memory::service::{load_relevant_memory_notes, remember_post};
 use llm::service::generate_text;
 use state::AppState;
 use telegram::command_handler::handle_command;
 use telegram::commands::Command;
 use telegram::render::{send_html, send_html_reply};
-use text::{normalize_ai_markers, strip_links};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -195,33 +198,19 @@ async fn maybe_comment_post(
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
 
-    sqlx::query(
-        r#"
-        update post_comment_jobs
-        set status = 'sent', bot_comment_message_id = $2, updated_at = now()
-        where id = $1
-        "#,
+    mark_post_comment_sent(pool, job_id, sent.id.0).await?;
+    insert_llm_generation(
+        pool,
+        LlmGenerationInsert {
+            job_id,
+            provider: &generation.provider,
+            model: &generation.model,
+            prompt: &prompt,
+            image_used: generation.image_used,
+            response: &generation.content,
+            final_html: &final_html,
+        },
     )
-    .bind(job_id)
-    .bind(sent.id.0)
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        insert into llm_generations
-            (post_comment_job_id, provider, model, prompt, image_used, response, final_html)
-        values ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(job_id)
-    .bind(&generation.provider)
-    .bind(&generation.model)
-    .bind(&prompt)
-    .bind(generation.image_used)
-    .bind(&generation.content)
-    .bind(&final_html)
-    .execute(pool)
     .await?;
 
     if let Some(owner_id) = owner_preview_chat(config) {
@@ -265,34 +254,6 @@ async fn send_owner_preview(
     }
 }
 
-async fn create_post_comment_job(
-    pool: &PgPool,
-    discussion_chat_id: i64,
-    discussion_message_id: i32,
-    source_channel_id: i64,
-    source_message_id: i32,
-    cleaned_post_text: &str,
-) -> anyhow::Result<Option<i64>> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        r#"
-        insert into post_comment_jobs
-            (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id, cleaned_post_text)
-        values ($1, $2, $3, $4, $5)
-        on conflict do nothing
-        returning id
-        "#,
-    )
-    .bind(discussion_chat_id)
-    .bind(discussion_message_id)
-    .bind(source_channel_id)
-    .bind(source_message_id)
-    .bind(cleaned_post_text)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|(id,)| id))
-}
-
 async fn download_largest_photo_base64(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
@@ -325,24 +286,4 @@ async fn get_chat_member_count(
             None
         }
     }
-}
-
-async fn load_recent_bot_comments(pool: &PgPool) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query_as::<_, (String,)>(
-        r#"
-        select coalesce(response, final_html)
-        from llm_generations
-        where coalesce(response, final_html) is not null
-        order by created_at desc
-        limit 6
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(text,)| normalize_ai_markers(&strip_links(&text)))
-        .filter(|text| !text.trim().is_empty())
-        .collect())
 }
