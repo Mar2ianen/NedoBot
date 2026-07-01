@@ -8,6 +8,9 @@
   <a href="https://t.me/ned0news">
     <img alt="Telegram channel" src="https://img.shields.io/badge/Telegram-ned0news-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
   </a>
+  <a href="https://t.me/+RxmPtw7Bs-IxNzEy">
+    <img alt="Telegram chat" src="https://img.shields.io/badge/Telegram-chat-26A5E4?style=for-the-badge&logo=telegram&logoColor=white">
+  </a>
   <a href="docs/TECHNICAL.md">
     <img alt="Technical docs" src="https://img.shields.io/badge/docs-technical-8A2BE2?style=for-the-badge&logo=readthedocs&logoColor=white">
   </a>
@@ -28,6 +31,8 @@
 <p>
   <a href="https://t.me/ned0news">Канал</a>
   ·
+  <a href="https://t.me/+RxmPtw7Bs-IxNzEy">Чат</a>
+  ·
   <a href="docs/TECHNICAL.md">Техническая документация</a>
   ·
   <a href="prompts/first_comment.md">Prompt первого комментария</a>
@@ -43,7 +48,7 @@
 
 ## Что это
 
-**НедоBot** — внутренний AI-помощник для экосистемы [`НедоNews`](https://t.me/ned0news).
+**НедоBot** — внутренний AI-помощник для экосистемы [`НедоNews`](https://t.me/ned0news) и [`НедоNews Chat`](https://t.me/+RxmPtw7Bs-IxNzEy).
 
 Он не пытается заменить людей, модерировать всё подряд или быть универсальным ботом «для любого чата». Его задача проще и полезнее: помогать живому обсуждению появляться быстрее, не терять контекст и понимать, что реально происходит в комьюнити.
 
