@@ -17,11 +17,13 @@ mod text;
 
 use config::Config;
 use db::telegram::{
-    refresh_known_member_snapshots, save_chat_member_event, save_edited_telegram_message,
-    save_message_reaction, save_message_reaction_count,
+    mark_user_profile_refresh_error, refresh_known_member_snapshots, save_chat_member_event,
+    save_edited_telegram_message, save_message_reaction, save_message_reaction_count,
+    user_profile_needs_refresh,
 };
 use db::{build_pool, migrate};
 use features::first_comment::pipeline::maybe_comment_post;
+use features::user_profiles::service::refresh_profile;
 use features::voice::pipeline::maybe_transcribe_voice;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
@@ -81,6 +83,10 @@ async fn handle_message(
     msg: Message,
     state: AppState,
 ) -> ResponseResult<()> {
+    if let Err(err) = maybe_refresh_message_author_profile(&bot, &msg, &state).await {
+        tracing::warn!(%err, "failed to refresh message author profile");
+    }
+
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
         return Ok(());
     }
@@ -93,6 +99,36 @@ async fn handle_message(
 
     if let Err(err) = maybe_comment_post(&bot, &msg, &state).await {
         tracing::error!(%err, "failed to process message");
+    }
+
+    Ok(())
+}
+
+async fn maybe_refresh_message_author_profile(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+) -> anyhow::Result<()> {
+    if msg.chat.id.0 != state.config.discussion_chat_id || msg.is_automatic_forward() {
+        return Ok(());
+    }
+
+    let Some(user) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    if user.is_bot {
+        return Ok(());
+    }
+
+    let user_id = user.id.0 as i64;
+    if !user_profile_needs_refresh(&state.pool, user_id).await? {
+        return Ok(());
+    }
+
+    if let Err(err) = refresh_profile(bot.inner(), &state.pool, user_id).await {
+        let message = err.to_string();
+        mark_user_profile_refresh_error(&state.pool, user_id, &message).await?;
+        anyhow::bail!(err);
     }
 
     Ok(())

@@ -497,6 +497,29 @@ pub async fn mark_user_profile_refresh_error(
     Ok(())
 }
 
+pub async fn user_profile_needs_refresh(
+    pool: &PgPool,
+    telegram_user_id: i64,
+) -> anyhow::Result<bool> {
+    let row = sqlx::query_as::<_, (bool,)>(
+        r#"
+        select coalesce(
+            (
+                select not is_bot and profile_refreshed_at is null
+                from telegram_user_profiles
+                where telegram_user_id = $1
+            ),
+            true
+        )
+        "#,
+    )
+    .bind(telegram_user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
 pub async fn save_message_reaction(
     pool: &PgPool,
     reaction: &MessageReactionUpdated,
