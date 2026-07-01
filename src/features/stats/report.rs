@@ -33,9 +33,10 @@ pub async fn send_user_stats(
     chat_id: ChatId,
     pool: &PgPool,
     config: &Config,
-    target: &str,
+    target: Option<&str>,
+    reply_user_id: Option<i64>,
 ) -> ResponseResult<()> {
-    let report = build_user_stats_report(pool, config, target)
+    let report = build_user_stats_report(pool, config, target, reply_user_id)
         .await
         .map_err(|err| {
             tracing::error!(%err, "failed to build user stats");
@@ -359,13 +360,15 @@ fn human_comment_preview(text: &str) -> String {
 async fn build_user_stats_report(
     pool: &PgPool,
     config: &Config,
-    target: &str,
+    target: Option<&str>,
+    reply_user_id: Option<i64>,
 ) -> anyhow::Result<String> {
-    let Some(user_id) = resolve_user_id(pool, target).await? else {
-        return Ok(format!(
-            "Не нашёл пользователя {}. Используй id или @username из уже виденных ботом пользователей.",
-            Html::code(target).into_string()
-        ));
+    let Some(user_id) = resolve_user_id(pool, target, reply_user_id).await? else {
+        let hint = match target.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(_) => "Не нашёл пользователя. Используй id, username из уже виденных ботом пользователей или reply на сообщение.".to_string(),
+            None => "Не понял, кого смотреть. Ответь командой на сообщение пользователя или передай id/username.".to_string(),
+        };
+        return Ok(hint);
     };
 
     let profile = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, bool)>(
@@ -602,10 +605,14 @@ async fn build_user_stats_report(
     ))
 }
 
-async fn resolve_user_id(pool: &PgPool, target: &str) -> anyhow::Result<Option<i64>> {
-    let clean = target.trim();
+async fn resolve_user_id(
+    pool: &PgPool,
+    target: Option<&str>,
+    reply_user_id: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    let clean = target.unwrap_or_default().trim();
     if clean.is_empty() {
-        return Ok(None);
+        return Ok(reply_user_id);
     }
 
     if let Ok(user_id) = clean.parse::<i64>() {

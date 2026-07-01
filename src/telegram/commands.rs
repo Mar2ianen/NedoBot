@@ -23,7 +23,7 @@ pub enum Command {
     StatsMonth,
     #[command(
         rename = "userstats",
-        description = "статистика пользователя: /userstats <id|@username>"
+        description = "статистика пользователя: /userstats <id|username>, или reply на сообщение"
     )]
     UserStats(String),
 }

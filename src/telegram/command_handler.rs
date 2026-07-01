@@ -74,9 +74,61 @@ pub async fn handle_command(
             send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month).await?;
         }
         Command::UserStats(target) => {
-            send_user_stats(&bot, msg.chat.id, pool, config, &target).await?;
+            send_user_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                Some(&target),
+                reply_user_id(&msg),
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+pub async fn handle_reply_user_stats_command(
+    bot: teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: Message,
+    state: AppState,
+) -> ResponseResult<bool> {
+    if !is_bare_userstats_command(&msg) {
+        return Ok(false);
+    }
+
+    let pool = &state.pool;
+    let config = &state.config;
+
+    if let Err(err) = save_telegram_message(pool, &msg).await {
+        tracing::error!(%err, "failed to save command message");
+    }
+
+    send_user_stats(&bot, msg.chat.id, pool, config, None, reply_user_id(&msg)).await?;
+
+    Ok(true)
+}
+
+fn reply_user_id(msg: &Message) -> Option<i64> {
+    msg.reply_to_message()
+        .and_then(|reply| reply.from.as_ref())
+        .map(|user| user.id.0 as i64)
+}
+
+fn is_bare_userstats_command(msg: &Message) -> bool {
+    let Some(text) = msg.text().or_else(|| msg.caption()) else {
+        return false;
+    };
+
+    let mut parts = text.split_whitespace();
+    let command = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return false;
+    }
+
+    matches!(command, "/userstats")
+        || command
+            .strip_prefix("/userstats@")
+            .is_some_and(|bot_name| !bot_name.is_empty())
 }

@@ -82,10 +82,6 @@ pub fn display_name(
     last_name: Option<&str>,
     fallback_user_id: i64,
 ) -> String {
-    if let Some(username) = username.filter(|value| !value.trim().is_empty()) {
-        return format!("@{username}");
-    }
-
     let full_name = format!(
         "{} {}",
         first_name.unwrap_or_default(),
@@ -94,10 +90,14 @@ pub fn display_name(
     .trim()
     .to_string();
 
-    if full_name.is_empty() {
-        fallback_user_id.to_string()
+    if !full_name.is_empty() {
+        return full_name;
+    }
+
+    if let Some(username) = username.filter(|value| !value.trim().is_empty()) {
+        username.trim_start_matches('@').to_string()
     } else {
-        full_name
+        fallback_user_id.to_string()
     }
 }
 
@@ -136,5 +136,26 @@ fn human_member_status(status: &str) -> &'static str {
         "left" => "не в чате",
         "banned" => "забанен",
         _ => "статус неизвестен",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_name_prefers_real_name_over_username() {
+        assert_eq!(
+            display_name(Some("Chechulinm"), Some("Михаил"), Some("Чечулин"), 42),
+            "Михаил Чечулин"
+        );
+    }
+
+    #[test]
+    fn display_name_uses_username_without_at_as_fallback() {
+        assert_eq!(
+            display_name(Some("@Chechulinm"), None, None, 42),
+            "Chechulinm"
+        );
     }
 }
