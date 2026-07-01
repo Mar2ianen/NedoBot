@@ -2,7 +2,7 @@
 
 Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 
-Текущая MVP-задача: бот ждёт авто-форвард поста из канала в привязанном чате, проверяет что это обычный пост с подписью `Не теряем связь`, вырезает VK/MAX-хвост, отдаёт текст, фото, RAG, память и последние ответы в Ollama Gemma, затем отвечает первым комментарием под постом.
+Текущая MVP-задача: бот помогает живому Telegram-чату не терять контекст. Основные контуры: первый комментарий под постом канала, память/RAG для новостей, статистика чата и расшифровка голосовых через Groq ASR + LLM cleanup.
 
 ## Что Уже Работает
 
@@ -10,8 +10,8 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Сохраняет входящие сообщения в Postgres.
 - Распознаёт авто-форварды из канала по `forward_origin.channel.id`.
 - Пропускает рекламу/служебные посты без маркера `Не теряем связь`.
-- Скачивает самое большое фото поста и отправляет его в vision-модель.
-- Генерирует комментарий через Ollama Cloud `gemma4:31b`.
+- Скачивает самое большое фото поста и отправляет его в vision-модель, если текущий LLM provider/model поддерживает изображения.
+- Генерирует комментарий через LLM provider router: `ollama`, `groq`, `cerebras`, `openrouter`, `openai_compat`.
 - Отправляет HTML-комментарий reply под постом.
 - Отключает link preview.
 - Подставляет premium/custom emoji по тематике, включая канал/AMD/Radeon/Ryzen.
@@ -22,6 +22,9 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
 - Показывает пользователей в отчётах человекочитаемо: имя кликабельно, ID спрятан в `tg://user`, рядом статус/админство.
 - Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
+- Расшифровывает `voice` и `audio`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
+- Для голосовых делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
+- Короткие голосовые отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
 
 ## Важный Нюанс Telegram
 
@@ -52,7 +55,7 @@ curl "https://api.telegram.org/bot$TELOXIDE_TOKEN/getMe"
 
 ## Конфиг
 
-Локальный `.env` не коммитится. Шаблон лежит в [.env.example](.env.example).
+Локальный `.env` не коммитится. Шаблон лежит в [.env.example](../.env.example).
 
 Основные переменные:
 
@@ -66,13 +69,60 @@ CHAT_INVITE_URL=https://t.me/+RxmPtw7Bs-IxNzEy
 CHAT_INVITE_LABEL=чате
 POST_SIGNATURE_MARKER=Не теряем связь
 
+LLM_PROVIDER=ollama
+LLM_MODEL=
+LLM_SUPPORTS_IMAGES=true
+LLM_TEMPERATURE=0.35
+LLM_MAX_TOKENS=140
+MEMORY_LLM_TEMPERATURE=0.2
+MEMORY_LLM_MAX_TOKENS=220
+
+GROQ_API_KEY=
+CEREBRAS_API_KEY=
+OPENROUTER_API_KEY=
 OLLAMA_API_KEY=
 OLLAMA_BASE_URL=https://ollama.com
+OLLAMA_MODEL=gemma4:31b
 VISION_MODEL=gemma4:31b
+OPENAI_COMPAT_API_KEY=
+OPENAI_COMPAT_BASE_URL=https://api.openai.com/v1
+OPENAI_COMPAT_MODEL=
 
 OWNER_TELEGRAM_ID=
 SEND_OWNER_PREVIEW=true
 ```
+
+Voice transcription:
+
+```env
+VOICE_TRANSCRIPTION_ENABLED=false
+VOICE_AUTO_TRANSCRIBE=false
+VOICE_MAX_DURATION_SEC=600
+VOICE_MAX_FILE_MB=20
+VOICE_SHORT_TEXT_MAX_CHARS=400
+VOICE_LANGUAGE=ru
+VOICE_ASR_PROVIDER=groq
+VOICE_ASR_MODEL=whisper-large-v3-turbo
+VOICE_ASR_TEMPERATURE=0
+VOICE_CLEANUP_PROVIDER=
+VOICE_CLEANUP_MODEL=
+VOICE_CLEANUP_TEMPERATURE=0.2
+VOICE_CLEANUP_MAX_TOKENS=1800
+VOICE_RENDER_EXPANDABLE_CHAPTERS=true
+VOICE_SEND_FULL_FILE=true
+```
+
+Правила voice-конфига:
+
+- `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline.
+- `VOICE_AUTO_TRANSCRIBE=false` оставляет контур выключенным для обычных сообщений; ручной `/transcribe` пока не реализован.
+- `VOICE_ASR_PROVIDER=groq` - сейчас единственный поддержанный ASR provider.
+- `VOICE_ASR_MODEL=whisper-large-v3-turbo` - быстрый дефолт под бесплатные/дешёвые квоты Groq.
+- `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
+- `VOICE_CLEANUP_MODEL` пустой значит использовать модель обычного provider-а.
+- `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
+- `VOICE_MAX_FILE_MB=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
+- `VOICE_SEND_FULL_FILE=true` включает fallback `preview + voice-transcript.txt`, если HTML не влезает в безопасный лимит Telegram.
 
 ## Локальный Запуск
 
@@ -127,6 +177,7 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `post_comment_jobs` - дедупликация и статус комментария под постом.
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
 - `post_memory_notes` - короткие конспекты прошлых новостей, keywords и осторожные ограничения для будущих комментариев.
+- `voice_transcription_jobs` - job/status/raw ASR/segments/cleaned transcript/final HTML/file id для расшифровки голосовых.
 - `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium.
 - `telegram_chat_users` - явная расширяемая карточка пользователя в конкретном чате: первое/последнее сообщение, счётчики сообщений/реплаев/ссылок/медиа, статус в чате, админство, join/leave/invite-link поля.
 - `telegram_chat_member_snapshots` - последний известный статус пользователя в чате.
@@ -151,6 +202,12 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 ```bash
 ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select title, summary, keywords, created_at from post_memory_notes order by id desc limit 20;\""
+```
+
+Посмотреть voice jobs:
+
+```bash
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select id, chat_id, message_id, media_kind, duration_sec, file_size, status, asr_provider, asr_model, render_mode, left(coalesce(error, ''), 120) as error, created_at, updated_at from voice_transcription_jobs order by id desc limit 20;\""
 ```
 
 ## Команды Бота
@@ -179,10 +236,11 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 ## Prompt
 
-Основной prompt лежит в [prompts/first_comment.md](prompts/first_comment.md).
-Короткий факт-чек/RAG для защиты от устаревших утверждений лежит в [prompts/tech_rag.md](prompts/tech_rag.md).
+Основной prompt лежит в [prompts/first_comment.md](../prompts/first_comment.md).
+Короткий факт-чек/RAG для защиты от устаревших утверждений лежит в [prompts/tech_rag.md](../prompts/tech_rag.md).
+Cleanup prompt для расшифровки голосовых лежит в [prompts/voice_cleanup.md](../prompts/voice_cleanup.md).
 
-Важно: модель должна вернуть текст с плейсхолдером `{CHAT_LINK}`. Код сам заменяет его на HTML-ссылку и не даёт модели портить URL.
+Важно: модель первого комментария должна вернуть текст с плейсхолдером `{CHAT_LINK}`. Код сам заменяет его на HTML-ссылку и не даёт модели портить URL.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
 Автоматическая память работает поверх RAG:
@@ -200,6 +258,65 @@ RAG не предназначен для пересказа новости: по
 - перед генерацией бот достаёт последние 6 ответов из `llm_generations`;
 - prompt просит не повторять их начало, глаголы CTA и общий рисунок фразы;
 - это снижает повторы вроде `залетайте`, `заходите`, `сравним`, `обсудим`.
+
+## Расшифровка Голосовых
+
+Pipeline вызывается в `handle_message` до first-comment pipeline:
+
+```rust
+match maybe_transcribe_voice(&bot, &msg, &state).await {
+    Ok(true) => return Ok(()),
+    Ok(false) => {}
+    Err(err) => tracing::error!(%err, "failed to process voice transcription"),
+}
+```
+
+Порядок обработки:
+
+1. Проверить `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
+2. Отфильтровать чужие чаты, ботов, команды и automatic forwards.
+3. Определить `VoiceMedia` из `voice`, `audio` или `video_note`.
+4. Сохранить исходное Telegram message в `telegram_messages`.
+5. Создать `voice_transcription_jobs`; повтор того же `(chat_id, message_id)` не создаёт новый job.
+6. Проверить duration/file size до скачивания.
+7. Скачать файл через Telegram `getFile` во временный файл.
+8. Отправить multipart request в Groq `/audio/transcriptions`.
+9. Сохранить raw ASR text, segments и raw JSON.
+10. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
+11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
+12. Собрать Telegram HTML через `telegram::html`.
+13. Отправить reply: одно сообщение или preview + `voice-transcript.txt`.
+14. Сохранить cleaned text, chapters JSON, final HTML и file id.
+
+ASR request:
+
+```text
+POST https://api.groq.com/openai/v1/audio/transcriptions
+model = VOICE_ASR_MODEL
+response_format = verbose_json
+language = VOICE_LANGUAGE
+temperature = VOICE_ASR_TEMPERATURE
+timestamp_granularities[] = segment
+```
+
+Cleanup request:
+
+- сначала используется `VOICE_CLEANUP_PROVIDER`/`VOICE_CLEANUP_MODEL`, если заданы;
+- если cleanup provider отличается от основного `LLM_PROVIDER` и падает, код пробует основной provider;
+- если все cleanup providers падают, используется raw ASR transcript;
+- если JSON от модели не парсится, используется plain LLM text.
+
+Rendering policy:
+
+- `clean.text.chars().count() <= VOICE_SHORT_TEXT_MAX_CHARS` -> только исправленный текст;
+- `mode=chapters` + непустые chapters -> заголовок `Расшифровка голосового` и главы;
+- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true`;
+- если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет preview;
+- если `VOICE_SEND_FULL_FILE=true`, полный transcript отправляется файлом.
+
+Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
+
+`video_note` сейчас определяется, но отклоняется с пользовательским сообщением: для кружков нужен отдельный audio extract через ffmpeg.
 
 ## Метрики И Отладка
 
@@ -282,8 +399,8 @@ ssh vps-153 "podman cp tg-ai-bot-postgres:/tmp/tg_ai_bot_before_export_import.du
 
 Список считанных premium/custom emoji:
 
-- [docs/custom_emoji_stickers.tsv](docs/custom_emoji_stickers.tsv)
-- [docs/custom_emoji_sheet.png](docs/custom_emoji_sheet.png)
+- [docs/custom_emoji_stickers.tsv](custom_emoji_stickers.tsv)
+- [docs/custom_emoji_sheet.png](custom_emoji_sheet.png)
 
 Текущие ID:
 
@@ -301,6 +418,9 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 - Merge памяти эвристический; за качеством заметок надо иногда смотреть через `/memory` или SQL.
 - Реакции считаются только с момента включения reaction updates; старые реакции Telegram Bot API задним числом не отдаёт.
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
-- Если Ollama Cloud вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
+- Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
+- Voice ASR сейчас только через Groq; local Whisper/Ollama audio не подключены.
+- `video_note` пока не расшифровывается, потому что нужен ffmpeg audio extract.
+- Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; настройки меняются через `.env` и рестарт сервиса.
