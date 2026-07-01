@@ -41,6 +41,13 @@ impl Html {
         ))
     }
 
+    pub fn expandable_blockquote(text: impl AsRef<str>) -> Self {
+        Self(format!(
+            "<blockquote expandable>{}</blockquote>",
+            escape(text.as_ref())
+        ))
+    }
+
     pub fn push(&mut self, part: Html) {
         self.0.push_str(part.as_str());
     }
@@ -84,6 +91,10 @@ pub fn code(text: impl AsRef<str>) -> Html {
 
 pub fn link(label: impl AsRef<str>, url: impl AsRef<str>) -> Html {
     Html::link(label, url)
+}
+
+pub fn expandable_blockquote(text: impl AsRef<str>) -> Html {
+    Html::expandable_blockquote(text)
 }
 
 pub fn lines(parts: impl IntoIterator<Item = Html>) -> Html {
@@ -149,6 +160,14 @@ mod tests {
         assert_eq!(
             Html::custom_emoji(r#"123"456"#, "😎").into_string(),
             r#"<tg-emoji emoji-id="123&quot;456">😎</tg-emoji>"#
+        );
+    }
+
+    #[test]
+    fn expandable_blockquote_escapes_body() {
+        assert_eq!(
+            Html::expandable_blockquote("<b>x</b>").into_string(),
+            "<blockquote expandable>&lt;b&gt;x&lt;/b&gt;</blockquote>"
         );
     }
 

@@ -22,6 +22,7 @@ use db::telegram::{
 };
 use db::{build_pool, migrate};
 use features::first_comment::pipeline::maybe_comment_post;
+use features::voice::pipeline::maybe_transcribe_voice;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
 use telegram::commands::Command;
@@ -81,6 +82,12 @@ async fn handle_message(
 ) -> ResponseResult<()> {
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
         return Ok(());
+    }
+
+    match maybe_transcribe_voice(&bot, &msg, &state).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(err) => tracing::error!(%err, "failed to process voice transcription"),
     }
 
     if let Err(err) = maybe_comment_post(&bot, &msg, &state).await {

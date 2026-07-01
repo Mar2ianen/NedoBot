@@ -4,6 +4,7 @@ use crate::llm::openai_compat::OpenAiCompatClient;
 use crate::llm::types::{GeneratedText, LlmClient, LlmRequest};
 
 const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
+const CEREBRAS_OPENAI_BASE_URL: &str = "https://api.cerebras.ai/v1";
 const OPENROUTER_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 pub async fn generate_text(
@@ -13,8 +14,29 @@ pub async fn generate_text(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<GeneratedText> {
-    let provider = normalize_provider(&config.llm_provider)?;
-    let model = model_for_provider(config, provider);
+    generate_text_with_provider(
+        config,
+        None,
+        None,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+    )
+    .await
+}
+
+pub async fn generate_text_with_provider(
+    config: &Config,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+) -> anyhow::Result<GeneratedText> {
+    let provider = normalize_provider(provider_override.unwrap_or(&config.llm_provider))?;
+    let model = model_override.unwrap_or_else(|| model_for_provider(config, provider));
     let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
         model,
@@ -26,6 +48,11 @@ pub async fn generate_text(
     let response = match provider {
         "groq" => {
             OpenAiCompatClient::new(GROQ_OPENAI_BASE_URL, &config.groq_api_key)
+                .generate(request)
+                .await?
+        }
+        "cerebras" => {
+            OpenAiCompatClient::new(CEREBRAS_OPENAI_BASE_URL, &config.cerebras_api_key)
                 .generate(request)
                 .await?
         }
@@ -54,6 +81,7 @@ fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
     match provider.trim().to_lowercase().as_str() {
         "" | "ollama" => Ok("ollama"),
         "groq" => Ok("groq"),
+        "cerebras" => Ok("cerebras"),
         "openrouter" => Ok("openrouter"),
         "openai_compat" => Ok("openai_compat"),
         other => anyhow::bail!("unknown LLM_PROVIDER: {other}"),
@@ -62,7 +90,9 @@ fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
 
 fn model_for_provider<'a>(config: &'a Config, provider: &str) -> &'a str {
     match provider {
-        "groq" | "openrouter" => config.llm_model.as_deref().unwrap_or(&config.vision_model),
+        "groq" | "cerebras" | "openrouter" => {
+            config.llm_model.as_deref().unwrap_or(&config.vision_model)
+        }
         "openai_compat" => config
             .openai_compat_model
             .as_deref()
