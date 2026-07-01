@@ -437,17 +437,26 @@ async fn build_user_stats_report(
 
     let totals = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64)>(
         r#"
+        with recursive post_thread_messages as (
+            select chat_id, message_id
+            from telegram_messages
+            where chat_id = $1 and source_channel_id is not null
+
+            union
+
+            select child.chat_id, child.message_id
+            from telegram_messages child
+            join post_thread_messages parent
+              on parent.chat_id = child.chat_id
+             and parent.message_id = child.reply_to_message_id
+            where child.chat_id = $1
+              and child.source_channel_id is null
+        )
         select count(*)::bigint as messages,
                count(*) filter (where reply_to_message_id is not null)::bigint as replies,
                count(*) filter (where has_links)::bigint as links,
                count(*) filter (where has_photo or has_video or has_document or has_audio or has_voice or has_sticker or has_animation)::bigint as media,
-               count(*) filter (
-                   where reply_to_message_id in (
-                       select message_id
-                       from telegram_messages
-                       where chat_id = $1 and source_channel_id is not null
-                   )
-               )::bigint as replies_to_channel_posts,
+               count(*) filter (where message_id in (select message_id from post_thread_messages))::bigint as post_comments,
                count(*) filter (where reply_to_message_id in (select bot_comment_message_id from post_comment_jobs))::bigint as replies_to_bot,
                count(distinct date_trunc('day', created_at at time zone 'Europe/Moscow' - interval '5 hours'))::bigint as active_days,
                count(*) filter (where has_voice)::bigint as voices
@@ -624,7 +633,7 @@ async fn build_user_stats_report(
     );
 
     Ok(format!(
-        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
+        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nКомментарии: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
         user.linked_with_badges(),
         escape_html(observed_at),
         first_message,
