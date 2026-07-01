@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use teloxide::{
     payloads::GetUserProfilePhotosSetters,
@@ -98,22 +99,38 @@ pub async fn refresh_profile(bot: &Bot, pool: &PgPool, user_id: i64) -> anyhow::
     let user_id_u64 = u64::try_from(user_id).context("negative user id")?;
     let user_id = UserId(user_id_u64);
 
-    let chat_result = bot.get_chat(ChatId(user_id.0 as i64)).await;
-    let photos_result = bot.get_user_profile_photos(user_id).limit(1).await;
+    let personal_channel_future = fetch_personal_channel_messages(user_id.0 as i64);
+    let (chat_result, photos_result, personal_channel_result) = tokio::join!(
+        bot.get_chat(ChatId(user_id.0 as i64)),
+        bot.get_user_profile_photos(user_id).limit(1),
+        personal_channel_future,
+    );
 
     let chat = chat_result.as_ref().ok();
     let photos = photos_result.as_ref().ok();
-    if chat.is_none() && photos.is_none() {
+    let personal_channel = personal_channel_result.as_ref().ok();
+    let personal_channel_error = personal_channel_result
+        .as_ref()
+        .err()
+        .map(|err| err.to_string());
+    if chat.is_none() && photos.is_none() && personal_channel.is_none() {
         let chat_error = chat_result.err().map(|err| err.to_string());
         let photos_error = photos_result.err().map(|err| err.to_string());
         bail!(
-            "getChat and getUserProfilePhotos failed: chat={:?}, photos={:?}",
+            "profile API calls failed: chat={:?}, photos={:?}, personal_channel={:?}",
             chat_error,
-            photos_error
+            photos_error,
+            personal_channel_error
         );
     }
 
-    let details = build_details(user_id.0 as i64, chat, photos);
+    let details = build_details(
+        user_id.0 as i64,
+        chat,
+        photos,
+        personal_channel,
+        personal_channel_error,
+    );
     update_user_profile_details(pool, details).await?;
     Ok(())
 }
@@ -122,6 +139,8 @@ fn build_details(
     telegram_user_id: i64,
     chat: Option<&Chat>,
     photos: Option<&UserProfilePhotos>,
+    personal_channel: Option<&PersonalChannelData>,
+    personal_channel_error: Option<String>,
 ) -> UserProfileDetails {
     let private = chat.and_then(|chat| match &chat.kind {
         ChatKind::Private(private) => Some(private),
@@ -151,9 +170,23 @@ fn build_details(
             .and_then(|chat| chat.chat_full_info.emoji_status_custom_emoji_id.clone()),
         profile_accent_color_id: chat
             .and_then(|chat| chat.chat_full_info.profile_accent_color_id.map(i16::from)),
+        personal_channel_chat_id: personal_channel.and_then(|channel| channel.chat_id),
+        personal_channel_title: personal_channel.and_then(|channel| channel.title.clone()),
+        personal_channel_username: personal_channel.and_then(|channel| channel.username.clone()),
+        personal_channel_message_count: personal_channel.map(|channel| channel.message_count),
+        personal_channel_last_message_id: personal_channel
+            .and_then(|channel| channel.last_message_id),
+        personal_channel_last_message_at: personal_channel
+            .and_then(|channel| channel.last_message_at),
+        personal_channel_last_text: personal_channel.and_then(|channel| channel.last_text.clone()),
+        personal_channel_has_adult_links: personal_channel
+            .is_some_and(|channel| channel.has_adult_links),
+        personal_channel_raw_json: personal_channel.map(|channel| channel.raw_json.clone()),
+        personal_channel_fetch_error: personal_channel_error,
         raw_json: json!({
             "chat": chat,
             "profile_photos": photos,
+            "personal_channel": personal_channel.map(|channel| &channel.raw_json),
         }),
     }
 }
@@ -164,4 +197,104 @@ fn photo_width(photo: &PhotoSize) -> i32 {
 
 fn photo_height(photo: &PhotoSize) -> i32 {
     i32::try_from(photo.height).unwrap_or(i32::MAX)
+}
+
+struct PersonalChannelData {
+    chat_id: Option<i64>,
+    title: Option<String>,
+    username: Option<String>,
+    message_count: i32,
+    last_message_id: Option<i32>,
+    last_message_at: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>,
+    last_text: Option<String>,
+    has_adult_links: bool,
+    raw_json: Value,
+}
+
+#[derive(Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    result: Option<T>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonalChannelMessage {
+    message_id: i32,
+    date: i64,
+    chat: PersonalChannelChat,
+    text: Option<String>,
+    caption: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PersonalChannelChat {
+    id: i64,
+    title: Option<String>,
+    username: Option<String>,
+}
+
+async fn fetch_personal_channel_messages(user_id: i64) -> anyhow::Result<PersonalChannelData> {
+    let token = std::env::var("TELOXIDE_TOKEN").or_else(|_| std::env::var("BOT_TOKEN"))?;
+    let url = format!("https://api.telegram.org/bot{token}/getUserPersonalChatMessages");
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "user_id": user_id,
+            "limit": 5,
+        }))
+        .send()
+        .await?;
+
+    let raw_json: Value = response.json().await?;
+    let api: TelegramApiResponse<Vec<PersonalChannelMessage>> =
+        serde_json::from_value(raw_json.clone())?;
+
+    if !api.ok {
+        anyhow::bail!(
+            "{}",
+            api.description
+                .unwrap_or_else(|| "getUserPersonalChatMessages failed".to_string())
+        );
+    }
+
+    Ok(build_personal_channel_data(
+        api.result.unwrap_or_default(),
+        raw_json,
+    ))
+}
+
+fn build_personal_channel_data(
+    messages: Vec<PersonalChannelMessage>,
+    raw_json: Value,
+) -> PersonalChannelData {
+    let first = messages.first();
+    let last_text = first.and_then(|message| message.text.clone().or(message.caption.clone()));
+    let has_adult_links = messages.iter().any(|message| {
+        let text = message
+            .text
+            .as_deref()
+            .or(message.caption.as_deref())
+            .unwrap_or_default()
+            .to_lowercase();
+        text.contains("t.me/+")
+            && (text.contains("хочешь увидеть")
+                || text.contains("заходи")
+                || text.contains("18+")
+                || text.contains("приват")
+                || text.contains("вход для своих"))
+    });
+
+    PersonalChannelData {
+        chat_id: first.map(|message| message.chat.id),
+        title: first.and_then(|message| message.chat.title.clone()),
+        username: first.and_then(|message| message.chat.username.clone()),
+        message_count: i32::try_from(messages.len()).unwrap_or(i32::MAX),
+        last_message_id: first.map(|message| message.message_id),
+        last_message_at: first
+            .and_then(|message| sqlx::types::chrono::DateTime::from_timestamp(message.date, 0)),
+        last_text,
+        has_adult_links,
+        raw_json,
+    }
 }

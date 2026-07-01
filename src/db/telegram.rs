@@ -55,6 +55,16 @@ pub struct UserProfileDetails {
     pub profile_photo_count: Option<i32>,
     pub emoji_status_custom_emoji_id: Option<String>,
     pub profile_accent_color_id: Option<i16>,
+    pub personal_channel_chat_id: Option<i64>,
+    pub personal_channel_title: Option<String>,
+    pub personal_channel_username: Option<String>,
+    pub personal_channel_message_count: Option<i32>,
+    pub personal_channel_last_message_id: Option<i32>,
+    pub personal_channel_last_message_at: Option<DateTime<Utc>>,
+    pub personal_channel_last_text: Option<String>,
+    pub personal_channel_has_adult_links: bool,
+    pub personal_channel_raw_json: Option<serde_json::Value>,
+    pub personal_channel_fetch_error: Option<String>,
     pub raw_json: serde_json::Value,
 }
 
@@ -418,6 +428,11 @@ pub async fn update_user_profile_details(
                 profile_photo_file_id, profile_photo_file_unique_id,
                 profile_photo_width, profile_photo_height, profile_photo_count,
                 emoji_status_custom_emoji_id, profile_accent_color_id,
+                personal_channel_chat_id, personal_channel_title, personal_channel_username,
+                personal_channel_message_count, personal_channel_last_message_id,
+                personal_channel_last_message_at, personal_channel_last_text,
+                personal_channel_has_adult_links, personal_channel_raw_json,
+                personal_channel_refreshed_at, personal_channel_fetch_error,
                 profile_raw_json, profile_refreshed_at, profile_refresh_error,
                 updated_at
             )
@@ -425,7 +440,9 @@ pub async fn update_user_profile_details(
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9,
             $10, $11, $12, $13, $14,
-            $15, $16, $17, now(), null, now()
+            $15, $16,
+            $17, $18, $19, $20, $21, $22, $23, $24, $25, now(), $26,
+            $27, now(), null, now()
         )
         on conflict (telegram_user_id) do update set
             username = coalesce(excluded.username, telegram_user_profiles.username),
@@ -443,6 +460,17 @@ pub async fn update_user_profile_details(
             profile_photo_count = excluded.profile_photo_count,
             emoji_status_custom_emoji_id = excluded.emoji_status_custom_emoji_id,
             profile_accent_color_id = excluded.profile_accent_color_id,
+            personal_channel_chat_id = excluded.personal_channel_chat_id,
+            personal_channel_title = excluded.personal_channel_title,
+            personal_channel_username = excluded.personal_channel_username,
+            personal_channel_message_count = excluded.personal_channel_message_count,
+            personal_channel_last_message_id = excluded.personal_channel_last_message_id,
+            personal_channel_last_message_at = excluded.personal_channel_last_message_at,
+            personal_channel_last_text = excluded.personal_channel_last_text,
+            personal_channel_has_adult_links = excluded.personal_channel_has_adult_links,
+            personal_channel_raw_json = excluded.personal_channel_raw_json,
+            personal_channel_refreshed_at = excluded.personal_channel_refreshed_at,
+            personal_channel_fetch_error = excluded.personal_channel_fetch_error,
             profile_raw_json = excluded.profile_raw_json,
             profile_refreshed_at = excluded.profile_refreshed_at,
             profile_refresh_error = null,
@@ -465,6 +493,16 @@ pub async fn update_user_profile_details(
     .bind(details.profile_photo_count)
     .bind(details.emoji_status_custom_emoji_id)
     .bind(details.profile_accent_color_id)
+    .bind(details.personal_channel_chat_id)
+    .bind(details.personal_channel_title)
+    .bind(details.personal_channel_username)
+    .bind(details.personal_channel_message_count)
+    .bind(details.personal_channel_last_message_id)
+    .bind(details.personal_channel_last_message_at)
+    .bind(details.personal_channel_last_text)
+    .bind(details.personal_channel_has_adult_links)
+    .bind(details.personal_channel_raw_json)
+    .bind(details.personal_channel_fetch_error)
     .bind(details.raw_json)
     .execute(pool)
     .await?;
