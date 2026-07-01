@@ -136,7 +136,7 @@
 
 Rust, teloxide, PostgreSQL, LLM/Vision, prompt-файлы, память, RAG, импорт Telegram export и деплой на VPS.
 
-README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode, импорт истории и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md). Текущая инженерная карта и ближайшие шаги лежат в [`docs/REFACTOR_NEXT.md`](docs/REFACTOR_NEXT.md).
+README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode, импорт истории и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md). Активный инженерный план лежит в [`docs/REFACTOR_NEXT.md`](docs/REFACTOR_NEXT.md), а уже закрытый рефактор заархивирован в [`docs/REFACTOR_DONE.md`](docs/REFACTOR_DONE.md).
 
 ## Лицензия
 
