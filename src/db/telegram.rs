@@ -461,6 +461,35 @@ pub async fn refresh_known_member_snapshots(
     Ok(())
 }
 
+pub async fn refresh_chat_member_snapshot(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &PgPool,
+    config: &Config,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    let user_id_u64 = u64::try_from(user_id)?;
+    let member = bot
+        .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id_u64))
+        .await?;
+
+    upsert_user_profile(pool, &member.user).await?;
+    upsert_member_snapshot(
+        pool,
+        MemberSnapshot {
+            chat_id: config.discussion_chat_id,
+            user_id,
+            status: chat_member_status(&member.kind),
+            is_admin: member.kind.is_privileged(),
+            is_present: member.kind.is_present(),
+            raw_json: serde_json::to_value(&member)?,
+            observed_at: Utc::now(),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
 async fn upsert_member_snapshot(pool: &PgPool, snapshot: MemberSnapshot) -> anyhow::Result<()> {
     sqlx::query(
         r#"

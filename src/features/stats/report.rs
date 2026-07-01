@@ -1,9 +1,8 @@
 use sqlx::PgPool;
 use teloxide::prelude::*;
-use teloxide::types::UserId;
 
 use crate::config::Config;
-use crate::db::telegram::upsert_user_profile;
+use crate::db::telegram::refresh_chat_member_snapshot;
 use crate::features::stats::types::{
     ChatStatsSummary, StatsPeriod, UserPresentation, display_name,
 };
@@ -62,6 +61,8 @@ pub async fn send_top_messages(
     pool: &PgPool,
     config: &Config,
 ) -> ResponseResult<()> {
+    refresh_top_message_users(bot, pool, config).await;
+
     let report = build_top_messages_report(pool, config)
         .await
         .map_err(|err| {
@@ -80,14 +81,18 @@ pub async fn send_top_reacted(
     pool: &PgPool,
     config: &Config,
 ) -> ResponseResult<()> {
-    let report = build_top_reacted_report(pool, config)
+    refresh_top_reacted_users(bot, pool, config).await;
+
+    let reports = build_top_reacted_reports(pool, config)
         .await
         .map_err(|err| {
             tracing::error!(%err, "failed to build top reacted report");
             teloxide::RequestError::Io(std::io::Error::other("top reacted failed"))
         })?;
 
-    send_html(bot, chat_id, report).await?;
+    for report in reports {
+        send_html(bot, chat_id, report).await?;
+    }
 
     Ok(())
 }
@@ -139,7 +144,11 @@ async fn build_top_messages_report(pool: &PgPool, config: &Config) -> anyhow::Re
         r#"
         select m.user_id,
                p.username,
-               p.first_name,
+               coalesce(
+                   nullif(case when p.first_name = 'пользователь' then '' else p.first_name end, ''),
+                   raw_name.display_name,
+                   'скрытый пользователь'
+               ) as first_name,
                p.last_name,
                coalesce(p.is_bot, false) as is_bot,
                coalesce(s.status, 'unknown') as status,
@@ -155,12 +164,27 @@ async fn build_top_messages_report(pool: &PgPool, config: &Config) -> anyhow::Re
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
         left join telegram_message_reaction_counts rc on rc.chat_id = m.chat_id and rc.message_id = m.message_id
+        left join lateral (
+            select coalesce(
+                       nullif(tm.raw_json #>> '{from,first_name}', ''),
+                       nullif(tm.raw_json ->> 'from', '')
+                   ) as display_name
+            from telegram_messages tm
+            where tm.chat_id = m.chat_id
+              and tm.user_id = m.user_id
+              and coalesce(
+                      nullif(tm.raw_json #>> '{from,first_name}', ''),
+                      nullif(tm.raw_json ->> 'from', '')
+                  ) is not null
+            order by tm.created_at desc
+            limit 1
+        ) raw_name on true
         where m.chat_id = $1
           and m.user_id is not null
           and m.source_channel_id is null
           and m.user_id <> 777000
           and coalesce(p.is_bot, false) = false
-        group by m.user_id, p.username, p.first_name, p.last_name, p.is_bot, s.status, s.is_admin, s.is_present
+        group by m.user_id, p.username, p.first_name, p.last_name, p.is_bot, s.status, s.is_admin, s.is_present, raw_name.display_name
         order by messages desc, reactions_received desc
         limit $2
         "#,
@@ -227,13 +251,17 @@ async fn build_top_messages_report(pool: &PgPool, config: &Config) -> anyhow::Re
     Ok(report)
 }
 
-async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Result<String> {
+async fn build_top_reacted_reports(pool: &PgPool, config: &Config) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query_as::<_, TopReactedRow>(
         r#"
         select m.message_id,
                m.user_id,
                p.username,
-               p.first_name,
+               coalesce(
+                   nullif(case when p.first_name = 'пользователь' then '' else p.first_name end, ''),
+                   raw_name.display_name,
+                   'скрытый пользователь'
+               ) as first_name,
                p.last_name,
                coalesce(p.is_bot, false) as is_bot,
                coalesce(s.status, 'unknown') as status,
@@ -254,6 +282,21 @@ async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Res
         join telegram_messages m on m.chat_id = rc.chat_id and m.message_id = rc.message_id
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
+        left join lateral (
+            select coalesce(
+                       nullif(tm.raw_json #>> '{from,first_name}', ''),
+                       nullif(tm.raw_json ->> 'from', '')
+                   ) as display_name
+            from telegram_messages tm
+            where tm.chat_id = m.chat_id
+              and tm.user_id = m.user_id
+              and coalesce(
+                      nullif(tm.raw_json #>> '{from,first_name}', ''),
+                      nullif(tm.raw_json ->> 'from', '')
+                  ) is not null
+            order by tm.created_at desc
+            limit 1
+        ) raw_name on true
         where rc.chat_id = $1
           and rc.total_count > 0
           and m.user_id is not null
@@ -269,14 +312,20 @@ async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Res
     .fetch_all(pool)
     .await?;
 
-    let mut report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время\n");
+    let mut reports = Vec::new();
+    let mut report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время, 1/2\n");
 
     if rows.is_empty() {
         report.push_str("\nНет данных.");
-        return Ok(report);
+        return Ok(vec![report]);
     }
 
     for (index, row) in rows.into_iter().enumerate() {
+        if index == 10 {
+            reports.push(report);
+            report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время, 2/2\n");
+        }
+
         let user = UserPresentation {
             user_id: row.user_id,
             display_name: display_name(
@@ -319,7 +368,8 @@ async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Res
         ));
     }
 
-    Ok(report)
+    reports.push(report);
+    Ok(reports)
 }
 
 async fn refresh_user_profile_from_telegram(
@@ -328,21 +378,95 @@ async fn refresh_user_profile_from_telegram(
     config: &Config,
     user_id: i64,
 ) {
-    let Ok(user_id) = u64::try_from(user_id) else {
-        return;
-    };
-
-    match bot
-        .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id))
-        .await
-    {
-        Ok(member) => {
-            if let Err(err) = upsert_user_profile(pool, &member.user).await {
-                tracing::warn!(%err, "failed to save refreshed user profile");
-            }
-        }
+    match refresh_chat_member_snapshot(bot, pool, config, user_id).await {
+        Ok(()) => {}
         Err(err) => {
             tracing::debug!(%err, user_id, "failed to refresh user profile from Telegram");
+        }
+    }
+}
+
+async fn refresh_top_message_users(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &PgPool,
+    config: &Config,
+) {
+    let user_ids = match sqlx::query_as::<_, (i64,)>(
+        r#"
+        select m.user_id
+        from telegram_messages m
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        where m.chat_id = $1
+          and m.user_id is not null
+          and m.source_channel_id is null
+          and m.user_id <> 777000
+          and coalesce(p.is_bot, false) = false
+        group by m.user_id
+        order by count(*) desc
+        limit $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(TOP_LIMIT)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "failed to load top message users for refresh");
+            return;
+        }
+    };
+
+    refresh_member_snapshots_for_users(bot, pool, config, user_ids).await;
+}
+
+async fn refresh_top_reacted_users(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &PgPool,
+    config: &Config,
+) {
+    let user_ids = match sqlx::query_as::<_, (i64,)>(
+        r#"
+        select m.user_id
+        from telegram_message_reaction_counts rc
+        join telegram_messages m on m.chat_id = rc.chat_id and m.message_id = rc.message_id
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        where rc.chat_id = $1
+          and rc.total_count > 0
+          and m.user_id is not null
+          and m.source_channel_id is null
+          and m.user_id <> 777000
+          and coalesce(p.is_bot, false) = false
+        group by m.user_id
+        order by max(rc.total_count) desc
+        limit $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(TOP_LIMIT)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "failed to load top reacted users for refresh");
+            return;
+        }
+    };
+
+    refresh_member_snapshots_for_users(bot, pool, config, user_ids).await;
+}
+
+async fn refresh_member_snapshots_for_users(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &PgPool,
+    config: &Config,
+    user_ids: Vec<(i64,)>,
+) {
+    for (user_id,) in user_ids {
+        if let Err(err) = refresh_chat_member_snapshot(bot, pool, config, user_id).await {
+            tracing::debug!(%err, user_id, "failed to refresh top user from Telegram");
         }
     }
 }
