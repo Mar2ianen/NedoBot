@@ -150,6 +150,7 @@ mod tests {
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
             groq_api_key: String::new(),
+            cerebras_api_key: String::new(),
             openrouter_api_key: String::new(),
             ollama_base_url: "https://ollama.com".to_string(),
             ollama_api_key: String::new(),
