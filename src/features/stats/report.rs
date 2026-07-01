@@ -5,8 +5,9 @@ use crate::config::Config;
 use crate::features::stats::types::{
     ChatStatsSummary, StatsPeriod, UserPresentation, display_name,
 };
+use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::{escape_html, send_html};
-use crate::text::{first_text_chars, normalize_ai_markers};
+use crate::text::normalize_ai_markers;
 
 pub async fn send_chat_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
@@ -340,7 +341,7 @@ async fn top_bot_comments_for_period(
                     msg_30m,
                     direct_replies,
                     reactions,
-                    escape_html(&first_text_chars(&clean_response, 110))
+                    Html::text(truncate_text(&clean_response, 110)).into_string()
                 )
             },
         )
@@ -362,8 +363,8 @@ async fn build_user_stats_report(
 ) -> anyhow::Result<String> {
     let Some(user_id) = resolve_user_id(pool, target).await? else {
         return Ok(format!(
-            "Не нашёл пользователя <code>{}</code>. Используй id или @username из уже виденных ботом пользователей.",
-            escape_html(target)
+            "Не нашёл пользователя {}. Используй id или @username из уже виденных ботом пользователей.",
+            Html::code(target).into_string()
         ));
     };
 

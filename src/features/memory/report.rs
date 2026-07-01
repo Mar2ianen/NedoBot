@@ -1,7 +1,8 @@
 use sqlx::PgPool;
 use teloxide::prelude::*;
 
-use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::html::{Html, bold, code, lines, paragraphs};
+use crate::telegram::render::send_html;
 
 pub async fn send_memory_notes(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
@@ -28,18 +29,10 @@ pub async fn send_memory_notes(
         return Ok(());
     }
 
-    let text = notes
-        .into_iter()
-        .map(|(title, summary, keywords)| {
-            format!(
-                "<b>{}</b>\n{}\n<code>{}</code>",
-                escape_html(&title),
-                escape_html(&summary),
-                escape_html(&keywords)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let text = paragraphs(notes.into_iter().map(|(title, summary, keywords)| {
+        lines([bold(title), Html::text(summary), code(keywords)])
+    }))
+    .into_string();
 
     send_html(bot, chat_id, text).await?;
 
