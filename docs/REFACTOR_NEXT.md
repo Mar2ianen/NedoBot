@@ -1,724 +1,231 @@
-# Voice transcription integration plan
+# Voice transcription follow-up
 
-Активный следующий проход: добавить расшифровку голосовых сообщений в бота без возврата к огромному `main.rs`.
+Актуальное состояние после реализации voice pipeline. Старый план внедрения выполнен: вертикальный срез `voice -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit` уже есть в коде.
 
-Уже закрытый рефактор вынесен в [`REFACTOR_DONE.md`](REFACTOR_DONE.md). В этом файле остаётся только план новой фичи.
+## Уже реализовано
 
-## Цель
+Коммиты после README cleanup добавили рабочий контур:
 
-Бот должен уметь принимать `voice`, `audio` и позже `video_note`, получать расшифровку через Groq Whisper, прогонять результат через LLM-cleanup и отвечать в чат аккуратным Telegram HTML.
+- `src/features/voice/pipeline.rs` - оркестрация job: сохранить сообщение, создать `voice_transcription_jobs`, скачать файл, вызвать ASR, cleanup, render, отправить reply/file, сохранить результат.
+- `src/features/voice/types.rs` - `VoiceMedia`, `AsrTranscript`, `AsrSegment`, `CleanTranscript`, `TranscriptChapter`, render mode.
+- `src/features/voice/download.rs` - `getFile`, temp file, проверка duration/file size, user-facing skip для слишком длинных/больших файлов.
+- `src/features/voice/asr.rs` - Groq OpenAI-compatible `/audio/transcriptions`, `verbose_json`, segment timestamps.
+- `src/features/voice/cleanup.rs` - LLM cleanup через JSON, fallback chain, plain fallback при parse/provider failure, нормализация техтерминов.
+- `src/features/voice/render.rs` - short text, chapters, expandable blockquotes, safe Telegram limit, preview + file fallback.
+- `src/features/voice/repo.rs` - запись job/status/raw ASR/cleaned result/final HTML/file id.
+- `prompts/voice_cleanup.md` - prompt под русскоязычный техчат.
+- `src/telegram/html.rs` - общий safe HTML builder, `expandable_blockquote`, `SAFE_TEXT_LIMIT`, truncation.
+- `main.rs` - `maybe_transcribe_voice` вызывается до first-comment pipeline.
 
-Короткие голосовые не надо превращать в протокол. Если после cleanup текст меньше `VOICE_SHORT_TEXT_MAX_CHARS` 300-400 символов, бот отправляет только исправленный текст без глав, таймкодов и раскрываемых блоков:
+## Текущая политика поведения
 
-```text
-Да, у AMD опять странная история с драйверами: на Windows жалуются на отвал, а на Linux часть людей пишет, что через свежую Mesa всё нормально. Надо смотреть конкретную версию и багрепорты.
-```
-
-Для средних и длинных голосовых желаемый результат:
-
-```text
-Расшифровка голосового
-
-Обсуждение AMD 0:00
-[свернутый текст расшифровки до следующей главы]
-
-Linux и Proton 0:28
-[свернутый текст расшифровки до следующей главы]
-
-Итог 1:10
-[свернутый текст расшифровки]
-```
-
-В Telegram это рендерится как видимые главы и раскрываемые блоки:
-
-```html
-<b>Расшифровка голосового</b>
-
-<b>Обсуждение AMD</b> <code>0:00</code>
-<blockquote expandable>Начали обсуждать драйверы AMD и почему опять всё отвалилось...</blockquote>
-
-<b>Linux и Proton</b> <code>0:28</code>
-<blockquote expandable>Перешли к Linux/Proton и спору, насколько это массовая проблема...</blockquote>
-```
-
-Если итоговый HTML не влезает в безопасный лимит Telegram, бот отправляет короткий preview в чат и полный transcript файлом.
-
-## Внешние ограничения
-
-Telegram `sendMessage` принимает 0-4096 символов после entities parsing. В коде уже есть hard-limit `TELEGRAM_TEXT_LIMIT = 4096` и safe warning около `3900`. Для voice нельзя просто надеяться, что LLM уложится в лимит: renderer обязан сам выбирать short text, expandable chapters, chunks или file fallback.
-
-Telegram HTML поддерживает раскрываемые цитаты через `<blockquote expandable>...</blockquote>`. Это хороший формат для voice chapters: заголовок главы остаётся видимым, подробная расшифровка свёрнута. `blockquote` и `expandable_blockquote` нельзя вкладывать друг в друга, поэтому renderer должен собирать главы плоским списком.
-
-Обычный cloud Bot API через `getFile` скачивает файлы до 20 MB. Для больших аудио нужен local Bot API server, где файл доступен локальным путём. На MVP держать консервативный лимит и явно писать пользователю, что файл слишком большой.
-
-Groq Speech-to-Text использует OpenAI-compatible endpoint:
-
-```text
-POST https://api.groq.com/openai/v1/audio/transcriptions
-```
-
-Для MVP:
-
-```text
-model = whisper-large-v3-turbo
-response_format = verbose_json
-timestamp_granularities[] = segment
-language = ru
-temperature = 0
-```
-
-`whisper-large-v3` оставить как более точный, но более дорогой/медленный fallback. Groq сейчас поддерживает `flac`, `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `ogg`, `wav`, `webm`; Telegram voice обычно `ogg/opus`, поэтому первый MVP может обойтись без ffmpeg для обычных ГС.
-
-Ссылки для проверки перед деплоем:
-
-- Groq Speech-to-Text: <https://console.groq.com/docs/speech-to-text>
-- Groq API reference: <https://console.groq.com/docs/api-reference>
-- Telegram Bot API `getFile`: <https://core.telegram.org/bots/api#getfile>
-- Telegram Bot API `sendMessage`: <https://core.telegram.org/bots/api#sendmessage>
-- Telegram Bot API formatting options: <https://core.telegram.org/bots/api#formatting-options>
-
-## UX policy
-
-Рекомендуемый MVP:
-
-- Автоматически расшифровывать `voice` в `DISCUSSION_CHAT_ID`, если `VOICE_AUTO_TRANSCRIBE=true`.
-- Не трогать сообщения бота, команды и auto-forward посты канала.
-- Не расшифровывать файлы больше `VOICE_MAX_FILE_MB` и дольше `VOICE_MAX_DURATION_SEC`.
-- На слишком длинное или большое аудио отвечать коротким HTML-сообщением с причиной отказа.
-- Короткие расшифровки до `VOICE_SHORT_TEXT_MAX_CHARS` отправлять обычным исправленным текстом без глав и времени.
-- Средние расшифровки отправлять как главы + expandable blockquotes.
-- Полный файл отправлять только если главы не влезают в `SAFE_TEXT_LIMIT` или пользователь явно попросил файл.
-- Для `audio` включить поддержку после `voice`: там чаще бывают длинные файлы, музыка и мусор.
-- Для `video_note` включить третьим шагом: нужно решить, хотим ли выдирать аудио через ffmpeg.
-
-Опциональная ручная команда позже:
-
-```text
-/transcribe
-```
-
-Она полезна как безопасный режим, если auto-transcribe начнёт шуметь. Команду можно сделать reply-only: пользователь отвечает `/transcribe` на voice/audio, бот расшифровывает именно reply message.
-
-## Архитектура
-
-Новая структура:
-
-```text
-src/features/voice/
-  mod.rs
-  pipeline.rs
-  types.rs
-  download.rs
-  asr.rs
-  cleanup.rs
-  render.rs
-  repo.rs
-
-prompts/voice_cleanup.md
-```
-
-Ответственность модулей:
-
-| Модуль | Ответственность |
-| --- | --- |
-| `pipeline.rs` | Оркестрация: определить media, создать job, скачать, ASR, cleanup, render, send, mark status. |
-| `types.rs` | `VoiceMedia`, `AsrSegment`, `AsrTranscript`, `TranscriptChapter`, `CleanTranscript`, `RenderedTranscript`. |
-| `download.rs` | `getFile`, проверка размера, скачивание в temp path, cleanup temp files. |
-| `asr.rs` | Groq multipart request, парсинг `verbose_json`, нормализация timestamps. |
-| `cleanup.rs` | LLM prompt для short/chapter cleanup. |
-| `render.rs` | Short text, Telegram HTML chapters, expandable blockquotes, preview, file body, fallback для длинного текста. |
-| `repo.rs` | SQL для `voice_transcription_jobs`. |
-
-`main.rs` должен получить только один новый делегат в `handle_message`:
-
-```rust
-if maybe_transcribe_voice(&bot, &msg, &state).await? {
-    return Ok(());
-}
-```
-
-Порядок в `handle_message`:
-
-1. reply-only command hacks, которые уже есть;
-2. voice transcription;
-3. first-comment pipeline.
-
-Voice не должен мешать first-comment pipeline: auto-forward посты из канала не являются `voice`, а обычные voice/audio не являются first-comment candidates.
-
-## Config
-
-Добавить в `Config` и `.env.example`:
+Voice pipeline включается только при двух флагах:
 
 ```env
 VOICE_TRANSCRIPTION_ENABLED=true
 VOICE_AUTO_TRANSCRIBE=true
-VOICE_MAX_DURATION_SEC=600
-VOICE_MAX_FILE_MB=20
-VOICE_SHORT_TEXT_MAX_CHARS=400
-VOICE_LANGUAGE=ru
-VOICE_ASR_PROVIDER=groq
-VOICE_ASR_MODEL=whisper-large-v3-turbo
-VOICE_ASR_TEMPERATURE=0
-VOICE_CLEANUP_PROVIDER=
-VOICE_CLEANUP_MODEL=
-VOICE_CLEANUP_TEMPERATURE=0.2
-VOICE_CLEANUP_MAX_TOKENS=1800
-VOICE_RENDER_EXPANDABLE_CHAPTERS=true
-VOICE_SEND_FULL_FILE=true
 ```
 
-Правила:
+Фильтры в `maybe_transcribe_voice`:
 
-- `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
-- `VOICE_CLEANUP_MODEL` пустой значит использовать обычную модель provider-а.
-- `VOICE_MAX_FILE_MB=20` выбран из-за cloud Bot API `getFile`; если поднимешь local Bot API server, можно увеличивать отдельно.
-- `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткие ГС после cleanup отправляются простым текстом без глав и timestamps.
-- `VOICE_RENDER_EXPANDABLE_CHAPTERS=true` значит использовать видимые заголовки глав и `<blockquote expandable>` для тела главы.
-- `VOICE_SEND_FULL_FILE=true` значит длинная расшифровка уходит preview + `.md`/`.txt` файлом.
+- работает в private chat или в `DISCUSSION_CHAT_ID`;
+- игнорирует ботов;
+- игнорирует команды;
+- игнорирует automatic forward;
+- поддерживает `voice` и `audio`;
+- `video_note` определяется, но сейчас явно отклоняется как unsupported.
 
-## Database
+Короткие расшифровки:
 
-Добавить миграцию без Postgres enum, чтобы проще менять статусы:
+- если итоговый clean text `<= VOICE_SHORT_TEXT_MAX_CHARS`, renderer отправляет только текст;
+- без заголовка;
+- без глав;
+- без timestamp;
+- без blockquote.
+
+Длинные расшифровки:
+
+- если cleanup вернул главы и текст длиннее short limit, renderer собирает `Расшифровка голосового` + главы;
+- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true`;
+- если HTML влезает в `SAFE_TEXT_LIMIT`, отправляется одним сообщением;
+- если не влезает, отправляется preview и полный `voice-transcript.txt`, если `VOICE_SEND_FULL_FILE=true`.
+
+Fallback:
+
+- если `VOICE_CLEANUP_PROVIDER` задан и падает, код пробует обычный `LLM_PROVIDER`;
+- если все cleanup providers падают, используется raw ASR text;
+- если cleanup JSON не парсится, используется plain LLM text;
+- если после normalize нет глав, режим принудительно становится `short`.
+
+## Что проверить руками
+
+Минимальный smoke в живом чате:
+
+1. `VOICE_TRANSCRIPTION_ENABLED=true`, `VOICE_AUTO_TRANSCRIBE=true`.
+2. `VOICE_ASR_PROVIDER=groq`, `VOICE_ASR_MODEL=whisper-large-v3-turbo`.
+3. `GROQ_API_KEY` заполнен.
+4. Отправить короткое voice до 10 секунд.
+5. Проверить, что ответ plain text без заголовка и timestamp.
+6. Отправить длинное voice с 2-3 явными темами.
+7. Проверить, что есть главы и раскрываемые цитаты.
+8. Проверить записи в `voice_transcription_jobs`.
+
+SQL для проверки:
 
 ```sql
-create table voice_transcription_jobs (
-    id bigserial primary key,
-    chat_id bigint not null,
-    message_id integer not null,
-    user_id bigint,
-    file_id text not null,
-    file_unique_id text,
-    media_kind text not null,
-    duration_sec integer,
-    file_size bigint,
-    mime_type text,
-    status text not null default 'pending',
-    error text,
-    asr_provider text,
-    asr_model text,
-    asr_request_id text,
-    cleanup_provider text,
-    cleanup_model text,
-    raw_transcript text,
-    cleaned_text text,
-    render_mode text,
-    chapters_json jsonb,
-    segments_json jsonb,
-    raw_asr_json jsonb,
-    final_html text,
-    full_text_file_id text,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (chat_id, message_id),
-    check (status in ('pending', 'downloading', 'transcribing', 'cleaning', 'sent', 'failed', 'skipped'))
-);
-
-create index voice_transcription_jobs_status_idx on voice_transcription_jobs(status);
-create index voice_transcription_jobs_created_at_idx on voice_transcription_jobs(created_at desc);
+select
+    id,
+    chat_id,
+    message_id,
+    media_kind,
+    duration_sec,
+    file_size,
+    status,
+    asr_provider,
+    asr_model,
+    render_mode,
+    left(coalesce(error, ''), 120) as error,
+    created_at,
+    updated_at
+from voice_transcription_jobs
+order by id desc
+limit 20;
 ```
 
-`render_mode` значения для MVP:
+## Ближайшие фиксы
+
+### 1. Вернуть timestamp в заголовки глав
+
+Запрошенный UX был таким:
 
 ```text
-short
-chapters
-file
+Обсуждение AMD 0:00
+[свернутый текст до следующей главы]
 ```
 
-`repo.rs` API:
+Текущий `src/features/voice/render.rs` выводит только `chapter.title`, без `chapter.start_sec`.
 
-```rust
-pub async fn create_voice_job(
-    pool: &PgPool,
-    media: &VoiceMedia,
-) -> anyhow::Result<Option<i64>>;
+Нужно:
 
-pub async fn mark_voice_job_status(
-    pool: &PgPool,
-    job_id: i64,
-    status: &str,
-) -> anyhow::Result<()>;
+- добавить `format_timestamp(seconds: f32) -> String` в `voice/render.rs` или общий helper;
+- в `render_chapters`, `render_one_chapter` и `render_file_body` писать `title + timestamp`;
+- timestamp рендерить через `Html::code(...)` или plain text рядом с title;
+- добавить тест, что chapter title содержит `0:00`.
 
-pub async fn mark_voice_job_failed(
-    pool: &PgPool,
-    job_id: i64,
-    error: &str,
-) -> anyhow::Result<()>;
+Критерий готовности:
 
-pub async fn save_asr_result(
-    pool: &PgPool,
-    job_id: i64,
-    transcript: &AsrTranscript,
-) -> anyhow::Result<()>;
-
-pub async fn save_voice_result(
-    pool: &PgPool,
-    job_id: i64,
-    result: &CleanTranscript,
-    final_html: &str,
-    full_text_file_id: Option<&str>,
-) -> anyhow::Result<()>;
+```text
+<b>Обсуждение AMD</b> <code>0:00</code>
+<blockquote expandable>...</blockquote>
 ```
 
-## Types
+### 2. Сохранять cleanup provider/model в БД
 
-Минимальные типы:
+Миграция уже содержит поля:
+
+```text
+cleanup_provider
+cleanup_model
+```
+
+Но `save_voice_result` сейчас их не пишет. Для отладки fallback chain надо знать, какая модель реально чистила текст.
+
+Вариант:
 
 ```rust
-pub enum VoiceMediaKind {
-    Voice,
-    Audio,
-    VideoNote,
-}
-
-pub enum TranscriptRenderMode {
-    Short,
-    Chapters,
-    File,
-}
-
-pub struct VoiceMedia {
-    pub chat_id: i64,
-    pub message_id: i32,
-    pub user_id: Option<i64>,
-    pub kind: VoiceMediaKind,
-    pub file_id: String,
-    pub file_unique_id: Option<String>,
-    pub duration_sec: Option<u32>,
-    pub file_size: Option<u64>,
-    pub mime_type: Option<String>,
-}
-
-pub struct AsrSegment {
-    pub start_sec: f32,
-    pub end_sec: f32,
-    pub text: String,
-}
-
-pub struct AsrTranscript {
+pub struct CleanupResult {
     pub provider: String,
     pub model: String,
-    pub request_id: Option<String>,
-    pub text: String,
-    pub segments: Vec<AsrSegment>,
-    pub raw_json: serde_json::Value,
-}
-
-pub struct TranscriptChapter {
-    pub title: String,
-    pub start_sec: f32,
-    pub end_sec: Option<f32>,
-    pub text: String,
-}
-
-pub struct CleanTranscript {
-    pub mode: TranscriptRenderMode,
-    pub text: String,
-    pub chapters: Vec<TranscriptChapter>,
-    pub short_summary: Option<String>,
+    pub transcript: CleanTranscript,
 }
 ```
 
-Не хранить Telegram HTML как единственный источник истины. `cleaned_text` должен быть plain text/Markdown-like, `chapters_json` должен хранить структурные главы, а HTML собирать отдельно.
+Или минимально расширить `CleanTranscript`, если не хочется отдельный тип.
 
-## Download layer
+### 3. User-facing ошибки для ASR/cleanup/download
 
-`download.rs` должен:
+Сейчас validate errors отвечают пользователю, а ошибки download/ASR/cleanup в основном уходят в logs + `voice_transcription_jobs.error`.
 
-1. выбрать `file_id` из `msg.voice()`, `msg.audio()`, позже `msg.video_note()`;
-2. проверить duration/file_size из Telegram metadata до скачивания;
-3. вызвать `bot.get_file(file_id.clone()).await?`;
-4. скачать файл во временную директорию;
-5. вернуть `DownloadedVoice { path, original_ext, mime_type, size }`;
-6. удалить temp-файл после ASR.
+Нужно решить policy:
 
-Зависимости, которые могут понадобиться:
+- transient Groq/Telegram error: тихо логировать или отвечать `Не смог расшифровать, API отвалился`;
+- empty ASR transcript: лучше коротко ответить пользователю;
+- cleanup failed but ASR ok: можно отправлять raw ASR с пометкой не надо, если бот только для себя.
 
-```toml
-reqwest = { version = "0.12", features = ["json", "multipart"] }
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
-```
+Практичный MVP: отвечать пользователю только на понятные recoverable ошибки, внутренние stack details не показывать.
 
-Если включишь ffmpeg preprocessing позже, добавить `tokio/process` и отдельный helper:
+### 4. Manual `/transcribe` reply command
 
-```rust
-async fn normalize_audio_for_asr(input: &Path) -> anyhow::Result<PathBuf>;
-```
+Auto mode уже есть, но ручной режим полезен, если auto-transcribe начнёт шуметь.
 
-Для MVP не надо ffmpeg для обычного Telegram voice: `ogg` поддерживается Groq.
-
-## Groq ASR client
-
-Не смешивать ASR с `llm/service.rs`: это другой тип API и другой контракт. Сделать отдельный `features/voice/asr.rs`.
-
-Примерная функция:
-
-```rust
-pub async fn transcribe_with_groq(
-    config: &Config,
-    audio_path: &Path,
-    prompt: Option<&str>,
-) -> anyhow::Result<AsrTranscript>;
-```
-
-Запрос:
-
-```rust
-let form = reqwest::multipart::Form::new()
-    .text("model", config.voice_asr_model.clone())
-    .text("response_format", "verbose_json")
-    .text("language", config.voice_language.clone())
-    .text("temperature", config.voice_asr_temperature.to_string())
-    .text("timestamp_granularities[]", "segment")
-    .part("file", file_part);
-```
-
-Headers:
+Правило:
 
 ```text
-Authorization: Bearer $GROQ_API_KEY
-Content-Type: multipart/form-data
+/transcribe reply на voice/audio -> расшифровать reply message
 ```
 
-Парсить минимум:
+Не нужно делать свободный аргумент с message id на первом проходе.
 
-```json
-{
-  "text": "...",
-  "segments": [
-    { "start": 0.0, "end": 12.4, "text": "..." }
-  ],
-  "x_groq": { "id": "..." }
-}
-```
+### 5. `video_note` через ffmpeg
 
-`x_groq.id` сохранить в `asr_request_id`, если есть.
+Сейчас `video_note` определяется, но `download.rs` возвращает `UnsupportedVideoNote`.
 
-## Cleanup prompt
+Чтобы включить кружки:
 
-Создать `prompts/voice_cleanup.md`.
+- скачать `.mp4`;
+- вытащить audio stream через ffmpeg;
+- отправить audio в ASR;
+- сохранить исходный `media_kind=video_note`.
 
-Задача cleanup LLM:
+Не тащить это до стабилизации обычных voice/audio.
 
-- исправить явные ошибки ASR;
-- восстановить пунктуацию;
-- убрать слова-паразиты и бессмысленные повторы;
-- не выдумывать факты;
-- сохранить смысл, стиль и важные формулировки;
-- сохранить/поправить технические термины;
-- заменить длинные числительные цифрами, где это улучшает читаемость;
-- для коротких сообщений вернуть только исправленный текст;
-- для средних/длинных сообщений разбить на главы/смысловые фрагменты;
-- дать каждой главе короткий заголовок и timestamp в формате `0:30`;
-- тело главы должно покрывать расшифровку до следующей главы;
-- если кусок неразборчив, писать `[неразборчиво]`, а не фантазировать.
+### 6. Тесты, которых не хватает
 
-Лучше просить модель вернуть JSON, а не сразу текст:
+Уже есть тесты для:
 
-```json
-{
-  "mode": "short",
-  "text": "Исправленный короткий текст без таймкодов и глав.",
-  "chapters": [],
-  "short_summary": null
-}
-```
+- HTML escaping;
+- expandable blockquote escaping;
+- short transcript render;
+- cleanup fallback на отсутствие глав;
+- normalize terms.
 
-Или для длинного:
-
-```json
-{
-  "mode": "chapters",
-  "text": "Полная очищенная расшифровка plain text.",
-  "chapters": [
-    {
-      "title": "Обсуждение AMD",
-      "start": "0:00",
-      "text": "Начали обсуждать драйверы AMD и почему опять всё отвалилось. ..."
-    },
-    {
-      "title": "Linux и Proton",
-      "start": "0:28",
-      "text": "Перешли к Linux/Proton и спору, насколько это массовая проблема. ..."
-    }
-  ],
-  "short_summary": "Коротко обсудили AMD, Linux/Proton и проверку Mesa."
-}
-```
-
-Пример prompt:
+Добавить:
 
 ```text
-Ты чистишь расшифровку голосового сообщения из Telegram-чата.
-
-На входе ASR segments с таймкодами. Исправь ошибки распознавания, восстанови пунктуацию, убери слова-паразиты и бессмысленные повторы. Не добавляй новых фактов и не меняй позицию говорящего.
-
-Верни JSON строго такого вида:
-{
-  "mode": "short" | "chapters",
-  "text": "Полный очищенный текст без Telegram HTML.",
-  "chapters": [
-    { "title": "Короткий заголовок", "start": "0:00", "text": "Текст главы до следующей главы." }
-  ],
-  "short_summary": "Одна короткая фраза о голосовом или null."
-}
-
-Правила:
-- если очищенный текст короче 300-400 символов, верни mode = "short", chapters = [] и не добавляй timestamps;
-- если текст длиннее, верни mode = "chapters" и разбей его на смысловые главы;
-- timestamp бери из начала соответствующего ASR segment;
-- объединяй соседние segments, если это одна мысль;
-- глава должна быть смысловым блоком, а не каждым ASR segment;
-- title должен быть коротким: 2-5 слов;
-- text главы не должен повторять title;
-- технические термины сохраняй точно;
-- если не уверен в слове, выбери наиболее вероятный вариант по контексту;
-- если фрагмент реально неразборчив, напиши [неразборчиво];
-- не используй Telegram HTML;
-- не оборачивай JSON в markdown.
+voice::render chapter title includes timestamp
+voice::render long chapters produce MessageAndFile when over SAFE_TEXT_LIMIT
+voice::cleanup parses valid chapter JSON
+voice::cleanup invalid JSON falls back to plain text
+voice::download rejects video_note
+voice::download rejects too long voice
+voice::download rejects too large voice
+voice::asr parses Groq verbose_json with segments
 ```
 
-Контекст для модели лучше передавать как compact list segments:
+## Остаточные риски
 
-```text
-[0:00-0:12] ну короче амд опять что то с драйверами
-[0:12-0:24] на линуксе вроде норм но в протоне...
-```
+- `VOICE_ASR_PROVIDER` сейчас фактически поддерживает только `groq`; unknown provider падает ошибкой.
+- `VOICE_CLEANUP_PROVIDER` использует общий LLM provider router; если ошибиться в имени, будет `unknown LLM_PROVIDER`, хотя речь про cleanup provider.
+- Для `audio` Telegram metadata обычно есть, но если duration/file_size внезапно отсутствуют, файл может дойти до API и упасть там.
+- `render_mode=file` парсится как enum value, но renderer не имеет отдельной ветки для file-only режима; сейчас это не проблема, потому что prompt просит только `short | chapters`.
+- В `render_preview` считается длина по уже HTML-escaped строкам плюс chunk; это достаточно для MVP, но не полноценный entity-aware splitter.
+- CI/status checks на GitHub не настроены, поэтому сборку надо подтверждать локально через `cargo check`.
 
-Если JSON parse упал, fallback: взять plain `content`; если текст короткий, отрендерить как short, иначе разбить по строкам с timestamps и отрендерить без chapters.
+## Не делать сейчас
 
-## Rendering
+- diarization/speaker labels;
+- VAD/chunking длинных аудио;
+- local Whisper;
+- embeddings по voice transcripts;
+- summary всей истории голосовых;
+- полноценный Telegram entities renderer;
+- local Bot API server ради файлов больше 20 MB.
 
-`voice/render.rs` должен работать от structured `CleanTranscript`, а не от HTML, придуманного моделью.
+## Следующий порядок работы
 
-MVP-правило:
-
-1. если `mode = Short` или `text.chars().count() <= VOICE_SHORT_TEXT_MAX_CHARS`, отправить только исправленный текст через `Html::text`, без заголовка, timestamps и blockquote;
-2. если `mode = Chapters`, собрать HTML title;
-3. для каждой главы вывести видимый заголовок `title + timestamp`;
-4. тело главы положить в `<blockquote expandable>`;
-5. если `chars <= SAFE_TEXT_LIMIT`, отправить одним reply;
-6. если длиннее, отправить preview с первыми главами и полный `.md`/`.txt` через `send_document`;
-7. если даже preview внезапно > 4096, обрезать preview через `truncate_text` до `SAFE_TEXT_LIMIT`.
-
-Пример типа:
-
-```rust
-pub enum RenderedTranscript {
-    Short { html: String },
-    Single { html: String },
-    PreviewAndFile { html: String, filename: String, body: String },
-}
-```
-
-Добавить helper в `telegram/html.rs`:
-
-```rust
-pub fn expandable_blockquote(text: impl AsRef<str>) -> Html {
-    Html::raw_trusted(format!(
-        "<blockquote expandable>{}</blockquote>",
-        escape(text.as_ref())
-    ))
-}
-```
-
-И helper для timestamp:
-
-```rust
-pub fn format_timestamp(seconds: f32) -> String {
-    let total = seconds.max(0.0).round() as u32;
-    format!("{}:{:02}", total / 60, total % 60)
-}
-```
-
-Пример сборки главы:
-
-```rust
-let mut html = Html::empty();
-html.line(Html::bold("Расшифровка голосового"));
-html.blank_line();
-
-for chapter in &transcript.chapters {
-    html.line(Html::raw_trusted(format!(
-        "{} {}",
-        Html::bold(&chapter.title).into_string(),
-        Html::code(format_timestamp(chapter.start_sec)).into_string(),
-    )));
-    html.line(html::expandable_blockquote(&chapter.text));
-    html.blank_line();
-}
-```
-
-В реальном коде лучше не собирать `raw_trusted(format!(...))` вокруг внешнего текста. Заголовок и timestamp должны быть уже безопасными `Html`, а raw использовать только для пробела/перевода строки или самого тега blockquote.
-
-Для file body использовать plain Markdown-like text:
-
-```text
-# Расшифровка голосового
-
-## Обсуждение AMD 0:00
-
-Начали обсуждать драйверы AMD и почему опять всё отвалилось.
-
-## Linux и Proton 0:28
-
-Перешли к Linux/Proton и спору, насколько это массовая проблема.
-```
-
-## Pipeline skeleton
-
-```rust
-pub async fn maybe_transcribe_voice(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
-    state: &AppState,
-) -> anyhow::Result<bool> {
-    if !state.config.voice_transcription_enabled {
-        return Ok(false);
-    }
-
-    let Some(media) = VoiceMedia::from_message(msg) else {
-        return Ok(false);
-    };
-
-    if !state.config.voice_auto_transcribe {
-        return Ok(false);
-    }
-
-    if should_skip_voice(&media, &state.config) {
-        return Ok(true);
-    }
-
-    let Some(job_id) = repo::create_voice_job(&state.pool, &media).await? else {
-        return Ok(true);
-    };
-
-    let result = run_voice_job(bot, &state.config, &state.pool, job_id, media).await;
-    if let Err(err) = result {
-        repo::mark_voice_job_failed(&state.pool, job_id, &err.to_string()).await?;
-        return Err(err);
-    }
-
-    Ok(true)
-}
-```
-
-`run_voice_job`:
-
-1. `mark status = downloading`;
-2. download;
-3. `mark status = transcribing`;
-4. Groq ASR;
-5. save raw ASR;
-6. `mark status = cleaning`;
-7. cleanup via LLM;
-8. render;
-9. send reply or preview + document;
-10. save final result and `status = sent`.
-
-## Sending document fallback
-
-Для длинной расшифровки:
-
-```rust
-bot.send_document(chat_id, InputFile::memory(body.into_bytes()).file_name(filename))
-    .caption("Полная расшифровка")
-    .reply_parameters(ReplyParameters::new(original_message_id).allow_sending_without_reply())
-    .await?;
-```
-
-Хранить `full_text_file_id`, если Telegram вернул document with file_id. Это позволит потом не генерировать файл повторно при retry/report.
-
-## Error policy
-
-Не спамить чат внутренними ошибками.
-
-Пользовательские ответы:
-
-- файл слишком большой;
-- голосовое слишком длинное;
-- Telegram не дал скачать файл;
-- ASR временно недоступен;
-- расшифровка получилась пустой.
-
-Внутренние детали писать в `voice_transcription_jobs.error` и logs.
-
-Для transient ошибок Groq/Telegram можно оставить job `failed` и позже добавить retry tool:
-
-```bash
-cargo run --release --bin retry_voice_transcriptions -- --limit 10
-```
-
-Но retry tool не тащить в первый commit, если MVP ещё не стабилен.
-
-## Security and privacy
-
-- Не логировать полный transcript на info level.
-- Не логировать download URL: он содержит bot token.
-- Temp files удалять после ASR даже при ошибке.
-- Не сохранять audio bytes в Postgres.
-- Сохранять только `file_id`, `file_unique_id`, ASR JSON и cleaned text.
-- Для owner preview voice не нужен.
-
-## Порядок коммитов
-
-Оптимальный порядок:
-
-1. `config: add voice transcription settings`.
-2. `db: add voice transcription jobs table`.
-3. `voice: add media detection and types`.
-4. `voice: add telegram file download layer`.
-5. `voice: add groq transcription client`.
-6. `voice: add cleanup prompt and renderer`.
-7. `voice: wire pipeline into message handler`.
-8. `voice: add document fallback for long transcripts`.
-9. `docs: document voice transcription`.
-
-После каждого шага:
-
-```bash
-cargo fmt
-cargo check
-```
-
-После pipeline wiring проверить в живом чате на коротком voice до 10 секунд.
-
-## Tests
-
-Минимальные unit tests:
-
-```text
-voice::types::VoiceMedia::from_message ignores non-voice
-voice::render short transcript has no title/timestamp/blockquote
-voice::render expandable chapters escape title/body
-voice::render preview + file for long transcript
-voice::render escapes raw HTML from cleanup model
-voice::cleanup parses short JSON
-voice::cleanup parses chapter JSON
-voice::cleanup falls back when JSON is invalid
-voice::asr parses verbose_json segments
-telegram::html::expandable_blockquote escapes body
-config parses voice env defaults
-```
-
-Integration smoke без реального Groq:
-
-- fake `AsrClient` возвращает segments;
-- fake cleanup возвращает short text;
-- fake cleanup возвращает chapters;
-- renderer отправляет short one-message path без timestamps;
-- renderer отправляет one-message path with expandable blockquotes;
-- long chapters уходят в `PreviewAndFile`.
-
-## Что не делать в первом voice PR
-
-- Не делать VAD/chunking длинных аудио.
-- Не делать diarization.
-- Не делать speaker labels.
-- Не делать embeddings по transcript.
-- Не делать summary по всей истории голосовых.
-- Не делать local Whisper/Ollama audio.
-- Не переписывать весь Telegram renderer под entities.
-
-Первый PR должен дать рабочий вертикальный срез: voice -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit.
+1. Timestamp в chapter headings + тест.
+2. Cleanup provider/model persistence.
+3. User-facing error policy для ASR/download failures.
+4. Manual `/transcribe` reply command.
+5. Smoke в живом чате на коротком и длинном voice.
+6. Только потом думать про `video_note`/ffmpeg.
