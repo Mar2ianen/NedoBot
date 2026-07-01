@@ -11,6 +11,32 @@ use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::{escape_html, send_html};
 use crate::text::normalize_ai_markers;
 
+const TOP_LIMIT: i64 = 20;
+
+#[derive(sqlx::FromRow)]
+struct TopReactedRow {
+    message_id: i32,
+    user_id: i64,
+    username: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    is_bot: bool,
+    status: String,
+    is_admin: bool,
+    is_present: bool,
+    text: Option<String>,
+    has_photo: bool,
+    has_video: bool,
+    has_document: bool,
+    has_audio: bool,
+    has_voice: bool,
+    has_sticker: bool,
+    has_animation: bool,
+    total_count: i32,
+    reactions: serde_json::Value,
+    created_at: String,
+}
+
 pub async fn send_chat_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
@@ -23,6 +49,42 @@ pub async fn send_chat_stats(
         .map_err(|err| {
             tracing::error!(%err, "failed to build chat stats");
             teloxide::RequestError::Io(std::io::Error::other("stats failed"))
+        })?;
+
+    send_html(bot, chat_id, report).await?;
+
+    Ok(())
+}
+
+pub async fn send_top_messages(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+    config: &Config,
+) -> ResponseResult<()> {
+    let report = build_top_messages_report(pool, config)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "failed to build top messages report");
+            teloxide::RequestError::Io(std::io::Error::other("top messages failed"))
+        })?;
+
+    send_html(bot, chat_id, report).await?;
+
+    Ok(())
+}
+
+pub async fn send_top_reacted(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+    config: &Config,
+) -> ResponseResult<()> {
+    let report = build_top_reacted_report(pool, config)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "failed to build top reacted report");
+            teloxide::RequestError::Io(std::io::Error::other("top reacted failed"))
         })?;
 
     send_html(bot, chat_id, report).await?;
@@ -52,6 +114,212 @@ pub async fn send_user_stats(
     send_html(bot, chat_id, report).await?;
 
     Ok(())
+}
+
+async fn build_top_messages_report(pool: &PgPool, config: &Config) -> anyhow::Result<String> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            String,
+            bool,
+            bool,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ),
+    >(
+        r#"
+        select m.user_id,
+               p.username,
+               p.first_name,
+               p.last_name,
+               coalesce(p.is_bot, false) as is_bot,
+               coalesce(s.status, 'unknown') as status,
+               coalesce(s.is_admin, false) as is_admin,
+               coalesce(s.is_present, false) as is_present,
+               count(*)::bigint as messages,
+               count(*) filter (where m.reply_to_message_id is not null)::bigint as replies,
+               count(*) filter (where m.has_photo or m.has_video or m.has_document or m.has_audio or m.has_voice or m.has_sticker or m.has_animation)::bigint as media,
+               count(*) filter (where m.has_voice)::bigint as voices,
+               count(*) filter (where m.has_links)::bigint as links,
+               coalesce(sum(rc.total_count), 0)::bigint as reactions_received
+        from telegram_messages m
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
+        left join telegram_message_reaction_counts rc on rc.chat_id = m.chat_id and rc.message_id = m.message_id
+        where m.chat_id = $1
+          and m.user_id is not null
+          and m.source_channel_id is null
+          and m.user_id <> 777000
+          and coalesce(p.is_bot, false) = false
+        group by m.user_id, p.username, p.first_name, p.last_name, p.is_bot, s.status, s.is_admin, s.is_present
+        order by messages desc, reactions_received desc
+        limit $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(TOP_LIMIT)
+    .fetch_all(pool)
+    .await?;
+
+    let mut report = String::from("<b>Топ пишущих</b>\nЗа всё время\n");
+
+    if rows.is_empty() {
+        report.push_str("\nНет данных.");
+        return Ok(report);
+    }
+
+    for (
+        index,
+        (
+            user_id,
+            username,
+            first_name,
+            last_name,
+            is_bot,
+            status,
+            is_admin,
+            is_present,
+            messages,
+            replies,
+            media,
+            voices,
+            links,
+            reactions_received,
+        ),
+    ) in rows.into_iter().enumerate()
+    {
+        let user = UserPresentation {
+            user_id,
+            display_name: display_name(
+                username.as_deref(),
+                first_name.as_deref(),
+                last_name.as_deref(),
+                user_id,
+            ),
+            is_bot,
+            status: Some(status),
+            is_admin,
+            is_present: Some(is_present),
+        };
+
+        report.push_str(&format!(
+            "\n{}. {}: <b>{}</b> соо, {} reply, {} медиа, {} голосовых, {} ссылок, {} реакций",
+            index + 1,
+            user.linked_with_badges(),
+            messages,
+            replies,
+            media,
+            voices,
+            links,
+            reactions_received
+        ));
+    }
+
+    Ok(report)
+}
+
+async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Result<String> {
+    let rows = sqlx::query_as::<_, TopReactedRow>(
+        r#"
+        select m.message_id,
+               m.user_id,
+               p.username,
+               p.first_name,
+               p.last_name,
+               coalesce(p.is_bot, false) as is_bot,
+               coalesce(s.status, 'unknown') as status,
+               coalesce(s.is_admin, false) as is_admin,
+               coalesce(s.is_present, false) as is_present,
+               m.text,
+               m.has_photo,
+               m.has_video,
+               m.has_document,
+               m.has_audio,
+               m.has_voice,
+               m.has_sticker,
+               m.has_animation,
+               rc.total_count,
+               rc.reactions,
+               to_char(m.created_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as created_at
+        from telegram_message_reaction_counts rc
+        join telegram_messages m on m.chat_id = rc.chat_id and m.message_id = rc.message_id
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
+        where rc.chat_id = $1
+          and rc.total_count > 0
+          and m.user_id is not null
+          and m.source_channel_id is null
+          and m.user_id <> 777000
+          and coalesce(p.is_bot, false) = false
+        order by rc.total_count desc, m.created_at desc
+        limit $2
+        "#,
+    )
+    .bind(config.discussion_chat_id)
+    .bind(TOP_LIMIT)
+    .fetch_all(pool)
+    .await?;
+
+    let mut report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время\n");
+
+    if rows.is_empty() {
+        report.push_str("\nНет данных.");
+        return Ok(report);
+    }
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let user = UserPresentation {
+            user_id: row.user_id,
+            display_name: display_name(
+                row.username.as_deref(),
+                row.first_name.as_deref(),
+                row.last_name.as_deref(),
+                row.user_id,
+            ),
+            is_bot: row.is_bot,
+            status: Some(row.status),
+            is_admin: row.is_admin,
+            is_present: Some(row.is_present),
+        };
+        let preview = message_preview(
+            row.text.as_deref(),
+            row.has_photo,
+            row.has_video,
+            row.has_document,
+            row.has_audio,
+            row.has_voice,
+            row.has_sticker,
+            row.has_animation,
+        );
+        let message_link = Html::link(
+            format!("#{}", row.message_id),
+            message_url(config.discussion_chat_id, row.message_id),
+        )
+        .into_string();
+        let reaction_summary = reaction_summary(&row.reactions, 4);
+
+        report.push_str(&format!(
+            "\n{}. {}: <b>{}</b> реакций{} от {}, <code>{}</code>\n{}",
+            index + 1,
+            message_link,
+            row.total_count,
+            reaction_summary,
+            user.linked_with_badges(),
+            escape_html(&row.created_at),
+            Html::text(truncate_text(&preview, 80)).into_string()
+        ));
+    }
+
+    Ok(report)
 }
 
 async fn refresh_user_profile_from_telegram(
@@ -390,6 +658,71 @@ fn human_comment_preview(text: &str) -> String {
         .replace("  ", " ")
         .trim()
         .to_string()
+}
+
+fn message_preview(
+    text: Option<&str>,
+    has_photo: bool,
+    has_video: bool,
+    has_document: bool,
+    has_audio: bool,
+    has_voice: bool,
+    has_sticker: bool,
+    has_animation: bool,
+) -> String {
+    if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
+        return normalize_ai_markers(text);
+    }
+
+    let media = [
+        (has_photo, "фото"),
+        (has_video, "видео"),
+        (has_document, "файл"),
+        (has_audio, "аудио"),
+        (has_voice, "голосовое"),
+        (has_sticker, "стикер"),
+        (has_animation, "GIF"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, label)| enabled.then_some(label))
+    .collect::<Vec<_>>();
+
+    if media.is_empty() {
+        "сообщение без текста".to_string()
+    } else {
+        format!("медиа: {}", media.join(", "))
+    }
+}
+
+fn reaction_summary(reactions: &serde_json::Value, limit: usize) -> String {
+    let Some(items) = reactions.as_array() else {
+        return String::new();
+    };
+
+    let parts = items
+        .iter()
+        .filter_map(|item| {
+            let count = item.get("count")?.as_i64()?;
+            if count <= 0 {
+                return None;
+            }
+
+            let label = item
+                .get("emoji")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| item.get("type").and_then(serde_json::Value::as_str))
+                .unwrap_or("reaction");
+
+            Some(format!("{label} {count}"))
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 async fn build_user_stats_report(
@@ -750,4 +1083,28 @@ fn message_url(chat_id: i64, message_id: i32) -> String {
         .unwrap_or_else(|| chat_id.abs().to_string());
 
     format!("https://t.me/c/{internal_chat_id}/{message_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reaction_summary_formats_top_reactions() {
+        let reactions = serde_json::json!([
+            {"type": "emoji", "emoji": "🤣", "count": 67},
+            {"type": "emoji", "emoji": "😢", "count": 8},
+            {"type": "emoji", "emoji": "👍", "count": 1}
+        ]);
+
+        assert_eq!(reaction_summary(&reactions, 2), " (🤣 67, 😢 8)");
+    }
+
+    #[test]
+    fn message_preview_falls_back_to_media() {
+        assert_eq!(
+            message_preview(None, true, false, false, false, true, false, false),
+            "медиа: фото, голосовое"
+        );
+    }
 }

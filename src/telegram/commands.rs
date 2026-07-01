@@ -21,6 +21,13 @@ pub enum Command {
     StatsWeek,
     #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК")]
     StatsMonth,
+    #[command(rename = "topmsg", description = "топ 20 пользователей по сообщениям")]
+    TopMsg,
+    #[command(
+        rename = "topreact",
+        description = "топ 20 сообщений по реакциям со ссылками"
+    )]
+    TopReact,
     #[command(
         rename = "userstats",
         description = "статистика пользователя: /userstats <id|username>, или reply на сообщение"
