@@ -32,8 +32,6 @@ struct TopReactedRow {
     has_sticker: bool,
     has_animation: bool,
     total_count: i32,
-    reactions: serde_json::Value,
-    created_at: String,
 }
 
 pub async fn send_chat_stats(
@@ -273,9 +271,7 @@ async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Res
                m.has_voice,
                m.has_sticker,
                m.has_animation,
-               rc.total_count,
-               rc.reactions,
-               to_char(m.created_at at time zone 'Europe/Moscow', 'DD.MM.YY') as created_at
+               rc.total_count
         from telegram_message_reaction_counts rc
         join telegram_messages m on m.chat_id = rc.chat_id and m.message_id = rc.message_id
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
@@ -341,22 +337,18 @@ async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Res
             row.has_sticker,
             row.has_animation,
         );
-        let message_link = Html::link(
-            format!("#{}", row.message_id),
+        let author_link = Html::link(
+            user.display_name,
             message_url(config.discussion_chat_id, row.message_id),
         )
         .into_string();
-        let reaction_summary = reaction_summary(&row.reactions, 4);
-        let preview = truncate_text(&preview, 48);
+        let preview = truncate_text(&preview, 64);
 
         report.push_str(&format!(
-            "\n{}. {}: <b>{}</b>{} - {}, <code>{}</code>: {}",
+            "\n{}. <b>{}</b> - {}: {}",
             index + 1,
-            message_link,
             row.total_count,
-            reaction_summary,
-            user.linked_name(),
-            escape_html(&row.created_at),
+            author_link,
             Html::text(preview).into_string()
         ));
     }
@@ -810,42 +802,6 @@ fn message_preview(
     }
 }
 
-fn reaction_summary(reactions: &serde_json::Value, limit: usize) -> String {
-    let Some(items) = reactions.as_array() else {
-        return String::new();
-    };
-
-    let parts = items
-        .iter()
-        .filter_map(|item| {
-            let count = item.get("count")?.as_i64()?;
-            if count <= 0 {
-                return None;
-            }
-
-            let label = item
-                .get("emoji")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| item.get("type").and_then(serde_json::Value::as_str))
-                .unwrap_or("reaction");
-            let label = match label {
-                "custom_emoji" => "⭐",
-                "emoji" | "paid" | "reaction" => "•",
-                other => other,
-            };
-
-            Some(format!("{label}{count}"))
-        })
-        .take(limit)
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join(", "))
-    }
-}
-
 async fn build_user_stats_report(
     pool: &PgPool,
     config: &Config,
@@ -1209,17 +1165,6 @@ fn message_url(chat_id: i64, message_id: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reaction_summary_formats_top_reactions() {
-        let reactions = serde_json::json!([
-            {"type": "emoji", "emoji": "🤣", "count": 67},
-            {"type": "emoji", "emoji": "😢", "count": 8},
-            {"type": "emoji", "emoji": "👍", "count": 1}
-        ]);
-
-        assert_eq!(reaction_summary(&reactions, 2), " (🤣67, 😢8)");
-    }
 
     #[test]
     fn message_preview_falls_back_to_media() {
