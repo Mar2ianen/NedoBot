@@ -401,6 +401,9 @@ async fn build_user_stats_report(
             Option<String>,
             Option<i32>,
             Option<i32>,
+            Option<i64>,
+            Option<i64>,
+            i64,
             i64,
             i64,
             i64,
@@ -414,12 +417,15 @@ async fn build_user_stats_report(
                to_char(last_seen_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI'),
                first_message_id,
                last_message_id,
+               floor(extract(epoch from (now() - first_seen_at)) / 86400)::bigint,
+               floor(extract(epoch from (now() - last_seen_at)) / 86400)::bigint,
                message_count,
                reply_count,
                link_count,
                media_count,
                reply_to_channel_post_count,
-               reply_to_bot_count
+               reply_to_bot_count,
+               0::bigint as voice_count
         from telegram_chat_users
         where chat_id = $1 and telegram_user_id = $2
         "#,
@@ -429,15 +435,22 @@ async fn build_user_stats_report(
     .fetch_optional(pool)
     .await?;
 
-    let totals = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+    let totals = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64)>(
         r#"
         select count(*)::bigint as messages,
                count(*) filter (where reply_to_message_id is not null)::bigint as replies,
                count(*) filter (where has_links)::bigint as links,
                count(*) filter (where has_photo or has_video or has_document or has_audio or has_voice or has_sticker or has_animation)::bigint as media,
-               count(*) filter (where reply_to_message_id in (select discussion_message_id from post_comment_jobs))::bigint as replies_to_channel_posts,
+               count(*) filter (
+                   where reply_to_message_id in (
+                       select message_id
+                       from telegram_messages
+                       where chat_id = $1 and source_channel_id is not null
+                   )
+               )::bigint as replies_to_channel_posts,
                count(*) filter (where reply_to_message_id in (select bot_comment_message_id from post_comment_jobs))::bigint as replies_to_bot,
-               count(distinct date_trunc('day', created_at at time zone 'Europe/Moscow' - interval '5 hours'))::bigint as active_days
+               count(distinct date_trunc('day', created_at at time zone 'Europe/Moscow' - interval '5 hours'))::bigint as active_days,
+               count(*) filter (where has_voice)::bigint as voices
         from telegram_messages
         where chat_id = $1 and user_id = $2 and source_channel_id is null
         "#,
@@ -532,12 +545,15 @@ async fn build_user_stats_report(
         last_seen_at,
         first_message_id,
         last_message_id,
+        first_seen_days_ago,
+        last_seen_days_ago,
         messages,
         replies,
         links,
         media,
         replies_to_channel_posts,
         replies_to_bot,
+        voices,
     ) = user_data
         .map(
             |(
@@ -545,12 +561,15 @@ async fn build_user_stats_report(
                 last_seen_at,
                 first_message_id,
                 last_message_id,
+                first_seen_days_ago,
+                last_seen_days_ago,
                 messages,
                 replies,
                 links,
                 media,
                 replies_to_channel_posts,
                 replies_to_bot,
+                voices,
             )| {
                 (
                     first_seen_at.unwrap_or_else(|| "нет данных".to_string()),
@@ -561,12 +580,15 @@ async fn build_user_stats_report(
                     last_message_id
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "нет данных".to_string()),
+                    first_seen_days_ago,
+                    last_seen_days_ago,
                     messages,
                     replies,
                     links,
                     media,
                     replies_to_channel_posts,
                     replies_to_bot,
+                    voices,
                 )
             },
         )
@@ -576,29 +598,44 @@ async fn build_user_stats_report(
                 "нет данных".to_string(),
                 "нет данных".to_string(),
                 "нет данных".to_string(),
+                None,
+                None,
                 totals.0,
                 totals.1,
                 totals.2,
                 totals.3,
                 totals.4,
                 totals.5,
+                totals.7,
             )
         });
 
+    let first_message = linked_message(
+        config.discussion_chat_id,
+        &first_seen_at,
+        &first_message_id,
+        first_seen_days_ago,
+    );
+    let last_message = linked_message(
+        config.discussion_chat_id,
+        &last_seen_at,
+        &last_message_id,
+        last_seen_days_ago,
+    );
+
     Ok(format!(
-        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: <code>{}</code> (#<code>{}</code>)\nПоследнее сообщение: <code>{}</code> (#<code>{}</code>)\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
+        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nРеплаи на посты: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
         user.linked_with_badges(),
         escape_html(observed_at),
-        escape_html(&first_seen_at),
-        escape_html(&first_message_id),
-        escape_html(&last_seen_at),
-        escape_html(&last_message_id),
-        messages,
-        replies,
-        replies_to_channel_posts,
-        replies_to_bot,
-        links,
-        media,
+        first_message,
+        last_message,
+        totals.0.max(messages),
+        totals.1.max(replies),
+        totals.4.max(replies_to_channel_posts),
+        totals.5.max(replies_to_bot),
+        totals.2.max(links),
+        totals.3.max(media),
+        totals.7.max(voices),
         totals.6,
         reactions_given,
         reactions_received,
@@ -634,4 +671,39 @@ async fn resolve_user_id(
     .await?;
 
     Ok(row.map(|(user_id,)| user_id))
+}
+
+fn linked_message(
+    chat_id: i64,
+    date_label: &str,
+    message_id: &str,
+    days_ago: Option<i64>,
+) -> String {
+    let label = match days_ago {
+        Some(days) => format!("{date_label} ({days} дн. назад)"),
+        None => date_label.to_string(),
+    };
+
+    match message_id.parse::<i32>() {
+        Ok(message_id) => format!(
+            "{} (#<code>{}</code>)",
+            Html::link(label, message_url(chat_id, message_id)).into_string(),
+            message_id
+        ),
+        Err(_) => format!(
+            "{} (#<code>{}</code>)",
+            escape_html(date_label),
+            escape_html(message_id)
+        ),
+    }
+}
+
+fn message_url(chat_id: i64, message_id: i32) -> String {
+    let internal_chat_id = chat_id
+        .to_string()
+        .strip_prefix("-100")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| chat_id.abs().to_string());
+
+    format!("https://t.me/c/{internal_chat_id}/{message_id}")
 }
