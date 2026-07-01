@@ -74,6 +74,15 @@ impl UserPresentation {
     pub fn linked_with_badges(&self) -> String {
         format!("{} ({})", self.linked_name(), self.badges())
     }
+
+    pub fn linked_with_known_badges(&self) -> String {
+        let badges = self.badges();
+        if badges == "статус неизвестен" {
+            self.linked_name()
+        } else {
+            format!("{} ({badges})", self.linked_name())
+        }
+    }
 }
 
 pub fn display_name(
