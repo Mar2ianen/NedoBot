@@ -13,21 +13,22 @@ pub async fn cleanup_transcript(
     transcript: &AsrTranscript,
 ) -> anyhow::Result<CleanTranscript> {
     let prompt = build_prompt(config, transcript);
-    let generated = generate_text_with_provider(
-        config,
-        config.voice_cleanup_provider.as_deref(),
-        config.voice_cleanup_model.as_deref(),
-        &prompt,
-        None,
-        config.voice_cleanup_temperature,
-        config.voice_cleanup_max_tokens,
-    )
-    .await?;
+    let content = match generate_cleanup_content(config, &prompt).await {
+        Ok(content) => content,
+        Err(err) => {
+            tracing::warn!(%err, "all voice cleanup providers failed, using raw ASR transcript");
+            return Ok(normalize_cleanup(
+                plain_cleanup(&transcript.text, config.voice_short_text_max_chars),
+                transcript,
+                config.voice_short_text_max_chars,
+            ));
+        }
+    };
 
-    let clean = parse_cleanup_json(&generated.content).or_else(|err| {
+    let clean = parse_cleanup_json(&content).or_else(|err| {
         tracing::warn!(%err, "failed to parse voice cleanup JSON, using plain LLM text");
         Ok::<CleanTranscript, anyhow::Error>(plain_cleanup(
-            &generated.content,
+            &content,
             config.voice_short_text_max_chars,
         ))
     })?;
@@ -37,6 +38,54 @@ pub async fn cleanup_transcript(
         transcript,
         config.voice_short_text_max_chars,
     ))
+}
+
+async fn generate_cleanup_content(config: &Config, prompt: &str) -> anyhow::Result<String> {
+    match generate_cleanup_with_provider(
+        config,
+        config.voice_cleanup_provider.as_deref(),
+        config.voice_cleanup_model.as_deref(),
+        prompt,
+    )
+    .await
+    {
+        Ok(content) => return Ok(content),
+        Err(err) if should_try_default_cleanup_provider(config) => {
+            tracing::warn!(%err, "voice cleanup provider failed, falling back to default LLM provider");
+        }
+        Err(err) => return Err(err),
+    }
+
+    generate_cleanup_with_provider(config, None, None, prompt).await
+}
+
+async fn generate_cleanup_with_provider(
+    config: &Config,
+    provider: Option<&str>,
+    model: Option<&str>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    Ok(generate_text_with_provider(
+        config,
+        provider,
+        model,
+        prompt,
+        None,
+        config.voice_cleanup_temperature,
+        config.voice_cleanup_max_tokens,
+    )
+    .await?
+    .content)
+}
+
+fn should_try_default_cleanup_provider(config: &Config) -> bool {
+    let Some(provider) = config.voice_cleanup_provider.as_deref() else {
+        return false;
+    };
+
+    !provider
+        .trim()
+        .eq_ignore_ascii_case(config.llm_provider.trim())
 }
 
 fn build_prompt(config: &Config, transcript: &AsrTranscript) -> String {
