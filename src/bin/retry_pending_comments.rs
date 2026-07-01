@@ -156,6 +156,12 @@ async fn retry_job(
     )
     .await?;
     let final_html = build_comment_html(&generation.content, config);
+    if final_html.trim().is_empty() {
+        anyhow::bail!(
+            "empty rendered comment from LLM response: {}",
+            generation.content.chars().take(120).collect::<String>()
+        );
+    }
 
     let sent = send_html_reply(
         bot,
