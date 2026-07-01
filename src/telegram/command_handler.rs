@@ -105,7 +105,15 @@ pub async fn handle_reply_user_stats_command(
         tracing::error!(%err, "failed to save command message");
     }
 
-    send_user_stats(&bot, msg.chat.id, pool, config, None, reply_user_id(&msg)).await?;
+    send_user_stats(
+        &bot,
+        msg.chat.id,
+        pool,
+        config,
+        None,
+        reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
+    )
+    .await?;
 
     Ok(true)
 }
@@ -114,6 +122,10 @@ fn reply_user_id(msg: &Message) -> Option<i64> {
     msg.reply_to_message()
         .and_then(|reply| reply.from.as_ref())
         .map(|user| user.id.0 as i64)
+}
+
+fn sender_user_id(msg: &Message) -> Option<i64> {
+    msg.from.as_ref().map(|user| user.id.0 as i64)
 }
 
 fn is_bare_userstats_command(msg: &Message) -> bool {
