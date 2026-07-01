@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use reqwest::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -44,6 +45,7 @@ impl LlmClient for OpenAiCompatClient<'_> {
                 "{}/chat/completions",
                 self.api_base.trim_end_matches('/')
             ))
+            .header(USER_AGENT, "tg-ai-bot-teloxide/0.1")
             .bearer_auth(self.api_key)
             .json(&body)
             .send()
