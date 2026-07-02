@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use reqwest::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
@@ -40,7 +41,9 @@ impl LlmClient for OpenAiCompatClient<'_> {
             max_completion_tokens: request.num_predict,
         };
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .build()?
             .post(format!(
                 "{}/chat/completions",
                 self.api_base.trim_end_matches('/')
