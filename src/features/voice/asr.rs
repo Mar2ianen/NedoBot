@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -36,7 +37,9 @@ pub async fn transcribe_audio(
         .text("timestamp_granularities[]", "segment")
         .part("file", file_part);
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?
         .post(GROQ_TRANSCRIPTIONS_URL)
         .bearer_auth(config.groq_api_key.trim())
         .multipart(form)

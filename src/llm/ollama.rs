@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
@@ -32,7 +33,9 @@ impl LlmClient for OllamaClient<'_> {
             },
         };
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?;
         let response = client
             .post(format!(
                 "{}/api/chat",
