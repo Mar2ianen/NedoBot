@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
 use crate::llm::types::{GeneratedText, LlmClient, LlmRequest};
@@ -61,6 +62,7 @@ pub async fn generate_text_with_provider(
                 .generate(request)
                 .await?
         }
+        "gemini" => GeminiClient::new(config).generate(request).await?,
         "openai_compat" => {
             OpenAiCompatClient::from_config(config)
                 .generate(request)
@@ -83,6 +85,7 @@ fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
         "groq" => Ok("groq"),
         "cerebras" => Ok("cerebras"),
         "openrouter" => Ok("openrouter"),
+        "gemini" | "google" | "google_ai_studio" => Ok("gemini"),
         "openai_compat" => Ok("openai_compat"),
         other => anyhow::bail!("unknown LLM_PROVIDER: {other}"),
     }
@@ -93,6 +96,10 @@ fn model_for_provider<'a>(config: &'a Config, provider: &str) -> &'a str {
         "groq" | "cerebras" | "openrouter" => {
             config.llm_model.as_deref().unwrap_or(&config.vision_model)
         }
+        "gemini" => config
+            .llm_model
+            .as_deref()
+            .unwrap_or(&config.gemini_flash_model),
         "openai_compat" => config
             .openai_compat_model
             .as_deref()
@@ -108,7 +115,7 @@ fn supports_images(config: &Config, provider: &str, model: &str) -> bool {
     }
 
     let model = model.to_lowercase();
-    matches!(provider, "ollama")
+    matches!(provider, "ollama" | "gemini")
         || model.contains("vision")
         || model.contains("llama-4")
         || model.contains("gpt-4o")
