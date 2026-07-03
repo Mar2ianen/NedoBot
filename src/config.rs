@@ -16,6 +16,10 @@ pub struct Config {
     pub groq_api_key: String,
     pub cerebras_api_key: String,
     pub openrouter_api_key: String,
+    pub gemini_api_key: String,
+    pub gemini_text_model: String,
+    pub gemini_flash_model: String,
+    pub gemini_tts_model: String,
     pub ollama_base_url: String,
     pub ollama_api_key: String,
     pub openai_compat_base_url: String,
@@ -65,6 +69,12 @@ impl Config {
             groq_api_key: env_or("GROQ_API_KEY", ""),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
+            gemini_api_key: env_optional("GEMINI_API_KEY")
+                .or_else(|| env_optional("GOOGLE_AI_STUDIO_API_KEY"))
+                .unwrap_or_default(),
+            gemini_text_model: env_or("GEMINI_TEXT_MODEL", "gemini-3.5-flash"),
+            gemini_flash_model: env_or("GEMINI_FLASH_MODEL", "gemini-3.5-flash"),
+            gemini_tts_model: env_or("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
             ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
             ollama_api_key: env_or("OLLAMA_API_KEY", ""),
             openai_compat_base_url: env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),

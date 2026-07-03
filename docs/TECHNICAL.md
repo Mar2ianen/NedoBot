@@ -329,6 +329,20 @@ Rendering policy:
 
 `video_note` сейчас определяется, но отклоняется с пользовательским сообщением: для кружков нужен отдельный audio extract через ffmpeg.
 
+Cleanup prompt находится в `prompts/voice_cleanup.md`. Он должен чистить ASR, а не пересказывать голосовое: сохранять спорные формулировки автора, не менять числа/версии/названия моделей и учитывать локальный контекст канала `НедоNews`. В частности, `Gemma 4 31B` / `gemma4:31b` — валидная модель проекта, её нельзя заменять на `Gemma 2`, `Gemini` или `27B`.
+
+## New User Audit
+
+`src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
+
+Для ручного пересчёта истории:
+
+```bash
+cargo run --release --bin analyze_new_users -- --limit 4000 --max-messages 1000000 --include-analyzed
+```
+
+Ключевая таблица: `telegram_new_user_profile_audits`. В ней сохраняются классы риска, labels/reasons, возраст в чате, reply/comment context, текстовая повторяемость, профиль/персональный канал, наличие/метрики фото. `profile_photo_reuse_count` сейчас метрика only и не добавляет risk score.
+
 ## Метрики И Отладка
 
 Отсечки периодов:
@@ -397,7 +411,8 @@ cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.
 - сообщения пишутся через `telegram_messages unique(chat_id, message_id)`;
 - профили пишутся через `telegram_user_profiles primary key (telegram_user_id)`;
 - пользовательская статистика пересобирается из `telegram_messages` в `telegram_chat_users`, поэтому повторный импорт не увеличивает счётчики;
-- live Bot API `raw_json` не затирается экспортным JSON при конфликте, импорт только дополняет отсутствующие поля и флаги.
+- live Bot API `raw_json` не затирается экспортным JSON при конфликте, импорт только дополняет отсутствующие поля и флаги;
+- forwarded channel messages и automatic channel posts различаются: `sender_chat_id` заполняется только для реального `from_id/actor_id=channel...`, а `source_channel_id` может хранить как auto-forward source, так и forwarded source.
 
 Перед импортом на VPS лучше сделать backup:
 

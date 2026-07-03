@@ -1,0 +1,148 @@
+use async_trait::async_trait;
+use reqwest::header::USER_AGENT;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+use crate::config::Config;
+use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
+
+const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+pub struct GeminiClient<'a> {
+    api_key: &'a str,
+}
+
+impl<'a> GeminiClient<'a> {
+    pub fn new(config: &'a Config) -> Self {
+        Self {
+            api_key: config.gemini_api_key.trim(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for GeminiClient<'_> {
+    async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
+        if self.api_key.is_empty() {
+            anyhow::bail!("GEMINI_API_KEY is empty");
+        }
+
+        let body = GenerateContentRequest {
+            contents: vec![GeminiContent {
+                role: "user",
+                parts: request_parts(request.prompt, request.image_base64),
+            }],
+            generation_config: GenerationConfig {
+                temperature: request.temperature,
+                max_output_tokens: request.num_predict,
+            },
+        };
+
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .build()?
+            .post(format!(
+                "{}/models/{}:generateContent",
+                GEMINI_API_BASE_URL,
+                request.model.trim()
+            ))
+            .header(USER_AGENT, "tg-ai-bot-teloxide/0.1")
+            .header("x-goog-api-key", self.api_key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<GenerateContentResponse>()
+            .await?;
+
+        let content = response
+            .candidates
+            .into_iter()
+            .next()
+            .map(|candidate| {
+                candidate
+                    .content
+                    .parts
+                    .into_iter()
+                    .filter_map(|part| part.text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        if content.trim().is_empty() {
+            anyhow::bail!("empty Gemini response");
+        }
+
+        Ok(LlmResponse { content })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateContentRequest<'a> {
+    contents: Vec<GeminiContent<'a>>,
+    generation_config: GenerationConfig,
+}
+
+#[derive(Serialize)]
+struct GeminiContent<'a> {
+    role: &'a str,
+    parts: Vec<GeminiPart<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationConfig {
+    temperature: f32,
+    max_output_tokens: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum GeminiPart<'a> {
+    Text { text: &'a str },
+    InlineData { inline_data: InlineData<'a> },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InlineData<'a> {
+    mime_type: &'a str,
+    data: &'a str,
+}
+
+#[derive(Deserialize)]
+struct GenerateContentResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: GeminiResponseContent,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponseContent {
+    #[serde(default)]
+    parts: Vec<GeminiResponsePart>,
+}
+
+#[derive(Deserialize)]
+struct GeminiResponsePart {
+    text: Option<String>,
+}
+
+fn request_parts<'a>(prompt: &'a str, image_base64: Option<&'a str>) -> Vec<GeminiPart<'a>> {
+    let mut parts = vec![GeminiPart::Text { text: prompt }];
+    if let Some(image_base64) = image_base64 {
+        parts.push(GeminiPart::InlineData {
+            inline_data: InlineData {
+                mime_type: "image/jpeg",
+                data: image_base64,
+            },
+        });
+    }
+    parts
+}

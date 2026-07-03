@@ -342,6 +342,7 @@ async fn import_messages(
                 continue;
             };
 
+            let sender_chat_id = message_sender_chat_id(message);
             let source_channel_id = message_source_channel_id(message);
             let user_id = message_user_id(message);
             let text = message_text(&message.text);
@@ -381,12 +382,12 @@ async fn import_messages(
             .bind(message.id)
             .bind(user_id)
             .bind(source_channel_id)
-            .bind(source_channel_id.is_some())
+            .bind(sender_chat_id.is_some())
             .bind(text)
             .bind(raw_json)
             .bind(created_at)
             .bind(message.reply_to_message_id)
-            .bind(source_channel_id)
+            .bind(sender_chat_id)
             .bind(message.photo.is_some())
             .bind(matches!(media_type, Some("video_file" | "video_message")))
             .bind(message.file.is_some() && media_type.is_none())
@@ -675,8 +676,16 @@ fn message_user_id(message: &ExportMessage) -> Option<i64> {
 }
 
 fn message_source_channel_id(message: &ExportMessage) -> Option<i64> {
+    message_sender_chat_id(message).or_else(|| message_forwarded_channel_id(message))
+}
+
+fn message_sender_chat_id(message: &ExportMessage) -> Option<i64> {
     parse_prefixed_id(message.from_id.as_deref(), "channel")
-        .or_else(|| parse_prefixed_id(message.forwarded_from_id.as_deref(), "channel"))
+        .or_else(|| parse_prefixed_id(message.actor_id.as_deref(), "channel"))
+}
+
+fn message_forwarded_channel_id(message: &ExportMessage) -> Option<i64> {
+    parse_prefixed_id(message.forwarded_from_id.as_deref(), "channel")
 }
 
 fn parse_prefixed_id(value: Option<&str>, prefix: &str) -> Option<i64> {
@@ -758,6 +767,66 @@ mod tests {
     fn flattens_rich_text() {
         let text = serde_json::json!(["hello ", {"type": "link", "text": "https://t.me/x"}]);
         assert_eq!(message_text(&text), "hello https://t.me/x");
+    }
+
+    #[test]
+    fn forwarded_channel_message_is_not_automatic_forward() {
+        let message = ExportMessage {
+            id: 1,
+            message_type: "message".to_string(),
+            date: "2026-07-03T00:00:00".to_string(),
+            date_unixtime: "1783036800".to_string(),
+            from: Some("User".to_string()),
+            from_id: Some("user123".to_string()),
+            actor: None,
+            actor_id: None,
+            reply_to_message_id: None,
+            text: Value::String("forward".to_string()),
+            text_entities: None,
+            photo: None,
+            file: None,
+            media_type: None,
+            mime_type: None,
+            forwarded_from: Some("Channel".to_string()),
+            forwarded_from_id: Some("channel456".to_string()),
+            via_bot: None,
+            reactions: None,
+            extra: serde_json::Map::new(),
+        };
+
+        assert_eq!(message_user_id(&message), Some(123));
+        assert_eq!(message_source_channel_id(&message), Some(-1000000000456));
+        assert_eq!(message_sender_chat_id(&message), None);
+    }
+
+    #[test]
+    fn automatic_channel_message_has_sender_chat() {
+        let message = ExportMessage {
+            id: 1,
+            message_type: "message".to_string(),
+            date: "2026-07-03T00:00:00".to_string(),
+            date_unixtime: "1783036800".to_string(),
+            from: Some("Channel".to_string()),
+            from_id: Some("channel456".to_string()),
+            actor: None,
+            actor_id: None,
+            reply_to_message_id: None,
+            text: Value::String("auto".to_string()),
+            text_entities: None,
+            photo: None,
+            file: None,
+            media_type: None,
+            mime_type: None,
+            forwarded_from: None,
+            forwarded_from_id: None,
+            via_bot: None,
+            reactions: None,
+            extra: serde_json::Map::new(),
+        };
+
+        assert_eq!(message_user_id(&message), None);
+        assert_eq!(message_source_channel_id(&message), Some(-1000000000456));
+        assert_eq!(message_sender_chat_id(&message), Some(-1000000000456));
     }
 
     #[test]

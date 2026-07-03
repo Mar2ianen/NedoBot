@@ -23,6 +23,7 @@ use db::telegram::{
 };
 use db::{build_pool, migrate};
 use features::first_comment::pipeline::maybe_comment_post;
+use features::new_user_analysis::analyze_new_user_profile;
 use features::user_profiles::service::refresh_profile;
 use features::voice::pipeline::maybe_transcribe_voice;
 use state::AppState;
@@ -119,6 +120,7 @@ fn spawn_message_author_profile_refresh(
     }
 
     let user_id = user.id.0 as i64;
+    let chat_id = msg.chat.id.0;
     let bot = bot.inner().clone();
     let pool = state.pool.clone();
     tokio::spawn(async move {
@@ -131,12 +133,21 @@ fn spawn_message_author_profile_refresh(
             }
         }
 
-        if let Err(err) = refresh_profile(&bot, &pool, user_id).await {
-            let message = err.to_string();
-            if let Err(save_err) = mark_user_profile_refresh_error(&pool, user_id, &message).await {
-                tracing::warn!(%save_err, user_id, "failed to save profile refresh error");
+        match refresh_profile(&bot, &pool, user_id).await {
+            Ok(()) => {
+                if let Err(err) = analyze_new_user_profile(&pool, chat_id, user_id).await {
+                    tracing::warn!(%err, user_id, "failed to analyze new user profile");
+                }
             }
-            tracing::warn!(%err, user_id, "failed to refresh message author profile");
+            Err(err) => {
+                let message = err.to_string();
+                if let Err(save_err) =
+                    mark_user_profile_refresh_error(&pool, user_id, &message).await
+                {
+                    tracing::warn!(%save_err, user_id, "failed to save profile refresh error");
+                }
+                tracing::warn!(%err, user_id, "failed to refresh message author profile");
+            }
         }
     });
 }

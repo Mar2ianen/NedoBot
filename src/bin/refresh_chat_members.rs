@@ -232,6 +232,6 @@ fn member_status(kind: &ChatMemberKind) -> (&'static str, bool, bool) {
         ChatMemberKind::Member => ("member", false, true),
         ChatMemberKind::Restricted(restricted) => ("restricted", false, restricted.is_member),
         ChatMemberKind::Left => ("left", false, false),
-        ChatMemberKind::Banned(_) => ("kicked", false, false),
+        ChatMemberKind::Banned(_) => ("banned", false, false),
     }
 }

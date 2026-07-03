@@ -583,6 +583,7 @@ pub async fn save_message_reaction(
         insert into telegram_message_reactions
             (chat_id, message_id, user_id, actor_chat_id, old_reactions, new_reactions, raw_json, event_at)
         values ($1, $2, $3, $4, $5, $6, $7, $8)
+        on conflict do nothing
         "#,
     )
     .bind(reaction.chat.id.0)
@@ -627,7 +628,7 @@ pub async fn save_message_reaction_count(
     .bind(reaction_count.chat.id.0)
     .bind(reaction_count.message_id.0)
     .bind(reactions)
-    .bind(total_count as i32)
+    .bind(total_count)
     .bind(raw_json)
     .bind(reaction_count.date)
     .execute(pool)
@@ -731,8 +732,13 @@ pub async fn refresh_known_member_snapshots(
     .await?;
 
     for (user_id,) in users {
+        let Ok(user_id_u64) = u64::try_from(user_id) else {
+            tracing::debug!(user_id, "skip invalid negative Telegram user id");
+            continue;
+        };
+
         match bot
-            .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id as u64))
+            .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id_u64))
             .await
         {
             Ok(member) => {
@@ -901,5 +907,13 @@ async fn update_chat_user_member_event(
 }
 
 fn chat_member_status(kind: &ChatMemberKind) -> String {
-    format!("{:?}", kind.status()).to_lowercase()
+    match kind {
+        ChatMemberKind::Owner(_) => "creator",
+        ChatMemberKind::Administrator(_) => "administrator",
+        ChatMemberKind::Member => "member",
+        ChatMemberKind::Restricted(_) => "restricted",
+        ChatMemberKind::Left => "left",
+        ChatMemberKind::Banned(_) => "banned",
+    }
+    .to_string()
 }
