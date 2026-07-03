@@ -91,7 +91,7 @@ pub async fn load_recent_bot_comments(pool: &PgPool) -> anyhow::Result<Vec<Strin
         from llm_generations
         where coalesce(response, final_html) is not null
         order by created_at desc
-        limit 6
+        limit 12
         "#,
     )
     .fetch_all(pool)
