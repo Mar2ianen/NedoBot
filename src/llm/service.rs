@@ -39,33 +39,30 @@ pub async fn generate_text_with_provider(
     let provider = normalize_provider(provider_override.unwrap_or(&config.llm_provider))?;
     let model = model_override.unwrap_or_else(|| model_for_provider(config, provider));
 
-    match generate_once(
-        config,
-        provider,
-        model,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-    )
-    .await
-    {
-        Ok(generation) => Ok(generation),
-        Err(err) if should_try_gemini_fallback(config, provider, model_override, model) => {
-            tracing::warn!(%err, model, fallback_model = config.gemini_flash_model, "Gemini primary model failed, trying fallback model");
-            generate_once(
-                config,
-                provider,
-                &config.gemini_flash_model,
-                prompt,
-                image_base64,
-                temperature,
-                num_predict,
-            )
-            .await
+    let fallbacks = fallback_models(config, provider, model_override, model);
+    let mut last_error = None;
+
+    for fallback in fallbacks {
+        match generate_once(
+            config,
+            fallback.provider,
+            fallback.model,
+            prompt,
+            image_base64,
+            temperature,
+            num_predict,
+        )
+        .await
+        {
+            Ok(generation) => return Ok(generation),
+            Err(err) => {
+                tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation attempt failed");
+                last_error = Some(err);
+            }
         }
-        Err(err) => Err(err),
     }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no LLM generation attempts were configured")))
 }
 
 async fn generate_once(
@@ -118,16 +115,43 @@ async fn generate_once(
     })
 }
 
-fn should_try_gemini_fallback(
-    config: &Config,
-    provider: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FallbackModel<'a> {
+    provider: &'static str,
+    model: &'a str,
+}
+
+fn fallback_models<'a>(
+    config: &'a Config,
+    provider: &'static str,
     model_override: Option<&str>,
-    model: &str,
-) -> bool {
-    provider == "gemini"
-        && model_override.is_none()
-        && !config.gemini_flash_model.trim().is_empty()
-        && !model.eq_ignore_ascii_case(config.gemini_flash_model.trim())
+    model: &'a str,
+) -> Vec<FallbackModel<'a>> {
+    let primary = FallbackModel { provider, model };
+    match (provider, model_override) {
+        ("gemini", None) => {
+            let mut models = vec![primary];
+            push_unique_model(&mut models, "gemini", config.gemini_flash_model.trim());
+            push_unique_model(&mut models, "ollama", config.vision_model.trim());
+            models
+        }
+        _ => vec![primary],
+    }
+}
+
+fn push_unique_model<'a>(
+    models: &mut Vec<FallbackModel<'a>>,
+    provider: &'static str,
+    model: &'a str,
+) {
+    match model.is_empty()
+        || models
+            .iter()
+            .any(|item| item.provider == provider && item.model.eq_ignore_ascii_case(model))
+    {
+        true => {}
+        false => models.push(FallbackModel { provider, model }),
+    }
 }
 
 fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
@@ -173,4 +197,104 @@ fn supports_images(config: &Config, provider: &str, model: &str) -> bool {
         || model.contains("gemma4")
         || model.contains("gemini")
         || model.contains("pixtral")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            source_channel_id: -1001,
+            discussion_chat_id: -1002,
+            chat_invite_url: "https://t.me/example".to_string(),
+            chat_invite_label: "чат".to_string(),
+            post_signature_marker: "marker".to_string(),
+            llm_provider: "gemini".to_string(),
+            llm_model: Some("gemini-3.5-flash".to_string()),
+            llm_supports_images: Some(true),
+            llm_temperature: 0.35,
+            llm_max_tokens: 90,
+            memory_llm_temperature: 0.2,
+            memory_llm_max_tokens: 220,
+            groq_api_key: String::new(),
+            cerebras_api_key: String::new(),
+            openrouter_api_key: String::new(),
+            gemini_api_key: String::new(),
+            gemini_text_model: "gemini-3.5-flash".to_string(),
+            gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
+            gemini_tts_model: "gemini-3.1-flash-tts-preview".to_string(),
+            ollama_base_url: "https://ollama.com".to_string(),
+            ollama_api_key: String::new(),
+            openai_compat_base_url: "https://api.openai.com/v1".to_string(),
+            openai_compat_api_key: String::new(),
+            openai_compat_model: None,
+            vision_model: "gemma4:31b".to_string(),
+            owner_telegram_id: None,
+            send_owner_preview: false,
+            comment_custom_emoji_id: None,
+            tech_custom_emoji_id: None,
+            amd_custom_emoji_id: None,
+            radeon_custom_emoji_id: None,
+            ryzen_custom_emoji_id: None,
+            voice_transcription_enabled: false,
+            voice_auto_transcribe: false,
+            voice_max_duration_sec: 600,
+            voice_max_file_mb: 20,
+            voice_short_text_max_chars: 400,
+            voice_language: "ru".to_string(),
+            voice_asr_provider: "groq".to_string(),
+            voice_asr_model: "whisper-large-v3-turbo".to_string(),
+            voice_asr_temperature: 0.0,
+            voice_cleanup_provider: None,
+            voice_cleanup_model: None,
+            voice_cleanup_temperature: 0.2,
+            voice_cleanup_max_tokens: 1800,
+            voice_render_expandable_chapters: true,
+            voice_send_full_file: true,
+        }
+    }
+
+    #[test]
+    fn gemini_comments_fallback_to_flash_lite_then_gemma_31b() {
+        let config = config();
+        let models = fallback_models(&config, "gemini", None, "gemini-3.5-flash");
+
+        assert_eq!(
+            models,
+            vec![
+                FallbackModel {
+                    provider: "gemini",
+                    model: "gemini-3.5-flash",
+                },
+                FallbackModel {
+                    provider: "gemini",
+                    model: "gemini-3.1-flash-lite",
+                },
+                FallbackModel {
+                    provider: "ollama",
+                    model: "gemma4:31b",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_model_override_disables_comment_fallback_chain() {
+        let config = config();
+        let models = fallback_models(
+            &config,
+            "gemini",
+            Some("gemini-3.5-flash"),
+            "gemini-3.5-flash",
+        );
+
+        assert_eq!(
+            models,
+            vec![FallbackModel {
+                provider: "gemini",
+                model: "gemini-3.5-flash",
+            }]
+        );
+    }
 }

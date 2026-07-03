@@ -95,7 +95,7 @@ OWNER_TELEGRAM_ID=
 SEND_OWNER_PREVIEW=true
 ```
 
-Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель и `Gemini 3.1 Flash Lite` как fallback при ошибке основного Gemini-запроса. Fallback срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
+Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель, `Gemini 3.1 Flash Lite` как первый fallback, затем `ollama`/`gemma4:31b` как последний fallback. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 Fallback срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 
 Voice transcription:
