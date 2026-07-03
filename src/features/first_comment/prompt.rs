@@ -53,7 +53,7 @@ fn render_recent_comment_context(recent_comments: &[String]) -> String {
 
     recent_comments
         .iter()
-        .take(6)
+        .take(12)
         .map(|comment| format!("- {}", strip_html_tags(comment)))
         .collect::<Vec<_>>()
         .join("\n")
