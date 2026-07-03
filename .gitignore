@@ -2,3 +2,4 @@
 .env
 .env.*
 !.env.example
+docs/LOCAL_WORKFLOW.md
