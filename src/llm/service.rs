@@ -38,6 +38,45 @@ pub async fn generate_text_with_provider(
 ) -> anyhow::Result<GeneratedText> {
     let provider = normalize_provider(provider_override.unwrap_or(&config.llm_provider))?;
     let model = model_override.unwrap_or_else(|| model_for_provider(config, provider));
+
+    match generate_once(
+        config,
+        provider,
+        model,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+    )
+    .await
+    {
+        Ok(generation) => Ok(generation),
+        Err(err) if should_try_gemini_fallback(config, provider, model_override, model) => {
+            tracing::warn!(%err, model, fallback_model = config.gemini_flash_model, "Gemini primary model failed, trying fallback model");
+            generate_once(
+                config,
+                provider,
+                &config.gemini_flash_model,
+                prompt,
+                image_base64,
+                temperature,
+                num_predict,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn generate_once(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+) -> anyhow::Result<GeneratedText> {
     let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
         model,
@@ -79,6 +118,18 @@ pub async fn generate_text_with_provider(
     })
 }
 
+fn should_try_gemini_fallback(
+    config: &Config,
+    provider: &str,
+    model_override: Option<&str>,
+    model: &str,
+) -> bool {
+    provider == "gemini"
+        && model_override.is_none()
+        && !config.gemini_flash_model.trim().is_empty()
+        && !model.eq_ignore_ascii_case(config.gemini_flash_model.trim())
+}
+
 fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
     match provider.trim().to_lowercase().as_str() {
         "" | "ollama" => Ok("ollama"),
@@ -99,7 +150,7 @@ fn model_for_provider<'a>(config: &'a Config, provider: &str) -> &'a str {
         "gemini" => config
             .llm_model
             .as_deref()
-            .unwrap_or(&config.gemini_flash_model),
+            .unwrap_or(&config.gemini_text_model),
         "openai_compat" => config
             .openai_compat_model
             .as_deref()

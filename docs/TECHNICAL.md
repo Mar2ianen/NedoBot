@@ -69,8 +69,8 @@ CHAT_INVITE_URL=https://t.me/+RxmPtw7Bs-IxNzEy
 CHAT_INVITE_LABEL=чате
 POST_SIGNATURE_MARKER=Не теряем связь
 
-LLM_PROVIDER=ollama
-LLM_MODEL=
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.5-flash
 LLM_SUPPORTS_IMAGES=true
 LLM_TEMPERATURE=0.35
 LLM_MAX_TOKENS=90
@@ -80,6 +80,9 @@ MEMORY_LLM_MAX_TOKENS=220
 GROQ_API_KEY=
 CEREBRAS_API_KEY=
 OPENROUTER_API_KEY=
+GEMINI_API_KEY=
+GEMINI_TEXT_MODEL=gemini-3.5-flash
+GEMINI_FLASH_MODEL=gemini-3.1-flash-lite
 OLLAMA_API_KEY=
 OLLAMA_BASE_URL=https://ollama.com
 OLLAMA_MODEL=gemma4:31b
@@ -91,6 +94,9 @@ OPENAI_COMPAT_MODEL=
 OWNER_TELEGRAM_ID=
 SEND_OWNER_PREVIEW=true
 ```
+
+Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель и `Gemini 3.1 Flash Lite` как fallback при ошибке основного Gemini-запроса. Fallback срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
+Fallback срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 
 Voice transcription:
 

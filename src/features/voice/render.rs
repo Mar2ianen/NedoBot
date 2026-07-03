@@ -185,7 +185,7 @@ mod tests {
             openrouter_api_key: String::new(),
             gemini_api_key: String::new(),
             gemini_text_model: "gemini-3.5-flash".to_string(),
-            gemini_flash_model: "gemini-3.5-flash".to_string(),
+            gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
             gemini_tts_model: "gemini-3.1-flash-tts-preview".to_string(),
             ollama_base_url: "http://localhost:11434".to_string(),
             ollama_api_key: String::new(),

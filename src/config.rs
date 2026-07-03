@@ -73,7 +73,7 @@ impl Config {
                 .or_else(|| env_optional("GOOGLE_AI_STUDIO_API_KEY"))
                 .unwrap_or_default(),
             gemini_text_model: env_or("GEMINI_TEXT_MODEL", "gemini-3.5-flash"),
-            gemini_flash_model: env_or("GEMINI_FLASH_MODEL", "gemini-3.5-flash"),
+            gemini_flash_model: env_or("GEMINI_FLASH_MODEL", "gemini-3.1-flash-lite"),
             gemini_tts_model: env_or("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
             ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
             ollama_api_key: env_or("OLLAMA_API_KEY", ""),
