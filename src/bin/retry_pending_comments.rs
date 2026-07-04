@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = parse_args()?;
     let config = Config::from_env();
+    config.validate_runtime_secrets()?;
     let pool = build_pool().await?;
     migrate(&pool).await?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);

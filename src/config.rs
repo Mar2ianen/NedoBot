@@ -108,6 +108,100 @@ impl Config {
             voice_send_full_file: env_bool("VOICE_SEND_FULL_FILE", true),
         }
     }
+
+    pub fn validate_runtime_secrets(&self) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+
+        validate_llm_provider_secret(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
+
+        if self.voice_transcription_enabled && self.voice_auto_transcribe {
+            validate_voice_asr_secret(&mut errors, self);
+            if let Some(provider) = self.voice_cleanup_provider.as_deref() {
+                validate_llm_provider_secret(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "invalid runtime secret configuration:\n- {}",
+                errors.join("\n- ")
+            )
+        }
+    }
+}
+
+fn validate_voice_asr_secret(errors: &mut Vec<String>, config: &Config) {
+    match config.voice_asr_provider.trim().to_lowercase().as_str() {
+        "groq" => require_secret(
+            errors,
+            "GROQ_API_KEY",
+            &config.groq_api_key,
+            "VOICE_ASR_PROVIDER=groq",
+        ),
+        provider => errors.push(format!(
+            "VOICE_ASR_PROVIDER={provider} is unsupported; supported provider: groq"
+        )),
+    }
+}
+
+fn validate_llm_provider_secret(
+    errors: &mut Vec<String>,
+    config: &Config,
+    provider: &str,
+    context: &str,
+) {
+    match normalize_llm_provider(provider) {
+        Ok("ollama") => {}
+        Ok("groq") => require_secret(errors, "GROQ_API_KEY", &config.groq_api_key, context),
+        Ok("cerebras") => require_secret(
+            errors,
+            "CEREBRAS_API_KEY",
+            &config.cerebras_api_key,
+            context,
+        ),
+        Ok("openrouter") => require_secret(
+            errors,
+            "OPENROUTER_API_KEY",
+            &config.openrouter_api_key,
+            context,
+        ),
+        Ok("gemini") => require_secret(
+            errors,
+            "GEMINI_API_KEY or GOOGLE_AI_STUDIO_API_KEY",
+            &config.gemini_api_key,
+            context,
+        ),
+        Ok("openai_compat") => require_secret(
+            errors,
+            "OPENAI_COMPAT_API_KEY",
+            &config.openai_compat_api_key,
+            context,
+        ),
+        Ok(_) => unreachable!("all normalized providers are matched"),
+        Err(err) => errors.push(format!(
+            "{context} has unsupported provider {provider:?}: {err}"
+        )),
+    }
+}
+
+fn normalize_llm_provider(provider: &str) -> anyhow::Result<&'static str> {
+    match provider.trim().to_lowercase().as_str() {
+        "" | "ollama" => Ok("ollama"),
+        "groq" => Ok("groq"),
+        "cerebras" => Ok("cerebras"),
+        "openrouter" => Ok("openrouter"),
+        "gemini" | "google" | "google_ai_studio" => Ok("gemini"),
+        "openai_compat" => Ok("openai_compat"),
+        other => anyhow::bail!("unknown provider: {other}"),
+    }
+}
+
+fn require_secret(errors: &mut Vec<String>, key: &str, value: &str, context: &str) {
+    if value.trim().is_empty() {
+        errors.push(format!("{context} requires non-empty {key}"));
+    }
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -154,4 +248,103 @@ fn env_optional(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            source_channel_id: -1001,
+            discussion_chat_id: -1002,
+            chat_invite_url: "https://t.me/example".to_string(),
+            chat_invite_label: "чат".to_string(),
+            post_signature_marker: "marker".to_string(),
+            llm_provider: "ollama".to_string(),
+            llm_model: Some("gemma4:31b".to_string()),
+            llm_supports_images: Some(true),
+            llm_temperature: 0.35,
+            llm_max_tokens: 90,
+            memory_llm_temperature: 0.2,
+            memory_llm_max_tokens: 220,
+            groq_api_key: String::new(),
+            cerebras_api_key: String::new(),
+            openrouter_api_key: String::new(),
+            gemini_api_key: String::new(),
+            gemini_text_model: "gemini-3.5-flash".to_string(),
+            gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
+            gemini_tts_model: "gemini-3.1-flash-tts-preview".to_string(),
+            ollama_base_url: "https://ollama.com".to_string(),
+            ollama_api_key: String::new(),
+            openai_compat_base_url: "https://api.openai.com/v1".to_string(),
+            openai_compat_api_key: String::new(),
+            openai_compat_model: None,
+            vision_model: "gemma4:31b".to_string(),
+            owner_telegram_id: None,
+            send_owner_preview: false,
+            comment_custom_emoji_id: None,
+            tech_custom_emoji_id: None,
+            amd_custom_emoji_id: None,
+            radeon_custom_emoji_id: None,
+            ryzen_custom_emoji_id: None,
+            voice_transcription_enabled: false,
+            voice_auto_transcribe: false,
+            voice_max_duration_sec: 600,
+            voice_max_file_mb: 20,
+            voice_short_text_max_chars: 400,
+            voice_language: "ru".to_string(),
+            voice_asr_provider: "groq".to_string(),
+            voice_asr_model: "whisper-large-v3-turbo".to_string(),
+            voice_asr_temperature: 0.0,
+            voice_cleanup_provider: None,
+            voice_cleanup_model: None,
+            voice_cleanup_temperature: 0.2,
+            voice_cleanup_max_tokens: 1800,
+            voice_render_expandable_chapters: true,
+            voice_send_full_file: true,
+        }
+    }
+
+    #[test]
+    fn gemini_provider_requires_gemini_key_at_startup() {
+        let mut config = config();
+        config.llm_provider = "gemini".to_string();
+        config.llm_model = Some("gemini-3.5-flash".to_string());
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("LLM_PROVIDER requires non-empty GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn enabled_voice_pipeline_requires_asr_key() {
+        let mut config = config();
+        config.voice_transcription_enabled = true;
+        config.voice_auto_transcribe = true;
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("VOICE_ASR_PROVIDER=groq requires non-empty GROQ_API_KEY"));
+    }
+
+    #[test]
+    fn configured_voice_cleanup_provider_requires_its_key() {
+        let mut config = config();
+        config.voice_transcription_enabled = true;
+        config.voice_auto_transcribe = true;
+        config.groq_api_key = "groq-key".to_string();
+        config.voice_cleanup_provider = Some("openrouter".to_string());
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("VOICE_CLEANUP_PROVIDER requires non-empty OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn ollama_without_secrets_is_valid_when_voice_is_disabled() {
+        let config = config();
+
+        config.validate_runtime_secrets().unwrap();
+    }
 }

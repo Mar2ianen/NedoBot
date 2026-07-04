@@ -40,10 +40,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let config = Config::from_env();
+    config.validate_runtime_secrets()?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
     let pool = build_pool().await?;
     migrate(&pool).await?;
-    let config = Config::from_env();
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
         tracing::warn!(%err, "failed to refresh member snapshots");
     }
