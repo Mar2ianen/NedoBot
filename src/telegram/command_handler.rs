@@ -152,7 +152,7 @@ pub async fn handle_reply_user_stats_command(
         .text()
         .or_else(|| msg.caption())
         .map(render_from_args)
-        .unwrap_or(StatsRender::Html);
+        .unwrap_or(StatsRender::Rich);
 
     send_user_stats(
         &bot,
@@ -215,7 +215,7 @@ fn render_from_args(args: &str) -> StatsRender {
     } else if args.split_whitespace().any(is_rich_render_flag) {
         StatsRender::Rich
     } else {
-        StatsRender::Html
+        StatsRender::Rich
     }
 }
 
@@ -265,7 +265,7 @@ mod tests {
     fn parses_rich_and_forced_plain_flags() {
         assert!(matches!(render_from_args("-r"), StatsRender::Rich));
         assert!(matches!(render_from_args("week --rich"), StatsRender::Rich));
-        assert!(matches!(render_from_args("week"), StatsRender::Html));
+        assert!(matches!(render_from_args("week"), StatsRender::Rich));
         assert!(matches!(render_from_args("week -p"), StatsRender::Html));
         assert!(matches!(
             render_from_args("--rich --poor"),
