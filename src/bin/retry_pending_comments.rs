@@ -10,6 +10,7 @@ use tg_ai_bot_teloxide::{
     features::{
         first_comment::{
             prompt::build_llm_prompt,
+            quality::validate_comment_output,
             render::build_comment_html,
             repo::{
                 LlmGenerationInsert, insert_llm_generation, load_recent_bot_comments,
@@ -18,7 +19,7 @@ use tg_ai_bot_teloxide::{
         },
         memory::service::{load_relevant_memory_notes, remember_post},
     },
-    llm::service::generate_text,
+    llm::service::generate_text_checked,
     telegram::render::send_html_reply,
 };
 
@@ -148,12 +149,13 @@ async fn retry_job(
         &memory_notes,
         &recent_comments,
     );
-    let generation = generate_text(
+    let generation = generate_text_checked(
         config,
         &prompt,
         None,
         config.llm_temperature,
         config.llm_max_tokens,
+        Some(validate_comment_output),
     )
     .await?;
     let final_html = build_comment_html(&generation.content, config);

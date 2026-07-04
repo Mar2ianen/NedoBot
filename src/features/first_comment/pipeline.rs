@@ -6,13 +6,14 @@ use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::prompt::build_llm_prompt;
+use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
     mark_post_comment_sent,
 };
 use crate::features::memory::service::{load_relevant_memory_notes, remember_post};
-use crate::llm::service::generate_text;
+use crate::llm::service::generate_text_checked;
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
@@ -77,12 +78,13 @@ pub async fn maybe_comment_post(
         &memory_notes,
         &recent_comments,
     );
-    let generation = generate_text(
+    let generation = generate_text_checked(
         config,
         &prompt,
         image_base64.as_deref(),
         config.llm_temperature,
         config.llm_max_tokens,
+        Some(validate_comment_output),
     )
     .await?;
     let final_html = build_comment_html(&generation.content, config);
