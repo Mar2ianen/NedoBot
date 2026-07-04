@@ -329,13 +329,15 @@ async fn build_top_reacted_report(pool: &PgPool, config: &Config) -> anyhow::Res
         };
         let preview = message_preview(
             row.text.as_deref(),
-            row.has_photo,
-            row.has_video,
-            row.has_document,
-            row.has_audio,
-            row.has_voice,
-            row.has_sticker,
-            row.has_animation,
+            MessageMediaPreview {
+                has_photo: row.has_photo,
+                has_video: row.has_video,
+                has_document: row.has_document,
+                has_audio: row.has_audio,
+                has_voice: row.has_voice,
+                has_sticker: row.has_sticker,
+                has_animation: row.has_animation,
+            },
         );
         let author_link = Html::link(
             user.display_name,
@@ -768,8 +770,8 @@ fn human_comment_preview(text: &str) -> String {
         .to_string()
 }
 
-fn message_preview(
-    text: Option<&str>,
+#[derive(Clone, Copy, Default)]
+struct MessageMediaPreview {
     has_photo: bool,
     has_video: bool,
     has_document: bool,
@@ -777,19 +779,21 @@ fn message_preview(
     has_voice: bool,
     has_sticker: bool,
     has_animation: bool,
-) -> String {
+}
+
+fn message_preview(text: Option<&str>, media: MessageMediaPreview) -> String {
     if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
         return normalize_ai_markers(text);
     }
 
     let media = [
-        (has_photo, "фото"),
-        (has_video, "видео"),
-        (has_document, "файл"),
-        (has_audio, "аудио"),
-        (has_voice, "голосовое"),
-        (has_sticker, "стикер"),
-        (has_animation, "GIF"),
+        (media.has_photo, "фото"),
+        (media.has_video, "видео"),
+        (media.has_document, "файл"),
+        (media.has_audio, "аудио"),
+        (media.has_voice, "голосовое"),
+        (media.has_sticker, "стикер"),
+        (media.has_animation, "GIF"),
     ]
     .into_iter()
     .filter_map(|(enabled, label)| enabled.then_some(label))
@@ -1169,7 +1173,14 @@ mod tests {
     #[test]
     fn message_preview_falls_back_to_media() {
         assert_eq!(
-            message_preview(None, true, false, false, false, true, false, false),
+            message_preview(
+                None,
+                MessageMediaPreview {
+                    has_photo: true,
+                    has_voice: true,
+                    ..Default::default()
+                },
+            ),
             "медиа: фото, голосовое"
         );
     }

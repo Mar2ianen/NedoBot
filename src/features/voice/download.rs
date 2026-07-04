@@ -51,13 +51,13 @@ pub fn validate_media(media: &VoiceMedia, config: &Config) -> Result<(), VoiceDo
         return Err(VoiceDownloadSkip::UnsupportedVideoNote);
     }
 
-    if let Some(duration_sec) = media.duration_sec {
-        if duration_sec > config.voice_max_duration_sec {
-            return Err(VoiceDownloadSkip::TooLong {
-                duration_sec,
-                max_sec: config.voice_max_duration_sec,
-            });
-        }
+    if let Some(duration_sec) = media.duration_sec
+        && duration_sec > config.voice_max_duration_sec
+    {
+        return Err(VoiceDownloadSkip::TooLong {
+            duration_sec,
+            max_sec: config.voice_max_duration_sec,
+        });
     }
 
     if let Some(file_size) = media.file_size {
