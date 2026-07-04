@@ -281,6 +281,7 @@ mod tests {
             gemini_text_model: "gemini-3.5-flash".to_string(),
             gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
             gemini_tts_model: "gemini-3.1-flash-tts-preview".to_string(),
+            gemini_thinking_budget: 1024,
             ollama_base_url: "https://ollama.com".to_string(),
             ollama_api_key: String::new(),
             openai_compat_base_url: "https://api.openai.com/v1".to_string(),
