@@ -53,7 +53,7 @@ impl UserPresentation {
         Html::link(visible, format!("tg://user?id={}", self.user_id)).into_string()
     }
 
-    fn badges(&self) -> String {
+    pub fn badges(&self) -> String {
         let mut parts = Vec::new();
 
         if self.is_bot {

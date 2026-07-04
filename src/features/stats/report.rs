@@ -369,17 +369,13 @@ async fn build_user_stats_rich_report(
             Option<String>,
             bool,
             Option<String>,
-            Option<i32>,
             Option<String>,
             Option<String>,
-            Option<i32>,
-            Option<i32>,
         ),
     >(
         r#"
-        select username, first_name, last_name, is_bot, bio, profile_photo_count,
-               profile_photo_file_id, profile_photo_file_unique_id,
-               profile_photo_width, profile_photo_height
+        select username, first_name, last_name, is_bot, bio,
+               profile_photo_file_id, profile_photo_file_unique_id
         from telegram_user_profiles
         where telegram_user_id = $1
         "#,
@@ -390,9 +386,20 @@ async fn build_user_stats_rich_report(
     let totals = user_totals(pool, config, user_id).await?;
     let reactions_given = user_reactions_given(pool, config, user_id).await?;
     let reactions_received = user_reactions_received(pool, config, user_id).await?;
-    let member = sqlx::query_as::<_, (String, bool, bool, Option<String>)>(
+    let member = sqlx::query_as::<_, (String, bool, bool, Option<String>, Option<String>)>(
         r#"
-        select status, is_admin, is_present, to_char(observed_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI')
+        select status,
+               is_admin,
+               is_present,
+               to_char(observed_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI'),
+               coalesce(
+                   nullif(raw_json #>> '{custom_title}', ''),
+                   nullif(raw_json #>> '{kind,custom_title}', ''),
+                   nullif(raw_json #>> '{administrator,custom_title}', ''),
+                   nullif(raw_json #>> '{owner,custom_title}', ''),
+                   nullif(raw_json #>> '{member,custom_title}', ''),
+                   nullif(raw_json #>> '{restricted,custom_title}', '')
+               ) as written_tag
         from telegram_chat_member_snapshots
         where chat_id = $1 and telegram_user_id = $2
         "#,
@@ -442,18 +449,8 @@ async fn build_user_stats_rich_report(
     .fetch_optional(pool)
     .await?;
 
-    let (
-        username,
-        first_name,
-        last_name,
-        is_bot,
-        bio,
-        photo_count,
-        photo_file_id,
-        photo_unique_id,
-        photo_width,
-        photo_height,
-    ) = profile.unwrap_or((None, None, None, false, None, None, None, None, None, None));
+    let (username, first_name, last_name, is_bot, bio, photo_file_id, photo_unique_id) =
+        profile.unwrap_or((None, None, None, false, None, None, None));
     let avatar_url = cached_profile_photo_url(
         bot,
         config,
@@ -462,8 +459,8 @@ async fn build_user_stats_rich_report(
         photo_unique_id.as_deref(),
     )
     .await;
-    let (status, is_admin, is_present, _observed_at) =
-        member.unwrap_or(("unknown".to_string(), false, false, None));
+    let (status, is_admin, is_present, _observed_at, written_tag) =
+        member.unwrap_or(("unknown".to_string(), false, false, None, None));
     let user = UserPresentation {
         user_id,
         display_name: display_name(
@@ -477,30 +474,18 @@ async fn build_user_stats_rich_report(
         is_admin,
         is_present: Some(is_present),
     };
-    let avatar_link = avatar_url
-        .as_deref()
-        .map(|url| Html::link("открыть аватар", url).into_string());
     let avatar_block = avatar_url
         .as_deref()
         .map(|url| format!("<img src=\"{}\"/>", escape_html(url)))
         .unwrap_or_default();
-    let profile_block = rich_table_no_header(&[
-        vec![
-            "имя".to_string(),
-            rich_user_link(&username, user_id, &user.display_name),
-        ],
-        vec![
-            "фото".to_string(),
-            match (photo_count, photo_width, photo_height, avatar_link) {
-                (Some(count), Some(width), Some(height), Some(link)) => {
-                    format!("{} · {}×{} · {}", count, width, height, link)
-                }
-                (Some(count), _, _, Some(link)) => format!("{} · {}", count, link),
-                (Some(count), _, _, None) => count.to_string(),
-                _ => "нет данных".to_string(),
-            },
-        ],
-    ]);
+    let mut profile_rows = vec![vec![
+        "имя".to_string(),
+        rich_user_link(&username, user_id, &user.display_name),
+    ]];
+    if let Some(tag) = profile_written_tag(written_tag.as_deref()) {
+        profile_rows.push(vec!["тег".to_string(), tag]);
+    }
+    let profile_block = rich_table_no_header(&profile_rows);
     let activity_block = rich_table_no_header(&[
         vec!["сообщения".to_string(), bold_num(totals.0)],
         vec!["reply".to_string(), bold_num(totals.1)],
@@ -670,6 +655,12 @@ fn push_rich_table_rows(table: &mut String, rows: &[Vec<String>]) {
 
 fn bold_num(value: i64) -> String {
     format!("<strong>{value}</strong>")
+}
+
+fn profile_written_tag(tag: Option<&str>) -> Option<String> {
+    tag.map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(escape_html)
 }
 
 async fn user_top_words(
