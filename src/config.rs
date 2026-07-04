@@ -53,6 +53,8 @@ pub struct Config {
     pub voice_cleanup_max_tokens: u32,
     pub voice_render_expandable_chapters: bool,
     pub voice_send_full_file: bool,
+    pub public_base_url: Option<String>,
+    pub static_files_dir: String,
 }
 
 impl Config {
@@ -116,6 +118,8 @@ impl Config {
             voice_cleanup_max_tokens: env_u32("VOICE_CLEANUP_MAX_TOKENS", 1800),
             voice_render_expandable_chapters: env_bool("VOICE_RENDER_EXPANDABLE_CHAPTERS", true),
             voice_send_full_file: env_bool("VOICE_SEND_FULL_FILE", true),
+            public_base_url: env_optional("PUBLIC_BASE_URL"),
+            static_files_dir: env_or("STATIC_FILES_DIR", "/opt/tg-ai-bot-teloxide/static"),
         }
     }
 
@@ -344,6 +348,8 @@ mod tests {
             voice_cleanup_max_tokens: 1800,
             voice_render_expandable_chapters: true,
             voice_send_full_file: true,
+            public_base_url: None,
+            static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
     }
 

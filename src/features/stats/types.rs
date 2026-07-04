@@ -7,6 +7,12 @@ pub enum StatsPeriod {
     Month,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StatsRender {
+    Html,
+    Rich,
+}
+
 #[derive(sqlx::FromRow)]
 pub struct ChatStatsSummary {
     pub start_label: String,
