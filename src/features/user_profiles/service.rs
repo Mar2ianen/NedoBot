@@ -15,6 +15,7 @@ use tokio::time::sleep;
 use crate::db::telegram::{
     UserProfileDetails, mark_user_profile_refresh_error, update_user_profile_details,
 };
+use crate::http;
 
 #[allow(dead_code)]
 pub struct RefreshUserProfilesQuery {
@@ -252,10 +253,7 @@ struct PersonalChannelChat {
 async fn fetch_personal_channel_messages(user_id: i64) -> anyhow::Result<PersonalChannelData> {
     let token = std::env::var("TELOXIDE_TOKEN").or_else(|_| std::env::var("BOT_TOKEN"))?;
     let url = format!("https://api.telegram.org/bot{token}/getUserPersonalChatMessages");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let response = client
+    let response = http::client(Duration::from_secs(5))?
         .post(url)
         .json(&json!({
             "user_id": user_id,

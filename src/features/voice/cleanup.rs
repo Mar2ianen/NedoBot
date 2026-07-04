@@ -18,7 +18,7 @@ pub async fn cleanup_transcript(
         Err(err) => {
             tracing::warn!(%err, "all voice cleanup providers failed, using raw ASR transcript");
             return Ok(normalize_cleanup(
-                plain_cleanup(&transcript.text, config.voice_short_text_max_chars),
+                plain_cleanup(&transcript.text),
                 transcript,
                 config.voice_short_text_max_chars,
             ));
@@ -27,10 +27,7 @@ pub async fn cleanup_transcript(
 
     let clean = parse_cleanup_json(&content).or_else(|err| {
         tracing::warn!(%err, "failed to parse voice cleanup JSON, using plain LLM text");
-        Ok::<CleanTranscript, anyhow::Error>(plain_cleanup(
-            &content,
-            config.voice_short_text_max_chars,
-        ))
+        Ok::<CleanTranscript, anyhow::Error>(plain_cleanup(&content))
     })?;
 
     Ok(normalize_cleanup(
@@ -41,22 +38,13 @@ pub async fn cleanup_transcript(
 }
 
 async fn generate_cleanup_content(config: &Config, prompt: &str) -> anyhow::Result<String> {
-    match generate_cleanup_with_provider(
+    generate_cleanup_with_provider(
         config,
         config.voice_cleanup_provider.as_deref(),
         config.voice_cleanup_model.as_deref(),
         prompt,
     )
     .await
-    {
-        Ok(content) => return Ok(content),
-        Err(err) if should_try_default_cleanup_provider(config) => {
-            tracing::warn!(%err, "voice cleanup provider failed, falling back to default LLM provider");
-        }
-        Err(err) => return Err(err),
-    }
-
-    generate_cleanup_with_provider(config, None, None, prompt).await
 }
 
 async fn generate_cleanup_with_provider(
@@ -76,16 +64,6 @@ async fn generate_cleanup_with_provider(
     )
     .await?
     .content)
-}
-
-fn should_try_default_cleanup_provider(config: &Config) -> bool {
-    let Some(provider) = config.voice_cleanup_provider.as_deref() else {
-        return false;
-    };
-
-    !provider
-        .trim()
-        .eq_ignore_ascii_case(config.llm_provider.trim())
 }
 
 fn build_prompt(config: &Config, transcript: &AsrTranscript) -> String {
@@ -145,7 +123,7 @@ fn parse_cleanup_json(value: &str) -> anyhow::Result<CleanTranscript> {
     })
 }
 
-fn plain_cleanup(value: &str, _short_limit: usize) -> CleanTranscript {
+fn plain_cleanup(value: &str) -> CleanTranscript {
     let text = value.trim().to_string();
     CleanTranscript {
         mode: TranscriptRenderMode::Short,

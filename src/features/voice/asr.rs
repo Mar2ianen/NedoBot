@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::features::voice::types::{AsrSegment, AsrTranscript};
+use crate::http;
 
 const GROQ_TRANSCRIPTIONS_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 
@@ -37,9 +38,7 @@ pub async fn transcribe_audio(
         .text("timestamp_granularities[]", "segment")
         .part("file", file_part);
 
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?
+    let response = http::client(Duration::from_secs(120))?
         .post(GROQ_TRANSCRIPTIONS_URL)
         .bearer_auth(config.groq_api_key.trim())
         .multipart(form)

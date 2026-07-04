@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::http;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
 
 pub struct OpenAiCompatClient<'a> {
@@ -41,9 +42,7 @@ impl LlmClient for OpenAiCompatClient<'_> {
             max_completion_tokens: request.num_predict,
         };
 
-        let response = reqwest::Client::builder()
-            .timeout(Duration::from_secs(45))
-            .build()?
+        let response = http::client(Duration::from_secs(45))?
             .post(format!(
                 "{}/chat/completions",
                 self.api_base.trim_end_matches('/')

@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, normalize_llm_provider};
 use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
@@ -36,8 +36,11 @@ pub async fn generate_text_with_provider(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<GeneratedText> {
-    let provider = normalize_provider(provider_override.unwrap_or(&config.llm_provider))?;
-    let model = model_override.unwrap_or_else(|| model_for_provider(config, provider));
+    let provider = normalize_llm_provider(provider_override.unwrap_or(&config.llm_provider))?;
+    let model = match model_override {
+        Some(model) => model,
+        None => model_for_provider(config, provider)?,
+    };
 
     let fallbacks = fallback_models(config, provider, model_override, model);
     let mut last_error = None;
@@ -154,33 +157,37 @@ fn push_unique_model<'a>(
     }
 }
 
-fn normalize_provider(provider: &str) -> anyhow::Result<&'static str> {
-    match provider.trim().to_lowercase().as_str() {
-        "" | "ollama" => Ok("ollama"),
-        "groq" => Ok("groq"),
-        "cerebras" => Ok("cerebras"),
-        "openrouter" => Ok("openrouter"),
-        "gemini" | "google" | "google_ai_studio" => Ok("gemini"),
-        "openai_compat" => Ok("openai_compat"),
-        other => anyhow::bail!("unknown LLM_PROVIDER: {other}"),
-    }
-}
-
-fn model_for_provider<'a>(config: &'a Config, provider: &str) -> &'a str {
+fn model_for_provider<'a>(config: &'a Config, provider: &str) -> anyhow::Result<&'a str> {
     match provider {
-        "groq" | "cerebras" | "openrouter" => {
-            config.llm_model.as_deref().unwrap_or(&config.vision_model)
-        }
-        "gemini" => config
+        "groq" => config
             .llm_model
             .as_deref()
-            .unwrap_or(&config.gemini_text_model),
-        "openai_compat" => config
+            .or(config.groq_model.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("LLM_PROVIDER=groq requires LLM_MODEL or GROQ_MODEL")),
+        "cerebras" => config
+            .llm_model
+            .as_deref()
+            .or(config.cerebras_model.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("LLM_PROVIDER=cerebras requires LLM_MODEL or CEREBRAS_MODEL")
+            }),
+        "openrouter" => config
+            .llm_model
+            .as_deref()
+            .or(config.openrouter_model.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("LLM_PROVIDER=openrouter requires LLM_MODEL or OPENROUTER_MODEL")
+            }),
+        "gemini" => Ok(config
+            .llm_model
+            .as_deref()
+            .unwrap_or(&config.gemini_text_model)),
+        "openai_compat" => Ok(config
             .openai_compat_model
             .as_deref()
             .or(config.llm_model.as_deref())
-            .unwrap_or(&config.vision_model),
-        _ => &config.vision_model,
+            .unwrap_or(&config.vision_model)),
+        _ => Ok(&config.vision_model),
     }
 }
 
@@ -219,8 +226,11 @@ mod tests {
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
             groq_api_key: String::new(),
+            groq_model: None,
             cerebras_api_key: String::new(),
+            cerebras_model: None,
             openrouter_api_key: String::new(),
+            openrouter_model: None,
             gemini_api_key: String::new(),
             gemini_text_model: "gemini-3.5-flash".to_string(),
             gemini_flash_model: "gemini-3.1-flash-lite".to_string(),

@@ -78,8 +78,11 @@ MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
 
 GROQ_API_KEY=
+GROQ_MODEL=
 CEREBRAS_API_KEY=
+CEREBRAS_MODEL=
 OPENROUTER_API_KEY=
+OPENROUTER_MODEL=
 GEMINI_API_KEY=
 GEMINI_TEXT_MODEL=gemini-3.5-flash
 GEMINI_FLASH_MODEL=gemini-3.1-flash-lite
@@ -104,6 +107,7 @@ SEND_OWNER_PREVIEW=true
 
 - `LLM_PROVIDER=gemini` требует непустой `GEMINI_API_KEY` или `GOOGLE_AI_STUDIO_API_KEY`.
 - `LLM_PROVIDER=groq|cerebras|openrouter|openai_compat` требует соответствующий API key.
+- `LLM_PROVIDER=groq|cerebras|openrouter` требует явную модель через `LLM_MODEL` или provider-specific переменную `GROQ_MODEL`/`CEREBRAS_MODEL`/`OPENROUTER_MODEL`; fallback на `VISION_MODEL` запрещён.
 - `LLM_PROVIDER=ollama` секрета не требует.
 - Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
