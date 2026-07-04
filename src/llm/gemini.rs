@@ -12,6 +12,7 @@ const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1b
 pub struct GeminiClient<'a> {
     api_key: &'a str,
     proxy_url: Option<&'a str>,
+    thinking_budget: u32,
 }
 
 impl<'a> GeminiClient<'a> {
@@ -19,6 +20,7 @@ impl<'a> GeminiClient<'a> {
         Self {
             api_key: config.gemini_api_key.trim(),
             proxy_url: config.llm_proxy_url.as_deref().map(str::trim),
+            thinking_budget: config.gemini_thinking_budget,
         }
     }
 }
@@ -37,7 +39,10 @@ impl LlmClient for GeminiClient<'_> {
             }],
             generation_config: GenerationConfig {
                 temperature: request.temperature,
-                max_output_tokens: request.num_predict,
+                max_output_tokens: request.num_predict.saturating_add(self.thinking_budget),
+                thinking_config: (self.thinking_budget > 0).then_some(ThinkingConfig {
+                    thinking_budget: self.thinking_budget,
+                }),
             },
         };
 
@@ -97,6 +102,14 @@ struct GeminiContent<'a> {
 struct GenerationConfig {
     temperature: f32,
     max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<ThinkingConfig>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThinkingConfig {
+    thinking_budget: u32,
 }
 
 #[derive(Serialize)]
@@ -169,5 +182,20 @@ mod tests {
                 {"inlineData": {"mimeType": "image/jpeg", "data": "base64-image"}}
             ])
         );
+    }
+
+    #[test]
+    fn generation_config_keeps_thinking_budget_separate_from_answer_budget() {
+        let output_budget = 90;
+        let thinking_budget = 256;
+        let config = GenerationConfig {
+            temperature: 0.35,
+            max_output_tokens: output_budget + thinking_budget,
+            thinking_config: Some(ThinkingConfig { thinking_budget }),
+        };
+
+        let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["maxOutputTokens"], json!(346));
+        assert_eq!(value["thinkingConfig"]["thinkingBudget"], json!(256));
     }
 }
