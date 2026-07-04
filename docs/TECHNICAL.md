@@ -83,6 +83,7 @@ OPENROUTER_API_KEY=
 GEMINI_API_KEY=
 GEMINI_TEXT_MODEL=gemini-3.5-flash
 GEMINI_FLASH_MODEL=gemini-3.1-flash-lite
+LLM_PROXY_URL=
 OLLAMA_API_KEY=
 OLLAMA_BASE_URL=https://ollama.com
 OLLAMA_MODEL=gemma4:31b
@@ -97,7 +98,7 @@ SEND_OWNER_PREVIEW=true
 
 Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель, `Gemini 3.1 Flash Lite` как первый fallback, затем `ollama`/`gemma4:31b` как последний fallback. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 
-Если Gemini недоступен напрямую из региона сервера, `reqwest` собран с поддержкой SOCKS proxy и может использовать стандартные env-переменные `HTTPS_PROXY`/`HTTP_PROXY`. На текущем `vps-153` Gemini-трафик идёт через локальный SOCKS `socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
+Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
 
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 

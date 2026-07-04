@@ -178,6 +178,7 @@ mod tests {
             llm_supports_images: None,
             llm_temperature: 0.45,
             llm_max_tokens: 140,
+            llm_proxy_url: None,
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
             groq_api_key: String::new(),
