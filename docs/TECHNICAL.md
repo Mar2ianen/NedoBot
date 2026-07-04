@@ -96,7 +96,16 @@ SEND_OWNER_PREVIEW=true
 ```
 
 Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель, `Gemini 3.1 Flash Lite` как первый fallback, затем `ollama`/`gemma4:31b` как последний fallback. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
-Fallback срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
+
+На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
+
+- `LLM_PROVIDER=gemini` требует непустой `GEMINI_API_KEY` или `GOOGLE_AI_STUDIO_API_KEY`.
+- `LLM_PROVIDER=groq|cerebras|openrouter|openai_compat` требует соответствующий API key.
+- `LLM_PROVIDER=ollama` секрета не требует.
+- Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
+- Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
+
+Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
 Voice transcription:
 
