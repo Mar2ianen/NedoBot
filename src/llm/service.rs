@@ -6,6 +6,16 @@ use crate::llm::types::{GeneratedText, LlmClient, LlmRequest};
 
 pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
 
+pub struct GenerateTextOptions<'a> {
+    pub provider_override: Option<&'a str>,
+    pub model_override: Option<&'a str>,
+    pub prompt: &'a str,
+    pub image_base64: Option<&'a str>,
+    pub temperature: f32,
+    pub num_predict: u32,
+    pub output_validator: Option<OutputValidator>,
+}
+
 const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const CEREBRAS_OPENAI_BASE_URL: &str = "https://api.cerebras.ai/v1";
 const OPENROUTER_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -30,13 +40,15 @@ pub async fn generate_text_checked(
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
-        None,
-        None,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-        output_validator,
+        GenerateTextOptions {
+            provider_override: None,
+            model_override: None,
+            prompt,
+            image_base64,
+            temperature,
+            num_predict,
+            output_validator,
+        },
     )
     .await
 }
@@ -52,34 +64,31 @@ pub async fn generate_text_with_provider(
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
-        provider_override,
-        model_override,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-        None,
+        GenerateTextOptions {
+            provider_override,
+            model_override,
+            prompt,
+            image_base64,
+            temperature,
+            num_predict,
+            output_validator: None,
+        },
     )
     .await
 }
 
 pub async fn generate_text_with_provider_checked(
     config: &Config,
-    provider_override: Option<&str>,
-    model_override: Option<&str>,
-    prompt: &str,
-    image_base64: Option<&str>,
-    temperature: f32,
-    num_predict: u32,
-    output_validator: Option<OutputValidator>,
+    options: GenerateTextOptions<'_>,
 ) -> anyhow::Result<GeneratedText> {
-    let provider = normalize_llm_provider(provider_override.unwrap_or(&config.llm_provider))?;
-    let model = match model_override {
+    let provider =
+        normalize_llm_provider(options.provider_override.unwrap_or(&config.llm_provider))?;
+    let model = match options.model_override {
         Some(model) => model,
         None => model_for_provider(config, provider)?,
     };
 
-    let fallbacks = fallback_models(config, provider, model_override, model);
+    let fallbacks = fallback_models(config, provider, options.model_override, model);
     let mut last_error = None;
 
     for fallback in fallbacks {
@@ -87,20 +96,20 @@ pub async fn generate_text_with_provider_checked(
             config,
             fallback.provider,
             fallback.model,
-            prompt,
-            image_base64,
-            temperature,
-            num_predict,
+            options.prompt,
+            options.image_base64,
+            options.temperature,
+            options.num_predict,
         )
         .await
         {
             Ok(generation) => {
-                if let Some(validate) = output_validator {
-                    if let Err(err) = validate(&generation.content) {
-                        tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation output failed validation");
-                        last_error = Some(err);
-                        continue;
-                    }
+                if let Some(validate) = options.output_validator
+                    && let Err(err) = validate(&generation.content)
+                {
+                    tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation output failed validation");
+                    last_error = Some(err);
+                    continue;
                 }
                 return Ok(generation);
             }

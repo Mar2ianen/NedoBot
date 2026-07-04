@@ -157,9 +157,9 @@ pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyho
     let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
     let new_text = message_text(msg);
     let new_raw_json = serde_json::to_value(msg)?;
-    let changed = old.as_ref().is_none_or(|old| {
-        old.text.as_deref() != new_text.as_deref() || old.raw_json != new_raw_json
-    });
+    let changed = old
+        .as_ref()
+        .is_none_or(|old| old.text.as_deref() != new_text || old.raw_json != new_raw_json);
 
     save_telegram_message(pool, msg).await?;
 
@@ -187,7 +187,7 @@ pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyho
             .or_else(|| old.as_ref().and_then(|old| old.user_id)),
     )
     .bind(old.as_ref().and_then(|old| old.text.as_deref()))
-    .bind(new_text.as_deref())
+    .bind(new_text)
     .bind(old.as_ref().map(|old| &old.raw_json))
     .bind(new_raw_json)
     .bind(edited_at)

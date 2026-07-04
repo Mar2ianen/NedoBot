@@ -162,9 +162,8 @@ impl RiskAccumulator {
     }
 
     fn add_optional(&mut self, signal: Option<RiskSignal>) {
-        match signal {
-            Some(signal) => self.add(signal),
-            None => {}
+        if let Some(signal) = signal {
+            self.add(signal);
         }
     }
 
@@ -783,86 +782,76 @@ fn chat_age_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
 }
 
 fn only_replies_or_comments(features: &NewUserFeatures) -> bool {
-    match (
-        features.message_count,
-        features.top_level_message_count,
-        features.reply_to_channel_post_count,
-        features.reply_to_bot_count,
-        features.reply_to_comment_count,
-    ) {
+    matches!(
+        (
+            features.message_count,
+            features.top_level_message_count,
+            features.reply_to_channel_post_count,
+            features.reply_to_bot_count,
+            features.reply_to_comment_count,
+        ),
         (count, 0, channel_comments, bot_replies, comment_replies)
-            if count > 0 && channel_comments + bot_replies + comment_replies >= count =>
-        {
-            true
-        }
-        _ => false,
-    }
+            if count > 0 && channel_comments + bot_replies + comment_replies >= count
+    )
 }
 
 fn only_channel_post_comments(features: &NewUserFeatures) -> bool {
-    match (
-        features.message_count,
-        features.reply_to_channel_post_count,
-        features.reply_to_bot_count,
-        features.reply_to_comment_count,
-    ) {
-        (count, channel_comments, 0, 0) if count > 0 && channel_comments == count => true,
-        _ => false,
-    }
+    matches!(
+        (
+            features.message_count,
+            features.reply_to_channel_post_count,
+            features.reply_to_bot_count,
+            features.reply_to_comment_count,
+        ),
+        (count, channel_comments, 0, 0) if count > 0 && channel_comments == count
+    )
 }
 
 fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     let mut signals = Vec::new();
 
-    match features.personal_channel_chat_id {
-        Some(channel_id) => {
+    if let Some(channel_id) = features.personal_channel_chat_id {
+        signals.push(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            points: 12,
+            label: "personal_channel_attached",
+            reason: "User has an attached personal channel",
+        });
+        if channel_id.abs() > 4_000_000_000_000 {
             signals.push(RiskSignal {
-                class: SpamClass::LlmProfileBait,
-                points: 12,
-                label: "personal_channel_attached",
-                reason: "User has an attached personal channel",
+                class: SpamClass::FreshAccount,
+                points: 6,
+                label: "recent_personal_channel_id",
+                reason: "Attached personal channel id is in a very high range",
             });
-            match channel_id.abs() > 4_000_000_000_000 {
-                true => signals.push(RiskSignal {
-                    class: SpamClass::FreshAccount,
-                    points: 6,
-                    label: "recent_personal_channel_id",
-                    reason: "Attached personal channel id is in a very high range",
-                }),
-                false => {}
-            }
         }
-        None => {}
     }
 
-    match features.personal_channel_has_adult_links {
-        true => signals.push(RiskSignal {
+    if features.personal_channel_has_adult_links {
+        signals.push(RiskSignal {
             class: SpamClass::AdultPersonalChannel,
             points: 55,
             label: "personal_channel_adult_links",
             reason: "Attached personal channel contains adult/invite promo links",
-        }),
-        false => {}
+        });
     }
 
-    match personal_channel_has_invite_link(features) {
-        true => signals.push(RiskSignal {
+    if personal_channel_has_invite_link(features) {
+        signals.push(RiskSignal {
             class: SpamClass::LinkDropper,
             points: 20,
             label: "personal_channel_invite_link",
             reason: "Attached personal channel contains Telegram invite links",
-        }),
-        false => {}
+        });
     }
 
-    match personal_channel_has_external_link(features) {
-        true => signals.push(RiskSignal {
+    if personal_channel_has_external_link(features) {
+        signals.push(RiskSignal {
             class: SpamClass::LinkDropper,
             points: 8,
             label: "personal_channel_external_link",
             reason: "Attached personal channel contains an external link",
-        }),
-        false => {}
+        });
     }
 
     signals
