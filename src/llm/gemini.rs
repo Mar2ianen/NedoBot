@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::http;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
 
 const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -40,13 +41,7 @@ impl LlmClient for GeminiClient<'_> {
             },
         };
 
-        let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(45));
-        if let Some(proxy_url) = self.proxy_url.filter(|value| !value.is_empty()) {
-            client_builder = client_builder.proxy(reqwest::Proxy::all(proxy_url)?);
-        }
-
-        let response = client_builder
-            .build()?
+        let response = http::client_with_proxy(Duration::from_secs(45), self.proxy_url)?
             .post(format!(
                 "{}/models/{}:generateContent",
                 GEMINI_API_BASE_URL,

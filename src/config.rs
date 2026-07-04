@@ -15,8 +15,11 @@ pub struct Config {
     pub memory_llm_temperature: f32,
     pub memory_llm_max_tokens: u32,
     pub groq_api_key: String,
+    pub groq_model: Option<String>,
     pub cerebras_api_key: String,
+    pub cerebras_model: Option<String>,
     pub openrouter_api_key: String,
+    pub openrouter_model: Option<String>,
     pub gemini_api_key: String,
     pub gemini_text_model: String,
     pub gemini_flash_model: String,
@@ -69,8 +72,11 @@ impl Config {
             memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2),
             memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220),
             groq_api_key: env_or("GROQ_API_KEY", ""),
+            groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
+            cerebras_model: env_optional("CEREBRAS_MODEL"),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
+            openrouter_model: env_optional("OPENROUTER_MODEL"),
             gemini_api_key: env_optional("GEMINI_API_KEY")
                 .or_else(|| env_optional("GOOGLE_AI_STUDIO_API_KEY"))
                 .unwrap_or_default(),
@@ -115,11 +121,13 @@ impl Config {
         let mut errors = Vec::new();
 
         validate_llm_provider_secret(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
+        validate_llm_provider_model(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
 
         if self.voice_transcription_enabled && self.voice_auto_transcribe {
             validate_voice_asr_secret(&mut errors, self);
             if let Some(provider) = self.voice_cleanup_provider.as_deref() {
                 validate_llm_provider_secret(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
+                validate_llm_provider_model(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
             }
         }
 
@@ -131,6 +139,30 @@ impl Config {
                 errors.join("\n- ")
             )
         }
+    }
+}
+
+fn validate_llm_provider_model(
+    errors: &mut Vec<String>,
+    config: &Config,
+    provider: &str,
+    context: &str,
+) {
+    match normalize_llm_provider(provider) {
+        Ok("groq") if config.llm_model.is_none() && config.groq_model.is_none() => errors.push(
+            format!("{context}=groq requires LLM_MODEL or GROQ_MODEL; refusing to fallback to VISION_MODEL"),
+        ),
+        Ok("cerebras") if config.llm_model.is_none() && config.cerebras_model.is_none() => {
+            errors.push(format!(
+                "{context}=cerebras requires LLM_MODEL or CEREBRAS_MODEL; refusing to fallback to VISION_MODEL"
+            ));
+        }
+        Ok("openrouter") if config.llm_model.is_none() && config.openrouter_model.is_none() => {
+            errors.push(format!(
+                "{context}=openrouter requires LLM_MODEL or OPENROUTER_MODEL; refusing to fallback to VISION_MODEL"
+            ));
+        }
+        Ok(_) | Err(_) => {}
     }
 }
 
@@ -188,7 +220,7 @@ fn validate_llm_provider_secret(
     }
 }
 
-fn normalize_llm_provider(provider: &str) -> anyhow::Result<&'static str> {
+pub(crate) fn normalize_llm_provider(provider: &str) -> anyhow::Result<&'static str> {
     match provider.trim().to_lowercase().as_str() {
         "" | "ollama" => Ok("ollama"),
         "groq" => Ok("groq"),
@@ -272,8 +304,11 @@ mod tests {
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
             groq_api_key: String::new(),
+            groq_model: None,
             cerebras_api_key: String::new(),
+            cerebras_model: None,
             openrouter_api_key: String::new(),
+            openrouter_model: None,
             gemini_api_key: String::new(),
             gemini_text_model: "gemini-3.5-flash".to_string(),
             gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
@@ -318,6 +353,19 @@ mod tests {
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 
         assert!(err.contains("LLM_PROVIDER requires non-empty GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn groq_provider_requires_explicit_model_at_startup() {
+        let mut config = config();
+        config.llm_provider = "groq".to_string();
+        config.llm_model = None;
+        config.groq_model = None;
+        config.groq_api_key = "secret".to_string();
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("LLM_PROVIDER=groq requires LLM_MODEL or GROQ_MODEL"));
     }
 
     #[test]

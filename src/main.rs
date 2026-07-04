@@ -10,6 +10,7 @@ use teloxide::{
 mod config;
 mod db;
 mod features;
+mod http;
 mod llm;
 mod state;
 mod telegram;

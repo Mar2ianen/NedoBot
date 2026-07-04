@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::http;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
 
 pub struct OllamaClient<'a> {
@@ -33,10 +34,7 @@ impl LlmClient for OllamaClient<'_> {
             },
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
-        let response = client
+        let response = http::client(Duration::from_secs(60))?
             .post(format!(
                 "{}/api/chat",
                 self.config.ollama_base_url.trim_end_matches('/')

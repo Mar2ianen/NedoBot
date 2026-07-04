@@ -9,89 +9,72 @@
 - Medium 11: `telegram_message_reaction_counts.total_count` мигрирован на `bigint`, код сохраняет `i64` без `as i32`.
 - Voice cleanup: prompt жёстко запрещает менять числа/версии/названия моделей и явно фиксирует контекст `НедоNews` + `Gemma 4 31B / gemma4:31b`.
 
-## 🔴 Critical
+## ✅ Исправлено 2026-07-04
 
-### 1. `import_telegram_export.rs:389` — sender_chat_id = source_channel_id (неверно для forwarded)
-**Суть:** В SQL `$10` — `sender_chat_id`, но на этой позиции биндится `source_channel_id`. Когда юзер пересылает сообщение из канала: `source_channel_id = Some(channel_id)`, а `sender_chat_id` должен быть `None`.
-**Фикс:** Парсить `from_id` отдельно для `sender_chat_id`, а не использовать `source_channel_id`.
-
-### 2. `import_telegram_export.rs:384` — is_automatic_forward = source_channel_id.is_some() (неверно для forwarded)
-**Суть:** `$5` — `is_automatic_forward`, биндится `source_channel_id.is_some()`. Если юзер переслал из канала (`forwarded_from_id`), `is_automatic_forward` должно быть `false`, но будет `true`.
-**Фикс:** Учитывать, что сообщение forwarded, а не auto-forwarded.
-
----
-
-## 🔴 High
-
-### 3. `db/telegram.rs:735` — `user_id as u64` без проверки отрицательного
-**Суть:** Если в БД `user_id` (i64) отрицательный, `as u64` даст огромное число → битый API-запрос к Telegram.
-**Фикс:** `UserId(u64::try_from(user_id)?)`.
-
-### 4. `refresh_chat_members.rs:235` — статус `"kicked"` вместо единого `"banned"`
-**Суть:** `ChatMemberKind::Banned(_)` возвращает `"kicked"`, а `chat_member_status` в `db/telegram.rs:903-904` через Debug-формат даёт `"banned"`. В БД два разных значения для одного статуса — ломается фильтрация и отчёты.
-**Фикс:** `("banned", false, false)`.
-
-### 5. `db/telegram.rs:903-904` — chat_member_status зависит от Debug-формата
-**Суть:** `format!("{:?}", kind.status()).to_lowercase()` — если teloxide изменит Debug-формат, все статусы в БД перестанут совпадать.
-**Фикс:** Явный match, как в `refresh_chat_members.rs`.
+- Gemini request parts serialization: `text` и `inlineData` теперь сериализуются в формате Gemini API; добавлен unit-test `request_parts_match_gemini_api_shape`.
+- M1: для `groq`/`cerebras`/`openrouter` больше нет fallback на `VISION_MODEL`. Требуется `LLM_MODEL` или provider-specific `GROQ_MODEL`/`CEREBRAS_MODEL`/`OPENROUTER_MODEL`, иначе startup fail-fast.
+- M2: `reqwest::Client` больше не создаётся заново на каждый LLM/ASR/profile request; добавлен общий кэш HTTP-клиентов с учётом timeout/proxy.
+- M3: удалён unreachable `lower.contains("amd")` из вычисления `is_tech`.
+- M4: voice cleanup больше не делает второй LLM-запрос с тем же prompt при падении кастомного cleanup provider; используется raw ASR fallback.
+- L1: `first_text_chars` добавляет `…` при обрезке.
+- L2: `strip_links` удаляет ссылки, обёрнутые пунктуацией/кавычками, например `(https://example.com)`.
+- L5: удалён неиспользуемый параметр `_short_limit` из `plain_cleanup`.
+- AP1: `normalize_provider` больше не дублируется; LLM router использует общий `normalize_llm_provider` из config.
 
 ---
 
-## 🟡 Medium
+## 🟡 Medium (отозвано / не подтвердилось)
 
-### 6. `db/telegram.rs:581-597` — save_message_reaction без ON CONFLICT
-**Суть:** INSERT в `telegram_message_reactions` без `on conflict`. При повторной доставке апдейта (реконнект) — `unique violation`. Рядом `save_message_reaction_count` (строка 619) имеет `on conflict`, значит просто забыли.
-**Фикс:** `on conflict (chat_id, message_id, user_id, event_at) do nothing`.
+### ~~H1. `user_profiles/service.rs:254` — getUserPersonalChatMessages не существует в Bot API~~
+~~**Суть:** `fetch_personal_channel_messages` вызывает `getUserPersonalChatMessages` — это **не официальный метод Telegram Bot API**.~~
+~~**Статус:** Отозван. Метод `getUserPersonalChatMessages` добавлен в **Bot API 10.1** (2026-06-11) и есть в официальной документации.~~
 
-### 7. `llm/service.rs:96-97` — fallback на vision_model для groq/cerebras/openrouter
-**Суть:** Если `LLM_MODEL` не указан, для groq/cerebras/openrouter используется `config.vision_model` (напр. `gemma4:31b`). 31B модель может быть недоступна или неоптимальна для этих провайдеров.
-**Фикс:** Хранить дефолтную модель для каждого провайдера отдельно.
-
-### 8. 4× `reqwest::Client` создаётся на каждый запрос
-**Файлы:** `llm/gemini.rs:41`, `llm/openai_compat.rs:44`, `llm/ollama.rs:36`, `features/voice/asr.rs:40`
-**Суть:** На каждый вызов LLM/ASR новый HTTP-клиент → TLS handshake оверхед, нет keep-alive.
-**Фикс:** Вынести `Client` в поле структуры или в `AppState`.
-
-### 9. `render.rs:55` — мёртвый код (unreachable `lower.contains("amd")`)
-**Суть:** Строка 48-53: `if lower.contains("amd") { return ... }`. Строка 55: `lower.contains("amd")` в вычислении `is_tech` — никогда не выполнится.
-**Фикс:** Убрать дублирующую проверку.
-
-### 10. `cleanup.rs:43-60` — двойная генерация при падении cleanup-провайдера
-**Суть:** При ошибке кастомного провайдера и `should_try_default_cleanup_provider = true` делается второй запрос к LLM с тем же промптом. Удвоение времени и токенов.
-**Фикс:** Логировать первую ошибку, не пересоздавая запрос.
-
-### 11. `db/telegram.rs:630` — total_count as i32 может переполниться
-**Суть:** Сумма реакций считается как `i64` (строка 611-612), но кастуется в `i32`. При >2³¹ реакций — переполнение.
-**Фикс:** Убрать `as i32`, оставить `i64`.
+### ~~M5. `main.rs:112` — is_automatic_forward блокирует профиль для всех форвардов~~
+~~**Суть:** `spawn_message_author_profile_refresh` проверяет `msg.is_automatic_forward()` и выходит.~~
+~~**Статус:** Не подтвердилось. В `teloxide`/Bot API `is_automatic_forward` означает именно automatic channel post в connected discussion group, а не ручной user forward.~~
 
 ---
 
 ## 🟢 Low
 
-### 12. `text.rs:1-8` — first_text_chars не добавляет многоточие при обрезке
-**Суть:** Текст просто обрезается без `…`.
-**Фикс:** Добавить `…` при обрезке.
-
-### 13. `text.rs:19-24` — strip_links не ловит ссылки с пунктуацией
-**Суть:** `split_whitespace()` + `starts_with("http://"|"https://")` — ссылка `https://example.com.` (с точкой) не удалится.
-**Фикс:** Трим пунктуации перед проверкой.
-
-### 14. `.env.example:45` — VOICE_ASR_TEMPERATURE=0 без дробной части
+### L3. `.env.example:45` — VOICE_ASR_TEMPERATURE=0 без дробной части
 **Суть:** Везде `0.35`, `0.2`, а тут `0` без точки. Не баг (парсится ок), но неконсистентно.
 
-### 15. `config.rs:78` — OLLAMA_BASE_URL=https://ollama.com (по умолчанию)
+### L4. `config.rs:80` — OLLAMA_BASE_URL=https://ollama.com (по умолчанию)
 **Суть:** `https://ollama.com` — рабочий эндпоинт Ollama Cloud (см. docs.ollama.com/api/introduction). Не баг, но локальным пользователям нужно переопределять на `http://localhost:11434`. В `.env.example` тоже указан `https://ollama.com`.
+
+### ~~L6. `first_comment/render.rs:77-95` — непарный `{CHAT_LINK` обрывает HTML~~
+~~**Статус:** Уже исправлено ранее. При отсутствии `}` код добавляет весь остаток `after_start` как обычный текст и не теряет содержимое.~~
+
+---
+
+## 📋 Антипаттерны (code quality)
+
+### AP2. Все тестовые fixtures дублируются
+Каждый тестовый модуль определяет свою `fn config() -> Config` с 40+ полями. Добавление поля в `Config` требует правки в 10+ тестах. Нужен общий test-helper.
+
+### AP3. Ошибки логируются, но Telegram не получает сигнал
+`main.rs:94-102` — `maybe_transcribe_voice` / `maybe_comment_post` при ошибке возвращают `Ok(())`. Telegram не перешлёт update повторно при временных сбоях.
+
+### AP4. Нет retry/backoff для внешних API
+Нигде нет повторных попыток при временных ошибках Telegram Bot API или LLM провайдеров.
+
+### AP5. `#[allow(dead_code)]` на неиспользуемых структурах
+`Config`, `UserProfileDetails` (частично), `RefreshUserProfilesQuery`, `ProfileRefreshStats`, voice repo/types и другие заделы помечены `#[allow(dead_code)]`.
+
+### AP6. Динамические имена колонок в ON CONFLICT UPDATE
+`new_user_analysis.rs:1159-1168` — итерация по строкам с именами колонок. Хотя имена хардкожены в `audit_insert_columns()`, это хрупко.
 
 ---
 
 ## Статистика
 
-| Уровень    | Было | Исправлено | Осталось |
-|------------|------|------------|----------|
-| 🔴 Critical | 2    | 2          | 0        |
-| 🔴 High     | 3    | 3          | 0        |
-| 🟡 Medium   | 6    | 2          | 4        |
-| 🟢 Low      | 4    | 0          | 4        |
-| **Итого**   | **15** | **7**    | **8**    |
+| Уровень       | Было | Исправлено | Отозвано | Осталось |
+|---------------|------|------------|----------|----------|
+| 🔴 Critical   | 2    | 2          | 0        | 0        |
+| 🔴 High       | 3    | 3          | 0        | 0        |
+| 🟡 Medium     | 10   | 8          | 2        | 0        |
+| 🟢 Low        | 6    | 3          | 1        | 2        |
+| AP            | 6    | 1          | 0        | 5        |
 
-(составлено 2026-07-03, обновлено 2026-07-03)
+(составлено 2026-07-03, обновлено 2026-07-04)

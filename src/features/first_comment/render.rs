@@ -52,8 +52,7 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
             .or(config.comment_custom_emoji_id.as_deref());
     }
 
-    let is_tech = lower.contains("amd")
-        || lower.contains("windows")
+    let is_tech = lower.contains("windows")
         || lower.contains("драйвер")
         || lower.contains("fps")
         || lower.contains("пк")
@@ -151,8 +150,11 @@ mod tests {
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
             groq_api_key: String::new(),
+            groq_model: None,
             cerebras_api_key: String::new(),
+            cerebras_model: None,
             openrouter_api_key: String::new(),
+            openrouter_model: None,
             gemini_api_key: String::new(),
             gemini_text_model: "gemini-3.5-flash".to_string(),
             gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
