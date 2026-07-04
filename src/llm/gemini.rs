@@ -105,10 +105,15 @@ struct GenerationConfig {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", untagged)]
 enum GeminiPart<'a> {
-    Text { text: &'a str },
-    InlineData { inline_data: InlineData<'a> },
+    Text {
+        text: &'a str,
+    },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: InlineData<'a>,
+    },
 }
 
 #[derive(Serialize)]
@@ -151,4 +156,23 @@ fn request_parts<'a>(prompt: &'a str, image_base64: Option<&'a str>) -> Vec<Gemi
         });
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_parts_match_gemini_api_shape() {
+        let parts = request_parts("hello", Some("base64-image"));
+
+        assert_eq!(
+            serde_json::to_value(parts).unwrap(),
+            json!([
+                {"text": "hello"},
+                {"inlineData": {"mimeType": "image/jpeg", "data": "base64-image"}}
+            ])
+        );
+    }
 }
