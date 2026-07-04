@@ -10,12 +10,14 @@ const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1b
 
 pub struct GeminiClient<'a> {
     api_key: &'a str,
+    proxy_url: Option<&'a str>,
 }
 
 impl<'a> GeminiClient<'a> {
     pub fn new(config: &'a Config) -> Self {
         Self {
             api_key: config.gemini_api_key.trim(),
+            proxy_url: config.llm_proxy_url.as_deref().map(str::trim),
         }
     }
 }
@@ -38,8 +40,12 @@ impl LlmClient for GeminiClient<'_> {
             },
         };
 
-        let response = reqwest::Client::builder()
-            .timeout(Duration::from_secs(45))
+        let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(45));
+        if let Some(proxy_url) = self.proxy_url.filter(|value| !value.is_empty()) {
+            client_builder = client_builder.proxy(reqwest::Proxy::all(proxy_url)?);
+        }
+
+        let response = client_builder
             .build()?
             .post(format!(
                 "{}/models/{}:generateContent",
