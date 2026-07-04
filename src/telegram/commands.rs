@@ -15,22 +15,35 @@ pub enum Command {
     FormatTest(String),
     #[command(description = "показать последние заметки памяти")]
     Memory,
-    #[command(description = "статистика за текущий день с 05:00 МСК")]
-    StatsDay,
-    #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК")]
-    StatsWeek,
-    #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК")]
-    StatsMonth,
-    #[command(rename = "topmsg", description = "топ 20 пользователей по сообщениям")]
-    TopMsg,
+    #[command(description = "статистика за текущий день с 05:00 МСК; -r для rich")]
+    StatsDay(String),
+    #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; -r для rich")]
+    StatsWeek(String),
+    #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК; -r для rich")]
+    StatsMonth(String),
+    #[command(
+        rename = "status",
+        description = "статистика: /status day|week|month [-r]"
+    )]
+    Status(String),
+    #[command(
+        rename = "topmsg",
+        description = "топ 20 пользователей по сообщениям; -r для rich"
+    )]
+    TopMsg(String),
     #[command(
         rename = "topreact",
-        description = "топ 20 сообщений по реакциям со ссылками"
+        description = "топ 20 сообщений по реакциям со ссылками; -r для rich"
     )]
-    TopReact,
+    TopReact(String),
     #[command(
         rename = "userstats",
-        description = "статистика пользователя: /userstats <id|username>, или reply на сообщение"
+        description = "статистика пользователя: /userstats <id|username> [-r], или reply на сообщение"
     )]
     UserStats(String),
+    #[command(
+        rename = "userstatus",
+        description = "alias /userstats: /userstatus <id|username> [-r], или reply"
+    )]
+    UserStatus(String),
 }

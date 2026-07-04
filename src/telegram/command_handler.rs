@@ -7,7 +7,7 @@ use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
-use crate::features::stats::types::StatsPeriod;
+use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::state::AppState;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
@@ -70,22 +70,48 @@ pub async fn handle_command(
         Command::Memory => {
             send_memory_notes(&bot, msg.chat.id, pool).await?;
         }
-        Command::StatsDay => {
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Day).await?;
+        Command::StatsDay(args) => {
+            let render = render_from_message_or_args(&msg, &args);
+            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Day, render).await?;
         }
-        Command::StatsWeek => {
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Week).await?;
+        Command::StatsWeek(args) => {
+            let render = render_from_message_or_args(&msg, &args);
+            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Week, render).await?;
         }
-        Command::StatsMonth => {
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month).await?;
+        Command::StatsMonth(args) => {
+            let render = render_from_message_or_args(&msg, &args);
+            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month, render).await?;
         }
-        Command::TopMsg => {
-            send_top_messages(&bot, msg.chat.id, pool, config).await?;
+        Command::Status(args) => {
+            let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
+            let render = render_from_message_or_args(&msg, &args);
+            let period = status_period_from_args(raw_args).unwrap_or(StatsPeriod::Day);
+            send_chat_stats(&bot, msg.chat.id, pool, config, period, render).await?;
         }
-        Command::TopReact => {
-            send_top_reacted(&bot, msg.chat.id, pool, config).await?;
+        Command::TopMsg(args) => {
+            send_top_messages(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                render_from_message_or_args(&msg, &args),
+            )
+            .await?;
         }
-        Command::UserStats(target) => {
+        Command::TopReact(args) => {
+            send_top_reacted(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                render_from_message_or_args(&msg, &args),
+            )
+            .await?;
+        }
+        Command::UserStats(target) | Command::UserStatus(target) => {
+            let raw_args = raw_message_args(&msg).unwrap_or(target.as_str());
+            let render = render_from_message_or_args(&msg, &target);
+            let target = strip_render_flag(raw_args);
             let target = target.trim();
             let explicit_target = (!target.is_empty()).then_some(target);
             let fallback_user_id = reply_user_id(&msg).or_else(|| sender_user_id(&msg));
@@ -97,6 +123,7 @@ pub async fn handle_command(
                 config,
                 explicit_target,
                 fallback_user_id,
+                render,
             )
             .await?;
         }
@@ -121,6 +148,12 @@ pub async fn handle_reply_user_stats_command(
         tracing::error!(%err, "failed to save command message");
     }
 
+    let render = msg
+        .text()
+        .or_else(|| msg.caption())
+        .map(render_from_args)
+        .unwrap_or(StatsRender::Html);
+
     send_user_stats(
         &bot,
         msg.chat.id,
@@ -128,6 +161,7 @@ pub async fn handle_reply_user_stats_command(
         config,
         None,
         reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
+        render,
     )
     .await?;
 
@@ -155,8 +189,117 @@ fn is_bare_userstats_command(msg: &Message) -> bool {
         return false;
     }
 
-    matches!(command, "/userstats")
+    matches!(command, "/userstats" | "/userstatus")
         || command
             .strip_prefix("/userstats@")
+            .or_else(|| command.strip_prefix("/userstatus@"))
             .is_some_and(|bot_name| !bot_name.is_empty())
+}
+
+fn render_from_message_or_args(msg: &Message, args: &str) -> StatsRender {
+    raw_message_args(msg)
+        .filter(|raw_args| has_render_flag(raw_args))
+        .map(render_from_args)
+        .unwrap_or_else(|| render_from_args(args))
+}
+
+fn raw_message_args(msg: &Message) -> Option<&str> {
+    msg.text()
+        .or_else(|| msg.caption())
+        .and_then(raw_command_args)
+}
+
+fn render_from_args(args: &str) -> StatsRender {
+    if args.split_whitespace().any(is_plain_render_flag) {
+        StatsRender::Html
+    } else if args.split_whitespace().any(is_rich_render_flag) {
+        StatsRender::Rich
+    } else {
+        StatsRender::Html
+    }
+}
+
+fn has_render_flag(args: &str) -> bool {
+    args.split_whitespace()
+        .any(|part| is_rich_render_flag(part) || is_plain_render_flag(part))
+}
+
+fn is_rich_render_flag(part: &str) -> bool {
+    matches!(part, "-r" | "--rich")
+}
+
+fn is_plain_render_flag(part: &str) -> bool {
+    matches!(part, "-p" | "--plain" | "--poor")
+}
+
+fn raw_command_args(text: &str) -> Option<&str> {
+    let mut parts = text.trim().splitn(2, char::is_whitespace);
+    parts.next()?;
+    Some(parts.next().unwrap_or_default().trim())
+}
+
+fn strip_render_flag(args: &str) -> String {
+    args.split_whitespace()
+        .filter(|part| !is_rich_render_flag(part) && !is_plain_render_flag(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn status_period_from_args(args: &str) -> Option<StatsPeriod> {
+    strip_render_flag(args)
+        .split_whitespace()
+        .next()
+        .and_then(|period| match period.to_lowercase().as_str() {
+            "day" | "daily" | "день" | "дня" => Some(StatsPeriod::Day),
+            "week" | "weekly" | "неделя" | "неделю" => Some(StatsPeriod::Week),
+            "month" | "monthly" | "месяц" => Some(StatsPeriod::Month),
+            _ => None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rich_and_forced_plain_flags() {
+        assert!(matches!(render_from_args("-r"), StatsRender::Rich));
+        assert!(matches!(render_from_args("week --rich"), StatsRender::Rich));
+        assert!(matches!(render_from_args("week"), StatsRender::Html));
+        assert!(matches!(render_from_args("week -p"), StatsRender::Html));
+        assert!(matches!(
+            render_from_args("--rich --poor"),
+            StatsRender::Html
+        ));
+    }
+
+    #[test]
+    fn reads_raw_command_args_from_full_message_text() {
+        assert_eq!(raw_command_args("/stats_day -r"), Some("-r"));
+        assert_eq!(
+            raw_command_args("/userstats 445144708 -r"),
+            Some("445144708 -r")
+        );
+        assert_eq!(raw_command_args("/topmsg"), Some(""));
+    }
+
+    #[test]
+    fn strips_render_flags_from_user_target() {
+        assert_eq!(strip_render_flag("@Chechulinm -r"), "@Chechulinm");
+        assert_eq!(strip_render_flag("-r 445144708"), "445144708");
+        assert_eq!(strip_render_flag("445144708 --poor"), "445144708");
+        assert_eq!(strip_render_flag("--plain @Chechulinm"), "@Chechulinm");
+    }
+
+    #[test]
+    fn parses_status_period() {
+        assert!(matches!(
+            status_period_from_args("week -r"),
+            Some(StatsPeriod::Week)
+        ));
+        assert!(matches!(
+            status_period_from_args("месяц"),
+            Some(StatsPeriod::Month)
+        ));
+    }
 }

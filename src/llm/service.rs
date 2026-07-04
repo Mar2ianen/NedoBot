@@ -319,6 +319,8 @@ mod tests {
             voice_cleanup_max_tokens: 1800,
             voice_render_expandable_chapters: true,
             voice_send_full_file: true,
+            public_base_url: None,
+            static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
     }
 
