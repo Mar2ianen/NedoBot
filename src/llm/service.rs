@@ -4,6 +4,8 @@ use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
 use crate::llm::types::{GeneratedText, LlmClient, LlmRequest};
 
+pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
+
 const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const CEREBRAS_OPENAI_BASE_URL: &str = "https://api.cerebras.ai/v1";
 const OPENROUTER_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -15,7 +17,18 @@ pub async fn generate_text(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<GeneratedText> {
-    generate_text_with_provider(
+    generate_text_checked(config, prompt, image_base64, temperature, num_predict, None).await
+}
+
+pub async fn generate_text_checked(
+    config: &Config,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+    output_validator: Option<OutputValidator>,
+) -> anyhow::Result<GeneratedText> {
+    generate_text_with_provider_checked(
         config,
         None,
         None,
@@ -23,6 +36,7 @@ pub async fn generate_text(
         image_base64,
         temperature,
         num_predict,
+        output_validator,
     )
     .await
 }
@@ -35,6 +49,29 @@ pub async fn generate_text_with_provider(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
+) -> anyhow::Result<GeneratedText> {
+    generate_text_with_provider_checked(
+        config,
+        provider_override,
+        model_override,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+        None,
+    )
+    .await
+}
+
+pub async fn generate_text_with_provider_checked(
+    config: &Config,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+    output_validator: Option<OutputValidator>,
 ) -> anyhow::Result<GeneratedText> {
     let provider = normalize_llm_provider(provider_override.unwrap_or(&config.llm_provider))?;
     let model = match model_override {
@@ -57,7 +94,16 @@ pub async fn generate_text_with_provider(
         )
         .await
         {
-            Ok(generation) => return Ok(generation),
+            Ok(generation) => {
+                if let Some(validate) = output_validator {
+                    if let Err(err) = validate(&generation.content) {
+                        tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation output failed validation");
+                        last_error = Some(err);
+                        continue;
+                    }
+                }
+                return Ok(generation);
+            }
             Err(err) => {
                 tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation attempt failed");
                 last_error = Some(err);
