@@ -1,5 +1,7 @@
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::features::search::extract::extract_search_queries;
@@ -14,6 +16,22 @@ pub async fn run_search(config: &Config, clean_post: &str) -> SearchContext {
         return SearchContext::skipped("disabled", started.elapsed().as_millis());
     }
 
+    let timeout_duration = Duration::from_secs(config.search_mcp_timeout_sec);
+    match timeout(
+        timeout_duration,
+        run_search_enabled(config, clean_post, started),
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(_) => {
+            tracing::warn!("search run timed out");
+            SearchContext::skipped("timeout", started.elapsed().as_millis())
+        }
+    }
+}
+
+async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant) -> SearchContext {
     let queries = match extract_search_queries(config, clean_post).await {
         Ok(queries) => queries,
         Err(err) => {
