@@ -11,13 +11,13 @@
 
 ## 1. Config
 
-- [ ] Добавить `SearchMcpTools` в `src/config.rs`.
-- [ ] Добавить поля `search_*` в `Config`.
-- [ ] Добавить env parsing для SEARCH-полей.
-- [ ] Добавить `validate_search_config`.
-- [ ] Gated validation: выполнять search validation только если `search_enabled=true`.
-- [ ] Обновить все test `fn config()` после изменения `Config`.
-- [ ] Обновить `.env.example` секцией SEARCH.
+- [x] Добавить `SearchMcpTools` в `src/config.rs`.
+- [x] Добавить поля `search_*` в `Config`.
+- [x] Добавить env parsing для SEARCH-полей.
+- [x] Добавить `validate_search_config`.
+- [x] Gated validation: выполнять search validation только если `search_enabled=true`.
+- [x] Обновить все test `fn config()` после изменения `Config`.
+- [x] Обновить `.env.example` секцией SEARCH.
 
 ## 2. Search module skeleton
 
@@ -87,7 +87,7 @@
 ## 9. Validation
 
 - [ ] `cargo fmt`
-- [ ] `cargo test config`
+- [x] `cargo test config`
 - [ ] `cargo test search`
 - [ ] `cargo test first_comment`
 - [ ] `cargo test`
