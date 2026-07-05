@@ -2,12 +2,12 @@
 
 ## Правила итерации
 
-- [ ] Не менять поведение при `SEARCH_ENABLED=false`.
-- [ ] Не менять `validate_comment_output`.
-- [ ] Не добавлять DB cache/migrations в первой итерации.
-- [ ] Не добавлять long-lived MCP client в `AppState`.
-- [ ] MCP process запускается lazy per search-run.
-- [ ] Все ошибки поиска превращаются в `SearchContext::skipped(...)`, а не ломают комментарий.
+- [x] Не менять поведение при `SEARCH_ENABLED=false`.
+- [x] Не менять `validate_comment_output`.
+- [x] Не добавлять DB cache/migrations в первой итерации.
+- [x] Не добавлять long-lived MCP client в `AppState`.
+- [x] MCP process запускается lazy per search-run.
+- [x] Все ошибки поиска превращаются в `SearchContext::skipped(...)`, а не ломают комментарий.
 
 ## 1. Config
 
@@ -41,8 +41,8 @@
 ## 4. Lazy MCP provider
 
 - [x] Проверить актуальный API `mcpr`.
-- [ ] Если `mcpr` подходит — добавить dependency.
-- [x] Если `mcpr` не подходит — реализовать минимальный stdio JSON-RPC client в `mcp.rs`.
+- [x] `mcpr` dependency не добавлять: выбран минимальный stdio JSON-RPC client.
+- [x] Реализовать минимальный stdio JSON-RPC client в `mcp.rs`.
 - [x] Добавить `tokio` features `process`, `time`.
 - [x] Реализовать запуск `SEARCH_MCP_COMMAND` на один search call.
 - [x] Передавать только env vars из `SEARCH_MCP_ENV`.
@@ -86,8 +86,8 @@
 
 ## 9. Validation
 
-- [ ] `cargo fmt`
+- [x] `cargo fmt`
 - [x] `cargo test config`
 - [x] `cargo test search`
 - [x] `cargo test first_comment`
-- [ ] `cargo test`
+- [x] `cargo test`
