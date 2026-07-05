@@ -73,10 +73,10 @@
 
 ## 7. First-comment pipeline integration
 
-- [ ] В `pipeline.rs` вызвать `run_search(config, &clean_post).await` перед `build_llm_prompt`.
-- [ ] Передать search context в prompt only if search enabled.
-- [ ] Расширить owner preview search summary.
-- [ ] Search errors не должны возвращаться из `maybe_comment_post`.
+- [x] В `pipeline.rs` вызвать `run_search(config, &clean_post).await` перед `build_llm_prompt`.
+- [x] Передать search context в prompt only if search enabled.
+- [x] Расширить owner preview search summary.
+- [x] Search errors не должны возвращаться из `maybe_comment_post`.
 
 ## 8. Documentation
 
@@ -89,5 +89,5 @@
 - [ ] `cargo fmt`
 - [x] `cargo test config`
 - [ ] `cargo test search`
-- [ ] `cargo test first_comment`
+- [x] `cargo test first_comment`
 - [ ] `cargo test`
