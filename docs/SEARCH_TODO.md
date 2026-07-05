@@ -21,22 +21,22 @@
 
 ## 2. Search module skeleton
 
-- [ ] Создать `src/features/search/mod.rs`.
-- [ ] Создать `src/features/search/types.rs`.
-- [ ] Создать `src/features/search/provider.rs`.
-- [ ] Создать `src/features/search/extract.rs`.
+- [x] Создать `src/features/search/mod.rs`.
+- [x] Создать `src/features/search/types.rs`.
+- [x] Создать `src/features/search/provider.rs`.
+- [x] Создать `src/features/search/extract.rs`.
 - [ ] Создать `src/features/search/mcp.rs`.
 - [ ] Создать `src/features/search/service.rs`.
-- [ ] Добавить `pub mod search;` в `src/features/mod.rs`.
+- [x] Добавить `pub mod search;` в `src/features/mod.rs`.
 
 ## 3. Extract prompt and parser
 
-- [ ] Создать `prompts/search_extract.md`.
-- [ ] Реализовать JSON response structs.
-- [ ] Реализовать strip fenced JSON.
-- [ ] Реализовать query sanitize/dedupe/truncate.
-- [ ] Реализовать вызов `generate_text_with_provider` с `SEARCH_EXTRACT_PROVIDER/MODEL`.
-- [ ] Добавить unit-тесты parser/sanitizer.
+- [x] Создать `prompts/search_extract.md`.
+- [x] Реализовать JSON response structs.
+- [x] Реализовать strip fenced JSON.
+- [x] Реализовать query sanitize/dedupe/truncate.
+- [x] Реализовать вызов `generate_text_with_provider` с `SEARCH_EXTRACT_PROVIDER/MODEL`.
+- [x] Добавить unit-тесты parser/sanitizer.
 
 ## 4. Lazy MCP provider
 
