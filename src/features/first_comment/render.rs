@@ -133,6 +133,7 @@ fn allowed_chat_link_label(label: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SearchMcpTools;
 
     fn config() -> Config {
         Config {
@@ -149,6 +150,20 @@ mod tests {
             llm_proxy_url: None,
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
+            search_enabled: false,
+            search_extract_provider: Some("ollama".to_string()),
+            search_extract_model: Some("gemma4:31b".to_string()),
+            search_extract_temperature: 0.1,
+            search_extract_max_tokens: 700,
+            search_mcp_command: None,
+            search_mcp_args: Vec::new(),
+            search_mcp_env: Vec::new(),
+            search_mcp_timeout_sec: 8,
+            search_mcp_tools: SearchMcpTools {
+                web: "web_search".to_string(),
+                github: "github_search".to_string(),
+                reddit: "reddit_search".to_string(),
+            },
             groq_api_key: String::new(),
             groq_model: None,
             cerebras_api_key: String::new(),
