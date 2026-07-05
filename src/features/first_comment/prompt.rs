@@ -21,17 +21,17 @@ pub fn build_llm_prompt(
     let recent_context = render_recent_comment_context(recent_comments);
 
     format!(
-        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}\n\n{search_context}\n\nПамять прошлых новостей, использовать только если релевантно:\n{memory_context}\n\nПоследние комментарии бота, не повторять стиль и CTA:\n{recent_context}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
+        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}{search_context}\n\nПамять прошлых новостей, использовать только если релевантно:\n{memory_context}\n\nПоследние комментарии бота, не повторять стиль и CTA:\n{recent_context}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
     )
 }
 
 fn render_search_context(search_context: Option<&SearchContext>) -> String {
     let Some(search_context) = search_context else {
-        return "Свежий поиск: нет дополнительного контекста.".to_string();
+        return String::new();
     };
 
     if search_context.is_skipped() || search_context.results.is_empty() {
-        return "Свежий поиск: нет дополнительного контекста.".to_string();
+        return "\n\nСвежий поиск: нет дополнительного контекста.".to_string();
     }
 
     let results = search_context
@@ -49,7 +49,7 @@ fn render_search_context(search_context: Option<&SearchContext>) -> String {
         .join("\n");
 
     format!(
-        "Свежий поиск, использовать осторожно:\n- Это вспомогательный контекст, он ниже поста по приоритету.\n- Не цитируй URL и не добавляй ссылки.\n- Если поиск противоречит посту, не утверждай спорное как факт.\n- Если результаты нерелевантны, игнорируй их.\n\nРезультаты:\n{results}"
+        "\n\nСвежий поиск, использовать осторожно:\n- Это вспомогательный контекст, он ниже поста по приоритету.\n- Не цитируй URL и не добавляй ссылки.\n- Если поиск противоречит посту, не утверждай спорное как факт.\n- Если результаты нерелевантны, игнорируй их.\n\nРезультаты:\n{results}"
     )
 }
 
@@ -129,6 +129,13 @@ mod tests {
     #[test]
     fn empty_memory_context_is_explicit() {
         assert_eq!(render_memory_context(&[]), "Нет релевантных заметок.");
+    }
+
+    #[test]
+    fn absent_search_context_keeps_search_block_out() {
+        let prompt = build_llm_prompt("Пост", None, &[], &[], None);
+
+        assert!(!prompt.contains("Свежий поиск"));
     }
 
     #[test]
