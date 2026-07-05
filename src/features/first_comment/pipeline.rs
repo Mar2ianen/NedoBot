@@ -77,6 +77,7 @@ pub async fn maybe_comment_post(
         chat_member_count,
         &memory_notes,
         &recent_comments,
+        None,
     );
     let generation = generate_text_checked(
         config,

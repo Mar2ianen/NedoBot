@@ -1,10 +1,12 @@
 use crate::features::memory::service::MemoryNote;
+use crate::features::search::types::{SearchContext, SearchSource};
 
 pub fn build_llm_prompt(
     post_text: &str,
     chat_member_count: Option<u32>,
     memory_notes: &[MemoryNote],
     recent_comments: &[String],
+    search_context: Option<&SearchContext>,
 ) -> String {
     let system_prompt = include_str!("../../../prompts/first_comment.md");
     let tech_rag = include_str!("../../../prompts/tech_rag.md");
@@ -14,12 +16,49 @@ pub fn build_llm_prompt(
         ),
         None => "Число участников чата неизвестно, не называй конкретное количество.".to_string(),
     };
+    let search_context = render_search_context(search_context);
     let memory_context = render_memory_context(memory_notes);
     let recent_context = render_recent_comment_context(recent_comments);
 
     format!(
-        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}\n\nПамять прошлых новостей, использовать только если релевантно:\n{memory_context}\n\nПоследние комментарии бота, не повторять стиль и CTA:\n{recent_context}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
+        "{system_prompt}\n\nRAG для факт-чека, не пересказывать:\n{tech_rag}\n\n{search_context}\n\nПамять прошлых новостей, использовать только если релевантно:\n{memory_context}\n\nПоследние комментарии бота, не повторять стиль и CTA:\n{recent_context}\n\nКонтекст чата:\n{chat_context}\n\nПост:\n{post_text}"
     )
+}
+
+fn render_search_context(search_context: Option<&SearchContext>) -> String {
+    let Some(search_context) = search_context else {
+        return "Свежий поиск: нет дополнительного контекста.".to_string();
+    };
+
+    if search_context.is_skipped() || search_context.results.is_empty() {
+        return "Свежий поиск: нет дополнительного контекста.".to_string();
+    }
+
+    let results = search_context
+        .results
+        .iter()
+        .map(|result| {
+            format!(
+                "- [{}] {} — {}",
+                search_source_label(result.source),
+                result.title,
+                result.snippet
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Свежий поиск, использовать осторожно:\n- Это вспомогательный контекст, он ниже поста по приоритету.\n- Не цитируй URL и не добавляй ссылки.\n- Если поиск противоречит посту, не утверждай спорное как факт.\n- Если результаты нерелевантны, игнорируй их.\n\nРезультаты:\n{results}"
+    )
+}
+
+fn search_source_label(source: SearchSource) -> &'static str {
+    match source {
+        SearchSource::Web => "web",
+        SearchSource::Github => "github",
+        SearchSource::Reddit => "reddit",
+    }
 }
 
 fn render_memory_context(memory_notes: &[MemoryNote]) -> String {
@@ -78,6 +117,7 @@ fn strip_html_tags(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::search::types::{SearchQuery, SearchResult};
 
     #[test]
     fn recent_comments_are_stripped_from_html() {
@@ -89,5 +129,42 @@ mod tests {
     #[test]
     fn empty_memory_context_is_explicit() {
         assert_eq!(render_memory_context(&[]), "Нет релевантных заметок.");
+    }
+
+    #[test]
+    fn search_context_is_rendered_without_urls() {
+        let search_context = SearchContext {
+            queries: vec![SearchQuery {
+                source: SearchSource::Web,
+                text: "Rust release".to_string(),
+            }],
+            results: vec![SearchResult {
+                source: SearchSource::Web,
+                title: "Rust 1.90 released".to_string(),
+                url: "https://example.com/rust".to_string(),
+                snippet: "Release notes mention compiler improvements.".to_string(),
+            }],
+            skipped_reason: None,
+            latency_ms: 42,
+        };
+
+        let prompt = build_llm_prompt("Пост", None, &[], &[], Some(&search_context));
+
+        assert!(prompt.contains("Свежий поиск, использовать осторожно:"));
+        assert!(
+            prompt.contains(
+                "- [web] Rust 1.90 released — Release notes mention compiler improvements."
+            )
+        );
+        assert!(!prompt.contains("https://example.com/rust"));
+    }
+
+    #[test]
+    fn skipped_search_context_is_explicit() {
+        let search_context = SearchContext::skipped("no_search_needed", 10);
+
+        let prompt = build_llm_prompt("Пост", None, &[], &[], Some(&search_context));
+
+        assert!(prompt.contains("Свежий поиск: нет дополнительного контекста."));
     }
 }

@@ -65,11 +65,11 @@
 
 ## 6. First-comment prompt integration
 
-- [ ] Обновить signature `build_llm_prompt(..., search_context: Option<&SearchContext>)`.
-- [ ] Добавить render search block.
-- [ ] Не включать raw URLs в prompt.
-- [ ] Добавить tests: facts included, URLs excluded, skipped block.
-- [ ] Обновить все call sites.
+- [x] Обновить signature `build_llm_prompt(..., search_context: Option<&SearchContext>)`.
+- [x] Добавить render search block.
+- [x] Не включать raw URLs в prompt.
+- [x] Добавить tests: facts included, URLs excluded, skipped block.
+- [x] Обновить все call sites.
 
 ## 7. First-comment pipeline integration
 
