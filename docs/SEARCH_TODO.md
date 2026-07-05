@@ -26,7 +26,7 @@
 - [x] Создать `src/features/search/provider.rs`.
 - [x] Создать `src/features/search/extract.rs`.
 - [x] Создать `src/features/search/mcp.rs`.
-- [ ] Создать `src/features/search/service.rs`.
+- [x] Создать `src/features/search/service.rs`.
 - [x] Добавить `pub mod search;` в `src/features/mod.rs`.
 
 ## 3. Extract prompt and parser
@@ -54,13 +54,13 @@
 
 ## 5. Search service
 
-- [ ] Реализовать `run_search(config, clean_post) -> SearchContext`.
-- [ ] Disabled → skipped `disabled`.
-- [ ] Extract failed → skipped `extract_failed`.
-- [ ] No queries → skipped `no_search_needed`.
-- [ ] No results → skipped `no_results`.
-- [ ] Dedupe results by URL.
-- [ ] Limit results to `MAX_SEARCH_RESULTS`.
+- [x] Реализовать `run_search(config, clean_post) -> SearchContext`.
+- [x] Disabled → skipped `disabled`.
+- [x] Extract failed → skipped `extract_failed`.
+- [x] No queries → skipped `no_search_needed`.
+- [x] No results → skipped `no_results`.
+- [x] Dedupe results by URL.
+- [x] Limit results to `MAX_SEARCH_RESULTS`.
 - [ ] Добавить tests для skipped states и dedupe.
 
 ## 6. First-comment prompt integration
