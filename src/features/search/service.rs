@@ -90,6 +90,33 @@ mod tests {
     use super::*;
     use crate::features::search::types::SearchSource;
 
+    #[tokio::test]
+    async fn disabled_returns_skipped_disabled() {
+        let mut config = Config::from_env();
+        config.search_enabled = false;
+
+        let context = run_search(&config, "post").await;
+
+        assert_eq!(context.skipped_reason.as_deref(), Some("disabled"));
+        assert!(context.queries.is_empty());
+        assert!(context.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_error_returns_skipped_extract_failed() {
+        let mut config = Config::from_env();
+        config.search_enabled = true;
+        config.search_extract_provider = Some("unsupported".to_string());
+        config.search_mcp_command = Some("unused".to_string());
+        config.search_mcp_timeout_sec = 1;
+
+        let context = run_search(&config, "post").await;
+
+        assert_eq!(context.skipped_reason.as_deref(), Some("extract_failed"));
+        assert!(context.queries.is_empty());
+        assert!(context.results.is_empty());
+    }
+
     #[test]
     fn dedupes_by_url() {
         let results = dedupe_results(vec![

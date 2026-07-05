@@ -61,7 +61,7 @@
 - [x] No results → skipped `no_results`.
 - [x] Dedupe results by URL.
 - [x] Limit results to `MAX_SEARCH_RESULTS`.
-- [ ] Добавить tests для skipped states и dedupe.
+- [x] Добавить tests для skipped states и dedupe.
 
 ## 6. First-comment prompt integration
 
@@ -88,6 +88,6 @@
 
 - [ ] `cargo fmt`
 - [x] `cargo test config`
-- [ ] `cargo test search`
+- [x] `cargo test search`
 - [x] `cargo test first_comment`
 - [ ] `cargo test`
