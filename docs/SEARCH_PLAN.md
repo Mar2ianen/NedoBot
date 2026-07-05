@@ -1,125 +1,440 @@
 # План: провайдер-нейтральный поиск фактов для первого комментария
 
-## Архитектура
+Цель: добавить optional web/GitHub/Reddit факт-чек перед генерацией первого комментария, не меняя текущее поведение при `SEARCH_ENABLED=false`.
 
-```
+## Финальная архитектура первой итерации
+
+```text
 пост канала
-  → gemma (Ollama API): сама решает что проверить, ищет первоисточник, формирует запросы
-  → mcpr (MCP stdio клиент) → search MCP-сервер (web + GitHub + Reddit)
-  → сырые результаты → короткий блок фактов
-  → блок фактов в gemini-промпт как «свежий контекст»
-  → gemini комментарий (валидатор не меняется)
+  → search extract LLM: определить, нужен ли поиск, и вернуть JSON с запросами
+  → lazy MCP process: запустить SEARCH_MCP_COMMAND на один search-run
+  → MCP tools/call: выполнить web/github/reddit запросы
+  → короткий SearchContext: queries + results + skipped_reason + latency
+  → build_llm_prompt: добавить блок свежего поиска как вспомогательный контекст
+  → generate_text_checked через текущий LLM_PROVIDER
+  → validate_comment_output без изменений
+  → build_comment_html без изменений
 ```
 
-gemma автономно: нет хардкода сущностей, она сама определяет что проверяемо в данном посте и формирует поисковые запросы с фокусом на первоисточник новости. Сменить search-backend = поменять MCP-сервер в конфиге, без правки Rust-кода.
+Ключевое решение: **MCP process запускается лениво на каждый search-run**. В первой итерации не держим long-lived child process в `AppState`, не реализуем restart/shutdown lifecycle и не добавляем DB cache.
 
-## Как типовой пост проходит через pipeline
+## Инвариант поведения
 
-**Пост:** «Дефицит памяти продлится до 2028 ... спрос +36%, производство +19% ... 😎Не теряем связь»
+- `SEARCH_ENABLED=false` — поведение строго идентично текущему.
+- Любая ошибка extract/MCP/search parsing/timeout → `SearchContext::skipped(...)`, комментарий генерируется как сейчас.
+- Search не должен блокировать first-comment pipeline дольше `SEARCH_MCP_TIMEOUT_SEC`.
+- Search facts имеют приоритет ниже поста, `tech_rag` и валидатора.
+- Search не меняет `validate_comment_output`.
+- Search не добавляется в voice cleanup.
 
-1. `should_generate_comment` → true (есть «Не теряем связь»)
-2. `clean_post_for_llm` → текст без подписи
-3. **gemma extract** (автономно, без хардкода) →
-   ```
-   NEED_SEARCH: yes
-   QUERIES:
-   - web: "DRAM memory shortage forecast 2028 demand supply analysis"
-   - reddit: "r/hardware DRAM shortage 2026 2027 discussion"
-   ```
-4. **MCP search** → 2 запроса × 4-5 результатов
-5. **Блок фактов в gemini-промпт:**
-   ```
-   Свежие факты из поиска:
-   - DRAM дефицит: TrendForce прогнозирует до Q2 2028 (web)
-   - r/hardware: споры о темпах роста цен (reddit)
-   ```
-6. gemini комментирует, опираясь на пост + факты
-7. `validate_comment_output` отбивает если модель начала выдумывать
+## Конфиг
 
-**Простой пост (некролог, праздник):** gemma возвращает `NEED_SEARCH: no` → MCP-шаг пропускается, комментарий как сейчас.
+Добавить в `Config`:
 
-## Этап 1 — абстракция поиска
+```rust
+pub search_enabled: bool,
+pub search_extract_provider: Option<String>,
+pub search_extract_model: Option<String>,
+pub search_extract_temperature: f32,
+pub search_extract_max_tokens: u32,
+pub search_mcp_command: Option<String>,
+pub search_mcp_args: Vec<String>,
+pub search_mcp_env: Vec<String>,
+pub search_mcp_timeout_sec: u64,
+pub search_mcp_tools: SearchMcpTools,
+```
 
-**Новые файлы:** `src/features/search/{mod,types,provider}.rs`
+Добавить helper struct:
 
-- `SearchClaim`, `SearchQuery` (text + source: GitHub/Reddit/Web), `SearchResult` (title/url/snippet/source), `SearchContext` (claims + queries + results + skipped)
-- Trait `SearchProvider` с `search()` и `health()` — провайдер-нейтральный, позволяет позже воткнуть прямой API
+```rust
+#[derive(Clone)]
+pub struct SearchMcpTools {
+    pub web: String,
+    pub github: String,
+    pub reddit: String,
+}
+```
 
-## Этап 2 — MCP клиент через `mcpr`
+Env defaults:
 
-**Новые файлы:** `src/mcp/mod.rs`, `src/mcp/search_provider.rs`
+```env
+SEARCH_ENABLED=false
+SEARCH_EXTRACT_PROVIDER=ollama
+SEARCH_EXTRACT_MODEL=gemma4:31b
+SEARCH_EXTRACT_TEMPERATURE=0.1
+SEARCH_EXTRACT_MAX_TOKENS=700
+SEARCH_MCP_COMMAND=
+SEARCH_MCP_ARGS=
+SEARCH_MCP_ENV=
+SEARCH_MCP_TIMEOUT_SEC=8
+SEARCH_MCP_TOOL_WEB=web_search
+SEARCH_MCP_TOOL_GITHUB=github_search
+SEARCH_MCP_TOOL_REDDIT=reddit_search
+```
 
-- mcpr берёт на себя stdio transport, JSON-RPC 2.0, handshake, tools/list, tools/call
-- Один mcpr Client на lifecycle бота (spawn + graceful shutdown)
-- `search()` мапит `SearchQuery.source` → имя tool, парсит result → `SearchResult`
-- Ошибка/timeout → лог + пустой Vec (не ронять комментарий)
-- Рестарт child при падении, healthcheck на startup
+Parsing rules:
 
-**Конфиг:** `SEARCH_ENABLED`, `SEARCH_MCP_COMMAND`, `SEARCH_MCP_ARGS`, `SEARCH_MCP_ENV`, `SEARCH_MCP_TIMEOUT_SEC`, `SEARCH_MCP_TOOLS`
+- `SEARCH_MCP_ARGS` — split whitespace, empty → `Vec::new()`.
+- `SEARCH_MCP_ENV` — comma-separated list of env variable names allowed to pass from bot process to MCP child.
+- `SEARCH_MCP_COMMAND` is required only when `SEARCH_ENABLED=true`.
+- `SEARCH_EXTRACT_PROVIDER/MODEL` are required only when `SEARCH_ENABLED=true`.
 
-## Этап 3 — gemma extraction (автономная)
+`validate_runtime_secrets`:
 
-**Новые файлы:** `prompts/search_extract.md`, `src/features/search/extract.rs`
+```rust
+if self.search_enabled {
+    validate_search_config(&mut errors, self);
+    validate_llm_provider_secret(... SEARCH_EXTRACT_PROVIDER ...);
+    validate_llm_provider_model(... SEARCH_EXTRACT_PROVIDER ...);
+}
+```
 
-Вызов через существующий `generate_text_with_provider(config, Some("ollama"), ...)`. Промпт указывает gemma:
-- Прочитать пост, определить есть ли проверяемые утверждения (даты, цифры, прогнозы, цены, релизы)
-- Если да → сформулировать 1-3 поисковых запроса для поиска первоисточника новости
-- Сама выбрать источники (web для новостей/аналитики, github для кода/benchmark-ов, reddit для обсуждений)
-- Если пост не содержит проверяемых фактов (некролог, праздник, опрос) → `NEED_SEARCH: no`
+Важно: validation строго gated by `search_enabled`.
 
-**Без хардкода сущностей.** gemma сама решает что важно в конкретном посте.
+## Новые файлы
 
-Defensive парсинг: мусор → `skipped=true`, комментарий без поиска.
+```text
+src/features/search/mod.rs
+src/features/search/types.rs
+src/features/search/extract.rs
+src/features/search/provider.rs
+src/features/search/mcp.rs
+src/features/search/service.rs
+prompts/search_extract.md
+```
 
-## Этап 4 — интеграция в pipeline
+В `src/features/mod.rs` добавить:
 
-**Изменить:** `pipeline.rs`, `prompt.rs`
+```rust
+pub mod search;
+```
 
-- Между `load_relevant_memory_notes` и `generate_text_checked`: `run_search()` → `SearchContext`
-- `build_llm_prompt` получает `Option<&SearchContext>`, добавляет блок фактов между RAG и постом
-- При `SEARCH_ENABLED=false` — поведение идентично текущему
-- Рекомендация: кэш `post_search_cache` с TTL 24-72ч, `extract` параллельно с memory+photo через `tokio::join!`
+## Search types
 
-## Этап 5 — диагностика
+`src/features/search/types.rs`:
 
-- Owner preview: `search: 2 queries, 8 results (web+reddit)` или `search: skipped`
-- Логи: `tracing::info!` с claims/queries/results count и latency
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSource {
+    Web,
+    Github,
+    Reddit,
+}
 
-## Этап 6 — тесты
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchQuery {
+    pub source: SearchSource,
+    pub text: String,
+}
 
-- Unit: парсинг gemma extraction (валидный/мусор/`need_search: no`)
-- Unit: MCP-result → SearchResult, `build_llm_prompt` с контекстом и без
-- Обновить все test `fn config()` новыми полями
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchResult {
+    pub source: SearchSource,
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
 
-## Этап 7 — конфиг и документация
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchContext {
+    pub queries: Vec<SearchQuery>,
+    pub results: Vec<SearchResult>,
+    pub skipped_reason: Option<String>,
+    pub latency_ms: u128,
+}
+```
 
-- `config.rs`: новые поля + `validate_runtime_secrets` проверка MCP-команды
-- `.env.example`: секция SEARCH_*
-- `AGENTS.md`: search pipeline секция
-- `docs/TECHNICAL.md`: контур, провайдер-нейтральность
-- `docs/LOCAL_WORKFLOW.md`: как локально поднять MCP-сервер
+Required impl:
 
-## Этап 8 — deploy (vps-153)
+```rust
+impl SearchContext {
+    pub fn skipped(reason: impl Into<String>, latency_ms: u128) -> Self;
+    pub fn is_skipped(&self) -> bool;
+}
+```
 
-- MCP-сервер на VPS (npm/pnpm или binary)
-- `SEARCH_*` env через `EnvironmentFile=.env` в systemd
-- Секреты (GITHUB_API_KEY и т.д.) — в `.env`, бот прокидывает только перечисленные в `SEARCH_MCP_ENV`
+Limits:
 
-## Не делаем в этой итерации
+```rust
+pub const MAX_SEARCH_QUERIES: usize = 3;
+pub const MAX_QUERY_CHARS: usize = 180;
+pub const MAX_SEARCH_RESULTS: usize = 8;
+pub const MAX_RESULT_TITLE_CHARS: usize = 140;
+pub const MAX_RESULT_SNIPPET_CHARS: usize = 220;
+```
 
-- pgvector/embeddings для memory notes
-- Изменение `validate_comment_output`
-- Search в voice cleanup
-- LLM tool-use/function-calling
+## Extract prompt
+
+`prompts/search_extract.md` должен требовать только JSON без markdown:
+
+```text
+Ты выбираешь поисковые запросы для факт-чека техно-новости.
+
+Верни строго JSON без markdown и без пояснений:
+{
+  "need_search": true,
+  "queries": [
+    { "source": "web", "text": "..." }
+  ]
+}
+
+Правила:
+- Если в посте нет проверяемых дат, цифр, релизов, цен, прогнозов, названий моделей или спорных фактов, верни {"need_search":false,"queries":[]}.
+- Максимум 3 запроса.
+- source только: web, github, reddit.
+- web: новости, аналитика, первоисточники, версии, цены, прогнозы.
+- github: релизы, changelog, issues, benchmarks из репозиториев.
+- reddit: реакция сообщества, если это полезно для контекста.
+- Запросы пиши на английском, если тема международная.
+- Не добавляй факты от себя.
+```
+
+`src/features/search/extract.rs`:
+
+- build prompt: `SEARCH_EXTRACT_PROMPT + "\n\nPOST:\n" + clean_post`.
+- call:
+
+```rust
+generate_text_with_provider(
+    config,
+    config.search_extract_provider.as_deref(),
+    config.search_extract_model.as_deref(),
+    &prompt,
+    None,
+    config.search_extract_temperature,
+    config.search_extract_max_tokens,
+)
+```
+
+- parse JSON via `serde_json`.
+- accept optional fenced JSON by stripping ```json fences.
+- if parse fails → return `Vec::new()` plus skipped reason from service.
+- sanitize queries:
+  - trim
+  - drop empty
+  - truncate to `MAX_QUERY_CHARS`
+  - drop unknown source
+  - dedupe by `(source, lowercase text)`
+  - take `MAX_SEARCH_QUERIES`
+
+## SearchProvider
+
+`src/features/search/provider.rs`:
+
+```rust
+#[async_trait::async_trait]
+pub trait SearchProvider: Send + Sync {
+    async fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<SearchResult>>;
+}
+```
+
+## Lazy MCP provider
+
+`src/features/search/mcp.rs` implements `McpSearchProvider`.
+
+Behavior:
+
+- For each call to `search(&SearchQuery)`:
+  1. spawn `SEARCH_MCP_COMMAND` with `SEARCH_MCP_ARGS`.
+  2. pass only env vars listed in `SEARCH_MCP_ENV`.
+  3. initialize MCP stdio client.
+  4. call one tool based on `SearchQuery.source`:
+     - `Web` → `config.search_mcp_tools.web`
+     - `Github` → `config.search_mcp_tools.github`
+     - `Reddit` → `config.search_mcp_tools.reddit`
+  5. parse tool result into `Vec<SearchResult>`.
+  6. close process.
+- Wrap the whole operation with `tokio::time::timeout(Duration::from_secs(config.search_mcp_timeout_sec), ...)`.
+- On timeout/tool error/process error/parsing error return `Ok(Vec::new())` and log `tracing::warn!` without secrets.
+- Do not log `SEARCH_MCP_ENV` values.
+
+Tool input JSON:
+
+```json
+{ "query": "...", "limit": 5 }
+```
+
+Accepted tool output shapes:
+
+```json
+[
+  { "title": "...", "url": "...", "snippet": "..." }
+]
+```
+
+or:
+
+```json
+{
+  "results": [
+    { "title": "...", "url": "...", "snippet": "..." }
+  ]
+}
+```
+
+Normalize results:
+
+- empty title and empty snippet → drop
+- truncate title/snippet
+- take remaining up to `MAX_SEARCH_RESULTS` at service level
+
+## Search service
+
+`src/features/search/service.rs`:
+
+```rust
+pub async fn run_search(config: &Config, clean_post: &str) -> SearchContext
+```
+
+Flow:
+
+1. `let started = Instant::now();`
+2. if `!config.search_enabled` → `SearchContext::skipped("disabled", latency)`.
+3. run extract.
+4. if extract failed → `skipped("extract_failed", latency)`.
+5. if no queries → `skipped("no_search_needed", latency)`.
+6. create `McpSearchProvider::new(config.clone())`.
+7. for each query sequentially call provider.search(query).
+8. collect results, dedupe by URL, take `MAX_SEARCH_RESULTS`.
+9. if no results → context with queries, empty results, `skipped_reason=Some("no_results")`.
+10. else return context with results.
+
+First iteration intentionally sequential. Do not use `tokio::join!` yet.
+
+## Prompt integration
+
+Change `src/features/first_comment/prompt.rs`:
+
+```rust
+pub fn build_llm_prompt(
+    post_text: &str,
+    chat_member_count: Option<u32>,
+    memory_notes: &[MemoryNote],
+    recent_comments: &[String],
+    search_context: Option<&SearchContext>,
+) -> String
+```
+
+Insert search block after `tech_rag` and before memory:
+
+```text
+Свежий поиск, использовать осторожно:
+- Это вспомогательный контекст, он ниже поста по приоритету.
+- Не цитируй URL и не добавляй ссылки.
+- Если поиск противоречит посту, не утверждай спорное как факт.
+- Если результаты нерелевантны, игнорируй их.
+
+Результаты:
+- [web] Title — snippet
+- [github] Title — snippet
+```
+
+If disabled/skipped/no results, include one short line:
+
+```text
+Свежий поиск: нет дополнительного контекста.
+```
+
+Do not put raw URLs into the prompt. If source identity is useful, include domain only later in a separate iteration.
+
+## First-comment pipeline integration
+
+Change `src/features/first_comment/pipeline.rs`:
+
+Current order remains mostly sequential:
+
+1. download image
+2. get chat member count
+3. load memory notes
+4. load recent comments
+5. `let search_context = run_search(config, &clean_post).await;`
+6. build prompt with `Some(&search_context)` if `config.search_enabled`, else `None`
+7. generate comment as before
+
+Owner preview:
+
+Change signature:
+
+```rust
+send_owner_preview(bot, owner_id, &final_html, candidate.source_message_id, &search_context).await;
+```
+
+Append one line:
+
+```text
+search=2 queries, 6 results, 1420ms
+```
+
+or:
+
+```text
+search=skipped(no_search_needed), 120ms
+```
+
+## Tests
+
+Add unit tests:
+
+- `extract.rs`
+  - parses valid JSON
+  - parses fenced JSON
+  - returns no queries for invalid JSON
+  - drops unknown source
+  - dedupes duplicate queries
+  - truncates long query
+- `mcp.rs`
+  - parses array tool output
+  - parses `{ results: [...] }` tool output
+  - drops empty result
+  - truncates title/snippet
+- `service.rs`
+  - disabled returns skipped disabled
+  - no queries returns skipped no_search_needed
+  - result dedupe by URL
+- `prompt.rs`
+  - prompt includes search facts when context has results
+  - prompt does not include raw URLs
+  - prompt says no additional context when skipped
+
+## Cargo.toml
+
+Add dependencies/features needed by implementation:
+
+```toml
+async-trait = "0.1" # already present
+```
+
+For lazy process implementation, ensure tokio features include:
+
+```toml
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "time"] }
+```
+
+MCP crate:
+
+- Add `mcpr` only after checking its current API locally.
+- If `mcpr` API does not support stdio client cleanly, implement minimal JSON-RPC stdio client in `src/features/search/mcp.rs` using `tokio::process::Command`.
+- This decision must be made by the main agent before spawning implementation subagents.
+
+## Documentation updates
+
+- `.env.example`: add SEARCH section.
+- `docs/TECHNICAL.md`: describe search pipeline and env vars.
+- `docs/SEARCH_TODO.md`: keep implementation checklist.
+- `docs/SEARCH_SUBAGENT_PROMPTS.md`: keep exact subagent prompts.
+
+`docs/LOCAL_WORKFLOW.md` currently does not exist. Do not reference it unless created in a separate docs task.
+
+## Not in first iteration
+
+- long-lived MCP process in `AppState`
+- restart/shutdown lifecycle
+- DB cache `post_search_cache`
+- migrations
+- pgvector/embeddings
 - Gemini grounding
-- Любые breaking changes (SEARCH_ENABLED=false = текущее поведение)
-
-## Риски
-
-| Риск | Митигация |
-|------|-----------|
-| gemma плохо формирует запросы | Defensive парсинг + skipped=true |
-| MCP-сервер падает | mcpr рестарт, healthcheck, поиск optional |
-| Latency +1-3с | Timeout, кэш, async parallel |
-| Шумные результаты | В промпте «приоритет ниже поста» |
-| Rate limits | Кэш, web-only fallback |
+- LLM tool-use/function-calling
+- search in voice cleanup
+- changing `validate_comment_output`
+- parallel `tokio::join!` optimization

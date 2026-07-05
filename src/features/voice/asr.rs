@@ -50,9 +50,6 @@ pub async fn transcribe_audio(
 
     let raw_json = serde_json::to_value(&response)?;
     let text = response.text.trim().to_string();
-    if text.is_empty() {
-        anyhow::bail!("empty ASR transcript");
-    }
 
     Ok(AsrTranscript {
         provider,
