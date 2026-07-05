@@ -19,6 +19,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Автоматически конспектирует обычные новости в память и подмешивает релевантные заметки в следующие генерации.
 - Объединяет похожие заметки памяти, чтобы не плодить дубли.
 - Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
+- Опционально добавляет свежий web/GitHub/Reddit факт-чек для первого комментария через lazy MCP process, если включён `SEARCH_ENABLED`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
 - Показывает пользователей в отчётах человекочитаемо: имя кликабельно, ID спрятан в `tg://user`, рядом статус/админство.
 - Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
@@ -77,6 +78,19 @@ LLM_MAX_TOKENS=90
 MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
 
+SEARCH_ENABLED=false
+SEARCH_EXTRACT_PROVIDER=ollama
+SEARCH_EXTRACT_MODEL=gemma4:31b
+SEARCH_EXTRACT_TEMPERATURE=0.1
+SEARCH_EXTRACT_MAX_TOKENS=700
+SEARCH_MCP_COMMAND=
+SEARCH_MCP_ARGS=
+SEARCH_MCP_ENV=
+SEARCH_MCP_TIMEOUT_SEC=8
+SEARCH_MCP_TOOL_WEB=web_search
+SEARCH_MCP_TOOL_GITHUB=github_search
+SEARCH_MCP_TOOL_REDDIT=reddit_search
+
 GROQ_API_KEY=
 GROQ_MODEL=
 CEREBRAS_API_KEY=
@@ -116,6 +130,25 @@ SEND_OWNER_PREVIEW=true
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
+
+### Поиск фактов для первого комментария
+
+SEARCH-контур добавляет вспомогательный свежий контекст перед генерацией первого комментария:
+
+```text
+clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build_llm_prompt -> generate_text_checked
+```
+
+Поведение gated by config:
+
+- `SEARCH_ENABLED=false` сохраняет старое поведение: prompt получает строку “Свежий поиск: нет дополнительного контекста.”, а генерация идёт через обычный `LLM_PROVIDER` без внешнего поиска.
+- `SEARCH_EXTRACT_PROVIDER` / `SEARCH_EXTRACT_MODEL` задают LLM, который из очищенного поста возвращает JSON с максимум 3 запросами для `web`, `github` или `reddit`.
+- `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
+- `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
+- `SEARCH_MCP_TOOL_WEB`, `SEARCH_MCP_TOOL_GITHUB`, `SEARCH_MCP_TOOL_REDDIT` задают имена MCP tools для разных источников.
+- Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
+- Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
+- DB cache, migrations и отдельная таблица search results не входят в первую итерацию.
 
 Voice transcription:
 

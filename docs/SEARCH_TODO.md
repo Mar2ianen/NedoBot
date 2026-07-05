@@ -80,9 +80,9 @@
 
 ## 8. Documentation
 
-- [ ] Обновить `docs/TECHNICAL.md` секцией Search.
-- [ ] Обновить список env vars в `docs/TECHNICAL.md`.
-- [ ] Не ссылаться на `docs/LOCAL_WORKFLOW.md`, пока файла нет.
+- [x] Обновить `docs/TECHNICAL.md` секцией Search.
+- [x] Обновить список env vars в `docs/TECHNICAL.md`.
+- [x] Не ссылаться на `docs/LOCAL_WORKFLOW.md`, пока файла нет.
 
 ## 9. Validation
 
