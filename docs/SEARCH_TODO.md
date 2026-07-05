@@ -25,7 +25,7 @@
 - [x] Создать `src/features/search/types.rs`.
 - [x] Создать `src/features/search/provider.rs`.
 - [x] Создать `src/features/search/extract.rs`.
-- [ ] Создать `src/features/search/mcp.rs`.
+- [x] Создать `src/features/search/mcp.rs`.
 - [ ] Создать `src/features/search/service.rs`.
 - [x] Добавить `pub mod search;` в `src/features/mod.rs`.
 
@@ -40,17 +40,17 @@
 
 ## 4. Lazy MCP provider
 
-- [ ] Проверить актуальный API `mcpr`.
+- [x] Проверить актуальный API `mcpr`.
 - [ ] Если `mcpr` подходит — добавить dependency.
-- [ ] Если `mcpr` не подходит — реализовать минимальный stdio JSON-RPC client в `mcp.rs`.
-- [ ] Добавить `tokio` features `process`, `time`.
-- [ ] Реализовать запуск `SEARCH_MCP_COMMAND` на один search call.
-- [ ] Передавать только env vars из `SEARCH_MCP_ENV`.
-- [ ] Реализовать source → tool name mapping.
-- [ ] Реализовать timeout.
-- [ ] Реализовать parsing array output и `{ results: [...] }` output.
-- [ ] Не логировать secrets/env values.
-- [ ] Добавить unit-тесты parsing/normalization.
+- [x] Если `mcpr` не подходит — реализовать минимальный stdio JSON-RPC client в `mcp.rs`.
+- [x] Добавить `tokio` features `process`, `time`.
+- [x] Реализовать запуск `SEARCH_MCP_COMMAND` на один search call.
+- [x] Передавать только env vars из `SEARCH_MCP_ENV`.
+- [x] Реализовать source → tool name mapping.
+- [x] Реализовать timeout.
+- [x] Реализовать parsing array output и `{ results: [...] }` output.
+- [x] Не логировать secrets/env values.
+- [x] Добавить unit-тесты parsing/normalization.
 
 ## 5. Search service
 
