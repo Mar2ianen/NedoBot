@@ -6,13 +6,13 @@ pub enum SearchSource {
     Reddit,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SearchQuery {
     pub source: SearchSource,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SearchResult {
     pub source: SearchSource,
     pub title: String,

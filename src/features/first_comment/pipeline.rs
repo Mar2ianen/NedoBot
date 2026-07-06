@@ -13,6 +13,7 @@ use crate::features::first_comment::repo::{
     mark_post_comment_sent,
 };
 use crate::features::memory::service::{load_relevant_memory_notes, remember_post};
+use crate::features::search::repo::insert_search_run;
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
 use crate::llm::service::generate_text_checked;
@@ -75,6 +76,9 @@ pub async fn maybe_comment_post(
     let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
     let search_context = run_search(config, &clean_post).await;
+    if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
+        tracing::warn!(%err, "failed to save search run");
+    }
     let prompt = build_llm_prompt(
         &clean_post,
         chat_member_count,
