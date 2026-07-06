@@ -160,7 +160,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
 - Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
 - Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
-- DB cache, migrations и отдельная таблица search results не входят в первую итерацию.
+- Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
 
 Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
 
