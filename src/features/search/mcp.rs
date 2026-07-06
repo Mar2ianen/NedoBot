@@ -126,16 +126,15 @@ fn initialized_notification() -> Value {
 }
 
 fn tools_call_request(config: &Config, query: &SearchQuery) -> Value {
+    let tool_name = tool_name(config, query.source);
+
     json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": tool_name(config, query.source),
-            "arguments": {
-                "query": query.text,
-                "limit": 5
-            }
+            "name": tool_name,
+            "arguments": tool_arguments(tool_name, query)
         }
     })
 }
@@ -145,6 +144,31 @@ fn tool_name(config: &Config, source: SearchSource) -> &str {
         SearchSource::Web => &config.search_mcp_tools.web,
         SearchSource::Github => &config.search_mcp_tools.github,
         SearchSource::Reddit => &config.search_mcp_tools.reddit,
+    }
+}
+
+fn tool_arguments(tool_name: &str, query: &SearchQuery) -> Value {
+    match tool_name {
+        "web_search_exa" | "web_search_advanced_exa" => json!({
+            "query": query.text,
+            "numResults": 5
+        }),
+        "brave_web_search" | "brave_local_search" => json!({
+            "query": query.text,
+            "count": 5
+        }),
+        "search_repositories" => json!({
+            "query": query.text,
+            "perPage": 5
+        }),
+        "search_code" | "search_issues" | "search_users" => json!({
+            "q": query.text,
+            "per_page": 5
+        }),
+        _ => json!({
+            "query": query.text,
+            "limit": 5
+        }),
     }
 }
 
@@ -202,7 +226,11 @@ fn parse_mcp_tool_response(
 }
 
 fn parse_tool_output(source: SearchSource, text: &str) -> anyhow::Result<Vec<SearchResult>> {
-    let value: Value = serde_json::from_str(text.trim())?;
+    let trimmed = text.trim();
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return Ok(parse_text_results(source, trimmed));
+    };
+
     let items = match value.as_array() {
         Some(items) => items,
         None => value
@@ -217,6 +245,54 @@ fn parse_tool_output(source: SearchSource, text: &str) -> anyhow::Result<Vec<Sea
         .iter()
         .filter_map(|item| parse_result(source, item))
         .collect())
+}
+
+fn parse_text_results(source: SearchSource, text: &str) -> Vec<SearchResult> {
+    text.split("\n---\n")
+        .filter_map(|block| parse_text_result(source, block))
+        .collect()
+}
+
+fn parse_text_result(source: SearchSource, block: &str) -> Option<SearchResult> {
+    let mut title = String::new();
+    let mut url = String::new();
+    let mut snippet = String::new();
+    let mut in_highlights = false;
+
+    for line in block.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Title:") {
+            title = value.trim().to_string();
+            in_highlights = false;
+        } else if let Some(value) = line.strip_prefix("URL:") {
+            url = value.trim().to_string();
+            in_highlights = false;
+        } else if let Some(value) = line.strip_prefix("Highlights:") {
+            snippet = value.trim().to_string();
+            in_highlights = true;
+        } else if line.ends_with(':') {
+            in_highlights = false;
+        } else if in_highlights && !line.is_empty() {
+            if !snippet.is_empty() {
+                snippet.push(' ');
+            }
+            snippet.push_str(line);
+        }
+    }
+
+    title = truncate_chars(title.trim(), MAX_RESULT_TITLE_CHARS);
+    snippet = truncate_chars(snippet.trim(), MAX_RESULT_SNIPPET_CHARS);
+
+    if title.is_empty() && snippet.is_empty() {
+        return None;
+    }
+
+    Some(SearchResult {
+        source,
+        title,
+        url,
+        snippet,
+    })
 }
 
 fn parse_result(source: SearchSource, item: &Value) -> Option<SearchResult> {
@@ -259,6 +335,48 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exa_tool_uses_num_results_argument() {
+        let query = SearchQuery {
+            source: SearchSource::Web,
+            text: "AYANEO NEXT 2".to_string(),
+        };
+
+        assert_eq!(
+            tool_arguments("web_search_exa", &query),
+            json!({"query":"AYANEO NEXT 2","numResults":5})
+        );
+    }
+
+    #[test]
+    fn github_tool_uses_per_page_argument() {
+        let query = SearchQuery {
+            source: SearchSource::Github,
+            text: "tokio release".to_string(),
+        };
+
+        assert_eq!(
+            tool_arguments("search_repositories", &query),
+            json!({"query":"tokio release","perPage":5})
+        );
+    }
+
+    #[test]
+    fn parses_exa_text_results() {
+        let output = "Title: AYANEO NEXT 2 Strix Halo handheld starts global shipping\nURL: https://videocardz.com/newz/ayaneo-next-2\nPublished: 2026-07-04T11:46:38.000Z\nAuthor: WhyCry\nHighlights:\nRyzen AI Max 385 with 32GB of memory and 1TB of storage: $2999.\n\n---\n\nTitle: AYANEO NEXT 2\nURL: https://shop.ayaneo.com/products/ayaneo-next-2\nHighlights:\nAI395-128GB+2TB-Polar Black - Sold Out";
+
+        let results = parse_tool_output(SearchSource::Web, output).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].title,
+            "AYANEO NEXT 2 Strix Halo handheld starts global shipping"
+        );
+        assert_eq!(results[0].url, "https://videocardz.com/newz/ayaneo-next-2");
+        assert!(results[0].snippet.contains("$2999"));
+        assert_eq!(results[1].title, "AYANEO NEXT 2");
+    }
 
     #[test]
     fn parses_array_results() {
