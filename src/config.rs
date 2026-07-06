@@ -32,6 +32,9 @@ pub struct Config {
     pub search_mcp_env: Vec<String>,
     pub search_mcp_timeout_sec: u64,
     pub search_mcp_tools: SearchMcpTools,
+    pub search_mcp_fetch_tool: Option<String>,
+    pub search_fetch_top_n: usize,
+    pub search_fetch_max_chars: usize,
     pub groq_api_key: String,
     pub groq_model: Option<String>,
     pub cerebras_api_key: String,
@@ -108,6 +111,10 @@ impl Config {
                 github: env_or("SEARCH_MCP_TOOL_GITHUB", "github_search"),
                 reddit: env_or("SEARCH_MCP_TOOL_REDDIT", "reddit_search"),
             },
+            search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
+                .or_else(|| Some("web_fetch_exa".to_string())),
+            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 2),
+            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
             groq_api_key: env_or("GROQ_API_KEY", ""),
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
@@ -251,6 +258,10 @@ fn validate_search_config(errors: &mut Vec<String>, config: &Config) {
 
     if config.search_mcp_timeout_sec == 0 {
         errors.push("SEARCH_MCP_TIMEOUT_SEC must be greater than 0".to_string());
+    }
+
+    if config.search_fetch_max_chars == 0 {
+        errors.push("SEARCH_FETCH_MAX_CHARS must be greater than 0".to_string());
     }
 }
 
@@ -433,6 +444,9 @@ mod tests {
                 github: "github_search".to_string(),
                 reddit: "reddit_search".to_string(),
             },
+            search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
+            search_fetch_top_n: 2,
+            search_fetch_max_chars: 6000,
             groq_api_key: String::new(),
             groq_model: None,
             cerebras_api_key: String::new(),

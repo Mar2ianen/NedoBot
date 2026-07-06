@@ -96,10 +96,31 @@ async fn run_mcp_flow(
     read_json_line(&mut stdout).await?;
 
     write_json_line(&mut stdin, &initialized_notification()).await?;
-    write_json_line(&mut stdin, &tools_call_request(config, query)).await?;
+    write_json_line(&mut stdin, &search_call_request(config, query)).await?;
     let response = read_json_line(&mut stdout).await?;
+    let mut results = parse_mcp_tool_response(query.source, &response)?;
 
-    parse_mcp_tool_response(query.source, &response)
+    if let Some(fetch_tool) = config.search_mcp_fetch_tool.as_deref() {
+        let urls = fetch_urls(&results, config.search_fetch_top_n);
+        for (index, url) in urls.iter().enumerate() {
+            write_json_line(
+                &mut stdin,
+                &fetch_call_request(
+                    3 + index as u64,
+                    fetch_tool,
+                    std::slice::from_ref(url),
+                    config.search_fetch_max_chars,
+                ),
+            )
+            .await?;
+            let response = read_json_line(&mut stdout).await?;
+            let mut fetched_results = parse_mcp_tool_response(query.source, &response)?;
+            attach_requested_url(&mut fetched_results, url);
+            enrich_results_with_fetch(&mut results, fetched_results);
+        }
+    }
+
+    Ok(results)
 }
 
 fn initialize_request() -> Value {
@@ -125,16 +146,28 @@ fn initialized_notification() -> Value {
     })
 }
 
-fn tools_call_request(config: &Config, query: &SearchQuery) -> Value {
+fn search_call_request(config: &Config, query: &SearchQuery) -> Value {
     let tool_name = tool_name(config, query.source);
 
+    tools_call_request(2, tool_name, tool_arguments(tool_name, query))
+}
+
+fn fetch_call_request(id: u64, tool_name: &str, urls: &[String], max_chars: usize) -> Value {
+    tools_call_request(
+        id,
+        tool_name,
+        fetch_tool_arguments(tool_name, urls, max_chars),
+    )
+}
+
+fn tools_call_request(id: u64, tool_name: &str, arguments: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": id,
         "method": "tools/call",
         "params": {
             "name": tool_name,
-            "arguments": tool_arguments(tool_name, query)
+            "arguments": arguments
         }
     })
 }
@@ -170,6 +203,69 @@ fn tool_arguments(tool_name: &str, query: &SearchQuery) -> Value {
             "limit": 5
         }),
     }
+}
+
+fn fetch_tool_arguments(tool_name: &str, urls: &[String], max_chars: usize) -> Value {
+    match tool_name {
+        "web_fetch_exa" => json!({
+            "urls": urls,
+            "maxCharacters": max_chars
+        }),
+        _ => json!({
+            "urls": urls,
+            "max_chars": max_chars
+        }),
+    }
+}
+
+fn fetch_urls(results: &[SearchResult], top_n: usize) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    for result in results {
+        let url = result.url.trim();
+        if url.is_empty() || urls.iter().any(|seen| seen == url) {
+            continue;
+        }
+
+        urls.push(url.to_string());
+        if urls.len() >= top_n {
+            break;
+        }
+    }
+
+    urls
+}
+
+fn attach_requested_url(fetched_results: &mut [SearchResult], requested_url: &str) {
+    for fetched in fetched_results {
+        fetched.url = requested_url.to_string();
+    }
+}
+
+fn enrich_results_with_fetch(results: &mut Vec<SearchResult>, fetched_results: Vec<SearchResult>) {
+    for fetched in fetched_results {
+        if let Some(existing) = results
+            .iter_mut()
+            .find(|result| !fetched.url.is_empty() && result.url == fetched.url)
+        {
+            append_fetch_snippet(existing, &fetched.snippet);
+        } else {
+            results.push(fetched);
+        }
+    }
+}
+
+fn append_fetch_snippet(result: &mut SearchResult, fetched_snippet: &str) {
+    if fetched_snippet.trim().is_empty() {
+        return;
+    }
+
+    let combined = format!(
+        "{} Fetch: {}",
+        result.snippet.trim(),
+        fetched_snippet.trim()
+    );
+    result.snippet = truncate_chars(combined.trim(), MAX_RESULT_SNIPPET_CHARS);
 }
 
 async fn write_json_line(
@@ -258,21 +354,38 @@ fn parse_text_result(source: SearchSource, block: &str) -> Option<SearchResult> 
     let mut url = String::new();
     let mut snippet = String::new();
     let mut in_highlights = false;
+    let mut can_collect_body = false;
 
     for line in block.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("Title:") {
             title = value.trim().to_string();
+            can_collect_body = true;
+            in_highlights = false;
+        } else if let Some(value) = line.strip_prefix("# ") {
+            if title.is_empty() {
+                title = value.trim().to_string();
+            }
+            can_collect_body = true;
             in_highlights = false;
         } else if let Some(value) = line.strip_prefix("URL:") {
             url = value.trim().to_string();
+            can_collect_body = true;
             in_highlights = false;
         } else if let Some(value) = line.strip_prefix("Highlights:") {
             snippet = value.trim().to_string();
             in_highlights = true;
+        } else if let Some(value) = line.strip_prefix("Text:") {
+            snippet = value.trim().to_string();
+            in_highlights = true;
+        } else if let Some(value) = line.strip_prefix("Content:") {
+            snippet = value.trim().to_string();
+            in_highlights = true;
+        } else if line.starts_with("Published:") || line.starts_with("Author:") {
+            in_highlights = false;
         } else if line.ends_with(':') {
             in_highlights = false;
-        } else if in_highlights && !line.is_empty() {
+        } else if !line.is_empty() && (in_highlights || can_collect_body) {
             if !snippet.is_empty() {
                 snippet.push(' ');
             }
@@ -360,6 +473,56 @@ mod tests {
             tool_arguments("search_repositories", &query),
             json!({"query":"tokio release","perPage":5})
         );
+    }
+
+    #[test]
+    fn exa_fetch_uses_urls_and_max_characters() {
+        let urls = vec!["https://example.com/a".to_string()];
+
+        assert_eq!(
+            fetch_tool_arguments("web_fetch_exa", &urls, 6000),
+            json!({"urls":["https://example.com/a"],"maxCharacters":6000})
+        );
+    }
+
+    #[test]
+    fn enriches_existing_result_with_fetched_text() {
+        let mut results = vec![SearchResult {
+            source: SearchSource::Web,
+            title: "AYANEO NEXT 2".to_string(),
+            url: "https://example.com/ayaneo".to_string(),
+            snippet: "Search snippet.".to_string(),
+        }];
+        let fetched = vec![SearchResult {
+            source: SearchSource::Web,
+            title: "AYANEO NEXT 2".to_string(),
+            url: "https://example.com/ayaneo".to_string(),
+            snippet: "Fetched page confirms $5299 tier.".to_string(),
+        }];
+
+        enrich_results_with_fetch(&mut results, fetched);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].snippet.contains("Search snippet."));
+        assert!(
+            results[0]
+                .snippet
+                .contains("Fetched page confirms $5299 tier.")
+        );
+    }
+
+    #[test]
+    fn parses_exa_fetch_text_results() {
+        let output = "# AYANEO NEXT 2\nURL: https://shop.ayaneo.com/products/ayaneo-next-2\nPublished: 2026-06-15\n\n$3,699.00\n\nSeries AI385-32GB+1TB-Polar Black AI395-64GB+1TB-Polar Black AI395-128GB+2TB-Polar Black\n\nAI395-128GB+2TB-Polar Black - Sold Out";
+
+        let results = parse_tool_output(SearchSource::Web, output).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].url,
+            "https://shop.ayaneo.com/products/ayaneo-next-2"
+        );
+        assert!(results[0].snippet.contains("AI395-128GB+2TB-Polar Black"));
     }
 
     #[test]
