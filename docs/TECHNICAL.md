@@ -141,7 +141,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 
 Поведение gated by config:
 
-- `SEARCH_ENABLED=false` сохраняет старое поведение: prompt получает строку “Свежий поиск: нет дополнительного контекста.”, а генерация идёт через обычный `LLM_PROVIDER` без внешнего поиска.
+- `SEARCH_ENABLED=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт через обычный `LLM_PROVIDER` без внешнего поиска.
 - `SEARCH_EXTRACT_PROVIDER` / `SEARCH_EXTRACT_MODEL` задают LLM, который из очищенного поста возвращает JSON с максимум 3 запросами для `web`, `github` или `reddit`.
 - `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
 - `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
@@ -149,6 +149,21 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
 - Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
 - DB cache, migrations и отдельная таблица search results не входят в первую итерацию.
+
+Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
+
+```env
+SEARCH_ENABLED=true
+SEARCH_MCP_COMMAND=npx
+SEARCH_MCP_ARGS=-y mcp-remote https://mcp.exa.ai/mcp
+SEARCH_MCP_ENV=PATH,HOME
+SEARCH_MCP_TIMEOUT_SEC=30
+SEARCH_MCP_TOOL_WEB=web_search_exa
+SEARCH_MCP_TOOL_GITHUB=web_search_exa
+SEARCH_MCP_TOOL_REDDIT=web_search_exa
+```
+
+`PATH,HOME` нужны не Exa, а `npx`/`mcp-remote` после `env_clear()`. Значения не логируются.
 
 Voice transcription:
 
