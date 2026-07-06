@@ -13,6 +13,9 @@ use crate::features::first_comment::repo::{
     mark_post_comment_sent,
 };
 use crate::features::memory::service::{load_relevant_memory_notes, remember_post};
+use crate::features::search::repo::insert_search_run;
+use crate::features::search::service::run_search;
+use crate::features::search::types::SearchContext;
 use crate::llm::service::generate_text_checked;
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
@@ -72,11 +75,16 @@ pub async fn maybe_comment_post(
     let chat_member_count = get_chat_member_count(bot, config).await;
     let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
+    let search_context = run_search(config, &clean_post).await;
+    if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
+        tracing::warn!(%err, "failed to save search run");
+    }
     let prompt = build_llm_prompt(
         &clean_post,
         chat_member_count,
         &memory_notes,
         &recent_comments,
+        config.search_enabled.then_some(&search_context),
     );
     let generation = generate_text_checked(
         config,
@@ -108,7 +116,14 @@ pub async fn maybe_comment_post(
     .await?;
 
     if let Some(owner_id) = owner_preview_chat(config) {
-        send_owner_preview(bot, owner_id, &final_html, candidate.source_message_id).await;
+        send_owner_preview(
+            bot,
+            owner_id,
+            &final_html,
+            candidate.source_message_id,
+            &search_context,
+        )
+        .await;
     }
 
     if let Err(err) = remember_post(
@@ -143,15 +158,30 @@ fn owner_preview_chat(config: &Config) -> Option<i64> {
         .then_some(config.owner_telegram_id)?
 }
 
+fn render_search_summary(search_context: &SearchContext) -> String {
+    match search_context.skipped_reason.as_deref() {
+        Some(reason) => format!("search=skipped({reason}), {}ms", search_context.latency_ms),
+        None => format!(
+            "search={} queries, {} results, {}ms",
+            search_context.queries.len(),
+            search_context.results.len(),
+            search_context.latency_ms
+        ),
+    }
+}
+
 async fn send_owner_preview(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     owner_id: i64,
     final_html: &str,
     source_message_id: MessageId,
+    search_context: &SearchContext,
 ) {
     let preview = format!(
-        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>",
-        final_html, source_message_id.0
+        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>\n<code>{}</code>",
+        final_html,
+        source_message_id.0,
+        render_search_summary(search_context)
     );
 
     if let Err(err) = send_html(bot, ChatId(owner_id), preview).await {

@@ -148,6 +148,7 @@ async fn retry_job(
         None,
         &memory_notes,
         &recent_comments,
+        None,
     );
     let generation = generate_text_checked(
         config,

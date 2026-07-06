@@ -165,6 +165,7 @@ fn render_file_body(clean: &CleanTranscript, chapters: &[TranscriptChapter]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SearchMcpTools;
 
     fn config() -> Config {
         Config {
@@ -181,6 +182,31 @@ mod tests {
             llm_proxy_url: None,
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
+            search_enabled: false,
+            search_extract_provider: Some("ollama".to_string()),
+            search_extract_model: Some("gemma4:31b".to_string()),
+            search_extract_temperature: 0.1,
+            search_extract_max_tokens: 700,
+            search_mcp_command: None,
+            search_mcp_args: Vec::new(),
+            search_mcp_env: Vec::new(),
+            search_mcp_timeout_sec: 8,
+            search_mcp_tools: SearchMcpTools {
+                web: "web_search".to_string(),
+                github: "github_search".to_string(),
+                reddit: "reddit_search".to_string(),
+            },
+            search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
+            search_fetch_top_n: 2,
+            search_fetch_max_chars: 6000,
+            search_github_mcp_command: None,
+            search_github_mcp_args: Vec::new(),
+            search_github_mcp_env: vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+            ],
+            search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             groq_api_key: String::new(),
             groq_model: None,
             cerebras_api_key: String::new(),
