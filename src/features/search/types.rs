@@ -47,4 +47,4 @@ pub const MAX_SEARCH_QUERIES: usize = 3;
 pub const MAX_QUERY_CHARS: usize = 180;
 pub const MAX_SEARCH_RESULTS: usize = 8;
 pub const MAX_RESULT_TITLE_CHARS: usize = 140;
-pub const MAX_RESULT_SNIPPET_CHARS: usize = 220;
+pub const MAX_RESULT_SNIPPET_CHARS: usize = 1600;

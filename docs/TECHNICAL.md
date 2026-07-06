@@ -90,6 +90,9 @@ SEARCH_MCP_TIMEOUT_SEC=8
 SEARCH_MCP_TOOL_WEB=web_search
 SEARCH_MCP_TOOL_GITHUB=github_search
 SEARCH_MCP_TOOL_REDDIT=reddit_search
+SEARCH_MCP_TOOL_FETCH=web_fetch_exa
+SEARCH_FETCH_TOP_N=2
+SEARCH_FETCH_MAX_CHARS=6000
 
 GROQ_API_KEY=
 GROQ_MODEL=
@@ -146,6 +149,8 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
 - `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
 - `SEARCH_MCP_TOOL_WEB`, `SEARCH_MCP_TOOL_GITHUB`, `SEARCH_MCP_TOOL_REDDIT` задают имена MCP tools для разных источников.
+- `SEARCH_MCP_TOOL_FETCH` включает дополнительный fetch top URL после search. Для Exa это `web_fetch_exa`.
+- `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
 - Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
 - Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
 - DB cache, migrations и отдельная таблица search results не входят в первую итерацию.
@@ -161,6 +166,9 @@ SEARCH_MCP_TIMEOUT_SEC=30
 SEARCH_MCP_TOOL_WEB=web_search_exa
 SEARCH_MCP_TOOL_GITHUB=web_search_exa
 SEARCH_MCP_TOOL_REDDIT=web_search_exa
+SEARCH_MCP_TOOL_FETCH=web_fetch_exa
+SEARCH_FETCH_TOP_N=2
+SEARCH_FETCH_MAX_CHARS=6000
 ```
 
 `PATH,HOME` нужны не Exa, а `npx`/`mcp-remote` после `env_clear()`. Значения не логируются.
