@@ -1,5 +1,13 @@
 #[derive(Clone)]
 #[allow(dead_code)]
+pub struct SearchMcpTools {
+    pub web: String,
+    pub github: String,
+    pub reddit: String,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
 pub struct Config {
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
@@ -14,6 +22,23 @@ pub struct Config {
     pub llm_proxy_url: Option<String>,
     pub memory_llm_temperature: f32,
     pub memory_llm_max_tokens: u32,
+    pub search_enabled: bool,
+    pub search_extract_provider: Option<String>,
+    pub search_extract_model: Option<String>,
+    pub search_extract_temperature: f32,
+    pub search_extract_max_tokens: u32,
+    pub search_mcp_command: Option<String>,
+    pub search_mcp_args: Vec<String>,
+    pub search_mcp_env: Vec<String>,
+    pub search_mcp_timeout_sec: u64,
+    pub search_mcp_tools: SearchMcpTools,
+    pub search_mcp_fetch_tool: Option<String>,
+    pub search_fetch_top_n: usize,
+    pub search_fetch_max_chars: usize,
+    pub search_github_mcp_command: Option<String>,
+    pub search_github_mcp_args: Vec<String>,
+    pub search_github_mcp_env: Vec<String>,
+    pub search_github_mcp_tools: Vec<String>,
     pub groq_api_key: String,
     pub groq_model: Option<String>,
     pub cerebras_api_key: String,
@@ -74,6 +99,36 @@ impl Config {
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
             memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2),
             memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220),
+            search_enabled: env_bool("SEARCH_ENABLED", false),
+            search_extract_provider: env_optional("SEARCH_EXTRACT_PROVIDER")
+                .or_else(|| Some("ollama".to_string())),
+            search_extract_model: env_optional("SEARCH_EXTRACT_MODEL")
+                .or_else(|| Some("gemma4:31b".to_string())),
+            search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1),
+            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 700),
+            search_mcp_command: env_optional("SEARCH_MCP_COMMAND"),
+            search_mcp_args: env_args("SEARCH_MCP_ARGS"),
+            search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
+            search_mcp_timeout_sec: env_u64("SEARCH_MCP_TIMEOUT_SEC", 8),
+            search_mcp_tools: SearchMcpTools {
+                web: env_or("SEARCH_MCP_TOOL_WEB", "web_search"),
+                github: env_or("SEARCH_MCP_TOOL_GITHUB", "github_search"),
+                reddit: env_or("SEARCH_MCP_TOOL_REDDIT", "reddit_search"),
+            },
+            search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
+                .or_else(|| Some("web_fetch_exa".to_string())),
+            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 2),
+            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
+            search_github_mcp_command: env_optional("SEARCH_GITHUB_MCP_COMMAND"),
+            search_github_mcp_args: env_args("SEARCH_GITHUB_MCP_ARGS"),
+            search_github_mcp_env: env_list_csv_or(
+                "SEARCH_GITHUB_MCP_ENV",
+                &["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+            ),
+            search_github_mcp_tools: env_list_csv_or(
+                "SEARCH_GITHUB_MCP_TOOLS",
+                &["search_issues", "search_code"],
+            ),
             groq_api_key: env_or("GROQ_API_KEY", ""),
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
@@ -137,6 +192,26 @@ impl Config {
             }
         }
 
+        if self.search_enabled {
+            validate_search_config(&mut errors, self);
+            if let Some(provider) = self.search_extract_provider.as_deref() {
+                validate_llm_provider_secret(
+                    &mut errors,
+                    self,
+                    provider,
+                    "SEARCH_EXTRACT_PROVIDER",
+                );
+                validate_llm_provider_model_with_model(
+                    &mut errors,
+                    self,
+                    provider,
+                    "SEARCH_EXTRACT_PROVIDER",
+                    self.search_extract_model.as_deref(),
+                    "SEARCH_EXTRACT_MODEL",
+                );
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -154,21 +229,53 @@ fn validate_llm_provider_model(
     provider: &str,
     context: &str,
 ) {
+    validate_llm_provider_model_with_model(
+        errors,
+        config,
+        provider,
+        context,
+        config.llm_model.as_deref(),
+        "LLM_MODEL",
+    );
+}
+
+fn validate_llm_provider_model_with_model(
+    errors: &mut Vec<String>,
+    config: &Config,
+    provider: &str,
+    context: &str,
+    model: Option<&str>,
+    model_key: &str,
+) {
     match normalize_llm_provider(provider) {
-        Ok("groq") if config.llm_model.is_none() && config.groq_model.is_none() => errors.push(
-            format!("{context}=groq requires LLM_MODEL or GROQ_MODEL; refusing to fallback to VISION_MODEL"),
-        ),
-        Ok("cerebras") if config.llm_model.is_none() && config.cerebras_model.is_none() => {
+        Ok("groq") if model.is_none() && config.groq_model.is_none() => errors.push(format!(
+            "{context}=groq requires {model_key} or GROQ_MODEL; refusing to fallback to VISION_MODEL"
+        )),
+        Ok("cerebras") if model.is_none() && config.cerebras_model.is_none() => {
             errors.push(format!(
-                "{context}=cerebras requires LLM_MODEL or CEREBRAS_MODEL; refusing to fallback to VISION_MODEL"
+                "{context}=cerebras requires {model_key} or CEREBRAS_MODEL; refusing to fallback to VISION_MODEL"
             ));
         }
-        Ok("openrouter") if config.llm_model.is_none() && config.openrouter_model.is_none() => {
+        Ok("openrouter") if model.is_none() && config.openrouter_model.is_none() => {
             errors.push(format!(
-                "{context}=openrouter requires LLM_MODEL or OPENROUTER_MODEL; refusing to fallback to VISION_MODEL"
+                "{context}=openrouter requires {model_key} or OPENROUTER_MODEL; refusing to fallback to VISION_MODEL"
             ));
         }
         Ok(_) | Err(_) => {}
+    }
+}
+
+fn validate_search_config(errors: &mut Vec<String>, config: &Config) {
+    if config.search_mcp_command.is_none() {
+        errors.push("SEARCH_ENABLED=true requires non-empty SEARCH_MCP_COMMAND".to_string());
+    }
+
+    if config.search_mcp_timeout_sec == 0 {
+        errors.push("SEARCH_MCP_TIMEOUT_SEC must be greater than 0".to_string());
+    }
+
+    if config.search_fetch_max_chars == 0 {
+        errors.push("SEARCH_FETCH_MAX_CHARS must be greater than 0".to_string());
     }
 }
 
@@ -265,6 +372,13 @@ fn env_u32(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -290,6 +404,32 @@ fn env_optional(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_list_csv(name: &str) -> Vec<String> {
+    parse_csv_env(name).unwrap_or_default()
+}
+
+fn env_list_csv_or(name: &str, default: &[&str]) -> Vec<String> {
+    parse_csv_env(name).unwrap_or_else(|| default.iter().map(ToString::to_string).collect())
+}
+
+fn parse_csv_env(name: &str) -> Option<Vec<String>> {
+    std::env::var(name).ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    })
+}
+
+fn env_args(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.split_whitespace().map(ToString::to_string).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +449,31 @@ mod tests {
             llm_proxy_url: None,
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
+            search_enabled: false,
+            search_extract_provider: Some("ollama".to_string()),
+            search_extract_model: Some("gemma4:31b".to_string()),
+            search_extract_temperature: 0.1,
+            search_extract_max_tokens: 700,
+            search_mcp_command: None,
+            search_mcp_args: Vec::new(),
+            search_mcp_env: Vec::new(),
+            search_mcp_timeout_sec: 8,
+            search_mcp_tools: SearchMcpTools {
+                web: "web_search".to_string(),
+                github: "github_search".to_string(),
+                reddit: "reddit_search".to_string(),
+            },
+            search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
+            search_fetch_top_n: 2,
+            search_fetch_max_chars: 6000,
+            search_github_mcp_command: None,
+            search_github_mcp_args: Vec::new(),
+            search_github_mcp_env: vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+            ],
+            search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             groq_api_key: String::new(),
             groq_model: None,
             cerebras_api_key: String::new(),
@@ -406,5 +571,28 @@ mod tests {
         let config = config();
 
         config.validate_runtime_secrets().unwrap();
+    }
+
+    #[test]
+    fn disabled_search_does_not_validate_mcp_command() {
+        let mut config = config();
+        config.search_enabled = false;
+        config.search_mcp_command = None;
+        config.search_mcp_timeout_sec = 0;
+
+        config.validate_runtime_secrets().unwrap();
+    }
+
+    #[test]
+    fn enabled_search_requires_mcp_command_and_timeout() {
+        let mut config = config();
+        config.search_enabled = true;
+        config.search_mcp_command = None;
+        config.search_mcp_timeout_sec = 0;
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("SEARCH_ENABLED=true requires non-empty SEARCH_MCP_COMMAND"));
+        assert!(err.contains("SEARCH_MCP_TIMEOUT_SEC must be greater than 0"));
     }
 }

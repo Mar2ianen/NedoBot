@@ -19,6 +19,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Автоматически конспектирует обычные новости в память и подмешивает релевантные заметки в следующие генерации.
 - Объединяет похожие заметки памяти, чтобы не плодить дубли.
 - Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
+- Опционально добавляет свежий web/GitHub/Reddit факт-чек для первого комментария через lazy MCP process, если включён `SEARCH_ENABLED`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
 - Показывает пользователей в отчётах человекочитаемо: имя кликабельно, ID спрятан в `tg://user`, рядом статус/админство.
 - Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
@@ -77,6 +78,26 @@ LLM_MAX_TOKENS=90
 MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
 
+SEARCH_ENABLED=false
+SEARCH_EXTRACT_PROVIDER=ollama
+SEARCH_EXTRACT_MODEL=gemma4:31b
+SEARCH_EXTRACT_TEMPERATURE=0.1
+SEARCH_EXTRACT_MAX_TOKENS=700
+SEARCH_MCP_COMMAND=
+SEARCH_MCP_ARGS=
+SEARCH_MCP_ENV=
+SEARCH_MCP_TIMEOUT_SEC=8
+SEARCH_MCP_TOOL_WEB=web_search
+SEARCH_MCP_TOOL_GITHUB=github_search
+SEARCH_MCP_TOOL_REDDIT=reddit_search
+SEARCH_MCP_TOOL_FETCH=web_fetch_exa
+SEARCH_FETCH_TOP_N=2
+SEARCH_FETCH_MAX_CHARS=6000
+SEARCH_GITHUB_MCP_COMMAND=
+SEARCH_GITHUB_MCP_ARGS=
+SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
+SEARCH_GITHUB_MCP_TOOLS=search_issues,search_code
+
 GROQ_API_KEY=
 GROQ_MODEL=
 CEREBRAS_API_KEY=
@@ -116,6 +137,58 @@ SEND_OWNER_PREVIEW=true
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
+
+### Поиск фактов для первого комментария
+
+SEARCH-контур добавляет вспомогательный свежий контекст перед генерацией первого комментария:
+
+```text
+clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build_llm_prompt -> generate_text_checked
+```
+
+Поведение gated by config:
+
+- `SEARCH_ENABLED=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт через обычный `LLM_PROVIDER` без внешнего поиска.
+- `SEARCH_EXTRACT_PROVIDER` / `SEARCH_EXTRACT_MODEL` задают LLM, который из очищенного поста возвращает JSON с максимум 3 запросами для `web`, `github` или `reddit`.
+- `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают основной MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
+- `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
+- `SEARCH_MCP_TOOL_WEB`, `SEARCH_MCP_TOOL_GITHUB`, `SEARCH_MCP_TOOL_REDDIT` задают имена MCP tools для основного MCP server.
+- `SEARCH_MCP_TOOL_FETCH` включает дополнительный fetch top URL после search. Для Exa это `web_fetch_exa`.
+- `SEARCH_GITHUB_MCP_COMMAND` / `SEARCH_GITHUB_MCP_ARGS` включают отдельный GitHub MCP server для запросов `source=github`; если они не заданы, GitHub-запросы идут через основной `SEARCH_MCP_TOOL_GITHUB`.
+- `SEARCH_GITHUB_MCP_ENV` по умолчанию пропускает только `PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN`; значения не логируются.
+- `SEARCH_GITHUB_MCP_TOOLS` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
+- `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
+- Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
+- Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
+- Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
+
+Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
+
+```env
+SEARCH_ENABLED=true
+SEARCH_MCP_COMMAND=npx
+SEARCH_MCP_ARGS=-y mcp-remote https://mcp.exa.ai/mcp
+SEARCH_MCP_ENV=PATH,HOME
+SEARCH_MCP_TIMEOUT_SEC=30
+SEARCH_MCP_TOOL_WEB=web_search_exa
+SEARCH_MCP_TOOL_GITHUB=web_search_exa
+SEARCH_MCP_TOOL_REDDIT=web_search_exa
+SEARCH_MCP_TOOL_FETCH=web_fetch_exa
+SEARCH_FETCH_TOP_N=2
+SEARCH_FETCH_MAX_CHARS=6000
+```
+
+Для новостей об утилитах можно добавить GitHub MCP поверх Exa, чтобы `source=github` ходил в GitHub issues/code отдельно:
+
+```env
+GITHUB_PERSONAL_ACCESS_TOKEN=
+SEARCH_GITHUB_MCP_COMMAND=npx
+SEARCH_GITHUB_MCP_ARGS=-y @modelcontextprotocol/server-github
+SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
+SEARCH_GITHUB_MCP_TOOLS=search_issues,search_code
+```
+
+`PATH,HOME` нужны не Exa, а `npx`/`mcp-remote` после `env_clear()`. Значения не логируются.
 
 Voice transcription:
 
