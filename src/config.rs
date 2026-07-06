@@ -35,6 +35,10 @@ pub struct Config {
     pub search_mcp_fetch_tool: Option<String>,
     pub search_fetch_top_n: usize,
     pub search_fetch_max_chars: usize,
+    pub search_github_mcp_command: Option<String>,
+    pub search_github_mcp_args: Vec<String>,
+    pub search_github_mcp_env: Vec<String>,
+    pub search_github_mcp_tools: Vec<String>,
     pub groq_api_key: String,
     pub groq_model: Option<String>,
     pub cerebras_api_key: String,
@@ -115,6 +119,16 @@ impl Config {
                 .or_else(|| Some("web_fetch_exa".to_string())),
             search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 2),
             search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
+            search_github_mcp_command: env_optional("SEARCH_GITHUB_MCP_COMMAND"),
+            search_github_mcp_args: env_args("SEARCH_GITHUB_MCP_ARGS"),
+            search_github_mcp_env: env_list_csv_or(
+                "SEARCH_GITHUB_MCP_ENV",
+                &["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+            ),
+            search_github_mcp_tools: env_list_csv_or(
+                "SEARCH_GITHUB_MCP_TOOLS",
+                &["search_issues", "search_code"],
+            ),
             groq_api_key: env_or("GROQ_API_KEY", ""),
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
@@ -391,17 +405,22 @@ fn env_optional(key: &str) -> Option<String> {
 }
 
 fn env_list_csv(name: &str) -> Vec<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    parse_csv_env(name).unwrap_or_default()
+}
+
+fn env_list_csv_or(name: &str, default: &[&str]) -> Vec<String> {
+    parse_csv_env(name).unwrap_or_else(|| default.iter().map(ToString::to_string).collect())
+}
+
+fn parse_csv_env(name: &str) -> Option<Vec<String>> {
+    std::env::var(name).ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    })
 }
 
 fn env_args(name: &str) -> Vec<String> {
@@ -447,6 +466,14 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            search_github_mcp_command: None,
+            search_github_mcp_args: Vec::new(),
+            search_github_mcp_env: vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+            ],
+            search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             groq_api_key: String::new(),
             groq_model: None,
             cerebras_api_key: String::new(),

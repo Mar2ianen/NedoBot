@@ -44,12 +44,9 @@ async fn search_with_mcp(
     config: &Config,
     query: &SearchQuery,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let command = config
-        .search_mcp_command
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("SEARCH_MCP_COMMAND is not configured"))?;
-    let mut child = spawn_mcp_process(config, command)?;
-    let result = run_mcp_flow(config, query, &mut child).await;
+    let process_config = McpProcessConfig::for_query(config, query)?;
+    let mut child = spawn_mcp_process(&process_config)?;
+    let result = run_mcp_flow(config, query, &process_config, &mut child).await;
 
     if let Err(err) = child.kill().await {
         tracing::debug!(%err, "failed to kill MCP child process after search");
@@ -58,17 +55,67 @@ async fn search_with_mcp(
     result
 }
 
-fn spawn_mcp_process(config: &Config, command: &str) -> anyhow::Result<Child> {
-    let mut process = Command::new(command);
+struct McpProcessConfig {
+    command: String,
+    args: Vec<String>,
+    env: Vec<String>,
+    tool_names: Vec<String>,
+    fetch_tool: Option<String>,
+}
+
+impl McpProcessConfig {
+    fn for_query(config: &Config, query: &SearchQuery) -> anyhow::Result<Self> {
+        if query.source == SearchSource::Github {
+            if let Some(command) = config.search_github_mcp_command.as_deref() {
+                return Ok(Self {
+                    command: command.to_string(),
+                    args: config.search_github_mcp_args.clone(),
+                    env: config.search_github_mcp_env.clone(),
+                    tool_names: github_tool_names(config),
+                    fetch_tool: None,
+                });
+            }
+        }
+
+        let command = config
+            .search_mcp_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("SEARCH_MCP_COMMAND is not configured"))?;
+
+        Ok(Self {
+            command: command.to_string(),
+            args: config.search_mcp_args.clone(),
+            env: config.search_mcp_env.clone(),
+            tool_names: vec![tool_name(config, query.source).to_string()],
+            fetch_tool: config.search_mcp_fetch_tool.clone(),
+        })
+    }
+}
+
+fn github_tool_names(config: &Config) -> Vec<String> {
+    config
+        .search_github_mcp_tools
+        .iter()
+        .filter(|tool| is_github_readonly_search_tool(tool))
+        .cloned()
+        .collect()
+}
+
+fn is_github_readonly_search_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "search_issues" | "search_code")
+}
+
+fn spawn_mcp_process(config: &McpProcessConfig) -> anyhow::Result<Child> {
+    let mut process = Command::new(&config.command);
     process
-        .args(&config.search_mcp_args)
+        .args(&config.args)
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    for name in &config.search_mcp_env {
+    for name in &config.env {
         if let Ok(value) = std::env::var(name) {
             process.env(name, value);
         }
@@ -80,6 +127,7 @@ fn spawn_mcp_process(config: &Config, command: &str) -> anyhow::Result<Child> {
 async fn run_mcp_flow(
     config: &Config,
     query: &SearchQuery,
+    process_config: &McpProcessConfig,
     child: &mut Child,
 ) -> anyhow::Result<Vec<SearchResult>> {
     let mut stdin = child
@@ -96,23 +144,36 @@ async fn run_mcp_flow(
     read_json_line(&mut stdout).await?;
 
     write_json_line(&mut stdin, &initialized_notification()).await?;
-    write_json_line(&mut stdin, &search_call_request(config, query)).await?;
-    let response = read_json_line(&mut stdout).await?;
-    let mut results = parse_mcp_tool_response(query.source, &response)?;
 
-    if let Some(fetch_tool) = config.search_mcp_fetch_tool.as_deref() {
+    let mut results = Vec::new();
+    let mut request_id = 2;
+    for tool_name in &process_config.tool_names {
+        write_json_line(
+            &mut stdin,
+            &tools_call_request(request_id, tool_name, tool_arguments(tool_name, query)),
+        )
+        .await?;
+        request_id += 1;
+
+        let response = read_json_line(&mut stdout).await?;
+        results.extend(parse_mcp_tool_response(query.source, &response)?);
+    }
+
+    if let Some(fetch_tool) = process_config.fetch_tool.as_deref() {
         let urls = fetch_urls(&results, config.search_fetch_top_n);
-        for (index, url) in urls.iter().enumerate() {
+        for url in &urls {
             write_json_line(
                 &mut stdin,
                 &fetch_call_request(
-                    3 + index as u64,
+                    request_id,
                     fetch_tool,
                     std::slice::from_ref(url),
                     config.search_fetch_max_chars,
                 ),
             )
             .await?;
+            request_id += 1;
+
             let response = read_json_line(&mut stdout).await?;
             let mut fetched_results = parse_mcp_tool_response(query.source, &response)?;
             attach_requested_url(&mut fetched_results, url);
@@ -144,12 +205,6 @@ fn initialized_notification() -> Value {
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     })
-}
-
-fn search_call_request(config: &Config, query: &SearchQuery) -> Value {
-    let tool_name = tool_name(config, query.source);
-
-    tools_call_request(2, tool_name, tool_arguments(tool_name, query))
 }
 
 fn fetch_call_request(id: u64, tool_name: &str, urls: &[String], max_chars: usize) -> Value {
@@ -331,9 +386,10 @@ fn parse_tool_output(source: SearchSource, text: &str) -> anyhow::Result<Vec<Sea
         Some(items) => items,
         None => value
             .get("results")
+            .or_else(|| value.get("items"))
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                anyhow::anyhow!("MCP tool output must be array or object with results")
+                anyhow::anyhow!("MCP tool output must be array or object with results/items")
             })?,
     };
 
@@ -410,17 +466,11 @@ fn parse_text_result(source: SearchSource, block: &str) -> Option<SearchResult> 
 
 fn parse_result(source: SearchSource, item: &Value) -> Option<SearchResult> {
     let title = truncate_chars(
-        item.get("title")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim(),
+        first_text_field(item, &["title", "name", "full_name"]),
         MAX_RESULT_TITLE_CHARS,
     );
     let snippet = truncate_chars(
-        item.get("snippet")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim(),
+        first_text_field(item, &["snippet", "body", "description", "text", "content"]),
         MAX_RESULT_SNIPPET_CHARS,
     );
 
@@ -431,14 +481,32 @@ fn parse_result(source: SearchSource, item: &Value) -> Option<SearchResult> {
     Some(SearchResult {
         source,
         title,
-        url: item
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
+        url: first_text_field(item, &["html_url", "url"]).to_string(),
         snippet,
     })
+}
+
+fn first_text_field<'a>(item: &'a Value, fields: &[&str]) -> &'a str {
+    for field in fields {
+        if let Some(value) = item.get(*field).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+
+    if fields.contains(&"full_name") {
+        if let Some(value) = item
+            .get("repository")
+            .and_then(|repository| repository.get("full_name"))
+            .and_then(Value::as_str)
+        {
+            return value.trim();
+        }
+    }
+
+    ""
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -463,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn github_tool_uses_per_page_argument() {
+    fn github_repository_tool_uses_per_page_argument() {
         let query = SearchQuery {
             source: SearchSource::Github,
             text: "tokio release".to_string(),
@@ -472,6 +540,35 @@ mod tests {
         assert_eq!(
             tool_arguments("search_repositories", &query),
             json!({"query":"tokio release","perPage":5})
+        );
+    }
+
+    #[test]
+    fn github_issue_tool_uses_q_argument() {
+        let query = SearchQuery {
+            source: SearchSource::Github,
+            text: "ripgrep release changelog".to_string(),
+        };
+
+        assert_eq!(
+            tool_arguments("search_issues", &query),
+            json!({"q":"ripgrep release changelog","per_page":5})
+        );
+    }
+
+    #[test]
+    fn github_tool_names_keep_only_readonly_search_tools() {
+        let mut config = Config::from_env();
+        config.search_github_mcp_tools = vec![
+            "search_issues".to_string(),
+            "create_issue".to_string(),
+            "search_code".to_string(),
+            "push_files".to_string(),
+        ];
+
+        assert_eq!(
+            github_tool_names(&config),
+            vec!["search_issues".to_string(), "search_code".to_string()]
         );
     }
 
@@ -569,6 +666,56 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source, SearchSource::Github);
         assert_eq!(results[0].title, "Issue");
+    }
+
+    #[test]
+    fn parses_github_items_results() {
+        let output = r#"{
+            "total_count": 1,
+            "items": [
+                {
+                    "html_url": "https://github.com/BurntSushi/ripgrep/issues/2658",
+                    "title": "Release 15.0.0 changelog",
+                    "body": "Tracking issue for the release notes and changelog.",
+                    "state": "closed",
+                    "repository": { "full_name": "BurntSushi/ripgrep" }
+                }
+            ],
+            "search_type": "lexical"
+        }"#;
+
+        let results = parse_tool_output(SearchSource::Github, output).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, SearchSource::Github);
+        assert_eq!(results[0].title, "Release 15.0.0 changelog");
+        assert_eq!(
+            results[0].url,
+            "https://github.com/BurntSushi/ripgrep/issues/2658"
+        );
+        assert!(results[0].snippet.contains("release notes"));
+    }
+
+    #[test]
+    fn parses_github_code_items_with_repository_title_fallback() {
+        let output = r#"{
+            "items": [
+                {
+                    "html_url": "https://github.com/org/repo/blob/main/CHANGELOG.md",
+                    "text_matches": [],
+                    "repository": { "full_name": "org/repo" }
+                }
+            ]
+        }"#;
+
+        let results = parse_tool_output(SearchSource::Github, output).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "org/repo");
+        assert_eq!(
+            results[0].url,
+            "https://github.com/org/repo/blob/main/CHANGELOG.md"
+        );
     }
 
     #[test]
