@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Context;
 use sqlx::PgPool;
 use tg_ai_bot_teloxide::{
@@ -58,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     migrate(&pool).await?;
 
     let notes = load_memory_notes(&pool, args.limit).await?;
-    let groups = build_archive_groups(notes, args.min_overlap);
+    let groups = build_archive_groups(&config, notes, args.min_overlap).await?;
     println!(
         "archive groups: {} mode={}",
         groups.len(),
@@ -178,7 +180,170 @@ async fn load_memory_notes(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<Memo
         .collect())
 }
 
-fn build_archive_groups(notes: Vec<MemoryRow>, min_overlap: usize) -> Vec<ArchiveGroup> {
+async fn build_archive_groups(
+    config: &Config,
+    notes: Vec<MemoryRow>,
+    min_overlap: usize,
+) -> anyhow::Result<Vec<ArchiveGroup>> {
+    let by_id = notes
+        .iter()
+        .cloned()
+        .map(|note| (note.id, note))
+        .collect::<HashMap<_, _>>();
+
+    let mut groups = match plan_archive_groups_with_llm(config, &notes).await {
+        Ok(plan) => materialize_llm_plan(plan, &by_id),
+        Err(err) => {
+            tracing::warn!(%err, "LLM archive planner failed, falling back to keyword grouping");
+            heuristic_archive_groups(notes.clone(), min_overlap)
+        }
+    };
+
+    let used_ids = groups
+        .iter()
+        .flat_map(|group| {
+            std::iter::once(group.keeper.id).chain(group.merged.iter().map(|note| note.id))
+        })
+        .collect::<HashSet<_>>();
+    groups.extend(bloated_single_groups(notes, &used_ids));
+
+    Ok(groups)
+}
+
+#[derive(Debug)]
+struct ArchivePlanGroup {
+    keeper_id: i64,
+    merge_ids: Vec<i64>,
+}
+
+async fn plan_archive_groups_with_llm(
+    config: &Config,
+    notes: &[MemoryRow],
+) -> anyhow::Result<Vec<ArchivePlanGroup>> {
+    if notes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let prompt = build_archive_plan_prompt(notes);
+    let generated = generate_text(
+        config,
+        &prompt,
+        None,
+        0.1,
+        config.memory_llm_max_tokens.max(700),
+    )
+    .await?;
+
+    Ok(parse_archive_plan(&generated.content))
+}
+
+fn build_archive_plan_prompt(notes: &[MemoryRow]) -> String {
+    let notes = notes
+        .iter()
+        .map(|note| {
+            format!(
+                "ID: {}\nTITLE: {}\nKEYWORDS: {}\nSUMMARY: {}\nCAUTIONS: {}",
+                note.id,
+                note.title,
+                note.keywords.join(", "),
+                note.summary,
+                note.cautions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    format!(
+        r#"Ты LLM-архивариус RAG-памяти техно-новостей НедоNews.
+Твоя задача: найти заметки, которые стоит реструктурировать: слить в одну устойчивую RAG-запись или оставить отдельно.
+
+Группируй только если заметки реально про одну долгоживущую тему, повторяющийся факт/тренд или одну цепочку событий.
+Не группируй просто потому, что совпал бренд: Intel, Microsoft, Sony, Nvidia и т.п.
+Не группируй разные новости о памяти, если это разные рынки/компании/технологии и из них нельзя сделать одну аккуратную заметку.
+Не выдумывай ID. Используй только ID из списка.
+Если хороших групп нет, верни только NO_GROUPS.
+
+Формат ответа строго построчный:
+GROUP: keeper_id=<ID> merge_ids=<ID,ID,...>
+
+Где keeper_id — лучшая базовая заметка, merge_ids — заметки, которые надо удалить после слияния в keeper.
+Не добавляй объяснений.
+
+Заметки:
+{notes}"#
+    )
+}
+
+fn parse_archive_plan(raw: &str) -> Vec<ArchivePlanGroup> {
+    raw.lines()
+        .filter_map(parse_archive_plan_line)
+        .collect::<Vec<_>>()
+}
+
+fn parse_archive_plan_line(line: &str) -> Option<ArchivePlanGroup> {
+    let line = line.trim();
+    if line.eq_ignore_ascii_case("NO_GROUPS") || !line.starts_with("GROUP:") {
+        return None;
+    }
+
+    let keeper_id = field_after(line, "keeper_id=")?.parse().ok()?;
+    let merge_ids = field_after(line, "merge_ids=")?
+        .split(',')
+        .filter_map(|value| value.trim().parse::<i64>().ok())
+        .filter(|id| *id != keeper_id)
+        .collect::<Vec<_>>();
+
+    (!merge_ids.is_empty()).then_some(ArchivePlanGroup {
+        keeper_id,
+        merge_ids,
+    })
+}
+
+fn field_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find(' ').unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+fn materialize_llm_plan(
+    plan: Vec<ArchivePlanGroup>,
+    by_id: &HashMap<i64, MemoryRow>,
+) -> Vec<ArchiveGroup> {
+    let mut used_ids = HashSet::new();
+    let mut groups = Vec::new();
+
+    for planned in plan {
+        if used_ids.contains(&planned.keeper_id) {
+            continue;
+        }
+        let Some(keeper) = by_id.get(&planned.keeper_id).cloned() else {
+            continue;
+        };
+
+        let mut merged = Vec::new();
+        for merge_id in planned.merge_ids {
+            if used_ids.contains(&merge_id) {
+                continue;
+            }
+            if let Some(note) = by_id.get(&merge_id).cloned() {
+                used_ids.insert(merge_id);
+                merged.push(note);
+            }
+        }
+
+        if merged.is_empty() {
+            continue;
+        }
+
+        used_ids.insert(keeper.id);
+        groups.push(ArchiveGroup { keeper, merged });
+    }
+
+    groups
+}
+
+fn heuristic_archive_groups(notes: Vec<MemoryRow>, min_overlap: usize) -> Vec<ArchiveGroup> {
     let mut remaining = notes;
     let mut groups = Vec::new();
 
@@ -194,10 +359,7 @@ fn build_archive_groups(notes: Vec<MemoryRow>, min_overlap: usize) -> Vec<Archiv
             }
         }
 
-        let keeper_needs_compaction = keeper.summary.chars().count() > MAX_ARCHIVED_SUMMARY_CHARS
-            || keeper.cautions.chars().count() > MAX_ARCHIVED_CAUTIONS_CHARS;
-
-        if !merged.is_empty() || keeper_needs_compaction {
+        if !merged.is_empty() {
             groups.push(ArchiveGroup { keeper, merged });
         }
 
@@ -205,6 +367,21 @@ fn build_archive_groups(notes: Vec<MemoryRow>, min_overlap: usize) -> Vec<Archiv
     }
 
     groups
+}
+
+fn bloated_single_groups(notes: Vec<MemoryRow>, used_ids: &HashSet<i64>) -> Vec<ArchiveGroup> {
+    notes
+        .into_iter()
+        .filter(|note| !used_ids.contains(&note.id))
+        .filter(|note| {
+            note.summary.chars().count() > MAX_ARCHIVED_SUMMARY_CHARS
+                || note.cautions.chars().count() > MAX_ARCHIVED_CAUTIONS_CHARS
+        })
+        .map(|keeper| ArchiveGroup {
+            keeper,
+            merged: Vec::new(),
+        })
+        .collect()
 }
 
 async fn archive_group(
