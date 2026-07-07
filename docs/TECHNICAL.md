@@ -157,6 +157,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `SEARCH_GITHUB_MCP_COMMAND` / `SEARCH_GITHUB_MCP_ARGS` включают отдельный GitHub MCP server для запросов `source=github`; если они не заданы, GitHub-запросы идут через основной `SEARCH_MCP_TOOL_GITHUB`.
 - `SEARCH_GITHUB_MCP_ENV` по умолчанию пропускает только `PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN`; значения не логируются.
 - `SEARCH_GITHUB_MCP_TOOLS` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
+- Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
 - Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
 - Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.

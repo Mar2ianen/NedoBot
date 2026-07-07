@@ -1,6 +1,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -181,6 +182,17 @@ async fn run_mcp_flow(
         }
     }
 
+    if query.source == SearchSource::Github && process_config.fetch_tool.is_none() {
+        enrich_github_results(
+            &mut stdin,
+            &mut stdout,
+            &mut request_id,
+            &mut results,
+            config.search_fetch_top_n,
+        )
+        .await;
+    }
+
     Ok(results)
 }
 
@@ -260,6 +272,39 @@ fn tool_arguments(tool_name: &str, query: &SearchQuery) -> Value {
     }
 }
 
+fn github_fetch_call_request(id: u64, resource: &GithubResource) -> Value {
+    match resource {
+        GithubResource::Issue {
+            owner,
+            repo,
+            issue_number,
+        } => tools_call_request(
+            id,
+            "get_issue",
+            json!({
+                "owner": owner,
+                "repo": repo,
+                "issue_number": issue_number
+            }),
+        ),
+        GithubResource::File {
+            owner,
+            repo,
+            path,
+            reference,
+        } => tools_call_request(
+            id,
+            "get_file_contents",
+            json!({
+                "owner": owner,
+                "repo": repo,
+                "path": path,
+                "ref": reference
+            }),
+        ),
+    }
+}
+
 fn fetch_tool_arguments(tool_name: &str, urls: &[String], max_chars: usize) -> Value {
     match tool_name {
         "web_fetch_exa" => json!({
@@ -308,6 +353,53 @@ fn enrich_results_with_fetch(results: &mut Vec<SearchResult>, fetched_results: V
             results.push(fetched);
         }
     }
+}
+
+async fn enrich_github_results(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    request_id: &mut u64,
+    results: &mut [SearchResult],
+    top_n: usize,
+) {
+    let resources = github_resources(results, top_n);
+    for (index, resource) in resources {
+        if let Err(err) =
+            write_json_line(stdin, &github_fetch_call_request(*request_id, &resource)).await
+        {
+            tracing::debug!(%err, "failed to write GitHub MCP fetch request");
+            return;
+        }
+        *request_id += 1;
+
+        let response = match read_json_line(stdout).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::debug!(%err, "failed to read GitHub MCP fetch response");
+                return;
+            }
+        };
+
+        if let Some(fetched_text) = extract_github_fetch_text(&response) {
+            append_fetch_snippet(&mut results[index], &fetched_text);
+        }
+    }
+}
+
+fn github_resources(results: &[SearchResult], top_n: usize) -> Vec<(usize, GithubResource)> {
+    let mut resources = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        let Some(resource) = parse_github_resource_url(&result.url) else {
+            continue;
+        };
+
+        resources.push((index, resource));
+        if resources.len() >= top_n {
+            break;
+        }
+    }
+
+    resources
 }
 
 fn append_fetch_snippet(result: &mut SearchResult, fetched_snippet: &str) {
@@ -486,6 +578,139 @@ fn parse_result(source: SearchSource, item: &Value) -> Option<SearchResult> {
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GithubResource {
+    Issue {
+        owner: String,
+        repo: String,
+        issue_number: u64,
+    },
+    File {
+        owner: String,
+        repo: String,
+        path: String,
+        reference: String,
+    },
+}
+
+fn parse_github_resource_url(url: &str) -> Option<GithubResource> {
+    let path = url
+        .trim()
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.trim().strip_prefix("http://github.com/"))?;
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let owner = parts[0].to_string();
+    let repo = parts[1].to_string();
+    match parts[2] {
+        "issues" | "pull" => {
+            parts[3]
+                .parse::<u64>()
+                .ok()
+                .map(|issue_number| GithubResource::Issue {
+                    owner,
+                    repo,
+                    issue_number,
+                })
+        }
+        "blob" if parts.len() >= 5 => Some(GithubResource::File {
+            owner,
+            repo,
+            reference: parts[3].to_string(),
+            path: parts[4..].join("/"),
+        }),
+        _ => None,
+    }
+}
+
+fn extract_github_fetch_text(response: &Value) -> Option<String> {
+    let mut texts = Vec::new();
+    for item in response
+        .pointer("/result/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(text) = item.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        texts.push(extract_github_text_block(text));
+    }
+
+    let joined = texts
+        .into_iter()
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.trim().is_empty()).then(|| truncate_chars(joined.trim(), MAX_RESULT_SNIPPET_CHARS))
+}
+
+fn extract_github_text_block(text: &str) -> String {
+    let trimmed = text.trim();
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return truncate_chars(trimmed, MAX_RESULT_SNIPPET_CHARS);
+    };
+
+    let mut fields = Vec::new();
+    collect_github_text_fields(&value, &mut fields);
+    fields
+        .into_iter()
+        .filter_map(normalize_github_text_field)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_github_text_fields(value: &Value, fields: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "body" | "description" | "text" | "content") {
+                    if let Some(text) = value.as_str() {
+                        fields.push(text.to_string());
+                    }
+                }
+                collect_github_text_fields(value, fields);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_github_text_fields(item, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_github_text_field(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if looks_like_base64(trimmed) {
+        if let Ok(decoded) = BASE64.decode(trimmed.replace('\n', "")) {
+            if let Ok(decoded_text) = String::from_utf8(decoded) {
+                return Some(truncate_chars(
+                    decoded_text.trim(),
+                    MAX_RESULT_SNIPPET_CHARS,
+                ));
+            }
+        }
+    }
+
+    Some(truncate_chars(trimmed, MAX_RESULT_SNIPPET_CHARS))
+}
+
+fn looks_like_base64(text: &str) -> bool {
+    text.len() >= 40
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '\n' | '\r'))
+}
+
 fn first_text_field<'a>(item: &'a Value, fields: &[&str]) -> &'a str {
     for field in fields {
         if let Some(value) = item.get(*field).and_then(Value::as_str) {
@@ -570,6 +795,83 @@ mod tests {
             github_tool_names(&config),
             vec!["search_issues".to_string(), "search_code".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_github_issue_url() {
+        assert_eq!(
+            parse_github_resource_url("https://github.com/BurntSushi/ripgrep/issues/2658"),
+            Some(GithubResource::Issue {
+                owner: "BurntSushi".to_string(),
+                repo: "ripgrep".to_string(),
+                issue_number: 2658,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_github_pull_url_as_issue_resource() {
+        assert_eq!(
+            parse_github_resource_url("https://github.com/BurntSushi/ripgrep/pull/3456"),
+            Some(GithubResource::Issue {
+                owner: "BurntSushi".to_string(),
+                repo: "ripgrep".to_string(),
+                issue_number: 3456,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_github_blob_url() {
+        assert_eq!(
+            parse_github_resource_url(
+                "https://github.com/BurntSushi/ripgrep/blob/master/CHANGELOG.md"
+            ),
+            Some(GithubResource::File {
+                owner: "BurntSushi".to_string(),
+                repo: "ripgrep".to_string(),
+                reference: "master".to_string(),
+                path: "CHANGELOG.md".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn extracts_github_fetch_text_from_json_content() {
+        let response = json!({
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": r#"{"content":"IyBDaGFuZ2Vsb2cKCi0gUmVsZWFzZSBub3RlcyBmb3IgdjE1"}"#
+                }]
+            }
+        });
+
+        let text = extract_github_fetch_text(&response).unwrap();
+
+        assert!(text.contains("# Changelog"));
+        assert!(text.contains("Release notes"));
+    }
+
+    #[test]
+    fn github_resources_keeps_top_n_parseable_urls() {
+        let results = vec![
+            SearchResult {
+                source: SearchSource::Github,
+                title: "CHANGELOG.md".to_string(),
+                url: "https://github.com/org/repo/blob/main/CHANGELOG.md".to_string(),
+                snippet: String::new(),
+            },
+            SearchResult {
+                source: SearchSource::Github,
+                title: "Issue".to_string(),
+                url: "https://github.com/org/repo/issues/7".to_string(),
+                snippet: String::new(),
+            },
+        ];
+
+        assert_eq!(github_resources(&results, 1).len(), 1);
+        assert_eq!(github_resources(&results, 2).len(), 2);
     }
 
     #[test]
