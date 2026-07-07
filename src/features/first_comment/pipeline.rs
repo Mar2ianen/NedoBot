@@ -10,7 +10,7 @@ use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
-    mark_post_comment_sent,
+    load_topic_bot_comments, mark_post_comment_sent,
 };
 use crate::features::memory::service::{load_relevant_memory_notes, remember_post};
 use crate::features::search::repo::insert_search_run;
@@ -75,6 +75,7 @@ pub async fn maybe_comment_post(
     let chat_member_count = get_chat_member_count(bot, config).await;
     let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
+    let topic_comments = load_topic_bot_comments(pool, &clean_post).await?;
     let search_context = run_search(config, &clean_post).await;
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
@@ -84,6 +85,7 @@ pub async fn maybe_comment_post(
         chat_member_count,
         &memory_notes,
         &recent_comments,
+        &topic_comments,
         config.search_enabled.then_some(&search_context),
     );
     let generation = generate_text_checked(
