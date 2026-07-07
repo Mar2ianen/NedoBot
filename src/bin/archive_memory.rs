@@ -13,6 +13,7 @@ const DEFAULT_MIN_OVERLAP: usize = 4;
 const MAX_ARCHIVED_SUMMARY_CHARS: usize = 360;
 const MAX_ARCHIVED_CAUTIONS_CHARS: usize = 180;
 const MAX_ARCHIVED_KEYWORDS: usize = 12;
+const BROAD_ARCHIVE_MIN_KEYWORD_OVERLAP: usize = 8;
 
 #[derive(Debug)]
 struct Args {
@@ -332,6 +333,13 @@ fn materialize_llm_plan(
                 continue;
             }
             if let Some(note) = by_id.get(&merge_id).cloned() {
+                if keeper.merged_source_posts > 3
+                    && keyword_overlap(&keeper.keywords, &note.keywords)
+                        < BROAD_ARCHIVE_MIN_KEYWORD_OVERLAP
+                {
+                    continue;
+                }
+
                 used_ids.insert(merge_id);
                 merged.push(note);
             }
