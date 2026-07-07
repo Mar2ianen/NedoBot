@@ -14,7 +14,7 @@ use tg_ai_bot_teloxide::{
             render::build_comment_html,
             repo::{
                 LlmGenerationInsert, insert_llm_generation, load_recent_bot_comments,
-                mark_post_comment_sent,
+                load_topic_bot_comments, mark_post_comment_sent,
             },
         },
         memory::service::{load_relevant_memory_notes, remember_post},
@@ -143,11 +143,13 @@ async fn retry_job(
 ) -> anyhow::Result<i32> {
     let memory_notes = load_relevant_memory_notes(pool, &job.cleaned_post_text).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
+    let topic_comments = load_topic_bot_comments(pool, &job.cleaned_post_text).await?;
     let prompt = build_llm_prompt(
         &job.cleaned_post_text,
         None,
         &memory_notes,
         &recent_comments,
+        &topic_comments,
         None,
     );
     let generation = generate_text_checked(

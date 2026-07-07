@@ -298,7 +298,7 @@ fn merge_keywords(mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
     left
 }
 
-fn extract_keywords(text: &str) -> Vec<String> {
+pub(crate) fn extract_keywords(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
     let mut keywords = Vec::new();
 
