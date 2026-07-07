@@ -195,8 +195,7 @@ fn build_archive_groups(notes: Vec<MemoryRow>, min_overlap: usize) -> Vec<Archiv
         }
 
         let keeper_needs_compaction = keeper.summary.chars().count() > MAX_ARCHIVED_SUMMARY_CHARS
-            || keeper.cautions.chars().count() > MAX_ARCHIVED_CAUTIONS_CHARS
-            || keeper.keywords.len() > MAX_ARCHIVED_KEYWORDS;
+            || keeper.cautions.chars().count() > MAX_ARCHIVED_CAUTIONS_CHARS;
 
         if !merged.is_empty() || keeper_needs_compaction {
             groups.push(ArchiveGroup { keeper, merged });
