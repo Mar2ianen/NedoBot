@@ -167,7 +167,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 ```env
 SEARCH_ENABLED=true
 SEARCH_MCP_COMMAND=npx
-SEARCH_MCP_ARGS=-y mcp-remote https://mcp.exa.ai/mcp
+SEARCH_MCP_ARGS="-y mcp-remote https://mcp.exa.ai/mcp"
 SEARCH_MCP_ENV=PATH,HOME
 SEARCH_MCP_TIMEOUT_SEC=30
 SEARCH_MCP_TOOL_WEB=web_search_exa
@@ -183,7 +183,7 @@ SEARCH_FETCH_MAX_CHARS=6000
 ```env
 GITHUB_PERSONAL_ACCESS_TOKEN=
 SEARCH_GITHUB_MCP_COMMAND=npx
-SEARCH_GITHUB_MCP_ARGS=-y @modelcontextprotocol/server-github
+SEARCH_GITHUB_MCP_ARGS="-y @modelcontextprotocol/server-github"
 SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
 SEARCH_GITHUB_MCP_TOOLS=search_issues,search_code
 ```
