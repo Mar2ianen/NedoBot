@@ -375,6 +375,7 @@ mod tests {
             owner_telegram_id: None,
             send_owner_preview: false,
             comment_custom_emoji_id: None,
+            first_comment_max_image_mb: 10,
             tech_custom_emoji_id: None,
             amd_custom_emoji_id: None,
             radeon_custom_emoji_id: None,

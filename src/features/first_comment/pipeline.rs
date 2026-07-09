@@ -65,7 +65,7 @@ pub async fn maybe_comment_post(
         return Ok(());
     };
 
-    let image_base64 = match download_largest_photo_base64(bot, msg).await {
+    let image_base64 = match download_largest_photo_base64(bot, msg, config).await {
         Ok(image) => image,
         Err(err) => {
             tracing::warn!(%err, "failed to download post image, continue text-only");
@@ -196,6 +196,7 @@ async fn send_owner_preview(
 async fn download_largest_photo_base64(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
+    config: &Config,
 ) -> anyhow::Result<Option<String>> {
     let Some(photo) = msg
         .photo()
@@ -205,6 +206,13 @@ async fn download_largest_photo_base64(
     };
 
     let file = bot.get_file(photo.file.id.clone()).await?;
+    let max_bytes = u64::from(config.first_comment_max_image_mb) * 1024 * 1024;
+    if u64::from(file.size) > max_bytes {
+        anyhow::bail!(
+            "post image exceeds configured limit of {} MB",
+            config.first_comment_max_image_mb
+        );
+    }
     let mut bytes = Vec::new();
     bot.download_file(&file.path, &mut bytes).await?;
 
