@@ -25,10 +25,10 @@ pub async fn cleanup_transcript(
         }
     };
 
-    let clean = parse_cleanup_json(&content).or_else(|err| {
-        tracing::warn!(%err, "failed to parse voice cleanup JSON, using plain LLM text");
-        Ok::<CleanTranscript, anyhow::Error>(plain_cleanup(&content))
-    })?;
+    let clean = parse_cleanup_json(&content).unwrap_or_else(|err| {
+        tracing::warn!(%err, "failed to parse voice cleanup JSON, using raw ASR transcript");
+        plain_cleanup(&transcript.text)
+    });
 
     Ok(normalize_cleanup(
         clean,
