@@ -4,6 +4,58 @@ const MAX_SENTENCE_MARKS: usize = 2;
 const MIN_WORDS: usize = 5;
 const MIN_CYRILLIC_CHARS: usize = 8;
 
+const NUMBER_WORDS: &[&str] = &[
+    "ноль",
+    "один",
+    "одна",
+    "одно",
+    "два",
+    "две",
+    "три",
+    "четыре",
+    "пять",
+    "шесть",
+    "семь",
+    "восемь",
+    "девять",
+    "десять",
+    "одиннадцать",
+    "двенадцать",
+    "тринадцать",
+    "четырнадцать",
+    "пятнадцать",
+    "шестнадцать",
+    "семнадцать",
+    "восемнадцать",
+    "девятнадцать",
+    "двадцать",
+    "тридцать",
+    "сорок",
+    "пятьдесят",
+    "шестьдесят",
+    "семьдесят",
+    "восемьдесят",
+    "девяносто",
+    "сто",
+    "двести",
+    "триста",
+    "четыреста",
+    "пятьсот",
+    "шестьсот",
+    "семьсот",
+    "восемьсот",
+    "девятьсот",
+    "тысяча",
+    "тысячи",
+    "тысяч",
+    "миллион",
+    "миллиона",
+    "миллионов",
+    "миллиард",
+    "миллиарда",
+    "миллиардов",
+];
+
 const VICTIM_PHRASES: &[&str] = &[
     "из нас последнее",
     "из нас выжимают",
@@ -108,6 +160,9 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!("first comment sounds like a victim complaint: {phrase}");
     }
+    if let Some(word) = find_number_word(&lower) {
+        anyhow::bail!("first comment writes a number as a word: {word}");
+    }
 
     let has_substantive_cyrillic_word = visible.split_whitespace().any(|word| {
         word.chars()
@@ -138,6 +193,12 @@ struct PlaceholderScan {
 fn ends_with_forbidden_final_punctuation(text: &str) -> bool {
     let trimmed = text.trim_end();
     trimmed.ends_with('.') || trimmed.ends_with('…')
+}
+
+fn find_number_word(text: &str) -> Option<&'static str> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_alphabetic()))
+        .find_map(|word| NUMBER_WORDS.iter().copied().find(|number| word == *number))
 }
 
 fn scan_chat_link_placeholders(text: &str) -> anyhow::Result<PlaceholderScan> {
@@ -272,6 +333,24 @@ mod tests {
             validate_comment_output("ИИ опять выжимает из нас последнее. Прайсы в {CHAT_LINK}")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_numbers_written_as_words() {
+        assert!(
+            validate_comment_output(
+                "Двадцать процентов неизвестных ОС выглядят как побег в инкогнито. Аналитика в {CHAT_LINK:обсуждении}",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_numbers_written_as_digits() {
+        validate_comment_output(
+            "21,45% неизвестных ОС выглядят как побег в инкогнито. Linux с 4,36% в {CHAT_LINK:обсуждении}",
+        )
+        .unwrap();
     }
 
     #[test]
