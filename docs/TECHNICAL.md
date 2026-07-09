@@ -67,14 +67,15 @@ DATABASE_URL=postgres://tg_ai_bot:tg_ai_bot@localhost:5432/tg_ai_bot
 SOURCE_CHANNEL_ID=-1001575496091
 DISCUSSION_CHAT_ID=-1001932061163
 CHAT_INVITE_URL=https://t.me/+RxmPtw7Bs-IxNzEy
-CHAT_INVITE_LABEL=чате
+CHAT_INVITE_LABEL=Присоединяйтесь к чату
 POST_SIGNATURE_MARKER=Не теряем связь
 
 LLM_PROVIDER=gemini
 LLM_MODEL=gemini-3.5-flash
 LLM_SUPPORTS_IMAGES=true
-LLM_TEMPERATURE=0.35
+LLM_TEMPERATURE=0.45
 LLM_MAX_TOKENS=90
+LLM_PROXY_URL=
 MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
 
@@ -107,7 +108,11 @@ OPENROUTER_MODEL=
 GEMINI_API_KEY=
 GEMINI_TEXT_MODEL=gemini-3.5-flash
 GEMINI_FLASH_MODEL=gemini-3.1-flash-lite
+GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 GEMINI_THINKING_BUDGET=1024
+
+PUBLIC_BASE_URL=
+STATIC_FILES_DIR=/opt/tg-ai-bot-teloxide/static
 LLM_PROXY_URL=
 OLLAMA_API_KEY=
 OLLAMA_BASE_URL=https://ollama.com
@@ -337,10 +342,14 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /emojiids
 /format_test <текст поста>
 /memory
+/status day|week|month [-r|-p]
 /stats_day
 /stats_week
 /stats_month
+/topmsg [-r|-p]
+/topreact [-r|-p]
 /userstats <id|username>
+/userstatus <id|username> [-r|-p]
 ```
 
 В группах лучше писать с username:
