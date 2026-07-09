@@ -22,6 +22,7 @@ const CEREBRAS_OPENAI_BASE_URL: &str = "https://api.cerebras.ai/v1";
 const OPENROUTER_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const VALIDATION_RETRY_ATTEMPTS: usize = 1;
 
+#[allow(dead_code)]
 pub async fn generate_text(
     config: &Config,
     prompt: &str,
@@ -32,6 +33,7 @@ pub async fn generate_text(
     generate_text_checked(config, prompt, image_base64, temperature, num_predict, None).await
 }
 
+#[allow(dead_code)]
 pub async fn generate_text_checked(
     config: &Config,
     prompt: &str,
@@ -65,12 +67,35 @@ pub async fn generate_text_with_provider(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<GeneratedText> {
+    generate_text_with_provider_and_system(
+        config,
+        provider_override,
+        model_override,
+        None,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+    )
+    .await
+}
+
+pub async fn generate_text_with_provider_and_system(
+    config: &Config,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
             provider_override,
             model_override,
-            system_prompt: None,
+            system_prompt,
             prompt,
             image_base64,
             temperature,
