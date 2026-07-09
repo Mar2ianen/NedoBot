@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
-use crate::features::first_comment::prompt::build_llm_prompt;
+use crate::features::first_comment::prompt::build_llm_prompt_parts;
 use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::first_comment::repo::{
@@ -16,7 +16,7 @@ use crate::features::memory::service::{load_relevant_memory_notes, remember_post
 use crate::features::search::repo::insert_search_run;
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
-use crate::llm::service::generate_text_checked;
+use crate::llm::service::generate_text_checked_with_system;
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
@@ -80,7 +80,7 @@ pub async fn maybe_comment_post(
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
-    let prompt = build_llm_prompt(
+    let prompt = build_llm_prompt_parts(
         &clean_post,
         chat_member_count,
         &memory_notes,
@@ -88,15 +88,17 @@ pub async fn maybe_comment_post(
         &topic_comments,
         config.search_enabled.then_some(&search_context),
     );
-    let generation = generate_text_checked(
+    let generation = generate_text_checked_with_system(
         config,
-        &prompt,
+        &prompt.system,
+        &prompt.user,
         image_base64.as_deref(),
         config.llm_temperature,
         config.llm_max_tokens,
         Some(validate_comment_output),
     )
     .await?;
+    let prompt_for_log = prompt.combined_for_log();
     let final_html = build_comment_html(&generation.content, config);
     ensure_comment_html(&final_html, &generation.content)?;
 
@@ -109,7 +111,7 @@ pub async fn maybe_comment_post(
             job_id,
             provider: &generation.provider,
             model: &generation.model,
-            prompt: &prompt,
+            prompt: &prompt_for_log,
             image_used: generation.image_used,
             response: &generation.content,
             final_html: &final_html,

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 #[derive(Clone, Copy)]
 pub struct LlmRequest<'a> {
     pub model: &'a str,
+    pub system_prompt: Option<&'a str>,
     pub prompt: &'a str,
     pub image_base64: Option<&'a str>,
     pub temperature: f32,

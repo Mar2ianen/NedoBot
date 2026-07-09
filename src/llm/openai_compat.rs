@@ -32,12 +32,21 @@ impl LlmClient for OpenAiCompatClient<'_> {
             anyhow::bail!("OpenAI-compatible API key is empty");
         }
 
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = request.system_prompt {
+            messages.push(ChatMessage {
+                role: "system",
+                content: MessageContent::Text(system_prompt),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user",
+            content: user_content(request.prompt, request.image_base64),
+        });
+
         let body = ChatCompletionRequest {
             model: request.model,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: user_content(request.prompt, request.image_base64),
-            }],
+            messages,
             temperature: request.temperature,
             max_completion_tokens: request.num_predict,
         };

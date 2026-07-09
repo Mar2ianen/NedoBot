@@ -20,13 +20,23 @@ impl<'a> OllamaClient<'a> {
 impl LlmClient for OllamaClient<'_> {
     async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
         let images = request.image_base64.into_iter().collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = request.system_prompt {
+            messages.push(OllamaMessage {
+                role: "system",
+                content: system_prompt,
+                images: Vec::new(),
+            });
+        }
+        messages.push(OllamaMessage {
+            role: "user",
+            content: request.prompt,
+            images,
+        });
+
         let body = OllamaChatRequest {
             model: request.model,
-            messages: vec![OllamaMessage {
-                role: "user",
-                content: request.prompt,
-                images,
-            }],
+            messages,
             stream: false,
             options: OllamaOptions {
                 temperature: request.temperature,
