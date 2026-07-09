@@ -192,21 +192,23 @@ async fn send_rich_message_request(request: SendRichMessageRequest) -> ResponseR
     let api_response: TelegramApiResponse<Message> =
         serde_json::from_str(&body).map_err(|err| {
             io_request_error(format!(
-                "failed to parse sendRichMessage response: {err}; status={status}; body={body}"
+                "failed to parse sendRichMessage response: {err}; status={status}"
             ))
         })?;
 
     if api_response.ok {
         api_response.result.ok_or_else(|| {
             io_request_error(format!(
-                "sendRichMessage response is ok but result is missing; status={status}; body={body}"
+                "sendRichMessage response is ok but result is missing; status={status}"
             ))
         })
     } else {
         Err(io_request_error(format!(
             "sendRichMessage failed: error_code={:?}; description={}; status={status}",
             api_response.error_code,
-            api_response.description.unwrap_or_else(|| body.clone())
+            api_response
+                .description
+                .unwrap_or_else(|| "unknown Telegram API error".to_owned())
         )))
     }
 }

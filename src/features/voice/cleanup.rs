@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::features::voice::types::{
     AsrTranscript, CleanTranscript, TranscriptChapter, TranscriptRenderMode,
 };
-use crate::llm::service::generate_text_with_provider;
+use crate::llm::service::generate_text_with_provider_and_system;
 
 const CLEANUP_PROMPT: &str = include_str!("../../../prompts/voice_cleanup.md");
 
@@ -12,7 +12,7 @@ pub async fn cleanup_transcript(
     config: &Config,
     transcript: &AsrTranscript,
 ) -> anyhow::Result<CleanTranscript> {
-    let prompt = build_prompt(config, transcript);
+    let prompt = build_user_prompt(config, transcript);
     let content = match generate_cleanup_content(config, &prompt).await {
         Ok(content) => content,
         Err(err) => {
@@ -53,10 +53,11 @@ async fn generate_cleanup_with_provider(
     model: Option<&str>,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    Ok(generate_text_with_provider(
+    Ok(generate_text_with_provider_and_system(
         config,
         provider,
         model,
+        Some(CLEANUP_PROMPT),
         prompt,
         None,
         config.voice_cleanup_temperature,
@@ -66,7 +67,7 @@ async fn generate_cleanup_with_provider(
     .content)
 }
 
-fn build_prompt(config: &Config, transcript: &AsrTranscript) -> String {
+fn build_user_prompt(config: &Config, transcript: &AsrTranscript) -> String {
     let segments = if transcript.segments.is_empty() {
         transcript.text.clone()
     } else {
@@ -86,7 +87,7 @@ fn build_prompt(config: &Config, transcript: &AsrTranscript) -> String {
     };
 
     format!(
-        "{CLEANUP_PROMPT}\n\nSHORT_LIMIT={}\n\nRAW_TEXT:\n{}\n\nSEGMENTS:\n{}",
+        "SHORT_LIMIT={}\n\nRAW_TEXT:\n{}\n\nSEGMENTS:\n{}",
         config.voice_short_text_max_chars, transcript.text, segments
     )
 }
