@@ -162,7 +162,7 @@ async fn retry_job(
         Some(validate_comment_output),
     )
     .await?;
-    let prompt_for_log = prompt.combined_for_log();
+    let prompt_for_log = prompt.compact_for_log();
     let final_html = build_comment_html(&generation.content, config);
     if final_html.trim().is_empty() {
         anyhow::bail!(

@@ -15,6 +15,15 @@ impl FirstCommentPrompt {
     pub fn combined_for_log(&self) -> String {
         format!("{}\n\n{}", self.system, self.user)
     }
+
+    pub fn compact_for_log(&self) -> String {
+        let preview = self.user.chars().take(1_200).collect::<String>();
+        format!(
+            "system=first_comment.md ({} chars); user={} chars; user_preview={preview}",
+            self.system.chars().count(),
+            self.user.chars().count(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +267,21 @@ mod tests {
         assert!(!prompt.system.contains("Пост:\nПост"));
         assert!(prompt.user.contains("Пост:\nПост"));
         assert!(!prompt.user.contains("Ты пишешь первый комментарий"));
+    }
+
+    #[test]
+    fn compact_prompt_log_omits_full_system_prompt_and_truncates_user_preview() {
+        let prompt = FirstCommentPrompt {
+            system: "system secret".to_string(),
+            user: "user ".repeat(500),
+        };
+
+        let compact = prompt.compact_for_log();
+
+        assert!(!compact.contains("system secret"));
+        assert!(compact.contains("system=first_comment.md"));
+        assert!(compact.contains("user=2500 chars"));
+        assert!(compact.chars().count() < 1_500);
     }
 
     #[test]
