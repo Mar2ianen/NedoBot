@@ -9,6 +9,7 @@ pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
 pub struct GenerateTextOptions<'a> {
     pub provider_override: Option<&'a str>,
     pub model_override: Option<&'a str>,
+    pub system_prompt: Option<&'a str>,
     pub prompt: &'a str,
     pub image_base64: Option<&'a str>,
     pub temperature: f32,
@@ -19,6 +20,7 @@ pub struct GenerateTextOptions<'a> {
 const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const CEREBRAS_OPENAI_BASE_URL: &str = "https://api.cerebras.ai/v1";
 const OPENROUTER_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const VALIDATION_RETRY_ATTEMPTS: usize = 1;
 
 pub async fn generate_text(
     config: &Config,
@@ -43,6 +45,7 @@ pub async fn generate_text_checked(
         GenerateTextOptions {
             provider_override: None,
             model_override: None,
+            system_prompt: None,
             prompt,
             image_base64,
             temperature,
@@ -67,11 +70,37 @@ pub async fn generate_text_with_provider(
         GenerateTextOptions {
             provider_override,
             model_override,
+            system_prompt: None,
             prompt,
             image_base64,
             temperature,
             num_predict,
             output_validator: None,
+        },
+    )
+    .await
+}
+
+pub async fn generate_text_checked_with_system(
+    config: &Config,
+    system_prompt: &str,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+    output_validator: Option<OutputValidator>,
+) -> anyhow::Result<GeneratedText> {
+    generate_text_with_provider_checked(
+        config,
+        GenerateTextOptions {
+            provider_override: None,
+            model_override: None,
+            system_prompt: Some(system_prompt),
+            prompt,
+            image_base64,
+            temperature,
+            num_predict,
+            output_validator,
         },
     )
     .await
@@ -92,30 +121,42 @@ pub async fn generate_text_with_provider_checked(
     let mut last_error = None;
 
     for fallback in fallbacks {
-        match generate_once(
-            config,
-            fallback.provider,
-            fallback.model,
-            options.prompt,
-            options.image_base64,
-            options.temperature,
-            options.num_predict,
-        )
-        .await
-        {
-            Ok(generation) => {
-                if let Some(validate) = options.output_validator
-                    && let Err(err) = validate(&generation.content)
-                {
-                    tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation output failed validation");
-                    last_error = Some(err);
-                    continue;
+        let mut attempt_prompt = options.prompt.to_string();
+        for attempt in 0..=VALIDATION_RETRY_ATTEMPTS {
+            match generate_once(
+                config,
+                fallback.provider,
+                fallback.model,
+                options.system_prompt,
+                &attempt_prompt,
+                options.image_base64,
+                options.temperature,
+                options.num_predict,
+            )
+            .await
+            {
+                Ok(generation) => {
+                    if let Some(validate) = options.output_validator
+                        && let Err(err) = validate(&generation.content)
+                    {
+                        tracing::warn!(%err, provider = fallback.provider, model = fallback.model, attempt, "LLM generation output failed validation");
+                        last_error = Some(err);
+                        if attempt < VALIDATION_RETRY_ATTEMPTS {
+                            attempt_prompt = validation_retry_prompt(
+                                options.prompt,
+                                &format!("{:#}", last_error.as_ref().unwrap()),
+                            );
+                            continue;
+                        }
+                        break;
+                    }
+                    return Ok(generation);
                 }
-                return Ok(generation);
-            }
-            Err(err) => {
-                tracing::warn!(%err, provider = fallback.provider, model = fallback.model, "LLM generation attempt failed");
-                last_error = Some(err);
+                Err(err) => {
+                    tracing::warn!(%err, provider = fallback.provider, model = fallback.model, attempt, "LLM generation attempt failed");
+                    last_error = Some(err);
+                    break;
+                }
             }
         }
     }
@@ -127,6 +168,7 @@ async fn generate_once(
     config: &Config,
     provider: &str,
     model: &str,
+    system_prompt: Option<&str>,
     prompt: &str,
     image_base64: Option<&str>,
     temperature: f32,
@@ -135,6 +177,7 @@ async fn generate_once(
     let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
         model,
+        system_prompt,
         prompt,
         image_base64,
         temperature,
@@ -195,6 +238,12 @@ fn fallback_models<'a>(
         }
         _ => vec![primary],
     }
+}
+
+fn validation_retry_prompt(original_prompt: &str, validation_error: &str) -> String {
+    format!(
+        "{original_prompt}\n\nПредыдущий ответ не прошёл автоматическую проверку: {validation_error}. Верни новый ответ, строго соблюдая формат, ограничения длины и обязательные токены из системных правил."
+    )
 }
 
 fn push_unique_model<'a>(

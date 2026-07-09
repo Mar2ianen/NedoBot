@@ -33,6 +33,12 @@ impl LlmClient for GeminiClient<'_> {
         }
 
         let body = GenerateContentRequest {
+            system_instruction: request.system_prompt.map(|system_prompt| GeminiContent {
+                role: "system",
+                parts: vec![GeminiPart::Text {
+                    text: system_prompt,
+                }],
+            }),
             contents: vec![GeminiContent {
                 role: "user",
                 parts: request_parts(request.prompt, request.image_base64),
@@ -87,6 +93,8 @@ impl LlmClient for GeminiClient<'_> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateContentRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiContent<'a>>,
     contents: Vec<GeminiContent<'a>>,
     generation_config: GenerationConfig,
 }

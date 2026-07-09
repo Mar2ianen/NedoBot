@@ -9,7 +9,7 @@ use tg_ai_bot_teloxide::{
     db::{build_pool, migrate},
     features::{
         first_comment::{
-            prompt::build_llm_prompt,
+            prompt::build_llm_prompt_parts,
             quality::validate_comment_output,
             render::build_comment_html,
             repo::{
@@ -19,7 +19,7 @@ use tg_ai_bot_teloxide::{
         },
         memory::service::{load_relevant_memory_notes, remember_post},
     },
-    llm::service::generate_text_checked,
+    llm::service::generate_text_checked_with_system,
     telegram::render::send_html_reply,
 };
 
@@ -144,7 +144,7 @@ async fn retry_job(
     let memory_notes = load_relevant_memory_notes(pool, &job.cleaned_post_text).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
     let topic_comments = load_topic_bot_comments(pool, &job.cleaned_post_text).await?;
-    let prompt = build_llm_prompt(
+    let prompt = build_llm_prompt_parts(
         &job.cleaned_post_text,
         None,
         &memory_notes,
@@ -152,15 +152,17 @@ async fn retry_job(
         &topic_comments,
         None,
     );
-    let generation = generate_text_checked(
+    let generation = generate_text_checked_with_system(
         config,
-        &prompt,
+        &prompt.system,
+        &prompt.user,
         None,
         config.llm_temperature,
         config.llm_max_tokens,
         Some(validate_comment_output),
     )
     .await?;
+    let prompt_for_log = prompt.combined_for_log();
     let final_html = build_comment_html(&generation.content, config);
     if final_html.trim().is_empty() {
         anyhow::bail!(
@@ -184,7 +186,7 @@ async fn retry_job(
             job_id: job.id,
             provider: &generation.provider,
             model: &generation.model,
-            prompt: &prompt,
+            prompt: &prompt_for_log,
             image_used: false,
             response: &generation.content,
             final_html: &final_html,

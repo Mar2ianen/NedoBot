@@ -4,6 +4,17 @@ const MAX_SENTENCE_MARKS: usize = 2;
 const MIN_WORDS: usize = 5;
 const MIN_CYRILLIC_CHARS: usize = 8;
 
+const VICTIM_PHRASES: &[&str] = &[
+    "из нас последнее",
+    "из нас выжимают",
+    "кошельки плачут",
+    "нас опять заставляют",
+    "нас снова заставляют",
+    "нам ждать",
+    "придется ждать",
+    "придётся ждать",
+];
+
 const GENERIC_PHRASES: &[&str] = &[
     "давайте обсудим",
     "обсудим это",
@@ -34,6 +45,9 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
     let normalized = text.trim();
     if normalized.is_empty() {
         anyhow::bail!("empty first comment output");
+    }
+    if ends_with_forbidden_final_punctuation(normalized) {
+        anyhow::bail!("first comment must not end with a dot or ellipsis");
     }
 
     let placeholders = scan_chat_link_placeholders(normalized)?;
@@ -88,6 +102,12 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!("first comment contains generic CTA phrase: {phrase}");
     }
+    if let Some(phrase) = VICTIM_PHRASES
+        .iter()
+        .find(|phrase| lower.contains(**phrase))
+    {
+        anyhow::bail!("first comment sounds like a victim complaint: {phrase}");
+    }
 
     let has_substantive_cyrillic_word = visible.split_whitespace().any(|word| {
         word.chars()
@@ -113,6 +133,11 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
 struct PlaceholderScan {
     valid_count: usize,
     visible_text: String,
+}
+
+fn ends_with_forbidden_final_punctuation(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    trimmed.ends_with('.') || trimmed.ends_with('…')
 }
 
 fn scan_chat_link_placeholders(text: &str) -> anyhow::Result<PlaceholderScan> {
@@ -183,7 +208,7 @@ mod tests {
     fn rejects_missing_placeholder() {
         assert!(
             validate_comment_output(
-                "Физические релизы превращаются в архивный формат. Охота за коробками началась."
+                "Физические релизы превращаются в архивный формат. Охота за коробками началась"
             )
             .is_err()
         );
@@ -222,7 +247,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_final_dot() {
+        assert!(
+            validate_comment_output(
+                "ИИ опять крайний, а 32 гб в минималках это типа само выросло. Прайсы в {CHAT_LINK}.",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_final_ellipsis() {
+        assert!(
+            validate_comment_output(
+                "ИИ опять крайний, а системки игр подозрительно молчат. Прайсы в {CHAT_LINK}…",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_victim_tone() {
+        assert!(
+            validate_comment_output("ИИ опять выжимает из нас последнее. Прайсы в {CHAT_LINK}")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn accepts_normal_comment() {
-        validate_comment_output("Физические релизы превращаются в архивный формат. Коллекции и цены в {CHAT_LINK:чате}.").unwrap();
+        validate_comment_output(
+            "Физические релизы превращаются в архивный формат. Коллекции и цены в {CHAT_LINK:чате}",
+        )
+        .unwrap();
     }
 }

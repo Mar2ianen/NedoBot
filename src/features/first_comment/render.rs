@@ -71,8 +71,6 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
 fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
     let mut html = Html::empty();
     let mut rest = text;
-    let mut rendered_link = false;
-
     while let Some(start) = rest.find("{CHAT_LINK") {
         let (before, after_start) = rest.split_at(start);
         html.push(Html::text(before));
@@ -85,7 +83,6 @@ fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
         let token = &after_start[..=end];
         if let Some(label) = chat_link_label(token, config) {
             html.push(link(&label, &config.chat_invite_url));
-            rendered_link = true;
         } else {
             html.push(Html::text(token));
         }
@@ -94,11 +91,6 @@ fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
     }
 
     html.push(Html::text(rest));
-
-    if !rendered_link {
-        html.push(Html::raw_trusted(" "));
-        html.push(link("в чате", &config.chat_invite_url));
-    }
 
     html
 }
@@ -238,21 +230,20 @@ mod tests {
     }
 
     #[test]
-    fn ignores_unknown_chat_placeholder_label_and_adds_fallback() {
+    fn ignores_unknown_chat_placeholder_label_without_fallback() {
         let html = build_comment_html("Несите частоты в {CHAT_LINK:<b>ловушку</b>}", &config());
-
-        assert!(html.contains("{CHAT_LINK:&lt;b&gt;ловушку&lt;/b&gt;}"));
-        assert!(html.ends_with(r#"<a href="https://t.me/+test">в чате</a>"#));
-    }
-
-    #[test]
-    fn adds_fallback_link_without_placeholder() {
-        let html = build_comment_html("Пишите версии драйвера", &config());
 
         assert_eq!(
             html,
-            r#"Пишите версии драйвера <a href="https://t.me/+test">в чате</a>"#
+            "Несите частоты в {CHAT_LINK:&lt;b&gt;ловушку&lt;/b&gt;}"
         );
+    }
+
+    #[test]
+    fn does_not_add_fallback_link_without_placeholder() {
+        let html = build_comment_html("Пишите версии драйвера", &config());
+
+        assert_eq!(html, "Пишите версии драйвера");
     }
 
     #[test]
