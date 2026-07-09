@@ -323,7 +323,7 @@ fn fetch_urls(results: &[SearchResult], top_n: usize) -> Vec<String> {
 
     for result in results {
         let url = result.url.trim();
-        if url.is_empty() || urls.iter().any(|seen| seen == url) {
+        if !is_safe_fetch_url(url) || urls.iter().any(|seen| seen == url) {
             continue;
         }
 
@@ -334,6 +334,49 @@ fn fetch_urls(results: &[SearchResult], top_n: usize) -> Vec<String> {
     }
 
     urls
+}
+
+fn is_safe_fetch_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.username() != "" || url.password().is_some()
+    {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host == "metadata.google.internal"
+    {
+        return false;
+    }
+
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return true;
+    };
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || octets == [169, 254, 169, 254])
+        }
+        std::net::IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
 }
 
 fn attach_requested_url(fetched_results: &mut [SearchResult], requested_url: &str) {
@@ -741,6 +784,26 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_url_filter_rejects_private_and_non_http_targets() {
+        for url in [
+            "http://127.0.0.1/admin",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/latest/meta-data",
+            "http://localhost:8080/",
+            "file:///etc/passwd",
+            "https://user:pass@example.com/",
+        ] {
+            assert!(!is_safe_fetch_url(url), "must reject {url}");
+        }
+    }
+
+    #[test]
+    fn fetch_url_filter_accepts_public_http_targets() {
+        assert!(is_safe_fetch_url("https://example.com/news"));
+        assert!(is_safe_fetch_url("http://93.184.216.34/news"));
+    }
 
     #[test]
     fn exa_tool_uses_num_results_argument() {
