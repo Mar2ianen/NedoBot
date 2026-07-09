@@ -14,10 +14,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Self {
+        let profile_refresh_concurrency = config.profile_refresh_concurrency;
         Self {
             pool,
             config,
-            profile_refresh_slots: Arc::new(Semaphore::new(4)),
+            profile_refresh_slots: Arc::new(Semaphore::new(profile_refresh_concurrency)),
         }
     }
 }

@@ -399,6 +399,7 @@ mod tests {
             vision_model: "gemma4:31b".to_string(),
             owner_telegram_id: None,
             send_owner_preview: false,
+            profile_refresh_concurrency: 4,
             comment_custom_emoji_id: None,
             first_comment_max_image_mb: 10,
             tech_custom_emoji_id: None,
