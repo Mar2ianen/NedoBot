@@ -251,7 +251,9 @@ struct PersonalChannelChat {
 }
 
 async fn fetch_personal_channel_messages(user_id: i64) -> anyhow::Result<PersonalChannelData> {
-    let token = std::env::var("TELOXIDE_TOKEN").or_else(|_| std::env::var("BOT_TOKEN"))?;
+    let token = std::env::var("TELOXIDE_TOKEN")
+        .or_else(|_| std::env::var("BOT_TOKEN"))
+        .map_err(|_| anyhow::anyhow!("Telegram bot token is not configured"))?;
     let url = format!("https://api.telegram.org/bot{token}/getUserPersonalChatMessages");
     let response = http::client(Duration::from_secs(5))?
         .post(url)
@@ -260,9 +262,13 @@ async fn fetch_personal_channel_messages(user_id: i64) -> anyhow::Result<Persona
             "limit": 5,
         }))
         .send()
-        .await?;
+        .await
+        .map_err(|_| anyhow::anyhow!("personal channel request failed"))?;
 
-    let raw_json: Value = response.json().await?;
+    let raw_json: Value = response
+        .json()
+        .await
+        .map_err(|_| anyhow::anyhow!("personal channel response parsing failed"))?;
     let api: TelegramApiResponse<Vec<PersonalChannelMessage>> =
         serde_json::from_value(raw_json.clone())?;
 
