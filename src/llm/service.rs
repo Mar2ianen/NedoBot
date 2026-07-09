@@ -2,7 +2,7 @@ use crate::config::{Config, normalize_llm_provider};
 use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
-use crate::llm::types::{GeneratedText, LlmClient, LlmRequest};
+use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest};
 
 pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
 
@@ -144,6 +144,7 @@ pub async fn generate_text_with_provider_checked(
 
     let fallbacks = fallback_models(config, provider, options.model_override, model);
     let mut last_error = None;
+    let mut attempts = Vec::new();
 
     for (fallback_index, fallback) in fallbacks.into_iter().enumerate() {
         let mut attempt_prompt = options.prompt.to_string();
@@ -160,7 +161,12 @@ pub async fn generate_text_with_provider_checked(
             )
             .await
             {
-                Ok(generation) => {
+                Ok(mut generation) => {
+                    let llm_attempt = generation.attempts.pop().unwrap_or_else(|| LlmAttempt {
+                        provider: fallback.provider.to_string(),
+                        model: fallback.model.to_string(),
+                        outcome: "success".to_string(),
+                    });
                     if fallback_index > 0 {
                         tracing::info!(
                             fallback_index,
@@ -181,6 +187,10 @@ pub async fn generate_text_with_provider_checked(
                             attempt,
                             "LLM generation output failed validation"
                         );
+                        attempts.push(LlmAttempt {
+                            outcome: "validation_failed".to_string(),
+                            ..llm_attempt
+                        });
                         last_error = Some(err);
                         if attempt < VALIDATION_RETRY_ATTEMPTS {
                             attempt_prompt = validation_retry_prompt(
@@ -191,6 +201,8 @@ pub async fn generate_text_with_provider_checked(
                         }
                         break;
                     }
+                    attempts.push(llm_attempt);
+                    generation.attempts = attempts;
                     return Ok(generation);
                 }
                 Err(err) => {
@@ -203,6 +215,11 @@ pub async fn generate_text_with_provider_checked(
                         attempt,
                         "LLM generation attempt failed"
                     );
+                    attempts.push(LlmAttempt {
+                        provider: fallback.provider.to_string(),
+                        model: fallback.model.to_string(),
+                        outcome: classify_attempt_error(&err),
+                    });
                     last_error = Some(err);
                     break;
                 }
@@ -211,6 +228,19 @@ pub async fn generate_text_with_provider_checked(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no LLM generation attempts were configured")))
+}
+
+fn classify_attempt_error(error: &anyhow::Error) -> String {
+    let text = error.to_string().to_lowercase();
+    if text.contains("429") {
+        "http_429".to_string()
+    } else if text.contains("503") || text.contains("502") || text.contains("500") {
+        "http_5xx".to_string()
+    } else if text.contains("timeout") || text.contains("timed out") {
+        "timeout".to_string()
+    } else {
+        "error".to_string()
+    }
 }
 
 async fn generate_once(
@@ -262,6 +292,11 @@ async fn generate_once(
         model: model.to_string(),
         content: response.content,
         image_used: image_base64.is_some(),
+        attempts: vec![LlmAttempt {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            outcome: "success".to_string(),
+        }],
     })
 }
 

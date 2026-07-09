@@ -105,6 +105,7 @@ pub async fn maybe_comment_post(
     )
     .await?;
     let prompt_for_log = prompt.compact_for_log();
+    let attempts = serde_json::to_value(&generation.attempts)?;
     let final_html = build_comment_html(&generation.content, config);
     ensure_comment_html(&final_html, &generation.content)?;
 
@@ -121,6 +122,7 @@ pub async fn maybe_comment_post(
             image_used: generation.image_used,
             response: &generation.content,
             final_html: &final_html,
+            attempts: &attempts,
         },
     )
     .await?;

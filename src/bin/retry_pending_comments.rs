@@ -163,6 +163,7 @@ async fn retry_job(
     )
     .await?;
     let prompt_for_log = prompt.compact_for_log();
+    let attempts = serde_json::to_value(&generation.attempts)?;
     let final_html = build_comment_html(&generation.content, config);
     if final_html.trim().is_empty() {
         anyhow::bail!(
@@ -190,6 +191,7 @@ async fn retry_job(
             image_used: false,
             response: &generation.content,
             final_html: &final_html,
+            attempts: &attempts,
         },
     )
     .await?;
