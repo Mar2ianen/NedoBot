@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 
 use crate::config::Config;
-use crate::llm::service::generate_text;
+use crate::llm::service::generate_text_checked_with_system;
 use crate::text::first_text_chars;
 
 #[derive(Debug)]
@@ -65,12 +65,14 @@ pub async fn remember_post(
     post_text: &str,
 ) -> anyhow::Result<()> {
     let note_prompt = build_memory_note_prompt(post_text);
-    let raw_note = generate_text(
+    let raw_note = generate_text_checked_with_system(
         config,
+        MEMORY_SYSTEM_PROMPT,
         &note_prompt,
         None,
         config.memory_llm_temperature,
         config.memory_llm_max_tokens,
+        None,
     )
     .await?;
     let mut note = parse_memory_note(&raw_note.content, post_text);
@@ -230,20 +232,17 @@ fn merge_text_lines(existing: &str, new_text: &str, limit: usize) -> String {
     first_text_chars(&parts.join("; "), limit)
 }
 
-fn build_memory_note_prompt(post_text: &str) -> String {
-    format!(
-        r#"Сделай короткую заметку памяти для будущих комментариев под техно-новостями.
+const MEMORY_SYSTEM_PROMPT: &str = r#"Сделай короткую заметку памяти для будущих комментариев под техно-новостями.
 Не добавляй факты, которых нет в посте. Не пересказывай рекламный хвост. Не пиши стиль комментария.
 
 Формат строго такой:
 TITLE: короткая тема до 80 символов
 KEYWORDS: 5-10 ключей через запятую, нижний регистр
 SUMMARY: 1-2 коротких факта из поста
-CAUTIONS: что нельзя утверждать без данных, одной фразой
+CAUTIONS: что нельзя утверждать без данных, одной фразой"#;
 
-Пост:
-{post_text}"#
-    )
+fn build_memory_note_prompt(post_text: &str) -> String {
+    format!("Пост:\n{post_text}")
 }
 
 fn parse_memory_note(raw_note: &str, post_text: &str) -> MemoryNote {

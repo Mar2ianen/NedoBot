@@ -125,6 +125,7 @@ fn spawn_message_author_profile_refresh(
     let chat_id = msg.chat.id.0;
     let bot = bot.inner().clone();
     let pool = state.pool.clone();
+    let profile_refresh_slots = state.profile_refresh_slots.clone();
     tokio::spawn(async move {
         match user_profile_needs_refresh(&pool, user_id).await {
             Ok(true) => {}
@@ -134,6 +135,14 @@ fn spawn_message_author_profile_refresh(
                 return;
             }
         }
+
+        let _permit = match profile_refresh_slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(user_id, "profile refresh limiter is closed");
+                return;
+            }
+        };
 
         match refresh_profile(&bot, &pool, user_id).await {
             Ok(()) => {

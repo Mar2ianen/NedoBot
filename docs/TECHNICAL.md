@@ -211,6 +211,14 @@ VOICE_RENDER_EXPANDABLE_CHAPTERS=true
 VOICE_SEND_FULL_FILE=true
 ```
 
+Для изображений в постах первого комментария используется отдельный лимит:
+
+```env
+FIRST_COMMENT_MAX_IMAGE_MB=10
+```
+
+Если Telegram сообщает размер файла выше лимита, бот не скачивает изображение и продолжает генерацию текстового комментария.
+
 Правила voice-конфига:
 
 - `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline.
