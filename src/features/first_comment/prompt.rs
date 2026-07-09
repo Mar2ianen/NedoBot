@@ -12,6 +12,7 @@ pub struct FirstCommentPrompt {
 }
 
 impl FirstCommentPrompt {
+    #[cfg(test)]
     pub fn combined_for_log(&self) -> String {
         format!("{}\n\n{}", self.system, self.user)
     }
