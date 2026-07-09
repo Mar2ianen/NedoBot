@@ -58,6 +58,7 @@ pub struct Config {
     pub vision_model: String,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
+    pub profile_refresh_concurrency: usize,
     pub comment_custom_emoji_id: Option<String>,
     pub first_comment_max_image_mb: u32,
     pub tech_custom_emoji_id: Option<String>,
@@ -154,6 +155,7 @@ impl Config {
             owner_telegram_id: env_optional("OWNER_TELEGRAM_ID")
                 .and_then(|value| value.parse().ok()),
             send_owner_preview: env_or("SEND_OWNER_PREVIEW", "true") == "true",
+            profile_refresh_concurrency: env_usize("PROFILE_REFRESH_CONCURRENCY", 4),
             comment_custom_emoji_id: env_optional("COMMENT_CUSTOM_EMOJI_ID"),
             first_comment_max_image_mb: env_u32("FIRST_COMMENT_MAX_IMAGE_MB", 10),
             tech_custom_emoji_id: env_optional("TECH_CUSTOM_EMOJI_ID"),
@@ -212,6 +214,10 @@ impl Config {
                     "SEARCH_EXTRACT_MODEL",
                 );
             }
+        }
+
+        if self.profile_refresh_concurrency == 0 {
+            errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
 
         if errors.is_empty() {
@@ -495,6 +501,7 @@ mod tests {
             vision_model: "gemma4:31b".to_string(),
             owner_telegram_id: None,
             send_owner_preview: false,
+            profile_refresh_concurrency: 4,
             comment_custom_emoji_id: None,
             first_comment_max_image_mb: 10,
             tech_custom_emoji_id: None,
