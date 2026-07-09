@@ -145,7 +145,7 @@ pub async fn generate_text_with_provider_checked(
     let fallbacks = fallback_models(config, provider, options.model_override, model);
     let mut last_error = None;
 
-    for fallback in fallbacks {
+    for (fallback_index, fallback) in fallbacks.into_iter().enumerate() {
         let mut attempt_prompt = options.prompt.to_string();
         for attempt in 0..=VALIDATION_RETRY_ATTEMPTS {
             match generate_once(
@@ -161,10 +161,26 @@ pub async fn generate_text_with_provider_checked(
             .await
             {
                 Ok(generation) => {
+                    if fallback_index > 0 {
+                        tracing::info!(
+                            fallback_index,
+                            provider = fallback.provider,
+                            model = fallback.model,
+                            "LLM fallback succeeded"
+                        );
+                    }
                     if let Some(validate) = options.output_validator
                         && let Err(err) = validate(&generation.content)
                     {
-                        tracing::warn!(%err, provider = fallback.provider, model = fallback.model, attempt, "LLM generation output failed validation");
+                        tracing::warn!(
+                            %err,
+                            fallback_index,
+                            is_fallback = fallback_index > 0,
+                            provider = fallback.provider,
+                            model = fallback.model,
+                            attempt,
+                            "LLM generation output failed validation"
+                        );
                         last_error = Some(err);
                         if attempt < VALIDATION_RETRY_ATTEMPTS {
                             attempt_prompt = validation_retry_prompt(
@@ -178,7 +194,15 @@ pub async fn generate_text_with_provider_checked(
                     return Ok(generation);
                 }
                 Err(err) => {
-                    tracing::warn!(%err, provider = fallback.provider, model = fallback.model, attempt, "LLM generation attempt failed");
+                    tracing::warn!(
+                        %err,
+                        fallback_index,
+                        is_fallback = fallback_index > 0,
+                        provider = fallback.provider,
+                        model = fallback.model,
+                        attempt,
+                        "LLM generation attempt failed"
+                    );
                     last_error = Some(err);
                     break;
                 }
