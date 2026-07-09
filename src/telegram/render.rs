@@ -185,9 +185,12 @@ async fn send_rich_message_request(request: SendRichMessageRequest) -> ResponseR
         .json(&request)
         .send()
         .await
-        .map_err(io_request_error)?;
+        .map_err(|_| io_request_error("sendRichMessage request failed"))?;
     let status = response.status();
-    let body = response.text().await.map_err(io_request_error)?;
+    let body = response
+        .text()
+        .await
+        .map_err(|_| io_request_error("sendRichMessage response read failed"))?;
 
     let api_response: TelegramApiResponse<Message> =
         serde_json::from_str(&body).map_err(|err| {

@@ -52,6 +52,7 @@ pub async fn mark_post_comment_sent(
         update post_comment_jobs
         set status = 'sent', bot_comment_message_id = $2, updated_at = now()
         where id = $1
+          and status in ('pending', 'processing')
         "#,
     )
     .bind(job_id)

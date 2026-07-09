@@ -120,7 +120,7 @@ migrations/                            — sqlx compile-time миграции
 
 ### Secrets — не утекать
 - API ключи передаются через `bearer_auth()` или `header("x-goog-api-key", ...)`.
-- **Не логировать** response bodies от API при ошибках. Текущее место риска: `src/telegram/render.rs:190-211` — `send_rich_message_request` логирует response body в error.
+- **Не логировать** response bodies от API при ошибках. `send_rich_message_request` извлекает body только для разбора безопасных `error_code`/`description`; raw body и URL с токеном не должны попадать в ошибки.
 - Токен в URL для raw API calls (`getUserPersonalChatMessages`, `sendRichMessage`) — ок, но не логировать URL при ошибках.
 
 ### Telegram Bot API 10.1
