@@ -7,7 +7,8 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
-        .await?;
+        .await
+        .map_err(|_| anyhow::anyhow!("database connection failed"))?;
 
     Ok(pool)
 }
