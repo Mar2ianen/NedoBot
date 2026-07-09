@@ -95,23 +95,38 @@ fn parse_args() -> anyhow::Result<Args> {
 }
 
 async fn load_pending_jobs(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<PendingJob>> {
+    let mut tx = pool.begin().await?;
     let rows = sqlx::query_as::<_, (i64, i64, i32, i64, i32, String)>(
         r#"
-        select id,
-               discussion_chat_id,
-               discussion_message_id,
-               source_channel_id,
-               source_message_id,
-               cleaned_post_text
-        from post_comment_jobs
-        where status = 'pending'
-        order by created_at
-        limit $1
+        with claimed as (
+            select id,
+                   discussion_chat_id,
+                   discussion_message_id,
+                   source_channel_id,
+                   source_message_id,
+                   cleaned_post_text
+            from post_comment_jobs
+            where status = 'pending'
+            order by created_at
+            for update skip locked
+            limit $1
+        )
+        update post_comment_jobs as jobs
+        set status = 'processing', updated_at = now()
+        from claimed
+        where jobs.id = claimed.id
+        returning claimed.id,
+                  claimed.discussion_chat_id,
+                  claimed.discussion_message_id,
+                  claimed.source_channel_id,
+                  claimed.source_message_id,
+                  claimed.cleaned_post_text
         "#,
     )
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(rows
         .into_iter()
@@ -217,6 +232,7 @@ async fn mark_job_failed(pool: &PgPool, job_id: i64, error: &str) -> anyhow::Res
         update post_comment_jobs
         set status = 'failed', error = $2, updated_at = now()
         where id = $1
+          and status = 'processing'
         "#,
     )
     .bind(job_id)
