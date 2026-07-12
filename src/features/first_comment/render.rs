@@ -1,8 +1,19 @@
 use crate::config::Config;
+use crate::features::first_comment::draft::parse_source_link_placeholder;
+use crate::features::search::mcp::is_safe_fetch_url;
+use crate::features::search::types::SearchResult;
 use crate::telegram::html::{Html, link};
 use crate::text::{normalize_ai_markers, strip_links};
 
 pub fn build_comment_html(llm_body: &str, config: &Config) -> String {
+    build_comment_html_with_sources(llm_body, config, &[])
+}
+
+pub fn build_comment_html_with_sources(
+    llm_body: &str,
+    config: &Config,
+    search_results: &[SearchResult],
+) -> String {
     // The model decides the wording; code owns links and custom emoji markup.
     let clean_body = normalize_ai_markers(&strip_links(llm_body))
         .trim()
@@ -12,7 +23,7 @@ pub fn build_comment_html(llm_body: &str, config: &Config) -> String {
         return String::new();
     }
 
-    let body = render_chat_link_placeholder(&clean_body, config);
+    let body = render_link_placeholders(&clean_body, config, search_results);
 
     match pick_comment_emoji(llm_body, config) {
         Some(custom_emoji_id) => {
@@ -68,10 +79,10 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
     }
 }
 
-fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
+fn render_link_placeholders(text: &str, config: &Config, search_results: &[SearchResult]) -> Html {
     let mut html = Html::empty();
     let mut rest = text;
-    while let Some(start) = rest.find("{CHAT_LINK") {
+    while let Some((start, kind)) = next_link_placeholder(rest) {
         let (before, after_start) = rest.split_at(start);
         html.push(Html::text(before));
 
@@ -81,10 +92,21 @@ fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
         };
 
         let token = &after_start[..=end];
-        if let Some(label) = chat_link_label(token, config) {
-            html.push(link(&label, &config.chat_invite_url));
-        } else {
-            html.push(Html::text(token));
+        match kind {
+            LinkPlaceholderKind::Chat => {
+                if let Some(label) = chat_link_label(token, config) {
+                    html.push(link(&label, &config.chat_invite_url));
+                } else {
+                    html.push(Html::text(token));
+                }
+            }
+            LinkPlaceholderKind::Source => {
+                if let Some((label, url)) = source_link_target(token, search_results) {
+                    html.push(link(&label, url));
+                } else {
+                    html.push(Html::text(token));
+                }
+            }
         }
 
         rest = &after_start[end + 1..];
@@ -93,6 +115,32 @@ fn render_chat_link_placeholder(text: &str, config: &Config) -> Html {
     html.push(Html::text(rest));
 
     html
+}
+
+#[derive(Clone, Copy)]
+enum LinkPlaceholderKind {
+    Chat,
+    Source,
+}
+
+fn next_link_placeholder(text: &str) -> Option<(usize, LinkPlaceholderKind)> {
+    match (text.find("{CHAT_LINK"), text.find("{SOURCE_LINK")) {
+        (Some(chat), Some(source)) if chat < source => Some((chat, LinkPlaceholderKind::Chat)),
+        (Some(_), Some(source)) => Some((source, LinkPlaceholderKind::Source)),
+        (Some(chat), None) => Some((chat, LinkPlaceholderKind::Chat)),
+        (None, Some(source)) => Some((source, LinkPlaceholderKind::Source)),
+        (None, None) => None,
+    }
+}
+
+fn source_link_target<'a>(
+    token: &str,
+    search_results: &'a [SearchResult],
+) -> Option<(String, &'a str)> {
+    let placeholder = parse_source_link_placeholder(token).ok()?;
+    let result = search_results.get(placeholder.result_id.checked_sub(1)?)?;
+    let url = result.url.trim();
+    is_safe_fetch_url(url).then_some((placeholder.label, url))
 }
 
 fn chat_link_label(token: &str, config: &Config) -> Option<String> {
@@ -262,5 +310,43 @@ mod tests {
 
         assert!(!html.contains("https://example.com"));
         assert!(html.contains("Тест в "));
+    }
+
+    #[test]
+    fn replaces_source_placeholder_with_validated_result_link() {
+        let search_results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Court decision".to_string(),
+            url: "https://example.com/court".to_string(),
+            snippet: String::new(),
+        }];
+
+        let html = build_comment_html_with_sources(
+            "Судя по {SOURCE_LINK:1:решению суда}, аккаунт вернули. Опыт в {CHAT_LINK:чатике}",
+            &config(),
+            &search_results,
+        );
+
+        assert!(html.contains(r#"<a href="https://example.com/court">решению суда</a>"#));
+        assert!(html.contains(r#"<a href="https://t.me/+test">чатике</a>"#));
+    }
+
+    #[test]
+    fn leaves_source_placeholder_as_text_when_url_is_unsafe() {
+        let search_results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Local".to_string(),
+            url: "http://127.0.0.1/admin".to_string(),
+            snippet: String::new(),
+        }];
+
+        let html = build_comment_html_with_sources(
+            "Детали в {SOURCE_LINK:1:источнике}. Продолжение в {CHAT_LINK}",
+            &config(),
+            &search_results,
+        );
+
+        assert!(html.contains("{SOURCE_LINK:1:источнике}"));
+        assert!(!html.contains("127.0.0.1"));
     }
 }

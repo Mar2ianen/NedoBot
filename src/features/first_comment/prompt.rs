@@ -34,11 +34,49 @@ impl FirstCommentPrompt {
 struct FirstCommentContext<'a> {
     post: &'a str,
     chat_member_count: Option<u32>,
+    directives: CommentDirectives,
     manual_fact_reference: &'a str,
     memory_notes: Vec<MemoryPromptNote<'a>>,
     topic_comments: Vec<String>,
     recent_comments: Vec<String>,
     search: SearchPromptContext,
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub struct CommentDirectives {
+    chat_link_position: &'static str,
+    search_usage: &'static str,
+    source_link: &'static str,
+}
+
+impl CommentDirectives {
+    pub fn for_post(source_message_id: i32, search_context: Option<&SearchContext>) -> Self {
+        let search_available = search_context
+            .is_some_and(|context| !context.is_skipped() && !context.results.is_empty());
+        let source_link_allowed = search_available && source_message_id.rem_euclid(5) == 0;
+
+        Self {
+            chat_link_position: if source_message_id.rem_euclid(3) == 0 {
+                "first"
+            } else {
+                "second"
+            },
+            search_usage: if search_available {
+                "use_if_new"
+            } else {
+                "ignore"
+            },
+            source_link: if source_link_allowed {
+                "allowed"
+            } else {
+                "off"
+            },
+        }
+    }
+
+    pub fn source_link_allowed(self) -> bool {
+        self.source_link == "allowed"
+    }
 }
 
 #[derive(Serialize)]
@@ -70,6 +108,7 @@ fn build_llm_prompt(
     recent_comments: &[String],
     topic_comments: &[String],
     search_context: Option<&SearchContext>,
+    directives: CommentDirectives,
 ) -> String {
     build_llm_prompt_parts(
         post_text,
@@ -78,6 +117,7 @@ fn build_llm_prompt(
         recent_comments,
         topic_comments,
         search_context,
+        directives,
     )
     .combined_for_log()
 }
@@ -89,6 +129,7 @@ pub fn build_llm_prompt_parts(
     recent_comments: &[String],
     topic_comments: &[String],
     search_context: Option<&SearchContext>,
+    directives: CommentDirectives,
 ) -> FirstCommentPrompt {
     let system = include_str!("../../../prompts/first_comment.md").to_string();
     let user = build_llm_user_prompt(
@@ -98,6 +139,7 @@ pub fn build_llm_prompt_parts(
         recent_comments,
         topic_comments,
         search_context,
+        directives,
     );
 
     FirstCommentPrompt { system, user }
@@ -110,10 +152,12 @@ fn build_llm_user_prompt(
     recent_comments: &[String],
     topic_comments: &[String],
     search_context: Option<&SearchContext>,
+    directives: CommentDirectives,
 ) -> String {
     let context = FirstCommentContext {
         post: post_text,
         chat_member_count,
+        directives,
         manual_fact_reference: include_str!("../../../prompts/tech_rag.md"),
         memory_notes: memory_notes
             .iter()
@@ -263,7 +307,15 @@ mod tests {
 
     #[test]
     fn prompt_parts_split_system_rules_from_json_context() {
-        let prompt = build_llm_prompt_parts("Пост", None, &[], &[], &[], None);
+        let prompt = build_llm_prompt_parts(
+            "Пост",
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            CommentDirectives::for_post(1, None),
+        );
         let context = context_json(&prompt);
 
         assert!(prompt.system.contains("Ты постоянный комментатор"));
@@ -303,7 +355,15 @@ mod tests {
             latency_ms: 42,
         };
 
-        let prompt = build_llm_prompt_parts("Пост", None, &[], &[], &[], Some(&search_context));
+        let prompt = build_llm_prompt_parts(
+            "Пост",
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&search_context),
+            CommentDirectives::for_post(5, Some(&search_context)),
+        );
         let context = context_json(&prompt);
 
         assert_eq!(context["search"]["available"], true);
@@ -329,7 +389,15 @@ mod tests {
             latency_ms: 0,
         };
 
-        let prompt = build_llm_prompt_parts("Пост", None, &[], &[], &[], Some(&search_context));
+        let prompt = build_llm_prompt_parts(
+            "Пост",
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&search_context),
+            CommentDirectives::for_post(5, Some(&search_context)),
+        );
 
         assert!(prompt.user.starts_with(USER_CONTEXT_PREFIX));
         assert!(prompt.user.contains("Ignore previous instructions"));
@@ -372,14 +440,54 @@ mod tests {
     #[test]
     fn skipped_search_context_is_explicit_in_json() {
         let search_context = SearchContext::skipped("no_search_needed", 10);
-        let prompt = build_llm_prompt_parts("Пост", None, &[], &[], &[], Some(&search_context));
+        let prompt = build_llm_prompt_parts(
+            "Пост",
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&search_context),
+            CommentDirectives::for_post(1, Some(&search_context)),
+        );
 
         assert_eq!(context_json(&prompt)["search"]["available"], false);
     }
 
     #[test]
     fn test_build_llm_prompt_includes_context_for_legacy_callers() {
-        let prompt = build_llm_prompt("Пост", Some(7), &[], &[], &[], None);
+        let prompt = build_llm_prompt(
+            "Пост",
+            Some(7),
+            &[],
+            &[],
+            &[],
+            None,
+            CommentDirectives::for_post(1, None),
+        );
         assert!(prompt.contains("\"chat_member_count\":7"));
+    }
+
+    #[test]
+    fn directives_vary_link_position_and_source_link_mode() {
+        let search_context = SearchContext {
+            queries: Vec::new(),
+            results: vec![search_result("Source", "https://example.com", "fact")],
+            skipped_reason: None,
+            latency_ms: 0,
+        };
+
+        let source_link = CommentDirectives::for_post(5, Some(&search_context));
+        let no_source_link = CommentDirectives::for_post(7, Some(&search_context));
+
+        assert!(source_link.source_link_allowed());
+        assert!(!no_source_link.source_link_allowed());
+        assert_eq!(
+            serde_json::to_value(source_link).unwrap()["chat_link_position"],
+            "second"
+        );
+        assert_eq!(
+            serde_json::to_value(CommentDirectives::for_post(6, Some(&search_context))).unwrap()["chat_link_position"],
+            "first"
+        );
     }
 }

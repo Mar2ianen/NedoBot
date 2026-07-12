@@ -11,9 +11,9 @@ use tg_ai_bot_teloxide::{
         first_comment::{
             draft::{
                 first_comment_output_schema, parse_first_comment_draft,
-                validate_first_comment_draft_output,
+                validate_first_comment_draft_with_search,
             },
-            prompt::build_llm_prompt_parts,
+            prompt::{CommentDirectives, build_llm_prompt_parts},
             render::build_comment_html,
             repo::{
                 LlmGenerationInsert, insert_llm_generation, load_recent_bot_comments,
@@ -169,7 +169,9 @@ async fn retry_job(
         &recent_comments,
         &topic_comments,
         None,
+        CommentDirectives::for_post(job.source_message_id, None),
     );
+    let validator = |value: &str| validate_first_comment_draft_with_search(value, &[], false);
     let generation = generate_text_checked_with_system_and_schema(
         config,
         &prompt.system,
@@ -177,7 +179,7 @@ async fn retry_job(
         None,
         config.llm_temperature,
         config.llm_max_tokens,
-        Some(validate_first_comment_draft_output),
+        Some(&validator),
         first_comment_output_schema(),
     )
     .await?;

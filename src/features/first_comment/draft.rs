@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::features::first_comment::quality::validate_comment_output;
+use crate::features::search::mcp::is_safe_fetch_url;
+use crate::features::search::types::SearchResult;
 
 /// Structured LLM output for a first-comment generation.
 ///
@@ -14,6 +16,12 @@ use crate::features::first_comment::quality::validate_comment_output;
 pub struct FirstCommentDraft {
     pub comment: String,
     pub used_search_result_id: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLinkPlaceholder {
+    pub result_id: usize,
+    pub label: String,
 }
 
 static FIRST_COMMENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
@@ -50,7 +58,115 @@ pub fn parse_first_comment_draft(value: &str) -> anyhow::Result<FirstCommentDraf
 
 pub fn validate_first_comment_draft_output(value: &str) -> anyhow::Result<()> {
     let draft = parse_first_comment_draft(value)?;
-    validate_comment_output(&draft.comment)
+    validate_comment_body(&draft).map(|_| ())
+}
+
+pub fn validate_first_comment_draft_with_search(
+    value: &str,
+    search_results: &[SearchResult],
+    source_link_allowed: bool,
+) -> anyhow::Result<()> {
+    let draft = parse_first_comment_draft(value)?;
+    let source_link = validate_comment_body(&draft)?;
+
+    if let Some(result_id) = draft.used_search_result_id {
+        let result = search_result_by_id(search_results, result_id)?;
+        if source_link.is_some() && !is_safe_fetch_url(&result.url) {
+            anyhow::bail!("selected source link has an unsafe URL");
+        }
+    }
+
+    if let Some(source_link) = source_link {
+        if !source_link_allowed {
+            anyhow::bail!("SOURCE_LINK is disabled for this comment");
+        }
+        if draft.used_search_result_id != Some(source_link.result_id) {
+            anyhow::bail!("SOURCE_LINK result ID must match used_search_result_id");
+        }
+        let result = search_result_by_id(search_results, source_link.result_id)?;
+        if !is_safe_fetch_url(&result.url) {
+            anyhow::bail!("selected source link has an unsafe URL");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_comment_body(
+    draft: &FirstCommentDraft,
+) -> anyhow::Result<Option<SourceLinkPlaceholder>> {
+    let (visible_comment, source_link) = replace_source_link_placeholder(&draft.comment)?;
+    validate_comment_output(&visible_comment)?;
+    Ok(source_link)
+}
+
+fn search_result_by_id(
+    results: &[SearchResult],
+    result_id: usize,
+) -> anyhow::Result<&SearchResult> {
+    results.get(result_id - 1).ok_or_else(|| {
+        anyhow::anyhow!("used_search_result_id does not exist in this search context")
+    })
+}
+
+pub fn parse_source_link_placeholder(token: &str) -> anyhow::Result<SourceLinkPlaceholder> {
+    let value = token
+        .strip_prefix("{SOURCE_LINK:")
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| anyhow::anyhow!("malformed SOURCE_LINK placeholder: {token}"))?;
+    let (result_id, label) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("SOURCE_LINK must contain result ID and label"))?;
+    let result_id = result_id
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("SOURCE_LINK result ID must be a positive integer"))?;
+    if result_id == 0 {
+        anyhow::bail!("SOURCE_LINK result ID must start at 1");
+    }
+
+    let label = label.trim();
+    if label.is_empty() || label.chars().count() > 40 {
+        anyhow::bail!("SOURCE_LINK label must contain 1 to 40 characters");
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '-' | '+'))
+    {
+        anyhow::bail!("SOURCE_LINK label contains unsupported characters");
+    }
+
+    Ok(SourceLinkPlaceholder {
+        result_id,
+        label: label.to_string(),
+    })
+}
+
+fn replace_source_link_placeholder(
+    text: &str,
+) -> anyhow::Result<(String, Option<SourceLinkPlaceholder>)> {
+    let mut visible = String::with_capacity(text.len());
+    let mut source_link = None;
+    let mut rest = text;
+
+    while let Some(start) = rest.find("{SOURCE_LINK") {
+        let (before, after_start) = rest.split_at(start);
+        visible.push_str(before);
+        let Some(end) = after_start.find('}') else {
+            anyhow::bail!("unterminated SOURCE_LINK placeholder");
+        };
+        if source_link.is_some() {
+            anyhow::bail!("first comment contains multiple SOURCE_LINK placeholders");
+        }
+
+        let placeholder = parse_source_link_placeholder(&after_start[..=end])?;
+        visible.push_str(&placeholder.label);
+        source_link = Some(placeholder);
+        rest = &after_start[end + 1..];
+    }
+
+    visible.push_str(rest);
+    Ok((visible, source_link))
 }
 
 #[cfg(test)]
@@ -116,5 +232,39 @@ mod tests {
             schema["properties"]["used_search_result_id"]["type"],
             serde_json::json!(["integer", "null"])
         );
+    }
+
+    #[test]
+    fn validates_source_link_against_matching_search_result() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Court decision".to_string(),
+            url: "https://example.com/court".to_string(),
+            snippet: "Court restored the account.".to_string(),
+        }];
+
+        validate_first_comment_draft_with_search(
+            r#"{"comment":"Судя по {SOURCE_LINK:1:решению суда}, аккаунт вернули только после иска. Поддержка Xbox в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
+            &results,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_source_link_with_wrong_provenance() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Court decision".to_string(),
+            url: "https://example.com/court".to_string(),
+            snippet: String::new(),
+        }];
+
+        assert!(validate_first_comment_draft_with_search(
+            r#"{"comment":"Судя по {SOURCE_LINK:1:решению суда}, аккаунт вернули только после иска. Поддержка Xbox в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
+            &results,
+            true,
+        )
+        .is_err());
     }
 }
