@@ -12,10 +12,11 @@ use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::draft::{
-    first_comment_output_schema, parse_first_comment_draft, validate_first_comment_draft_output,
+    first_comment_output_schema, parse_first_comment_draft,
+    validate_first_comment_draft_with_search,
 };
-use crate::features::first_comment::prompt::build_llm_prompt_parts;
-use crate::features::first_comment::render::build_comment_html;
+use crate::features::first_comment::prompt::{CommentDirectives, build_llm_prompt_parts};
+use crate::features::first_comment::render::build_comment_html_with_sources;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
     load_topic_bot_comments, mark_post_comment_sent,
@@ -88,6 +89,8 @@ pub async fn maybe_comment_post(
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
+    let directives =
+        CommentDirectives::for_post(candidate.source_message_id.0, Some(&search_context));
     let prompt = build_llm_prompt_parts(
         &clean_post,
         chat_member_count,
@@ -95,7 +98,13 @@ pub async fn maybe_comment_post(
         &recent_comments,
         &topic_comments,
         config.search_enabled.then_some(&search_context),
+        directives,
     );
+    let validation_results = search_context.results.clone();
+    let source_link_allowed = directives.source_link_allowed();
+    let validator = move |value: &str| {
+        validate_first_comment_draft_with_search(value, &validation_results, source_link_allowed)
+    };
     let generation = generate_text_checked_with_system_and_schema(
         config,
         &prompt.system,
@@ -103,14 +112,15 @@ pub async fn maybe_comment_post(
         image_base64.as_deref(),
         config.llm_temperature,
         config.llm_max_tokens,
-        Some(validate_first_comment_draft_output),
+        Some(&validator),
         first_comment_output_schema(),
     )
     .await?;
     let draft = parse_first_comment_draft(&generation.content)?;
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
-    let final_html = build_comment_html(&draft.comment, config);
+    let final_html =
+        build_comment_html_with_sources(&draft.comment, config, &search_context.results);
     ensure_comment_html(&final_html, &draft.comment)?;
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;

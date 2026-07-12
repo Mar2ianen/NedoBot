@@ -5,7 +5,7 @@ use crate::llm::openai_compat::OpenAiCompatClient;
 use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest, StructuredOutput};
 use serde_json::Value;
 
-pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
+pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
 pub struct GenerateTextOptions<'a> {
     pub provider_override: Option<&'a str>,
@@ -15,7 +15,7 @@ pub struct GenerateTextOptions<'a> {
     pub image_base64: Option<&'a str>,
     pub temperature: f32,
     pub num_predict: u32,
-    pub output_validator: Option<OutputValidator>,
+    pub output_validator: Option<&'a OutputValidator>,
     pub structured_output: Option<StructuredOutput<'a>>,
 }
 
@@ -42,7 +42,7 @@ pub async fn generate_text_checked(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
-    output_validator: Option<OutputValidator>,
+    output_validator: Option<&OutputValidator>,
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
@@ -117,7 +117,7 @@ pub async fn generate_text_checked_with_system(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
-    output_validator: Option<OutputValidator>,
+    output_validator: Option<&OutputValidator>,
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
@@ -143,7 +143,7 @@ pub async fn generate_text_checked_with_system_and_schema(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
-    output_validator: Option<OutputValidator>,
+    output_validator: Option<&OutputValidator>,
     schema: &Value,
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(

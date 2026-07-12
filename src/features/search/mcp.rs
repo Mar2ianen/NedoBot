@@ -336,7 +336,7 @@ fn fetch_urls(results: &[SearchResult], top_n: usize) -> Vec<String> {
     urls
 }
 
-fn is_safe_fetch_url(value: &str) -> bool {
+pub(crate) fn is_safe_fetch_url(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
