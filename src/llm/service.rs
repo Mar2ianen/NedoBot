@@ -181,7 +181,7 @@ pub async fn generate_text_with_provider_checked(
     for (fallback_index, fallback) in fallbacks.into_iter().enumerate() {
         let mut attempt_prompt = options.prompt.to_string();
         for attempt in 0..=VALIDATION_RETRY_ATTEMPTS {
-            match generate_once(
+            let generation = generate_once(
                 config,
                 fallback.provider,
                 fallback.model,
@@ -192,14 +192,55 @@ pub async fn generate_text_with_provider_checked(
                 options.num_predict,
                 options.structured_output,
             )
-            .await
-            {
+            .await;
+            let generation = match generation {
+                Err(err)
+                    if options.structured_output.is_some()
+                        && is_structured_output_rejection(&err) =>
+                {
+                    tracing::warn!(
+                        %err,
+                        fallback_index,
+                        provider = fallback.provider,
+                        model = fallback.model,
+                        "structured output was rejected, retrying with prompt-only JSON contract"
+                    );
+                    generate_once(
+                        config,
+                        fallback.provider,
+                        fallback.model,
+                        options.system_prompt,
+                        &attempt_prompt,
+                        options.image_base64,
+                        options.temperature,
+                        options.num_predict,
+                        None,
+                    )
+                    .await
+                    .map(|mut generation| {
+                        generation.attempts.insert(
+                            0,
+                            LlmAttempt {
+                                provider: fallback.provider.to_string(),
+                                model: fallback.model.to_string(),
+                                outcome: "structured_output_fallback".to_string(),
+                            },
+                        );
+                        generation
+                    })
+                }
+                result => result,
+            };
+
+            match generation {
                 Ok(mut generation) => {
-                    let llm_attempt = generation.attempts.pop().unwrap_or_else(|| LlmAttempt {
+                    let mut generation_attempts = std::mem::take(&mut generation.attempts);
+                    let llm_attempt = generation_attempts.pop().unwrap_or_else(|| LlmAttempt {
                         provider: fallback.provider.to_string(),
                         model: fallback.model.to_string(),
                         outcome: "success".to_string(),
                     });
+                    attempts.extend(generation_attempts);
                     if fallback_index > 0 {
                         tracing::info!(
                             fallback_index,
@@ -274,6 +315,14 @@ fn classify_attempt_error(error: &anyhow::Error) -> String {
     } else {
         "error".to_string()
     }
+}
+
+fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("400")
+        || text.contains("422")
+        || text.contains("schema")
+        || text.contains("format")
 }
 
 async fn generate_once(
@@ -561,5 +610,18 @@ mod tests {
                 model: "gemini-3.5-flash",
             }]
         );
+    }
+
+    #[test]
+    fn detects_structured_output_rejections() {
+        assert!(is_structured_output_rejection(&anyhow::anyhow!(
+            "HTTP status client error (400 Bad Request)"
+        )));
+        assert!(is_structured_output_rejection(&anyhow::anyhow!(
+            "response JSON schema is unsupported"
+        )));
+        assert!(!is_structured_output_rejection(&anyhow::anyhow!(
+            "HTTP status server error (503 Service Unavailable)"
+        )));
     }
 }

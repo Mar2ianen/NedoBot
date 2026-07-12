@@ -46,14 +46,27 @@ pub fn first_comment_output_schema() -> &'static Value {
 }
 
 pub fn parse_first_comment_draft(value: &str) -> anyhow::Result<FirstCommentDraft> {
-    let draft: FirstCommentDraft = serde_json::from_str(value)
-        .map_err(|err| anyhow::anyhow!("first comment response must be a JSON object: {err}"))?;
+    let trimmed = value.trim();
+    let draft = match serde_json::from_str(trimmed) {
+        Ok(draft) => draft,
+        Err(err) if looks_like_structured_output(trimmed) => {
+            anyhow::bail!("first comment response must be a JSON object: {err}")
+        }
+        Err(_) => FirstCommentDraft {
+            comment: trimmed.to_string(),
+            used_search_result_id: None,
+        },
+    };
 
     if draft.used_search_result_id == Some(0) {
         anyhow::bail!("used_search_result_id must start at 1");
     }
 
     Ok(draft)
+}
+
+fn looks_like_structured_output(value: &str) -> bool {
+    value.starts_with('{') || value.starts_with('[') || value.starts_with("```")
 }
 
 pub fn validate_first_comment_draft_output(value: &str) -> anyhow::Result<()> {
@@ -193,6 +206,17 @@ mod tests {
             "```json\n{\"comment\":\"Память дорожает. Прайсы в {CHAT_LINK}\",\"used_search_result_id\":null}\n```",
         )
         .is_err());
+    }
+
+    #[test]
+    fn falls_back_to_legacy_plain_comment() {
+        let draft = parse_first_comment_draft(
+            "Память дорожает, а заводы не успевают. Прайсы в {CHAT_LINK:чатике}",
+        )
+        .unwrap();
+
+        assert_eq!(draft.used_search_result_id, None);
+        assert!(draft.comment.contains("{CHAT_LINK:чатике}"));
     }
 
     #[test]
