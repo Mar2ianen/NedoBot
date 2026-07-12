@@ -89,6 +89,7 @@ impl InputRichMessage {
 struct SendRichMessageRequest {
     chat_id: i64,
     rich_message: InputRichMessage,
+    link_preview_options: LinkPreviewOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_parameters: Option<ReplyParameters>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +151,7 @@ pub async fn send_rich_message(
     send_rich_message_request(SendRichMessageRequest {
         chat_id: chat_id.0,
         rich_message,
+        link_preview_options: disabled_link_preview(),
         reply_parameters: None,
         disable_notification: None,
         protect_content: None,
@@ -166,6 +168,7 @@ pub async fn send_rich_message_reply(
     send_rich_message_request(SendRichMessageRequest {
         chat_id: chat_id.0,
         rich_message,
+        link_preview_options: disabled_link_preview(),
         reply_parameters: Some(
             ReplyParameters::new(reply_to_message_id).allow_sending_without_reply(),
         ),
@@ -284,5 +287,21 @@ fn disabled_link_preview() -> LinkPreviewOptions {
         prefer_small_media: false,
         prefer_large_media: false,
         show_above_text: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_previews_are_disabled_for_every_text_send_path() {
+        let options = disabled_link_preview();
+
+        assert!(options.is_disabled);
+        assert!(options.url.is_none());
+        assert!(!options.prefer_small_media);
+        assert!(!options.prefer_large_media);
+        assert!(!options.show_above_text);
     }
 }
