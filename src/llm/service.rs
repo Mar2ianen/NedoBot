@@ -2,7 +2,8 @@ use crate::config::{Config, normalize_llm_provider};
 use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
-use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest};
+use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest, StructuredOutput};
+use serde_json::Value;
 
 pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
 
@@ -15,6 +16,7 @@ pub struct GenerateTextOptions<'a> {
     pub temperature: f32,
     pub num_predict: u32,
     pub output_validator: Option<OutputValidator>,
+    pub structured_output: Option<StructuredOutput<'a>>,
 }
 
 const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
@@ -53,6 +55,7 @@ pub async fn generate_text_checked(
             temperature,
             num_predict,
             output_validator,
+            structured_output: None,
         },
     )
     .await
@@ -101,6 +104,7 @@ pub async fn generate_text_with_provider_and_system(
             temperature,
             num_predict,
             output_validator: None,
+            structured_output: None,
         },
     )
     .await
@@ -126,6 +130,34 @@ pub async fn generate_text_checked_with_system(
             temperature,
             num_predict,
             output_validator,
+            structured_output: None,
+        },
+    )
+    .await
+}
+
+pub async fn generate_text_checked_with_system_and_schema(
+    config: &Config,
+    system_prompt: &str,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+    output_validator: Option<OutputValidator>,
+    schema: &Value,
+) -> anyhow::Result<GeneratedText> {
+    generate_text_with_provider_checked(
+        config,
+        GenerateTextOptions {
+            provider_override: None,
+            model_override: None,
+            system_prompt: Some(system_prompt),
+            prompt,
+            image_base64,
+            temperature,
+            num_predict,
+            output_validator,
+            structured_output: Some(StructuredOutput { schema }),
         },
     )
     .await
@@ -158,6 +190,7 @@ pub async fn generate_text_with_provider_checked(
                 options.image_base64,
                 options.temperature,
                 options.num_predict,
+                options.structured_output,
             )
             .await
             {
@@ -252,6 +285,7 @@ async fn generate_once(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
+    structured_output: Option<StructuredOutput<'_>>,
 ) -> anyhow::Result<GeneratedText> {
     let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
@@ -261,6 +295,7 @@ async fn generate_once(
         image_base64,
         temperature,
         num_predict,
+        structured_output,
     };
     let response = match provider {
         "groq" => {

@@ -9,7 +9,10 @@ use tg_ai_bot_teloxide::{
     db::{build_pool, migrate},
     features::{
         first_comment::{
-            draft::{parse_first_comment_draft, validate_first_comment_draft_output},
+            draft::{
+                first_comment_output_schema, parse_first_comment_draft,
+                validate_first_comment_draft_output,
+            },
             prompt::build_llm_prompt_parts,
             render::build_comment_html,
             repo::{
@@ -19,7 +22,7 @@ use tg_ai_bot_teloxide::{
         },
         memory::service::{load_relevant_memory_notes, remember_post},
     },
-    llm::service::generate_text_checked_with_system,
+    llm::service::generate_text_checked_with_system_and_schema,
     telegram::render::send_html_reply,
 };
 
@@ -167,7 +170,7 @@ async fn retry_job(
         &topic_comments,
         None,
     );
-    let generation = generate_text_checked_with_system(
+    let generation = generate_text_checked_with_system_and_schema(
         config,
         &prompt.system,
         &prompt.user,
@@ -175,6 +178,7 @@ async fn retry_job(
         config.llm_temperature,
         config.llm_max_tokens,
         Some(validate_first_comment_draft_output),
+        first_comment_output_schema(),
     )
     .await?;
     let draft = parse_first_comment_draft(&generation.content)?;

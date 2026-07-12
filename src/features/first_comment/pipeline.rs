@@ -12,7 +12,7 @@ use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::draft::{
-    parse_first_comment_draft, validate_first_comment_draft_output,
+    first_comment_output_schema, parse_first_comment_draft, validate_first_comment_draft_output,
 };
 use crate::features::first_comment::prompt::build_llm_prompt_parts;
 use crate::features::first_comment::render::build_comment_html;
@@ -24,7 +24,7 @@ use crate::features::memory::service::{load_relevant_memory_notes, remember_post
 use crate::features::search::repo::insert_search_run;
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
-use crate::llm::service::generate_text_checked_with_system;
+use crate::llm::service::generate_text_checked_with_system_and_schema;
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
@@ -96,7 +96,7 @@ pub async fn maybe_comment_post(
         &topic_comments,
         config.search_enabled.then_some(&search_context),
     );
-    let generation = generate_text_checked_with_system(
+    let generation = generate_text_checked_with_system_and_schema(
         config,
         &prompt.system,
         &prompt.user,
@@ -104,6 +104,7 @@ pub async fn maybe_comment_post(
         config.llm_temperature,
         config.llm_max_tokens,
         Some(validate_first_comment_draft_output),
+        first_comment_output_schema(),
     )
     .await?;
     let draft = parse_first_comment_draft(&generation.content)?;
