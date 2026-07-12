@@ -11,8 +11,10 @@ use crate::config::Config;
 use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+use crate::features::first_comment::draft::{
+    parse_first_comment_draft, validate_first_comment_draft_output,
+};
 use crate::features::first_comment::prompt::build_llm_prompt_parts;
-use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
@@ -101,13 +103,14 @@ pub async fn maybe_comment_post(
         image_base64.as_deref(),
         config.llm_temperature,
         config.llm_max_tokens,
-        Some(validate_comment_output),
+        Some(validate_first_comment_draft_output),
     )
     .await?;
+    let draft = parse_first_comment_draft(&generation.content)?;
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
-    let final_html = build_comment_html(&generation.content, config);
-    ensure_comment_html(&final_html, &generation.content)?;
+    let final_html = build_comment_html(&draft.comment, config);
+    ensure_comment_html(&final_html, &draft.comment)?;
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
 
@@ -120,7 +123,7 @@ pub async fn maybe_comment_post(
             model: &generation.model,
             prompt: &prompt_for_log,
             image_used: generation.image_used,
-            response: &generation.content,
+            response: &draft.comment,
             final_html: &final_html,
             attempts: &attempts,
         },
