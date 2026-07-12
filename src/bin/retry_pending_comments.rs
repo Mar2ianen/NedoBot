@@ -9,8 +9,8 @@ use tg_ai_bot_teloxide::{
     db::{build_pool, migrate},
     features::{
         first_comment::{
+            draft::{parse_first_comment_draft, validate_first_comment_draft_output},
             prompt::build_llm_prompt_parts,
-            quality::validate_comment_output,
             render::build_comment_html,
             repo::{
                 LlmGenerationInsert, insert_llm_generation, load_recent_bot_comments,
@@ -174,16 +174,17 @@ async fn retry_job(
         None,
         config.llm_temperature,
         config.llm_max_tokens,
-        Some(validate_comment_output),
+        Some(validate_first_comment_draft_output),
     )
     .await?;
+    let draft = parse_first_comment_draft(&generation.content)?;
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
-    let final_html = build_comment_html(&generation.content, config);
+    let final_html = build_comment_html(&draft.comment, config);
     if final_html.trim().is_empty() {
         anyhow::bail!(
             "empty rendered comment from LLM response: {}",
-            generation.content.chars().take(120).collect::<String>()
+            draft.comment.chars().take(120).collect::<String>()
         );
     }
 
@@ -204,7 +205,7 @@ async fn retry_job(
             model: &generation.model,
             prompt: &prompt_for_log,
             image_used: false,
-            response: &generation.content,
+            response: &draft.comment,
             final_html: &final_html,
             attempts: &attempts,
         },
