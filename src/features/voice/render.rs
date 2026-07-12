@@ -6,6 +6,10 @@ pub enum RenderedTranscript {
     Message {
         html: String,
     },
+    RichMessage {
+        html: String,
+        fallback: Box<RenderedTranscript>,
+    },
     MessageAndFile {
         html: String,
         filename: String,
@@ -16,7 +20,9 @@ pub enum RenderedTranscript {
 impl RenderedTranscript {
     pub fn html(&self) -> &str {
         match self {
-            Self::Message { html } | Self::MessageAndFile { html, .. } => html,
+            Self::Message { html }
+            | Self::RichMessage { html, .. }
+            | Self::MessageAndFile { html, .. } => html,
         }
     }
 }
@@ -34,16 +40,13 @@ pub fn render_transcript(clean: &CleanTranscript, config: &Config) -> RenderedTr
         return RenderedTranscript::Message { html };
     }
 
-    let preview = render_preview(clean, &chapters, config.voice_render_expandable_chapters);
-    let body = render_file_body(clean, &chapters);
-    if config.voice_send_full_file {
-        RenderedTranscript::MessageAndFile {
-            html: preview,
-            filename: "voice-transcript.txt".to_string(),
-            body,
-        }
-    } else {
-        RenderedTranscript::Message { html: preview }
+    RenderedTranscript::RichMessage {
+        html: render_rich_chapters(&chapters),
+        fallback: Box::new(render_file_fallback(
+            render_preview(clean, &chapters, config.voice_render_expandable_chapters),
+            render_file_body(clean, &chapters),
+            config,
+        )),
     }
 }
 
@@ -57,15 +60,25 @@ fn render_plain_text(text: &str, config: &Config) -> RenderedTranscript {
         "{}\n\nПолная расшифровка в файле.",
         html::truncate_text(text, 1200)
     );
-    let preview = Html::text(preview_text).into_string();
+    RenderedTranscript::RichMessage {
+        html: render_rich_text(text),
+        fallback: Box::new(render_file_fallback(
+            Html::text(preview_text).into_string(),
+            text.to_string(),
+            config,
+        )),
+    }
+}
+
+fn render_file_fallback(html: String, body: String, config: &Config) -> RenderedTranscript {
     if config.voice_send_full_file {
         RenderedTranscript::MessageAndFile {
-            html: preview,
+            html,
             filename: "voice-transcript.txt".to_string(),
-            body: text.to_string(),
+            body,
         }
     } else {
-        RenderedTranscript::Message { html: preview }
+        RenderedTranscript::Message { html }
     }
 }
 
@@ -97,6 +110,29 @@ fn render_chapters(chapters: &[TranscriptChapter], expandable: bool) -> String {
         }
     }
     out.into_string()
+}
+
+fn render_rich_text(text: &str) -> String {
+    format!(
+        "<h3>Расшифровка голосового</h3><details><summary>Полная расшифровка</summary><p>{}</p></details>",
+        escape_rich_text(text)
+    )
+}
+
+fn render_rich_chapters(chapters: &[TranscriptChapter]) -> String {
+    let mut html = String::from("<h3>Расшифровка голосового</h3>");
+    for chapter in chapters {
+        html.push_str("<details><summary>");
+        html.push_str(&crate::telegram::html::escape(&chapter.title));
+        html.push_str("</summary><p>");
+        html.push_str(&escape_rich_text(&chapter.text));
+        html.push_str("</p></details>");
+    }
+    html
+}
+
+fn escape_rich_text(text: &str) -> String {
+    crate::telegram::html::escape(text).replace('\n', "<br>")
 }
 
 fn render_preview(
@@ -262,5 +298,60 @@ mod tests {
             short_summary: None,
         };
         assert_eq!(render_transcript(&clean, &config()).html(), "&lt;hello&gt;");
+    }
+
+    #[test]
+    fn long_single_topic_uses_closed_rich_details_with_file_fallback() {
+        let clean = CleanTranscript {
+            mode: TranscriptRenderMode::Short,
+            text: "<голосовое>\n".repeat(500),
+            chapters: Vec::new(),
+            short_summary: None,
+        };
+
+        let rendered = render_transcript(&clean, &config());
+        let RenderedTranscript::RichMessage { html, fallback } = rendered else {
+            panic!("long transcript must use a rich message");
+        };
+
+        assert!(html.contains("<details><summary>Полная расшифровка</summary>"));
+        assert!(!html.contains("<details open>"));
+        assert!(html.contains("&lt;голосовое&gt;"));
+        assert!(matches!(
+            *fallback,
+            RenderedTranscript::MessageAndFile { .. }
+        ));
+    }
+
+    #[test]
+    fn long_chapters_use_closed_rich_details() {
+        let clean = CleanTranscript {
+            mode: TranscriptRenderMode::Chapters,
+            text: "длинная расшифровка ".repeat(500),
+            chapters: vec![
+                TranscriptChapter {
+                    title: "Первая <тема>".to_string(),
+                    start_sec: 0.0,
+                    end_sec: Some(60.0),
+                    text: "текст ".repeat(700),
+                },
+                TranscriptChapter {
+                    title: "Вторая тема".to_string(),
+                    start_sec: 60.0,
+                    end_sec: None,
+                    text: "ещё текст".to_string(),
+                },
+            ],
+            short_summary: None,
+        };
+
+        let rendered = render_transcript(&clean, &config());
+        let RenderedTranscript::RichMessage { html, .. } = rendered else {
+            panic!("long chapters must use a rich message");
+        };
+
+        assert_eq!(html.matches("<details>").count(), 2);
+        assert!(html.contains("Первая &lt;тема&gt;"));
+        assert!(!html.contains("<details open>"));
     }
 }
