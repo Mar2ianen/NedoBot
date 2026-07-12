@@ -169,7 +169,7 @@ impl Config {
             voice_short_text_max_chars: env_usize("VOICE_SHORT_TEXT_MAX_CHARS", 400),
             voice_language: env_or("VOICE_LANGUAGE", "ru"),
             voice_asr_provider: env_or("VOICE_ASR_PROVIDER", "groq"),
-            voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3-turbo"),
+            voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3"),
             voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0),
             voice_cleanup_provider: env_optional("VOICE_CLEANUP_PROVIDER"),
             voice_cleanup_model: env_optional("VOICE_CLEANUP_MODEL"),

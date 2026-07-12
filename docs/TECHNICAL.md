@@ -207,7 +207,7 @@ VOICE_MAX_FILE_MB=20
 VOICE_SHORT_TEXT_MAX_CHARS=400
 VOICE_LANGUAGE=ru
 VOICE_ASR_PROVIDER=groq
-VOICE_ASR_MODEL=whisper-large-v3-turbo
+VOICE_ASR_MODEL=whisper-large-v3
 VOICE_ASR_TEMPERATURE=0
 VOICE_CLEANUP_PROVIDER=
 VOICE_CLEANUP_MODEL=
@@ -230,12 +230,12 @@ FIRST_COMMENT_MAX_IMAGE_MB=10
 - `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline.
 - `VOICE_AUTO_TRANSCRIBE=false` оставляет контур выключенным для обычных сообщений; ручной `/transcribe` пока не реализован.
 - `VOICE_ASR_PROVIDER=groq` - сейчас единственный поддержанный ASR provider.
-- `VOICE_ASR_MODEL=whisper-large-v3-turbo` - быстрый дефолт под бесплатные/дешёвые квоты Groq.
+- `VOICE_ASR_MODEL=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
 - `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
 - `VOICE_CLEANUP_MODEL` пустой значит использовать модель обычного provider-а.
 - `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
 - `VOICE_MAX_FILE_MB=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
-- `VOICE_SEND_FULL_FILE=true` включает fallback `preview + voice-transcript.txt`, если HTML не влезает в безопасный лимит Telegram.
+- Если обычный HTML не влезает в безопасный лимит Telegram, бот отправляет Rich Message с закрытым блоком полного текста. `VOICE_SEND_FULL_FILE=true` оставляет `preview + voice-transcript.txt` только как fallback при ошибке Rich API или превышении rich-лимита.
 
 ## Локальный Запуск
 
@@ -434,15 +434,15 @@ Cleanup request:
 - сначала используется `VOICE_CLEANUP_PROVIDER`/`VOICE_CLEANUP_MODEL`, если заданы;
 - если cleanup provider отличается от основного `LLM_PROVIDER` и падает, код пробует основной provider;
 - если все cleanup providers падают, используется raw ASR transcript;
-- если JSON от модели не парсится, используется plain LLM text.
+- если JSON от модели не парсится или cleanup меняет объём/числа сверх безопасных границ, используется raw ASR transcript.
 
 Rendering policy:
 
 - `clean.text.chars().count() <= VOICE_SHORT_TEXT_MAX_CHARS` -> только исправленный текст;
 - `mode=chapters` + непустые chapters -> заголовок `Расшифровка голосового` и главы;
-- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true`;
-- если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет preview;
-- если `VOICE_SEND_FULL_FILE=true`, полный transcript отправляется файлом.
+- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true` и обычное сообщение влезает;
+- если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет Rich Message с закрытым `<details>`; rich-формат поддерживает до 32 768 символов;
+- если Rich API отклоняет сообщение или rich-лимит превышен, `VOICE_SEND_FULL_FILE=true` включает fallback `preview + voice-transcript.txt`.
 
 Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
 
