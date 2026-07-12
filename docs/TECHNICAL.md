@@ -166,7 +166,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
 - Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
-- Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
+- Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. Первые fetched-результаты получают до 6000 символов каждый, общий бюджет search-контекста — 14 000 символов; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
 
 Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
@@ -368,7 +368,9 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 Короткий факт-чек/RAG для защиты от устаревших утверждений лежит в [prompts/tech_rag.md](../prompts/tech_rag.md).
 Cleanup prompt для расшифровки голосовых лежит в [prompts/voice_cleanup.md](../prompts/voice_cleanup.md).
 
-Важно: модель первого комментария должна вернуть текст ровно с одним ссылочным плейсхолдером: `{CHAT_LINK}` или вариантом с разрешённым текстом ссылки вроде `{CHAT_LINK:чате}` / `{CHAT_LINK:комментах}`. Output validator отклоняет ответ без плейсхолдера, с дублем, raw URL, слишком длинный или generic CTA. Код сам заменяет плейсхолдер на HTML-ссылку и не даёт модели портить URL.
+Модель первого комментария возвращает structured JSON: `{"comment":"...","used_search_result_id":null}`. В `comment` обязателен ровно один `{CHAT_LINK}` или вариант с разрешённым текстом ссылки вроде `{CHAT_LINK:чате}` / `{CHAT_LINK:комментах}`. Gemini получает JSON Schema через API, Ollama fallback — ту же schema через `format`; для остальных совместимых провайдеров сохраняется строгий JSON-контракт в prompt.
+
+Если в комментарий добавлен новый факт из поиска, `used_search_result_id` должен содержать его one-based ID. В части генераций с поиском разрешён `{SOURCE_LINK:N:короткая подпись}`: `N` обязан совпадать с `used_search_result_id`, URL берётся только из соответствующего search result и должен быть публичным HTTP(S). Output validator отклоняет raw URL, битые/лишние плейсхолдеры, неподходящий ID, слишком длинный текст и generic CTA. Код сам рендерит ссылки в HTML, а предпросмотр ссылок отключён для обычных и rich text send-путей.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
 Автоматическая память работает поверх RAG:
@@ -383,7 +385,7 @@ RAG не предназначен для пересказа новости: по
 
 Антиповтор CTA:
 
-- перед генерацией бот достаёт последние 6 ответов из `llm_generations`;
+- перед генерацией бот достаёт последние 12 ответов из `llm_generations`;
 - prompt просит не повторять их начало, глаголы CTA и общий рисунок фразы;
 - это снижает повторы вроде `залетайте`, `заходите`, `сравним`, `обсудим`.
 
