@@ -1,5 +1,11 @@
 use async_trait::async_trait;
 use serde::Serialize;
+use serde_json::Value;
+
+#[derive(Clone, Copy)]
+pub struct StructuredOutput<'a> {
+    pub schema: &'a Value,
+}
 
 #[derive(Clone, Copy)]
 pub struct LlmRequest<'a> {
@@ -9,6 +15,7 @@ pub struct LlmRequest<'a> {
     pub image_base64: Option<&'a str>,
     pub temperature: f32,
     pub num_predict: u32,
+    pub structured_output: Option<StructuredOutput<'a>>,
 }
 
 pub struct LlmResponse {

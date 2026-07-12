@@ -1,4 +1,7 @@
+use std::sync::LazyLock;
+
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::features::first_comment::quality::validate_comment_output;
 
@@ -11,6 +14,27 @@ use crate::features::first_comment::quality::validate_comment_output;
 pub struct FirstCommentDraft {
     pub comment: String,
     pub used_search_result_id: Option<usize>,
+}
+
+static FIRST_COMMENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
+    json!({
+        "type": "object",
+        "properties": {
+            "comment": {
+                "type": "string",
+                "description": "Visible Russian first comment with one CHAT_LINK placeholder."
+            },
+            "used_search_result_id": {
+                "type": ["integer", "null"],
+                "description": "One-based ID of the search result used for a new factual addition, or null."
+            }
+        },
+        "required": ["comment", "used_search_result_id"]
+    })
+});
+
+pub fn first_comment_output_schema() -> &'static Value {
+    &FIRST_COMMENT_OUTPUT_SCHEMA
 }
 
 pub fn parse_first_comment_draft(value: &str) -> anyhow::Result<FirstCommentDraft> {
@@ -79,5 +103,18 @@ mod tests {
             r#"{"comment":"Память дорожает, а заводы не успевают. Прайсы в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_requires_comment_and_search_provenance() {
+        let schema = first_comment_output_schema();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["comment", "used_search_result_id"])
+        );
+        assert_eq!(
+            schema["properties"]["used_search_result_id"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
     }
 }

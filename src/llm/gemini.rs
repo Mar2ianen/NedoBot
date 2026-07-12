@@ -49,6 +49,8 @@ impl LlmClient for GeminiClient<'_> {
                 thinking_config: (self.thinking_budget > 0).then_some(ThinkingConfig {
                     thinking_budget: self.thinking_budget,
                 }),
+                response_mime_type: request.structured_output.map(|_| "application/json"),
+                response_json_schema: request.structured_output.map(|output| output.schema),
             },
         };
 
@@ -96,7 +98,7 @@ struct GenerateContentRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<GeminiContent<'a>>,
     contents: Vec<GeminiContent<'a>>,
-    generation_config: GenerationConfig,
+    generation_config: GenerationConfig<'a>,
 }
 
 #[derive(Serialize)]
@@ -107,11 +109,15 @@ struct GeminiContent<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GenerationConfig {
+struct GenerationConfig<'a> {
     temperature: f32,
     max_output_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_config: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_json_schema: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -200,10 +206,28 @@ mod tests {
             temperature: 0.35,
             max_output_tokens: output_budget + thinking_budget,
             thinking_config: Some(ThinkingConfig { thinking_budget }),
+            response_mime_type: None,
+            response_json_schema: None,
         };
 
         let value = serde_json::to_value(config).unwrap();
         assert_eq!(value["maxOutputTokens"], json!(346));
         assert_eq!(value["thinkingConfig"]["thinkingBudget"], json!(256));
+    }
+
+    #[test]
+    fn generation_config_serializes_structured_output_schema() {
+        let schema = json!({"type": "object", "properties": {"comment": {"type": "string"}}});
+        let config = GenerationConfig {
+            temperature: 0.35,
+            max_output_tokens: 90,
+            thinking_config: None,
+            response_mime_type: Some("application/json"),
+            response_json_schema: Some(&schema),
+        };
+
+        let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["responseMimeType"], json!("application/json"));
+        assert_eq!(value["responseJsonSchema"], schema);
     }
 }
