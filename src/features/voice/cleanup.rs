@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeSet;
 
 use crate::config::Config;
 use crate::features::voice::types::{
@@ -7,12 +8,14 @@ use crate::features::voice::types::{
 use crate::llm::service::generate_text_with_provider_and_system;
 
 const CLEANUP_PROMPT: &str = include_str!("../../../prompts/voice_cleanup.md");
+const MIN_CLEANUP_CONTENT_PERCENT: usize = 65;
+const MAX_CLEANUP_CONTENT_PERCENT: usize = 135;
 
 pub async fn cleanup_transcript(
     config: &Config,
     transcript: &AsrTranscript,
 ) -> anyhow::Result<CleanTranscript> {
-    let prompt = build_user_prompt(config, transcript);
+    let prompt = build_user_prompt(config.voice_short_text_max_chars, transcript);
     let content = match generate_cleanup_content(config, &prompt).await {
         Ok(content) => content,
         Err(err) => {
@@ -25,10 +28,15 @@ pub async fn cleanup_transcript(
         }
     };
 
-    let clean = parse_cleanup_json(&content).unwrap_or_else(|err| {
-        tracing::warn!(%err, "failed to parse voice cleanup JSON, using raw ASR transcript");
-        plain_cleanup(&transcript.text)
-    });
+    let clean = match parse_cleanup_json(&content)
+        .and_then(|clean| validate_cleanup_against_asr(&clean, transcript).map(|_| clean))
+    {
+        Ok(clean) => clean,
+        Err(err) => {
+            tracing::warn!(%err, "voice cleanup changed ASR beyond safe limits, using raw ASR transcript");
+            plain_cleanup(&transcript.text)
+        }
+    };
 
     Ok(normalize_cleanup(
         clean,
@@ -67,8 +75,8 @@ async fn generate_cleanup_with_provider(
     .content)
 }
 
-fn build_user_prompt(config: &Config, transcript: &AsrTranscript) -> String {
-    let segments = if transcript.segments.is_empty() {
+fn build_user_prompt(short_limit: usize, transcript: &AsrTranscript) -> String {
+    let source = if transcript.segments.is_empty() {
         transcript.text.clone()
     } else {
         transcript
@@ -86,10 +94,61 @@ fn build_user_prompt(config: &Config, transcript: &AsrTranscript) -> String {
             .join("\n")
     };
 
-    format!(
-        "SHORT_LIMIT={}\n\nRAW_TEXT:\n{}\n\nSEGMENTS:\n{}",
-        config.voice_short_text_max_chars, transcript.text, segments
-    )
+    format!("SHORT_LIMIT={short_limit}\n\nSOURCE_TRANSCRIPT:\n{source}")
+}
+
+fn validate_cleanup_against_asr(
+    clean: &CleanTranscript,
+    transcript: &AsrTranscript,
+) -> anyhow::Result<()> {
+    validate_cleanup_text(&transcript.text, &clean.text)?;
+
+    if !clean.chapters.is_empty() {
+        let chapters = clean
+            .chapters
+            .iter()
+            .map(|chapter| chapter.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        validate_cleanup_text(&transcript.text, &chapters)?;
+    }
+
+    Ok(())
+}
+
+fn validate_cleanup_text(raw: &str, cleaned: &str) -> anyhow::Result<()> {
+    let raw_len = content_len(raw);
+    let cleaned_len = content_len(cleaned);
+    if raw_len >= 100
+        && (cleaned_len * 100 < raw_len * MIN_CLEANUP_CONTENT_PERCENT
+            || cleaned_len * 100 > raw_len * MAX_CLEANUP_CONTENT_PERCENT)
+    {
+        anyhow::bail!(
+            "cleanup content length changed too much: raw={raw_len}, cleaned={cleaned_len}"
+        );
+    }
+
+    let raw_numbers = number_tokens(raw);
+    let added_numbers = number_tokens(cleaned)
+        .difference(&raw_numbers)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !added_numbers.is_empty() {
+        anyhow::bail!("cleanup introduced numbers not present in ASR: {added_numbers:?}");
+    }
+
+    Ok(())
+}
+
+fn content_len(text: &str) -> usize {
+    text.chars().filter(|ch| ch.is_alphanumeric()).count()
+}
+
+fn number_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_digit())
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_cleanup_json(value: &str) -> anyhow::Result<CleanTranscript> {
@@ -284,5 +343,57 @@ mod tests {
 
         let normalized = normalize_cleanup(clean, &transcript, 400);
         assert_eq!(normalized.text, "groq и cleanup через Gemma.");
+    }
+
+    #[test]
+    fn prompt_uses_timestamped_segments_without_duplicate_raw_text() {
+        let transcript = AsrTranscript {
+            provider: "groq".to_string(),
+            model: "whisper".to_string(),
+            request_id: None,
+            text: "дублировать этот текст не надо".to_string(),
+            segments: vec![crate::features::voice::types::AsrSegment {
+                start_sec: 2.0,
+                end_sec: 5.0,
+                text: "единственный источник".to_string(),
+            }],
+            raw_json: serde_json::json!({}),
+        };
+
+        let prompt = build_user_prompt(400, &transcript);
+
+        assert!(prompt.contains("SOURCE_TRANSCRIPT"));
+        assert!(prompt.contains("[0:02-0:05] единственный источник"));
+        assert!(!prompt.contains(&transcript.text));
+    }
+
+    #[test]
+    fn cleanup_rejects_new_numbers_and_excessive_rewrite() {
+        let raw = "Gemma 4 31B ".repeat(40);
+        let transcript = transcript_with_text(&raw);
+        let with_new_number = plain_cleanup(&format!("{} 2027", raw));
+        let rewritten = plain_cleanup("короткое резюме");
+
+        assert!(validate_cleanup_against_asr(&with_new_number, &transcript).is_err());
+        assert!(validate_cleanup_against_asr(&rewritten, &transcript).is_err());
+    }
+
+    #[test]
+    fn cleanup_accepts_punctuation_edits_without_new_numbers() {
+        let transcript = transcript_with_text("Вышла Gemma 4 31B и новый драйвер для Vulkan.");
+        let clean = plain_cleanup("Вышла Gemma 4 31B, и новый драйвер для Vulkan.");
+
+        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+    }
+
+    fn transcript_with_text(text: &str) -> AsrTranscript {
+        AsrTranscript {
+            provider: "groq".to_string(),
+            model: "whisper".to_string(),
+            request_id: None,
+            text: text.to_string(),
+            segments: Vec::new(),
+            raw_json: serde_json::json!({}),
+        }
     }
 }
