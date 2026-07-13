@@ -72,7 +72,7 @@ fn looks_like_structured_output(value: &str) -> bool {
 pub fn validate_first_comment_draft_with_search(
     value: &str,
     search_results: &[SearchResult],
-    source_link_allowed: bool,
+    source_link_available: bool,
 ) -> anyhow::Result<()> {
     let draft = parse_first_comment_draft(value)?;
     let source_link = validate_comment_body(&draft)?;
@@ -84,8 +84,12 @@ pub fn validate_first_comment_draft_with_search(
         }
     }
 
+    if draft.used_search_result_id.is_some() && source_link.is_none() {
+        anyhow::bail!("used search result must have a SOURCE_LINK");
+    }
+
     if let Some(source_link) = source_link {
-        if !source_link_allowed {
+        if !source_link_available {
             anyhow::bail!("SOURCE_LINK is disabled for this comment");
         }
         if draft.used_search_result_id != Some(source_link.result_id) {
@@ -287,5 +291,41 @@ mod tests {
             true,
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_missing_source_link_when_search_result_is_used() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Release notes".to_string(),
+            url: "https://example.com/release".to_string(),
+            snippet: "Version 2.0 is available.".to_string(),
+        }];
+
+        assert!(
+            validate_first_comment_draft_with_search(
+                r#"{"comment":"Версия 2.0 уже вышла. Детали в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
+                &results,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn allows_unused_search_context_when_it_adds_no_new_angle() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Release notes".to_string(),
+            url: "https://example.com/release".to_string(),
+            snippet: "Version 2.0 is available.".to_string(),
+        }];
+
+        validate_first_comment_draft_with_search(
+            r#"{"comment":"Обновление уже вышло. Детали в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
+            &results,
+            true,
+        )
+        .unwrap();
     }
 }

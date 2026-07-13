@@ -184,6 +184,7 @@ async fn retry_job(
     )
     .await?;
     let draft = parse_first_comment_draft(&generation.content)?;
+    let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
     let final_html = build_comment_html(&draft.comment, config);
@@ -214,6 +215,7 @@ async fn retry_job(
             response: &draft.comment,
             final_html: &final_html,
             attempts: &attempts,
+            used_search_result_id,
         },
     )
     .await?;
