@@ -23,9 +23,9 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
 - Показывает пользователей в отчётах человекочитаемо: имя кликабельно, ID спрятан в `tg://user`, рядом статус/админство.
 - Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
-- Расшифровывает `voice` и `audio`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
-- Для голосовых делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
-- Короткие голосовые отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
+- Расшифровывает `voice`, `audio` и `video_note`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
+- Для аудиозаписей делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
+- Короткие расшифровки отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
 
 ## Важный Нюанс Telegram
 
@@ -410,7 +410,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 5. Создать `voice_transcription_jobs`; повтор того же `(chat_id, message_id)` не создаёт новый job.
 6. Проверить duration/file size до скачивания.
 7. Скачать файл через Telegram `getFile` во временный файл.
-8. Отправить multipart request в Groq `/audio/transcriptions`.
+8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
 9. Сохранить raw ASR text, segments и raw JSON.
 10. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
 11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
@@ -446,7 +446,7 @@ Rendering policy:
 
 Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
 
-`video_note` сейчас определяется, но отклоняется с пользовательским сообщением: для кружков нужен отдельный audio extract через ffmpeg.
+`video_note` Telegram не сопровождает MIME-типом, поэтому pipeline задаёт `video/mp4` сам. Groq принимает MP4 напрямую: отдельный `ffmpeg` и постоянное хранение кружков не нужны. Временный файл удаляется сразу после завершения ASR-запроса.
 
 Cleanup prompt находится в `prompts/voice_cleanup.md`. Он должен чистить ASR, а не пересказывать голосовое: сохранять спорные формулировки автора, не менять числа/версии/названия моделей и учитывать локальный контекст канала `НедоNews`. В частности, `Gemma 4 31B` / `gemma4:31b` — валидная модель проекта, её нельзя заменять на `Gemma 2`, `Gemini` или `27B`.
 
@@ -565,7 +565,6 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
 - Voice ASR сейчас только через Groq; local Whisper/Ollama audio не подключены.
-- `video_note` пока не расшифровывается, потому что нужен ffmpeg audio extract.
 - Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; настройки меняются через `.env` и рестарт сервиса.
