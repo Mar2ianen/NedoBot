@@ -101,9 +101,9 @@ pub async fn maybe_comment_post(
         directives,
     );
     let validation_results = search_context.results.clone();
-    let source_link_allowed = directives.source_link_allowed();
+    let source_link_available = directives.source_link_available();
     let validator = move |value: &str| {
-        validate_first_comment_draft_with_search(value, &validation_results, source_link_allowed)
+        validate_first_comment_draft_with_search(value, &validation_results, source_link_available)
     };
     let generation = generate_text_checked_with_system_and_schema(
         config,
@@ -117,6 +117,7 @@ pub async fn maybe_comment_post(
     )
     .await?;
     let draft = parse_first_comment_draft(&generation.content)?;
+    let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
     let final_html =
@@ -137,6 +138,7 @@ pub async fn maybe_comment_post(
             response: &draft.comment,
             final_html: &final_html,
             attempts: &attempts,
+            used_search_result_id,
         },
     )
     .await?;
@@ -148,6 +150,7 @@ pub async fn maybe_comment_post(
             &final_html,
             candidate.source_message_id,
             &search_context,
+            used_search_result_id,
         )
         .await;
     }
@@ -202,11 +205,15 @@ async fn send_owner_preview(
     final_html: &str,
     source_message_id: MessageId,
     search_context: &SearchContext,
+    used_search_result_id: Option<i32>,
 ) {
     let preview = format!(
-        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>\n<code>{}</code>",
+        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>\n<code>used_search_result_id={}</code>\n<code>{}</code>",
         final_html,
         source_message_id.0,
+        used_search_result_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "null".to_string()),
         render_search_summary(search_context)
     );
 

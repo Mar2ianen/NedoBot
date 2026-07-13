@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::features::memory::service::MemoryNote;
+use crate::features::search::mcp::is_safe_fetch_url;
 use crate::features::search::types::{SearchContext, SearchResult, SearchSource};
 
 const MAX_PROMPT_SEARCH_RESULTS: usize = 8;
@@ -51,9 +52,13 @@ pub struct CommentDirectives {
 
 impl CommentDirectives {
     pub fn for_post(source_message_id: i32, search_context: Option<&SearchContext>) -> Self {
-        let search_available = search_context
-            .is_some_and(|context| !context.is_skipped() && !context.results.is_empty());
-        let source_link_allowed = search_available && source_message_id.rem_euclid(5) == 0;
+        let search_available = search_context.is_some_and(|context| {
+            !context.is_skipped()
+                && context
+                    .results
+                    .iter()
+                    .any(|result| is_safe_fetch_url(&result.url))
+        });
 
         Self {
             chat_link_position: if source_message_id.rem_euclid(3) == 0 {
@@ -62,20 +67,20 @@ impl CommentDirectives {
                 "second"
             },
             search_usage: if search_available {
-                "use_if_new"
+                "prefer_additive"
             } else {
                 "ignore"
             },
-            source_link: if source_link_allowed {
-                "allowed"
+            source_link: if search_available {
+                "required_if_used"
             } else {
                 "off"
             },
         }
     }
 
-    pub fn source_link_allowed(self) -> bool {
-        self.source_link == "allowed"
+    pub fn source_link_available(self) -> bool {
+        self.source_link == "required_if_used"
     }
 }
 
@@ -192,9 +197,10 @@ fn render_search_context(search_context: Option<&SearchContext>) -> SearchPrompt
         };
     }
 
+    let results = render_search_results_for_prompt(&search_context.results);
     SearchPromptContext {
-        available: true,
-        results: render_search_results_for_prompt(&search_context.results),
+        available: !results.is_empty(),
+        results,
     }
 }
 
@@ -202,7 +208,13 @@ fn render_search_results_for_prompt(results: &[SearchResult]) -> Vec<SearchPromp
     let mut rendered = Vec::new();
     let mut used_chars = 0;
 
-    for result in results.iter().take(MAX_PROMPT_SEARCH_RESULTS) {
+    for (index, result) in results.iter().enumerate() {
+        if !is_safe_fetch_url(&result.url) {
+            continue;
+        }
+        if rendered.len() >= MAX_PROMPT_SEARCH_RESULTS {
+            break;
+        }
         let title = truncate_chars(&compact_text(&result.title), MAX_PROMPT_SEARCH_TITLE_CHARS);
         let available_chars = MAX_PROMPT_SEARCH_BLOCK_CHARS.saturating_sub(used_chars);
         if available_chars == 0 {
@@ -218,7 +230,7 @@ fn render_search_results_for_prompt(results: &[SearchResult]) -> Vec<SearchPromp
         let content = truncate_chars(&compact_text(&result.snippet), content_limit);
         used_chars += title.chars().count() + content.chars().count();
         rendered.push(SearchPromptResult {
-            id: rendered.len() + 1,
+            id: index + 1,
             source: result.source,
             title,
             content,
@@ -468,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn directives_vary_link_position_and_source_link_mode() {
+    fn directives_prefer_additive_context_when_linkable_search_exists() {
         let search_context = SearchContext {
             queries: Vec::new(),
             results: vec![search_result("Source", "https://example.com", "fact")],
@@ -476,18 +488,52 @@ mod tests {
             latency_ms: 0,
         };
 
-        let source_link = CommentDirectives::for_post(5, Some(&search_context));
-        let no_source_link = CommentDirectives::for_post(7, Some(&search_context));
+        let directives = CommentDirectives::for_post(5, Some(&search_context));
 
-        assert!(source_link.source_link_allowed());
-        assert!(!no_source_link.source_link_allowed());
+        assert!(directives.source_link_available());
         assert_eq!(
-            serde_json::to_value(source_link).unwrap()["chat_link_position"],
+            serde_json::to_value(directives).unwrap()["source_link"],
+            "required_if_used"
+        );
+        assert_eq!(
+            serde_json::to_value(directives).unwrap()["search_usage"],
+            "prefer_additive"
+        );
+        assert_eq!(
+            serde_json::to_value(directives).unwrap()["chat_link_position"],
             "second"
         );
         assert_eq!(
             serde_json::to_value(CommentDirectives::for_post(6, Some(&search_context))).unwrap()["chat_link_position"],
             "first"
         );
+    }
+
+    #[test]
+    fn search_prompt_filters_unsafe_urls_without_renumbering_results() {
+        let search_context = SearchContext {
+            queries: Vec::new(),
+            results: vec![
+                search_result("Unsafe", "http://127.0.0.1/private", "hidden"),
+                search_result("Public", "https://example.com/release", "Version 2.0"),
+            ],
+            skipped_reason: None,
+            latency_ms: 0,
+        };
+
+        let prompt = build_llm_prompt_parts(
+            "Пост",
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&search_context),
+            CommentDirectives::for_post(1, Some(&search_context)),
+        );
+        let context = context_json(&prompt);
+
+        assert_eq!(context["search"]["available"], true);
+        assert_eq!(context["search"]["results"].as_array().unwrap().len(), 1);
+        assert_eq!(context["search"]["results"][0]["id"], 2);
     }
 }
