@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use teloxide::types::Message;
 
+pub const VIDEO_NOTE_MIME_TYPE: &str = "video/mp4";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceMediaKind {
@@ -91,8 +93,45 @@ impl VoiceMedia {
             file_unique_id: Some(video_note.file.unique_id.clone()),
             duration_sec: Some(video_note.duration.seconds()),
             file_size: Some(video_note.file.size as u64),
-            mime_type: None,
+            mime_type: Some(VIDEO_NOTE_MIME_TYPE.to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_note_has_mp4_mime_type_for_asr_upload() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 42,
+            "date": 0,
+            "chat": {
+                "id": -100,
+                "type": "supergroup",
+                "title": "Test chat"
+            },
+            "from": {
+                "id": 7,
+                "is_bot": false,
+                "first_name": "Test"
+            },
+            "video_note": {
+                "file_id": "file-id",
+                "file_unique_id": "unique-id",
+                "length": 320,
+                "duration": 60,
+                "file_size": 1024
+            }
+        }))
+        .unwrap();
+
+        let media = VoiceMedia::from_message(&message).unwrap();
+
+        assert_eq!(media.kind, VoiceMediaKind::VideoNote);
+        assert_eq!(media.mime_type.as_deref(), Some(VIDEO_NOTE_MIME_TYPE));
+        assert_eq!(media.duration_sec, Some(60));
     }
 }
 

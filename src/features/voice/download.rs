@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use teloxide::net::Download;
 use teloxide::prelude::*;
@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use crate::config::Config;
 use crate::features::voice::types::{VoiceMedia, VoiceMediaKind};
 
-pub struct DownloadedVoice {
+pub struct DownloadedMedia {
     pub path: PathBuf,
     pub filename: String,
     pub mime_type: Option<String>,
@@ -20,7 +20,6 @@ pub struct DownloadedVoice {
 pub enum VoiceDownloadSkip {
     TooLong { duration_sec: u32, max_sec: u32 },
     TooLarge { size: u64, max_size: u64 },
-    UnsupportedVideoNote,
 }
 
 impl VoiceDownloadSkip {
@@ -30,38 +29,45 @@ impl VoiceDownloadSkip {
                 duration_sec,
                 max_sec,
             } => format!(
-                "Голосовое слишком длинное: {}. Сейчас лимит {}.",
+                "Запись слишком длинная: {}. Сейчас лимит {}.",
                 format_duration(*duration_sec),
                 format_duration(*max_sec)
             ),
             Self::TooLarge { size, max_size } => format!(
-                "Файл слишком большой: {} MB. Сейчас лимит {} MB.",
+                "Запись слишком большая: {} MB. Сейчас лимит {} MB.",
                 bytes_to_mb(*size),
                 bytes_to_mb(*max_size)
             ),
-            Self::UnsupportedVideoNote => {
-                "Кружки пока не расшифровываю: для них нужен отдельный аудио-extract.".to_string()
-            }
         }
     }
 }
 
 pub fn validate_media(media: &VoiceMedia, config: &Config) -> Result<(), VoiceDownloadSkip> {
-    if media.kind == VoiceMediaKind::VideoNote {
-        return Err(VoiceDownloadSkip::UnsupportedVideoNote);
-    }
+    validate_limits(
+        media.duration_sec,
+        media.file_size,
+        config.voice_max_duration_sec,
+        config.voice_max_file_mb,
+    )
+}
 
-    if let Some(duration_sec) = media.duration_sec
-        && duration_sec > config.voice_max_duration_sec
+fn validate_limits(
+    duration_sec: Option<u32>,
+    file_size: Option<u64>,
+    max_duration_sec: u32,
+    max_file_mb: u32,
+) -> Result<(), VoiceDownloadSkip> {
+    if let Some(duration_sec) = duration_sec
+        && duration_sec > max_duration_sec
     {
         return Err(VoiceDownloadSkip::TooLong {
             duration_sec,
-            max_sec: config.voice_max_duration_sec,
+            max_sec: max_duration_sec,
         });
     }
 
-    if let Some(file_size) = media.file_size {
-        let max_size = config.voice_max_file_mb as u64 * 1024 * 1024;
+    if let Some(file_size) = file_size {
+        let max_size = max_file_mb as u64 * 1024 * 1024;
         if file_size > max_size {
             return Err(VoiceDownloadSkip::TooLarge {
                 size: file_size,
@@ -73,14 +79,14 @@ pub fn validate_media(media: &VoiceMedia, config: &Config) -> Result<(), VoiceDo
     Ok(())
 }
 
-pub async fn download_voice_file(
+pub async fn download_media_file(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     media: &VoiceMedia,
-) -> anyhow::Result<DownloadedVoice> {
+) -> anyhow::Result<DownloadedMedia> {
     let file = bot.get_file(media.file_id.clone()).await?;
     let suffix = file_suffix(media);
     let named = tempfile::Builder::new()
-        .prefix("tg-voice-")
+        .prefix("tg-media-")
         .suffix(&suffix)
         .tempfile()?;
     let temp_path = named.into_temp_path();
@@ -91,9 +97,9 @@ pub async fn download_voice_file(
     dst.flush().await?;
 
     let size = tokio::fs::metadata(&path).await?.len();
-    Ok(DownloadedVoice {
+    Ok(DownloadedMedia {
         path,
-        filename: format!("voice{}", file_suffix(media)),
+        filename: format!("telegram-{}{}", media.kind.as_str(), file_suffix(media)),
         mime_type: media.mime_type.clone(),
         size,
         _temp_path: temp_path,
@@ -136,7 +142,57 @@ fn format_duration(seconds: u32) -> String {
     }
 }
 
-#[allow(dead_code)]
-fn _path_exists(path: &Path) -> bool {
-    path.exists()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::voice::types::VIDEO_NOTE_MIME_TYPE;
+
+    fn media(
+        kind: VoiceMediaKind,
+        duration_sec: Option<u32>,
+        file_size: Option<u64>,
+        mime_type: Option<&str>,
+    ) -> VoiceMedia {
+        VoiceMedia {
+            chat_id: -100,
+            message_id: 42,
+            user_id: Some(7),
+            kind,
+            file_id: "file-id".to_string(),
+            file_unique_id: Some("unique-id".to_string()),
+            duration_sec,
+            file_size,
+            mime_type: mime_type.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn video_note_uses_mp4_file_extension() {
+        let media = media(
+            VoiceMediaKind::VideoNote,
+            Some(60),
+            Some(20 * 1024 * 1024),
+            Some(VIDEO_NOTE_MIME_TYPE),
+        );
+
+        assert_eq!(file_suffix(&media), ".mp4");
+    }
+
+    #[test]
+    fn video_note_keeps_duration_and_size_limits() {
+        assert_eq!(
+            validate_limits(Some(61), Some(1024), 60, 20),
+            Err(VoiceDownloadSkip::TooLong {
+                duration_sec: 61,
+                max_sec: 60,
+            })
+        );
+        assert_eq!(
+            validate_limits(Some(1), Some(20 * 1024 * 1024 + 1), 60, 20),
+            Err(VoiceDownloadSkip::TooLarge {
+                size: 20 * 1024 * 1024 + 1,
+                max_size: 20 * 1024 * 1024,
+            })
+        );
+    }
 }

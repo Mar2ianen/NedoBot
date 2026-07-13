@@ -4,7 +4,7 @@ use teloxide::types::{InputFile, MessageId, ReplyParameters};
 use crate::db::telegram::save_telegram_message;
 use crate::features::voice::asr::transcribe_audio;
 use crate::features::voice::cleanup::cleanup_transcript;
-use crate::features::voice::download::{download_voice_file, validate_media};
+use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
 use crate::features::voice::repo::{
     create_voice_job, mark_voice_job_failed, mark_voice_job_status, save_asr_result,
@@ -14,8 +14,7 @@ use crate::features::voice::types::{AsrTranscript, VoiceMedia};
 use crate::state::AppState;
 use crate::telegram::render::{InputRichMessage, send_html_reply, send_rich_message_reply};
 
-const NO_SPEECH_MESSAGE: &str =
-    "В голосовом не нашёл распознаваемой речи — не буду додумывать текст.";
+const NO_SPEECH_MESSAGE: &str = "В записи не нашёл распознаваемой речи — не буду додумывать текст.";
 
 const NO_SPEECH_ARTIFACTS: &[&str] = &[
     "музыка",
@@ -98,21 +97,24 @@ async fn process_voice_job(
     media: &VoiceMedia,
 ) -> anyhow::Result<()> {
     mark_voice_job_status(&state.pool, job_id, "downloading").await?;
-    let downloaded = download_voice_file(bot, media).await?;
-    tracing::info!(
-        job_id,
-        size = downloaded.size,
-        "downloaded voice file for transcription"
-    );
+    let transcript = {
+        let downloaded = download_media_file(bot, media).await?;
+        tracing::info!(
+            job_id,
+            size = downloaded.size,
+            media_kind = media.kind.as_str(),
+            "downloaded media file for transcription"
+        );
 
-    mark_voice_job_status(&state.pool, job_id, "transcribing").await?;
-    let transcript = transcribe_audio(
-        &state.config,
-        &downloaded.path,
-        &downloaded.filename,
-        downloaded.mime_type.as_deref(),
-    )
-    .await?;
+        mark_voice_job_status(&state.pool, job_id, "transcribing").await?;
+        transcribe_audio(
+            &state.config,
+            &downloaded.path,
+            &downloaded.filename,
+            downloaded.mime_type.as_deref(),
+        )
+        .await?
+    };
     save_asr_result(&state.pool, job_id, &transcript).await?;
     if !transcript_has_speech(&transcript) {
         mark_voice_job_failed(&state.pool, job_id, NO_SPEECH_MESSAGE).await?;
