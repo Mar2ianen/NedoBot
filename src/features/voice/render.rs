@@ -17,16 +17,6 @@ pub enum RenderedTranscript {
     },
 }
 
-impl RenderedTranscript {
-    pub fn html(&self) -> &str {
-        match self {
-            Self::Message { html }
-            | Self::RichMessage { html, .. }
-            | Self::MessageAndFile { html, .. } => html,
-        }
-    }
-}
-
 pub fn render_transcript(clean: &CleanTranscript, config: &Config) -> RenderedTranscript {
     if clean.mode == TranscriptRenderMode::Short
         || clean.text.chars().count() <= config.voice_short_text_max_chars
@@ -297,7 +287,11 @@ mod tests {
             chapters: Vec::new(),
             short_summary: None,
         };
-        assert_eq!(render_transcript(&clean, &config()).html(), "&lt;hello&gt;");
+        let RenderedTranscript::Message { html } = render_transcript(&clean, &config()) else {
+            panic!("short transcript must render as a regular message");
+        };
+
+        assert_eq!(html, "&lt;hello&gt;");
     }
 
     #[test]

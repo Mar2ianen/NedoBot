@@ -69,11 +69,6 @@ fn looks_like_structured_output(value: &str) -> bool {
     value.starts_with('{') || value.starts_with('[') || value.starts_with("```")
 }
 
-pub fn validate_first_comment_draft_output(value: &str) -> anyhow::Result<()> {
-    let draft = parse_first_comment_draft(value)?;
-    validate_comment_body(&draft).map(|_| ())
-}
-
 pub fn validate_first_comment_draft_with_search(
     value: &str,
     search_results: &[SearchResult],
@@ -239,10 +234,12 @@ mod tests {
 
     #[test]
     fn validator_checks_visible_comment() {
-        validate_first_comment_draft_output(
+        let draft = parse_first_comment_draft(
             r#"{"comment":"Память дорожает, а заводы не успевают. Прайсы в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
         )
         .unwrap();
+
+        validate_comment_body(&draft).unwrap();
     }
 
     #[test]
