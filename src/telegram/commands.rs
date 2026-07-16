@@ -15,6 +15,8 @@ pub enum Command {
     FormatTest(String),
     #[command(description = "показать последние заметки памяти")]
     Memory,
+    #[command(description = "спросить помощника по истории чата; /ask <вопрос>")]
+    Ask(String),
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]
     StatsDay(String),
     #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p]")]
