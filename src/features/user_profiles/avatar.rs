@@ -33,7 +33,7 @@ impl CachedProfileAvatar {
 }
 
 pub async fn cache_profile_avatar(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    bot: &Bot,
     static_files_dir: &str,
     user_id: i64,
     file_id: Option<&str>,
@@ -59,7 +59,7 @@ pub async fn cache_profile_avatar(
 }
 
 async fn download_profile_avatar(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    bot: &Bot,
     file_id: &str,
     avatars_dir: &Path,
     path: &Path,

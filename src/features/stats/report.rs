@@ -1140,7 +1140,7 @@ async fn cached_profile_photo_url(
         .trim()
         .trim_end_matches('/');
     let avatar = match cache_profile_avatar(
-        bot,
+        bot.inner(),
         &config.static_files_dir,
         user_id,
         file_id,

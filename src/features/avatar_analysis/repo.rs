@@ -12,6 +12,7 @@ pub struct AvatarAnalysisJob {
     pub profile_photo_file_id: String,
     pub profile_photo_file_unique_id: String,
     pub features_snapshot_hash: String,
+    pub features_json: Value,
     pub prompt_version: String,
     pub attempts: i32,
 }
@@ -22,16 +23,18 @@ pub async fn enqueue_avatar_analysis_job(
     profile_photo_file_id: &str,
     profile_photo_file_unique_id: &str,
     features_snapshot_hash: &str,
+    features_json: &Value,
     prompt_version: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         insert into avatar_analysis_jobs
-            (telegram_user_id, profile_photo_file_id, profile_photo_file_unique_id, features_snapshot_hash, prompt_version)
-        values ($1, $2, $3, $4, $5)
+            (telegram_user_id, profile_photo_file_id, profile_photo_file_unique_id, features_snapshot_hash, features_json, prompt_version)
+        values ($1, $2, $3, $4, $5, $6)
         on conflict (telegram_user_id, profile_photo_file_unique_id, features_snapshot_hash, prompt_version)
         do update set
             profile_photo_file_id = excluded.profile_photo_file_id,
+            features_json = excluded.features_json,
             updated_at = now()
         "#,
     )
@@ -39,6 +42,7 @@ pub async fn enqueue_avatar_analysis_job(
     .bind(profile_photo_file_id)
     .bind(profile_photo_file_unique_id)
     .bind(features_snapshot_hash)
+    .bind(features_json)
     .bind(prompt_version)
     .execute(pool)
     .await?;
@@ -69,7 +73,7 @@ pub async fn claim_next_avatar_analysis_job(
         where job.id = candidate.id
         returning job.id, job.telegram_user_id, job.profile_photo_file_id,
                   job.profile_photo_file_unique_id, job.features_snapshot_hash,
-                  job.prompt_version, job.attempts
+                  job.features_json, job.prompt_version, job.attempts
         "#,
     )
     .bind(LEASE_SECONDS)
@@ -82,6 +86,7 @@ pub async fn claim_next_avatar_analysis_job(
         profile_photo_file_id: row.get("profile_photo_file_id"),
         profile_photo_file_unique_id: row.get("profile_photo_file_unique_id"),
         features_snapshot_hash: row.get("features_snapshot_hash"),
+        features_json: row.get("features_json"),
         prompt_version: row.get("prompt_version"),
         attempts: row.get("attempts"),
     }))
