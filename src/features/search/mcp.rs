@@ -24,6 +24,19 @@ impl McpSearchProvider {
     }
 }
 
+pub async fn search_for_ask(
+    config: &Config,
+    source: SearchSource,
+    query: &str,
+) -> anyhow::Result<Vec<SearchResult>> {
+    McpSearchProvider::new(config.clone())
+        .search(&SearchQuery {
+            source,
+            text: query.to_string(),
+        })
+        .await
+}
+
 #[async_trait::async_trait]
 impl SearchProvider for McpSearchProvider {
     async fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<SearchResult>> {
