@@ -6,6 +6,26 @@ pub struct SearchMcpTools {
     pub reddit: String,
 }
 
+const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
+    "meduza.io",
+    "theins.ru",
+    "tvrain.tv",
+    "novayagazeta.eu",
+    "zona.media",
+    "istories.media",
+    "holod.media",
+    "verstka.media",
+    "proekt.media",
+    "thebell.io",
+    "currenttime.tv",
+    "svoboda.org",
+    "severreal.org",
+    "ridl.io",
+    "doxa.team",
+    "7x7-journal.ru",
+    "paperpaper.ru",
+];
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct Config {
@@ -125,7 +145,7 @@ impl Config {
             search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
             comment_blocked_source_domains: env_list_csv_or(
                 "COMMENT_BLOCKED_SOURCE_DOMAINS",
-                &["meduza.io"],
+                DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS,
             ),
             comment_blocked_terms: env_list_csv("COMMENT_BLOCKED_TERMS"),
             search_github_mcp_command: env_optional("SEARCH_GITHUB_MCP_COMMAND"),

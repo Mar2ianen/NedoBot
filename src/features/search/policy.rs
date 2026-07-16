@@ -60,6 +60,17 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_contains_multiple_blocked_sources() {
+        let config = Config::from_env();
+
+        assert!(!is_allowed_source_url(&config, "https://theins.ru/story"));
+        assert!(!is_allowed_source_url(
+            &config,
+            "https://www.currenttime.tv/story"
+        ));
+    }
+
+    #[test]
     fn blocks_configured_terms_in_comment_text() {
         let mut config = Config::from_env();
         config.comment_blocked_terms = vec!["запрещенное название".to_string()];
