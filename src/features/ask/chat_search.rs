@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
@@ -5,7 +6,8 @@ const MAX_QUERY_CHARS: usize = 240;
 const MAX_RESULT_LIMIT: i64 = 20;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum MessageSort {
     Relevance,
     Newest,
@@ -36,14 +38,14 @@ pub struct MessageSearchRequest {
     pub limit: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ChatMessage {
     pub message_id: i32,
     pub user_id: Option<i64>,
     pub author: String,
     pub text: String,
     pub reply_to_message_id: Option<i32>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: String,
     pub relevance: i32,
     pub source_id: String,
     pub message_url: Option<String>,
@@ -139,7 +141,7 @@ pub async fn search_messages(
             author: row.author,
             text: first_chars(&row.text, 700),
             reply_to_message_id: row.reply_to_message_id,
-            created_at: row.created_at,
+            created_at: row.created_at.to_rfc3339(),
         })
         .collect())
 }
@@ -190,7 +192,7 @@ pub async fn message_context(
             author: row.author,
             text: first_chars(&row.text, 700),
             reply_to_message_id: row.reply_to_message_id,
-            created_at: row.created_at,
+            created_at: row.created_at.to_rfc3339(),
         })
         .collect())
 }
