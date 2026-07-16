@@ -23,9 +23,9 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
 - Показывает пользователей в отчётах человекочитаемо: имя кликабельно, ID спрятан в `tg://user`, рядом статус/админство.
 - Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
-- Расшифровывает `voice` и `audio`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
-- Для голосовых делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
-- Короткие голосовые отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
+- Расшифровывает `voice`, `audio` и `video_note`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
+- Для аудиозаписей делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
+- Короткие расшифровки отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
 
 ## Важный Нюанс Telegram
 
@@ -83,7 +83,7 @@ SEARCH_ENABLED=false
 SEARCH_EXTRACT_PROVIDER=ollama
 SEARCH_EXTRACT_MODEL=gemma4:31b
 SEARCH_EXTRACT_TEMPERATURE=0.1
-SEARCH_EXTRACT_MAX_TOKENS=700
+SEARCH_EXTRACT_MAX_TOKENS=900
 SEARCH_MCP_COMMAND=
 SEARCH_MCP_ARGS=
 SEARCH_MCP_ENV=
@@ -92,8 +92,8 @@ SEARCH_MCP_TOOL_WEB=web_search
 SEARCH_MCP_TOOL_GITHUB=github_search
 SEARCH_MCP_TOOL_REDDIT=reddit_search
 SEARCH_MCP_TOOL_FETCH=web_fetch_exa
-SEARCH_FETCH_TOP_N=2
-SEARCH_FETCH_MAX_CHARS=6000
+SEARCH_FETCH_TOP_N=4
+SEARCH_FETCH_MAX_CHARS=9000
 SEARCH_GITHUB_MCP_COMMAND=
 SEARCH_GITHUB_MCP_ARGS=
 SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
@@ -166,7 +166,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
 - Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
-- Результаты поиска добавляются в prompt без raw URL и имеют приоритет ниже текста поста, `tech_rag` и output validator.
+- Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. Первые fetched-результаты получают до 6000 символов каждый, общий бюджет search-контекста — 14 000 символов; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
 
 Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
@@ -181,8 +181,8 @@ SEARCH_MCP_TOOL_WEB=web_search_exa
 SEARCH_MCP_TOOL_GITHUB=web_search_exa
 SEARCH_MCP_TOOL_REDDIT=web_search_exa
 SEARCH_MCP_TOOL_FETCH=web_fetch_exa
-SEARCH_FETCH_TOP_N=2
-SEARCH_FETCH_MAX_CHARS=6000
+SEARCH_FETCH_TOP_N=4
+SEARCH_FETCH_MAX_CHARS=9000
 ```
 
 Для новостей об утилитах можно добавить GitHub MCP поверх Exa, чтобы `source=github` ходил в GitHub issues/code отдельно:
@@ -207,7 +207,7 @@ VOICE_MAX_FILE_MB=20
 VOICE_SHORT_TEXT_MAX_CHARS=400
 VOICE_LANGUAGE=ru
 VOICE_ASR_PROVIDER=groq
-VOICE_ASR_MODEL=whisper-large-v3-turbo
+VOICE_ASR_MODEL=whisper-large-v3
 VOICE_ASR_TEMPERATURE=0
 VOICE_CLEANUP_PROVIDER=
 VOICE_CLEANUP_MODEL=
@@ -230,12 +230,12 @@ FIRST_COMMENT_MAX_IMAGE_MB=10
 - `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline.
 - `VOICE_AUTO_TRANSCRIBE=false` оставляет контур выключенным для обычных сообщений; ручной `/transcribe` пока не реализован.
 - `VOICE_ASR_PROVIDER=groq` - сейчас единственный поддержанный ASR provider.
-- `VOICE_ASR_MODEL=whisper-large-v3-turbo` - быстрый дефолт под бесплатные/дешёвые квоты Groq.
+- `VOICE_ASR_MODEL=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
 - `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
 - `VOICE_CLEANUP_MODEL` пустой значит использовать модель обычного provider-а.
 - `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
 - `VOICE_MAX_FILE_MB=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
-- `VOICE_SEND_FULL_FILE=true` включает fallback `preview + voice-transcript.txt`, если HTML не влезает в безопасный лимит Telegram.
+- Если обычный HTML не влезает в безопасный лимит Telegram, бот отправляет Rich Message с закрытым блоком полного текста. `VOICE_SEND_FULL_FILE=true` оставляет `preview + voice-transcript.txt` только как fallback при ошибке Rich API или превышении rich-лимита.
 
 ## Локальный Запуск
 
@@ -343,12 +343,12 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /format_test <текст поста>
 /memory
 /status day|week|month [-r|-p]
-/stats_day
-/stats_week
-/stats_month
+/stats_day [-r|-p]
+/stats_week [-r|-p]
+/stats_month [-r|-p]
 /topmsg [-r|-p]
 /topreact [-r|-p]
-/userstats <id|username>
+/userstats <id|username> [-r|-p]
 /userstatus <id|username> [-r|-p]
 ```
 
@@ -368,7 +368,9 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 Короткий факт-чек/RAG для защиты от устаревших утверждений лежит в [prompts/tech_rag.md](../prompts/tech_rag.md).
 Cleanup prompt для расшифровки голосовых лежит в [prompts/voice_cleanup.md](../prompts/voice_cleanup.md).
 
-Важно: модель первого комментария должна вернуть текст ровно с одним ссылочным плейсхолдером: `{CHAT_LINK}` или вариантом с разрешённым текстом ссылки вроде `{CHAT_LINK:чате}` / `{CHAT_LINK:комментах}`. Output validator отклоняет ответ без плейсхолдера, с дублем, raw URL, слишком длинный или generic CTA. Код сам заменяет плейсхолдер на HTML-ссылку и не даёт модели портить URL.
+Модель первого комментария возвращает structured JSON: `{"comment":"...","used_search_result_id":null}`. В `comment` обязателен ровно один `{CHAT_LINK}` или вариант с разрешённым текстом ссылки вроде `{CHAT_LINK:чате}` / `{CHAT_LINK:комментах}`. Gemini получает JSON Schema через API, Ollama fallback — ту же schema через `format`; для остальных совместимых провайдеров сохраняется строгий JSON-контракт в prompt.
+
+Если поиск вернул результат с публичным HTTP(S) URL, модель ищет отдельный угол, которого нет в новости: связанный релиз, ограничение, последствие, сравнение, цену, changelog или реакцию сообщества. Поиск нельзя использовать только для подтверждения или пересказа факта из поста. Если полезного дополнения нет, модель возвращает `used_search_result_id: null` и пишет уникальную реплику по самой новости. Если внешний факт использован, его one-based ID сохраняется в `llm_generations`, а `{SOURCE_LINK:N:подпись}` становится обязательным. Подпись должна быть частью фразы («как пишет VideoCardz»), а не отдельным «детали» или «источник». `COMMENT_BLOCKED_SOURCE_DOMAINS` исключает указанные домены и поддомены до fetch, из prompt и при финальном рендере; `COMMENT_BLOCKED_TERMS` так же исключает результаты и комментарии с заданными фрагментами текста. Output validator отклоняет факт без источника, raw URL, битые/лишние плейсхолдеры, неподходящий ID, текст длиннее 180 видимых символов и generic CTA. Код сам рендерит ссылки в HTML, а предпросмотр ссылок отключён для обычных и rich text send-путей.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
 Автоматическая память работает поверх RAG:
@@ -383,7 +385,7 @@ RAG не предназначен для пересказа новости: по
 
 Антиповтор CTA:
 
-- перед генерацией бот достаёт последние 6 ответов из `llm_generations`;
+- перед генерацией бот достаёт последние 12 ответов из `llm_generations`;
 - prompt просит не повторять их начало, глаголы CTA и общий рисунок фразы;
 - это снижает повторы вроде `залетайте`, `заходите`, `сравним`, `обсудим`.
 
@@ -408,7 +410,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 5. Создать `voice_transcription_jobs`; повтор того же `(chat_id, message_id)` не создаёт новый job.
 6. Проверить duration/file size до скачивания.
 7. Скачать файл через Telegram `getFile` во временный файл.
-8. Отправить multipart request в Groq `/audio/transcriptions`.
+8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
 9. Сохранить raw ASR text, segments и raw JSON.
 10. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
 11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
@@ -432,19 +434,19 @@ Cleanup request:
 - сначала используется `VOICE_CLEANUP_PROVIDER`/`VOICE_CLEANUP_MODEL`, если заданы;
 - если cleanup provider отличается от основного `LLM_PROVIDER` и падает, код пробует основной provider;
 - если все cleanup providers падают, используется raw ASR transcript;
-- если JSON от модели не парсится, используется plain LLM text.
+- если JSON от модели не парсится или cleanup меняет объём/числа сверх безопасных границ, используется raw ASR transcript.
 
 Rendering policy:
 
 - `clean.text.chars().count() <= VOICE_SHORT_TEXT_MAX_CHARS` -> только исправленный текст;
 - `mode=chapters` + непустые chapters -> заголовок `Расшифровка голосового` и главы;
-- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true`;
-- если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет preview;
-- если `VOICE_SEND_FULL_FILE=true`, полный transcript отправляется файлом.
+- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true` и обычное сообщение влезает;
+- если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет Rich Message с закрытым `<details>`; rich-формат поддерживает до 32 768 символов;
+- если Rich API отклоняет сообщение или rich-лимит превышен, `VOICE_SEND_FULL_FILE=true` включает fallback `preview + voice-transcript.txt`.
 
 Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
 
-`video_note` сейчас определяется, но отклоняется с пользовательским сообщением: для кружков нужен отдельный audio extract через ffmpeg.
+`video_note` Telegram не сопровождает MIME-типом, поэтому pipeline задаёт `video/mp4` сам. Groq принимает MP4 напрямую: отдельный `ffmpeg` и постоянное хранение кружков не нужны. Временный файл удаляется сразу после завершения ASR-запроса.
 
 Cleanup prompt находится в `prompts/voice_cleanup.md`. Он должен чистить ASR, а не пересказывать голосовое: сохранять спорные формулировки автора, не менять числа/версии/названия моделей и учитывать локальный контекст канала `НедоNews`. В частности, `Gemma 4 31B` / `gemma4:31b` — валидная модель проекта, её нельзя заменять на `Gemma 2`, `Gemini` или `27B`.
 
@@ -563,7 +565,6 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
 - Voice ASR сейчас только через Groq; local Whisper/Ollama audio не подключены.
-- `video_note` пока не расшифровывается, потому что нужен ffmpeg audio extract.
 - Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; настройки меняются через `.env` и рестарт сервиса.

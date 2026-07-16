@@ -1,15 +1,12 @@
-use std::path::Path;
-
 use sqlx::PgPool;
-use teloxide::net::Download;
 use teloxide::prelude::*;
-use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
 use crate::db::telegram::refresh_chat_member_snapshot;
 use crate::features::stats::types::{
     ChatStatsSummary, StatsPeriod, StatsRender, UserPresentation, display_name,
 };
+use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::{escape_html, send_html, send_rich_html};
@@ -1142,52 +1139,27 @@ async fn cached_profile_photo_url(
         .as_deref()?
         .trim()
         .trim_end_matches('/');
-    let file_id = file_id?.trim();
-    if file_id.is_empty() {
-        return None;
-    }
-
-    let avatars_dir = Path::new(&config.static_files_dir).join("avatars");
-    let filename = format!(
-        "{}_{}.jpg",
+    let avatar = match cache_profile_avatar(
+        bot.inner(),
+        &config.static_files_dir,
         user_id,
-        safe_static_name(unique_id.unwrap_or("photo"))
-    );
-    let path = avatars_dir.join(&filename);
-
-    if tokio::fs::metadata(&path).await.is_err()
-        && let Err(err) = download_profile_photo(bot, file_id, &avatars_dir, &path).await
+        file_id,
+        unique_id,
+    )
+    .await
     {
-        tracing::debug!(%err, user_id, "failed to cache profile photo");
-        return None;
-    }
+        Ok(Some(avatar)) => avatar,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::debug!(%err, user_id, "failed to cache profile photo");
+            return None;
+        }
+    };
 
     Some(format!(
-        "{public_base_url}/tg-ai-bot-static/avatars/{filename}"
+        "{public_base_url}/tg-ai-bot-static/avatars/{}",
+        avatar.filename()
     ))
-}
-
-async fn download_profile_photo(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    file_id: &str,
-    avatars_dir: &Path,
-    path: &Path,
-) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(avatars_dir).await?;
-    let file = bot.get_file(file_id.to_string()).await?;
-    let tmp_path = path.with_extension("tmp");
-    let mut dst = tokio::fs::File::create(&tmp_path).await?;
-    bot.download_file(&file.path, &mut dst).await?;
-    dst.flush().await?;
-    tokio::fs::rename(tmp_path, path).await?;
-    Ok(())
-}
-
-fn safe_static_name(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        .collect::<String>()
 }
 
 async fn chat_stats_summary(

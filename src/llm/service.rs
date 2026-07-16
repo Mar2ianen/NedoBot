@@ -2,9 +2,10 @@ use crate::config::{Config, normalize_llm_provider};
 use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
-use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest};
+use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest, StructuredOutput};
+use serde_json::Value;
 
-pub type OutputValidator = fn(&str) -> anyhow::Result<()>;
+pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
 pub struct GenerateTextOptions<'a> {
     pub provider_override: Option<&'a str>,
@@ -14,7 +15,8 @@ pub struct GenerateTextOptions<'a> {
     pub image_base64: Option<&'a str>,
     pub temperature: f32,
     pub num_predict: u32,
-    pub output_validator: Option<OutputValidator>,
+    pub output_validator: Option<&'a OutputValidator>,
+    pub structured_output: Option<StructuredOutput<'a>>,
 }
 
 const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
@@ -40,7 +42,7 @@ pub async fn generate_text_checked(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
-    output_validator: Option<OutputValidator>,
+    output_validator: Option<&OutputValidator>,
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
@@ -53,6 +55,7 @@ pub async fn generate_text_checked(
             temperature,
             num_predict,
             output_validator,
+            structured_output: None,
         },
     )
     .await
@@ -101,6 +104,7 @@ pub async fn generate_text_with_provider_and_system(
             temperature,
             num_predict,
             output_validator: None,
+            structured_output: None,
         },
     )
     .await
@@ -113,7 +117,7 @@ pub async fn generate_text_checked_with_system(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
-    output_validator: Option<OutputValidator>,
+    output_validator: Option<&OutputValidator>,
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
@@ -126,6 +130,38 @@ pub async fn generate_text_checked_with_system(
             temperature,
             num_predict,
             output_validator,
+            structured_output: None,
+        },
+    )
+    .await
+}
+
+pub async fn generate_text_checked_with_system_and_schema(
+    config: &Config,
+    system_prompt: &str,
+    prompt: &str,
+    image_base64: Option<&str>,
+    temperature: f32,
+    num_predict: u32,
+    output_validator: Option<&OutputValidator>,
+    schema_name: &str,
+    schema: &Value,
+) -> anyhow::Result<GeneratedText> {
+    generate_text_with_provider_checked(
+        config,
+        GenerateTextOptions {
+            provider_override: None,
+            model_override: None,
+            system_prompt: Some(system_prompt),
+            prompt,
+            image_base64,
+            temperature,
+            num_predict,
+            output_validator,
+            structured_output: Some(StructuredOutput {
+                name: schema_name,
+                schema,
+            }),
         },
     )
     .await
@@ -149,7 +185,7 @@ pub async fn generate_text_with_provider_checked(
     for (fallback_index, fallback) in fallbacks.into_iter().enumerate() {
         let mut attempt_prompt = options.prompt.to_string();
         for attempt in 0..=VALIDATION_RETRY_ATTEMPTS {
-            match generate_once(
+            let generation = generate_once(
                 config,
                 fallback.provider,
                 fallback.model,
@@ -158,15 +194,57 @@ pub async fn generate_text_with_provider_checked(
                 options.image_base64,
                 options.temperature,
                 options.num_predict,
+                options.structured_output,
             )
-            .await
-            {
+            .await;
+            let generation = match generation {
+                Err(err)
+                    if options.structured_output.is_some()
+                        && is_structured_output_rejection(&err) =>
+                {
+                    tracing::warn!(
+                        %err,
+                        fallback_index,
+                        provider = fallback.provider,
+                        model = fallback.model,
+                        "structured output was rejected, retrying with prompt-only JSON contract"
+                    );
+                    generate_once(
+                        config,
+                        fallback.provider,
+                        fallback.model,
+                        options.system_prompt,
+                        &attempt_prompt,
+                        options.image_base64,
+                        options.temperature,
+                        options.num_predict,
+                        None,
+                    )
+                    .await
+                    .map(|mut generation| {
+                        generation.attempts.insert(
+                            0,
+                            LlmAttempt {
+                                provider: fallback.provider.to_string(),
+                                model: fallback.model.to_string(),
+                                outcome: "structured_output_fallback".to_string(),
+                            },
+                        );
+                        generation
+                    })
+                }
+                result => result,
+            };
+
+            match generation {
                 Ok(mut generation) => {
-                    let llm_attempt = generation.attempts.pop().unwrap_or_else(|| LlmAttempt {
+                    let mut generation_attempts = std::mem::take(&mut generation.attempts);
+                    let llm_attempt = generation_attempts.pop().unwrap_or_else(|| LlmAttempt {
                         provider: fallback.provider.to_string(),
                         model: fallback.model.to_string(),
                         outcome: "success".to_string(),
                     });
+                    attempts.extend(generation_attempts);
                     if fallback_index > 0 {
                         tracing::info!(
                             fallback_index,
@@ -243,6 +321,14 @@ fn classify_attempt_error(error: &anyhow::Error) -> String {
     }
 }
 
+fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("400")
+        || text.contains("422")
+        || text.contains("schema")
+        || text.contains("format")
+}
+
 async fn generate_once(
     config: &Config,
     provider: &str,
@@ -252,6 +338,7 @@ async fn generate_once(
     image_base64: Option<&str>,
     temperature: f32,
     num_predict: u32,
+    structured_output: Option<StructuredOutput<'_>>,
 ) -> anyhow::Result<GeneratedText> {
     let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
@@ -261,6 +348,7 @@ async fn generate_once(
         image_base64,
         temperature,
         num_predict,
+        structured_output,
     };
     let response = match provider {
         "groq" => {
@@ -431,6 +519,8 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            comment_blocked_source_domains: vec!["meduza.io".to_string()],
+            comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
             search_github_mcp_args: Vec::new(),
             search_github_mcp_env: vec![
@@ -443,6 +533,10 @@ mod tests {
             groq_model: None,
             cerebras_api_key: String::new(),
             cerebras_model: None,
+            avatar_classifier_enabled: false,
+            avatar_classifier_model: None,
+            avatar_classifier_max_tokens: 900,
+            avatar_classifier_concurrency: 1,
             openrouter_api_key: String::new(),
             openrouter_model: None,
             gemini_api_key: String::new(),
@@ -526,5 +620,18 @@ mod tests {
                 model: "gemini-3.5-flash",
             }]
         );
+    }
+
+    #[test]
+    fn detects_structured_output_rejections() {
+        assert!(is_structured_output_rejection(&anyhow::anyhow!(
+            "HTTP status client error (400 Bad Request)"
+        )));
+        assert!(is_structured_output_rejection(&anyhow::anyhow!(
+            "response JSON schema is unsupported"
+        )));
+        assert!(!is_structured_output_rejection(&anyhow::anyhow!(
+            "HTTP status server error (503 Service Unavailable)"
+        )));
     }
 }

@@ -1,6 +1,6 @@
 # Voice transcription follow-up
 
-Актуальное состояние после реализации voice pipeline. Старый план внедрения выполнен: вертикальный срез `voice -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit` уже есть в коде.
+Актуальное состояние после реализации voice pipeline. Старый план внедрения выполнен: вертикальный срез `voice/audio/video_note -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit` уже есть в коде.
 
 ## Уже реализовано
 
@@ -32,8 +32,8 @@ VOICE_AUTO_TRANSCRIBE=true
 - игнорирует ботов;
 - игнорирует команды;
 - игнорирует automatic forward;
-- поддерживает `voice` и `audio`;
-- `video_note` определяется, но сейчас явно отклоняется как unsupported.
+- поддерживает `voice`, `audio` и `video_note`;
+- кружок отправляется в Groq как исходный MP4 с MIME `video/mp4`, без `ffmpeg`.
 
 Короткие расшифровки:
 
@@ -69,6 +69,7 @@ Fallback:
 6. Отправить длинное voice с 2-3 явными темами.
 7. Проверить, что есть главы и раскрываемые цитаты.
 8. Проверить записи в `voice_transcription_jobs`.
+9. Отправить кружок и проверить `media_kind=video_note`, `status=sent`.
 
 SQL для проверки:
 
@@ -141,18 +142,9 @@ Auto mode уже есть, но ручной режим полезен, если
 
 Не нужно делать свободный аргумент с message id на первом проходе.
 
-### 4. `video_note` через ffmpeg
+### 4. `video_note` без `ffmpeg` — выполнено
 
-Сейчас `video_note` определяется, но `download.rs` возвращает `UnsupportedVideoNote`.
-
-Чтобы включить кружки:
-
-- скачать `.mp4`;
-- вытащить audio stream через ffmpeg;
-- отправить audio в ASR;
-- сохранить исходный `media_kind=video_note`.
-
-Не тащить это до стабилизации обычных voice/audio.
+Groq ASR принимает MP4 напрямую, поэтому кружок скачивается во временный файл и отправляется в существующий multipart ASR request с MIME `video/mp4`. `TempPath` удаляется после ASR, исходник на сервере не хранится, а в `voice_transcription_jobs` сохраняется только audit-результат с `media_kind=video_note`.
 
 ### 5. Тесты, которых не хватает
 
@@ -171,7 +163,9 @@ voice::render chapter title has no timestamp
 voice::render long chapters produce MessageAndFile when over SAFE_TEXT_LIMIT
 voice::cleanup parses valid chapter JSON
 voice::cleanup invalid JSON falls back to plain text
-voice::download rejects video_note
+voice::types video_note has mp4 MIME type for ASR upload
+voice::download accepts video_note as mp4 media
+voice::download keeps duration and size limits for video_note
 voice::download rejects too long voice
 voice::download rejects too large voice
 voice::asr parses Groq verbose_json with segments
@@ -201,5 +195,4 @@ voice::asr parses Groq verbose_json with segments
 1. Cleanup provider/model persistence.
 2. User-facing error policy для ASR/download failures.
 3. Manual `/transcribe` reply command.
-4. Smoke в живом чате на коротком и длинном voice.
-5. Только потом думать про `video_note`/ffmpeg.
+4. Smoke в живом чате на коротком и длинном voice, а также на кружке.

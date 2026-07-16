@@ -6,6 +6,26 @@ pub struct SearchMcpTools {
     pub reddit: String,
 }
 
+const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
+    "meduza.io",
+    "theins.ru",
+    "tvrain.tv",
+    "novayagazeta.eu",
+    "zona.media",
+    "istories.media",
+    "holod.media",
+    "verstka.media",
+    "proekt.media",
+    "thebell.io",
+    "currenttime.tv",
+    "svoboda.org",
+    "severreal.org",
+    "ridl.io",
+    "doxa.team",
+    "7x7-journal.ru",
+    "paperpaper.ru",
+];
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct Config {
@@ -35,6 +55,8 @@ pub struct Config {
     pub search_mcp_fetch_tool: Option<String>,
     pub search_fetch_top_n: usize,
     pub search_fetch_max_chars: usize,
+    pub comment_blocked_source_domains: Vec<String>,
+    pub comment_blocked_terms: Vec<String>,
     pub search_github_mcp_command: Option<String>,
     pub search_github_mcp_args: Vec<String>,
     pub search_github_mcp_env: Vec<String>,
@@ -43,6 +65,10 @@ pub struct Config {
     pub groq_model: Option<String>,
     pub cerebras_api_key: String,
     pub cerebras_model: Option<String>,
+    pub avatar_classifier_enabled: bool,
+    pub avatar_classifier_model: Option<String>,
+    pub avatar_classifier_max_tokens: u32,
+    pub avatar_classifier_concurrency: usize,
     pub openrouter_api_key: String,
     pub openrouter_model: Option<String>,
     pub gemini_api_key: String,
@@ -107,7 +133,7 @@ impl Config {
             search_extract_model: env_optional("SEARCH_EXTRACT_MODEL")
                 .or_else(|| Some("gemma4:31b".to_string())),
             search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1),
-            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 700),
+            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 900),
             search_mcp_command: env_optional("SEARCH_MCP_COMMAND"),
             search_mcp_args: env_args("SEARCH_MCP_ARGS"),
             search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
@@ -119,8 +145,13 @@ impl Config {
             },
             search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
                 .or_else(|| Some("web_fetch_exa".to_string())),
-            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 2),
-            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
+            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 4),
+            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 9000),
+            comment_blocked_source_domains: env_list_csv_or(
+                "COMMENT_BLOCKED_SOURCE_DOMAINS",
+                DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS,
+            ),
+            comment_blocked_terms: env_list_csv("COMMENT_BLOCKED_TERMS"),
             search_github_mcp_command: env_optional("SEARCH_GITHUB_MCP_COMMAND"),
             search_github_mcp_args: env_args("SEARCH_GITHUB_MCP_ARGS"),
             search_github_mcp_env: env_list_csv_or(
@@ -135,6 +166,11 @@ impl Config {
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
+            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true),
+            avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
+                .or_else(|| Some("gemma-4-31b".to_string())),
+            avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900),
+            avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
             openrouter_model: env_optional("OPENROUTER_MODEL"),
             gemini_api_key: env_optional("GEMINI_API_KEY")
@@ -169,7 +205,7 @@ impl Config {
             voice_short_text_max_chars: env_usize("VOICE_SHORT_TEXT_MAX_CHARS", 400),
             voice_language: env_or("VOICE_LANGUAGE", "ru"),
             voice_asr_provider: env_or("VOICE_ASR_PROVIDER", "groq"),
-            voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3-turbo"),
+            voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3"),
             voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0),
             voice_cleanup_provider: env_optional("VOICE_CLEANUP_PROVIDER"),
             voice_cleanup_model: env_optional("VOICE_CLEANUP_MODEL"),
@@ -218,6 +254,22 @@ impl Config {
 
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
+        }
+        if self.avatar_classifier_enabled {
+            require_secret(
+                &mut errors,
+                "CEREBRAS_API_KEY",
+                &self.cerebras_api_key,
+                "AVATAR_CLASSIFIER_ENABLED=true",
+            );
+            if self.avatar_classifier_model.is_none() {
+                errors.push(
+                    "AVATAR_CLASSIFIER_ENABLED=true requires AVATAR_CLASSIFIER_MODEL".to_string(),
+                );
+            }
+            if self.avatar_classifier_concurrency == 0 {
+                errors.push("AVATAR_CLASSIFIER_CONCURRENCY must be greater than 0".to_string());
+            }
         }
 
         if errors.is_empty() {
@@ -474,6 +526,8 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            comment_blocked_source_domains: vec!["meduza.io".to_string()],
+            comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
             search_github_mcp_args: Vec::new(),
             search_github_mcp_env: vec![
@@ -486,6 +540,10 @@ mod tests {
             groq_model: None,
             cerebras_api_key: String::new(),
             cerebras_model: None,
+            avatar_classifier_enabled: false,
+            avatar_classifier_model: None,
+            avatar_classifier_max_tokens: 900,
+            avatar_classifier_concurrency: 1,
             openrouter_api_key: String::new(),
             openrouter_model: None,
             gemini_api_key: String::new(),
