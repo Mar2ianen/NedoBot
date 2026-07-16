@@ -17,6 +17,10 @@ pub enum Command {
     Memory,
     #[command(description = "спросить помощника по истории чата; /ask <вопрос>")]
     Ask(String),
+    #[command(description = "добавить общую заметку чата; /chat_note <текст>")]
+    ChatNote(String),
+    #[command(description = "добавить заметку о пользователе reply; /user_note <текст>")]
+    UserNote(String),
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]
     StatsDay(String),
     #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p]")]
