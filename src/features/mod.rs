@@ -1,3 +1,6 @@
+// Wired into the dispatcher after the agent and Telegram handler slices land.
+#[allow(dead_code)]
+pub mod ask;
 pub mod avatar_analysis;
 pub mod first_comment;
 pub mod memory;
