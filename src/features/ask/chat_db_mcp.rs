@@ -13,6 +13,7 @@ use crate::features::ask::chat_search::{
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
 const TOOL_MESSAGE_CONTEXT: &str = "chat.get_message_context";
 const TOOL_REPLY_THREAD: &str = "chat.get_reply_thread";
+const TOOL_RESOLVE_USER: &str = "chat.resolve_user";
 const TOOL_LIST_CHAT_NOTES: &str = "notes.list_chat";
 const TOOL_LIST_USER_NOTES: &str = "notes.list_user";
 
@@ -58,6 +59,19 @@ struct ContextArguments {
 #[derive(Deserialize)]
 struct UserNotesArguments {
     telegram_user_id: i64,
+}
+
+#[derive(Deserialize)]
+struct ResolveUserArguments {
+    query: Option<String>,
+    telegram_user_id: Option<i64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ResolvedUserRow {
+    telegram_user_id: i64,
+    username: Option<String>,
+    display_name: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -204,6 +218,7 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
                     .map_err(|_| ())?,
             )
         }
+        TOOL_RESOLVE_USER => resolve_user(pool, chat_id, params.arguments).await,
         TOOL_LIST_CHAT_NOTES => {
             let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
                 .bind(chat_id).fetch_all(pool).await.map_err(|_| ())?;
@@ -218,6 +233,55 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
         }
         _ => Err(()),
     }
+}
+
+async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<Value, ()> {
+    let arguments: ResolveUserArguments = serde_json::from_value(arguments).map_err(|_| ())?;
+    let query = arguments
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(|query| query.chars().take(80).collect::<String>());
+    if arguments.telegram_user_id.is_none() && query.is_none() {
+        return Err(());
+    }
+    let users = sqlx::query_as::<_, ResolvedUserRow>(
+        r#"
+        select p.telegram_user_id, nullif(p.username, '') as username,
+               coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
+                        nullif(p.username, ''), 'Неизвестный пользователь') as display_name
+        from telegram_user_profiles p
+        where exists (
+            select 1 from telegram_messages m
+            where m.chat_id = $1 and m.user_id = p.telegram_user_id
+        )
+          and ($2::bigint is null or p.telegram_user_id = $2)
+          and ($3::text is null or concat_ws(' ', p.username, p.first_name, p.last_name) ilike '%' || $3 || '%')
+        order by
+            case when p.telegram_user_id = $2 then 0 else 1 end,
+            case when lower(coalesce(p.username, '')) = lower(coalesce($3, '')) then 0 else 1 end,
+            p.last_seen_at desc
+        limit 10
+        "#,
+    )
+    .bind(chat_id)
+    .bind(arguments.telegram_user_id)
+    .bind(query)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| ())?
+    .into_iter()
+    .map(|user| {
+        json!({
+            "telegram_user_id": user.telegram_user_id,
+            "username": user.username,
+            "display_name": user.display_name,
+            "author_url": public_username_url(user.username.as_deref())
+        })
+    })
+    .collect::<Vec<_>>();
+    tool_text_result(&users)
 }
 
 fn parse_timestamp(value: Option<String>) -> Result<Option<DateTime<Utc>>, ()> {
@@ -243,6 +307,7 @@ fn tools_list_result() -> Value {
         {"name": TOOL_SEARCH_MESSAGES, "description": "Ищет сообщения только в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 240}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "reply_to_message_id": {"type": "integer"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
         {"name": TOOL_MESSAGE_CONTEXT, "description": "Возвращает ограниченный контекст вокруг найденного сообщения.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}, "before": {"type": "integer", "minimum": 0, "maximum": 5}, "after": {"type": "integer", "minimum": 0, "maximum": 5}}}}
         ,{"name": TOOL_REPLY_THREAD, "description": "Возвращает цепочку родителей reply до глубины 5.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}}
+        ,{"name": TOOL_RESOLVE_USER, "description": "Находит участника разрешённого чата по точному Telegram ID, username или отображаемому имени. Перед вопросом о конкретном человеке сначала используй этот инструмент.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"query": {"type": "string", "maxLength": 80}, "telegram_user_id": {"type": "integer"}}}}
         ,{"name": TOOL_LIST_CHAT_NOTES, "description": "Возвращает активные общие заметки разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}}
         ,{"name": TOOL_LIST_USER_NOTES, "description": "Возвращает активные заметки указанного пользователя в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["telegram_user_id"], "properties": {"telegram_user_id": {"type": "integer"}}}}
     ]})
@@ -251,6 +316,15 @@ fn tools_list_result() -> Value {
 fn tool_text_result<T: Serialize>(value: &T) -> Result<Value, ()> {
     let text = serde_json::to_string(value).map_err(|_| ())?;
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
+fn public_username_url(username: Option<&str>) -> Option<String> {
+    let username = username?.trim();
+    ((5..=32).contains(&username.len())
+        && username
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || character == b'_'))
+    .then(|| format!("https://t.me/{username}"))
 }
 
 fn success(id: Value, result: Value) -> JsonRpcResponse {
@@ -293,6 +367,7 @@ mod tests {
                 TOOL_SEARCH_MESSAGES,
                 TOOL_MESSAGE_CONTEXT,
                 TOOL_REPLY_THREAD,
+                TOOL_RESOLVE_USER,
                 TOOL_LIST_CHAT_NOTES,
                 TOOL_LIST_USER_NOTES,
             ]
