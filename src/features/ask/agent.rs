@@ -7,6 +7,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
+use crate::features::search::mcp::search_for_ask;
+use crate::features::search::types::SearchSource;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
 
@@ -61,7 +63,7 @@ pub async fn answer(
             AgentAction::Final { markdown } if !markdown.trim().is_empty() => return Ok(markdown),
             AgentAction::Final { .. } => anyhow::bail!("ask LLM returned an empty answer"),
             AgentAction::Tool { tool, arguments } => {
-                let result = mcp.call(&tool, arguments).await?;
+                let result = call_tool(config, &mut mcp, &tool, arguments).await?;
                 observations.push(format!("TOOL_RESULT_UNTRUSTED {tool}:\n{result}"));
             }
         }
@@ -91,8 +93,38 @@ fn build_prompt(question: &str, observations: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "Вопрос пользователя:\n{question}\n\nДоступные инструменты:\n- chat.search_messages: query, user_id?, date_from?, date_to?, limit?\n- chat.get_message_context: message_id, before?, after?\n\nНаблюдения:\n{observations}"
+        "Вопрос пользователя:\n{question}\n\nДоступные инструменты:\n- chat.search_messages: query, user_id?, date_from?, date_to?, limit?\n- chat.get_message_context: message_id, before?, after?\n- web.search: query\n- github.search: query\n\nНаблюдения:\n{observations}"
     )
+}
+
+async fn call_tool(
+    config: &Config,
+    mcp: &mut McpClient,
+    tool: &str,
+    arguments: Value,
+) -> anyhow::Result<String> {
+    match tool {
+        "chat.search_messages" | "chat.get_message_context" => mcp.call(tool, arguments).await,
+        "web.search" => external_search(config, SearchSource::Web, arguments).await,
+        "github.search" => external_search(config, SearchSource::Github, arguments).await,
+        _ => anyhow::bail!("ask agent requested a forbidden tool"),
+    }
+}
+
+async fn external_search(
+    config: &Config,
+    source: SearchSource,
+    arguments: Value,
+) -> anyhow::Result<String> {
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("external search requires query"))?;
+    Ok(serde_json::to_string(
+        &search_for_ask(config, source, query).await?,
+    )?)
 }
 
 struct McpClient {
