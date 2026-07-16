@@ -166,8 +166,9 @@ impl Config {
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
-            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", false),
-            avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL"),
+            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true),
+            avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
+                .or_else(|| Some("gemma4:31b".to_string())),
             avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900),
             avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
