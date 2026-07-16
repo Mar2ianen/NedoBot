@@ -129,7 +129,7 @@ impl Config {
             search_extract_model: env_optional("SEARCH_EXTRACT_MODEL")
                 .or_else(|| Some("gemma4:31b".to_string())),
             search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1),
-            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 700),
+            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 900),
             search_mcp_command: env_optional("SEARCH_MCP_COMMAND"),
             search_mcp_args: env_args("SEARCH_MCP_ARGS"),
             search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
@@ -141,8 +141,8 @@ impl Config {
             },
             search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
                 .or_else(|| Some("web_fetch_exa".to_string())),
-            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 2),
-            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
+            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 4),
+            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 9000),
             comment_blocked_source_domains: env_list_csv_or(
                 "COMMENT_BLOCKED_SOURCE_DOMAINS",
                 DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS,
