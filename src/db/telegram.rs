@@ -69,6 +69,54 @@ pub struct UserProfileDetails {
     pub raw_json: serde_json::Value,
 }
 
+struct ProfileIdentityObservation {
+    telegram_user_id: i64,
+    snapshot_key: String,
+    username_normalized: Option<String>,
+    display_name_normalized: Option<String>,
+    profile_photo_file_unique_id: Option<String>,
+}
+
+impl ProfileIdentityObservation {
+    fn from_details(details: &UserProfileDetails) -> Self {
+        let username_normalized = normalize_profile_identifier(details.username.as_deref());
+        let display_name = [details.first_name.as_deref(), details.last_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let display_name_normalized = normalize_profile_identifier(Some(&display_name));
+        let profile_photo_file_unique_id = details
+            .profile_photo_file_unique_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let snapshot_key = format!(
+            "u={};n={};a={}",
+            username_normalized.as_deref().unwrap_or(""),
+            display_name_normalized.as_deref().unwrap_or(""),
+            profile_photo_file_unique_id.as_deref().unwrap_or("")
+        );
+
+        Self {
+            telegram_user_id: details.telegram_user_id,
+            snapshot_key,
+            username_normalized,
+            display_name_normalized,
+            profile_photo_file_unique_id,
+        }
+    }
+}
+
+fn normalize_profile_identifier(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .map(|value| value.trim_start_matches('@'))
+        .map(|value| value.replace('ё', "е").to_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
 pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
     let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
@@ -419,6 +467,7 @@ pub async fn update_user_profile_details(
     pool: &PgPool,
     details: UserProfileDetails,
 ) -> anyhow::Result<()> {
+    let observation = ProfileIdentityObservation::from_details(&details);
     sqlx::query(
         r#"
         insert into telegram_user_profiles
@@ -506,6 +555,22 @@ pub async fn update_user_profile_details(
     .bind(details.personal_channel_refreshed_at)
     .bind(details.personal_channel_fetch_error)
     .bind(details.raw_json)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        insert into telegram_profile_identity_observations
+            (telegram_user_id, snapshot_key, username_normalized, display_name_normalized, profile_photo_file_unique_id)
+        values ($1, $2, $3, $4, $5)
+        on conflict (telegram_user_id, snapshot_key) do update set last_seen_at = now()
+        "#,
+    )
+    .bind(observation.telegram_user_id)
+    .bind(observation.snapshot_key)
+    .bind(observation.username_normalized)
+    .bind(observation.display_name_normalized)
+    .bind(observation.profile_photo_file_unique_id)
     .execute(pool)
     .await?;
 
