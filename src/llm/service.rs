@@ -554,6 +554,7 @@ mod tests {
             send_owner_preview: false,
             ask_enabled: false,
             ask_allow_chat_admins: true,
+            ask_private_user_ids: Vec::new(),
             ask_llm_provider: "gemini".to_string(),
             ask_llm_model: Some("gemini-3.5-flash".to_string()),
             ask_llm_temperature: 0.2,
