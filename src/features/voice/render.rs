@@ -225,6 +225,8 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            comment_blocked_source_domains: vec!["meduza.io".to_string()],
+            comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
             search_github_mcp_args: Vec::new(),
             search_github_mcp_env: vec![

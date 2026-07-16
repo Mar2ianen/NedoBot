@@ -13,7 +13,7 @@ use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::draft::{
     first_comment_output_schema, parse_first_comment_draft,
-    validate_first_comment_draft_with_search,
+    validate_first_comment_draft_with_search_and_policy,
 };
 use crate::features::first_comment::prompt::{CommentDirectives, build_llm_prompt_parts};
 use crate::features::first_comment::render::build_comment_html_with_sources;
@@ -102,8 +102,14 @@ pub async fn maybe_comment_post(
     );
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
+    let source_policy = config.clone();
     let validator = move |value: &str| {
-        validate_first_comment_draft_with_search(value, &validation_results, source_link_available)
+        validate_first_comment_draft_with_search_and_policy(
+            value,
+            &validation_results,
+            source_link_available,
+            &source_policy,
+        )
     };
     let generation = generate_text_checked_with_system_and_schema(
         config,

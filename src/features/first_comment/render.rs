@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::features::first_comment::draft::parse_source_link_placeholder;
-use crate::features::search::mcp::is_safe_fetch_url;
 use crate::features::search::types::SearchResult;
+use crate::features::search::{mcp::is_safe_fetch_url, policy::is_allowed_source_url};
 use crate::telegram::html::{Html, link};
 use crate::text::{normalize_ai_markers, strip_links};
 
@@ -101,7 +101,7 @@ fn render_link_placeholders(text: &str, config: &Config, search_results: &[Searc
                 }
             }
             LinkPlaceholderKind::Source => {
-                if let Some((label, url)) = source_link_target(token, search_results) {
+                if let Some((label, url)) = source_link_target(token, search_results, config) {
                     html.push(link(&label, url));
                 } else {
                     html.push(Html::text(token));
@@ -136,11 +136,13 @@ fn next_link_placeholder(text: &str) -> Option<(usize, LinkPlaceholderKind)> {
 fn source_link_target<'a>(
     token: &str,
     search_results: &'a [SearchResult],
+    config: &Config,
 ) -> Option<(String, &'a str)> {
     let placeholder = parse_source_link_placeholder(token).ok()?;
     let result = search_results.get(placeholder.result_id.checked_sub(1)?)?;
     let url = result.url.trim();
-    is_safe_fetch_url(url).then_some((placeholder.label, url))
+    (is_safe_fetch_url(url) && is_allowed_source_url(config, url))
+        .then_some((placeholder.label, url))
 }
 
 fn chat_link_label(token: &str, config: &Config) -> Option<String> {
@@ -207,6 +209,8 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            comment_blocked_source_domains: vec!["meduza.io".to_string()],
+            comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
             search_github_mcp_args: Vec::new(),
             search_github_mcp_env: vec![
@@ -348,5 +352,24 @@ mod tests {
 
         assert!(html.contains("{SOURCE_LINK:1:источнике}"));
         assert!(!html.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn leaves_source_placeholder_as_text_when_domain_is_blocked() {
+        let search_results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Blocked".to_string(),
+            url: "https://meduza.io/story".to_string(),
+            snippet: String::new(),
+        }];
+
+        let html = build_comment_html_with_sources(
+            "Как пишет {SOURCE_LINK:1:ресурс}, новость уже вышла. Обсуждение в {CHAT_LINK}",
+            &config(),
+            &search_results,
+        );
+
+        assert!(html.contains("{SOURCE_LINK:1:ресурс}"));
+        assert!(!html.contains("meduza.io"));
     }
 }

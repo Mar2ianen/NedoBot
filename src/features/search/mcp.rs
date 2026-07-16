@@ -8,6 +8,7 @@ use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 use crate::config::Config;
+use crate::features::search::policy::is_allowed_search_result;
 use crate::features::search::provider::SearchProvider;
 use crate::features::search::types::{
     MAX_RESULT_SNIPPET_CHARS, MAX_RESULT_TITLE_CHARS, SearchQuery, SearchResult, SearchSource,
@@ -159,9 +160,10 @@ async fn run_mcp_flow(
         let response = read_json_line(&mut stdout).await?;
         results.extend(parse_mcp_tool_response(query.source, &response)?);
     }
+    results.retain(|result| is_allowed_search_result(config, result));
 
     if let Some(fetch_tool) = process_config.fetch_tool.as_deref() {
-        let urls = fetch_urls(&results, config.search_fetch_top_n);
+        let urls = fetch_urls(&results, config, config.search_fetch_top_n);
         for url in &urls {
             write_json_line(
                 &mut stdin,
@@ -178,6 +180,7 @@ async fn run_mcp_flow(
             let response = read_json_line(&mut stdout).await?;
             let mut fetched_results = parse_mcp_tool_response(query.source, &response)?;
             attach_requested_url(&mut fetched_results, url);
+            fetched_results.retain(|result| is_allowed_search_result(config, result));
             enrich_results_with_fetch(&mut results, fetched_results);
         }
     }
@@ -192,6 +195,8 @@ async fn run_mcp_flow(
         )
         .await;
     }
+
+    results.retain(|result| is_allowed_search_result(config, result));
 
     Ok(results)
 }
@@ -318,12 +323,15 @@ fn fetch_tool_arguments(tool_name: &str, urls: &[String], max_chars: usize) -> V
     }
 }
 
-fn fetch_urls(results: &[SearchResult], top_n: usize) -> Vec<String> {
+fn fetch_urls(results: &[SearchResult], config: &Config, top_n: usize) -> Vec<String> {
     let mut urls = Vec::new();
 
     for result in results {
         let url = result.url.trim();
-        if !is_safe_fetch_url(url) || urls.iter().any(|seen| seen == url) {
+        if !is_safe_fetch_url(url)
+            || !is_allowed_search_result(config, result)
+            || urls.iter().any(|seen| seen == url)
+        {
             continue;
         }
 
@@ -803,6 +811,30 @@ mod tests {
     fn fetch_url_filter_accepts_public_http_targets() {
         assert!(is_safe_fetch_url("https://example.com/news"));
         assert!(is_safe_fetch_url("http://93.184.216.34/news"));
+    }
+
+    #[test]
+    fn fetch_urls_skips_blocked_source_domains() {
+        let config = Config::from_env();
+        let results = vec![
+            SearchResult {
+                source: SearchSource::Web,
+                title: "Blocked".to_string(),
+                url: "https://meduza.io/story".to_string(),
+                snippet: String::new(),
+            },
+            SearchResult {
+                source: SearchSource::Web,
+                title: "Allowed".to_string(),
+                url: "https://example.com/story".to_string(),
+                snippet: String::new(),
+            },
+        ];
+
+        assert_eq!(
+            fetch_urls(&results, &config, 2),
+            vec!["https://example.com/story"]
+        );
     }
 
     #[test]

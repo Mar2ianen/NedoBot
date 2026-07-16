@@ -6,6 +6,7 @@ use tokio::time::timeout;
 use crate::config::Config;
 use crate::features::search::extract::extract_search_queries;
 use crate::features::search::mcp::McpSearchProvider;
+use crate::features::search::policy::is_allowed_search_result;
 use crate::features::search::provider::SearchProvider;
 use crate::features::search::types::{MAX_SEARCH_RESULTS, SearchContext, SearchResult};
 
@@ -54,7 +55,12 @@ async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant)
         }
     }
 
-    let results = dedupe_results(results);
+    let results = dedupe_results(
+        results
+            .into_iter()
+            .filter(|result| is_allowed_search_result(config, result))
+            .collect(),
+    );
     if results.is_empty() {
         return SearchContext {
             queries,
