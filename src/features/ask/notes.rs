@@ -33,6 +33,23 @@ pub async fn add_user_note(
     Ok(())
 }
 
+pub async fn add_user_note_from_search(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+    author_id: i64,
+    note: &str,
+    source_message_ids: &[i32],
+) -> anyhow::Result<()> {
+    let note = normalize_note(note)?;
+    if source_message_ids.is_empty() {
+        anyhow::bail!("automatic user notes require message sources");
+    }
+    sqlx::query("insert into telegram_user_notes (chat_id, telegram_user_id, note, created_by_user_id, source_message_ids) select $1, $2, $3, $4, $5 where not exists (select 1 from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and note = $3 and status = 'active')")
+        .bind(chat_id).bind(user_id).bind(&note).bind(author_id).bind(serde_json::json!(source_message_ids)).execute(pool).await?;
+    Ok(())
+}
+
 fn normalize_note(note: &str) -> anyhow::Result<String> {
     let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
     if note.is_empty() {

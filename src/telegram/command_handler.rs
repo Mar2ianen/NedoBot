@@ -235,12 +235,18 @@ async fn handle_ask_command(
     let reply_context = msg
         .reply_to_message()
         .and_then(|reply| reply.text().or_else(|| reply.caption()));
-    let answer = agent::answer(config, question, reply_context)
-        .await
-        .map_err(|err| {
-            tracing::warn!(%err, "ask assistant failed");
-            teloxide::RequestError::Io(std::io::Error::other("ask assistant failed"))
-        });
+    let answer = agent::answer(
+        config,
+        &state.pool,
+        user.id.0 as i64,
+        question,
+        reply_context,
+    )
+    .await
+    .map_err(|err| {
+        tracing::warn!(%err, "ask assistant failed");
+        teloxide::RequestError::Io(std::io::Error::other("ask assistant failed"))
+    });
     drop(permit);
     match answer {
         Ok(answer) => {
