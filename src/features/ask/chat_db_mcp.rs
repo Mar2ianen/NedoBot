@@ -12,6 +12,8 @@ use crate::features::ask::chat_search::{
 
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
 const TOOL_MESSAGE_CONTEXT: &str = "chat.get_message_context";
+const TOOL_LIST_CHAT_NOTES: &str = "notes.list_chat";
+const TOOL_LIST_USER_NOTES: &str = "notes.list_user";
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
@@ -50,6 +52,19 @@ struct ContextArguments {
     before: Option<i64>,
     #[serde(default)]
     after: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct UserNotesArguments {
+    telegram_user_id: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct NoteRow {
+    id: i64,
+    note: String,
+    created_by_user_id: i64,
+    created_at: String,
 }
 
 #[derive(Serialize)]
@@ -179,6 +194,18 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             .map_err(|_| ())?;
             tool_text_result(&messages)
         }
+        TOOL_LIST_CHAT_NOTES => {
+            let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
+                .bind(chat_id).fetch_all(pool).await.map_err(|_| ())?;
+            tool_text_result(&notes)
+        }
+        TOOL_LIST_USER_NOTES => {
+            let arguments: UserNotesArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and status = 'active' order by created_at desc limit 20")
+                .bind(chat_id).bind(arguments.telegram_user_id).fetch_all(pool).await.map_err(|_| ())?;
+            tool_text_result(&notes)
+        }
         _ => Err(()),
     }
 }
@@ -205,6 +232,8 @@ fn tools_list_result() -> Value {
     json!({"tools": [
         {"name": TOOL_SEARCH_MESSAGES, "description": "Ищет сообщения только в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 240}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "reply_to_message_id": {"type": "integer"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
         {"name": TOOL_MESSAGE_CONTEXT, "description": "Возвращает ограниченный контекст вокруг найденного сообщения.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}, "before": {"type": "integer", "minimum": 0, "maximum": 5}, "after": {"type": "integer", "minimum": 0, "maximum": 5}}}}
+        ,{"name": TOOL_LIST_CHAT_NOTES, "description": "Возвращает активные общие заметки разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}}
+        ,{"name": TOOL_LIST_USER_NOTES, "description": "Возвращает активные заметки указанного пользователя в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["telegram_user_id"], "properties": {"telegram_user_id": {"type": "integer"}}}}
     ]})
 }
 
@@ -247,7 +276,15 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec![TOOL_SEARCH_MESSAGES, TOOL_MESSAGE_CONTEXT]);
+        assert_eq!(
+            names,
+            vec![
+                TOOL_SEARCH_MESSAGES,
+                TOOL_MESSAGE_CONTEXT,
+                TOOL_LIST_CHAT_NOTES,
+                TOOL_LIST_USER_NOTES,
+            ]
+        );
     }
 
     #[test]
