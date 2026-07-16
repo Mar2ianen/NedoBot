@@ -188,10 +188,10 @@ fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
             drop(permit);
             match processed {
                 Ok(true) => continue,
-                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(60)).await,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
                 Err(err) => {
                     tracing::warn!(%err, "avatar analysis worker failed to claim a job");
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         }
