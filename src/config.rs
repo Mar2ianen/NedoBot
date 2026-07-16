@@ -84,6 +84,19 @@ pub struct Config {
     pub vision_model: String,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
+    pub ask_enabled: bool,
+    pub ask_allow_chat_admins: bool,
+    pub ask_llm_provider: String,
+    pub ask_llm_model: Option<String>,
+    pub ask_llm_temperature: f32,
+    pub ask_llm_max_tokens: u32,
+    pub ask_max_steps: usize,
+    pub ask_timeout_sec: u64,
+    pub ask_max_concurrency: usize,
+    pub ask_db_mcp_command: Option<String>,
+    pub ask_db_mcp_args: Vec<String>,
+    pub ask_db_mcp_env: Vec<String>,
+    pub ask_db_mcp_timeout_sec: u64,
     pub profile_refresh_concurrency: usize,
     pub comment_custom_emoji_id: Option<String>,
     pub first_comment_max_image_mb: u32,
@@ -191,6 +204,20 @@ impl Config {
             owner_telegram_id: env_optional("OWNER_TELEGRAM_ID")
                 .and_then(|value| value.parse().ok()),
             send_owner_preview: env_or("SEND_OWNER_PREVIEW", "true") == "true",
+            ask_enabled: env_bool("ASK_ENABLED", false),
+            ask_allow_chat_admins: env_bool("ASK_ALLOW_CHAT_ADMINS", true),
+            ask_llm_provider: env_optional("ASK_LLM_PROVIDER")
+                .unwrap_or_else(|| env_or("LLM_PROVIDER", "ollama")),
+            ask_llm_model: env_optional("ASK_LLM_MODEL").or_else(|| env_optional("LLM_MODEL")),
+            ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2),
+            ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800),
+            ask_max_steps: env_usize("ASK_MAX_STEPS", 5),
+            ask_timeout_sec: env_u64("ASK_TIMEOUT_SEC", 45),
+            ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1),
+            ask_db_mcp_command: env_optional("ASK_DB_MCP_COMMAND"),
+            ask_db_mcp_args: env_args("ASK_DB_MCP_ARGS"),
+            ask_db_mcp_env: env_list_csv_or("ASK_DB_MCP_ENV", &["ASK_DATABASE_URL"]),
+            ask_db_mcp_timeout_sec: env_u64("ASK_DB_MCP_TIMEOUT_SEC", 8),
             profile_refresh_concurrency: env_usize("PROFILE_REFRESH_CONCURRENCY", 4),
             comment_custom_emoji_id: env_optional("COMMENT_CUSTOM_EMOJI_ID"),
             first_comment_max_image_mb: env_u32("FIRST_COMMENT_MAX_IMAGE_MB", 10),
@@ -269,6 +296,41 @@ impl Config {
             }
             if self.avatar_classifier_concurrency == 0 {
                 errors.push("AVATAR_CLASSIFIER_CONCURRENCY must be greater than 0".to_string());
+            }
+        }
+
+        if self.ask_enabled {
+            if self.owner_telegram_id.is_none() {
+                errors.push("ASK_ENABLED=true requires OWNER_TELEGRAM_ID".to_string());
+            }
+            validate_llm_provider_secret(
+                &mut errors,
+                self,
+                &self.ask_llm_provider,
+                "ASK_LLM_PROVIDER",
+            );
+            validate_llm_provider_model_with_model(
+                &mut errors,
+                self,
+                &self.ask_llm_provider,
+                "ASK_LLM_PROVIDER",
+                self.ask_llm_model.as_deref(),
+                "ASK_LLM_MODEL",
+            );
+            if self.ask_max_steps == 0 {
+                errors.push("ASK_MAX_STEPS must be greater than 0".to_string());
+            }
+            if self.ask_timeout_sec == 0 {
+                errors.push("ASK_TIMEOUT_SEC must be greater than 0".to_string());
+            }
+            if self.ask_max_concurrency == 0 {
+                errors.push("ASK_MAX_CONCURRENCY must be greater than 0".to_string());
+            }
+            if self.ask_db_mcp_command.is_none() {
+                errors.push("ASK_ENABLED=true requires ASK_DB_MCP_COMMAND".to_string());
+            }
+            if self.ask_db_mcp_timeout_sec == 0 {
+                errors.push("ASK_DB_MCP_TIMEOUT_SEC must be greater than 0".to_string());
             }
         }
 
@@ -559,6 +621,19 @@ mod tests {
             vision_model: "gemma4:31b".to_string(),
             owner_telegram_id: None,
             send_owner_preview: false,
+            ask_enabled: false,
+            ask_allow_chat_admins: true,
+            ask_llm_provider: "ollama".to_string(),
+            ask_llm_model: Some("gemma4:31b".to_string()),
+            ask_llm_temperature: 0.2,
+            ask_llm_max_tokens: 1800,
+            ask_max_steps: 5,
+            ask_timeout_sec: 45,
+            ask_max_concurrency: 1,
+            ask_db_mcp_command: None,
+            ask_db_mcp_args: Vec::new(),
+            ask_db_mcp_env: vec!["ASK_DATABASE_URL".to_string()],
+            ask_db_mcp_timeout_sec: 8,
             profile_refresh_concurrency: 4,
             comment_custom_emoji_id: None,
             first_comment_max_image_mb: 10,
@@ -662,5 +737,21 @@ mod tests {
 
         assert!(err.contains("SEARCH_ENABLED=true requires non-empty SEARCH_MCP_COMMAND"));
         assert!(err.contains("SEARCH_MCP_TIMEOUT_SEC must be greater than 0"));
+    }
+
+    #[test]
+    fn enabled_ask_requires_owner_model_and_mcp_command() {
+        let mut config = config();
+        config.ask_enabled = true;
+        config.ask_llm_provider = "cerebras".to_string();
+        config.ask_llm_model = None;
+        config.ask_db_mcp_command = None;
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("ASK_ENABLED=true requires OWNER_TELEGRAM_ID"));
+        assert!(err.contains("ASK_LLM_PROVIDER requires non-empty CEREBRAS_API_KEY"));
+        assert!(err.contains("ASK_LLM_PROVIDER=cerebras requires ASK_LLM_MODEL or CEREBRAS_MODEL"));
+        assert!(err.contains("ASK_ENABLED=true requires ASK_DB_MCP_COMMAND"));
     }
 }
