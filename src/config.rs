@@ -65,6 +65,10 @@ pub struct Config {
     pub groq_model: Option<String>,
     pub cerebras_api_key: String,
     pub cerebras_model: Option<String>,
+    pub avatar_classifier_enabled: bool,
+    pub avatar_classifier_model: Option<String>,
+    pub avatar_classifier_max_tokens: u32,
+    pub avatar_classifier_concurrency: usize,
     pub openrouter_api_key: String,
     pub openrouter_model: Option<String>,
     pub gemini_api_key: String,
@@ -162,6 +166,10 @@ impl Config {
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
+            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", false),
+            avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL"),
+            avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900),
+            avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
             openrouter_model: env_optional("OPENROUTER_MODEL"),
             gemini_api_key: env_optional("GEMINI_API_KEY")
@@ -245,6 +253,22 @@ impl Config {
 
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
+        }
+        if self.avatar_classifier_enabled {
+            require_secret(
+                &mut errors,
+                "CEREBRAS_API_KEY",
+                &self.cerebras_api_key,
+                "AVATAR_CLASSIFIER_ENABLED=true",
+            );
+            if self.avatar_classifier_model.is_none() {
+                errors.push(
+                    "AVATAR_CLASSIFIER_ENABLED=true requires AVATAR_CLASSIFIER_MODEL".to_string(),
+                );
+            }
+            if self.avatar_classifier_concurrency == 0 {
+                errors.push("AVATAR_CLASSIFIER_CONCURRENCY must be greater than 0".to_string());
+            }
         }
 
         if errors.is_empty() {
@@ -515,6 +539,10 @@ mod tests {
             groq_model: None,
             cerebras_api_key: String::new(),
             cerebras_model: None,
+            avatar_classifier_enabled: false,
+            avatar_classifier_model: None,
+            avatar_classifier_max_tokens: 900,
+            avatar_classifier_concurrency: 1,
             openrouter_api_key: String::new(),
             openrouter_model: None,
             gemini_api_key: String::new(),
