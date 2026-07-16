@@ -89,6 +89,12 @@ pub async fn answer(
             AgentAction::Final { markdown } if !markdown.trim().is_empty() => return Ok(markdown),
             AgentAction::Final { .. } => anyhow::bail!("ask LLM returned an empty answer"),
             AgentAction::Tool { tool, arguments } => {
+                if !allowed_agent_tool(&tool) {
+                    observations.push(format!(
+                        "SYSTEM: инструмент {tool:?} недопустим. Выбери только инструмент из списка."
+                    ));
+                    continue;
+                }
                 let result = call_tool(
                     config,
                     pool,
@@ -114,11 +120,26 @@ fn action_schema() -> Value {
         "required": ["kind"],
         "properties": {
             "kind": {"type": "string", "enum": ["tool", "final"]},
-            "tool": {"type": "string"},
+            "tool": {"type": "string", "enum": ["chat.resolve_user", "chat.search_messages", "chat.get_message_context", "chat.get_reply_thread", "notes.list_chat", "notes.list_user", "notes.add_user", "web.search", "github.search"]},
             "arguments": {"type": "object"},
             "markdown": {"type": "string"}
         }
     })
+}
+
+fn allowed_agent_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "chat.resolve_user"
+            | "chat.search_messages"
+            | "chat.get_message_context"
+            | "chat.get_reply_thread"
+            | "notes.list_chat"
+            | "notes.list_user"
+            | "notes.add_user"
+            | "web.search"
+            | "github.search"
+    )
 }
 
 fn build_prompt(question: &str, observations: &[String]) -> String {
@@ -429,5 +450,11 @@ mod tests {
             mentioned_user_queries("какой процессор у Парти"),
             vec!["парти", "parti"]
         );
+    }
+
+    #[test]
+    fn rejects_unknown_agent_tool_without_failing_the_request() {
+        assert!(!allowed_agent_tool("chat.search_users"));
+        assert!(allowed_agent_tool("chat.resolve_user"));
     }
 }
