@@ -2,6 +2,7 @@ use teloxide::{prelude::*, utils::command::BotCommands};
 
 use crate::db::telegram::save_telegram_message;
 use crate::features::ask::agent;
+use crate::features::ask::notes::{add_chat_note, add_user_note};
 use crate::features::ask::rich_markdown;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::render::build_comment_html;
@@ -75,6 +76,12 @@ pub async fn handle_command(
         Command::Ask(question) => {
             handle_ask_command(&bot, &msg, &state, &question).await?;
         }
+        Command::ChatNote(note) => {
+            handle_note_command(&bot, &msg, &state, &note, None).await?;
+        }
+        Command::UserNote(note) => {
+            handle_note_command(&bot, &msg, &state, &note, reply_user_id(&msg)).await?;
+        }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
             send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Day, render).await?;
@@ -135,6 +142,56 @@ pub async fn handle_command(
     }
 
     Ok(())
+}
+
+async fn handle_note_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    note: &str,
+    target_user_id: Option<i64>,
+) -> ResponseResult<()> {
+    let Some(author) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    if msg.chat.id.0 != state.config.discussion_chat_id {
+        return Ok(());
+    }
+    let allowed = state.config.owner_telegram_id == Some(author.id.0 as i64)
+        || (state.config.ask_allow_chat_admins
+            && bot
+                .get_chat_member(msg.chat.id, author.id)
+                .await
+                .map(|member| member.kind.is_privileged())
+                .unwrap_or(false));
+    if !allowed {
+        return Ok(());
+    }
+    let result = match target_user_id {
+        Some(target_user_id) => {
+            add_user_note(
+                &state.pool,
+                msg.chat.id.0,
+                target_user_id,
+                author.id.0 as i64,
+                note,
+            )
+            .await
+        }
+        None => add_chat_note(&state.pool, msg.chat.id.0, author.id.0 as i64, note).await,
+    };
+    match result {
+        Ok(()) => send_html(bot, msg.chat.id, "Заметка сохранена.")
+            .await
+            .map(|_| ()),
+        Err(_) => send_html(
+            bot,
+            msg.chat.id,
+            "Не удалось сохранить заметку: проверь текст и reply для /user_note.",
+        )
+        .await
+        .map(|_| ()),
+    }
 }
 
 async fn handle_ask_command(
