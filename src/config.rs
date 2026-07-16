@@ -86,6 +86,7 @@ pub struct Config {
     pub send_owner_preview: bool,
     pub ask_enabled: bool,
     pub ask_allow_chat_admins: bool,
+    pub ask_private_user_ids: Vec<i64>,
     pub ask_llm_provider: String,
     pub ask_llm_model: Option<String>,
     pub ask_llm_temperature: f32,
@@ -206,6 +207,10 @@ impl Config {
             send_owner_preview: env_or("SEND_OWNER_PREVIEW", "true") == "true",
             ask_enabled: env_bool("ASK_ENABLED", false),
             ask_allow_chat_admins: env_bool("ASK_ALLOW_CHAT_ADMINS", true),
+            ask_private_user_ids: env_list_csv("ASK_PRIVATE_USER_IDS")
+                .into_iter()
+                .filter_map(|value| value.parse().ok())
+                .collect(),
             ask_llm_provider: env_optional("ASK_LLM_PROVIDER")
                 .unwrap_or_else(|| env_or("LLM_PROVIDER", "ollama")),
             ask_llm_model: env_optional("ASK_LLM_MODEL").or_else(|| env_optional("LLM_MODEL")),
@@ -623,6 +628,7 @@ mod tests {
             send_owner_preview: false,
             ask_enabled: false,
             ask_allow_chat_admins: true,
+            ask_private_user_ids: Vec::new(),
             ask_llm_provider: "ollama".to_string(),
             ask_llm_model: Some("gemma4:31b".to_string()),
             ask_llm_temperature: 0.2,

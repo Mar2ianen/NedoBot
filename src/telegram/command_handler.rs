@@ -204,7 +204,9 @@ async fn handle_ask_command(
     let Some(user) = msg.from.as_ref() else {
         return Ok(());
     };
-    if !config.ask_enabled || msg.chat.id.0 != config.discussion_chat_id {
+    let is_private_allowed =
+        msg.chat.is_private() && config.ask_private_user_ids.contains(&(user.id.0 as i64));
+    if !config.ask_enabled || (msg.chat.id.0 != config.discussion_chat_id && !is_private_allowed) {
         return Ok(());
     }
     let is_owner = config.owner_telegram_id == Some(user.id.0 as i64);
@@ -214,7 +216,7 @@ async fn handle_ask_command(
             .await
             .map(|member| member.kind.is_privileged())
             .unwrap_or(false);
-    if !is_owner && !is_admin {
+    if !is_private_allowed && !is_owner && !is_admin {
         send_html(
             bot,
             msg.chat.id,
