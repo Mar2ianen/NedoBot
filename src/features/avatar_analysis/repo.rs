@@ -167,10 +167,8 @@ pub async fn mark_avatar_analysis_failed(
     retry_after_seconds: Option<i64>,
 ) -> anyhow::Result<()> {
     let delay_seconds = retry_after_seconds.unwrap_or(0).max(0);
-    let (status, next_delay) = match job.attempts {
-        1 => ("retry_wait", delay_seconds.max(5 * 60)),
-        2 => ("retry_wait", delay_seconds.max(24 * 60 * 60)),
-        _ => ("failed", 0),
+    let Some(next_delay) = retry_delay_seconds(job.attempts, delay_seconds) else {
+        return mark_avatar_analysis_terminally_failed(pool, job.id, error_kind).await;
     };
     sqlx::query(
         r#"
@@ -182,10 +180,61 @@ pub async fn mark_avatar_analysis_failed(
         "#,
     )
     .bind(job.id)
-    .bind(status)
+    .bind("retry_wait")
     .bind(error_kind)
     .bind(next_delay)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+fn retry_delay_seconds(attempts: i32, retry_after_seconds: i64) -> Option<i64> {
+    let scheduled_delay = match attempts {
+        1 => 15,
+        2 => 30,
+        3 => 60,
+        4 => 5 * 60,
+        5 => 24 * 60 * 60,
+        _ => return None,
+    };
+    Some(scheduled_delay.max(retry_after_seconds))
+}
+
+async fn mark_avatar_analysis_terminally_failed(
+    pool: &PgPool,
+    job_id: i64,
+    error_kind: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update avatar_analysis_jobs
+        set status = 'failed', error_kind = $2, lease_expires_at = null, updated_at = now()
+        where id = $1 and status = 'processing'
+        "#,
+    )
+    .bind(job_id)
+    .bind(error_kind)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_delay_seconds;
+
+    #[test]
+    fn retries_429_quickly_before_long_backoff() {
+        assert_eq!(retry_delay_seconds(1, 0), Some(15));
+        assert_eq!(retry_delay_seconds(2, 0), Some(30));
+        assert_eq!(retry_delay_seconds(3, 0), Some(60));
+        assert_eq!(retry_delay_seconds(4, 0), Some(300));
+        assert_eq!(retry_delay_seconds(5, 0), Some(86_400));
+        assert_eq!(retry_delay_seconds(6, 0), None);
+    }
+
+    #[test]
+    fn retry_after_never_shortens_provider_backoff() {
+        assert_eq!(retry_delay_seconds(1, 75), Some(75));
+    }
 }
