@@ -107,7 +107,7 @@ fn build_prompt(question: &str, observations: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "Вопрос пользователя:\n{question}\n\nДоступные инструменты:\n- chat.search_messages: query, user_id?, date_from?, date_to?, limit?\n- chat.get_message_context: message_id, before?, after?\n- notes.list_chat: без аргументов\n- notes.list_user: telegram_user_id\n- notes.add_user: telegram_user_id, note; только краткий факт после поиска сообщений\n- web.search: query\n- github.search: query\n\nНаблюдения:\n{observations}"
+        "Вопрос пользователя:\n{question}\n\nДоступные инструменты:\n- chat.search_messages: query, user_id?, date_from?, date_to?, limit?\n- chat.get_message_context: message_id, before?, after?\n- chat.get_reply_thread: message_id\n- notes.list_chat: без аргументов\n- notes.list_user: telegram_user_id\n- notes.add_user: telegram_user_id, note; только краткий факт после поиска сообщений\n- web.search: query\n- github.search: query\n\nНаблюдения:\n{observations}"
     )
 }
 
@@ -123,6 +123,7 @@ async fn call_tool(
     match tool {
         "chat.search_messages"
         | "chat.get_message_context"
+        | "chat.get_reply_thread"
         | "notes.list_chat"
         | "notes.list_user" => {
             let result = mcp.call(tool, arguments).await?;
@@ -240,6 +241,7 @@ impl McpClient {
             tool,
             "chat.search_messages"
                 | "chat.get_message_context"
+                | "chat.get_reply_thread"
                 | "notes.list_chat"
                 | "notes.list_user"
         ) {

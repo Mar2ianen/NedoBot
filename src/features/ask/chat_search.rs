@@ -197,6 +197,41 @@ pub async fn message_context(
         .collect())
 }
 
+pub async fn reply_thread(
+    pool: &PgPool,
+    chat_id: i64,
+    message_id: i32,
+) -> anyhow::Result<Vec<ChatMessage>> {
+    let rows = sqlx::query_as::<_, MessageRow>(r#"
+        with recursive chain as (
+            select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at, 0 as depth
+            from telegram_messages m where m.chat_id = $1 and m.message_id = $2
+            union all
+            select parent.message_id, parent.user_id, parent.text, parent.reply_to_message_id, parent.created_at, chain.depth + 1
+            from telegram_messages parent join chain on chain.reply_to_message_id = parent.message_id
+            where parent.chat_id = $1 and chain.depth < 5
+        )
+        select chain.message_id, chain.user_id, coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''), nullif(p.username, ''), 'Неизвестный пользователь') as author,
+               coalesce(chain.text, '[медиа без текста]') as text, chain.reply_to_message_id, chain.created_at, 0::real as relevance
+        from chain left join telegram_user_profiles p on p.telegram_user_id = chain.user_id
+        order by chain.created_at asc, chain.message_id asc
+    "#).bind(chat_id).bind(message_id).fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ChatMessage {
+            source_id: source_id(row.message_id),
+            message_url: message_url(chat_id, row.message_id),
+            relevance: 0,
+            message_id: row.message_id,
+            user_id: row.user_id,
+            author: row.author,
+            text: first_chars(&row.text, 700),
+            reply_to_message_id: row.reply_to_message_id,
+            created_at: row.created_at.to_rfc3339(),
+        })
+        .collect())
+}
+
 pub fn source_id(message_id: i32) -> String {
     format!("chat:{message_id}")
 }
