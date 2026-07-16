@@ -1,6 +1,7 @@
 use teloxide::{prelude::*, utils::command::BotCommands};
 
 use crate::db::telegram::save_telegram_message;
+use crate::features::ask::agent;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
@@ -11,7 +12,7 @@ use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::state::AppState;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
-use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::render::{escape_html, send_html, send_rich_markdown_reply};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -69,6 +70,9 @@ pub async fn handle_command(
         }
         Command::Memory => {
             send_memory_notes(&bot, msg.chat.id, pool).await?;
+        }
+        Command::Ask(question) => {
+            handle_ask_command(&bot, &msg, &state, &question).await?;
         }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
@@ -130,6 +134,68 @@ pub async fn handle_command(
     }
 
     Ok(())
+}
+
+async fn handle_ask_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    question: &str,
+) -> ResponseResult<()> {
+    let config = &state.config;
+    let Some(user) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    if !config.ask_enabled || msg.chat.id.0 != config.discussion_chat_id {
+        return Ok(());
+    }
+    let is_owner = config.owner_telegram_id == Some(user.id.0 as i64);
+    let is_admin = config.ask_allow_chat_admins
+        && bot
+            .get_chat_member(msg.chat.id, user.id)
+            .await
+            .map(|member| member.kind.is_privileged())
+            .unwrap_or(false);
+    if !is_owner && !is_admin {
+        send_html(
+            bot,
+            msg.chat.id,
+            "Команда /ask пока доступна владельцу и администраторам.",
+        )
+        .await?;
+        return Ok(());
+    }
+    if question.trim().is_empty() {
+        send_html(bot, msg.chat.id, "Напиши вопрос: /ask <вопрос>.").await?;
+        return Ok(());
+    }
+
+    let permit =
+        state.ask_slots.clone().try_acquire_owned().map_err(|_| {
+            teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy"))
+        })?;
+    let reply_context = msg
+        .reply_to_message()
+        .and_then(|reply| reply.text().or_else(|| reply.caption()));
+    let answer = agent::answer(config, question, reply_context)
+        .await
+        .map_err(|err| {
+            tracing::warn!(%err, "ask assistant failed");
+            teloxide::RequestError::Io(std::io::Error::other("ask assistant failed"))
+        });
+    drop(permit);
+    match answer {
+        Ok(answer) => send_rich_markdown_reply(msg.chat.id, msg.id, answer)
+            .await
+            .map(|_| ()),
+        Err(_) => send_html(
+            bot,
+            msg.chat.id,
+            "Не смог подготовить ответ. Попробуй ещё раз чуть позже.",
+        )
+        .await
+        .map(|_| ()),
+    }
 }
 
 pub async fn handle_reply_user_stats_command(
