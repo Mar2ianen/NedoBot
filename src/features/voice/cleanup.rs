@@ -104,6 +104,10 @@ fn validate_cleanup_against_asr(
     validate_cleanup_text(&transcript.text, &clean.text)?;
 
     if !clean.chapters.is_empty() {
+        for chapter in &clean.chapters {
+            validate_cleanup_text(&transcript.text, &chapter.title)?;
+        }
+
         let chapters = clean
             .chapters
             .iter()
@@ -111,6 +115,10 @@ fn validate_cleanup_against_asr(
             .collect::<Vec<_>>()
             .join(" ");
         validate_cleanup_text(&transcript.text, &chapters)?;
+    }
+
+    if let Some(summary) = &clean.short_summary {
+        validate_cleanup_text(&transcript.text, summary)?;
     }
 
     Ok(())
@@ -137,6 +145,15 @@ fn validate_cleanup_text(raw: &str, cleaned: &str) -> anyhow::Result<()> {
         anyhow::bail!("cleanup introduced numbers not present in ASR: {added_numbers:?}");
     }
 
+    let raw_tokens = normalized_tokens(raw);
+    let added_tokens = normalized_tokens(cleaned)
+        .difference(&raw_tokens)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !added_tokens.is_empty() {
+        anyhow::bail!("cleanup introduced words not present in ASR: {added_tokens:?}");
+    }
+
     Ok(())
 }
 
@@ -149,6 +166,24 @@ fn number_tokens(text: &str) -> BTreeSet<String> {
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalized_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(normalize_token)
+        .collect()
+}
+
+fn normalize_token(token: &str) -> String {
+    match token.to_lowercase().as_str() {
+        "грок" | "groq" => "groq".to_string(),
+        "оллама" | "ollama" => "ollama".to_string(),
+        "гемма" | "gemma" => "gemma".to_string(),
+        "церебрас" | "cerebras" => "cerebras".to_string(),
+        "клинап" | "cleanup" => "cleanup".to_string(),
+        _ => token.to_lowercase(),
+    }
 }
 
 fn parse_cleanup_json(value: &str) -> anyhow::Result<CleanTranscript> {
@@ -382,6 +417,32 @@ mod tests {
     fn cleanup_accepts_punctuation_edits_without_new_numbers() {
         let transcript = transcript_with_text("Вышла Gemma 4 31B и новый драйвер для Vulkan.");
         let clean = plain_cleanup("Вышла Gemma 4 31B, и новый драйвер для Vulkan.");
+
+        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+    }
+
+    #[test]
+    fn cleanup_allows_removing_incoherent_asr_fragment() {
+        let transcript = transcript_with_text(
+            "Без Mac нельзя писать под iOS. Mac Windows GPT E FNI Mac Windows Linux. Продолжаем разговор.",
+        );
+        let clean = plain_cleanup("Без Mac нельзя писать под iOS. Продолжаем разговор.");
+
+        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+    }
+
+    #[test]
+    fn cleanup_rejects_guessed_term_without_new_number() {
+        let transcript = transcript_with_text("Модель Fable 5 пока не вышла.");
+        let clean = plain_cleanup("Модель Claude 5 пока не вышла.");
+
+        assert!(validate_cleanup_against_asr(&clean, &transcript).is_err());
+    }
+
+    #[test]
+    fn cleanup_accepts_allowlisted_provider_normalization() {
+        let transcript = transcript_with_text("Проверим грок и клинап.");
+        let clean = plain_cleanup("Проверим groq и cleanup.");
 
         assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
     }
