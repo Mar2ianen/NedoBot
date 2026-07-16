@@ -1,3 +1,4 @@
+pub mod avatar_analysis;
 pub mod first_comment;
 pub mod memory;
 pub mod new_user_analysis;
