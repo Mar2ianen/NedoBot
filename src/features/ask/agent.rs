@@ -142,6 +142,18 @@ fn allowed_agent_tool(tool: &str) -> bool {
     )
 }
 
+fn allowed_mcp_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "chat.resolve_user"
+            | "chat.search_messages"
+            | "chat.get_message_context"
+            | "chat.get_reply_thread"
+            | "notes.list_chat"
+            | "notes.list_user"
+    )
+}
+
 fn build_prompt(question: &str, observations: &[String]) -> String {
     let observations = observations
         .iter()
@@ -381,14 +393,7 @@ impl McpClient {
     }
 
     async fn call(&mut self, tool: &str, arguments: Value) -> anyhow::Result<String> {
-        if !matches!(
-            tool,
-            "chat.search_messages"
-                | "chat.get_message_context"
-                | "chat.get_reply_thread"
-                | "notes.list_chat"
-                | "notes.list_user"
-        ) {
+        if !allowed_mcp_tool(tool) {
             anyhow::bail!("ask agent requested a forbidden tool");
         }
         let response = self
@@ -456,5 +461,7 @@ mod tests {
     fn rejects_unknown_agent_tool_without_failing_the_request() {
         assert!(!allowed_agent_tool("chat.search_users"));
         assert!(allowed_agent_tool("chat.resolve_user"));
+        assert!(allowed_mcp_tool("chat.resolve_user"));
+        assert!(!allowed_mcp_tool("notes.add_user"));
     }
 }
