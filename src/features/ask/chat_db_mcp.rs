@@ -7,11 +7,12 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::features::ask::chat_search::{
-    MessageSearchRequest, MessageSort, message_context, search_messages,
+    MessageSearchRequest, MessageSort, message_context, reply_thread, search_messages,
 };
 
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
 const TOOL_MESSAGE_CONTEXT: &str = "chat.get_message_context";
+const TOOL_REPLY_THREAD: &str = "chat.get_reply_thread";
 const TOOL_LIST_CHAT_NOTES: &str = "notes.list_chat";
 const TOOL_LIST_USER_NOTES: &str = "notes.list_user";
 
@@ -194,6 +195,15 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             .map_err(|_| ())?;
             tool_text_result(&messages)
         }
+        TOOL_REPLY_THREAD => {
+            let arguments: ContextArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            tool_text_result(
+                &reply_thread(pool, chat_id, arguments.message_id)
+                    .await
+                    .map_err(|_| ())?,
+            )
+        }
         TOOL_LIST_CHAT_NOTES => {
             let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
                 .bind(chat_id).fetch_all(pool).await.map_err(|_| ())?;
@@ -232,6 +242,7 @@ fn tools_list_result() -> Value {
     json!({"tools": [
         {"name": TOOL_SEARCH_MESSAGES, "description": "Ищет сообщения только в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 240}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "reply_to_message_id": {"type": "integer"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
         {"name": TOOL_MESSAGE_CONTEXT, "description": "Возвращает ограниченный контекст вокруг найденного сообщения.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}, "before": {"type": "integer", "minimum": 0, "maximum": 5}, "after": {"type": "integer", "minimum": 0, "maximum": 5}}}}
+        ,{"name": TOOL_REPLY_THREAD, "description": "Возвращает цепочку родителей reply до глубины 5.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}}
         ,{"name": TOOL_LIST_CHAT_NOTES, "description": "Возвращает активные общие заметки разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}}
         ,{"name": TOOL_LIST_USER_NOTES, "description": "Возвращает активные заметки указанного пользователя в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["telegram_user_id"], "properties": {"telegram_user_id": {"type": "integer"}}}}
     ]})
@@ -281,6 +292,7 @@ mod tests {
             vec![
                 TOOL_SEARCH_MESSAGES,
                 TOOL_MESSAGE_CONTEXT,
+                TOOL_REPLY_THREAD,
                 TOOL_LIST_CHAT_NOTES,
                 TOOL_LIST_USER_NOTES,
             ]
