@@ -2,6 +2,7 @@ use teloxide::{prelude::*, utils::command::BotCommands};
 
 use crate::db::telegram::save_telegram_message;
 use crate::features::ask::agent;
+use crate::features::ask::rich_markdown;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
@@ -185,9 +186,22 @@ async fn handle_ask_command(
         });
     drop(permit);
     match answer {
-        Ok(answer) => send_rich_markdown_reply(msg.chat.id, msg.id, answer)
-            .await
-            .map(|_| ()),
+        Ok(answer) => {
+            let markdown = rich_markdown::validate(&answer).map_err(|err| {
+                tracing::warn!(%err, "ask assistant returned unsafe markdown");
+                teloxide::RequestError::Io(std::io::Error::other("ask markdown is invalid"))
+            })?;
+            if send_rich_markdown_reply(msg.chat.id, msg.id, markdown)
+                .await
+                .is_ok()
+            {
+                Ok(())
+            } else {
+                send_html(bot, msg.chat.id, escape_html(&answer))
+                    .await
+                    .map(|_| ())
+            }
+        }
         Err(_) => send_html(
             bot,
             msg.chat.id,
