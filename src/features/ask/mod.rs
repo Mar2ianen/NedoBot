@@ -1,3 +1,4 @@
 pub mod agent;
 pub mod chat_db_mcp;
 pub mod chat_search;
+pub mod rich_markdown;
