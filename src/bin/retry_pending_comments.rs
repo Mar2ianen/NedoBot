@@ -183,6 +183,7 @@ async fn retry_job(
         config.llm_temperature,
         config.llm_max_tokens,
         Some(&validator),
+        "first_comment_draft",
         first_comment_output_schema(),
     )
     .await?;

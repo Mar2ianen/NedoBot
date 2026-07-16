@@ -49,7 +49,8 @@ static FIRST_COMMENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "description": "One-based ID of the search result used for a new factual addition, or null."
             }
         },
-        "required": ["comment", "used_search_result_id"]
+        "required": ["comment", "used_search_result_id"],
+        "additionalProperties": false
     })
 });
 

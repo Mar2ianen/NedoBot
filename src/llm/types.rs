@@ -4,6 +4,7 @@ use serde_json::Value;
 
 #[derive(Clone, Copy)]
 pub struct StructuredOutput<'a> {
+    pub name: &'a str,
     pub schema: &'a Value,
 }
 

@@ -119,6 +119,7 @@ pub async fn maybe_comment_post(
         config.llm_temperature,
         config.llm_max_tokens,
         Some(&validator),
+        "first_comment_draft",
         first_comment_output_schema(),
     )
     .await?;
