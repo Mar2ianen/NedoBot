@@ -3,9 +3,21 @@ use std::sync::LazyLock;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::config::Config;
 use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::search::mcp::is_safe_fetch_url;
+use crate::features::search::policy::{is_allowed_comment_text, is_allowed_source_url};
 use crate::features::search::types::SearchResult;
+
+const GENERIC_SOURCE_LINK_LABELS: &[&str] = &[
+    "детали",
+    "подробнее",
+    "источник",
+    "ссылка",
+    "здесь",
+    "тут",
+    "пруф",
+];
 
 /// Structured LLM output for a first-comment generation.
 ///
@@ -74,13 +86,29 @@ pub fn validate_first_comment_draft_with_search(
     search_results: &[SearchResult],
     source_link_available: bool,
 ) -> anyhow::Result<()> {
+    validate_first_comment_draft_with_search_and_policy(
+        value,
+        search_results,
+        source_link_available,
+        &Config::from_env(),
+    )
+}
+
+pub fn validate_first_comment_draft_with_search_and_policy(
+    value: &str,
+    search_results: &[SearchResult],
+    source_link_available: bool,
+    config: &Config,
+) -> anyhow::Result<()> {
     let draft = parse_first_comment_draft(value)?;
-    let source_link = validate_comment_body(&draft)?;
+    let source_link = validate_comment_body(&draft, config)?;
 
     if let Some(result_id) = draft.used_search_result_id {
         let result = search_result_by_id(search_results, result_id)?;
-        if source_link.is_some() && !is_safe_fetch_url(&result.url) {
-            anyhow::bail!("selected source link has an unsafe URL");
+        if source_link.is_some()
+            && (!is_safe_fetch_url(&result.url) || !is_allowed_source_url(config, &result.url))
+        {
+            anyhow::bail!("selected source link is not allowed by source policy");
         }
     }
 
@@ -96,8 +124,8 @@ pub fn validate_first_comment_draft_with_search(
             anyhow::bail!("SOURCE_LINK result ID must match used_search_result_id");
         }
         let result = search_result_by_id(search_results, source_link.result_id)?;
-        if !is_safe_fetch_url(&result.url) {
-            anyhow::bail!("selected source link has an unsafe URL");
+        if !is_safe_fetch_url(&result.url) || !is_allowed_source_url(config, &result.url) {
+            anyhow::bail!("selected source link is not allowed by source policy");
         }
     }
 
@@ -106,9 +134,13 @@ pub fn validate_first_comment_draft_with_search(
 
 fn validate_comment_body(
     draft: &FirstCommentDraft,
+    config: &Config,
 ) -> anyhow::Result<Option<SourceLinkPlaceholder>> {
     let (visible_comment, source_link) = replace_source_link_placeholder(&draft.comment)?;
     validate_comment_output(&visible_comment)?;
+    if !is_allowed_comment_text(config, &visible_comment) {
+        anyhow::bail!("first comment contains a blocked term");
+    }
     Ok(source_link)
 }
 
@@ -146,6 +178,9 @@ pub fn parse_source_link_placeholder(token: &str) -> anyhow::Result<SourceLinkPl
         .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '-' | '+'))
     {
         anyhow::bail!("SOURCE_LINK label contains unsupported characters");
+    }
+    if GENERIC_SOURCE_LINK_LABELS.contains(&label.to_lowercase().as_str()) {
+        anyhow::bail!("SOURCE_LINK label must be part of the sentence, not a generic pointer");
     }
 
     Ok(SourceLinkPlaceholder {
@@ -243,7 +278,7 @@ mod tests {
         )
         .unwrap();
 
-        validate_comment_body(&draft).unwrap();
+        validate_comment_body(&draft, &Config::from_env()).unwrap();
     }
 
     #[test]
@@ -310,6 +345,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_generic_source_link_label() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Release notes".to_string(),
+            url: "https://example.com/release".to_string(),
+            snippet: "Version 2.0 is available.".to_string(),
+        }];
+
+        assert!(validate_first_comment_draft_with_search(
+            r#"{"comment":"Версия 2.0 уже вышла. {SOURCE_LINK:1:Детали} в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
+            &results,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_source_link_as_part_of_sentence() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Release notes".to_string(),
+            url: "https://example.com/release".to_string(),
+            snippet: "Version 2.0 is available.".to_string(),
+        }];
+
+        validate_first_comment_draft_with_search(
+            r#"{"comment":"Как пишет {SOURCE_LINK:1:ресурс Example}, версия уже вышла. Обновление в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
+            &results,
+            true,
+        )
+        .unwrap();
     }
 
     #[test]

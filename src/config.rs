@@ -35,6 +35,8 @@ pub struct Config {
     pub search_mcp_fetch_tool: Option<String>,
     pub search_fetch_top_n: usize,
     pub search_fetch_max_chars: usize,
+    pub comment_blocked_source_domains: Vec<String>,
+    pub comment_blocked_terms: Vec<String>,
     pub search_github_mcp_command: Option<String>,
     pub search_github_mcp_args: Vec<String>,
     pub search_github_mcp_env: Vec<String>,
@@ -121,6 +123,11 @@ impl Config {
                 .or_else(|| Some("web_fetch_exa".to_string())),
             search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 2),
             search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 6000),
+            comment_blocked_source_domains: env_list_csv_or(
+                "COMMENT_BLOCKED_SOURCE_DOMAINS",
+                &["meduza.io"],
+            ),
+            comment_blocked_terms: env_list_csv("COMMENT_BLOCKED_TERMS"),
             search_github_mcp_command: env_optional("SEARCH_GITHUB_MCP_COMMAND"),
             search_github_mcp_args: env_args("SEARCH_GITHUB_MCP_ARGS"),
             search_github_mcp_env: env_list_csv_or(
@@ -474,6 +481,8 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            comment_blocked_source_domains: vec!["meduza.io".to_string()],
+            comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
             search_github_mcp_args: Vec::new(),
             search_github_mcp_env: vec![
