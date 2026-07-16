@@ -49,6 +49,9 @@ impl LlmClient for OpenAiCompatClient<'_> {
             messages,
             temperature: request.temperature,
             max_completion_tokens: request.num_predict,
+            response_format: request
+                .structured_output
+                .map(|output| ResponseFormat::json_schema(output.name, output.schema)),
         };
 
         let response = http::client(Duration::from_secs(45))?
@@ -86,6 +89,35 @@ struct ChatCompletionRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
     max_completion_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat<'a>>,
+}
+
+#[derive(Serialize)]
+struct ResponseFormat<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: JsonSchemaResponseFormat<'a>,
+}
+
+#[derive(Serialize)]
+struct JsonSchemaResponseFormat<'a> {
+    name: &'a str,
+    strict: bool,
+    schema: &'a serde_json::Value,
+}
+
+impl<'a> ResponseFormat<'a> {
+    fn json_schema(name: &'a str, schema: &'a serde_json::Value) -> Self {
+        Self {
+            kind: "json_schema",
+            json_schema: JsonSchemaResponseFormat {
+                name,
+                strict: true,
+                schema,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -142,4 +174,44 @@ fn user_content<'a>(prompt: &'a str, image_base64: Option<&'a str>) -> MessageCo
             },
         },
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(response_format: Option<ResponseFormat<'_>>) -> ChatCompletionRequest<'_> {
+        ChatCompletionRequest {
+            model: "gemma-4",
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_completion_tokens: 256,
+            response_format,
+        }
+    }
+
+    #[test]
+    fn text_request_omits_response_format() {
+        let body = serde_json::to_value(request(None)).unwrap();
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn structured_request_uses_strict_json_schema() {
+        let schema = json!({"type": "object", "additionalProperties": false});
+        let body = serde_json::to_value(request(Some(ResponseFormat::json_schema(
+            "avatar_profile_assessment",
+            &schema,
+        ))))
+        .unwrap();
+
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "avatar_profile_assessment"
+        );
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
 }

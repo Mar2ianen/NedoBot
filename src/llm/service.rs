@@ -144,6 +144,7 @@ pub async fn generate_text_checked_with_system_and_schema(
     temperature: f32,
     num_predict: u32,
     output_validator: Option<&OutputValidator>,
+    schema_name: &str,
     schema: &Value,
 ) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
@@ -157,7 +158,10 @@ pub async fn generate_text_checked_with_system_and_schema(
             temperature,
             num_predict,
             output_validator,
-            structured_output: Some(StructuredOutput { schema }),
+            structured_output: Some(StructuredOutput {
+                name: schema_name,
+                schema,
+            }),
         },
     )
     .await
