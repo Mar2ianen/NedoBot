@@ -43,6 +43,7 @@ pub struct ChatMessage {
     pub message_id: i32,
     pub user_id: Option<i64>,
     pub author: String,
+    pub author_url: Option<String>,
     pub text: String,
     pub reply_to_message_id: Option<i32>,
     pub created_at: String,
@@ -56,6 +57,7 @@ struct MessageRow {
     message_id: i32,
     user_id: Option<i64>,
     author: String,
+    author_username: Option<String>,
     text: String,
     reply_to_message_id: Option<i32>,
     created_at: DateTime<Utc>,
@@ -75,6 +77,7 @@ pub async fn search_messages(
             coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
                      nullif(p.username, ''),
                      'Неизвестный пользователь') as author,
+            nullif(p.username, '') as author_username,
             m.text,
             m.reply_to_message_id,
             m.created_at,
@@ -139,6 +142,7 @@ pub async fn search_messages(
             message_id: row.message_id,
             user_id: row.user_id,
             author: row.author,
+            author_url: author_url(row.author_username.as_deref()),
             text: first_chars(&row.text, 700),
             reply_to_message_id: row.reply_to_message_id,
             created_at: row.created_at.to_rfc3339(),
@@ -161,6 +165,7 @@ pub async fn message_context(
             coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
                      nullif(p.username, ''),
                      'Неизвестный пользователь') as author,
+            nullif(p.username, '') as author_username,
             coalesce(m.text, '[медиа без текста]') as text,
             m.reply_to_message_id,
             m.created_at,
@@ -190,6 +195,7 @@ pub async fn message_context(
             message_id: row.message_id,
             user_id: row.user_id,
             author: row.author,
+            author_url: author_url(row.author_username.as_deref()),
             text: first_chars(&row.text, 700),
             reply_to_message_id: row.reply_to_message_id,
             created_at: row.created_at.to_rfc3339(),
@@ -212,6 +218,7 @@ pub async fn reply_thread(
             where parent.chat_id = $1 and chain.depth < 5
         )
         select chain.message_id, chain.user_id, coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''), nullif(p.username, ''), 'Неизвестный пользователь') as author,
+               nullif(p.username, '') as author_username,
                coalesce(chain.text, '[медиа без текста]') as text, chain.reply_to_message_id, chain.created_at, 0::real as relevance
         from chain left join telegram_user_profiles p on p.telegram_user_id = chain.user_id
         order by chain.created_at asc, chain.message_id asc
@@ -225,6 +232,7 @@ pub async fn reply_thread(
             message_id: row.message_id,
             user_id: row.user_id,
             author: row.author,
+            author_url: author_url(row.author_username.as_deref()),
             text: first_chars(&row.text, 700),
             reply_to_message_id: row.reply_to_message_id,
             created_at: row.created_at.to_rfc3339(),
@@ -239,6 +247,15 @@ pub fn source_id(message_id: i32) -> String {
 pub fn message_url(chat_id: i64, message_id: i32) -> Option<String> {
     let internal_id = chat_id.to_string().strip_prefix("-100")?.to_string();
     Some(format!("https://t.me/c/{internal_id}/{message_id}"))
+}
+
+fn author_url(username: Option<&str>) -> Option<String> {
+    let username = username?.trim();
+    let valid = (5..=32).contains(&username.len())
+        && username
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || character == b'_');
+    valid.then(|| format!("https://t.me/{username}"))
 }
 
 fn normalized_query(query: &str) -> anyhow::Result<String> {
@@ -276,6 +293,19 @@ mod tests {
     #[test]
     fn message_url_rejects_non_supergroup_id() {
         assert_eq!(message_url(-12345, 42), None);
+    }
+
+    #[test]
+    fn author_url_accepts_telegram_username() {
+        assert_eq!(
+            author_url(Some("pasha_3060")),
+            Some("https://t.me/pasha_3060".to_string())
+        );
+    }
+
+    #[test]
+    fn author_url_rejects_unsafe_username() {
+        assert_eq!(author_url(Some("pasha/3060")), None);
     }
 
     #[test]
