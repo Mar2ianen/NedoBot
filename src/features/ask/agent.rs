@@ -44,6 +44,16 @@ pub async fn answer(
             "TOOL_RESULT_UNTRUSTED chat.resolve_user:\n{result}"
         ));
     }
+    for query in mentioned_user_queries(question) {
+        let result = mcp
+            .call("chat.resolve_user", json!({"query": query}))
+            .await?;
+        if resolved_user_found(&result) {
+            observations.push(format!(
+                "TOOL_RESULT_UNTRUSTED chat.resolve_user:\n{result}"
+            ));
+        }
+    }
     if let Some(reply_context) = reply_context.filter(|value| !value.trim().is_empty()) {
         observations.push(format!("REPLY_CONTEXT_UNTRUSTED:\n{reply_context}"));
     }
@@ -175,6 +185,100 @@ fn mentioned_telegram_user_id(question: &str) -> Option<i64> {
         .split(|character: char| !character.is_ascii_digit())
         .filter(|value| (5..=15).contains(&value.len()))
         .find_map(|value| value.parse::<i64>().ok())
+}
+
+fn mentioned_user_queries(question: &str) -> Vec<String> {
+    const GENERIC_WORDS: &[&str] = &[
+        "какой",
+        "какая",
+        "какие",
+        "какого",
+        "какому",
+        "процессор",
+        "процессоре",
+        "видеокарта",
+        "видеокарте",
+        "сообщение",
+        "сообщения",
+        "пользователь",
+        "пользователя",
+        "найди",
+        "расскажи",
+        "скажи",
+        "есть",
+    ];
+    question
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric() && character != '_')
+                .to_lowercase()
+        })
+        .filter(|word| (3..=32).contains(&word.chars().count()))
+        .filter(|word| !word.chars().all(|character| character.is_ascii_digit()))
+        .filter(|word| !GENERIC_WORDS.contains(&word.as_str()))
+        .flat_map(|word| {
+            let transliterated = transliterate_russian(&word);
+            if transliterated == word {
+                vec![word]
+            } else {
+                vec![word, transliterated]
+            }
+        })
+        .fold(Vec::new(), |mut queries, word| {
+            if queries.len() < 4 && !queries.contains(&word) {
+                queries.push(word);
+            }
+            queries
+        })
+}
+
+fn transliterate_russian(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            let latin = match character {
+                'а' => "a",
+                'б' => "b",
+                'в' => "v",
+                'г' => "g",
+                'д' => "d",
+                'е' | 'ё' => "e",
+                'ж' => "zh",
+                'з' => "z",
+                'и' | 'й' => "i",
+                'к' => "k",
+                'л' => "l",
+                'м' => "m",
+                'н' => "n",
+                'о' => "o",
+                'п' => "p",
+                'р' => "r",
+                'с' => "s",
+                'т' => "t",
+                'у' => "u",
+                'ф' => "f",
+                'х' => "h",
+                'ц' => "ts",
+                'ч' => "ch",
+                'ш' => "sh",
+                'щ' => "sch",
+                'ы' => "y",
+                'э' => "e",
+                'ю' => "yu",
+                'я' => "ya",
+                'ь' | 'ъ' => "",
+                _ => return character.to_string(),
+            };
+            latin.to_string()
+        })
+        .collect()
+}
+
+fn resolved_user_found(result: &str) -> bool {
+    serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|value| value.as_array().map(|users| !users.is_empty()))
+        .unwrap_or(false)
 }
 
 fn collect_message_ids(result: &str, ids: &mut Vec<i32>) {
@@ -317,5 +421,13 @@ mod tests {
             Some(6360097713)
         );
         assert_eq!(mentioned_telegram_user_id("без id"), None);
+    }
+
+    #[test]
+    fn extracts_person_name_without_query_noise() {
+        assert_eq!(
+            mentioned_user_queries("какой процессор у Парти"),
+            vec!["парти", "parti"]
+        );
     }
 }
