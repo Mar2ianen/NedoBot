@@ -181,6 +181,24 @@ mod tests {
     }
 
     #[test]
+    fn keeps_four_distinct_queries() {
+        let queries = parse_extract_response(
+            r#"{
+                "need_search":true,
+                "queries":[
+                    {"source":"web","text":"product alternatives"},
+                    {"source":"web","text":"product ownership impact"},
+                    {"source":"github","text":"product compatibility"},
+                    {"source":"reddit","text":"product community experience"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(queries.len(), MAX_SEARCH_QUERIES);
+    }
+
+    #[test]
     fn drops_unknown_source() {
         let queries = parse_extract_response(
             r#"{
