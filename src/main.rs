@@ -23,6 +23,9 @@ use db::telegram::{
     user_profile_needs_refresh,
 };
 use db::{build_pool, migrate};
+use features::avatar_analysis::service::{
+    enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
+};
 use features::first_comment::pipeline::maybe_comment_post;
 use features::new_user_analysis::analyze_new_user_profile;
 use features::user_profiles::service::refresh_profile;
@@ -53,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(%err, "failed to check reaction update availability");
     }
     let state = AppState::new(pool, config);
+    spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
 
     let handler = dptree::entry()
         .branch(
@@ -126,6 +130,7 @@ fn spawn_message_author_profile_refresh(
     let bot = bot.inner().clone();
     let pool = state.pool.clone();
     let profile_refresh_slots = state.profile_refresh_slots.clone();
+    let avatar_classifier_enabled = state.config.avatar_classifier_enabled;
     tokio::spawn(async move {
         match user_profile_needs_refresh(&pool, user_id).await {
             Ok(true) => {}
@@ -149,6 +154,11 @@ fn spawn_message_author_profile_refresh(
                 if let Err(err) = analyze_new_user_profile(&pool, chat_id, user_id).await {
                     tracing::warn!(%err, user_id, "failed to analyze new user profile");
                 }
+                if avatar_classifier_enabled
+                    && let Err(err) = enqueue_current_avatar_analysis(&pool, user_id).await
+                {
+                    tracing::warn!(%err, user_id, "failed to enqueue avatar analysis");
+                }
             }
             Err(err) => {
                 let message = err.to_string();
@@ -158,6 +168,31 @@ fn spawn_message_author_profile_refresh(
                     tracing::warn!(%save_err, user_id, "failed to save profile refresh error");
                 }
                 tracing::warn!(%err, user_id, "failed to refresh message author profile");
+            }
+        }
+    });
+}
+
+fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
+    if !state.config.avatar_classifier_enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let permit = match state.avatar_classifier_slots.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let processed =
+                process_next_avatar_analysis_job(&bot, &state.pool, &state.config).await;
+            drop(permit);
+            match processed {
+                Ok(true) => continue,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                Err(err) => {
+                    tracing::warn!(%err, "avatar analysis worker failed to claim a job");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
             }
         }
     });

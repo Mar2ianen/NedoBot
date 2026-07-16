@@ -1,13 +1,17 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::features::search::extract::extract_search_queries;
 use crate::features::search::mcp::McpSearchProvider;
+use crate::features::search::policy::is_allowed_search_result;
 use crate::features::search::provider::SearchProvider;
-use crate::features::search::types::{MAX_SEARCH_RESULTS, SearchContext, SearchResult};
+use crate::features::search::types::{
+    MAX_SEARCH_RESULTS, SearchContext, SearchQuery, SearchResult,
+};
 
 pub async fn run_search(config: &Config, clean_post: &str) -> SearchContext {
     let started = Instant::now();
@@ -44,17 +48,14 @@ async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant)
         return SearchContext::skipped("no_search_needed", started.elapsed().as_millis());
     }
 
-    let provider = McpSearchProvider::new(config.clone());
-    let mut results = Vec::new();
+    let results = run_queries_in_parallel(config, &queries).await;
 
-    for query in &queries {
-        match provider.search(query).await {
-            Ok(query_results) => results.extend(query_results),
-            Err(err) => tracing::warn!(%err, source = ?query.source, "search provider failed"),
-        }
-    }
-
-    let results = dedupe_results(results);
+    let results = dedupe_results(
+        results
+            .into_iter()
+            .filter(|result| is_allowed_search_result(config, result))
+            .collect(),
+    );
     if results.is_empty() {
         return SearchContext {
             queries,
@@ -70,6 +71,32 @@ async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant)
         skipped_reason: None,
         latency_ms: started.elapsed().as_millis(),
     }
+}
+
+async fn run_queries_in_parallel(config: &Config, queries: &[SearchQuery]) -> Vec<SearchResult> {
+    let mut tasks = JoinSet::new();
+
+    for (index, query) in queries.iter().cloned().enumerate() {
+        let config = config.clone();
+        tasks.spawn(async move {
+            let source = query.source;
+            let provider = McpSearchProvider::new(config);
+            (index, source, provider.search(&query).await)
+        });
+    }
+
+    let mut results_by_query = vec![Vec::new(); queries.len()];
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((index, _, Ok(results))) => results_by_query[index] = results,
+            Ok((_, source, Err(err))) => {
+                tracing::warn!(%err, ?source, "search provider failed")
+            }
+            Err(err) => tracing::warn!(%err, "search task failed"),
+        }
+    }
+
+    results_by_query.into_iter().flatten().collect()
 }
 
 fn dedupe_results(results: Vec<SearchResult>) -> Vec<SearchResult> {

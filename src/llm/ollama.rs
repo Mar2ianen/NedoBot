@@ -42,6 +42,7 @@ impl LlmClient for OllamaClient<'_> {
                 temperature: request.temperature,
                 num_predict: request.num_predict,
             },
+            format: request.structured_output.map(|output| output.schema),
         };
 
         let response = http::client(Duration::from_secs(60))?
@@ -80,6 +81,8 @@ struct OllamaChatRequest<'a> {
     messages: Vec<OllamaMessage<'a>>,
     stream: bool,
     options: OllamaOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -105,4 +108,27 @@ struct OllamaChatResponse {
 #[derive(Deserialize)]
 struct OllamaResponseMessage {
     content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn structured_output_schema_is_sent_as_ollama_format() {
+        let schema = json!({"type": "object"});
+        let request = OllamaChatRequest {
+            model: "gemma",
+            messages: Vec::new(),
+            stream: false,
+            options: OllamaOptions {
+                temperature: 0.4,
+                num_predict: 90,
+            },
+            format: Some(&schema),
+        };
+
+        assert_eq!(serde_json::to_value(request).unwrap()["format"], schema);
+    }
 }

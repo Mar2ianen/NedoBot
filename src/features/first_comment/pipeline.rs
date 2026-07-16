@@ -11,9 +11,12 @@ use crate::config::Config;
 use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
-use crate::features::first_comment::prompt::build_llm_prompt_parts;
-use crate::features::first_comment::quality::validate_comment_output;
-use crate::features::first_comment::render::build_comment_html;
+use crate::features::first_comment::draft::{
+    first_comment_output_schema, parse_first_comment_draft,
+    validate_first_comment_draft_with_search_and_policy,
+};
+use crate::features::first_comment::prompt::{CommentDirectives, build_llm_prompt_parts};
+use crate::features::first_comment::render::build_comment_html_with_sources;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
     load_topic_bot_comments, mark_post_comment_sent,
@@ -22,7 +25,7 @@ use crate::features::memory::service::{load_relevant_memory_notes, remember_post
 use crate::features::search::repo::insert_search_run;
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
-use crate::llm::service::generate_text_checked_with_system;
+use crate::llm::service::generate_text_checked_with_system_and_schema;
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
@@ -86,6 +89,8 @@ pub async fn maybe_comment_post(
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
+    let directives =
+        CommentDirectives::for_post(candidate.source_message_id.0, Some(&search_context));
     let prompt = build_llm_prompt_parts(
         &clean_post,
         chat_member_count,
@@ -93,21 +98,38 @@ pub async fn maybe_comment_post(
         &recent_comments,
         &topic_comments,
         config.search_enabled.then_some(&search_context),
+        directives,
     );
-    let generation = generate_text_checked_with_system(
+    let validation_results = search_context.results.clone();
+    let source_link_available = directives.source_link_available();
+    let source_policy = config.clone();
+    let validator = move |value: &str| {
+        validate_first_comment_draft_with_search_and_policy(
+            value,
+            &validation_results,
+            source_link_available,
+            &source_policy,
+        )
+    };
+    let generation = generate_text_checked_with_system_and_schema(
         config,
         &prompt.system,
         &prompt.user,
         image_base64.as_deref(),
         config.llm_temperature,
         config.llm_max_tokens,
-        Some(validate_comment_output),
+        Some(&validator),
+        "first_comment_draft",
+        first_comment_output_schema(),
     )
     .await?;
+    let draft = parse_first_comment_draft(&generation.content)?;
+    let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
-    let final_html = build_comment_html(&generation.content, config);
-    ensure_comment_html(&final_html, &generation.content)?;
+    let final_html =
+        build_comment_html_with_sources(&draft.comment, config, &search_context.results);
+    ensure_comment_html(&final_html, &draft.comment)?;
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
 
@@ -120,9 +142,10 @@ pub async fn maybe_comment_post(
             model: &generation.model,
             prompt: &prompt_for_log,
             image_used: generation.image_used,
-            response: &generation.content,
+            response: &draft.comment,
             final_html: &final_html,
             attempts: &attempts,
+            used_search_result_id,
         },
     )
     .await?;
@@ -134,6 +157,7 @@ pub async fn maybe_comment_post(
             &final_html,
             candidate.source_message_id,
             &search_context,
+            used_search_result_id,
         )
         .await;
     }
@@ -188,11 +212,15 @@ async fn send_owner_preview(
     final_html: &str,
     source_message_id: MessageId,
     search_context: &SearchContext,
+    used_search_result_id: Option<i32>,
 ) {
     let preview = format!(
-        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>\n<code>{}</code>",
+        "Комментарий отправлен:\n\n{}\n\n<code>source_message_id={}</code>\n<code>used_search_result_id={}</code>\n<code>{}</code>",
         final_html,
         source_message_id.0,
+        used_search_result_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "null".to_string()),
         render_search_summary(search_context)
     );
 

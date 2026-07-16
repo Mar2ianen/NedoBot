@@ -9,8 +9,11 @@ use tg_ai_bot_teloxide::{
     db::{build_pool, migrate},
     features::{
         first_comment::{
-            prompt::build_llm_prompt_parts,
-            quality::validate_comment_output,
+            draft::{
+                first_comment_output_schema, parse_first_comment_draft,
+                validate_first_comment_draft_with_search_and_policy,
+            },
+            prompt::{CommentDirectives, build_llm_prompt_parts},
             render::build_comment_html,
             repo::{
                 LlmGenerationInsert, insert_llm_generation, load_recent_bot_comments,
@@ -19,7 +22,7 @@ use tg_ai_bot_teloxide::{
         },
         memory::service::{load_relevant_memory_notes, remember_post},
     },
-    llm::service::generate_text_checked_with_system,
+    llm::service::generate_text_checked_with_system_and_schema,
     telegram::render::send_html_reply,
 };
 
@@ -166,24 +169,33 @@ async fn retry_job(
         &recent_comments,
         &topic_comments,
         None,
+        CommentDirectives::for_post(job.source_message_id, None),
     );
-    let generation = generate_text_checked_with_system(
+    let source_policy = config.clone();
+    let validator = move |value: &str| {
+        validate_first_comment_draft_with_search_and_policy(value, &[], false, &source_policy)
+    };
+    let generation = generate_text_checked_with_system_and_schema(
         config,
         &prompt.system,
         &prompt.user,
         None,
         config.llm_temperature,
         config.llm_max_tokens,
-        Some(validate_comment_output),
+        Some(&validator),
+        "first_comment_draft",
+        first_comment_output_schema(),
     )
     .await?;
+    let draft = parse_first_comment_draft(&generation.content)?;
+    let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
-    let final_html = build_comment_html(&generation.content, config);
+    let final_html = build_comment_html(&draft.comment, config);
     if final_html.trim().is_empty() {
         anyhow::bail!(
             "empty rendered comment from LLM response: {}",
-            generation.content.chars().take(120).collect::<String>()
+            draft.comment.chars().take(120).collect::<String>()
         );
     }
 
@@ -204,9 +216,10 @@ async fn retry_job(
             model: &generation.model,
             prompt: &prompt_for_log,
             image_used: false,
-            response: &generation.content,
+            response: &draft.comment,
             final_html: &final_html,
             attempts: &attempts,
+            used_search_result_id,
         },
     )
     .await?;

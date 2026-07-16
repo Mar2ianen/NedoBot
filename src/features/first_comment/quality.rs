@@ -1,5 +1,4 @@
 const MAX_VISIBLE_CHARS: usize = 180;
-const MAX_WORDS: usize = 30;
 const MAX_SENTENCE_MARKS: usize = 2;
 const MIN_WORDS: usize = 5;
 const MIN_CYRILLIC_CHARS: usize = 8;
@@ -123,10 +122,6 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
     if words < MIN_WORDS {
         anyhow::bail!("first comment is too short: {words} words");
     }
-    if words > MAX_WORDS {
-        anyhow::bail!("first comment is too wordy: {words} words");
-    }
-
     let sentence_marks = visible
         .chars()
         .filter(|ch| matches!(*ch, '.' | '!' | '?'))
