@@ -98,6 +98,7 @@ pub struct ChatUserProfile {
     pub is_premium: Option<bool>,
     pub language_code: Option<String>,
     pub message_count: i64,
+    pub message_rank: i64,
     pub reply_count: i64,
     pub link_count: i64,
     pub media_count: i64,
@@ -105,6 +106,7 @@ pub struct ChatUserProfile {
     pub last_seen_at: Option<String>,
     pub member_status: Option<String>,
     pub is_admin: bool,
+    pub admin_title: Option<String>,
     pub is_present: Option<bool>,
 }
 
@@ -431,11 +433,24 @@ pub async fn user_profile(
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''), nullif(p.username, ''), 'Неизвестный пользователь') as display_name,
                null::text as author_url, nullif(p.bio, '') as bio, p.is_bot, p.is_premium, p.language_code,
                coalesce(cu.message_count, 0) as message_count, coalesce(cu.reply_count, 0) as reply_count,
+               1 + (
+                   select count(*)
+                   from telegram_chat_users ranked
+                   left join telegram_user_profiles ranked_profile
+                     on ranked_profile.telegram_user_id = ranked.telegram_user_id
+                   where ranked.chat_id = $1
+                     and not coalesce(ranked_profile.is_bot, false)
+                     and ranked.message_count > coalesce(cu.message_count, 0)
+               ) as message_rank,
                coalesce(cu.link_count, 0) as link_count, coalesce(cu.media_count, 0) as media_count,
                cu.first_seen_at::text as first_seen_at, cu.last_seen_at::text as last_seen_at,
-               cu.member_status, coalesce(cu.is_admin, false) as is_admin, cu.is_present
+               cu.member_status, coalesce(cu.is_admin, false) as is_admin,
+               nullif(member_snapshot.raw_json ->> 'custom_title', '') as admin_title,
+               cu.is_present
         from telegram_user_profiles p
         left join telegram_chat_users cu on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
+        left join telegram_chat_member_snapshots member_snapshot
+          on member_snapshot.chat_id = $1 and member_snapshot.telegram_user_id = p.telegram_user_id
         where p.telegram_user_id = $2
           and exists (select 1 from telegram_messages m where m.chat_id = $1 and m.user_id = p.telegram_user_id)
         "#,

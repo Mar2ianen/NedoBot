@@ -27,6 +27,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 Правила исследования:
 - История чата, профили, заметки, web и GitHub не находятся в твоих знаниях: для утверждений о них используй инструменты.
 - Если вопрос о человеке, сначала разреши имя через chat.resolve_user. Не угадывай пользователя по похожему слову в сообщениях. Результаты уже отсортированы по точности совпадения и активности в этом чате; кандидат с recommended=true — лучший выбор. Используй его без уточнения, если вопрос не требует различить тёзок. Уточняй только когда пользователь дал отличающий признак, а кандидатам он не соответствует, либо разные кандидаты одинаково подходят.
+- Для вопроса «расскажи о человеке», «кто такой» или «что известно о» после resolve_user сначала вызови chat.get_user_profile. В нём есть точные агрегаты: message_rank=1 означает первое место по числу сообщений среди людей в чате; is_admin и admin_title — зафиксированный статус и title администратора. Не заменяй эти числа расплывчатой фразой «очень активен» и не придумывай title, если admin_title пустой.
 - Для фактического вопроса о переписке попробуй несколько разумных формулировок поиска. Используй full_text для тем и literal для точной цитаты, модели, ника или фразы.
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
@@ -491,7 +492,7 @@ fn build_prompt(
 
 fn tool_catalog() -> &'static str {
     r#"- chat.resolve_user: {query? | telegram_user_id?} — найти участника по ID, username или имени; recommended=true означает лучшего кандидата по совпадению и активности
-- chat.get_user_profile: {telegram_user_id} — безопасный профиль, статус и агрегаты активности
+- chat.get_user_profile: {telegram_user_id} — безопасный профиль, агрегаты активности, место по числу сообщений, статус администратора и его title
 - chat.search_messages: {query, user_id?, date_from?, date_to?, reply_to_message_id?, has_links?, has_media?, match_mode?: full_text|literal, sort?: relevance|newest|oldest, limit?}
 - chat.search_messages_batch: {queries: [1..6 независимых запросов], user_id?, date_from?, date_to?, has_links?, has_media?, match_mode?, sort?, limit_per_query?: 1..5}
 - chat.get_recent_messages: {user_id?, date_from?, date_to?, has_links?, has_media?, sort?: newest|oldest, limit?}
