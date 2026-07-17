@@ -408,7 +408,7 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
                case
                    when p.telegram_user_id = $2 then 0
                    when lower(coalesce(p.username, '')) = any(coalesce($3::text[], array[]::text[])) then 1
-                   when regexp_replace(lower(concat_ws(' ', p.username, p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g') = any(coalesce($3::text[], array[]::text[])) then 2
+                   when regexp_replace(lower(concat_ws(' ', p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g') = any(coalesce($3::text[], array[]::text[])) then 2
                    else 3
                end as match_rank,
                coalesce(cu.message_count, 0) as message_count
@@ -428,7 +428,7 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
         order by
             case when p.telegram_user_id = $2 then 0 else 1 end,
             case when lower(coalesce(p.username, '')) = any(coalesce($3::text[], array[]::text[])) then 0 else 1 end,
-            case when regexp_replace(lower(concat_ws(' ', p.username, p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g') = any(coalesce($3::text[], array[]::text[])) then 0 else 1 end,
+            case when regexp_replace(lower(concat_ws(' ', p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g') = any(coalesce($3::text[], array[]::text[])) then 0 else 1 end,
             coalesce(cu.message_count, 0) desc,
             p.last_seen_at desc
         limit 10
