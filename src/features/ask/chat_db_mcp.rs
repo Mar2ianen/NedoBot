@@ -127,6 +127,8 @@ struct ResolvedUserRow {
     telegram_user_id: i64,
     username: Option<String>,
     display_name: String,
+    match_rank: i32,
+    message_count: i64,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -402,8 +404,17 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
         r#"
         select p.telegram_user_id, nullif(p.username, '') as username,
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
-                        nullif(p.username, ''), 'Неизвестный пользователь') as display_name
+                        nullif(p.username, ''), 'Неизвестный пользователь') as display_name,
+               case
+                   when p.telegram_user_id = $2 then 0
+                   when lower(coalesce(p.username, '')) = any(coalesce($3::text[], array[]::text[])) then 1
+                   when regexp_replace(lower(concat_ws(' ', p.username, p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g') = any(coalesce($3::text[], array[]::text[])) then 2
+                   else 3
+               end as match_rank,
+               coalesce(cu.message_count, 0) as message_count
         from telegram_user_profiles p
+        left join telegram_chat_users cu
+          on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
         where exists (
             select 1 from telegram_messages m
             where m.chat_id = $1 and m.user_id = p.telegram_user_id
@@ -417,6 +428,8 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
         order by
             case when p.telegram_user_id = $2 then 0 else 1 end,
             case when lower(coalesce(p.username, '')) = any(coalesce($3::text[], array[]::text[])) then 0 else 1 end,
+            case when regexp_replace(lower(concat_ws(' ', p.username, p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g') = any(coalesce($3::text[], array[]::text[])) then 0 else 1 end,
+            coalesce(cu.message_count, 0) desc,
             p.last_seen_at desc
         limit 10
         "#,
@@ -428,12 +441,21 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
     .await
     .map_err(|_| ())?
     .into_iter()
-    .map(|user| {
+    .enumerate()
+    .map(|(index, user)| {
         json!({
             "telegram_user_id": user.telegram_user_id,
             "username": user.username,
             "display_name": user.display_name,
-            "author_url": public_username_url(user.username.as_deref())
+            "author_url": public_username_url(user.username.as_deref()),
+            "message_count": user.message_count,
+            "match": match user.match_rank {
+                0 => "telegram_id",
+                1 => "username",
+                2 => "exact_name",
+                _ => "partial_name",
+            },
+            "recommended": index == 0
         })
     })
     .collect::<Vec<_>>();
