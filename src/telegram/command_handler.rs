@@ -4,6 +4,7 @@ use crate::db::telegram::save_telegram_message;
 use crate::features::ask::agent;
 use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
+use crate::features::ask::repo;
 use crate::features::ask::rich_markdown;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
@@ -279,9 +280,27 @@ async fn handle_ask_command(
         },
         None => None,
     };
+    let ask_run_id = match repo::create_run(
+        &state.pool,
+        config,
+        msg.chat.id.0,
+        msg.id.0,
+        user.id.0 as i64,
+        question,
+        msg.reply_to_message().map(|reply| reply.id.0),
+    )
+    .await
+    {
+        Ok(ask_run_id) => Some(ask_run_id),
+        Err(err) => {
+            tracing::warn!(%err, "failed to start ask audit run");
+            None
+        }
+    };
     let answer = agent::answer(
         config,
         &state.pool,
+        ask_run_id,
         user.id.0 as i64,
         &requester_identity(user),
         question,
@@ -292,10 +311,24 @@ async fn handle_ask_command(
     drop(permit);
     match answer {
         Ok(answer) => {
-            let markdown = rich_markdown::validate(&answer).map_err(|err| {
-                tracing::warn!(%err, "ask assistant returned unsafe markdown");
-                teloxide::RequestError::Io(std::io::Error::other("ask markdown is invalid"))
-            })?;
+            let markdown = match rich_markdown::validate(&answer) {
+                Ok(markdown) => markdown,
+                Err(err) => {
+                    tracing::warn!(%err, "ask assistant returned unsafe markdown");
+                    finish_ask_run(
+                        &state.pool,
+                        ask_run_id,
+                        "failed",
+                        None,
+                        Some("render_validation"),
+                    )
+                    .await;
+                    return Err(teloxide::RequestError::Io(std::io::Error::other(
+                        "ask markdown is invalid",
+                    )));
+                }
+            };
+            finish_ask_run(&state.pool, ask_run_id, "completed", Some(&markdown), None).await;
             if send_rich_markdown_reply(msg.chat.id, msg.id, markdown)
                 .await
                 .is_ok()
@@ -309,10 +342,47 @@ async fn handle_ask_command(
         }
         Err(err) => {
             tracing::warn!(%err, "ask assistant failed");
+            finish_ask_run(
+                &state.pool,
+                ask_run_id,
+                "failed",
+                None,
+                Some(ask_error_kind(&err)),
+            )
+            .await;
             send_html(bot, msg.chat.id, ask_failure_message(&err))
                 .await
                 .map(|_| ())
         }
+    }
+}
+
+async fn finish_ask_run(
+    pool: &sqlx::PgPool,
+    ask_run_id: Option<i64>,
+    status: &str,
+    answer_markdown: Option<&str>,
+    error_kind: Option<&str>,
+) {
+    let Some(ask_run_id) = ask_run_id else {
+        return;
+    };
+    if let Err(err) = repo::finish_run(pool, ask_run_id, status, answer_markdown, error_kind).await
+    {
+        tracing::warn!(%err, ask_run_id, "failed to finish ask audit run");
+    }
+}
+
+fn ask_error_kind(error: &anyhow::Error) -> &'static str {
+    let error = error.to_string().to_lowercase();
+    if error.contains("timed out") {
+        "timeout"
+    } else if error.contains("mcp") || error.contains("database") {
+        "tool_error"
+    } else if error.contains("invalid action") || error.contains("final answer") {
+        "invalid_action"
+    } else {
+        "generation_error"
     }
 }
 

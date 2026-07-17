@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,6 +13,7 @@ use tokio::time::{Duration, timeout};
 use crate::config::Config;
 use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::add_user_note_from_search;
+use crate::features::ask::repo;
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
@@ -129,6 +131,7 @@ impl ResearchState {
 pub async fn answer(
     config: &Config,
     pool: &PgPool,
+    ask_run_id: Option<i64>,
     requester_user_id: i64,
     requester_identity: &str,
     question: &str,
@@ -233,6 +236,18 @@ pub async fn answer(
                     serde_json::to_string(&action.arguments).unwrap_or_default()
                 );
                 if !tool_signatures.insert(signature) {
+                    audit_tool_call(
+                        pool,
+                        ask_run_id,
+                        step + 1,
+                        tool,
+                        &action.arguments,
+                        "skipped_duplicate",
+                        None,
+                        Some(0),
+                        Some("duplicate"),
+                    )
+                    .await;
                     push_observation(
                         &mut observations,
                         format!(
@@ -243,6 +258,7 @@ pub async fn answer(
                 }
                 tool_call_count += 1;
                 let tracking_arguments = action.arguments.clone();
+                let started = Instant::now();
                 match call_tool(
                     config,
                     pool,
@@ -255,6 +271,18 @@ pub async fn answer(
                 .await
                 {
                     Ok(result) => {
+                        audit_tool_call(
+                            pool,
+                            ask_run_id,
+                            step + 1,
+                            tool,
+                            &tracking_arguments,
+                            "completed",
+                            tool_result_count(&result),
+                            elapsed_millis(started),
+                            None,
+                        )
+                        .await;
                         research.record(tool, &tracking_arguments, &result);
                         push_observation(
                             &mut observations,
@@ -262,6 +290,18 @@ pub async fn answer(
                         );
                     }
                     Err(err) => {
+                        audit_tool_call(
+                            pool,
+                            ask_run_id,
+                            step + 1,
+                            tool,
+                            &tracking_arguments,
+                            "failed",
+                            None,
+                            elapsed_millis(started),
+                            Some("tool_error"),
+                        )
+                        .await;
                         tracing::warn!(%err, tool, "ask tool call failed");
                         push_observation(
                             &mut observations,
@@ -464,6 +504,61 @@ fn allowed_agent_tool(tool: &str) -> bool {
 
 fn allowed_mcp_tool(tool: &str) -> bool {
     MCP_TOOLS.contains(&tool)
+}
+
+async fn audit_tool_call(
+    pool: &PgPool,
+    ask_run_id: Option<i64>,
+    step_number: usize,
+    tool_name: &str,
+    arguments: &Value,
+    status: &str,
+    result_count: Option<i64>,
+    latency_ms: Option<i64>,
+    error_kind: Option<&str>,
+) {
+    let Some(ask_run_id) = ask_run_id else {
+        return;
+    };
+    let step_number = i32::try_from(step_number).unwrap_or(i32::MAX);
+    if let Err(err) = repo::record_tool_call(
+        pool,
+        ask_run_id,
+        step_number,
+        tool_name,
+        arguments,
+        status,
+        result_count,
+        latency_ms,
+        error_kind,
+    )
+    .await
+    {
+        tracing::warn!(%err, ask_run_id, tool_name, "failed to audit ask tool call");
+    }
+}
+
+fn elapsed_millis(started: Instant) -> Option<i64> {
+    i64::try_from(started.elapsed().as_millis()).ok()
+}
+
+fn tool_result_count(result: &str) -> Option<i64> {
+    let value = serde_json::from_str::<Value>(result).ok()?;
+    let count = match value {
+        Value::Array(items) => items.len(),
+        Value::Object(object) => object
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .or_else(|| {
+                object
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            })?,
+        _ => return None,
+    };
+    i64::try_from(count).ok()
 }
 
 fn build_prompt(
@@ -1158,6 +1253,7 @@ mod tests {
         let result = answer(
             &config,
             &pool,
+            None,
             requester_user_id,
             &requester_identity,
             &question,
