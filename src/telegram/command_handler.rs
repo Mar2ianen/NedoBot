@@ -2,9 +2,11 @@ use teloxide::{prelude::*, utils::command::BotCommands};
 
 use crate::db::telegram::save_telegram_message;
 use crate::features::ask::agent;
+use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
 use crate::features::ask::rich_markdown;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
@@ -234,21 +236,73 @@ async fn handle_ask_command(
         state.ask_slots.clone().try_acquire_owned().map_err(|_| {
             teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy"))
         })?;
-    let reply_context = msg
-        .reply_to_message()
-        .and_then(|reply| reply.text().or_else(|| reply.caption()));
+    let reply_context = msg.reply_to_message().map(|reply| {
+        let author = reply
+            .from
+            .as_ref()
+            .map(|user| {
+                let name = format!(
+                    "{}{}",
+                    user.first_name,
+                    user.last_name
+                        .as_deref()
+                        .map(|last_name| format!(" {last_name}"))
+                        .unwrap_or_default()
+                );
+                format!(
+                    "{name} (telegram_user_id={}, username={})",
+                    user.id.0,
+                    user.username.as_deref().unwrap_or("нет")
+                )
+            })
+            .unwrap_or_else(|| "неизвестный автор".to_string());
+        let media = [
+            reply.photo().is_some().then_some("photo"),
+            reply.video().is_some().then_some("video"),
+            reply.document().is_some().then_some("document"),
+            reply.voice().is_some().then_some("voice"),
+            reply.audio().is_some().then_some("audio"),
+            reply.sticker().is_some().then_some("sticker"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        format!(
+            "message_id={}\nauthor={}\nmessage_url={}\nmedia={}\ntext={}",
+            reply.id.0,
+            author,
+            (reply.chat.id.0 == config.discussion_chat_id)
+                .then(|| message_url(config.discussion_chat_id, reply.id.0))
+                .flatten()
+                .as_deref()
+                .unwrap_or("нет"),
+            if media.is_empty() { "нет" } else { &media },
+            reply
+                .text()
+                .or_else(|| reply.caption())
+                .unwrap_or("[нет текста]")
+        )
+    });
+    let reply_image = match msg.reply_to_message() {
+        Some(reply) => match download_largest_photo_base64(bot, reply, config).await {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::warn!(%err, "failed to download /ask reply image");
+                None
+            }
+        },
+        None => None,
+    };
     let answer = agent::answer(
         config,
         &state.pool,
         user.id.0 as i64,
         question,
-        reply_context,
+        reply_context.as_deref(),
+        reply_image.as_deref(),
     )
-    .await
-    .map_err(|err| {
-        tracing::warn!(%err, "ask assistant failed");
-        teloxide::RequestError::Io(std::io::Error::other("ask assistant failed"))
-    });
+    .await;
     drop(permit);
     match answer {
         Ok(answer) => {
@@ -267,13 +321,25 @@ async fn handle_ask_command(
                     .map(|_| ())
             }
         }
-        Err(_) => send_html(
-            bot,
-            msg.chat.id,
-            "Не смог подготовить ответ. Попробуй ещё раз чуть позже.",
-        )
-        .await
-        .map(|_| ()),
+        Err(err) => {
+            tracing::warn!(%err, "ask assistant failed");
+            send_html(bot, msg.chat.id, ask_failure_message(&err))
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
+fn ask_failure_message(error: &anyhow::Error) -> &'static str {
+    let error = error.to_string().to_lowercase();
+    if error.contains("timed out") {
+        "Помощник не уложился в таймаут. Попробуй сузить вопрос или повторить позже."
+    } else if error.contains("mcp") || error.contains("database") {
+        "Сейчас недоступен поиск по истории чата. Попробуй повторить запрос позже."
+    } else if error.contains("invalid action") || error.contains("final answer") {
+        "Модель не смогла завершить агентный ответ. Запрос можно повторить без изменений."
+    } else {
+        "Не смог подготовить ответ из-за временной ошибки модели или инструмента. Попробуй ещё раз чуть позже."
     }
 }
 
