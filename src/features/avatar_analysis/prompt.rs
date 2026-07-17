@@ -57,7 +57,7 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-pub const PROMPT_VERSION: &str = "avatar-classifier-v1";
+pub const PROMPT_VERSION: &str = "avatar-classifier-v2";
 
 pub fn system_prompt() -> &'static str {
     SYSTEM_PROMPT
