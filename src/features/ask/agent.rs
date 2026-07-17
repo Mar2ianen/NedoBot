@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 
 use serde::Deserialize;
@@ -18,6 +18,7 @@ use crate::llm::types::StructuredOutput;
 
 const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
+const MAX_CORRECTION_STEPS: usize = 3;
 
 const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник Telegram-чата «НедоNews Chat». Это активный русскоязычный чат о технологиях, ПК, играх, смартфонах, софте, новостях и повседневных темах. Отвечай на сам вопрос, а инструменты используй только когда они добавляют нужные факты.
 
@@ -27,6 +28,8 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Для фактического вопроса о переписке попробуй несколько разумных формулировок поиска. Используй full_text для тем и literal для точной цитаты, модели, ника или фразы.
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
+- Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
+- Для любого личного факта не ограничивайся названием темы. Первый широкий поиск делай через chat.search_messages_batch с отдельными короткими queries ["у меня", "мой", "сижу на", "пользуюсь", "купил", "заказал себе"] и нужным user_id — не добавляй тему в каждую строку. Затем извлеки из результатов кандидатов (имена, модели, продукты, места и т.п.), найди каждого literal-запросом и сравни даты/контекст. Не склеивай альтернативы пробелами: в full_text это означает, что все слова обязательны.
 - chat.get_recent_messages нужен для сводки свежего обсуждения, хронологии или последних сообщений конкретного участника без поискового запроса.
 - chat.get_user_interactions показывает только прямые reply и не доказывает отношения вне чата. Формулируй выводы осторожно и только по наблюдаемой переписке.
 - web.search используй для актуальных внешних фактов и содержимого присланной ссылки; github.search — для публичного кода, issues и репозиториев. Не смешивай внешние сведения с историей чата без пояснения.
@@ -44,6 +47,7 @@ const MCP_TOOLS: &[&str] = &[
     "chat.resolve_user",
     "chat.get_user_profile",
     "chat.search_messages",
+    "chat.search_messages_batch",
     "chat.get_recent_messages",
     "chat.get_message",
     "chat.get_message_context",
@@ -57,6 +61,7 @@ const AGENT_TOOLS: &[&str] = &[
     "chat.resolve_user",
     "chat.get_user_profile",
     "chat.search_messages",
+    "chat.search_messages_batch",
     "chat.get_recent_messages",
     "chat.get_message",
     "chat.get_message_context",
@@ -98,6 +103,26 @@ struct Evidence {
     message_ids_by_user: HashMap<i64, Vec<i32>>,
 }
 
+#[derive(Default)]
+struct ResearchState {
+    personal_fact_required: bool,
+    personal_statement_searches: usize,
+    message_searches: usize,
+    targeted_message_searches: usize,
+    message_results: usize,
+    context_reads: usize,
+    context_message_ids: HashSet<i32>,
+}
+
+impl ResearchState {
+    fn for_question(question: &str) -> Self {
+        Self {
+            personal_fact_required: asks_personal_fact(question),
+            ..Self::default()
+        }
+    }
+}
+
 pub async fn answer(
     config: &Config,
     pool: &PgPool,
@@ -109,6 +134,9 @@ pub async fn answer(
     let mut mcp = McpClient::start(config).await?;
     let mut observations = Vec::new();
     let mut evidence = Evidence::default();
+    let mut research = ResearchState::for_question(question);
+    let mut tool_signatures = HashSet::new();
+    let mut tool_call_count = 0usize;
     if let Some(reply_context) = reply_context.filter(|value| !value.trim().is_empty()) {
         push_observation(
             &mut observations,
@@ -116,8 +144,9 @@ pub async fn answer(
         );
     }
 
-    for step in 0..config.ask_max_steps {
-        let remaining_steps = config.ask_max_steps.saturating_sub(step);
+    let max_attempts = config.ask_max_steps.saturating_add(MAX_CORRECTION_STEPS);
+    for step in 0..max_attempts {
+        let remaining_steps = max_attempts.saturating_sub(step);
         let prompt = build_prompt(requester_user_id, question, &observations, remaining_steps);
         let action = match generate_action(config, &prompt, image_base64).await {
             Ok(action) => action,
@@ -130,9 +159,25 @@ pub async fn answer(
             }
             Err(ActionGenerationError::Request(err)) => return Err(err),
         };
+        #[cfg(test)]
+        eprintln!(
+            "live ask decoded action: kind={:?} tool={:?} arguments={} markdown={}",
+            action.kind,
+            action.tool,
+            action.arguments,
+            action
+                .markdown
+                .as_deref()
+                .map(|value| first_chars(value, 240))
+                .unwrap_or_default()
+        );
         match action.kind {
             ActionKind::Final => {
                 if let Some(markdown) = non_empty(action.markdown.as_deref()) {
+                    if let Some(instruction) = research.follow_up_instruction(markdown) {
+                        push_observation(&mut observations, instruction);
+                        continue;
+                    }
                     return Ok(markdown.to_string());
                 }
                 push_observation(
@@ -162,6 +207,28 @@ pub async fn answer(
                     );
                     continue;
                 }
+                if tool_call_count >= config.ask_max_steps {
+                    push_observation(
+                        &mut observations,
+                        "SYSTEM: лимит вызовов инструментов исчерпан. Сформируй лучший честный final по уже полученным данным.".to_string(),
+                    );
+                    continue;
+                }
+                let signature = format!(
+                    "{tool}:{}",
+                    serde_json::to_string(&action.arguments).unwrap_or_default()
+                );
+                if !tool_signatures.insert(signature) {
+                    push_observation(
+                        &mut observations,
+                        format!(
+                            "SYSTEM: точный вызов {tool} с такими аргументами уже выполнялся. Не повторяй его: измени запрос/режим либо используй контекст найденного сообщения."
+                        ),
+                    );
+                    continue;
+                }
+                tool_call_count += 1;
+                let tracking_arguments = action.arguments.clone();
                 match call_tool(
                     config,
                     pool,
@@ -173,10 +240,13 @@ pub async fn answer(
                 )
                 .await
                 {
-                    Ok(result) => push_observation(
-                        &mut observations,
-                        format!("TOOL_RESULT_UNTRUSTED {tool}:\n{result}"),
-                    ),
+                    Ok(result) => {
+                        research.record(tool, &tracking_arguments, &result);
+                        push_observation(
+                            &mut observations,
+                            format!("TOOL_RESULT_UNTRUSTED {tool}:\n{result}"),
+                        );
+                    }
                     Err(err) => {
                         tracing::warn!(%err, tool, "ask tool call failed");
                         push_observation(
@@ -238,7 +308,14 @@ async fn generate_action(
     .await
     .map_err(|_| ActionGenerationError::Request(anyhow::anyhow!("ask LLM timed out")))?
     .map_err(ActionGenerationError::Request)?;
-    parse_agent_action(&generated.content).map_err(|_| ActionGenerationError::Invalid)
+    parse_agent_action(&generated.content).map_err(|_| {
+        #[cfg(test)]
+        eprintln!(
+            "invalid live ask action: {}",
+            first_chars(&generated.content, 2_000)
+        );
+        ActionGenerationError::Invalid
+    })
 }
 
 fn action_schema() -> Value {
@@ -264,11 +341,63 @@ fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed);
-    serde_json::from_str(without_fence).or_else(|_| {
-        let start = without_fence.find('{').ok_or(())?;
-        let end = without_fence.rfind('}').ok_or(())?;
-        serde_json::from_str(&without_fence[start..=end]).map_err(|_| ())
-    })
+    let parsed = serde_json::from_str(without_fence)
+        .or_else(|_| serde_json::from_str(&escape_json_string_controls(without_fence)))
+        .or_else(|_| {
+            let start = without_fence.find('{').ok_or(())?;
+            let end = without_fence.rfind('}').ok_or(())?;
+            let object = &without_fence[start..=end];
+            serde_json::from_str(object)
+                .or_else(|_| serde_json::from_str(&escape_json_string_controls(object)))
+                .map_err(|_| ())
+        });
+    match parsed {
+        Ok(action) => Ok(action),
+        Err(()) if !without_fence.is_empty() && !without_fence.contains("\"kind\"") => {
+            Ok(AgentAction {
+                kind: ActionKind::Final,
+                tool: None,
+                arguments: Value::Null,
+                markdown: Some(without_fence.to_string()),
+            })
+        }
+        Err(()) => Err(()),
+    }
+}
+
+fn escape_json_string_controls(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in value.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                result.push(character);
+                continue;
+            }
+            match character {
+                '\\' => {
+                    escaped = true;
+                    result.push(character);
+                }
+                '"' => {
+                    in_string = false;
+                    result.push(character);
+                }
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                _ => result.push(character),
+            }
+        } else {
+            if character == '"' {
+                in_string = true;
+            }
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn allowed_agent_tool(tool: &str) -> bool {
@@ -306,6 +435,7 @@ fn tool_catalog() -> &'static str {
     r#"- chat.resolve_user: {query? | telegram_user_id?} — найти участника по ID, username или имени
 - chat.get_user_profile: {telegram_user_id} — безопасный профиль, статус и агрегаты активности
 - chat.search_messages: {query, user_id?, date_from?, date_to?, reply_to_message_id?, has_links?, has_media?, match_mode?: full_text|literal, sort?: relevance|newest|oldest, limit?}
+- chat.search_messages_batch: {queries: [1..6 независимых запросов], user_id?, date_from?, date_to?, has_links?, has_media?, match_mode?, sort?, limit_per_query?: 1..5}
 - chat.get_recent_messages: {user_id?, date_from?, date_to?, has_links?, has_media?, sort?: newest|oldest, limit?}
 - chat.get_message: {message_id}
 - chat.get_message_context: {message_id, before?: 0..5, after?: 0..5}
@@ -365,27 +495,257 @@ async fn call_tool(
 }
 
 fn collect_message_evidence(result: &str, evidence: &mut Evidence) {
-    let Ok(items) = serde_json::from_str::<Vec<Value>>(result) else {
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
         return;
     };
-    for item in items {
-        let Some(message_id) = item
+    collect_message_evidence_value(&value, evidence);
+}
+
+fn collect_message_evidence_value(value: &Value, evidence: &mut Evidence) {
+    if let Some(item) = value.as_object() {
+        if let Some(message_id) = item
             .get("message_id")
             .and_then(Value::as_i64)
             .and_then(|id| i32::try_from(id).ok())
-        else {
-            continue;
-        };
-        if !evidence.message_ids.contains(&message_id) {
-            evidence.message_ids.push(message_id);
-        }
-        if let Some(user_id) = item.get("user_id").and_then(Value::as_i64) {
-            let ids = evidence.message_ids_by_user.entry(user_id).or_default();
-            if !ids.contains(&message_id) {
-                ids.push(message_id);
+        {
+            if !evidence.message_ids.contains(&message_id) {
+                evidence.message_ids.push(message_id);
+            }
+            if let Some(user_id) = item.get("user_id").and_then(Value::as_i64) {
+                let ids = evidence.message_ids_by_user.entry(user_id).or_default();
+                if !ids.contains(&message_id) {
+                    ids.push(message_id);
+                }
             }
         }
     }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_message_evidence_value(item, evidence);
+            }
+        }
+        Value::Object(object) => {
+            for nested in object.values() {
+                collect_message_evidence_value(nested, evidence);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ResearchState {
+    fn record(&mut self, tool: &str, arguments: &Value, result: &str) {
+        match tool {
+            "chat.search_messages" | "chat.search_messages_batch" => {
+                let searches = if tool == "chat.search_messages_batch" {
+                    arguments
+                        .get("queries")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                self.message_searches += searches;
+                if arguments.get("user_id").and_then(Value::as_i64).is_some() {
+                    self.targeted_message_searches += searches;
+                }
+                self.message_results += count_message_results(result);
+                self.personal_statement_searches += personal_statement_query_count(arguments);
+            }
+            "chat.get_recent_messages" => {
+                self.message_results += json_array_len(result);
+            }
+            "chat.get_message" | "chat.get_message_context" | "chat.get_reply_thread" => {
+                self.context_reads += 1;
+                self.message_results += json_array_len(result);
+                if let Some(message_id) = arguments
+                    .get("message_id")
+                    .and_then(Value::as_i64)
+                    .and_then(|id| i32::try_from(id).ok())
+                {
+                    self.context_message_ids.insert(message_id);
+                }
+            }
+            "chat.get_user_interactions" => {
+                self.context_reads += 1;
+                self.message_results += json_array_len(result);
+                self.context_message_ids.extend(message_ids_in_json(result));
+            }
+            _ => {}
+        }
+    }
+
+    fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
+        if self.personal_fact_required && self.personal_statement_searches == 0 {
+            return Some(
+                "SYSTEM: вопрос относится к личному факту, но прямые высказывания от первого лица ещё не проверены. Следующим действием вызови chat.search_messages_batch с нужным user_id и ТОЧНО отдельными queries [\"у меня\", \"мой\", \"сижу на\", \"пользуюсь\", \"купил\", \"заказал себе\"].".to_string(),
+            );
+        }
+        if self.targeted_message_searches == 1 {
+            return Some(
+                "SYSTEM: для вывода о сообщениях конкретного участника одного запроса недостаточно. Следующим действием сделай другой тематический запрос с тем же user_id или используй chat.search_messages_batch для нескольких независимых формулировок.".to_string(),
+            );
+        }
+        if self.message_searches == 1 && answer_claims_insufficient_data(markdown) {
+            return Some(
+                "SYSTEM: нельзя делать отрицательный вывод после одного поискового запроса. Следующим действием попробуй ещё одну осмысленную формулировку или другой match_mode.".to_string(),
+            );
+        }
+        if let Some(message_id) = cited_message_ids(markdown)
+            .into_iter()
+            .find(|message_id| !self.context_message_ids.contains(message_id))
+        {
+            return Some(format!(
+                "SYSTEM: финальный ответ ссылается на сообщение {message_id}, но его контекст ещё не проверен. Следующим действием вызови chat.get_message_context для message_id={message_id}."
+            ));
+        }
+        if self.personal_fact_required && overconfident_personal_inference(markdown) {
+            return Some(
+                "SYSTEM: формулировка о текущем личном факте слишком уверенная: заказ, покупка, план или шутка не доказывают текущее состояние. Перепиши final без «должен быть» и явно отдели подтверждённые события от неизвестного текущего состояния.".to_string(),
+            );
+        }
+        if self.targeted_message_searches >= 2
+            && self.message_results > 0
+            && self.context_reads == 0
+        {
+            return Some(
+                "SYSTEM: перед финальным выводом следующим действием обязательно вызови chat.get_message_context или chat.get_reply_thread для лучшего найденного сообщения.".to_string(),
+            );
+        }
+        None
+    }
+}
+
+fn message_ids_in_json(value: &str) -> Vec<i32> {
+    let Ok(value) = serde_json::from_str::<Value>(value) else {
+        return Vec::new();
+    };
+    let mut evidence = Evidence::default();
+    collect_message_evidence_value(&value, &mut evidence);
+    evidence.message_ids
+}
+
+fn cited_message_ids(markdown: &str) -> Vec<i32> {
+    let mut ids = Vec::new();
+    let mut remainder = markdown;
+    while let Some(start) = remainder.find("https://t.me/c/") {
+        remainder = &remainder[start + "https://t.me/c/".len()..];
+        let Some(slash) = remainder.find('/') else {
+            break;
+        };
+        remainder = &remainder[slash + 1..];
+        let digits = remainder
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if let Ok(id) = digits.parse::<i32>() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+fn personal_statement_query_count(arguments: &Value) -> usize {
+    let queries = arguments
+        .get("queries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            arguments
+                .get("query")
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        });
+    const MARKERS: &[&str] = &[
+        "у меня",
+        "мой",
+        "моя",
+        "сижу на",
+        "пользуюсь",
+        "купил",
+        "заказал себе",
+    ];
+    queries
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|query| query.trim().to_lowercase())
+        .filter(|query| MARKERS.contains(&query.as_str()))
+        .count()
+}
+
+fn asks_personal_fact(question: &str) -> bool {
+    let question = format!(" {} ", question.to_lowercase());
+    [
+        " у него ",
+        " у неё ",
+        " у нее ",
+        " его ",
+        " её ",
+        " ее ",
+        " пользуется ",
+        " использует ",
+        " владеет ",
+        " живёт ",
+        " живет ",
+        " работает ",
+        " любит ",
+    ]
+    .iter()
+    .any(|marker| question.contains(marker))
+        || (question.contains(" какой ") || question.contains(" какая "))
+            && question.contains(" у ")
+}
+
+fn overconfident_personal_inference(markdown: &str) -> bool {
+    let markdown = markdown.to_lowercase();
+    ["должен быть", "значит, сейчас", "следовательно, сейчас"]
+        .iter()
+        .any(|marker| markdown.contains(marker))
+}
+
+fn json_array_len(value: &str) -> usize {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|value| value.as_array().map(Vec::len))
+        .unwrap_or(0)
+}
+
+fn count_message_results(value: &str) -> usize {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .map(|value| count_message_results_value(&value))
+        .unwrap_or(0)
+}
+
+fn count_message_results_value(value: &Value) -> usize {
+    let own = usize::from(value.get("message_id").and_then(Value::as_i64).is_some());
+    own + match value {
+        Value::Array(items) => items.iter().map(count_message_results_value).sum(),
+        Value::Object(object) => object.values().map(count_message_results_value).sum(),
+        _ => 0,
+    }
+}
+
+fn answer_claims_insufficient_data(markdown: &str) -> bool {
+    let markdown = markdown.to_lowercase();
+    [
+        "не найден",
+        "нет сообщен",
+        "информации нет",
+        "нет информации",
+        "информация отсутствует",
+        "данных недостаточно",
+        "невозможно определить",
+        "не удалось найти",
+        "отсутствует",
+    ]
+    .iter()
+    .any(|marker| markdown.contains(marker))
 }
 
 fn push_observation(observations: &mut Vec<String>, observation: String) {
@@ -534,7 +894,6 @@ mod tests {
         assert!(prompt.contains("UNTRUSTED"));
         assert!(prompt.contains("chat.get_recent_messages"));
         assert!(!SYSTEM_PROMPT.contains("5700x3d"));
-        assert!(!SYSTEM_PROMPT.contains("заказал себе"));
     }
 
     #[test]
@@ -548,6 +907,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tool_action.kind, ActionKind::Tool);
+        let multiline =
+            parse_agent_action("{\"kind\":\"final\",\"markdown\":\"строка 1\n\nстрока 2\"}")
+                .unwrap();
+        assert_eq!(multiline.markdown.as_deref(), Some("строка 1\n\nстрока 2"));
+        let plain = parse_agent_action("**Короткий ответ:** готово").unwrap();
+        assert_eq!(plain.kind, ActionKind::Final);
+        assert_eq!(
+            plain.markdown.as_deref(),
+            Some("**Короткий ответ:** готово")
+        );
     }
 
     #[test]
@@ -587,6 +956,80 @@ mod tests {
                 .sum::<usize>()
                 <= 48_000
         );
+    }
+
+    #[test]
+    fn research_policy_retries_early_negative_answers_and_reads_context() {
+        let mut research = ResearchState::default();
+        research.record(
+            "chat.search_messages",
+            &json!({"user_id": 42, "query": "тема"}),
+            r#"[{"message_id":1}]"#,
+        );
+        assert!(
+            research
+                .follow_up_instruction("Информация не найдена")
+                .unwrap()
+                .contains("конкретного участника")
+        );
+        research.record(
+            "chat.search_messages",
+            &json!({"user_id": 42, "query": "другая формулировка"}),
+            "[]",
+        );
+        assert!(
+            research
+                .follow_up_instruction("Предварительный ответ")
+                .unwrap()
+                .contains("get_message_context")
+        );
+        research.record(
+            "chat.get_message_context",
+            &json!({"message_id": 1}),
+            r#"[{"message_id":1}]"#,
+        );
+        assert!(research.follow_up_instruction("Итог").is_none());
+    }
+
+    #[test]
+    fn detects_generic_personal_fact_intent_and_separate_statement_queries() {
+        assert!(asks_personal_fact("какой процессор у Парти"));
+        assert!(asks_personal_fact("чем он пользуется"));
+        assert!(!asks_personal_fact("объясни разницу TCP и UDP"));
+        assert_eq!(
+            personal_statement_query_count(&json!({
+                "queries": ["у меня", "мой", "купил", "мой процессор"]
+            })),
+            3
+        );
+    }
+
+    #[test]
+    fn requires_context_for_every_cited_chat_message() {
+        assert_eq!(
+            cited_message_ids(
+                "[первое](https://t.me/c/1932061163/330631) и [второе](https://t.me/c/1932061163/378272)"
+            ),
+            vec![330631, 378272]
+        );
+        let mut research = ResearchState::default();
+        research.context_message_ids.insert(378272);
+        assert!(
+            research
+                .follow_up_instruction("[источник](https://t.me/c/1932061163/330631)")
+                .unwrap()
+                .contains("330631")
+        );
+    }
+
+    #[test]
+    fn rejects_overconfident_current_state_from_indirect_events() {
+        assert!(overconfident_personal_inference(
+            "После заказа у него должен быть новый процессор"
+        ));
+        assert!(!overconfident_personal_inference(
+            "Он написал, что заказал процессор; текущее состояние неизвестно"
+        ));
     }
 
     #[tokio::test]

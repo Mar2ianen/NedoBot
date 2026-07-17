@@ -12,6 +12,7 @@ use crate::features::ask::chat_search::{
 };
 
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
+const TOOL_SEARCH_MESSAGES_BATCH: &str = "chat.search_messages_batch";
 const TOOL_RECENT_MESSAGES: &str = "chat.get_recent_messages";
 const TOOL_GET_MESSAGE: &str = "chat.get_message";
 const TOOL_MESSAGE_CONTEXT: &str = "chat.get_message_context";
@@ -65,6 +66,28 @@ struct RecentArguments {
     sort: Option<MessageSort>,
     #[serde(default)]
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct BatchSearchArguments {
+    queries: Vec<String>,
+    user_id: Option<i64>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    has_links: Option<bool>,
+    has_media: Option<bool>,
+    #[serde(default)]
+    match_mode: Option<MessageMatch>,
+    #[serde(default)]
+    sort: Option<MessageSort>,
+    #[serde(default)]
+    limit_per_query: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct BatchSearchResult {
+    query: String,
+    messages: Value,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +250,45 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             .await
             .map_err(|_| ())?;
             tool_text_result(&messages)
+        }
+        TOOL_SEARCH_MESSAGES_BATCH => {
+            let arguments: BatchSearchArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            if arguments.queries.is_empty() {
+                return Err(());
+            }
+            let date_from = parse_timestamp(arguments.date_from)?;
+            let date_to = parse_timestamp(arguments.date_to)?;
+            let queries = arguments.queries.into_iter().take(6).collect::<Vec<_>>();
+            let mut results = Vec::with_capacity(queries.len());
+            for query in queries {
+                let messages = search_messages(
+                    pool,
+                    &MessageSearchRequest {
+                        chat_id,
+                        query: query.clone(),
+                        user_id: arguments.user_id,
+                        date_from,
+                        date_to,
+                        reply_to_message_id: None,
+                        has_links: arguments.has_links,
+                        has_media: arguments.has_media,
+                        match_mode: arguments
+                            .match_mode
+                            .clone()
+                            .unwrap_or(MessageMatch::FullText),
+                        sort: arguments.sort.clone().unwrap_or(MessageSort::Relevance),
+                        limit: arguments.limit_per_query.unwrap_or(5).clamp(1, 5),
+                    },
+                )
+                .await
+                .map_err(|_| ())?;
+                results.push(BatchSearchResult {
+                    query,
+                    messages: serde_json::to_value(messages).map_err(|_| ())?,
+                });
+            }
+            tool_text_result(&results)
         }
         TOOL_RECENT_MESSAGES => {
             let arguments: RecentArguments =
@@ -464,6 +526,7 @@ fn initialize_result() -> Value {
 fn tools_list_result() -> Value {
     json!({"tools": [
         {"name": TOOL_SEARCH_MESSAGES, "description": "Ищет сообщения только в разрешённом чате. full_text ищет слова и выражения, literal — точную подстроку.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 240}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "reply_to_message_id": {"type": "integer"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "match_mode": {"type": "string", "enum": ["full_text", "literal"]}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
+        {"name": TOOL_SEARCH_MESSAGES_BATCH, "description": "Выполняет 1–6 независимых поисковых запросов с общими фильтрами. Используй для синонимов и разных формулировок вместо склеивания всех слов в один AND-запрос.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["queries"], "properties": {"queries": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "maxLength": 240}}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "match_mode": {"type": "string", "enum": ["full_text", "literal"]}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit_per_query": {"type": "integer", "minimum": 1, "maximum": 5}}}},
         {"name": TOOL_RECENT_MESSAGES, "description": "Возвращает последние или первые сообщения чата без поискового запроса, с фильтрами по автору и времени.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "sort": {"type": "string", "enum": ["newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
         {"name": TOOL_GET_MESSAGE, "description": "Возвращает одно сообщение по ID в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}},
         {"name": TOOL_MESSAGE_CONTEXT, "description": "Возвращает ограниченный контекст вокруг найденного сообщения.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}, "before": {"type": "integer", "minimum": 0, "maximum": 5}, "after": {"type": "integer", "minimum": 0, "maximum": 5}}}}
@@ -528,6 +591,7 @@ mod tests {
             names,
             vec![
                 TOOL_SEARCH_MESSAGES,
+                TOOL_SEARCH_MESSAGES_BATCH,
                 TOOL_RECENT_MESSAGES,
                 TOOL_GET_MESSAGE,
                 TOOL_MESSAGE_CONTEXT,
