@@ -216,7 +216,7 @@ impl Config {
             ask_llm_model: env_optional("ASK_LLM_MODEL").or_else(|| env_optional("LLM_MODEL")),
             ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2),
             ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800),
-            ask_max_steps: env_usize("ASK_MAX_STEPS", 5),
+            ask_max_steps: env_usize("ASK_MAX_STEPS", 7),
             ask_timeout_sec: env_u64("ASK_TIMEOUT_SEC", 45),
             ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1),
             ask_db_mcp_command: env_optional("ASK_DB_MCP_COMMAND"),
