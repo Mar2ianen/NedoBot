@@ -240,6 +240,55 @@ pub async fn reply_thread(
         .collect())
 }
 
+pub async fn user_interactions(
+    pool: &PgPool,
+    chat_id: i64,
+    first_user_id: i64,
+    second_user_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<ChatMessage>> {
+    let rows = sqlx::query_as::<_, MessageRow>(
+        r#"
+        select m.message_id, m.user_id,
+               coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
+                        nullif(p.username, ''), 'Неизвестный пользователь') as author,
+               nullif(p.username, '') as author_username,
+               coalesce(m.text, '[медиа без текста]') as text,
+               m.reply_to_message_id, m.created_at, 0::real as relevance
+        from telegram_messages m
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        where m.chat_id = $1
+          and m.deleted_by_bot_at is null
+          and m.spam_marked_at is null
+          and ((m.user_id = $2 and m.reply_to_user_id = $3)
+            or (m.user_id = $3 and m.reply_to_user_id = $2))
+        order by m.created_at desc, m.message_id desc
+        limit $4
+        "#,
+    )
+    .bind(chat_id)
+    .bind(first_user_id)
+    .bind(second_user_id)
+    .bind(limit.clamp(1, MAX_RESULT_LIMIT))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ChatMessage {
+            source_id: source_id(row.message_id),
+            message_url: message_url(chat_id, row.message_id),
+            relevance: 0,
+            message_id: row.message_id,
+            user_id: row.user_id,
+            author: row.author,
+            author_url: author_url(row.author_username.as_deref()),
+            text: first_chars(&row.text, 700),
+            reply_to_message_id: row.reply_to_message_id,
+            created_at: row.created_at.to_rfc3339(),
+        })
+        .collect())
+}
+
 pub fn source_id(message_id: i32) -> String {
     format!("chat:{message_id}")
 }
