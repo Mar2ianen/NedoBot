@@ -1293,6 +1293,10 @@ nullable = true
 pg_type = "jsonb"
 nullable = true
 
+[tables.telegram_new_user_profile_audits.columns.risk_signal_breakdown]
+pg_type = "jsonb"
+nullable = true
+
 [tables.telegram_new_user_profile_audits.columns.risk_score]
 pg_type = "integer"
 nullable = true

@@ -44,6 +44,7 @@ struct NewUserFeatures {
     last_message_text: Option<String>,
     recent_message_texts: Vec<String>,
     text_texture: TextTexture,
+    message_style: MessageStyle,
     id_rank_ratio: Option<f64>,
     username: Option<String>,
     first_name: Option<String>,
@@ -93,6 +94,15 @@ struct TextTexture {
     repetitive_pattern: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MessageStyle {
+    text_message_count: i64,
+    single_exclamation_ending_count: i64,
+    period_ending_count: i64,
+    emoji_message_count: i64,
+    emoji_ending_count: i64,
+}
+
 #[derive(Debug, Clone)]
 struct RiskAnalysis {
     score: i32,
@@ -101,6 +111,26 @@ struct RiskAnalysis {
     class_scores: Value,
     labels: Vec<String>,
     reasons: Vec<String>,
+    signals: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WarningStrength {
+    Weak,
+    Supporting,
+    Strong,
+    Mitigating,
+}
+
+impl WarningStrength {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Weak => "weak",
+            Self::Supporting => "supporting",
+            Self::Strong => "strong",
+            Self::Mitigating => "mitigating",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -140,9 +170,20 @@ impl SpamClass {
 #[derive(Debug, Clone, Copy)]
 struct RiskSignal {
     class: SpamClass,
-    points: i32,
+    coefficient: i32,
     label: &'static str,
     reason: &'static str,
+}
+
+impl RiskSignal {
+    fn warning_strength(self) -> WarningStrength {
+        match self.coefficient {
+            ..=-1 => WarningStrength::Mitigating,
+            0..=4 => WarningStrength::Weak,
+            5..=14 => WarningStrength::Supporting,
+            _ => WarningStrength::Strong,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -151,14 +192,22 @@ struct RiskAccumulator {
     class_scores: std::collections::BTreeMap<SpamClass, i32>,
     labels: Vec<String>,
     reasons: Vec<String>,
+    signals: Vec<Value>,
 }
 
 impl RiskAccumulator {
     fn add(&mut self, signal: RiskSignal) {
-        self.score += signal.points;
-        *self.class_scores.entry(signal.class).or_default() += signal.points;
+        self.score += signal.coefficient;
+        *self.class_scores.entry(signal.class).or_default() += signal.coefficient;
         self.labels.push(signal.label.to_string());
         self.reasons.push(signal.reason.to_string());
+        self.signals.push(json!({
+            "class": signal.class.as_str(),
+            "label": signal.label,
+            "warning_strength": signal.warning_strength().as_str(),
+            "coefficient": signal.coefficient,
+            "reason": signal.reason,
+        }));
     }
 
     fn add_optional(&mut self, signal: Option<RiskSignal>) {
@@ -197,6 +246,7 @@ impl RiskAccumulator {
             class_scores: Value::Object(class_scores),
             labels: self.labels,
             reasons: self.reasons,
+            signals: Value::Array(self.signals),
         }
     }
 }
@@ -229,6 +279,14 @@ pub async fn analyze_new_user_profile_with_config(
     // но не накидываем профильные штрафы за нормальное накопленное поведение.
     let is_old_active_user = features.message_count >= config.old_user_message_threshold;
     let risk = analyze_risk(&features, &config, is_old_active_user);
+    tracing::info!(
+        chat_id,
+        telegram_user_id,
+        risk_score = risk.score,
+        risk_level = %risk.level,
+        risk_signals = %risk.signals,
+        "new user spam risk analyzed"
+    );
     save_audit(pool, &features, &risk, &config).await
 }
 
@@ -421,6 +479,7 @@ async fn load_features(
 
     Ok(row.map(|row| {
         let recent_message_texts = row.get::<Vec<String>, _>("recent_message_texts");
+        let message_style = message_style(&recent_message_texts);
         let max_pairwise_similarity = max_pairwise_message_similarity(&recent_message_texts);
         let max_reuse_count = row.get("max_normalized_message_reuse_count");
         let duplicate_normalized_message_count = row.get("duplicate_normalized_message_count");
@@ -467,6 +526,7 @@ async fn load_features(
                 avg_message_len: row.get("avg_message_len"),
                 repetitive_pattern,
             },
+            message_style,
             id_rank_ratio: row.get("id_rank_ratio"),
             username: row.get("username"),
             first_name: row.get("first_name"),
@@ -527,6 +587,7 @@ fn old_active_user_risk() -> RiskAnalysis {
         reasons: vec![
             "Existing active chat participant; profile audit kept for baseline only.".to_string(),
         ],
+        signals: json!([]),
     }
 }
 
@@ -547,6 +608,10 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(feminine_name_signal(features));
     risk.add_optional(message_texture_signal(features));
     risk.add_optional(chat_position_signal(features));
+    for signal in generic_feminine_message_style_signals(features) {
+        risk.add(signal);
+    }
+    risk.add_optional(reply_to_comment_mitigation_signal(features));
     risk.add_optional(chat_age_signal(features));
 
     for signal in personal_channel_signals(features) {
@@ -562,13 +627,13 @@ fn message_count_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match (features.message_count, features.message_count_24h) {
         (count, _) if count <= 1 => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 12,
+            coefficient: 12,
             label: "single_message_account",
             reason: "Only one observed chat message",
         }),
         (2..=3, count_24h) if count_24h >= features.message_count => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 10,
+            coefficient: 10,
             label: "short_burst_account",
             reason: "Few messages concentrated in a short window",
         }),
@@ -580,7 +645,7 @@ fn link_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match features.link_count > 0 || features.link_count_24h > 0 {
         true => Some(RiskSignal {
             class: SpamClass::LinkDropper,
-            points: 18,
+            coefficient: 18,
             label: "chat_message_has_link",
             reason: "New user posted a link",
         }),
@@ -597,13 +662,13 @@ fn foreign_invite_link_signal(features: &NewUserFeatures) -> Option<RiskSignal> 
     ) {
         (true, true, count) if count <= 5 => Some(RiskSignal {
             class: SpamClass::ForeignInviteLink,
-            points: 55,
+            coefficient: 55,
             label: "foreign_invite_link_message",
             reason: "New user posted a Telegram invite link with foreign/CJK text",
         }),
         (true, false, count) if count <= 3 => Some(RiskSignal {
             class: SpamClass::ForeignInviteLink,
-            points: 32,
+            coefficient: 32,
             label: "invite_link_from_new_user",
             reason: "Very new user posted a Telegram invite link",
         }),
@@ -621,7 +686,7 @@ fn recent_id_signal(
     {
         true => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 15,
+            coefficient: 15,
             label: "recent_high_telegram_id",
             reason: "Telegram user id is in the recent high-id range observed by the bot",
         }),
@@ -633,13 +698,13 @@ fn username_signal(stats: &UsernameStats) -> Option<RiskSignal> {
     match (stats.has_random_suffix, stats.has_digits, stats.digit_count) {
         (true, _, _) => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 12,
+            coefficient: 12,
             label: "username_random_suffix",
             reason: "Username has a bot-like/random suffix pattern",
         }),
         (false, true, 3..) => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 5,
+            coefficient: 5,
             label: "username_many_digits",
             reason: "Username contains many digits",
         }),
@@ -655,14 +720,14 @@ fn display_name_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     ) {
         (spammer_count, _, _) if spammer_count > 0 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 22,
+            coefficient: 22,
             label: "display_name_reused_by_spammers",
             reason: "Display name has already appeared on manually marked spammers",
         }),
         (0, reuse_count, message_count) if reuse_count > 0 && message_count <= 3 => {
             Some(RiskSignal {
                 class: SpamClass::LlmProfileBait,
-                points: 10,
+                coefficient: 10,
                 label: "display_name_reused_by_new_accounts",
                 reason: "Display name is reused by other seen accounts",
             })
@@ -675,7 +740,7 @@ fn profile_photo_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match has_profile_photo(features) {
         false => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 6,
+            coefficient: 6,
             label: "missing_profile_photo",
             reason: "No visible profile photo via Bot API",
         }),
@@ -690,7 +755,7 @@ fn feminine_name_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     ) {
         (true, count) if count <= 5 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 16,
+            coefficient: 16,
             label: "atypical_feminine_first_name",
             reason: "New user profile has a feminine first-name pattern atypical for this chat baseline",
         }),
@@ -707,19 +772,19 @@ fn message_texture_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     ) {
         (reuse_count, _, _, _) if reuse_count > 1 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 28,
+            coefficient: 28,
             label: "duplicate_message_text",
             reason: "New user posted exactly repeated normalized messages",
         }),
         (_, duplicate_count, _, _) if duplicate_count > 0 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 22,
+            coefficient: 22,
             label: "duplicate_message_texture",
             reason: "New user has duplicate normalized message texture",
         }),
         (_, _, Some(similarity), count) if similarity >= 0.86 && count >= 2 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 16,
+            coefficient: 16,
             label: "similar_message_texture",
             reason: "Several new-user messages are unusually similar by text texture",
         }),
@@ -738,7 +803,7 @@ fn chat_position_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         (count, _, channel_comments, 0, 0) if count > 0 && channel_comments == count => {
             Some(RiskSignal {
                 class: SpamClass::LlmProfileBait,
-                points: 12,
+                coefficient: 12,
                 label: "only_channel_post_comments",
                 reason: "New user only comments under channel posts",
             })
@@ -748,14 +813,14 @@ fn chat_position_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         {
             Some(RiskSignal {
                 class: SpamClass::LlmProfileBait,
-                points: 9,
+                coefficient: 9,
                 label: "only_replies_or_comments",
                 reason: "New user appears only in comment/reply contexts, not as normal chat participant",
             })
         }
         (_, _, _, bot_replies, _) if bot_replies > 0 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 5,
+            coefficient: 5,
             label: "reply_to_bot_comment",
             reason: "New user replied to a bot first-comment thread",
         }),
@@ -763,17 +828,79 @@ fn chat_position_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     }
 }
 
+fn generic_feminine_message_style_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
+    if !looks_like_feminine_first_name(features.first_name.as_deref()) || features.message_count > 5
+    {
+        return Vec::new();
+    }
+
+    let style = &features.message_style;
+    let mut signals = Vec::new();
+
+    if style.single_exclamation_ending_count > 0 {
+        signals.push(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 3,
+            label: "generic_feminine_single_exclamation_ending",
+            reason: "Generic-feminine persona message ends with exactly one exclamation mark",
+        });
+    }
+    if features.reply_to_channel_post_count > 0 && features.reply_to_comment_count == 0 {
+        signals.push(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 6,
+            label: "generic_feminine_reply_to_channel_post",
+            reason: "Generic-feminine persona replies directly to a channel post, not another comment",
+        });
+    }
+    if style.emoji_message_count > 0 {
+        signals.push(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 2,
+            label: "generic_feminine_message_has_emoji",
+            reason: "Generic-feminine persona uses emoji in a new-user message",
+        });
+    }
+    if style.emoji_ending_count > 0 {
+        signals.push(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 3,
+            label: "generic_feminine_message_ends_with_emoji",
+            reason: "Generic-feminine persona message ends with emoji",
+        });
+    }
+    if style.period_ending_count > 0 {
+        signals.push(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 1,
+            label: "generic_feminine_single_period_ending",
+            reason: "Generic-feminine persona message ends with exactly one period",
+        });
+    }
+
+    signals
+}
+
+fn reply_to_comment_mitigation_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
+    (features.reply_to_comment_count > 0).then_some(RiskSignal {
+        class: SpamClass::LlmProfileBait,
+        coefficient: -18,
+        label: "reply_to_comment_reduces_generic_spam_risk",
+        reason: "Replying to an existing comment is strong evidence of genuine chat participation",
+    })
+}
+
 fn chat_age_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match (features.chat_age_sec, features.message_count) {
         (Some(age), count) if age < 6 * 60 * 60 && count <= 5 => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 8,
+            coefficient: 8,
             label: "very_new_to_chat",
             reason: "User was first seen in this chat less than six hours ago",
         }),
         (Some(age), count) if age < 24 * 60 * 60 && count <= 5 => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 4,
+            coefficient: 4,
             label: "new_to_chat_today",
             reason: "User was first seen in this chat less than a day ago",
         }),
@@ -813,14 +940,14 @@ fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     if let Some(channel_id) = features.personal_channel_chat_id {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            points: 12,
+            coefficient: 12,
             label: "personal_channel_attached",
             reason: "User has an attached personal channel",
         });
         if channel_id.abs() > 4_000_000_000_000 {
             signals.push(RiskSignal {
                 class: SpamClass::FreshAccount,
-                points: 6,
+                coefficient: 6,
                 label: "recent_personal_channel_id",
                 reason: "Attached personal channel id is in a very high range",
             });
@@ -830,7 +957,7 @@ fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     if features.personal_channel_has_adult_links {
         signals.push(RiskSignal {
             class: SpamClass::AdultPersonalChannel,
-            points: 55,
+            coefficient: 55,
             label: "personal_channel_adult_links",
             reason: "Attached personal channel contains adult/invite promo links",
         });
@@ -839,7 +966,7 @@ fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     if personal_channel_has_invite_link(features) {
         signals.push(RiskSignal {
             class: SpamClass::LinkDropper,
-            points: 20,
+            coefficient: 20,
             label: "personal_channel_invite_link",
             reason: "Attached personal channel contains Telegram invite links",
         });
@@ -848,7 +975,7 @@ fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     if personal_channel_has_external_link(features) {
         signals.push(RiskSignal {
             class: SpamClass::LinkDropper,
-            points: 8,
+            coefficient: 8,
             label: "personal_channel_external_link",
             reason: "Attached personal channel contains an external link",
         });
@@ -864,7 +991,7 @@ fn short_bio_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     ) {
         (Some(0..=4), count) if count <= 3 => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 4,
+            coefficient: 4,
             label: "very_short_bio",
             reason: "Very short bio on a new account",
         }),
@@ -876,7 +1003,7 @@ fn member_status_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match features.member_status.as_deref() {
         Some("left" | "banned") => Some(RiskSignal {
             class: SpamClass::FreshAccount,
-            points: 6,
+            coefficient: 6,
             label: "not_present_in_chat",
             reason: "Latest member snapshot says user is no longer present",
         }),
@@ -976,6 +1103,7 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "risk_class_scores",
         "risk_labels",
         "risk_reasons",
+        "risk_signal_breakdown",
         "raw_features",
     ]
 }
@@ -1030,6 +1158,13 @@ async fn save_audit(
             "max_normalized_message_reuse_count": features.text_texture.max_reuse_count,
             "max_pairwise_message_similarity": features.text_texture.max_pairwise_similarity,
             "repetitive_message_pattern": features.text_texture.repetitive_pattern,
+        },
+        "message_style": {
+            "text_message_count": features.message_style.text_message_count,
+            "single_exclamation_ending_count": features.message_style.single_exclamation_ending_count,
+            "period_ending_count": features.message_style.period_ending_count,
+            "emoji_message_count": features.message_style.emoji_message_count,
+            "emoji_ending_count": features.message_style.emoji_ending_count,
         },
     });
 
@@ -1142,6 +1277,7 @@ async fn save_audit(
         values.push_bind(&risk.class_scores);
         values.push_bind(json!(risk.labels));
         values.push_bind(json!(risk.reasons));
+        values.push_bind(&risk.signals);
         values.push_bind(raw_features);
     }
 
@@ -1316,6 +1452,7 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
             | "ирина"
             | "карина"
             | "кира"
+            | "кора"
             | "ксения"
             | "лана"
             | "лариса"
@@ -1330,6 +1467,7 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
             | "надежда"
             | "наталья"
             | "ника"
+            | "нино"
             | "нина"
             | "оксана"
             | "ольга"
@@ -1366,6 +1504,54 @@ fn user_message_text_blob(features: &NewUserFeatures) -> String {
     parts.extend(features.last_message_text.iter().map(String::as_str));
     parts.extend(features.recent_message_texts.iter().map(String::as_str));
     parts.join("\n")
+}
+
+fn message_style(texts: &[String]) -> MessageStyle {
+    texts
+        .iter()
+        .fold(MessageStyle::default(), |mut style, text| {
+            let text = text.trim_end();
+            if text.is_empty() {
+                return style;
+            }
+
+            style.text_message_count += 1;
+            if trailing_char_count(text, '!') == 1 {
+                style.single_exclamation_ending_count += 1;
+            }
+            if trailing_char_count(text, '.') == 1 {
+                style.period_ending_count += 1;
+            }
+            if text.chars().any(is_emoji) {
+                style.emoji_message_count += 1;
+            }
+            if ends_with_emoji(text) {
+                style.emoji_ending_count += 1;
+            }
+            style
+        })
+}
+
+fn trailing_char_count(text: &str, expected: char) -> usize {
+    text.chars().rev().take_while(|ch| *ch == expected).count()
+}
+
+fn ends_with_emoji(text: &str) -> bool {
+    let mut chars = text.trim_end().chars().rev();
+    let Some(last) = chars.next() else {
+        return false;
+    };
+    if is_emoji(last) {
+        return true;
+    }
+    matches!(last as u32, 0xFE0F | 0x1F3FB..=0x1F3FF) && chars.next().is_some_and(is_emoji)
+}
+
+fn is_emoji(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2300..=0x23FF | 0x2B00..=0x2BFF
+    )
 }
 
 fn contains_cjk(text: &str) -> bool {
@@ -1554,7 +1740,9 @@ mod tests {
     fn feminine_name_pattern_detects_known_feminine_names_conservatively() {
         assert!(looks_like_feminine_first_name(Some("Мария")));
         assert!(looks_like_feminine_first_name(Some("Анна")));
+        assert!(looks_like_feminine_first_name(Some("Нино ❤️")));
         assert!(looks_like_feminine_first_name(Some("Лана 💻")));
+        assert!(looks_like_feminine_first_name(Some("Кора 🌊")));
         assert!(looks_like_feminine_first_name(Some("Alice")));
         assert!(looks_like_feminine_first_name(Some("Mary Johnson")));
         assert!(looks_like_feminine_first_name(Some("Sophia")));
@@ -1584,6 +1772,45 @@ mod tests {
             "и кто теперь будет подбирать пин на восьмой попытке.".to_string(),
         ];
         assert!(max_pairwise_message_similarity(&texts).is_some_and(|score| score < 0.86));
+    }
+
+    #[test]
+    fn message_style_keeps_weak_punctuation_and_emoji_signals_separate() {
+        let style = message_style(&[
+            "Спасибо!".to_string(),
+            "Очень интересно!!".to_string(),
+            "Классно 🌊".to_string(),
+            "Обычное предложение.".to_string(),
+        ]);
+
+        assert_eq!(style.text_message_count, 4);
+        assert_eq!(style.single_exclamation_ending_count, 1);
+        assert_eq!(style.period_ending_count, 1);
+        assert_eq!(style.emoji_message_count, 1);
+        assert_eq!(style.emoji_ending_count, 1);
+    }
+
+    #[test]
+    fn risk_signals_record_warning_strength_and_coefficient() {
+        let mut risk = RiskAccumulator::default();
+        risk.add(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 3,
+            label: "weak_style_signal",
+            reason: "test",
+        });
+        risk.add(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: -18,
+            label: "genuine_reply",
+            reason: "test",
+        });
+        let signals = risk.finish().signals;
+
+        assert_eq!(signals[0]["warning_strength"], "weak");
+        assert_eq!(signals[0]["coefficient"], 3);
+        assert_eq!(signals[1]["warning_strength"], "mitigating");
+        assert_eq!(signals[1]["coefficient"], -18);
     }
 
     #[test]
