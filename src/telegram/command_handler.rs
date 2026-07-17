@@ -298,6 +298,7 @@ async fn handle_ask_command(
         config,
         &state.pool,
         user.id.0 as i64,
+        &requester_identity(user),
         question,
         reply_context.as_deref(),
         reply_image.as_deref(),
@@ -328,6 +329,20 @@ async fn handle_ask_command(
                 .map(|_| ())
         }
     }
+}
+
+fn requester_identity(user: &teloxide::types::User) -> String {
+    let mut identity = user.first_name.clone();
+    if let Some(last_name) = user.last_name.as_deref().filter(|value| !value.is_empty()) {
+        identity.push(' ');
+        identity.push_str(last_name);
+    }
+    if let Some(username) = user.username.as_deref().filter(|value| !value.is_empty()) {
+        identity.push_str(" (@");
+        identity.push_str(username);
+        identity.push(')');
+    }
+    identity.chars().take(120).collect()
 }
 
 fn ask_failure_message(error: &anyhow::Error) -> &'static str {

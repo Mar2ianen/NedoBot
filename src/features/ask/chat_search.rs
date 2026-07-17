@@ -69,6 +69,12 @@ pub struct ChatMessage {
     pub message_url: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ChatInteraction {
+    pub message: ChatMessage,
+    pub replied_to: Option<ChatMessage>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RecentMessagesRequest {
     pub chat_id: i64,
@@ -112,6 +118,23 @@ struct MessageRow {
     reply_to_message_id: Option<i32>,
     created_at: DateTime<Utc>,
     relevance: f32,
+}
+
+#[derive(FromRow)]
+struct InteractionRow {
+    message_id: i32,
+    user_id: Option<i64>,
+    author: String,
+    author_username: Option<String>,
+    text: String,
+    reply_to_message_id: Option<i32>,
+    created_at: DateTime<Utc>,
+    replied_to_message_id: Option<i32>,
+    replied_to_user_id: Option<i64>,
+    replied_to_author: Option<String>,
+    replied_to_username: Option<String>,
+    replied_to_text: Option<String>,
+    replied_to_created_at: Option<DateTime<Utc>>,
 }
 
 pub async fn search_messages(
@@ -316,17 +339,27 @@ pub async fn user_interactions(
     first_user_id: i64,
     second_user_id: i64,
     limit: i64,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let rows = sqlx::query_as::<_, MessageRow>(
+) -> anyhow::Result<Vec<ChatInteraction>> {
+    let rows = sqlx::query_as::<_, InteractionRow>(
         r#"
         select m.message_id, m.user_id,
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
                         nullif(p.username, ''), 'Неизвестный пользователь') as author,
                nullif(p.username, '') as author_username,
                coalesce(m.text, '[медиа без текста]') as text,
-               m.reply_to_message_id, m.created_at, 0::real as relevance
+               m.reply_to_message_id, m.created_at,
+               replied.message_id as replied_to_message_id,
+               replied.user_id as replied_to_user_id,
+               coalesce(nullif(concat_ws(' ', replied_profile.first_name, replied_profile.last_name), ''),
+                        nullif(replied_profile.username, ''), 'Неизвестный пользователь') as replied_to_author,
+               nullif(replied_profile.username, '') as replied_to_username,
+               coalesce(replied.text, '[медиа без текста]') as replied_to_text,
+               replied.created_at as replied_to_created_at
         from telegram_messages m
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        left join telegram_messages replied
+          on replied.chat_id = m.chat_id and replied.message_id = m.reply_to_message_id
+        left join telegram_user_profiles replied_profile on replied_profile.telegram_user_id = replied.user_id
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
@@ -342,7 +375,49 @@ pub async fn user_interactions(
     .bind(limit.clamp(1, MAX_RESULT_LIMIT))
     .fetch_all(pool)
     .await?;
-    Ok(map_rows(chat_id, rows))
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let message = ChatMessage {
+                source_id: source_id(row.message_id),
+                message_url: message_url(chat_id, row.message_id),
+                relevance: 0,
+                message_id: row.message_id,
+                user_id: row.user_id,
+                author: row.author,
+                author_url: author_url(row.author_username.as_deref()),
+                text: first_chars(&row.text, 700),
+                reply_to_message_id: row.reply_to_message_id,
+                created_at: row.created_at.to_rfc3339(),
+            };
+            let replied_to = row.replied_to_message_id.map(|message_id| ChatMessage {
+                source_id: source_id(message_id),
+                message_url: message_url(chat_id, message_id),
+                relevance: 0,
+                message_id,
+                user_id: row.replied_to_user_id,
+                author: row
+                    .replied_to_author
+                    .unwrap_or_else(|| "Неизвестный пользователь".to_string()),
+                author_url: author_url(row.replied_to_username.as_deref()),
+                text: first_chars(
+                    row.replied_to_text
+                        .as_deref()
+                        .unwrap_or("[медиа без текста]"),
+                    700,
+                ),
+                reply_to_message_id: None,
+                created_at: row
+                    .replied_to_created_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_default(),
+            });
+            ChatInteraction {
+                message,
+                replied_to,
+            }
+        })
+        .collect())
 }
 
 pub async fn user_profile(

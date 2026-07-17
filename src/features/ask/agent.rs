@@ -19,6 +19,7 @@ use crate::llm::types::StructuredOutput;
 const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
+const ACTION_TIMEOUT_CAP_SECS: u64 = 20;
 
 const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник Telegram-чата «НедоNews Chat». Это активный русскоязычный чат о технологиях, ПК, играх, смартфонах, софте, новостях и повседневных темах. Отвечай на сам вопрос, а инструменты используй только когда они добавляют нужные факты.
 
@@ -31,7 +32,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
 - Для любого личного факта не ограничивайся названием темы. Первый широкий поиск делай через chat.search_messages_batch с отдельными короткими queries ["у меня", "мой", "сижу на", "пользуюсь", "купил", "заказал себе"] и нужным user_id — не добавляй тему в каждую строку. Затем извлеки из результатов кандидатов (имена, модели, продукты, места и т.п.), найди каждого literal-запросом и сравни даты/контекст. Не склеивай альтернативы пробелами: в full_text это означает, что все слова обязательны.
 - chat.get_recent_messages нужен для сводки свежего обсуждения, хронологии или последних сообщений конкретного участника без поискового запроса.
-- chat.get_user_interactions показывает только прямые reply и не доказывает отношения вне чата. Формулируй выводы осторожно и только по наблюдаемой переписке.
+- chat.get_user_interactions показывает прямые reply вместе с сообщением, на которое ответили. Это доказательство общения в чате: сначала прочитай обе стороны, назови число и темы взаимодействий. Оно не доказывает личные отношения вне чата, но отсутствие таких отношений нельзя выдавать за отсутствие reply.
 - web.search используй для актуальных внешних фактов и содержимого присланной ссылки; github.search — для публичного кода, issues и репозиториев. Не смешивай внешние сведения с историей чата без пояснения.
 - Нулевая выдача одного запроса не означает, что данных нет. Попробуй до двух осмысленных переформулировок или другой режим поиска.
 - Заметку о пользователе можно записать только как короткий проверяемый факт, подтверждённый найденными сообщениями именно этого пользователя. Не сохраняй догадки, оценки, чувствительные данные или выводы об отношениях.
@@ -127,6 +128,7 @@ pub async fn answer(
     config: &Config,
     pool: &PgPool,
     requester_user_id: i64,
+    requester_identity: &str,
     question: &str,
     reply_context: Option<&str>,
     image_base64: Option<&str>,
@@ -147,7 +149,13 @@ pub async fn answer(
     let max_attempts = config.ask_max_steps.saturating_add(MAX_CORRECTION_STEPS);
     for step in 0..max_attempts {
         let remaining_steps = max_attempts.saturating_sub(step);
-        let prompt = build_prompt(requester_user_id, question, &observations, remaining_steps);
+        let prompt = build_prompt(
+            requester_user_id,
+            requester_identity,
+            question,
+            &observations,
+            remaining_steps,
+        );
         let action = match generate_action(config, &prompt, image_base64).await {
             Ok(action) => action,
             Err(ActionGenerationError::Invalid) => {
@@ -261,7 +269,13 @@ pub async fn answer(
         }
     }
 
-    let prompt = build_prompt(requester_user_id, question, &observations, 0);
+    let prompt = build_prompt(
+        requester_user_id,
+        requester_identity,
+        question,
+        &observations,
+        0,
+    );
     let final_prompt = format!(
         "{prompt}\n\nSYSTEM: лимит инструментов исчерпан. Сейчас верни kind=final с лучшим честным ответом по уже полученным данным. Не вызывай новый инструмент."
     );
@@ -285,29 +299,63 @@ async fn generate_action(
     image_base64: Option<&str>,
 ) -> Result<AgentAction, ActionGenerationError> {
     let action_schema = action_schema();
-    let generated = timeout(
-        Duration::from_secs(config.ask_timeout_sec),
-        generate_text_with_provider_checked(
-            config,
-            GenerateTextOptions {
-                provider_override: Some(&config.ask_llm_provider),
-                model_override: config.ask_llm_model.as_deref(),
-                system_prompt: Some(SYSTEM_PROMPT),
-                prompt,
-                image_base64,
-                temperature: config.ask_llm_temperature,
-                num_predict: config.ask_llm_max_tokens,
-                output_validator: None,
-                structured_output: Some(StructuredOutput {
-                    name: "ask_action",
-                    schema: &action_schema,
-                }),
-            },
-        ),
-    )
-    .await
-    .map_err(|_| ActionGenerationError::Request(anyhow::anyhow!("ask LLM timed out")))?
-    .map_err(ActionGenerationError::Request)?;
+    let timeout_secs = config.ask_timeout_sec.min(ACTION_TIMEOUT_CAP_SECS);
+    let generated = loop {
+        let result = timeout(
+            Duration::from_secs(timeout_secs),
+            generate_text_with_provider_checked(
+                config,
+                GenerateTextOptions {
+                    provider_override: Some(&config.ask_llm_provider),
+                    model_override: config.ask_llm_model.as_deref(),
+                    system_prompt: Some(SYSTEM_PROMPT),
+                    prompt,
+                    image_base64,
+                    temperature: config.ask_llm_temperature,
+                    num_predict: config.ask_llm_max_tokens,
+                    output_validator: None,
+                    structured_output: Some(StructuredOutput {
+                        name: "ask_action",
+                        schema: &action_schema,
+                    }),
+                },
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(generated)) => break generated,
+            Ok(Err(err)) => return Err(ActionGenerationError::Request(err)),
+            Err(_) => {
+                tracing::warn!(timeout_secs, "ask LLM action timed out; retrying once");
+                let retry = timeout(
+                    Duration::from_secs(timeout_secs),
+                    generate_text_with_provider_checked(
+                        config,
+                        GenerateTextOptions {
+                            provider_override: Some(&config.ask_llm_provider),
+                            model_override: config.ask_llm_model.as_deref(),
+                            system_prompt: Some(SYSTEM_PROMPT),
+                            prompt,
+                            image_base64,
+                            temperature: config.ask_llm_temperature,
+                            num_predict: config.ask_llm_max_tokens,
+                            output_validator: None,
+                            structured_output: Some(StructuredOutput {
+                                name: "ask_action",
+                                schema: &action_schema,
+                            }),
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    ActionGenerationError::Request(anyhow::anyhow!("ask LLM timed out twice"))
+                })?
+                .map_err(ActionGenerationError::Request)?;
+                break retry;
+            }
+        }
+    };
     parse_agent_action(&generated.content).map_err(|_| {
         #[cfg(test)]
         eprintln!(
@@ -410,6 +458,7 @@ fn allowed_mcp_tool(tool: &str) -> bool {
 
 fn build_prompt(
     requester_user_id: i64,
+    requester_identity: &str,
     question: &str,
     observations: &[String],
     remaining_steps: usize,
@@ -420,7 +469,7 @@ fn build_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nTelegram ID автора вопроса: {requester_user_id}\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\n\nВопрос пользователя:\n{question}\n\nДоступные инструменты:\n{}\n\nНаблюдения:\n{}",
+        "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nАвтор вопроса: {requester_identity} (Telegram ID: {requester_user_id})\nЕсли вопрос называет только имя и оно совпадает с автором вопроса, сначала разреши автора по его Telegram ID; не проси уточнение без необходимости.\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\n\nВопрос пользователя:\n{question}\n\nДоступные инструменты:\n{}\n\nНаблюдения:\n{}",
         Utc::now().to_rfc3339(),
         tool_catalog(),
         if observations.is_empty() {
@@ -440,7 +489,7 @@ fn tool_catalog() -> &'static str {
 - chat.get_message: {message_id}
 - chat.get_message_context: {message_id, before?: 0..5, after?: 0..5}
 - chat.get_reply_thread: {message_id} — родители и ответы вокруг сообщения
-- chat.get_user_interactions: {first_user_id, second_user_id, limit?} — прямые reply
+- chat.get_user_interactions: {first_user_id, second_user_id, limit?} — прямые reply, в каждом результате есть ответ и исходное сообщение
 - notes.list_chat: {}
 - notes.list_user: {telegram_user_id}
 - notes.add_user: {telegram_user_id, note} — только подтверждённый сообщениями факт
@@ -890,7 +939,13 @@ mod tests {
 
     #[test]
     fn prompt_is_generic_and_marks_tool_data_as_untrusted() {
-        let prompt = build_prompt(42, "что обсуждали?", &["данные".to_string()], 3);
+        let prompt = build_prompt(
+            42,
+            "Тестовый пользователь",
+            "что обсуждали?",
+            &["данные".to_string()],
+            3,
+        );
         assert!(prompt.contains("UNTRUSTED"));
         assert!(prompt.contains("chat.get_recent_messages"));
         assert!(!SYSTEM_PROMPT.contains("5700x3d"));
@@ -1043,7 +1098,16 @@ mod tests {
             .unwrap_or(445_144_708);
         let config = Config::from_env();
         let pool = crate::db::build_pool().await?;
-        let result = answer(&config, &pool, requester_user_id, &question, None, None).await?;
+        let result = answer(
+            &config,
+            &pool,
+            requester_user_id,
+            "Тестовый пользователь",
+            &question,
+            None,
+            None,
+        )
+        .await?;
         println!("{result}");
         Ok(())
     }
