@@ -229,7 +229,7 @@ async fn send_owner_preview(
     }
 }
 
-async fn download_largest_photo_base64(
+pub(crate) async fn download_largest_photo_base64(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     config: &Config,

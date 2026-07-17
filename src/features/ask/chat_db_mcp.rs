@@ -7,15 +7,18 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::features::ask::chat_search::{
-    MessageSearchRequest, MessageSort, message_context, reply_thread, search_messages,
-    user_interactions,
+    MessageMatch, MessageSearchRequest, MessageSort, RecentMessagesRequest, message_context,
+    recent_messages, reply_thread, search_messages, user_interactions, user_profile,
 };
 
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
+const TOOL_RECENT_MESSAGES: &str = "chat.get_recent_messages";
+const TOOL_GET_MESSAGE: &str = "chat.get_message";
 const TOOL_MESSAGE_CONTEXT: &str = "chat.get_message_context";
 const TOOL_REPLY_THREAD: &str = "chat.get_reply_thread";
 const TOOL_RESOLVE_USER: &str = "chat.resolve_user";
 const TOOL_USER_INTERACTIONS: &str = "chat.get_user_interactions";
+const TOOL_USER_PROFILE: &str = "chat.get_user_profile";
 const TOOL_LIST_CHAT_NOTES: &str = "notes.list_chat";
 const TOOL_LIST_USER_NOTES: &str = "notes.list_user";
 
@@ -41,6 +44,21 @@ struct SearchArguments {
     date_from: Option<String>,
     date_to: Option<String>,
     reply_to_message_id: Option<i32>,
+    has_links: Option<bool>,
+    has_media: Option<bool>,
+    #[serde(default)]
+    match_mode: Option<MessageMatch>,
+    #[serde(default)]
+    sort: Option<MessageSort>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RecentArguments {
+    user_id: Option<i64>,
+    date_from: Option<String>,
+    date_to: Option<String>,
     has_links: Option<bool>,
     has_media: Option<bool>,
     #[serde(default)]
@@ -74,6 +92,11 @@ struct UserInteractionsArguments {
     first_user_id: i64,
     second_user_id: i64,
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct UserProfileArguments {
+    telegram_user_id: i64,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -196,6 +219,7 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
                     reply_to_message_id: arguments.reply_to_message_id,
                     has_links: arguments.has_links,
                     has_media: arguments.has_media,
+                    match_mode: arguments.match_mode.unwrap_or(MessageMatch::FullText),
                     sort: arguments.sort.unwrap_or(MessageSort::Relevance),
                     limit: arguments.limit.unwrap_or(10),
                 },
@@ -203,6 +227,35 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             .await
             .map_err(|_| ())?;
             tool_text_result(&messages)
+        }
+        TOOL_RECENT_MESSAGES => {
+            let arguments: RecentArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            let messages = recent_messages(
+                pool,
+                &RecentMessagesRequest {
+                    chat_id,
+                    user_id: arguments.user_id,
+                    date_from: parse_timestamp(arguments.date_from)?,
+                    date_to: parse_timestamp(arguments.date_to)?,
+                    has_links: arguments.has_links,
+                    has_media: arguments.has_media,
+                    sort: arguments.sort.unwrap_or(MessageSort::Newest),
+                    limit: arguments.limit.unwrap_or(20),
+                },
+            )
+            .await
+            .map_err(|_| ())?;
+            tool_text_result(&messages)
+        }
+        TOOL_GET_MESSAGE => {
+            let arguments: ContextArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            tool_text_result(
+                &message_context(pool, chat_id, arguments.message_id, 0, 0)
+                    .await
+                    .map_err(|_| ())?,
+            )
         }
         TOOL_MESSAGE_CONTEXT => {
             let arguments: ContextArguments =
@@ -246,6 +299,15 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
                 .map_err(|_| ())?,
             )
         }
+        TOOL_USER_PROFILE => {
+            let arguments: UserProfileArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            tool_text_result(
+                &user_profile(pool, chat_id, arguments.telegram_user_id)
+                    .await
+                    .map_err(|_| ())?,
+            )
+        }
         TOOL_LIST_CHAT_NOTES => {
             let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
                 .bind(chat_id).fetch_all(pool).await.map_err(|_| ())?;
@@ -273,6 +335,7 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
     if arguments.telegram_user_id.is_none() && query.is_none() {
         return Err(());
     }
+    let query_variants = query.as_deref().map(resolve_query_variants);
     let users = sqlx::query_as::<_, ResolvedUserRow>(
         r#"
         select p.telegram_user_id, nullif(p.username, '') as username,
@@ -284,17 +347,21 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
             where m.chat_id = $1 and m.user_id = p.telegram_user_id
         )
           and ($2::bigint is null or p.telegram_user_id = $2)
-          and ($3::text is null or concat_ws(' ', p.username, p.first_name, p.last_name) ilike '%' || $3 || '%')
+          and ($3::text[] is null or exists (
+              select 1 from unnest($3::text[]) candidate
+              where position(lower(candidate) in lower(concat_ws(' ', p.username, p.first_name, p.last_name))) > 0
+                 or position(candidate in regexp_replace(lower(concat_ws(' ', p.username, p.first_name, p.last_name)), '[^[:alnum:]_]+', '', 'g')) > 0
+          ))
         order by
             case when p.telegram_user_id = $2 then 0 else 1 end,
-            case when lower(coalesce(p.username, '')) = lower(coalesce($3, '')) then 0 else 1 end,
+            case when lower(coalesce(p.username, '')) = any(coalesce($3::text[], array[]::text[])) then 0 else 1 end,
             p.last_seen_at desc
         limit 10
         "#,
     )
     .bind(chat_id)
     .bind(arguments.telegram_user_id)
-    .bind(query)
+    .bind(query_variants)
     .fetch_all(pool)
     .await
     .map_err(|_| ())?
@@ -309,6 +376,71 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
     })
     .collect::<Vec<_>>();
     tool_text_result(&users)
+}
+
+fn resolve_query_variants(query: &str) -> Vec<String> {
+    let normalized = query.trim().trim_start_matches('@').to_lowercase();
+    let compact = normalized
+        .chars()
+        .filter(|character| character.is_alphanumeric() || *character == '_')
+        .collect::<String>();
+    let mut variants = vec![normalized, compact.clone()];
+    if compact.chars().count() >= 4 {
+        if let Some(stem) = compact.strip_suffix('и') {
+            variants.extend([stem.to_string(), format!("{stem}а"), format!("{stem}я")]);
+        }
+    }
+    let transliterated = variants
+        .iter()
+        .map(|variant| transliterate_russian(variant))
+        .collect::<Vec<_>>();
+    variants.extend(transliterated);
+    variants.retain(|variant| !variant.is_empty());
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+fn transliterate_russian(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            match character {
+                'а' => "a",
+                'б' => "b",
+                'в' => "v",
+                'г' => "g",
+                'д' => "d",
+                'е' | 'ё' => "e",
+                'ж' => "zh",
+                'з' => "z",
+                'и' | 'й' => "i",
+                'к' => "k",
+                'л' => "l",
+                'м' => "m",
+                'н' => "n",
+                'о' => "o",
+                'п' => "p",
+                'р' => "r",
+                'с' => "s",
+                'т' => "t",
+                'у' => "u",
+                'ф' => "f",
+                'х' => "h",
+                'ц' => "ts",
+                'ч' => "ch",
+                'ш' => "sh",
+                'щ' => "sch",
+                'ы' => "y",
+                'э' => "e",
+                'ю' => "yu",
+                'я' => "ya",
+                'ь' | 'ъ' => "",
+                _ => return character.to_string(),
+            }
+            .to_string()
+        })
+        .collect()
 }
 
 fn parse_timestamp(value: Option<String>) -> Result<Option<DateTime<Utc>>, ()> {
@@ -331,11 +463,14 @@ fn initialize_result() -> Value {
 
 fn tools_list_result() -> Value {
     json!({"tools": [
-        {"name": TOOL_SEARCH_MESSAGES, "description": "Ищет сообщения только в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 240}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "reply_to_message_id": {"type": "integer"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
+        {"name": TOOL_SEARCH_MESSAGES, "description": "Ищет сообщения только в разрешённом чате. full_text ищет слова и выражения, literal — точную подстроку.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 240}, "user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "reply_to_message_id": {"type": "integer"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "match_mode": {"type": "string", "enum": ["full_text", "literal"]}, "sort": {"type": "string", "enum": ["relevance", "newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
+        {"name": TOOL_RECENT_MESSAGES, "description": "Возвращает последние или первые сообщения чата без поискового запроса, с фильтрами по автору и времени.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"user_id": {"type": "integer"}, "date_from": {"type": "string", "format": "date-time"}, "date_to": {"type": "string", "format": "date-time"}, "has_links": {"type": "boolean"}, "has_media": {"type": "boolean"}, "sort": {"type": "string", "enum": ["newest", "oldest"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}},
+        {"name": TOOL_GET_MESSAGE, "description": "Возвращает одно сообщение по ID в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}},
         {"name": TOOL_MESSAGE_CONTEXT, "description": "Возвращает ограниченный контекст вокруг найденного сообщения.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}, "before": {"type": "integer", "minimum": 0, "maximum": 5}, "after": {"type": "integer", "minimum": 0, "maximum": 5}}}}
-        ,{"name": TOOL_REPLY_THREAD, "description": "Возвращает цепочку родителей reply до глубины 5.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}}
+        ,{"name": TOOL_REPLY_THREAD, "description": "Возвращает родителей и дочерние ответы ветки вокруг сообщения (до 20 сообщений).", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}}
         ,{"name": TOOL_RESOLVE_USER, "description": "Находит участника разрешённого чата по точному Telegram ID, username или отображаемому имени. Перед вопросом о конкретном человеке сначала используй этот инструмент.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"query": {"type": "string", "maxLength": 80}, "telegram_user_id": {"type": "integer"}}}}
         ,{"name": TOOL_USER_INTERACTIONS, "description": "Возвращает последние прямые reply-взаимодействия между двумя участниками разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["first_user_id", "second_user_id"], "properties": {"first_user_id": {"type": "integer"}, "second_user_id": {"type": "integer"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}}
+        ,{"name": TOOL_USER_PROFILE, "description": "Возвращает безопасный профиль и агрегированную активность участника разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["telegram_user_id"], "properties": {"telegram_user_id": {"type": "integer"}}}}
         ,{"name": TOOL_LIST_CHAT_NOTES, "description": "Возвращает активные общие заметки разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}}
         ,{"name": TOOL_LIST_USER_NOTES, "description": "Возвращает активные заметки указанного пользователя в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["telegram_user_id"], "properties": {"telegram_user_id": {"type": "integer"}}}}
     ]})
@@ -393,10 +528,13 @@ mod tests {
             names,
             vec![
                 TOOL_SEARCH_MESSAGES,
+                TOOL_RECENT_MESSAGES,
+                TOOL_GET_MESSAGE,
                 TOOL_MESSAGE_CONTEXT,
                 TOOL_REPLY_THREAD,
                 TOOL_RESOLVE_USER,
                 TOOL_USER_INTERACTIONS,
+                TOOL_USER_PROFILE,
                 TOOL_LIST_CHAT_NOTES,
                 TOOL_LIST_USER_NOTES,
             ]

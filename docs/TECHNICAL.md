@@ -26,6 +26,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Расшифровывает `voice`, `audio` и `video_note`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
 - Для аудиозаписей делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
 - Короткие расшифровки отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
+- Отвечает на `/ask` как агентный помощник: ищет по истории и reply-веткам, разрешает участников, читает безопасные профили/заметки, использует web/GitHub и передаёт фото из reply vision-модели.
 
 ## Важный Нюанс Telegram
 
@@ -342,6 +343,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /emojiids
 /format_test <текст поста>
 /memory
+/ask <вопрос>
 /status day|week|month [-r|-p]
 /stats_day [-r|-p]
 /stats_week [-r|-p]
