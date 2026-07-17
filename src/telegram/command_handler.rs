@@ -208,23 +208,8 @@ async fn handle_ask_command(
     };
     let is_private_allowed =
         msg.chat.is_private() && config.ask_private_user_ids.contains(&(user.id.0 as i64));
-    if !config.ask_enabled || (msg.chat.id.0 != config.discussion_chat_id && !is_private_allowed) {
-        return Ok(());
-    }
-    let is_owner = config.owner_telegram_id == Some(user.id.0 as i64);
-    let is_admin = config.ask_allow_chat_admins
-        && bot
-            .get_chat_member(msg.chat.id, user.id)
-            .await
-            .map(|member| member.kind.is_privileged())
-            .unwrap_or(false);
-    if !is_private_allowed && !is_owner && !is_admin {
-        send_html(
-            bot,
-            msg.chat.id,
-            "Команда /ask пока доступна владельцу и администраторам.",
-        )
-        .await?;
+    let is_discussion_chat = msg.chat.id.0 == config.discussion_chat_id;
+    if !config.ask_enabled || (!is_discussion_chat && !is_private_allowed) {
         return Ok(());
     }
     if question.trim().is_empty() {
