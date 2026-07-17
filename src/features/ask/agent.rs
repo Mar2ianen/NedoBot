@@ -1096,13 +1096,15 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(445_144_708);
+        let requester_identity = std::env::var("ASK_LIVE_REQUESTER_IDENTITY")
+            .unwrap_or_else(|_| "Тестовый пользователь".to_string());
         let config = Config::from_env();
         let pool = crate::db::build_pool().await?;
         let result = answer(
             &config,
             &pool,
             requester_user_id,
-            "Тестовый пользователь",
+            &requester_identity,
             &question,
             None,
             None,
