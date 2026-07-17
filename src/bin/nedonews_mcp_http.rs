@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     net::SocketAddr,
+    path::Path,
     sync::Arc,
     time::Instant,
 };
@@ -127,6 +128,11 @@ struct FetchArgs {
 struct ChatMessageArgs {
     chat_id: i64,
     message_id: i32,
+}
+
+#[derive(Deserialize)]
+struct UserProfileArgs {
+    telegram_user_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +408,14 @@ fn tools_list() -> Vec<Value> {
             "Возвращает одно сообщение публичного Telegram-чата по точной паре chat_id и message_id. Используй после поиска или когда IDs уже известны.",
         ),
         (
+            "chat.get_user_profile",
+            "Возвращает полную безопасную typed-проекцию публичного профиля участника. Raw payload и Telegram file_id не возвращаются.",
+        ),
+        (
+            "chat.get_user_avatar",
+            "Возвращает публичную HTTPS-ссылку на уже кэшированную аватарку участника. Не раскрывает Telegram file_id.",
+        ),
+        (
             "moderation.list_spammers",
             "Возвращает размеченных спамеров публичного чата, их score, labels и причины. Обычные сообщения чата не возвращает.",
         ),
@@ -459,6 +473,9 @@ fn input_schema(name: &str) -> Value {
         "chat.get_message" => {
             json!({"type":"object","properties":{"chat_id":{"type":"integer","description":"Telegram ID публичного чата; сейчас -1001932061163."},"message_id":{"type":"integer","description":"ID сообщения внутри чата."}},"required":["chat_id","message_id"],"additionalProperties":false})
         }
+        "chat.get_user_profile" | "chat.get_user_avatar" => {
+            json!({"type":"object","properties":{"telegram_user_id":{"type":"integer","description":"Telegram ID участника публичного чата."}},"required":["telegram_user_id"],"additionalProperties":false})
+        }
         "db.count" => {
             json!({"type":"object","properties":{"table":table,"filters":filters},"required":["table"],"additionalProperties":false})
         }
@@ -495,6 +512,12 @@ fn output_schema(name: &str) -> Value {
         }
         "chat.get_message" => {
             json!({"type":"object","properties":{"found":{"type":"boolean"},"chat_id":{"type":"integer"},"message_id":{"type":"integer"},"author_id":{"type":["integer","null"]},"text":{"type":["string","null"]},"created_at":{"type":["string","null"]},"message":{"type":["object","null"],"additionalProperties":true}},"required":["found","chat_id","message_id","author_id","text","created_at","message"],"additionalProperties":false})
+        }
+        "chat.get_user_profile" => {
+            json!({"type":"object","properties":{"found":{"type":"boolean"},"profile":{"type":["object","null"],"additionalProperties":true}},"required":["found","profile"],"additionalProperties":false})
+        }
+        "chat.get_user_avatar" => {
+            json!({"type":"object","properties":{"found":{"type":"boolean"},"telegram_user_id":{"type":"integer"},"avatar_url":{"type":["string","null"],"format":"uri"}},"required":["found","telegram_user_id","avatar_url"],"additionalProperties":false})
         }
         "db.count" => {
             json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false})
@@ -546,6 +569,14 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Val
         "chat.get_message" => {
             let args: ChatMessageArgs = decode(arguments)?;
             chat_get_message(&state.pool, &state.manifest, args).await
+        }
+        "chat.get_user_profile" => {
+            let args: UserProfileArgs = decode(arguments)?;
+            chat_get_user_profile(&state.pool, &state.manifest, args).await
+        }
+        "chat.get_user_avatar" => {
+            let args: UserProfileArgs = decode(arguments)?;
+            chat_get_user_avatar(&state.pool, args).await
         }
         "moderation.list_spammers" => {
             select_rows(
@@ -814,6 +845,57 @@ async fn chat_get_message(
         "created_at": message["created_at"].clone(),
         "message": message,
     }))
+}
+
+async fn chat_get_user_profile(
+    pool: &PgPool,
+    manifest: &Manifest,
+    args: UserProfileArgs,
+) -> Result<Value, String> {
+    let result = fetch_row(
+        pool,
+        manifest,
+        FetchArgs {
+            table: "telegram_user_profiles".into(),
+            key: BTreeMap::from([(
+                "telegram_user_id".into(),
+                Value::from(args.telegram_user_id),
+            )]),
+        },
+    )
+    .await?;
+    let profile = result["row"].clone();
+    Ok(json!({"found": !profile.is_null(), "profile": profile}))
+}
+
+async fn chat_get_user_avatar(pool: &PgPool, args: UserProfileArgs) -> Result<Value, String> {
+    let row = sqlx::query("select profile_photo_file_unique_id from mcp_public.telegram_user_profiles where telegram_user_id = $1")
+        .bind(args.telegram_user_id).fetch_optional(pool).await.map_err(|_| "database query failed")?;
+    let unique_id = row.and_then(|row| {
+        row.try_get::<Option<String>, _>("profile_photo_file_unique_id")
+            .ok()
+            .flatten()
+    });
+    let filename = unique_id.map(|unique_id| {
+        format!(
+            "{}_{}.jpg",
+            args.telegram_user_id,
+            safe_static_name(&unique_id)
+        )
+    });
+    let avatar_url = filename
+        .filter(|name| Path::new("static/avatars").join(name).is_file())
+        .map(|name| format!("https://nedobot.chickenkiller.com/tg-ai-bot-static/avatars/{name}"));
+    Ok(
+        json!({"found": avatar_url.is_some(), "telegram_user_id": args.telegram_user_id, "avatar_url": avatar_url}),
+    )
+}
+
+fn safe_static_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect()
 }
 
 async fn count_rows(pool: &PgPool, manifest: &Manifest, args: CountArgs) -> Result<Value, String> {
