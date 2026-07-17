@@ -8,12 +8,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::features::ask::chat_search::{
     MessageSearchRequest, MessageSort, message_context, reply_thread, search_messages,
+    user_interactions,
 };
 
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
 const TOOL_MESSAGE_CONTEXT: &str = "chat.get_message_context";
 const TOOL_REPLY_THREAD: &str = "chat.get_reply_thread";
 const TOOL_RESOLVE_USER: &str = "chat.resolve_user";
+const TOOL_USER_INTERACTIONS: &str = "chat.get_user_interactions";
 const TOOL_LIST_CHAT_NOTES: &str = "notes.list_chat";
 const TOOL_LIST_USER_NOTES: &str = "notes.list_user";
 
@@ -65,6 +67,13 @@ struct UserNotesArguments {
 struct ResolveUserArguments {
     query: Option<String>,
     telegram_user_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct UserInteractionsArguments {
+    first_user_id: i64,
+    second_user_id: i64,
+    limit: Option<i64>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -219,6 +228,24 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             )
         }
         TOOL_RESOLVE_USER => resolve_user(pool, chat_id, params.arguments).await,
+        TOOL_USER_INTERACTIONS => {
+            let arguments: UserInteractionsArguments =
+                serde_json::from_value(params.arguments).map_err(|_| ())?;
+            if arguments.first_user_id == arguments.second_user_id {
+                return Err(());
+            }
+            tool_text_result(
+                &user_interactions(
+                    pool,
+                    chat_id,
+                    arguments.first_user_id,
+                    arguments.second_user_id,
+                    arguments.limit.unwrap_or(20),
+                )
+                .await
+                .map_err(|_| ())?,
+            )
+        }
         TOOL_LIST_CHAT_NOTES => {
             let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
                 .bind(chat_id).fetch_all(pool).await.map_err(|_| ())?;
@@ -308,6 +335,7 @@ fn tools_list_result() -> Value {
         {"name": TOOL_MESSAGE_CONTEXT, "description": "Возвращает ограниченный контекст вокруг найденного сообщения.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}, "before": {"type": "integer", "minimum": 0, "maximum": 5}, "after": {"type": "integer", "minimum": 0, "maximum": 5}}}}
         ,{"name": TOOL_REPLY_THREAD, "description": "Возвращает цепочку родителей reply до глубины 5.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["message_id"], "properties": {"message_id": {"type": "integer"}}}}
         ,{"name": TOOL_RESOLVE_USER, "description": "Находит участника разрешённого чата по точному Telegram ID, username или отображаемому имени. Перед вопросом о конкретном человеке сначала используй этот инструмент.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"query": {"type": "string", "maxLength": 80}, "telegram_user_id": {"type": "integer"}}}}
+        ,{"name": TOOL_USER_INTERACTIONS, "description": "Возвращает последние прямые reply-взаимодействия между двумя участниками разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["first_user_id", "second_user_id"], "properties": {"first_user_id": {"type": "integer"}, "second_user_id": {"type": "integer"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}}}
         ,{"name": TOOL_LIST_CHAT_NOTES, "description": "Возвращает активные общие заметки разрешённого чата.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}}
         ,{"name": TOOL_LIST_USER_NOTES, "description": "Возвращает активные заметки указанного пользователя в разрешённом чате.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["telegram_user_id"], "properties": {"telegram_user_id": {"type": "integer"}}}}
     ]})
@@ -368,6 +396,7 @@ mod tests {
                 TOOL_MESSAGE_CONTEXT,
                 TOOL_REPLY_THREAD,
                 TOOL_RESOLVE_USER,
+                TOOL_USER_INTERACTIONS,
                 TOOL_LIST_CHAT_NOTES,
                 TOOL_LIST_USER_NOTES,
             ]
