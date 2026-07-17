@@ -132,6 +132,14 @@ struct ResolvedUserRow {
 }
 
 #[derive(Serialize, sqlx::FromRow)]
+struct FuzzyUserRow {
+    telegram_user_id: i64,
+    username: Option<String>,
+    display_name: String,
+    message_count: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
 struct NoteRow {
     id: i64,
     note: String,
@@ -400,7 +408,7 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
         return Err(());
     }
     let query_variants = query.as_deref().map(resolve_query_variants);
-    let users = sqlx::query_as::<_, ResolvedUserRow>(
+    let mut users = sqlx::query_as::<_, ResolvedUserRow>(
         r#"
         select p.telegram_user_id, nullif(p.username, '') as username,
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
@@ -436,30 +444,149 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
     )
     .bind(chat_id)
     .bind(arguments.telegram_user_id)
-    .bind(query_variants)
+    .bind(&query_variants)
     .fetch_all(pool)
     .await
-    .map_err(|_| ())?
-    .into_iter()
-    .enumerate()
-    .map(|(index, user)| {
-        json!({
-            "telegram_user_id": user.telegram_user_id,
-            "username": user.username,
-            "display_name": user.display_name,
-            "author_url": public_username_url(user.username.as_deref()),
-            "message_count": user.message_count,
-            "match": match user.match_rank {
-                0 => "telegram_id",
-                1 => "username",
-                2 => "exact_name",
-                _ => "partial_name",
-            },
-            "recommended": index == 0
+    .map_err(|_| ())?;
+    if users.is_empty() && arguments.telegram_user_id.is_none() {
+        users = fuzzy_resolve_users(pool, chat_id, query_variants.as_deref().unwrap_or_default())
+            .await?;
+    }
+    let users = users
+        .into_iter()
+        .enumerate()
+        .map(|(index, user)| {
+            json!({
+                "telegram_user_id": user.telegram_user_id,
+                "username": user.username,
+                "display_name": user.display_name,
+                "author_url": public_username_url(user.username.as_deref()),
+                "message_count": user.message_count,
+                "match": match user.match_rank {
+                    0 => "telegram_id",
+                    1 => "username",
+                    2 => "exact_name",
+                    3 => "partial_name",
+                    _ => "fuzzy_name",
+                },
+                "recommended": index == 0
+            })
         })
-    })
-    .collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     tool_text_result(&users)
+}
+
+async fn fuzzy_resolve_users(
+    pool: &PgPool,
+    chat_id: i64,
+    query_variants: &[String],
+) -> Result<Vec<ResolvedUserRow>, ()> {
+    if query_variants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let candidates = sqlx::query_as::<_, FuzzyUserRow>(
+        r#"
+        select p.telegram_user_id, nullif(p.username, '') as username,
+               coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
+                        nullif(p.username, ''), 'Неизвестный пользователь') as display_name,
+               coalesce(cu.message_count, 0) as message_count
+        from telegram_user_profiles p
+        left join telegram_chat_users cu
+          on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
+        where exists (
+            select 1 from telegram_messages m
+            where m.chat_id = $1 and m.user_id = p.telegram_user_id
+        )
+        order by coalesce(cu.message_count, 0) desc, p.last_seen_at desc
+        limit 5000
+        "#,
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| ())?;
+
+    let mut matches = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let labels = [
+                candidate.display_name.as_str(),
+                candidate.username.as_deref().unwrap_or(""),
+            ];
+            let distance = query_variants
+                .iter()
+                .flat_map(|query| {
+                    labels
+                        .iter()
+                        .map(move |label| normalized_edit_distance(query, label))
+                })
+                .min_by(|left, right| {
+                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                })?;
+            (distance <= 0.45).then_some((distance, candidate))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_distance, left), (right_distance, right)| {
+        left_distance
+            .partial_cmp(right_distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.message_count.cmp(&left.message_count))
+    });
+    Ok(matches
+        .into_iter()
+        .take(5)
+        .map(|(_, candidate)| ResolvedUserRow {
+            telegram_user_id: candidate.telegram_user_id,
+            username: candidate.username,
+            display_name: candidate.display_name,
+            match_rank: 4,
+            message_count: candidate.message_count,
+        })
+        .collect())
+}
+
+fn normalized_edit_distance(left: &str, right: &str) -> f32 {
+    let left = normalize_resolve_label(left);
+    let right = normalize_resolve_label(right);
+    let max_len = left.chars().count().max(right.chars().count());
+    if max_len == 0 {
+        return 1.0;
+    }
+    levenshtein_chars(&left, &right) as f32 / max_len as f32
+}
+
+fn normalize_resolve_label(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .trim_start_matches('@')
+        .to_lowercase()
+        .chars()
+        .filter(|character| character.is_alphanumeric() || *character == '_')
+        .collect::<String>();
+    // Фонетические варианты после русско-латинской транслитерации: «ноунейм» → nouneim.
+    // Это применяется только в fallback-поиске, точное сопоставление выше остаётся неизменным.
+    normalized
+        .replace("ou", "o")
+        .replace("ei", "e")
+        .replace("ie", "e")
+}
+
+fn levenshtein_chars(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            let replace_cost = usize::from(left_character != *right_character);
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(previous[right_index] + replace_cost),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 fn resolve_query_variants(query: &str) -> Vec<String> {
@@ -632,5 +759,20 @@ mod tests {
         let encoded = serde_json::to_string(&failure(json!(1))).unwrap();
         assert!(!encoded.contains("postgres"));
         assert!(!encoded.contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn fuzzy_resolution_accepts_transliterated_display_name() {
+        let variants = resolve_query_variants("ноунейм");
+        assert!(
+            variants
+                .iter()
+                .any(|variant| normalized_edit_distance(variant, "NoName") <= 0.45)
+        );
+    }
+
+    #[test]
+    fn fuzzy_resolution_rejects_unrelated_short_name() {
+        assert!(normalized_edit_distance("паша", "NoName") > 0.45);
     }
 }
