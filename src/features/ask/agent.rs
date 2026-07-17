@@ -64,9 +64,9 @@ pub async fn answer(
             .call(
                 "chat.search_messages",
                 json!({
-                    "query": "заказал OR купил OR взял OR поставил OR использую OR обновился",
+                    "query": "заказал OR купил OR взял",
                     "user_id": user_id,
-                    "limit": 12
+                    "limit": 20
                 }),
             )
             .await?;
