@@ -1,4 +1,5 @@
-use teloxide::{prelude::*, utils::command::BotCommands};
+use teloxide::{prelude::*, types::ReplyParameters, utils::command::BotCommands};
+use tokio::sync::mpsc;
 
 use crate::db::telegram::save_telegram_message;
 use crate::features::ask::agent;
@@ -222,6 +223,12 @@ async fn handle_ask_command(
         state.ask_slots.clone().try_acquire_owned().map_err(|_| {
             teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy"))
         })?;
+    let progress_message = bot
+        .send_message(msg.chat.id, agent::AskProgress::Preparing.message())
+        .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
+        .await
+        .ok();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let reply_context = msg.reply_to_message().map(|reply| {
         let author = reply
             .from
@@ -297,18 +304,50 @@ async fn handle_ask_command(
             None
         }
     };
+    let requester_identity = requester_identity(user);
     let answer = agent::answer(
         config,
         &state.pool,
         ask_run_id,
         user.id.0 as i64,
-        &requester_identity(user),
+        &requester_identity,
         question,
         reply_context.as_deref(),
         reply_image.as_deref(),
-    )
-    .await;
+        progress_message.as_ref().map(|_| &progress_tx),
+    );
+    tokio::pin!(answer);
+    let mut progress_open = progress_message.is_some();
+    let mut last_progress = agent::AskProgress::Preparing;
+    let answer = loop {
+        tokio::select! {
+            answer = &mut answer => break answer,
+            update = progress_rx.recv(), if progress_open => {
+                match update {
+                    Some(update) if update != last_progress => {
+                        last_progress = update;
+                        if let Some(progress_message) = &progress_message {
+                            if let Err(err) = bot.edit_message_text(
+                                msg.chat.id,
+                                progress_message.id,
+                                update.message(),
+                            ).await {
+                                tracing::debug!(%err, "failed to update ask progress message");
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => progress_open = false,
+                }
+            }
+        }
+    };
     drop(permit);
+    if let Some(progress_message) = progress_message {
+        if let Err(err) = bot.delete_message(msg.chat.id, progress_message.id).await {
+            tracing::debug!(%err, "failed to remove ask progress message");
+        }
+    }
     match answer {
         Ok(answer) => {
             let markdown = match rich_markdown::validate(&answer) {
