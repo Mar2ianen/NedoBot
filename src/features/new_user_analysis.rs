@@ -98,11 +98,15 @@ struct TextTexture {
 struct MessageStyle {
     text_message_count: i64,
     single_exclamation_ending_count: i64,
+    repeated_exclamation_ending_count: i64,
     period_ending_count: i64,
     emoji_message_count: i64,
     emoji_ending_count: i64,
     single_emoji_message_count: i64,
     single_emoji_ending_count: i64,
+    adjacent_emoji_message_count: i64,
+    other_non_text_ending_count: i64,
+    unmatched_closing_parenthesis_ending_count: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -860,6 +864,13 @@ fn message_style_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
             reason: "New-user message ends with exactly one exclamation mark",
         });
     }
+    if style.repeated_exclamation_ending_count > 0 {
+        signals.push(human_style_signal(
+            "repeated_exclamation_ending",
+            "New-user message ends with several exclamation marks",
+            -5,
+        ));
+    }
     if features.reply_to_channel_post_count > 0 && features.reply_to_comment_count == 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
@@ -868,32 +879,54 @@ fn message_style_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
             reason: "New user replies directly to a channel post, not another comment",
         });
     }
-    if style.single_emoji_message_count > 0 {
+    if style.emoji_message_count > 0 && style.adjacent_emoji_message_count == 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
             coefficient: message_style_coefficient(persona, 1, 3, -1),
-            label: "single_emoji_message",
-            reason: "New-user message contains exactly one emoji",
+            label: "non_adjacent_emoji_message",
+            reason: "New-user message uses emoji without an adjacent emoji run",
         });
     }
-    if style.single_emoji_ending_count > 0 {
+    if style.emoji_ending_count > 0 && style.adjacent_emoji_message_count == 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
             coefficient: message_style_coefficient(persona, 2, 5, 0),
-            label: "single_emoji_message_ending",
-            reason: "New-user message ends with exactly one emoji",
+            label: "non_adjacent_emoji_message_ending",
+            reason: "New-user message ends with emoji but has no adjacent emoji run",
         });
     }
-    if style.period_ending_count > 0 {
-        signals.push(RiskSignal {
-            class: SpamClass::LlmProfileBait,
-            coefficient: message_style_coefficient(persona, 1, 2, 0),
-            label: "single_period_ending",
-            reason: "New-user message ends with exactly one period",
-        });
+    if style.adjacent_emoji_message_count > 0 {
+        signals.push(human_style_signal(
+            "adjacent_emoji_run",
+            "New-user message contains adjacent emoji",
+            -5,
+        ));
+    }
+    if style.period_ending_count > 0 || style.other_non_text_ending_count > 0 {
+        signals.push(human_style_signal(
+            "non_text_message_ending",
+            "New-user message ends with non-text punctuation other than emoji",
+            -3,
+        ));
+    }
+    if style.unmatched_closing_parenthesis_ending_count > 0 {
+        signals.push(human_style_signal(
+            "russian_unmatched_closing_parenthesis",
+            "New-user message ends with a closing parenthesis without a matching opening parenthesis",
+            -6,
+        ));
     }
 
     signals
+}
+
+fn human_style_signal(label: &'static str, reason: &'static str, coefficient: i32) -> RiskSignal {
+    RiskSignal {
+        class: SpamClass::LlmProfileBait,
+        coefficient,
+        label,
+        reason,
+    }
 }
 
 fn message_style_coefficient(
@@ -1234,11 +1267,15 @@ async fn save_audit(
             "persona": message_style_persona(features).as_str(),
             "text_message_count": features.message_style.text_message_count,
             "single_exclamation_ending_count": features.message_style.single_exclamation_ending_count,
+            "repeated_exclamation_ending_count": features.message_style.repeated_exclamation_ending_count,
             "period_ending_count": features.message_style.period_ending_count,
             "emoji_message_count": features.message_style.emoji_message_count,
             "emoji_ending_count": features.message_style.emoji_ending_count,
             "single_emoji_message_count": features.message_style.single_emoji_message_count,
             "single_emoji_ending_count": features.message_style.single_emoji_ending_count,
+            "adjacent_emoji_message_count": features.message_style.adjacent_emoji_message_count,
+            "other_non_text_ending_count": features.message_style.other_non_text_ending_count,
+            "unmatched_closing_parenthesis_ending_count": features.message_style.unmatched_closing_parenthesis_ending_count,
         },
     });
 
@@ -1590,8 +1627,12 @@ fn message_style(texts: &[String]) -> MessageStyle {
             }
 
             style.text_message_count += 1;
-            if trailing_char_count(text, '!') == 1 {
+            let trailing_exclamation_count = trailing_char_count(text, '!');
+            if trailing_exclamation_count == 1 {
                 style.single_exclamation_ending_count += 1;
+            }
+            if trailing_exclamation_count >= 2 {
+                style.repeated_exclamation_ending_count += 1;
             }
             if trailing_char_count(text, '.') == 1 {
                 style.period_ending_count += 1;
@@ -1607,6 +1648,15 @@ fn message_style(texts: &[String]) -> MessageStyle {
                 if ends_with_emoji(text) {
                     style.single_emoji_ending_count += 1;
                 }
+            }
+            if has_adjacent_emoji_clusters(text) {
+                style.adjacent_emoji_message_count += 1;
+            }
+            if ends_with_other_non_text(text) {
+                style.other_non_text_ending_count += 1;
+            }
+            if ends_with_unmatched_closing_parenthesis(text) {
+                style.unmatched_closing_parenthesis_ending_count += 1;
             }
             style
         })
@@ -1636,6 +1686,48 @@ fn is_emoji(ch: char) -> bool {
 
 fn emoji_scalar_count(text: &str) -> usize {
     text.chars().filter(|ch| is_emoji(*ch)).count()
+}
+
+fn has_adjacent_emoji_clusters(text: &str) -> bool {
+    let mut previous_was_emoji = false;
+    let mut joined_with_zwj = false;
+
+    for ch in text.chars() {
+        if is_emoji(ch) && !is_emoji_modifier(ch) {
+            if previous_was_emoji && !joined_with_zwj {
+                return true;
+            }
+            previous_was_emoji = true;
+            joined_with_zwj = false;
+        } else if is_emoji_modifier(ch) || ch == '\u{FE0F}' {
+            continue;
+        } else if ch == '\u{200D}' && previous_was_emoji {
+            joined_with_zwj = true;
+        } else {
+            previous_was_emoji = false;
+            joined_with_zwj = false;
+        }
+    }
+
+    false
+}
+
+fn is_emoji_modifier(ch: char) -> bool {
+    matches!(ch as u32, 0x1F3FB..=0x1F3FF)
+}
+
+fn ends_with_other_non_text(text: &str) -> bool {
+    let Some(last) = text.trim_end().chars().last() else {
+        return false;
+    };
+    !last.is_alphanumeric() && !is_emoji(last) && !matches!(last, '!' | ')' | '.')
+}
+
+fn ends_with_unmatched_closing_parenthesis(text: &str) -> bool {
+    let text = text.trim_end();
+    text.ends_with(')')
+        && text.chars().filter(|ch| *ch == ')').count()
+            > text.chars().filter(|ch| *ch == '(').count()
 }
 
 fn contains_cjk(text: &str) -> bool {
@@ -1880,6 +1972,17 @@ mod tests {
     fn message_style_uses_single_emoji_not_any_emoji_count() {
         assert_eq!(emoji_scalar_count("один ❤️"), 1);
         assert_eq!(emoji_scalar_count("два 🌊❤️"), 2);
+    }
+
+    #[test]
+    fn human_style_patterns_detect_adjacent_emoji_and_unmatched_parentheses() {
+        assert!(!has_adjacent_emoji_clusters("сначала 🌊 потом ❤️"));
+        assert!(has_adjacent_emoji_clusters("сразу 🌊❤️"));
+        assert!(!has_adjacent_emoji_clusters("разработчица 👩‍💻"));
+        assert!(ends_with_unmatched_closing_parenthesis("ну да)"));
+        assert!(!ends_with_unmatched_closing_parenthesis("(ну да)"));
+        assert!(ends_with_other_non_text("что-то?"));
+        assert!(!ends_with_other_non_text("обычная точка."));
     }
 
     #[test]
