@@ -10,6 +10,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
+use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::add_user_note_from_search;
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
@@ -41,7 +42,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 Ответ:
 - Пиши на языке пользователя в Rich Markdown Telegram: короткие абзацы, списки и заголовки только когда полезны.
 - Отделяй найденные факты от выводов. Честно говори о неопределённости и ограничениях поиска.
-- Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата добавляй ссылку на соответствующее message_url.
+- Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата встраивай ссылку на message_url прямо в фразу: «[Михаил написал](URL)», «[в этом сообщении](URL)». Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
 - На каждом шаге верни ровно один JSON-объект без code fence: {"kind":"tool","tool":"имя","arguments":{...}} либо {"kind":"final","markdown":"ответ"}."#;
 
 const MCP_TOOLS: &[&str] = &[
@@ -186,7 +187,11 @@ pub async fn answer(
                         push_observation(&mut observations, instruction);
                         continue;
                     }
-                    return Ok(markdown.to_string());
+                    return Ok(embed_bare_message_links(
+                        markdown,
+                        &evidence,
+                        config.discussion_chat_id,
+                    ));
                 }
                 push_observation(
                     &mut observations,
@@ -287,7 +292,11 @@ pub async fn answer(
         })?;
     if action.kind == ActionKind::Final {
         if let Some(markdown) = non_empty(action.markdown.as_deref()) {
-            return Ok(markdown.to_string());
+            return Ok(embed_bare_message_links(
+                markdown,
+                &evidence,
+                config.discussion_chat_id,
+            ));
         }
     }
     anyhow::bail!("ask agent did not produce a final answer")
@@ -698,6 +707,37 @@ fn cited_message_ids(markdown: &str) -> Vec<i32> {
     ids
 }
 
+fn embed_bare_message_links(markdown: &str, evidence: &Evidence, chat_id: i64) -> String {
+    let mut result = String::with_capacity(markdown.len());
+    let mut remainder = markdown;
+    while let Some(start) = remainder.find('[') {
+        let (before, candidate) = remainder.split_at(start);
+        result.push_str(before);
+        let Some(end) = candidate.find(']') else {
+            result.push_str(candidate);
+            remainder = "";
+            break;
+        };
+        let label = &candidate[1..end];
+        let after = &candidate[end + 1..];
+        let message_id = label.parse::<i32>().ok();
+        if let Some(message_id) = message_id
+            .filter(|message_id| evidence.message_ids.contains(message_id))
+            .filter(|_| !after.starts_with('('))
+        {
+            if let Some(url) = message_url(chat_id, message_id) {
+                result.push_str(&format!("[в этом сообщении]({url})"));
+                remainder = after;
+                continue;
+            }
+        }
+        result.push_str(&candidate[..=end]);
+        remainder = after;
+    }
+    result.push_str(remainder);
+    result
+}
+
 fn personal_statement_query_count(arguments: &Value) -> usize {
     let queries = arguments
         .get("queries")
@@ -1074,6 +1114,20 @@ mod tests {
                 .follow_up_instruction("[источник](https://t.me/c/1932061163/330631)")
                 .unwrap()
                 .contains("330631")
+        );
+    }
+
+    #[test]
+    fn embeds_only_observed_bare_message_ids_as_links() {
+        let mut evidence = Evidence::default();
+        evidence.message_ids.push(384_547);
+        assert_eq!(
+            embed_bare_message_links(
+                "Он задал загадку [384547], а число [30] не является источником.",
+                &evidence,
+                -1001932061163,
+            ),
+            "Он задал загадку [в этом сообщении](https://t.me/c/1932061163/384547), а число [30] не является источником."
         );
     }
 
