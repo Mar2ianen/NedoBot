@@ -112,7 +112,7 @@ GEMINI_FLASH_MODEL=gemini-3.1-flash-lite
 GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 GEMINI_THINKING_BUDGET=1024
 
-PUBLIC_BASE_URL=
+PUBLIC_BASE_URL=https://nedobot.chickenkiller.com
 STATIC_FILES_DIR=/opt/tg-ai-bot-teloxide/static
 LLM_PROXY_URL=
 OLLAMA_API_KEY=
@@ -127,6 +127,12 @@ OWNER_TELEGRAM_ID=
 SEND_OWNER_PREVIEW=true
 PROFILE_REFRESH_CONCURRENCY=4
 ```
+
+`nedobot.chickenkiller.com` — публичный HTTPS-домен проекта. Он отдаёт только
+кэшированные аватарки Telegram по пути `/tg-ai-bot-static/avatars/`; бот строит
+их URL из `PUBLIC_BASE_URL`. Production-конфиг общего SNI-фронта лежит в
+`deploy/vpn-nginx/nginx.conf`; сертификат Let’s Encrypt обновляется Certbot, а
+deploy hook перезагружает контейнерный Nginx после продления.
 
 Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель, `Gemini 3.1 Flash Lite` как первый fallback, затем `ollama`/`gemma4:31b` как последний fallback. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 
