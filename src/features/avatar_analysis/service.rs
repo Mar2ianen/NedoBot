@@ -32,6 +32,24 @@ pub async fn enqueue_current_avatar_analysis(pool: &PgPool, user_id: i64) -> any
                    'link_count', coalesce(cu.link_count, 0),
                    'first_seen_at', cu.first_seen_at,
                    'last_seen_at', cu.last_seen_at,
+                   'chat_behavior', coalesce((
+                       select jsonb_build_object(
+                           'chat_id', audit.chat_id,
+                           'analyzed_at', audit.analyzed_at,
+                           'risk_score', audit.risk_score,
+                           'risk_level', audit.risk_level,
+                           'primary_risk_class', audit.primary_risk_class,
+                           'risk_class_scores', audit.risk_class_scores,
+                           'risk_labels', audit.risk_labels,
+                           'risk_signal_breakdown', audit.risk_signal_breakdown,
+                           'message_style', audit.raw_features -> 'message_style',
+                           'chat_context', audit.raw_features -> 'chat_context'
+                       )
+                       from telegram_new_user_profile_audits audit
+                       where audit.telegram_user_id = p.telegram_user_id
+                       order by audit.analyzed_at desc
+                       limit 1
+                   ), '{}'::jsonb),
                    'avatar_seen_count', (
                        select count(*) from telegram_profile_identity_observations o
                        where o.profile_photo_file_unique_id = p.profile_photo_file_unique_id
