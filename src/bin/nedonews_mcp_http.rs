@@ -384,7 +384,93 @@ fn tools_list() -> Vec<Value> {
         ("search.list_runs", "Запуски поиска для комментариев."),
         ("llm.list_generations", "Генерации комментариев."),
     ];
-    names.into_iter().map(|(name, description)| json!({"name":name,"description":description,"inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}})).collect()
+    names
+        .into_iter()
+        .map(|(name, description)| {
+            json!({
+                "name": name,
+                "description": description,
+                "inputSchema": input_schema(name),
+                "outputSchema": output_schema(name),
+                "annotations": {"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+            })
+        })
+        .collect()
+}
+
+fn input_schema(name: &str) -> Value {
+    let table =
+        json!({"type":"string","description":"Имя разрешённой публичной view из db.list_tables."});
+    let limit = json!({"type":"integer","minimum":1,"maximum":200,"default":50});
+    let cursor =
+        json!({"type":["string","null"],"description":"Opaque cursor from the previous page."});
+    let filters = json!({"type":"array","maxItems":12,"items":{"type":"object","properties":{"column":{"type":"string"},"op":{"type":"string","enum":["eq","ne","lt","lte","gt","gte","in","not_in","is_null","is_not_null","contains","starts_with","ends_with","between"]},"value":{},"values":{"type":"array","maxItems":100}},"required":["column","op"],"additionalProperties":false}});
+    match name {
+        "db.list_tables"
+        | "ask.list_runs"
+        | "voice.list_transcripts"
+        | "memory.list_notes"
+        | "search.list_runs"
+        | "llm.list_generations" => {
+            json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+        "db.describe_table" => {
+            json!({"type":"object","properties":{"table":table},"required":["table"],"additionalProperties":false})
+        }
+        "db.select" => {
+            json!({"type":"object","properties":{"table":table,"columns":{"type":"array","maxItems":40,"items":{"type":"string"}},"filters":filters,"order_by":{"type":"array","items":{"type":"object","properties":{"column":{"type":"string"},"direction":{"type":"string","enum":["asc","desc"]}},"required":["column","direction"],"additionalProperties":false}},"limit":limit,"cursor":cursor},"required":["table"],"additionalProperties":false})
+        }
+        "db.fetch_row" => {
+            json!({"type":"object","properties":{"table":table,"key":{"type":"object","additionalProperties":true}},"required":["table","key"],"additionalProperties":false})
+        }
+        "chat.get_message" => {
+            json!({"type":"object","properties":{"key":{"type":"object","additionalProperties":true}},"required":["key"],"additionalProperties":false})
+        }
+        "db.count" => {
+            json!({"type":"object","properties":{"table":table,"filters":filters},"required":["table"],"additionalProperties":false})
+        }
+        "db.aggregate" => {
+            json!({"type":"object","properties":{"table":table,"operation":{"type":"string","enum":["count","count_distinct","min","max","sum","avg"]},"column":{"type":"string"},"group_by":{"type":"array","maxItems":3,"items":{"type":"string"}},"filters":filters},"required":["table","operation"],"additionalProperties":false})
+        }
+        "db.search_text" => {
+            json!({"type":"object","properties":{"table":table,"column":{"type":"string","description":"Разрешённая text-колонка."},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["table","query"],"additionalProperties":false})
+        }
+        "chat.search_messages" => {
+            json!({"type":"object","properties":{"column":{"type":"string","default":"text"},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["query"],"additionalProperties":false})
+        }
+        "moderation.list_spammers" => {
+            json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+        _ => json!({"type":"object","properties":{},"additionalProperties":false}),
+    }
+}
+
+fn output_schema(name: &str) -> Value {
+    let page = json!({"type":"object","properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":true}},"next_cursor":{"type":["string","null"]},"has_more":{"type":"boolean"}},"required":["rows","next_cursor","has_more"],"additionalProperties":false});
+    match name {
+        "db.select"
+        | "db.search_text"
+        | "chat.search_messages"
+        | "moderation.list_spammers"
+        | "ask.list_runs"
+        | "voice.list_transcripts"
+        | "memory.list_notes"
+        | "search.list_runs"
+        | "llm.list_generations" => page,
+        "db.fetch_row" | "chat.get_message" => {
+            json!({"type":"object","properties":{"row":{"type":["object","null"],"additionalProperties":true}},"required":["row"],"additionalProperties":false})
+        }
+        "db.count" => {
+            json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false})
+        }
+        "db.list_tables" => {
+            json!({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["tables"],"additionalProperties":false})
+        }
+        "db.describe_table" | "db.aggregate" => {
+            json!({"type":"object","additionalProperties":true})
+        }
+        _ => json!({"type":"object","additionalProperties":true}),
+    }
 }
 
 async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Value, String> {
@@ -415,14 +501,16 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Val
             search_text(&state.pool, &state.manifest, args).await
         }
         "chat.search_messages" => {
+            let mut arguments = arguments;
+            arguments["table"] = Value::String("telegram_messages".into());
             let mut args: SearchTextArgs = decode(arguments)?;
-            args.table = "telegram_messages".into();
             args.column.get_or_insert("text".into());
             search_text(&state.pool, &state.manifest, args).await
         }
         "chat.get_message" => {
-            let mut args: FetchArgs = decode(arguments)?;
-            args.table = "telegram_messages".into();
+            let mut arguments = arguments;
+            arguments["table"] = Value::String("telegram_messages".into());
+            let args: FetchArgs = decode(arguments)?;
             fetch_row(&state.pool, &state.manifest, args).await
         }
         "moderation.list_spammers" => {
@@ -620,7 +708,9 @@ async fn select_rows(
         .map(sanitize_value)
         .collect::<Vec<_>>();
     info!(tool="db.select", table=%args.table, result_count=rows.len(), "MCP database tool completed");
-    Ok(json!({"rows":rows,"next_cursor":has_more.then(|| encode_cursor(offset + limit))}))
+    Ok(
+        json!({"rows":rows,"next_cursor":has_more.then(|| encode_cursor(offset + limit)),"has_more":has_more}),
+    )
 }
 
 async fn fetch_row(pool: &PgPool, manifest: &Manifest, args: FetchArgs) -> Result<Value, String> {
@@ -1044,5 +1134,20 @@ mod tests {
     #[test]
     fn manifest_refuses_injection_identifier() {
         assert!(ensure_identifier("messages;drop table").is_err())
+    }
+    #[test]
+    fn parameterized_tools_publish_input_and_output_schemas() {
+        let tools = tools_list();
+        let find = |name| tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let search = find("db.search_text");
+        assert!(search["inputSchema"]["properties"]["query"].is_object());
+        assert!(
+            search["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("query".into()))
+        );
+        assert!(search["outputSchema"]["properties"]["rows"].is_object());
+        assert!(find("db.select")["inputSchema"]["properties"]["table"].is_object());
     }
 }
