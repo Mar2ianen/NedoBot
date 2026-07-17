@@ -282,6 +282,32 @@ ssh vps-153 'journalctl -u tg-ai-bot-teloxide -f'
 ssh vps-153 'podman ps'
 ```
 
+## Публичный Read-only MCP
+
+`https://nedobot.chickenkiller.com/mcp/nedonews` — намеренно публичный MCP Streamable HTTP endpoint с данными только `НедоNews Chat`. Он не даёт ни SQL, ни shell, ни доступ к `public.*`: отдельная PostgreSQL-роль `nedobot_mcp_ro` читает лишь явно перечисленные views схемы `mcp_public`.
+
+- Миграция `20260717180000_mcp_public_views.sql` задаёт scope и explicit-колонки. Private chat/DM, raw Telegram JSON, file ID, invite link, пути и credential-bearing поля в них отсутствуют.
+- `config/mcp_db_manifest.toml` — проверяемый allowlist views, колонок и их типов. При старте MCP сверяет manifest с БД и отказывается стартовать при schema drift.
+- Внешнему клиенту доступны только структурированные `db.*` и read-only domain tools; значения передаются bind-параметрами, лимит одной страницы — 200, соединений с БД — два, `statement_timeout` — 5 секунд.
+- JSON рекурсивно очищается от ключей наподобие `token`, `secret`, `authorization`, `database_url` и `invite_link`. В логах сохраняются только tool, table/columns/operators, количество строк и latency — без текстов сообщений и значений фильтров.
+
+Публикация новой таблицы или колонки — отдельный reviewed change: правка projection view, затем генерация и review manifest. Автоматически новые поля не раскрываются:
+
+```bash
+cargo run --release --bin generate_mcp_db_manifest -- config/mcp_db_manifest.toml
+git diff -- config/mcp_db_manifest.toml
+```
+
+Подготовка роли выполняется на сервере администратором (пароль не хранится в репозитории):
+
+```bash
+podman exec -i tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot \
+  -v mcp_password='GENERATE_A_LONG_RANDOM_PASSWORD' \
+  -f - < deploy/nedonews-mcp/bootstrap-role.sql
+```
+
+Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; туда не передаются Telegram или LLM secrets. Nginx проксирует исключительно `/mcp/nedonews` на `127.0.0.1:8787`.
+
 Ручной redeploy из локальной папки:
 
 ```bash

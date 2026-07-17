@@ -1,0 +1,1649 @@
+version = 1
+generated_at = "2026-07-17T18:14:36.178064522+00:00"
+source_schema = "public"
+public_schema = "mcp_public"
+
+[scope]
+discussion_chat_id = -1001932061163
+source_channel_id = -1001575496091
+
+[tables.admin_events]
+description = "Проверенная публичная проекция admin_events"
+primary_key = ["id"]
+approximate_rows = 3
+
+[tables.admin_events.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.admin_events.columns.event_type]
+pg_type = "text"
+nullable = true
+
+[tables.admin_events.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.admin_events.columns.payload]
+pg_type = "jsonb"
+nullable = true
+
+[tables.admin_events.columns.telegram_chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.admin_events.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_runs]
+description = "Публичные запуски /ask"
+primary_key = ["id"]
+approximate_rows = 1
+
+[tables.ask_runs.columns.answer_markdown]
+pg_type = "text"
+nullable = true
+
+[tables.ask_runs.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_runs.columns.command_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.ask_runs.columns.completed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.ask_runs.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.ask_runs.columns.error_kind]
+pg_type = "text"
+nullable = true
+
+[tables.ask_runs.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_runs.columns.model]
+pg_type = "text"
+nullable = true
+
+[tables.ask_runs.columns.provider]
+pg_type = "text"
+nullable = true
+
+[tables.ask_runs.columns.question]
+pg_type = "text"
+nullable = true
+
+[tables.ask_runs.columns.reply_to_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.ask_runs.columns.requester_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_runs.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.ask_runs.columns.step_count]
+pg_type = "integer"
+nullable = true
+
+[tables.ask_runs.columns.tool_call_count]
+pg_type = "integer"
+nullable = true
+
+[tables.ask_tool_calls]
+description = "Безопасный аудит вызовов /ask"
+primary_key = ["id"]
+approximate_rows = 1
+
+[tables.ask_tool_calls.columns.arguments]
+pg_type = "jsonb"
+nullable = true
+
+[tables.ask_tool_calls.columns.ask_run_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_tool_calls.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.ask_tool_calls.columns.error_kind]
+pg_type = "text"
+nullable = true
+
+[tables.ask_tool_calls.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_tool_calls.columns.latency_ms]
+pg_type = "bigint"
+nullable = true
+
+[tables.ask_tool_calls.columns.result_count]
+pg_type = "integer"
+nullable = true
+
+[tables.ask_tool_calls.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.ask_tool_calls.columns.step_number]
+pg_type = "integer"
+nullable = true
+
+[tables.ask_tool_calls.columns.tool_name]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs]
+description = "Проверенная публичная проекция avatar_analysis_jobs"
+primary_key = ["id"]
+approximate_rows = 210
+
+[tables.avatar_analysis_jobs.columns.attempts]
+pg_type = "integer"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.error_kind]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.features_json]
+pg_type = "jsonb"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.features_snapshot_hash]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.lease_expires_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.model]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.next_attempt_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.processing_started_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.profile_photo_file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.prompt_version]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.provider]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.avatar_analysis_jobs.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_image_analyses]
+description = "Проверенная публичная проекция avatar_image_analyses"
+primary_key = [
+    "profile_photo_file_unique_id",
+    "prompt_version",
+]
+approximate_rows = 155
+
+[tables.avatar_image_analyses.columns.analyzed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_image_analyses.columns.input_hash]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_image_analyses.columns.model]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_image_analyses.columns.observation_json]
+pg_type = "jsonb"
+nullable = true
+
+[tables.avatar_image_analyses.columns.profile_photo_file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_image_analyses.columns.prompt_version]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_image_analyses.columns.provider]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments]
+description = "Проверенная публичная проекция avatar_profile_assessments"
+primary_key = [
+    "telegram_user_id",
+    "profile_photo_file_unique_id",
+    "features_snapshot_hash",
+    "prompt_version",
+]
+approximate_rows = 270
+
+[tables.avatar_profile_assessments.columns.analyzed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.assessment_json]
+pg_type = "jsonb"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.features_snapshot_hash]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.input_hash]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.model]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.profile_photo_file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.prompt_version]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.provider]
+pg_type = "text"
+nullable = true
+
+[tables.avatar_profile_assessments.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.llm_generations]
+description = "Проверенная публичная проекция llm_generations"
+primary_key = ["id"]
+approximate_rows = 193
+
+[tables.llm_generations.columns.attempts]
+pg_type = "jsonb"
+nullable = true
+
+[tables.llm_generations.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.llm_generations.columns.final_html]
+pg_type = "text"
+nullable = true
+
+[tables.llm_generations.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.llm_generations.columns.image_used]
+pg_type = "boolean"
+nullable = true
+
+[tables.llm_generations.columns.model]
+pg_type = "text"
+nullable = true
+
+[tables.llm_generations.columns.post_comment_job_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.llm_generations.columns.prompt]
+pg_type = "text"
+nullable = true
+
+[tables.llm_generations.columns.provider]
+pg_type = "text"
+nullable = true
+
+[tables.llm_generations.columns.response]
+pg_type = "text"
+nullable = true
+
+[tables.llm_generations.columns.used_search_result_id]
+pg_type = "integer"
+nullable = true
+
+[tables.post_comment_jobs]
+description = "Проверенная публичная проекция post_comment_jobs"
+primary_key = ["id"]
+approximate_rows = 197
+
+[tables.post_comment_jobs.columns.bot_comment_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.post_comment_jobs.columns.cleaned_post_text]
+pg_type = "text"
+nullable = true
+
+[tables.post_comment_jobs.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.post_comment_jobs.columns.discussion_chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_comment_jobs.columns.discussion_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.post_comment_jobs.columns.error]
+pg_type = "text"
+nullable = true
+
+[tables.post_comment_jobs.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_comment_jobs.columns.source_channel_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_comment_jobs.columns.source_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.post_comment_jobs.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.post_comment_jobs.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.post_memory_notes]
+description = "Проверенная публичная проекция post_memory_notes"
+primary_key = ["id"]
+approximate_rows = 106
+
+[tables.post_memory_notes.columns.cautions]
+pg_type = "text"
+nullable = true
+
+[tables.post_memory_notes.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.post_memory_notes.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_memory_notes.columns.keywords]
+pg_type = "text[]"
+nullable = true
+
+[tables.post_memory_notes.columns.last_source_channel_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_memory_notes.columns.last_source_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.post_memory_notes.columns.merged_source_posts]
+pg_type = "integer"
+nullable = true
+
+[tables.post_memory_notes.columns.raw_note]
+pg_type = "text"
+nullable = true
+
+[tables.post_memory_notes.columns.source_channel_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_memory_notes.columns.source_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.post_memory_notes.columns.summary]
+pg_type = "text"
+nullable = true
+
+[tables.post_memory_notes.columns.title]
+pg_type = "text"
+nullable = true
+
+[tables.post_memory_notes.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.search_runs]
+description = "Проверенная публичная проекция search_runs"
+primary_key = ["id"]
+approximate_rows = 107
+
+[tables.search_runs.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.search_runs.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.search_runs.columns.latency_ms]
+pg_type = "bigint"
+nullable = true
+
+[tables.search_runs.columns.post_comment_job_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.search_runs.columns.queries]
+pg_type = "jsonb"
+nullable = true
+
+[tables.search_runs.columns.results]
+pg_type = "jsonb"
+nullable = true
+
+[tables.search_runs.columns.skipped_reason]
+pg_type = "text"
+nullable = true
+
+[tables.search_runs.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_member_events]
+description = "Проверенная публичная проекция telegram_chat_member_events"
+primary_key = ["id"]
+approximate_rows = 2
+
+[tables.telegram_chat_member_events.columns.actor_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.event_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.new_status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.old_status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_member_events.columns.via_chat_folder_invite_link]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_chat_member_snapshots]
+description = "Проверенная публичная проекция telegram_chat_member_snapshots"
+primary_key = [
+    "chat_id",
+    "telegram_user_id",
+]
+approximate_rows = 133
+
+[tables.telegram_chat_member_snapshots.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_member_snapshots.columns.is_admin]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_chat_member_snapshots.columns.is_present]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_chat_member_snapshots.columns.observed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_member_snapshots.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_member_snapshots.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_notes]
+description = "Проверенная публичная проекция telegram_chat_notes"
+primary_key = ["id"]
+approximate_rows = 3
+
+[tables.telegram_chat_notes.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_notes.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_notes.columns.created_by_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_notes.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_notes.columns.note]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_notes.columns.retracted_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_notes.columns.retracted_by_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_notes.columns.source_ask_run_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_notes.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_users]
+description = "Участники и статистика публичного чата"
+primary_key = [
+    "chat_id",
+    "telegram_user_id",
+]
+approximate_rows = 3238
+
+[tables.telegram_chat_users.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.first_joined_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.first_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_chat_users.columns.first_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.is_admin]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_chat_users.columns.is_present]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_chat_users.columns.is_spammer]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_chat_users.columns.last_joined_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.last_left_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.last_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_chat_users.columns.last_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.link_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.media_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.member_observed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.member_status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_users.columns.message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.reply_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.reply_to_bot_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.reply_to_channel_post_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_last_marked_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_profile_labels]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_profile_note]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_reason]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_score]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_type]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_chat_users.columns.spam_types]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_chat_users.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_chat_users.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_chat_users.columns.via_chat_folder_invite_link]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_message_edits]
+description = "Проверенная публичная проекция telegram_message_edits"
+primary_key = ["id"]
+approximate_rows = 639
+
+[tables.telegram_message_edits.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_edits.columns.edited_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_message_edits.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_edits.columns.message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_message_edits.columns.new_text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_message_edits.columns.observed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_message_edits.columns.old_text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_message_edits.columns.user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_reaction_counts]
+description = "Проверенная публичная проекция telegram_message_reaction_counts"
+primary_key = [
+    "chat_id",
+    "message_id",
+]
+approximate_rows = 66149
+
+[tables.telegram_message_reaction_counts.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_reaction_counts.columns.event_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_message_reaction_counts.columns.message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_message_reaction_counts.columns.reactions]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_message_reaction_counts.columns.total_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_reaction_counts.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_message_reactions]
+description = "Проверенная публичная проекция telegram_message_reactions"
+primary_key = ["id"]
+approximate_rows = 91676
+
+[tables.telegram_message_reactions.columns.actor_chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_reactions.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_reactions.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_message_reactions.columns.event_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_message_reactions.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_message_reactions.columns.message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_message_reactions.columns.new_reactions]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_message_reactions.columns.old_reactions]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_message_reactions.columns.user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages]
+description = "Сообщения публичного НедоNews Chat"
+primary_key = [
+    "chat_id",
+    "message_id",
+]
+approximate_rows = 398485
+
+[tables.telegram_messages.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_messages.columns.deleted_by_bot_actor_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.deleted_by_bot_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_messages.columns.deleted_by_bot_reason]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_messages.columns.edit_count]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_messages.columns.edited_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_messages.columns.has_animation]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_audio]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_document]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_links]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_photo]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_sticker]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_video]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.has_voice]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.is_automatic_forward]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_messages.columns.reply_to_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_messages.columns.reply_to_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.sender_chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.source_channel_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.source_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_messages.columns.spam_marked_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_messages.columns.spam_marked_by_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.spam_reason]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_messages.columns.spam_source]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_messages.columns.spam_type]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_messages.columns.text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_messages.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_messages.columns.user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.via_bot_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits]
+description = "Публичные антиспам-аудиты новых участников"
+primary_key = [
+    "chat_id",
+    "telegram_user_id",
+]
+approximate_rows = 3187
+
+[tables.telegram_new_user_profile_audits.columns.account_seen_age_sec]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.analyzed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.avg_message_len]
+pg_type = "double precision"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.bio]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.bio_len]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.burst_messages_per_min]
+pg_type = "double precision"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.chat_age_sec]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.display_name]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.display_name_reuse_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.display_name_reuse_spammer_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.display_name_reused_by_spammers]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.distinct_normalized_message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.duplicate_normalized_message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.first_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.first_message_len]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.first_message_text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.first_name]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.first_name_feminine_pattern]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.first_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.has_emoji_status]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.has_profile_photo]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.is_bot]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.is_premium]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.join_event_seen]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.language_code]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.last_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.last_message_len]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.last_message_text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.last_name]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.last_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.link_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.link_count_24h]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.max_normalized_message_reuse_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.max_pairwise_message_similarity]
+pg_type = "double precision"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.media_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.member_is_admin]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.member_is_present]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.member_status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.message_count_24h]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.normalized_message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.only_channel_post_comments]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.only_replies_or_comments]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_fetch_error]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_has_adult_links]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_has_external_link]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_has_invite_link]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_last_message_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_last_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_last_text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_last_text_len]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_message_count]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_refreshed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_title]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_title_len]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.personal_channel_username]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.primary_risk_class]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_accent_color_id]
+pg_type = "smallint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_count]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_dc_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_dc_source]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_height]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_reuse_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.profile_photo_width]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.repetitive_message_pattern]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.reply_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.reply_to_bot_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.reply_to_channel_post_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.reply_to_comment_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.risk_class_scores]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.risk_labels]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.risk_level]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.risk_reasons]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.risk_score]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.telegram_user_id_bucket]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.telegram_user_id_is_recent]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.telegram_user_id_rank_ratio]
+pg_type = "double precision"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.top_level_message_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.username]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.username_digit_count]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.username_has_digits]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.username_has_random_suffix]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.username_len]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.username_pattern]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.via_chat_folder_invite_link]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.voice_count]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_profile_identity_observations]
+description = "Проверенная публичная проекция telegram_profile_identity_observations"
+primary_key = [
+    "telegram_user_id",
+    "snapshot_key",
+]
+approximate_rows = 450
+
+[tables.telegram_profile_identity_observations.columns.display_name_normalized]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_profile_identity_observations.columns.first_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_profile_identity_observations.columns.last_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_profile_identity_observations.columns.profile_photo_file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_profile_identity_observations.columns.snapshot_key]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_profile_identity_observations.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_profile_identity_observations.columns.username_normalized]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_notes]
+description = "Проверенная публичная проекция telegram_user_notes"
+primary_key = ["id"]
+approximate_rows = 2
+
+[tables.telegram_user_notes.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_notes.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_notes.columns.created_by_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_notes.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_notes.columns.note]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_notes.columns.retracted_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_notes.columns.retracted_by_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_notes.columns.source_ask_run_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_notes.columns.source_message_ids]
+pg_type = "jsonb"
+nullable = true
+
+[tables.telegram_user_notes.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_notes.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_profiles]
+description = "Проверенная публичная проекция telegram_user_profiles"
+primary_key = ["telegram_user_id"]
+approximate_rows = 3040
+
+[tables.telegram_user_profiles.columns.bio]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.emoji_status_custom_emoji_id]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.first_name]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.is_bot]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_user_profiles.columns.is_premium]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_user_profiles.columns.language_code]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.last_name]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.last_seen_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_fetch_error]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_has_adult_links]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_last_message_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_last_message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_last_text]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_message_count]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_refreshed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_title]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.personal_channel_username]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_accent_color_id]
+pg_type = "smallint"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_photo_count]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_photo_file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_photo_height]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_photo_width]
+pg_type = "integer"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_refresh_error]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_user_profiles.columns.profile_refreshed_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_profiles.columns.telegram_user_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.telegram_user_profiles.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.telegram_user_profiles.columns.username]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs]
+description = "Расшифровки голосовых публичного чата"
+primary_key = ["id"]
+approximate_rows = 22
+
+[tables.voice_transcription_jobs.columns.asr_model]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.asr_provider]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.chapters_json]
+pg_type = "jsonb"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.chat_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.cleaned_text]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.cleanup_model]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.cleanup_provider]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.created_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.duration_sec]
+pg_type = "integer"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.error]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.file_size]
+pg_type = "bigint"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.file_unique_id]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.final_html]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.id]
+pg_type = "bigint"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.media_kind]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.message_id]
+pg_type = "integer"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.mime_type]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.raw_transcript]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.render_mode]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.segments_json]
+pg_type = "jsonb"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.status]
+pg_type = "text"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.updated_at]
+pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.voice_transcription_jobs.columns.user_id]
+pg_type = "bigint"
+nullable = true

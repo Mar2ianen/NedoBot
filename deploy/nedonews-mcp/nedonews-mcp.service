@@ -1,0 +1,28 @@
+[Unit]
+Description=NedoNews public read-only MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tg-ai-bot
+Group=tg-ai-bot
+WorkingDirectory=/opt/tg-ai-bot-teloxide
+EnvironmentFile=/etc/nedobot/nedonews-mcp.env
+ExecStart=/opt/tg-ai-bot-teloxide/target/release/nedonews_mcp_http
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/tg-ai-bot-teloxide
+
+[Install]
+WantedBy=multi-user.target
