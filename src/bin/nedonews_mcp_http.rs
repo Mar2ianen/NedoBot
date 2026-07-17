@@ -36,6 +36,7 @@ struct AppState {
     pool: PgPool,
     manifest: Arc<Manifest>,
     allowed_origins: Arc<BTreeSet<String>>,
+    static_avatars_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
         pool,
         manifest,
         allowed_origins: Arc::new(allowed_origins),
+        static_avatars_dir: env::var("MCP_STATIC_AVATARS_DIR")
+            .unwrap_or_else(|_| "static/avatars".into()),
     };
     let app = Router::new()
         .route(&path, post(mcp_post).get(mcp_get))
@@ -576,7 +579,7 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Val
         }
         "chat.get_user_avatar" => {
             let args: UserProfileArgs = decode(arguments)?;
-            chat_get_user_avatar(&state.pool, args).await
+            chat_get_user_avatar(state, args).await
         }
         "moderation.list_spammers" => {
             select_rows(
@@ -868,9 +871,9 @@ async fn chat_get_user_profile(
     Ok(json!({"found": !profile.is_null(), "profile": profile}))
 }
 
-async fn chat_get_user_avatar(pool: &PgPool, args: UserProfileArgs) -> Result<Value, String> {
+async fn chat_get_user_avatar(state: &AppState, args: UserProfileArgs) -> Result<Value, String> {
     let row = sqlx::query("select profile_photo_file_unique_id from mcp_public.telegram_user_profiles where telegram_user_id = $1")
-        .bind(args.telegram_user_id).fetch_optional(pool).await.map_err(|_| "database query failed")?;
+        .bind(args.telegram_user_id).fetch_optional(&state.pool).await.map_err(|_| "database query failed")?;
     let unique_id = row.and_then(|row| {
         row.try_get::<Option<String>, _>("profile_photo_file_unique_id")
             .ok()
@@ -884,7 +887,7 @@ async fn chat_get_user_avatar(pool: &PgPool, args: UserProfileArgs) -> Result<Va
         )
     });
     let avatar_url = filename
-        .filter(|name| Path::new("static/avatars").join(name).is_file())
+        .filter(|name| Path::new(&state.static_avatars_dir).join(name).is_file())
         .map(|name| format!("https://nedobot.chickenkiller.com/tg-ai-bot-static/avatars/{name}"));
     Ok(
         json!({"found": avatar_url.is_some(), "telegram_user_id": args.telegram_user_id, "avatar_url": avatar_url}),
