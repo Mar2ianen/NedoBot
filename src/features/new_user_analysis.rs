@@ -101,6 +101,25 @@ struct MessageStyle {
     period_ending_count: i64,
     emoji_message_count: i64,
     emoji_ending_count: i64,
+    single_emoji_message_count: i64,
+    single_emoji_ending_count: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MessageStylePersona {
+    General,
+    GenericFeminine,
+    SuccessPersona,
+}
+
+impl MessageStylePersona {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::GenericFeminine => "generic_feminine",
+            Self::SuccessPersona => "success_persona",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -608,7 +627,7 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(feminine_name_signal(features));
     risk.add_optional(message_texture_signal(features));
     risk.add_optional(chat_position_signal(features));
-    for signal in generic_feminine_message_style_signals(features) {
+    for signal in message_style_signals(features) {
         risk.add(signal);
     }
     risk.add_optional(reply_to_comment_mitigation_signal(features));
@@ -828,57 +847,109 @@ fn chat_position_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     }
 }
 
-fn generic_feminine_message_style_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
-    if !looks_like_feminine_first_name(features.first_name.as_deref()) || features.message_count > 5
-    {
-        return Vec::new();
-    }
-
+fn message_style_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     let style = &features.message_style;
+    let persona = message_style_persona(features);
     let mut signals = Vec::new();
 
     if style.single_exclamation_ending_count > 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            coefficient: 3,
-            label: "generic_feminine_single_exclamation_ending",
-            reason: "Generic-feminine persona message ends with exactly one exclamation mark",
+            coefficient: message_style_coefficient(persona, 2, 5, 1),
+            label: "single_exclamation_ending",
+            reason: "New-user message ends with exactly one exclamation mark",
         });
     }
     if features.reply_to_channel_post_count > 0 && features.reply_to_comment_count == 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            coefficient: 6,
-            label: "generic_feminine_reply_to_channel_post",
-            reason: "Generic-feminine persona replies directly to a channel post, not another comment",
+            coefficient: message_style_coefficient(persona, 4, 10, 2),
+            label: "reply_to_channel_post_not_comment",
+            reason: "New user replies directly to a channel post, not another comment",
         });
     }
-    if style.emoji_message_count > 0 {
+    if style.single_emoji_message_count > 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            coefficient: 2,
-            label: "generic_feminine_message_has_emoji",
-            reason: "Generic-feminine persona uses emoji in a new-user message",
+            coefficient: message_style_coefficient(persona, 1, 3, -1),
+            label: "single_emoji_message",
+            reason: "New-user message contains exactly one emoji",
         });
     }
-    if style.emoji_ending_count > 0 {
+    if style.single_emoji_ending_count > 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            coefficient: 3,
-            label: "generic_feminine_message_ends_with_emoji",
-            reason: "Generic-feminine persona message ends with emoji",
+            coefficient: message_style_coefficient(persona, 2, 5, 0),
+            label: "single_emoji_message_ending",
+            reason: "New-user message ends with exactly one emoji",
         });
     }
     if style.period_ending_count > 0 {
         signals.push(RiskSignal {
             class: SpamClass::LlmProfileBait,
-            coefficient: 1,
-            label: "generic_feminine_single_period_ending",
-            reason: "Generic-feminine persona message ends with exactly one period",
+            coefficient: message_style_coefficient(persona, 1, 2, 0),
+            label: "single_period_ending",
+            reason: "New-user message ends with exactly one period",
         });
     }
 
     signals
+}
+
+fn message_style_coefficient(
+    persona: MessageStylePersona,
+    general: i32,
+    generic_feminine: i32,
+    success_persona: i32,
+) -> i32 {
+    match persona {
+        MessageStylePersona::General => general,
+        MessageStylePersona::GenericFeminine => generic_feminine,
+        MessageStylePersona::SuccessPersona => success_persona,
+    }
+}
+
+fn message_style_persona(features: &NewUserFeatures) -> MessageStylePersona {
+    if has_success_persona_markers(features) {
+        MessageStylePersona::SuccessPersona
+    } else if looks_like_feminine_first_name(features.first_name.as_deref()) {
+        MessageStylePersona::GenericFeminine
+    } else {
+        MessageStylePersona::General
+    }
+}
+
+fn has_success_persona_markers(features: &NewUserFeatures) -> bool {
+    let profile_text = format!(
+        "{}\n{}\n{}\n{}",
+        features.display_name.as_deref().unwrap_or_default(),
+        features.bio.as_deref().unwrap_or_default(),
+        features
+            .personal_channel_title
+            .as_deref()
+            .unwrap_or_default(),
+        features
+            .personal_channel_last_text
+            .as_deref()
+            .unwrap_or_default(),
+    )
+    .to_lowercase();
+    [
+        "бизнес",
+        "доход",
+        "заработ",
+        "инвест",
+        "крипт",
+        "трейдер",
+        "успеш",
+        "предприним",
+        "financial",
+        "invest",
+        "crypto",
+        "trader",
+    ]
+    .iter()
+    .any(|marker| profile_text.contains(marker))
 }
 
 fn reply_to_comment_mitigation_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1160,11 +1231,14 @@ async fn save_audit(
             "repetitive_message_pattern": features.text_texture.repetitive_pattern,
         },
         "message_style": {
+            "persona": message_style_persona(features).as_str(),
             "text_message_count": features.message_style.text_message_count,
             "single_exclamation_ending_count": features.message_style.single_exclamation_ending_count,
             "period_ending_count": features.message_style.period_ending_count,
             "emoji_message_count": features.message_style.emoji_message_count,
             "emoji_ending_count": features.message_style.emoji_ending_count,
+            "single_emoji_message_count": features.message_style.single_emoji_message_count,
+            "single_emoji_ending_count": features.message_style.single_emoji_ending_count,
         },
     });
 
@@ -1528,6 +1602,12 @@ fn message_style(texts: &[String]) -> MessageStyle {
             if ends_with_emoji(text) {
                 style.emoji_ending_count += 1;
             }
+            if emoji_scalar_count(text) == 1 {
+                style.single_emoji_message_count += 1;
+                if ends_with_emoji(text) {
+                    style.single_emoji_ending_count += 1;
+                }
+            }
             style
         })
 }
@@ -1552,6 +1632,10 @@ fn is_emoji(ch: char) -> bool {
         ch as u32,
         0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2300..=0x23FF | 0x2B00..=0x2BFF
     )
+}
+
+fn emoji_scalar_count(text: &str) -> usize {
+    text.chars().filter(|ch| is_emoji(*ch)).count()
 }
 
 fn contains_cjk(text: &str) -> bool {
@@ -1788,6 +1872,30 @@ mod tests {
         assert_eq!(style.period_ending_count, 1);
         assert_eq!(style.emoji_message_count, 1);
         assert_eq!(style.emoji_ending_count, 1);
+        assert_eq!(style.single_emoji_message_count, 1);
+        assert_eq!(style.single_emoji_ending_count, 1);
+    }
+
+    #[test]
+    fn message_style_uses_single_emoji_not_any_emoji_count() {
+        assert_eq!(emoji_scalar_count("один ❤️"), 1);
+        assert_eq!(emoji_scalar_count("два 🌊❤️"), 2);
+    }
+
+    #[test]
+    fn message_style_weights_apply_to_every_persona() {
+        assert_eq!(
+            message_style_coefficient(MessageStylePersona::General, 2, 5, 1),
+            2
+        );
+        assert_eq!(
+            message_style_coefficient(MessageStylePersona::GenericFeminine, 2, 5, 1),
+            5
+        );
+        assert_eq!(
+            message_style_coefficient(MessageStylePersona::SuccessPersona, 1, 3, -1),
+            -1
+        );
     }
 
     #[test]
