@@ -567,6 +567,7 @@ fn normalize_resolve_label(value: &str) -> String {
     // Это применяется только в fallback-поиске, точное сопоставление выше остаётся неизменным.
     normalized
         .replace("ou", "o")
+        .replace("eim", "ame")
         .replace("ei", "e")
         .replace("ie", "e")
 }
@@ -764,11 +765,18 @@ mod tests {
     #[test]
     fn fuzzy_resolution_accepts_transliterated_display_name() {
         let variants = resolve_query_variants("ноунейм");
-        assert!(
-            variants
-                .iter()
-                .any(|variant| normalized_edit_distance(variant, "NoName") <= 0.45)
-        );
+        let best_no_name = variants
+            .iter()
+            .map(|variant| normalized_edit_distance(variant, "NoName"))
+            .min_by(|left, right| left.partial_cmp(right).unwrap())
+            .unwrap();
+        let best_none = variants
+            .iter()
+            .map(|variant| normalized_edit_distance(variant, "None"))
+            .min_by(|left, right| left.partial_cmp(right).unwrap())
+            .unwrap();
+        assert!(best_no_name <= 0.45);
+        assert!(best_no_name < best_none, "{best_no_name} >= {best_none}");
     }
 
     #[test]
