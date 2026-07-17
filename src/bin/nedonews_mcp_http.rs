@@ -124,6 +124,12 @@ struct FetchArgs {
 }
 
 #[derive(Deserialize)]
+struct ChatMessageArgs {
+    chat_id: i64,
+    message_id: i32,
+}
+
+#[derive(Deserialize)]
 struct CountArgs {
     table: String,
     #[serde(default)]
@@ -359,23 +365,50 @@ async fn dispatch(state: &AppState, request: JsonRpcRequest) -> Result<Value, St
 
 fn tools_list() -> Vec<Value> {
     let names = [
-        ("db.list_tables", "Каталог проверенных публичных views."),
-        ("db.describe_table", "Схема одной публичной view."),
+        (
+            "db.list_tables",
+            "Возвращает каталог разрешённых публичных view и их primary key. Используй перед любой универсальной DB-выборкой; другие таблицы недоступны.",
+        ),
+        (
+            "db.describe_table",
+            "Показывает колонки, типы, primary key и разрешённые операторы одной публичной view. Используй перед db.select, если не знаешь точные поля.",
+        ),
         (
             "db.select",
-            "Структурированная выборка с cursor pagination.",
+            "Выполняет read-only выборку из разрешённой публичной view с проверенными фильтрами, сортировкой, лимитом и cursor pagination. Не принимает произвольный SQL.",
         ),
-        ("db.fetch_row", "Строка по полному primary key."),
-        ("db.count", "Количество строк по фильтрам."),
-        ("db.aggregate", "Безопасная агрегация."),
+        (
+            "db.fetch_row",
+            "Возвращает одну строку по полному primary key разрешённой view. Для неизвестного сообщения сначала используй поиск.",
+        ),
+        (
+            "db.count",
+            "Считает строки разрешённой публичной view по структурированным фильтрам без выгрузки содержимого.",
+        ),
+        (
+            "db.aggregate",
+            "Выполняет безопасную count/min/max/sum/avg агрегацию с максимум тремя group_by полями.",
+        ),
         (
             "db.search_text",
-            "Текстовый поиск по разрешённой text-колонке.",
+            "Ищет подстроку в одной разрешённой text-колонке публичной view. Для структурированных фильтров и гибкой сортировки используй db.select.",
         ),
-        ("chat.search_messages", "Поиск сообщений публичного чата."),
-        ("chat.get_message", "Получение сообщения по ID."),
-        ("moderation.list_spammers", "Список размеченных спамеров."),
-        ("ask.list_runs", "Аудит публичных /ask запусков."),
+        (
+            "chat.search_messages",
+            "Ищет текст среди сообщений публичного НедоNews Chat. Возвращает страницы сообщений; для точного сообщения используй chat.get_message.",
+        ),
+        (
+            "chat.get_message",
+            "Возвращает одно сообщение публичного Telegram-чата по точной паре chat_id и message_id. Используй после поиска или когда IDs уже известны.",
+        ),
+        (
+            "moderation.list_spammers",
+            "Возвращает размеченных спамеров публичного чата, их score, labels и причины. Обычные сообщения чата не возвращает.",
+        ),
+        (
+            "ask.list_runs",
+            "Возвращает последние публичные запуски /ask со статусом, временем, моделью и итогом. Используй для аудита работы ассистента, не для поиска сообщений.",
+        ),
         (
             "voice.list_transcripts",
             "Расшифровки голосовых из публичного чата.",
@@ -424,7 +457,7 @@ fn input_schema(name: &str) -> Value {
             json!({"type":"object","properties":{"table":table,"key":{"type":"object","additionalProperties":true}},"required":["table","key"],"additionalProperties":false})
         }
         "chat.get_message" => {
-            json!({"type":"object","properties":{"key":{"type":"object","additionalProperties":true}},"required":["key"],"additionalProperties":false})
+            json!({"type":"object","properties":{"chat_id":{"type":"integer","description":"Telegram ID публичного чата; сейчас -1001932061163."},"message_id":{"type":"integer","description":"ID сообщения внутри чата."}},"required":["chat_id","message_id"],"additionalProperties":false})
         }
         "db.count" => {
             json!({"type":"object","properties":{"table":table,"filters":filters},"required":["table"],"additionalProperties":false})
@@ -433,7 +466,7 @@ fn input_schema(name: &str) -> Value {
             json!({"type":"object","properties":{"table":table,"operation":{"type":"string","enum":["count","count_distinct","min","max","sum","avg"]},"column":{"type":"string"},"group_by":{"type":"array","maxItems":3,"items":{"type":"string"}},"filters":filters},"required":["table","operation"],"additionalProperties":false})
         }
         "db.search_text" => {
-            json!({"type":"object","properties":{"table":table,"column":{"type":"string","description":"Разрешённая text-колонка."},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["table","query"],"additionalProperties":false})
+            json!({"type":"object","properties":{"table":table,"column":{"type":"string","description":"Разрешённая text-колонка."},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["table","column","query"],"additionalProperties":false})
         }
         "chat.search_messages" => {
             json!({"type":"object","properties":{"column":{"type":"string","default":"text"},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["query"],"additionalProperties":false})
@@ -457,8 +490,11 @@ fn output_schema(name: &str) -> Value {
         | "memory.list_notes"
         | "search.list_runs"
         | "llm.list_generations" => page,
-        "db.fetch_row" | "chat.get_message" => {
+        "db.fetch_row" => {
             json!({"type":"object","properties":{"row":{"type":["object","null"],"additionalProperties":true}},"required":["row"],"additionalProperties":false})
+        }
+        "chat.get_message" => {
+            json!({"type":"object","properties":{"found":{"type":"boolean"},"chat_id":{"type":"integer"},"message_id":{"type":"integer"},"author_id":{"type":["integer","null"]},"text":{"type":["string","null"]},"created_at":{"type":["string","null"]},"message":{"type":["object","null"],"additionalProperties":true}},"required":["found","chat_id","message_id","author_id","text","created_at","message"],"additionalProperties":false})
         }
         "db.count" => {
             json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false})
@@ -508,10 +544,8 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Val
             search_text(&state.pool, &state.manifest, args).await
         }
         "chat.get_message" => {
-            let mut arguments = arguments;
-            arguments["table"] = Value::String("telegram_messages".into());
-            let args: FetchArgs = decode(arguments)?;
-            fetch_row(&state.pool, &state.manifest, args).await
+            let args: ChatMessageArgs = decode(arguments)?;
+            chat_get_message(&state.pool, &state.manifest, args).await
         }
         "moderation.list_spammers" => {
             select_rows(
@@ -747,6 +781,39 @@ async fn fetch_row(pool: &PgPool, manifest: &Manifest, args: FetchArgs) -> Resul
     )
     .await?;
     Ok(json!({"row":result["rows"].as_array().and_then(|rows| rows.first()).cloned()}))
+}
+
+async fn chat_get_message(
+    pool: &PgPool,
+    manifest: &Manifest,
+    args: ChatMessageArgs,
+) -> Result<Value, String> {
+    if args.chat_id != -1001932061163 {
+        return Err("chat_id is outside the public chat scope".into());
+    }
+    let result = fetch_row(
+        pool,
+        manifest,
+        FetchArgs {
+            table: "telegram_messages".into(),
+            key: BTreeMap::from([
+                ("chat_id".into(), Value::from(args.chat_id)),
+                ("message_id".into(), Value::from(args.message_id)),
+            ]),
+        },
+    )
+    .await?;
+    let message = result["row"].clone();
+    let found = !message.is_null();
+    Ok(json!({
+        "found": found,
+        "chat_id": args.chat_id,
+        "message_id": args.message_id,
+        "author_id": message["user_id"].clone(),
+        "text": message["text"].clone(),
+        "created_at": message["created_at"].clone(),
+        "message": message,
+    }))
 }
 
 async fn count_rows(pool: &PgPool, manifest: &Manifest, args: CountArgs) -> Result<Value, String> {
@@ -1149,5 +1216,9 @@ mod tests {
         );
         assert!(search["outputSchema"]["properties"]["rows"].is_object());
         assert!(find("db.select")["inputSchema"]["properties"]["table"].is_object());
+        let message = find("chat.get_message");
+        assert!(message["inputSchema"]["properties"]["chat_id"].is_object());
+        assert!(message["inputSchema"]["properties"]["message_id"].is_object());
+        assert!(message["outputSchema"]["properties"]["message_id"].is_object());
     }
 }
