@@ -162,7 +162,7 @@ impl Config {
             search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
                 .or_else(|| Some("web_fetch_exa".to_string())),
             search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 4),
-            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 9000),
+            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 16_000),
             comment_blocked_source_domains: env_list_csv_or(
                 "COMMENT_BLOCKED_SOURCE_DOMAINS",
                 DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS,
