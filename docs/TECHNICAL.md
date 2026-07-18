@@ -89,12 +89,13 @@ SEARCH_MCP_COMMAND=
 SEARCH_MCP_ARGS=
 SEARCH_MCP_ENV=
 SEARCH_MCP_TIMEOUT_SEC=8
+SEARCH_QUERY_TIMEOUT_SEC=12
 SEARCH_MCP_TOOL_WEB=web_search
 SEARCH_MCP_TOOL_GITHUB=github_search
 SEARCH_MCP_TOOL_REDDIT=reddit_search
 SEARCH_MCP_TOOL_FETCH=web_fetch_exa
 SEARCH_FETCH_TOP_N=4
-SEARCH_FETCH_MAX_CHARS=9000
+SEARCH_FETCH_MAX_CHARS=16000
 SEARCH_GITHUB_MCP_COMMAND=
 SEARCH_GITHUB_MCP_ARGS=
 SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
@@ -162,9 +163,10 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 Поведение gated by config:
 
 - `SEARCH_ENABLED=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт через обычный `LLM_PROVIDER` без внешнего поиска.
-- `SEARCH_EXTRACT_PROVIDER` / `SEARCH_EXTRACT_MODEL` задают LLM, который из очищенного поста возвращает JSON с максимум 3 запросами для `web`, `github` или `reddit`.
+- `SEARCH_EXTRACT_PROVIDER` / `SEARCH_EXTRACT_MODEL` задают LLM, который из очищенного поста возвращает JSON с максимум 4 запросами для `web`, `github` или `reddit`.
 - `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают основной MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
 - `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
+- `SEARCH_QUERY_TIMEOUT_SEC` — отдельный deadline одного source query. Таймаут GitHub, Reddit или web не отбрасывает результаты остальных источников.
 - `SEARCH_MCP_TOOL_WEB`, `SEARCH_MCP_TOOL_GITHUB`, `SEARCH_MCP_TOOL_REDDIT` задают имена MCP tools для основного MCP server.
 - `SEARCH_MCP_TOOL_FETCH` включает дополнительный fetch top URL после search. Для Exa это `web_fetch_exa`.
 - `SEARCH_GITHUB_MCP_COMMAND` / `SEARCH_GITHUB_MCP_ARGS` включают отдельный GitHub MCP server для запросов `source=github`; если они не заданы, GitHub-запросы идут через основной `SEARCH_MCP_TOOL_GITHUB`.
@@ -172,8 +174,8 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `SEARCH_GITHUB_MCP_TOOLS` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
 - Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
-- Любая ошибка extract/MCP/parsing/timeout превращается в skipped `SearchContext`, комментарий не ломается.
-- Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. Первые fetched-результаты получают до 6000 символов каждый, общий бюджет search-контекста — 14 000 символов; URL остаётся только в `SearchContext` для безопасного рендера.
+- Ошибка extract превращается в skipped `SearchContext`; ошибка или таймаут отдельного MCP source оставляет успешные результаты других источников доступными для комментария.
+- Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. В промпт помещается до 24 результатов, до 16 000 символов на результат и до 160 000 символов суммарно; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
 
 Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
@@ -184,12 +186,13 @@ SEARCH_MCP_COMMAND=npx
 SEARCH_MCP_ARGS="-y mcp-remote https://mcp.exa.ai/mcp"
 SEARCH_MCP_ENV=PATH,HOME
 SEARCH_MCP_TIMEOUT_SEC=30
+SEARCH_QUERY_TIMEOUT_SEC=12
 SEARCH_MCP_TOOL_WEB=web_search_exa
 SEARCH_MCP_TOOL_GITHUB=web_search_exa
 SEARCH_MCP_TOOL_REDDIT=web_search_exa
 SEARCH_MCP_TOOL_FETCH=web_fetch_exa
 SEARCH_FETCH_TOP_N=4
-SEARCH_FETCH_MAX_CHARS=9000
+SEARCH_FETCH_MAX_CHARS=16000
 ```
 
 Для новостей об утилитах можно добавить GitHub MCP поверх Exa, чтобы `source=github` ходил в GitHub issues/code отдельно:
