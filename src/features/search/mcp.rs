@@ -40,15 +40,37 @@ pub async fn search_for_ask(
 #[async_trait::async_trait]
 impl SearchProvider for McpSearchProvider {
     async fn search(&self, query: &SearchQuery) -> anyhow::Result<Vec<SearchResult>> {
-        let timeout_duration = Duration::from_secs(self.config.search_mcp_timeout_sec);
+        let started = std::time::Instant::now();
+        let timeout_duration = Duration::from_secs(self.config.search_query_timeout_sec);
         match timeout(timeout_duration, search_with_mcp(&self.config, query)).await {
-            Ok(Ok(results)) => Ok(results),
+            Ok(Ok(results)) => {
+                tracing::info!(
+                    source = ?query.source,
+                    query = %query.text,
+                    result_count = results.len(),
+                    latency_ms = started.elapsed().as_millis(),
+                    "search source completed"
+                );
+                Ok(results)
+            }
             Ok(Err(err)) => {
-                tracing::warn!(%err, source = ?query.source, "MCP search failed");
+                tracing::warn!(
+                    %err,
+                    source = ?query.source,
+                    query = %query.text,
+                    latency_ms = started.elapsed().as_millis(),
+                    "MCP search source failed"
+                );
                 Ok(Vec::new())
             }
             Err(_) => {
-                tracing::warn!(source = ?query.source, "MCP search timed out");
+                tracing::warn!(
+                    source = ?query.source,
+                    query = %query.text,
+                    timeout_secs = self.config.search_query_timeout_sec,
+                    latency_ms = started.elapsed().as_millis(),
+                    "MCP search source timed out"
+                );
                 Ok(Vec::new())
             }
         }

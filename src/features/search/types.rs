@@ -6,6 +6,16 @@ pub enum SearchSource {
     Reddit,
 }
 
+impl SearchSource {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Web => "веб-поиск",
+            Self::Github => "GitHub",
+            Self::Reddit => "Reddit",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SearchQuery {
     pub source: SearchSource,

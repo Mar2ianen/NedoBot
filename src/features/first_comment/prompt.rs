@@ -106,6 +106,7 @@ struct SearchPromptContext {
 struct SearchPromptResult {
     id: usize,
     source: SearchSource,
+    source_name: String,
     title: String,
     content: String,
 }
@@ -239,12 +240,34 @@ fn render_search_results_for_prompt(results: &[SearchResult]) -> Vec<SearchPromp
         rendered.push(SearchPromptResult {
             id: index + 1,
             source: result.source,
+            source_name: search_result_source_name(result),
             title,
             content,
         });
     }
 
     rendered
+}
+
+fn search_result_source_name(result: &SearchResult) -> String {
+    match result.source {
+        SearchSource::Github | SearchSource::Reddit => result.source.display_name().to_string(),
+        SearchSource::Web => source_name_from_url(&result.url)
+            .unwrap_or_else(|| result.source.display_name().to_string()),
+    }
+}
+
+fn source_name_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.trim_start_matches("www.");
+    let name = host.split('.').next()?.trim();
+    (!name.is_empty()).then(|| {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return name.to_string();
+        };
+        format!("{}{}", first.to_uppercase(), chars.as_str())
+    })
 }
 
 fn compact_text(text: &str) -> String {
@@ -390,11 +413,24 @@ mod tests {
         assert_eq!(context["search"]["available"], true);
         assert_eq!(context["search"]["results"][0]["id"], 1);
         assert_eq!(context["search"]["results"][0]["source"], "web");
+        assert_eq!(context["search"]["results"][0]["source_name"], "Example");
         assert_eq!(
             context["search"]["results"][0]["content"],
             "Release notes mention compiler improvements."
         );
         assert!(!prompt.user.contains("https://example.com/rust"));
+    }
+
+    #[test]
+    fn github_results_keep_their_source_name_for_natural_attribution() {
+        let result = SearchResult {
+            source: SearchSource::Github,
+            title: "Release".to_string(),
+            url: "https://github.com/example/project/releases/tag/v1".to_string(),
+            snippet: "Release notes".to_string(),
+        };
+
+        assert_eq!(search_result_source_name(&result), "GitHub");
     }
 
     #[test]
