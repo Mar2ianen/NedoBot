@@ -51,6 +51,7 @@ pub struct Config {
     pub search_mcp_args: Vec<String>,
     pub search_mcp_env: Vec<String>,
     pub search_mcp_timeout_sec: u64,
+    pub search_query_timeout_sec: u64,
     pub search_mcp_tools: SearchMcpTools,
     pub search_mcp_fetch_tool: Option<String>,
     pub search_fetch_top_n: usize,
@@ -152,6 +153,7 @@ impl Config {
             search_mcp_args: env_args("SEARCH_MCP_ARGS"),
             search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
             search_mcp_timeout_sec: env_u64("SEARCH_MCP_TIMEOUT_SEC", 8),
+            search_query_timeout_sec: env_u64("SEARCH_QUERY_TIMEOUT_SEC", 12),
             search_mcp_tools: SearchMcpTools {
                 web: env_or("SEARCH_MCP_TOOL_WEB", "web_search"),
                 github: env_or("SEARCH_MCP_TOOL_GITHUB", "github_search"),
@@ -401,6 +403,10 @@ fn validate_search_config(errors: &mut Vec<String>, config: &Config) {
         errors.push("SEARCH_MCP_TIMEOUT_SEC must be greater than 0".to_string());
     }
 
+    if config.search_query_timeout_sec == 0 {
+        errors.push("SEARCH_QUERY_TIMEOUT_SEC must be greater than 0".to_string());
+    }
+
     if config.search_fetch_max_chars == 0 {
         errors.push("SEARCH_FETCH_MAX_CHARS must be greater than 0".to_string());
     }
@@ -585,6 +591,7 @@ mod tests {
             search_mcp_args: Vec::new(),
             search_mcp_env: Vec::new(),
             search_mcp_timeout_sec: 8,
+            search_query_timeout_sec: 8,
             search_mcp_tools: SearchMcpTools {
                 web: "web_search".to_string(),
                 github: "github_search".to_string(),

@@ -201,6 +201,7 @@ mod tests {
             search_mcp_args: Vec::new(),
             search_mcp_env: Vec::new(),
             search_mcp_timeout_sec: 8,
+            search_query_timeout_sec: 8,
             search_mcp_tools: SearchMcpTools {
                 web: "web_search".to_string(),
                 github: "github_search".to_string(),
