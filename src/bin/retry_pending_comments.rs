@@ -230,6 +230,8 @@ async fn retry_job(
         job.source_channel_id,
         job.source_message_id,
         &job.cleaned_post_text,
+        &draft.comment,
+        None,
     )
     .await
     {
