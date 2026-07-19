@@ -168,6 +168,10 @@ pub async fn maybe_comment_post(
         candidate.source_channel_id,
         candidate.source_message_id.0,
         &clean_post,
+        &draft.comment,
+        draft
+            .used_search_result_id
+            .and_then(|id| search_context.results.get(id.saturating_sub(1))),
     )
     .await
     {
