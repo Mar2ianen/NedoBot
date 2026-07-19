@@ -1,8 +1,9 @@
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::features::search::extract::extract_search_queries;
@@ -20,19 +21,7 @@ pub async fn run_search(config: &Config, clean_post: &str) -> SearchContext {
         return SearchContext::skipped("disabled", started.elapsed().as_millis());
     }
 
-    let timeout_duration = Duration::from_secs(config.search_mcp_timeout_sec);
-    match timeout(
-        timeout_duration,
-        run_search_enabled(config, clean_post, started),
-    )
-    .await
-    {
-        Ok(context) => context,
-        Err(_) => {
-            tracing::warn!("search run timed out");
-            SearchContext::skipped("timeout", started.elapsed().as_millis())
-        }
-    }
+    run_search_enabled(config, clean_post, started).await
 }
 
 async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant) -> SearchContext {
@@ -75,11 +64,26 @@ async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant)
 
 async fn run_queries_in_parallel(config: &Config, queries: &[SearchQuery]) -> Vec<SearchResult> {
     let mut tasks = JoinSet::new();
+    // Web and Reddit share the same remote Exa MCP. Starting every query at once
+    // made those short-lived proxy processes compete with each other and lose
+    // otherwise valid search responses. GitHub uses a separate MCP process.
+    let shared_mcp_slots = Arc::new(Semaphore::new(2));
 
     for (index, query) in queries.iter().cloned().enumerate() {
         let config = config.clone();
+        let shared_mcp_slots = Arc::clone(&shared_mcp_slots);
         tasks.spawn(async move {
             let source = query.source;
+            let _shared_mcp_permit = if uses_shared_mcp(&config, source) {
+                Some(
+                    shared_mcp_slots
+                        .acquire_owned()
+                        .await
+                        .expect("shared MCP semaphore is never closed"),
+                )
+            } else {
+                None
+            };
             let provider = McpSearchProvider::new(config);
             (index, source, provider.search(&query).await)
         });
@@ -97,6 +101,11 @@ async fn run_queries_in_parallel(config: &Config, queries: &[SearchQuery]) -> Ve
     }
 
     results_by_query.into_iter().flatten().collect()
+}
+
+fn uses_shared_mcp(config: &Config, source: crate::features::search::types::SearchSource) -> bool {
+    source != crate::features::search::types::SearchSource::Github
+        || config.search_github_mcp_command.is_none()
 }
 
 fn dedupe_results(results: Vec<SearchResult>) -> Vec<SearchResult> {

@@ -104,6 +104,10 @@ pub fn validate_first_comment_draft_with_search_and_policy(
     let draft = parse_first_comment_draft(value)?;
     let source_link = validate_comment_body(&draft, config)?;
 
+    if source_link_available && draft.used_search_result_id.is_none() {
+        anyhow::bail!("a usable search result is available; comment must cite one new source fact");
+    }
+
     if let Some(result_id) = draft.used_search_result_id {
         let result = search_result_by_id(search_results, result_id)?;
         if source_link.is_some()
@@ -383,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_unused_search_context_when_it_adds_no_new_angle() {
+    fn rejects_unused_search_context_when_a_source_is_available() {
         let results = vec![SearchResult {
             source: crate::features::search::types::SearchSource::Web,
             title: "Release notes".to_string(),
@@ -391,11 +395,11 @@ mod tests {
             snippet: "Version 2.0 is available.".to_string(),
         }];
 
-        validate_first_comment_draft_with_search(
+        assert!(validate_first_comment_draft_with_search(
             r#"{"comment":"Обновление уже вышло. Детали в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
             &results,
             true,
         )
-        .unwrap();
+        .is_err());
     }
 }

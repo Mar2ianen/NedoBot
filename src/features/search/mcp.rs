@@ -14,6 +14,8 @@ use crate::features::search::types::{
     MAX_RESULT_SNIPPET_CHARS, MAX_RESULT_TITLE_CHARS, SearchQuery, SearchResult, SearchSource,
 };
 
+const FETCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(4);
+
 pub struct McpSearchProvider {
     config: Config,
 }
@@ -185,38 +187,82 @@ async fn run_mcp_flow(
     let mut results = Vec::new();
     let mut request_id = 2;
     for tool_name in &process_config.tool_names {
-        write_json_line(
-            &mut stdin,
-            &tools_call_request(request_id, tool_name, tool_arguments(tool_name, query)),
-        )
-        .await?;
+        let request = tools_call_request(request_id, tool_name, tool_arguments(tool_name, query));
         request_id += 1;
+        if let Err(err) = write_json_line(&mut stdin, &request).await {
+            tracing::warn!(
+                %err,
+                source = ?query.source,
+                tool = %tool_name,
+                result_count = results.len(),
+                "MCP search tool write failed after partial results"
+            );
+            break;
+        }
 
-        let response = read_json_line(&mut stdout).await?;
-        results.extend(parse_mcp_tool_response(query.source, &response)?);
+        let response = match read_json_line(&mut stdout).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    source = ?query.source,
+                    tool = %tool_name,
+                    result_count = results.len(),
+                    "MCP search tool failed after partial results"
+                );
+                break;
+            }
+        };
+        match parse_mcp_tool_response(query.source, &response) {
+            Ok(mut parsed) => results.append(&mut parsed),
+            Err(err) => tracing::warn!(
+                %err,
+                source = ?query.source,
+                tool = %tool_name,
+                result_count = results.len(),
+                "MCP search response could not be parsed after partial results"
+            ),
+        }
     }
     results.retain(|result| is_allowed_search_result(config, result));
 
     if let Some(fetch_tool) = process_config.fetch_tool.as_deref() {
         let urls = fetch_urls(&results, config, config.search_fetch_top_n);
         for url in &urls {
-            write_json_line(
-                &mut stdin,
-                &fetch_call_request(
-                    request_id,
-                    fetch_tool,
-                    std::slice::from_ref(url),
-                    config.search_fetch_max_chars,
-                ),
-            )
-            .await?;
+            let fetch_request = fetch_call_request(
+                request_id,
+                fetch_tool,
+                std::slice::from_ref(url),
+                config.search_fetch_max_chars,
+            );
             request_id += 1;
 
-            let response = read_json_line(&mut stdout).await?;
-            let mut fetched_results = parse_mcp_tool_response(query.source, &response)?;
-            attach_requested_url(&mut fetched_results, url);
-            fetched_results.retain(|result| is_allowed_search_result(config, result));
-            enrich_results_with_fetch(&mut results, fetched_results);
+            let response = timeout(FETCH_RESPONSE_TIMEOUT, async {
+                write_json_line(&mut stdin, &fetch_request).await?;
+                read_json_line(&mut stdout).await
+            })
+            .await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, source = ?query.source, url, "MCP fetch failed; keeping raw search result");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(source = ?query.source, url, "MCP fetch timed out; keeping raw search result");
+                    continue;
+                }
+            };
+            match parse_mcp_tool_response(query.source, &response) {
+                Ok(mut fetched_results) => {
+                    attach_requested_url(&mut fetched_results, url);
+                    fetched_results.retain(|result| is_allowed_search_result(config, result));
+                    enrich_results_with_fetch(&mut results, fetched_results);
+                }
+                Err(err) => {
+                    tracing::warn!(%err, source = ?query.source, url, "MCP fetch response could not be parsed; keeping raw search result")
+                }
+            }
         }
     }
 
@@ -450,19 +496,23 @@ async fn enrich_github_results(
 ) {
     let resources = github_resources(results, top_n);
     for (index, resource) in resources {
-        if let Err(err) =
-            write_json_line(stdin, &github_fetch_call_request(*request_id, &resource)).await
-        {
-            tracing::debug!(%err, "failed to write GitHub MCP fetch request");
-            return;
-        }
+        let request = github_fetch_call_request(*request_id, &resource);
         *request_id += 1;
 
-        let response = match read_json_line(stdout).await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::debug!(%err, "failed to read GitHub MCP fetch response");
-                return;
+        let response = match timeout(FETCH_RESPONSE_TIMEOUT, async {
+            write_json_line(stdin, &request).await?;
+            read_json_line(stdout).await
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "GitHub MCP fetch failed; keeping raw search result");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("GitHub MCP fetch timed out; keeping raw search result");
+                continue;
             }
         };
 
