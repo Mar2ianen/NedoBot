@@ -89,7 +89,7 @@ SEARCH_MCP_COMMAND=
 SEARCH_MCP_ARGS=
 SEARCH_MCP_ENV=
 SEARCH_MCP_TIMEOUT_SEC=8
-SEARCH_QUERY_TIMEOUT_SEC=12
+SEARCH_QUERY_TIMEOUT_SEC=20
 SEARCH_MCP_TOOL_WEB=web_search
 SEARCH_MCP_TOOL_GITHUB=github_search
 SEARCH_MCP_TOOL_REDDIT=reddit_search
@@ -186,7 +186,7 @@ SEARCH_MCP_COMMAND=npx
 SEARCH_MCP_ARGS="-y mcp-remote https://mcp.exa.ai/mcp"
 SEARCH_MCP_ENV=PATH,HOME
 SEARCH_MCP_TIMEOUT_SEC=30
-SEARCH_QUERY_TIMEOUT_SEC=12
+SEARCH_QUERY_TIMEOUT_SEC=20
 SEARCH_MCP_TOOL_WEB=web_search_exa
 SEARCH_MCP_TOOL_GITHUB=web_search_exa
 SEARCH_MCP_TOOL_REDDIT=web_search_exa
@@ -407,7 +407,7 @@ Cleanup prompt для расшифровки голосовых лежит в [p
 
 Модель первого комментария возвращает structured JSON: `{"comment":"...","used_search_result_id":null}`. В `comment` обязателен ровно один `{CHAT_LINK}` или вариант с разрешённым текстом ссылки вроде `{CHAT_LINK:чате}` / `{CHAT_LINK:комментах}`. Gemini получает JSON Schema через API, Ollama fallback — ту же schema через `format`; для остальных совместимых провайдеров сохраняется строгий JSON-контракт в prompt.
 
-Если поиск вернул результат с публичным HTTP(S) URL, модель ищет отдельный угол, которого нет в новости: связанный релиз, ограничение, последствие, сравнение, цену, changelog или реакцию сообщества. Поиск нельзя использовать только для подтверждения или пересказа факта из поста. Если полезного дополнения нет, модель возвращает `used_search_result_id: null` и пишет уникальную реплику по самой новости. Если внешний факт использован, его one-based ID сохраняется в `llm_generations`, а `{SOURCE_LINK:N:подпись}` становится обязательным. Подпись должна быть частью фразы («как пишет VideoCardz»), а не отдельным «детали» или «источник». `COMMENT_BLOCKED_SOURCE_DOMAINS` исключает указанные домены и поддомены до fetch, из prompt и при финальном рендере; `COMMENT_BLOCKED_TERMS` так же исключает результаты и комментарии с заданными фрагментами текста. Output validator отклоняет факт без источника, raw URL, битые/лишние плейсхолдеры, неподходящий ID, текст длиннее 180 видимых символов и generic CTA. Код сам рендерит ссылки в HTML, а предпросмотр ссылок отключён для обычных и rich text send-путей.
+Если поиск вернул безопасный результат с публичным HTTP(S) URL, модель обязана выбрать один отдельный угол, которого нет в новости: связанный релиз, ограничение, последствие, сравнение, цену, changelog или реакцию сообщества. Поиск нельзя использовать только для подтверждения или пересказа факта из поста. `used_search_result_id: null` допускается только при пустом или небезопасном поиске. One-based ID сохраняется в `llm_generations`, а `{SOURCE_LINK:N:подпись}` становится обязательным. Подпись должна быть частью фразы («как пишет VideoCardz»), а не отдельным «детали» или «источник». `COMMENT_BLOCKED_SOURCE_DOMAINS` исключает указанные домены и поддомены до fetch, из prompt и при финальном рендере; `COMMENT_BLOCKED_TERMS` так же исключает результаты и комментарии с заданными фрагментами текста. Search response сохраняется до best-effort fetch: неуспешный fetch не удаляет title/snippet уже найденного источника. Output validator отклоняет факт без источника, raw URL, битые/лишние плейсхолдеры, неподходящий ID, текст длиннее 180 видимых символов и generic CTA. Код сам рендерит ссылки в HTML, а предпросмотр ссылок отключён для обычных и rich text send-путей.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
 Автоматическая память работает поверх RAG:

@@ -153,7 +153,7 @@ impl Config {
             search_mcp_args: env_args("SEARCH_MCP_ARGS"),
             search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
             search_mcp_timeout_sec: env_u64("SEARCH_MCP_TIMEOUT_SEC", 8),
-            search_query_timeout_sec: env_u64("SEARCH_QUERY_TIMEOUT_SEC", 12),
+            search_query_timeout_sec: env_u64("SEARCH_QUERY_TIMEOUT_SEC", 20),
             search_mcp_tools: SearchMcpTools {
                 web: env_or("SEARCH_MCP_TOOL_WEB", "web_search"),
                 github: env_or("SEARCH_MCP_TOOL_GITHUB", "github_search"),
