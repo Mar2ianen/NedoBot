@@ -306,35 +306,7 @@ impl Config {
         }
 
         if self.rag_enabled {
-            validate_llm_provider_secret(
-                &mut errors,
-                self,
-                &self.memory_llm_provider,
-                "MEMORY_LLM_PROVIDER",
-            );
-            validate_llm_provider_model_with_model(
-                &mut errors,
-                self,
-                &self.memory_llm_provider,
-                "MEMORY_LLM_PROVIDER",
-                self.memory_llm_model.as_deref(),
-                "MEMORY_LLM_MODEL",
-            );
-            if self.rag_embedding_url.trim().is_empty() {
-                errors.push("RAG_ENABLED=true requires RAG_EMBEDDING_URL".to_string());
-            }
-            if self.rag_top_k == 0 {
-                errors.push("RAG_TOP_K must be greater than 0".to_string());
-            }
-            if self.rag_embedding_timeout_sec == 0 {
-                errors.push("RAG_EMBEDDING_TIMEOUT_SEC must be greater than 0".to_string());
-            }
-            if !(0.0..=1.0).contains(&self.rag_min_similarity) {
-                errors.push("RAG_MIN_SIMILARITY must be between 0 and 1".to_string());
-            }
-            if self.rag_temporal_half_life_days <= 0.0 {
-                errors.push("RAG_TEMPORAL_HALF_LIFE_DAYS must be greater than 0".to_string());
-            }
+            self.validate_rag_config(&mut errors);
         }
 
         if self.profile_refresh_concurrency == 0 {
@@ -400,6 +372,58 @@ impl Config {
                 errors.join("\n- ")
             )
         }
+    }
+
+    fn validate_rag_config(&self, errors: &mut Vec<String>) {
+        validate_llm_provider_secret(
+            errors,
+            self,
+            &self.memory_llm_provider,
+            "MEMORY_LLM_PROVIDER",
+        );
+        validate_llm_provider_model_with_model(
+            errors,
+            self,
+            &self.memory_llm_provider,
+            "MEMORY_LLM_PROVIDER",
+            self.memory_llm_model.as_deref(),
+            "MEMORY_LLM_MODEL",
+        );
+
+        require_non_empty(errors, "RAG_EMBEDDING_URL", &self.rag_embedding_url);
+        require_positive(errors, "RAG_TOP_K", self.rag_top_k);
+        require_positive(
+            errors,
+            "RAG_EMBEDDING_TIMEOUT_SEC",
+            self.rag_embedding_timeout_sec,
+        );
+        require_in_unit_interval(errors, "RAG_MIN_SIMILARITY", self.rag_min_similarity);
+        require_positive(
+            errors,
+            "RAG_TEMPORAL_HALF_LIFE_DAYS",
+            self.rag_temporal_half_life_days,
+        );
+    }
+}
+
+fn require_non_empty(errors: &mut Vec<String>, key: &str, value: &str) {
+    if value.trim().is_empty() {
+        errors.push(format!("{key} must not be empty"));
+    }
+}
+
+fn require_positive<T>(errors: &mut Vec<String>, key: &str, value: T)
+where
+    T: PartialOrd + From<u8>,
+{
+    if value <= T::from(0) {
+        errors.push(format!("{key} must be greater than 0"));
+    }
+}
+
+fn require_in_unit_interval(errors: &mut Vec<String>, key: &str, value: f32) {
+    if !(0.0..=1.0).contains(&value) {
+        errors.push(format!("{key} must be between 0 and 1"));
     }
 }
 
