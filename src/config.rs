@@ -42,6 +42,15 @@ pub struct Config {
     pub llm_proxy_url: Option<String>,
     pub memory_llm_temperature: f32,
     pub memory_llm_max_tokens: u32,
+    pub memory_llm_provider: String,
+    pub memory_llm_model: Option<String>,
+    pub rag_enabled: bool,
+    pub rag_embedding_url: String,
+    pub rag_embedding_model: String,
+    pub rag_embedding_timeout_sec: u64,
+    pub rag_top_k: usize,
+    pub rag_min_similarity: f32,
+    pub rag_temporal_half_life_days: f32,
     pub search_enabled: bool,
     pub search_extract_provider: Option<String>,
     pub search_extract_model: Option<String>,
@@ -142,6 +151,16 @@ impl Config {
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
             memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2),
             memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220),
+            memory_llm_provider: env_or("MEMORY_LLM_PROVIDER", "ollama"),
+            memory_llm_model: env_optional("MEMORY_LLM_MODEL")
+                .or_else(|| Some("gemma4:31b".to_string())),
+            rag_enabled: env_bool("RAG_ENABLED", false),
+            rag_embedding_url: env_or("RAG_EMBEDDING_URL", "http://127.0.0.1:8788"),
+            rag_embedding_model: env_or("RAG_EMBEDDING_MODEL", "cointegrated/rubert-tiny2"),
+            rag_embedding_timeout_sec: env_u64("RAG_EMBEDDING_TIMEOUT_SEC", 10),
+            rag_top_k: env_usize("RAG_TOP_K", 6),
+            rag_min_similarity: env_f32("RAG_MIN_SIMILARITY", 0.55),
+            rag_temporal_half_life_days: env_f32("RAG_TEMPORAL_HALF_LIFE_DAYS", 180.0),
             search_enabled: env_bool("SEARCH_ENABLED", false),
             search_extract_provider: env_optional("SEARCH_EXTRACT_PROVIDER")
                 .or_else(|| Some("ollama".to_string())),
@@ -283,6 +302,38 @@ impl Config {
                     self.search_extract_model.as_deref(),
                     "SEARCH_EXTRACT_MODEL",
                 );
+            }
+        }
+
+        if self.rag_enabled {
+            validate_llm_provider_secret(
+                &mut errors,
+                self,
+                &self.memory_llm_provider,
+                "MEMORY_LLM_PROVIDER",
+            );
+            validate_llm_provider_model_with_model(
+                &mut errors,
+                self,
+                &self.memory_llm_provider,
+                "MEMORY_LLM_PROVIDER",
+                self.memory_llm_model.as_deref(),
+                "MEMORY_LLM_MODEL",
+            );
+            if self.rag_embedding_url.trim().is_empty() {
+                errors.push("RAG_ENABLED=true requires RAG_EMBEDDING_URL".to_string());
+            }
+            if self.rag_top_k == 0 {
+                errors.push("RAG_TOP_K must be greater than 0".to_string());
+            }
+            if self.rag_embedding_timeout_sec == 0 {
+                errors.push("RAG_EMBEDDING_TIMEOUT_SEC must be greater than 0".to_string());
+            }
+            if !(0.0..=1.0).contains(&self.rag_min_similarity) {
+                errors.push("RAG_MIN_SIMILARITY must be between 0 and 1".to_string());
+            }
+            if self.rag_temporal_half_life_days <= 0.0 {
+                errors.push("RAG_TEMPORAL_HALF_LIFE_DAYS must be greater than 0".to_string());
             }
         }
 
@@ -582,6 +633,15 @@ mod tests {
             llm_proxy_url: None,
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
+            memory_llm_provider: "ollama".to_string(),
+            memory_llm_model: Some("gemma4:31b".to_string()),
+            rag_enabled: false,
+            rag_embedding_url: "http://127.0.0.1:8788".to_string(),
+            rag_embedding_model: "cointegrated/rubert-tiny2".to_string(),
+            rag_embedding_timeout_sec: 10,
+            rag_top_k: 6,
+            rag_min_similarity: 0.55,
+            rag_temporal_half_life_days: 180.0,
             search_enabled: false,
             search_extract_provider: Some("ollama".to_string()),
             search_extract_model: Some("gemma4:31b".to_string()),
@@ -727,6 +787,21 @@ mod tests {
         let config = config();
 
         config.validate_runtime_secrets().unwrap();
+    }
+
+    #[test]
+    fn enabled_rag_validates_retrieval_limits() {
+        let mut config = config();
+        config.rag_enabled = true;
+        config.rag_top_k = 0;
+        config.rag_min_similarity = 1.5;
+        config.rag_temporal_half_life_days = 0.0;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("RAG_TOP_K"));
+        assert!(error.contains("RAG_MIN_SIMILARITY"));
+        assert!(error.contains("RAG_TEMPORAL_HALF_LIFE_DAYS"));
     }
 
     #[test]

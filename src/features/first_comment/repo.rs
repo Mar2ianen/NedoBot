@@ -1,6 +1,5 @@
 use sqlx::PgPool;
 
-use crate::features::memory::service::extract_keywords;
 use crate::text::{normalize_ai_markers, strip_links};
 
 pub struct LlmGenerationInsert<'a> {
@@ -108,57 +107,6 @@ pub async fn load_recent_bot_comments(pool: &PgPool) -> anyhow::Result<Vec<Strin
         .map(|(text,)| normalize_comment_text(&text))
         .filter(|text| !text.trim().is_empty())
         .collect())
-}
-
-pub async fn load_topic_bot_comments(
-    pool: &PgPool,
-    post_text: &str,
-) -> anyhow::Result<Vec<String>> {
-    let post_keywords = extract_keywords(post_text);
-    if post_keywords.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let rows = sqlx::query_as::<_, (String, String)>(
-        r#"
-        select pcj.cleaned_post_text,
-               coalesce(lg.response, lg.final_html)
-        from llm_generations lg
-        join post_comment_jobs pcj on pcj.id = lg.post_comment_job_id
-        where coalesce(lg.response, lg.final_html) is not null
-        order by lg.created_at desc
-        limit 160
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut scored = rows
-        .into_iter()
-        .filter_map(|(old_post, comment)| {
-            let old_keywords = extract_keywords(&old_post);
-            let score = old_keywords
-                .iter()
-                .filter(|keyword| post_keywords.contains(keyword))
-                .count();
-            (score >= 2).then_some((score, normalize_comment_text(&comment)))
-        })
-        .filter(|(_, comment)| !comment.trim().is_empty())
-        .collect::<Vec<_>>();
-
-    scored.sort_by(|(left_score, _), (right_score, _)| right_score.cmp(left_score));
-
-    let mut comments = Vec::new();
-    for (_, comment) in scored {
-        if !comments.iter().any(|saved| saved == &comment) {
-            comments.push(comment);
-        }
-        if comments.len() >= 6 {
-            break;
-        }
-    }
-
-    Ok(comments)
 }
 
 fn normalize_comment_text(text: &str) -> String {

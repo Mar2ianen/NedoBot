@@ -1,0 +1,22 @@
+[Unit]
+Description=NedoBot RuBERT Tiny 2 embedding service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/podman rm -f nedobot-rag-embedding
+ExecStart=/usr/bin/podman run --rm --name nedobot-rag-embedding \
+    --memory=800m --cpus=1.5 \
+    -p 127.0.0.1:8788:80 \
+    -v nedobot_rag_embedding:/data \
+    ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
+    --model-id cointegrated/rubert-tiny2 \
+    --dtype float32
+ExecStop=/usr/bin/podman stop --ignore -t 10 nedobot-rag-embedding
+
+[Install]
+WantedBy=multi-user.target
