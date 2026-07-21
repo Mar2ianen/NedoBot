@@ -41,7 +41,7 @@ src/features/first_comment/prompt.rs   — build_llm_prompt: system + tech_rag +
 src/features/first_comment/quality.rs  — validate_comment_output: длина, CHAT_LINK, CTA, кириллица, generic phrases
 src/features/first_comment/render.rs   — build_comment_html: strip_links → escape → CHAT_LINK → custom_emoji
 src/features/first_comment/repo.rs     — post_comment_jobs, llm_generations CRUD
-src/features/memory/service.rs         — remember_post (LLM), load_relevant_memory_notes (keyword match), merge
+src/features/memory/service.rs         — atomic post history jobs, RAG retrieval, bounded retry and lease-safe finalization
 src/features/memory/report.rs          — /memory command
 src/features/stats/types.rs            — StatsPeriod (Day/Week/Month), StatsRender (Html/Rich), UserPresentation
 src/features/stats/report.rs           — /stats_day, /stats_week, /stats_month, /topmsg, /topreact, /userstats, /userstatus
@@ -138,7 +138,7 @@ migrations/                            — sqlx compile-time миграции
 5. `generate_text_checked`: provider → model → fallback chain → output validator (`validate_comment_output`)
 6. `build_comment_html`: strip_links → normalize_ai_markers → escape → CHAT_LINK replacement → custom_emoji
 7. `send_html_reply` → `mark_post_comment_sent` → `insert_llm_generation` → owner preview
-8. `remember_post`: LLM note → `post_memory_notes` (merge if keywords overlap ≥ 3)
+8. `enqueue_post_history`: отдельная job → LLM JSON summary → RuBERT embedding → `post_history_entries`; retry с геометрическим backoff до terminal `failed`
 
 ### Голосовые
 1. `maybe_transcribe_voice`: check enabled + auto + right chat + not bot + not command + not auto-forward

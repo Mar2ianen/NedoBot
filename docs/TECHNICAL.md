@@ -286,6 +286,7 @@ cargo check
   - `container-tg-ai-bot-postgres.service`
   - `tg-ai-bot-teloxide.service`
   - `nedobot-rag-embedding.service`
+  - `nedonews-mcp.service`
 
 PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg16-bookworm` на том же persistent volume. RuBERT Tiny 2 обслуживается локальным CPU-only Text Embeddings Inference на `127.0.0.1:8788`; наружу этот порт не публикуется.
 
@@ -293,6 +294,7 @@ PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg1
 
 ```bash
 ssh vps-153 'systemctl status tg-ai-bot-teloxide --no-pager'
+ssh vps-153 'systemctl status nedonews-mcp --no-pager'
 ssh vps-153 'journalctl -u tg-ai-bot-teloxide -f'
 ssh vps-153 'podman ps'
 ```
@@ -327,7 +329,7 @@ Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/
 
 ```bash
 rsync -az --delete --exclude target --exclude .git --exclude .env ./ vps-153:/opt/tg-ai-bot-teloxide/
-ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release && systemctl restart tg-ai-bot-teloxide'
+ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release && systemctl restart tg-ai-bot-teloxide && systemctl is-active tg-ai-bot-teloxide && systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 ```
 
 ## База
