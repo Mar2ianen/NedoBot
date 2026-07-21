@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:0.8.2-pg16-bookworm
     container_name: tg-ai-bot-postgres
     restart: unless-stopped
     environment:
@@ -17,5 +17,20 @@ services:
       timeout: 5s
       retries: 5
 
+  rag-embedding:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    container_name: nedobot-rag-embedding
+    restart: unless-stopped
+    command:
+      - --model-id
+      - cointegrated/rubert-tiny2
+      - --dtype
+      - float32
+    ports:
+      - "127.0.0.1:8788:80"
+    volumes:
+      - rag_embedding_data:/data
+
 volumes:
   postgres_data:
+  rag_embedding_data:

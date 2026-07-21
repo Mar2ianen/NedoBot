@@ -17,10 +17,10 @@ use tg_ai_bot_teloxide::{
             render::build_comment_html,
             repo::{
                 LlmGenerationInsert, insert_llm_generation, load_recent_bot_comments,
-                load_topic_bot_comments, mark_post_comment_sent,
+                mark_post_comment_sent,
             },
         },
-        memory::service::{load_relevant_memory_notes, remember_post},
+        memory::service::{enqueue_post_history, load_relevant_memory_notes},
     },
     llm::service::generate_text_checked_with_system_and_schema,
     telegram::render::send_html_reply,
@@ -159,9 +159,9 @@ async fn retry_job(
     config: &Config,
     job: &PendingJob,
 ) -> anyhow::Result<i32> {
-    let memory_notes = load_relevant_memory_notes(pool, &job.cleaned_post_text).await?;
+    let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
-    let topic_comments = load_topic_bot_comments(pool, &job.cleaned_post_text).await?;
+    let topic_comments = Vec::new();
     let prompt = build_llm_prompt_parts(
         &job.cleaned_post_text,
         None,
@@ -224,9 +224,9 @@ async fn retry_job(
     )
     .await?;
 
-    if let Err(err) = remember_post(
+    if let Err(err) = enqueue_post_history(
         pool,
-        config,
+        job.id,
         job.source_channel_id,
         job.source_message_id,
         &job.cleaned_post_text,
@@ -235,7 +235,7 @@ async fn retry_job(
     )
     .await
     {
-        tracing::warn!(%err, "failed to save post memory note");
+        tracing::warn!(%err, "failed to enqueue post history entry");
     }
 
     Ok(sent.id.0)

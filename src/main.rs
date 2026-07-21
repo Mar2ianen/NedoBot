@@ -27,6 +27,7 @@ use features::avatar_analysis::service::{
     enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
 };
 use features::first_comment::pipeline::maybe_comment_post;
+use features::memory::service::process_next_history_entry;
 use features::new_user_analysis::analyze_new_user_profile;
 use features::user_profiles::service::refresh_profile;
 use features::voice::pipeline::maybe_transcribe_voice;
@@ -57,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = AppState::new(pool, config);
     spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
+    spawn_post_history_worker(state.clone());
 
     let handler = dptree::entry()
         .branch(
@@ -83,6 +85,24 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+fn spawn_post_history_worker(state: AppState) {
+    if !state.config.rag_enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            match process_next_history_entry(&state.pool, &state.config).await {
+                Ok(true) => continue,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                Err(err) => {
+                    tracing::warn!(%err, "post history worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
 }
 
 async fn handle_message(

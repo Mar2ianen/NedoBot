@@ -6,6 +6,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::Config;
+use crate::features::memory::service::MemoryNote;
 use crate::features::search::extract::extract_search_queries;
 use crate::features::search::mcp::McpSearchProvider;
 use crate::features::search::policy::is_allowed_search_result;
@@ -14,18 +15,27 @@ use crate::features::search::types::{
     MAX_SEARCH_RESULTS, SearchContext, SearchQuery, SearchResult,
 };
 
-pub async fn run_search(config: &Config, clean_post: &str) -> SearchContext {
+pub async fn run_search(
+    config: &Config,
+    clean_post: &str,
+    memory_notes: &[MemoryNote],
+) -> SearchContext {
     let started = Instant::now();
 
     if !config.search_enabled {
         return SearchContext::skipped("disabled", started.elapsed().as_millis());
     }
 
-    run_search_enabled(config, clean_post, started).await
+    run_search_enabled(config, clean_post, memory_notes, started).await
 }
 
-async fn run_search_enabled(config: &Config, clean_post: &str, started: Instant) -> SearchContext {
-    let queries = match extract_search_queries(config, clean_post).await {
+async fn run_search_enabled(
+    config: &Config,
+    clean_post: &str,
+    memory_notes: &[MemoryNote],
+    started: Instant,
+) -> SearchContext {
+    let queries = match extract_search_queries(config, clean_post, memory_notes).await {
         Ok(queries) => queries,
         Err(err) => {
             tracing::warn!(%err, "failed to extract search queries");
@@ -149,7 +159,7 @@ mod tests {
         let mut config = Config::from_env();
         config.search_enabled = false;
 
-        let context = run_search(&config, "post").await;
+        let context = run_search(&config, "post", &[]).await;
 
         assert_eq!(context.skipped_reason.as_deref(), Some("disabled"));
         assert!(context.queries.is_empty());
@@ -164,7 +174,7 @@ mod tests {
         config.search_mcp_command = Some("unused".to_string());
         config.search_mcp_timeout_sec = 1;
 
-        let context = run_search(&config, "post").await;
+        let context = run_search(&config, "post", &[]).await;
 
         assert_eq!(context.skipped_reason.as_deref(), Some("extract_failed"));
         assert!(context.queries.is_empty());

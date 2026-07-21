@@ -9,10 +9,10 @@ pub async fn send_memory_notes(
     chat_id: ChatId,
     pool: &PgPool,
 ) -> ResponseResult<()> {
-    let notes = sqlx::query_as::<_, (String, String, String)>(
+    let notes = sqlx::query_as::<_, (i32, Option<String>, Vec<String>, String)>(
         r#"
-        select title, summary, array_to_string(keywords, ', ')
-        from post_memory_notes
+        select source_message_id, summary, entities, status
+        from post_history_entries
         order by created_at desc
         limit 5
         "#,
@@ -29,9 +29,15 @@ pub async fn send_memory_notes(
         return Ok(());
     }
 
-    let text = paragraphs(notes.into_iter().map(|(title, summary, keywords)| {
-        lines([bold(title), Html::text(summary), code(keywords)])
-    }))
+    let text = paragraphs(notes.into_iter().map(
+        |(source_message_id, summary, entities, status)| {
+            lines([
+                bold(format!("Пост {source_message_id}")),
+                Html::text(summary.unwrap_or_else(|| "Без RAG-карточки".to_string())),
+                code(format!("{} · {}", status, entities.join(", "))),
+            ])
+        },
+    ))
     .into_string();
 
     send_html(bot, chat_id, text).await?;

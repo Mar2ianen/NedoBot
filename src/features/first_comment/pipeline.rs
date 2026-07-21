@@ -19,9 +19,9 @@ use crate::features::first_comment::prompt::{CommentDirectives, build_llm_prompt
 use crate::features::first_comment::render::build_comment_html_with_sources;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
-    load_topic_bot_comments, mark_post_comment_sent,
+    mark_post_comment_sent,
 };
-use crate::features::memory::service::{load_relevant_memory_notes, remember_post};
+use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
 use crate::features::search::repo::insert_search_run;
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
@@ -82,10 +82,10 @@ pub async fn maybe_comment_post(
         }
     };
     let chat_member_count = get_chat_member_count(bot, config).await;
-    let memory_notes = load_relevant_memory_notes(pool, &clean_post).await?;
+    let memory_notes = load_relevant_memory_notes(pool, config, &clean_post).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
-    let topic_comments = load_topic_bot_comments(pool, &clean_post).await?;
-    let search_context = run_search(config, &clean_post).await;
+    let topic_comments = Vec::new();
+    let search_context = run_search(config, &clean_post, &memory_notes).await;
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
@@ -162,9 +162,9 @@ pub async fn maybe_comment_post(
         .await;
     }
 
-    if let Err(err) = remember_post(
+    if let Err(err) = enqueue_post_history(
         pool,
-        config,
+        job_id,
         candidate.source_channel_id,
         candidate.source_message_id.0,
         &clean_post,
@@ -175,7 +175,7 @@ pub async fn maybe_comment_post(
     )
     .await
     {
-        tracing::warn!(%err, "failed to save post memory note");
+        tracing::warn!(%err, "failed to enqueue post history entry");
     }
 
     Ok(())

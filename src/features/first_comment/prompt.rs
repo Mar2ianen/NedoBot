@@ -85,9 +85,14 @@ impl CommentDirectives {
 
 #[derive(Serialize)]
 struct MemoryPromptNote<'a> {
-    title: &'a str,
+    source_message_id: i32,
     summary: &'a str,
-    cautions: &'a str,
+    entities: &'a [String],
+    used_angle: Option<&'a str>,
+    external_fact: Option<&'a str>,
+    similarity: f64,
+    temporal_coefficient: f64,
+    rank_score: f64,
 }
 
 #[derive(Serialize)]
@@ -173,11 +178,15 @@ fn build_llm_user_prompt(
             manual_fact_reference: include_str!("../../../prompts/tech_rag.md"),
             memory_notes: memory_notes
                 .iter()
-                .take(5)
                 .map(|note| MemoryPromptNote {
-                    title: &note.title,
+                    source_message_id: note.source_message_id,
                     summary: &note.summary,
-                    cautions: &note.cautions,
+                    entities: &note.entities,
+                    used_angle: note.used_angle.as_deref(),
+                    external_fact: note.external_fact.as_deref(),
+                    similarity: note.similarity,
+                    temporal_coefficient: note.temporal_coefficient,
+                    rank_score: note.rank_score,
                 })
                 .collect(),
         },
