@@ -409,7 +409,7 @@ fn build_memory_prompt(entry: &PendingHistoryEntry) -> String {
 }
 
 fn parse_memory_summary(value: &str) -> anyhow::Result<MemorySummaryOutput> {
-    let mut parsed: MemorySummaryOutput = serde_json::from_str(value.trim())?;
+    let mut parsed: MemorySummaryOutput = serde_json::from_str(strip_json_fence(value))?;
     parsed.summary = normalize_optional(parsed.summary, MAX_SUMMARY_CHARS);
     parsed.used_angle = normalize_optional(parsed.used_angle, MAX_USED_ANGLE_CHARS);
     parsed.external_fact = normalize_optional(parsed.external_fact, MAX_EXTERNAL_FACT_CHARS);
@@ -434,6 +434,22 @@ fn parse_memory_summary(value: &str) -> anyhow::Result<MemorySummaryOutput> {
         parsed.skip_reason = None;
     }
     Ok(parsed)
+}
+
+fn strip_json_fence(value: &str) -> &str {
+    let trimmed = value.trim();
+    let Some(without_opening) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let without_language = without_opening
+        .strip_prefix("json")
+        .or_else(|| without_opening.strip_prefix("JSON"))
+        .unwrap_or(without_opening)
+        .trim_start();
+    without_language
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or(trimmed)
 }
 
 fn normalize_optional(value: Option<String>, max_chars: usize) -> Option<String> {
@@ -533,6 +549,16 @@ mod tests {
         assert!(parsed.entities.is_empty());
         assert!(parsed.used_angle.is_none());
         assert!(parsed.external_fact.is_none());
+        assert_eq!(parsed.skip_reason.as_deref(), Some("реклама"));
+    }
+
+    #[test]
+    fn fenced_json_is_accepted_as_provider_fallback() {
+        let parsed = parse_memory_summary(
+            "```json\n{\"summary\":null,\"entities\":[],\"used_angle\":null,\"external_fact\":null,\"skip_reason\":\"реклама\"}\n```",
+        )
+        .unwrap();
+        assert!(parsed.summary.is_none());
         assert_eq!(parsed.skip_reason.as_deref(), Some("реклама"));
     }
 
