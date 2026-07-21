@@ -397,6 +397,7 @@ async fn generate_action(
 ) -> Result<AgentAction, ActionGenerationError> {
     let action_schema = action_schema();
     let timeout_secs = config.ask_timeout_sec.min(ACTION_TIMEOUT_CAP_SECS);
+    let validator = |value: &str| validate_agent_action_output(value);
     let generated = loop {
         let result = timeout(
             Duration::from_secs(timeout_secs),
@@ -410,7 +411,7 @@ async fn generate_action(
                     image_base64,
                     temperature: config.ask_llm_temperature,
                     num_predict: config.ask_llm_max_tokens,
-                    output_validator: None,
+                    output_validator: Some(&validator),
                     structured_output: Some(StructuredOutput {
                         name: "ask_action",
                         schema: &action_schema,
@@ -436,7 +437,7 @@ async fn generate_action(
                             image_base64,
                             temperature: config.ask_llm_temperature,
                             num_predict: config.ask_llm_max_tokens,
-                            output_validator: None,
+                            output_validator: Some(&validator),
                             structured_output: Some(StructuredOutput {
                                 name: "ask_action",
                                 schema: &action_schema,
@@ -508,6 +509,12 @@ fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
         }
         Err(()) => Err(()),
     }
+}
+
+fn validate_agent_action_output(value: &str) -> anyhow::Result<()> {
+    parse_agent_action(value)
+        .map(|_| ())
+        .map_err(|_| anyhow::anyhow!("ask LLM response is not a valid action"))
 }
 
 fn escape_json_string_controls(value: &str) -> String {
@@ -1194,6 +1201,12 @@ mod tests {
             plain.markdown.as_deref(),
             Some("**Короткий ответ:** готово")
         );
+    }
+
+    #[test]
+    fn agent_action_validator_rejects_invalid_structured_response() {
+        assert!(validate_agent_action_output(r#"{"kind":"unknown"}"#).is_err());
+        assert!(validate_agent_action_output("Короткий ответ: готово").is_ok());
     }
 
     #[test]
