@@ -132,7 +132,7 @@ fn primary_key(name: &str) -> Vec<String> {
         | "telegram_message_reactions"
         | "post_comment_jobs"
         | "llm_generations"
-        | "post_memory_notes"
+        | "post_history_entries"
         | "search_runs"
         | "ask_runs"
         | "ask_tool_calls"
@@ -169,6 +169,9 @@ fn description(name: &str) -> String {
         "ask_runs" => "Публичные запуски /ask".into(),
         "ask_tool_calls" => "Безопасный аудит вызовов /ask".into(),
         "voice_transcription_jobs" => "Расшифровки голосовых публичного чата".into(),
+        "post_history_entries" => {
+            "Атомарные RAG-карточки публичных постов без исходного текста и embedding".into()
+        }
         "telegram_new_user_profile_audits" => "Публичные антиспам-аудиты новых участников".into(),
         other => format!("Проверенная публичная проекция {other}"),
     }

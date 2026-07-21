@@ -430,7 +430,10 @@ fn tools_list() -> Vec<Value> {
             "voice.list_transcripts",
             "Расшифровки голосовых из публичного чата.",
         ),
-        ("memory.list_notes", "Память публичного канала."),
+        (
+            "memory.list_notes",
+            "Возвращает атомарные RAG-карточки публичных постов: саммари, сущности, использованный ракурс и внешний факт. Не возвращает исходный текст поста, комментарий бота или embedding.",
+        ),
         ("search.list_runs", "Запуски поиска для комментариев."),
         ("llm.list_generations", "Генерации комментариев."),
     ];
@@ -645,7 +648,7 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Val
                 &state.pool,
                 &state.manifest,
                 SelectArgs {
-                    table: "post_memory_notes".into(),
+                    table: "post_history_entries".into(),
                     columns: vec![],
                     filters: vec![],
                     order_by: vec![OrderBy {
