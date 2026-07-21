@@ -16,8 +16,8 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Отключает link preview.
 - Подставляет premium/custom emoji по тематике, включая канал/AMD/Radeon/Ryzen.
 - Пишет задачи и результаты генерации в Postgres.
-- Автоматически конспектирует обычные новости в память и подмешивает релевантные заметки в следующие генерации.
-- Объединяет похожие заметки памяти, чтобы не плодить дубли.
+- После комментария асинхронно создаёт атомарную Gemma-карточку полезного поста; рекламу, мемы и повторы помечает `ignored`.
+- Ищет релевантную историю через RuBERT Tiny 2 и pgvector с отдельными similarity, temporal coefficient и итоговым rank score.
 - Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
 - Опционально добавляет свежий web/GitHub/Reddit факт-чек для первого комментария через lazy MCP process, если включён `SEARCH_ENABLED`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
@@ -79,6 +79,15 @@ LLM_MAX_TOKENS=90
 LLM_PROXY_URL=
 MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
+MEMORY_LLM_PROVIDER=ollama
+MEMORY_LLM_MODEL=gemma4:31b
+RAG_ENABLED=true
+RAG_EMBEDDING_URL=http://127.0.0.1:8788
+RAG_EMBEDDING_MODEL=cointegrated/rubert-tiny2
+RAG_EMBEDDING_TIMEOUT_SEC=10
+RAG_TOP_K=6
+RAG_MIN_SIMILARITY=0.55
+RAG_TEMPORAL_HALF_LIFE_DAYS=180
 
 SEARCH_ENABLED=false
 SEARCH_EXTRACT_PROVIDER=ollama
@@ -276,6 +285,9 @@ cargo check
 - systemd:
   - `container-tg-ai-bot-postgres.service`
   - `tg-ai-bot-teloxide.service`
+  - `nedobot-rag-embedding.service`
+
+PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg16-bookworm` на том же persistent volume. RuBERT Tiny 2 обслуживается локальным CPU-only Text Embeddings Inference на `127.0.0.1:8788`; наружу этот порт не публикуется.
 
 Полезные команды:
 
@@ -325,7 +337,7 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `telegram_messages` - входящие сообщения и raw Telegram JSON.
 - `post_comment_jobs` - дедупликация и статус комментария под постом.
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
-- `post_memory_notes` - короткие конспекты прошлых новостей, keywords и осторожные ограничения для будущих комментариев.
+- `post_history_entries` - атомарная история новых постов: строгий Gemma-summary, сущности, использованный ракурс, реально использованный внешний факт и RuBERT embedding. Исходные посты не склеиваются.
 - `voice_transcription_jobs` - job/status/raw ASR/segments/cleaned transcript/final HTML/file id для расшифровки голосовых.
 - `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium, а также best-effort детали из `getChat(user_id)`, `getUserProfilePhotos` и `getUserPersonalChatMessages`: bio, avatar file ids, emoji status/accent, personal channel summary/raw JSON и ошибки API.
 - `telegram_chat_users` - явная расширяемая карточка пользователя в конкретном чате: первое/последнее сообщение, счётчики сообщений/реплаев/ссылок/медиа, статус в чате, админство, join/leave/invite-link поля.
@@ -358,10 +370,10 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select * from post_comment_jobs order by id desc limit 20;\""
 ```
 
-Посмотреть память:
+Посмотреть атомарную историю:
 
 ```bash
-ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select title, summary, keywords, created_at from post_memory_notes order by id desc limit 20;\""
+ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select source_message_id, status, summary, entities, used_angle, external_fact, skip_reason, created_at from post_history_entries order by id desc limit 20;\""
 ```
 
 Посмотреть voice jobs:
@@ -410,15 +422,17 @@ Cleanup prompt для расшифровки голосовых лежит в [p
 Если поиск вернул безопасный результат с публичным HTTP(S) URL, модель обязана выбрать один отдельный угол, которого нет в новости: связанный релиз, ограничение, последствие, сравнение, цену, changelog или реакцию сообщества. Поиск нельзя использовать только для подтверждения или пересказа факта из поста. `used_search_result_id: null` допускается только при пустом или небезопасном поиске. One-based ID сохраняется в `llm_generations`, а `{SOURCE_LINK:N:подпись}` становится обязательным. Подпись должна быть частью фразы («как пишет VideoCardz»), а не отдельным «детали» или «источник». `COMMENT_BLOCKED_SOURCE_DOMAINS` исключает указанные домены и поддомены до fetch, из prompt и при финальном рендере; `COMMENT_BLOCKED_TERMS` так же исключает результаты и комментарии с заданными фрагментами текста. Search response сохраняется до best-effort fetch: неуспешный fetch не удаляет title/snippet уже найденного источника. Output validator отклоняет факт без источника, raw URL, битые/лишние плейсхолдеры, неподходящий ID, текст длиннее 180 видимых символов и generic CTA. Код сам рендерит ссылки в HTML, а предпросмотр ссылок отключён для обычных и rich text send-путей.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
-Автоматическая память работает поверх RAG:
+Автоматическая история работает поверх RuBERT Tiny 2 и pgvector:
 
-- после отправки первого комментария бот просит LLM сделать короткую заметку по посту;
-- заметка сохраняется в `post_memory_notes` с keywords;
-- если уже есть похожая заметка, бот обновляет её вместо создания дубля;
-- похожесть сейчас считается по пересечению keywords, минимум 3 общих ключа;
-- короткие ключи вроде `sam` матчятся только как отдельное слово, чтобы не склеивать `SAM` и `Samsung`;
-- перед новой генерацией бот достаёт до 5 похожих заметок по пересечению keywords;
-- память используется только как контекст, если она релевантна текущему посту.
+- после успешной отправки комментария создаётся отдельная job с исходным постом, комментарием бота и только реально выбранным результатом поиска;
+- Gemma получает строгую JSON Schema через provider API и возвращает `summary`, `entities`, `used_angle`, `external_fact`, `skip_reason`;
+- `summary: null` разрешён для рекламы, мемов, служебных публикаций, повторов и постов без устойчивого полезного факта; запись становится `ignored` и не участвует в retrieval;
+- полезная запись получает 312-мерный embedding `cointegrated/rubert-tiny2` и становится `ready`;
+- перед внешним поиском бот строит embedding нового поста и выбирает до шести карточек по cosine similarity;
+- рейтинг считается как `similarity * temporal_coefficient`, где коэффициент свежести плавно снижается от `1.0` к `0.70`, а период полураспада настраивается через `RAG_TEMPORAL_HALF_LIFE_DAYS`;
+- Gemma-поисковик видит `already_known` и `already_used_angles`, поэтому ищет развитие истории, последствия, альтернативы, changelog или свежую реакцию, а при отсутствии нового направления может вернуть `need_search=false`;
+- модель комментария получает одновременно найденную историю и свежие результаты внешнего поиска;
+- старые объединённые заметки удаляются миграцией и не переносятся в новую историю.
 
 Антиповтор CTA:
 
@@ -596,8 +610,8 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 
 ## Ограничения MVP
 
-- Поиск памяти keyword-based, без embeddings/pgvector.
-- Merge памяти эвристический; за качеством заметок надо иногда смотреть через `/memory` или SQL.
+- Новая RAG-история начинается с момента миграции без backfill старых объединённых заметок.
+- RuBERT Tiny 2 работает на CPU и оценивает смысловую близость; окончательное решение о полезности карточки и направлении поиска остаётся за Gemma.
 - Реакции считаются только с момента включения reaction updates; старые реакции Telegram Bot API задним числом не отдаёт.
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
