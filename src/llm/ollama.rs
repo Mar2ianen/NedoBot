@@ -42,7 +42,10 @@ impl LlmClient for OllamaClient<'_> {
                 temperature: request.temperature,
                 num_predict: request.num_predict,
             },
-            format: request.structured_output.map(|output| output.schema),
+            // Ollama Cloud currently honors JSON mode for Gemma, but can ignore a
+            // schema object and return fenced/incomplete JSON. The typed validator
+            // still enforces the requested schema after generation.
+            format: request.structured_output.map(|_| "json"),
         };
 
         let response = http::client(Duration::from_secs(60))?
@@ -82,7 +85,7 @@ struct OllamaChatRequest<'a> {
     stream: bool,
     options: OllamaOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
-    format: Option<&'a serde_json::Value>,
+    format: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -113,11 +116,8 @@ struct OllamaResponseMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
     #[test]
-    fn structured_output_schema_is_sent_as_ollama_format() {
-        let schema = json!({"type": "object"});
+    fn structured_output_uses_ollama_json_mode() {
         let request = OllamaChatRequest {
             model: "gemma",
             messages: Vec::new(),
@@ -126,9 +126,9 @@ mod tests {
                 temperature: 0.4,
                 num_predict: 90,
             },
-            format: Some(&schema),
+            format: Some("json"),
         };
 
-        assert_eq!(serde_json::to_value(request).unwrap()["format"], schema);
+        assert_eq!(serde_json::to_value(request).unwrap()["format"], "json");
     }
 }
