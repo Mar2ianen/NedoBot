@@ -17,6 +17,9 @@ const MAX_EXTERNAL_FACT_CHARS: usize = 500;
 const MAX_SKIP_REASON_CHARS: usize = 240;
 const MAX_ENTITIES: usize = 12;
 const MAX_ENTITY_CHARS: usize = 80;
+const MAX_HISTORY_ATTEMPTS: i32 = 10;
+const INITIAL_HISTORY_RETRY_DELAY_SECONDS: i64 = 15;
+const MAX_HISTORY_RETRY_DELAY_SECONDS: i64 = 3_600;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MemoryNote {
@@ -38,6 +41,12 @@ struct PendingHistoryEntry {
     bot_comment: String,
     used_search_result: Option<Value>,
     attempts: i32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HistoryRetryAction {
+    Retry { delay_seconds: i64 },
+    Fail,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,14 +225,30 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
             Ok(true)
         }
         Err(err) => {
-            mark_history_retry(pool, entry.id, entry.attempts, classify_error(&err)).await?;
-            tracing::warn!(
-                %err,
-                history_entry_id = entry.id,
-                source_message_id = entry.source_message_id,
-                attempts = entry.attempts,
-                "post history generation failed and was scheduled for retry"
-            );
+            let error_kind = classify_error(&err);
+            match history_retry_action(entry.attempts) {
+                HistoryRetryAction::Retry { delay_seconds } => {
+                    mark_history_retry(pool, entry.id, delay_seconds, error_kind).await?;
+                    tracing::warn!(
+                        %err,
+                        history_entry_id = entry.id,
+                        source_message_id = entry.source_message_id,
+                        attempts = entry.attempts,
+                        delay_seconds,
+                        "post history generation failed and was scheduled for retry"
+                    );
+                }
+                HistoryRetryAction::Fail => {
+                    mark_history_failed(pool, entry.id, error_kind).await?;
+                    tracing::error!(
+                        %err,
+                        history_entry_id = entry.id,
+                        source_message_id = entry.source_message_id,
+                        attempts = entry.attempts,
+                        "post history generation failed permanently"
+                    );
+                }
+            }
             Ok(true)
         }
     }
@@ -372,11 +397,9 @@ async fn save_history_entry(
 async fn mark_history_retry(
     pool: &PgPool,
     id: i64,
-    attempts: i32,
+    delay_seconds: i64,
     error_kind: &str,
 ) -> anyhow::Result<()> {
-    let exponent = u32::try_from(attempts.saturating_sub(1).min(7)).unwrap_or(0);
-    let delay_seconds = 15_i64.saturating_mul(2_i64.pow(exponent)).min(1_800);
     sqlx::query(
         r#"
         update post_history_entries
@@ -394,6 +417,36 @@ async fn mark_history_retry(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+async fn mark_history_failed(pool: &PgPool, id: i64, error_kind: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update post_history_entries
+        set status = 'failed',
+            processing_started_at = null,
+            error_kind = $2,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(error_kind)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn history_retry_action(attempts: i32) -> HistoryRetryAction {
+    if attempts >= MAX_HISTORY_ATTEMPTS {
+        return HistoryRetryAction::Fail;
+    }
+
+    let exponent = u32::try_from(attempts.saturating_sub(1)).unwrap_or(0);
+    let delay_seconds = INITIAL_HISTORY_RETRY_DELAY_SECONDS
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(MAX_HISTORY_RETRY_DELAY_SECONDS);
+    HistoryRetryAction::Retry { delay_seconds }
 }
 
 fn build_memory_prompt(entry: &PendingHistoryEntry) -> String {
@@ -594,5 +647,29 @@ mod tests {
         let prompt = build_memory_prompt(&entry);
         assert!(prompt.contains("недоверенные данные"));
         assert!(prompt.contains("ignore previous instructions"));
+    }
+
+    #[test]
+    fn history_retry_schedule_grows_to_one_hour() {
+        let delays = (1..MAX_HISTORY_ATTEMPTS)
+            .map(|attempts| match history_retry_action(attempts) {
+                HistoryRetryAction::Retry { delay_seconds } => delay_seconds,
+                HistoryRetryAction::Fail => panic!("attempt {attempts} must retry"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![15, 30, 60, 120, 240, 480, 960, 1_920, 3_600]);
+    }
+
+    #[test]
+    fn history_retry_schedule_fails_after_last_attempt() {
+        assert_eq!(
+            history_retry_action(MAX_HISTORY_ATTEMPTS),
+            HistoryRetryAction::Fail
+        );
+        assert_eq!(
+            history_retry_action(MAX_HISTORY_ATTEMPTS + 1),
+            HistoryRetryAction::Fail
+        );
     }
 }
