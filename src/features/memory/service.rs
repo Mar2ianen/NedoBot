@@ -221,33 +221,60 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
     let outcome = build_history_entry(config, &entry).await;
     match outcome {
         Ok((generation, summary, embedding)) => {
-            save_history_entry(pool, config, entry.id, &generation, summary, embedding).await?;
+            let saved = save_history_entry(
+                pool,
+                config,
+                entry.id,
+                entry.attempts,
+                &generation,
+                summary,
+                embedding,
+            )
+            .await?;
+            if !saved {
+                tracing::info!(
+                    history_entry_id = entry.id,
+                    attempts = entry.attempts,
+                    "post history worker lost its processing lease before success"
+                );
+            }
             Ok(true)
         }
         Err(err) => {
             let error_kind = classify_error(&err);
-            match history_retry_action(entry.attempts) {
+            let updated = match history_retry_action(entry.attempts) {
                 HistoryRetryAction::Retry { delay_seconds } => {
-                    mark_history_retry(pool, entry.id, delay_seconds, error_kind).await?;
-                    tracing::warn!(
+                    mark_history_retry(pool, entry.id, entry.attempts, delay_seconds, error_kind)
+                        .await?
+                }
+                HistoryRetryAction::Fail => {
+                    mark_history_failed(pool, entry.id, entry.attempts, error_kind).await?
+                }
+            };
+            if updated {
+                match history_retry_action(entry.attempts) {
+                    HistoryRetryAction::Retry { delay_seconds } => tracing::warn!(
                         %err,
                         history_entry_id = entry.id,
                         source_message_id = entry.source_message_id,
                         attempts = entry.attempts,
                         delay_seconds,
                         "post history generation failed and was scheduled for retry"
-                    );
-                }
-                HistoryRetryAction::Fail => {
-                    mark_history_failed(pool, entry.id, error_kind).await?;
-                    tracing::error!(
+                    ),
+                    HistoryRetryAction::Fail => tracing::error!(
                         %err,
                         history_entry_id = entry.id,
                         source_message_id = entry.source_message_id,
                         attempts = entry.attempts,
                         "post history generation failed permanently"
-                    );
+                    ),
                 }
+            } else {
+                tracing::info!(
+                    history_entry_id = entry.id,
+                    attempts = entry.attempts,
+                    "post history worker lost its processing lease before failure handling"
+                );
             }
             Ok(true)
         }
@@ -345,10 +372,11 @@ async fn save_history_entry(
     pool: &PgPool,
     config: &Config,
     id: i64,
+    attempts: i32,
     generation: &crate::llm::types::GeneratedText,
     summary: MemorySummaryOutput,
     embedding: Option<Vec<f32>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let status = if summary.summary.is_some() {
         "ready"
     } else {
@@ -376,6 +404,8 @@ async fn save_history_entry(
             processing_started_at = null,
             updated_at = now()
         where id = $1
+          and status = 'processing'
+          and attempts = $12
         "#,
     )
     .bind(id)
@@ -389,17 +419,20 @@ async fn save_history_entry(
     .bind(&generation.model)
     .bind(embedding)
     .bind(&config.rag_embedding_model)
+    .bind(attempts)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await
+    .map(|result| result.rows_affected() == 1)
+    .map_err(Into::into)
 }
 
 async fn mark_history_retry(
     pool: &PgPool,
     id: i64,
+    attempts: i32,
     delay_seconds: i64,
     error_kind: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     sqlx::query(
         r#"
         update post_history_entries
@@ -409,17 +442,26 @@ async fn mark_history_retry(
             error_kind = $3,
             updated_at = now()
         where id = $1
+          and status = 'processing'
+          and attempts = $4
         "#,
     )
     .bind(id)
     .bind(delay_seconds as f64)
     .bind(error_kind)
+    .bind(attempts)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await
+    .map(|result| result.rows_affected() == 1)
+    .map_err(Into::into)
 }
 
-async fn mark_history_failed(pool: &PgPool, id: i64, error_kind: &str) -> anyhow::Result<()> {
+async fn mark_history_failed(
+    pool: &PgPool,
+    id: i64,
+    attempts: i32,
+    error_kind: &str,
+) -> anyhow::Result<bool> {
     sqlx::query(
         r#"
         update post_history_entries
@@ -428,13 +470,17 @@ async fn mark_history_failed(pool: &PgPool, id: i64, error_kind: &str) -> anyhow
             error_kind = $2,
             updated_at = now()
         where id = $1
+          and status = 'processing'
+          and attempts = $3
         "#,
     )
     .bind(id)
     .bind(error_kind)
+    .bind(attempts)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await
+    .map(|result| result.rows_affected() == 1)
+    .map_err(Into::into)
 }
 
 fn history_retry_action(attempts: i32) -> HistoryRetryAction {
