@@ -395,61 +395,73 @@ nullable = true
 pg_type = "timestamp with time zone"
 nullable = true
 
-[tables.post_memory_notes]
-description = "Проверенная публичная проекция post_memory_notes"
+[tables.post_history_entries]
+description = "Атомарные RAG-карточки публичных постов без исходного текста и embedding"
 primary_key = ["id"]
-approximate_rows = 106
+approximate_rows = 1
 
-[tables.post_memory_notes.columns.cautions]
-pg_type = "text"
-nullable = true
-
-[tables.post_memory_notes.columns.created_at]
+[tables.post_history_entries.columns.created_at]
 pg_type = "timestamp with time zone"
 nullable = true
 
-[tables.post_memory_notes.columns.id]
-pg_type = "bigint"
+[tables.post_history_entries.columns.embedding_model]
+pg_type = "text"
 nullable = true
 
-[tables.post_memory_notes.columns.keywords]
+[tables.post_history_entries.columns.entities]
 pg_type = "text[]"
 nullable = true
 
-[tables.post_memory_notes.columns.last_source_channel_id]
+[tables.post_history_entries.columns.external_fact]
+pg_type = "text"
+nullable = true
+
+[tables.post_history_entries.columns.external_source_url]
+pg_type = "text"
+nullable = true
+
+[tables.post_history_entries.columns.id]
 pg_type = "bigint"
 nullable = true
 
-[tables.post_memory_notes.columns.last_source_message_id]
-pg_type = "integer"
-nullable = true
-
-[tables.post_memory_notes.columns.merged_source_posts]
-pg_type = "integer"
-nullable = true
-
-[tables.post_memory_notes.columns.raw_note]
+[tables.post_history_entries.columns.model]
 pg_type = "text"
 nullable = true
 
-[tables.post_memory_notes.columns.source_channel_id]
+[tables.post_history_entries.columns.post_comment_job_id]
 pg_type = "bigint"
 nullable = true
 
-[tables.post_memory_notes.columns.source_message_id]
+[tables.post_history_entries.columns.provider]
+pg_type = "text"
+nullable = true
+
+[tables.post_history_entries.columns.skip_reason]
+pg_type = "text"
+nullable = true
+
+[tables.post_history_entries.columns.source_channel_id]
+pg_type = "bigint"
+nullable = true
+
+[tables.post_history_entries.columns.source_message_id]
 pg_type = "integer"
 nullable = true
 
-[tables.post_memory_notes.columns.summary]
+[tables.post_history_entries.columns.status]
 pg_type = "text"
 nullable = true
 
-[tables.post_memory_notes.columns.title]
+[tables.post_history_entries.columns.summary]
 pg_type = "text"
 nullable = true
 
-[tables.post_memory_notes.columns.updated_at]
+[tables.post_history_entries.columns.updated_at]
 pg_type = "timestamp with time zone"
+nullable = true
+
+[tables.post_history_entries.columns.used_angle]
+pg_type = "text"
 nullable = true
 
 [tables.search_runs]
