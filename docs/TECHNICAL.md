@@ -117,8 +117,10 @@ CEREBRAS_MODEL=
 OPENROUTER_API_KEY=
 OPENROUTER_MODEL=
 GEMINI_API_KEY=
-GEMINI_TEXT_MODEL=gemini-3.5-flash
-GEMINI_FLASH_MODEL=gemini-3.1-flash-lite
+GEMINI_TEXT_MODEL=gemini-3.6-flash
+GEMINI_FLASH_MODEL=gemini-3.5-flash
+GEMINI_FLASH_LITE_MODEL=gemini-3.5-flash-lite
+GEMINI_LEGACY_FLASH_LITE_MODEL=gemini-3.1-flash-lite
 GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 GEMINI_THINKING_BUDGET=1024
 
@@ -144,7 +146,7 @@ PROFILE_REFRESH_CONCURRENCY=4
 `deploy/vpn-nginx/nginx.conf`; сертификат Let’s Encrypt обновляется Certbot, а
 deploy hook перезагружает контейнерный Nginx после продления.
 
-Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.5 Flash` как основная модель, `Gemini 3.1 Flash Lite` как первый fallback, затем `ollama`/`gemma4:31b` как последний fallback. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
+Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.6 Flash` как основная модель, затем `Gemini 3.5 Flash`, `Gemini 3.5 Flash Lite`, `Gemini 3.1 Flash Lite` и в конце `ollama`/`gemma4:31b`. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 
 Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
 

@@ -405,6 +405,12 @@ fn fallback_models<'a>(
         ("gemini", None) => {
             let mut models = vec![primary];
             push_unique_model(&mut models, "gemini", config.gemini_flash_model.trim());
+            push_unique_model(&mut models, "gemini", config.gemini_flash_lite_model.trim());
+            push_unique_model(
+                &mut models,
+                "gemini",
+                config.gemini_legacy_flash_lite_model.trim(),
+            );
             push_unique_model(&mut models, "ollama", config.vision_model.trim());
             models
         }
@@ -550,8 +556,10 @@ mod tests {
             openrouter_api_key: String::new(),
             openrouter_model: None,
             gemini_api_key: String::new(),
-            gemini_text_model: "gemini-3.5-flash".to_string(),
-            gemini_flash_model: "gemini-3.1-flash-lite".to_string(),
+            gemini_text_model: "gemini-3.6-flash".to_string(),
+            gemini_flash_model: "gemini-3.5-flash".to_string(),
+            gemini_flash_lite_model: "gemini-3.5-flash-lite".to_string(),
+            gemini_legacy_flash_lite_model: "gemini-3.1-flash-lite".to_string(),
             gemini_tts_model: "gemini-3.1-flash-tts-preview".to_string(),
             gemini_thinking_budget: 1024,
             ollama_base_url: "https://ollama.com".to_string(),
@@ -604,16 +612,24 @@ mod tests {
     }
 
     #[test]
-    fn gemini_comments_fallback_to_flash_lite_then_gemma_31b() {
+    fn gemini_comments_fallback_from_flash_to_lite_then_gemma_31b() {
         let config = config();
-        let models = fallback_models(&config, "gemini", None, "gemini-3.5-flash");
+        let models = fallback_models(&config, "gemini", None, "gemini-3.6-flash");
 
         assert_eq!(
             models,
             vec![
                 FallbackModel {
                     provider: "gemini",
+                    model: "gemini-3.6-flash",
+                },
+                FallbackModel {
+                    provider: "gemini",
                     model: "gemini-3.5-flash",
+                },
+                FallbackModel {
+                    provider: "gemini",
+                    model: "gemini-3.5-flash-lite",
                 },
                 FallbackModel {
                     provider: "gemini",
@@ -633,15 +649,15 @@ mod tests {
         let models = fallback_models(
             &config,
             "gemini",
-            Some("gemini-3.5-flash"),
-            "gemini-3.5-flash",
+            Some("gemini-3.6-flash"),
+            "gemini-3.6-flash",
         );
 
         assert_eq!(
             models,
             vec![FallbackModel {
                 provider: "gemini",
-                model: "gemini-3.5-flash",
+                model: "gemini-3.6-flash",
             }]
         );
     }
