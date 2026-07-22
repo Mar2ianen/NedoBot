@@ -75,7 +75,7 @@ LLM_PROVIDER=gemini
 LLM_MODEL=gemini-3.5-flash
 LLM_SUPPORTS_IMAGES=true
 LLM_TEMPERATURE=0.45
-LLM_MAX_TOKENS=90
+LLM_MAX_TOKENS=180
 LLM_PROXY_URL=
 MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
@@ -150,7 +150,7 @@ deploy hook перезагружает контейнерный Nginx после
 
 Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
 
-Для reasoning Gemini-моделей `GEMINI_THINKING_BUDGET` задаёт отдельный бюджет thinking-токенов. В Gemini API общий `maxOutputTokens` включает и thinking, и финальный ответ, поэтому бот отправляет `maxOutputTokens = LLM_MAX_TOKENS + GEMINI_THINKING_BUDGET`, а длину/качество финального комментария дополнительно контролирует output validator.
+Для Gemini 3.x бот использует актуальный `thinkingLevel=low` и не передаёт устаревшие `temperature` и числовой `thinkingBudget`. `LLM_MAX_TOKENS` задаёт полный лимит вывода; для JSON-комментария нужен запас, поэтому значение по умолчанию — 180. Для старых Gemini-моделей сохраняется `GEMINI_THINKING_BUDGET`: бот отправляет `maxOutputTokens = LLM_MAX_TOKENS + GEMINI_THINKING_BUDGET`.
 
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 

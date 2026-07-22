@@ -149,7 +149,7 @@ impl Config {
             llm_supports_images: env_optional("LLM_SUPPORTS_IMAGES")
                 .and_then(|value| value.parse().ok()),
             llm_temperature: env_f32("LLM_TEMPERATURE", 0.45),
-            llm_max_tokens: env_u32("LLM_MAX_TOKENS", 90),
+            llm_max_tokens: env_u32("LLM_MAX_TOKENS", 180),
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
             memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2),
             memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220),
