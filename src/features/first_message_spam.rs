@@ -7,8 +7,10 @@ use crate::config::Config;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
+use crate::text::first_text_chars;
 
-const PROMPT_VERSION: &str = "first-message-spam-v1";
+const PROMPT_VERSION: &str = "first-message-spam-v2";
+const POST_CONTEXT_LIMIT: usize = 700;
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/first_message_spam_classification.md");
 
 pub async fn analyze_first_message(
@@ -44,12 +46,13 @@ pub async fn analyze_first_message(
     let embedding_literal = pgvector_literal(&embedding)?;
     let template_matches = template_match_count(pool, chat_id, user_id, &text).await?;
     let similarity = spam_similarity(pool, &embedding_literal).await?;
-    let assessment = classify_text(config, &text).await?;
+    let replied_post_context = replied_post_context(pool, chat_id, user_id).await?;
+    let assessment = classify_text(config, &text, replied_post_context.as_deref()).await?;
     let delta = score_delta(&assessment, template_matches, similarity);
     let signal = json!({
         "class": "first_message_content",
         "label": "first_message_spam_analysis",
-        "reason": format!("LLM markers; template matches: {template_matches}; spam similarity: {:.3}", similarity.unwrap_or(0.0)),
+        "reason": format!("LLM markers; post context: {}; template matches: {template_matches}; spam similarity: {:.3}", if replied_post_context.is_some() { "available" } else { "absent" }, similarity.unwrap_or(0.0)),
         "coefficient": delta,
         "warning_strength": if delta >= 30 { "strong" } else { "supporting" },
         "assessment": assessment
@@ -75,6 +78,36 @@ pub async fn analyze_first_message(
     .bind(&config.rag_embedding_model).bind(similarity).bind(template_matches).bind(delta).bind(&signal)
     .fetch_optional(pool).await?;
     Ok(updated.is_some())
+}
+
+async fn replied_post_context(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<Option<String>> {
+    let context = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        select coalesce(nullif(trim(history.summary), ''), nullif(trim(job.cleaned_post_text), ''))
+        from telegram_new_user_profile_audits audit
+        join telegram_messages first_message
+          on first_message.chat_id = audit.chat_id
+         and first_message.message_id = audit.first_message_id
+        join post_comment_jobs job
+          on job.discussion_chat_id = first_message.chat_id
+         and job.discussion_message_id = first_message.reply_to_message_id
+        left join post_history_entries history
+          on history.source_channel_id = job.source_channel_id
+         and history.source_message_id = job.source_message_id
+         and history.status = 'ready'
+        where audit.chat_id = $1 and audit.telegram_user_id = $2
+        "#,
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    Ok(context.map(|text| first_text_chars(&text, POST_CONTEXT_LIMIT)))
 }
 
 async fn template_match_count(
@@ -106,10 +139,16 @@ async fn spam_similarity(pool: &PgPool, embedding: &str) -> anyhow::Result<Optio
     Ok(value)
 }
 
-async fn classify_text(config: &Config, text: &str) -> anyhow::Result<Value> {
-    let prompt = serde_json::to_string(
-        &json!({"untrusted_first_message": text, "prompt_version": PROMPT_VERSION}),
-    )?;
+async fn classify_text(
+    config: &Config,
+    text: &str,
+    replied_post_context: Option<&str>,
+) -> anyhow::Result<Value> {
+    let prompt = serde_json::to_string(&json!({
+        "untrusted_first_message": text,
+        "trusted_replied_post_context": replied_post_context,
+        "prompt_version": PROMPT_VERSION
+    }))?;
     let generation = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
@@ -138,10 +177,11 @@ fn output_schema() -> &'static Value {
             "type":"object", "additionalProperties":false,
             "properties": {
                 "direct_dm_offer":{"type":"boolean"}, "offtopic_promo":{"type":"boolean"}, "template_campaign":{"type":"boolean"},
+                "relation_to_replied_post":{"type":"string","enum":["on_topic","loosely_related","off_topic","no_post_context"]},
                 "markers":{"type":"array","items":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action"]}},
                 "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"marker":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action"]},"quote":{"type":"string"}},"required":["marker","quote"]}},
                 "explanation":{"type":"string"}
-            }, "required":["direct_dm_offer","offtopic_promo","template_campaign","markers","evidence","explanation"]
+            }, "required":["direct_dm_offer","offtopic_promo","template_campaign","relation_to_replied_post","markers","evidence","explanation"]
         })
     });
     &SCHEMA
@@ -149,7 +189,8 @@ fn output_schema() -> &'static Value {
 
 fn score_delta(assessment: &Value, template_matches: i32, similarity: Option<f64>) -> i32 {
     let direct = assessment["direct_dm_offer"].as_bool().unwrap_or(false);
-    let offtopic = assessment["offtopic_promo"].as_bool().unwrap_or(false);
+    let offtopic = assessment["offtopic_promo"].as_bool().unwrap_or(false)
+        && assessment["relation_to_replied_post"].as_str() == Some("off_topic");
     let campaign = assessment["template_campaign"].as_bool().unwrap_or(false);
     let llm = match (direct, offtopic, campaign) {
         (true, true, _) => 30,
@@ -220,11 +261,23 @@ mod tests {
     fn direct_dm_campaign_is_strong_but_capped() {
         assert_eq!(
             score_delta(
-                &json!({"direct_dm_offer":true,"offtopic_promo":true,"template_campaign":true}),
+                &json!({"direct_dm_offer":true,"offtopic_promo":true,"template_campaign":true,"relation_to_replied_post":"off_topic"}),
                 2,
                 Some(0.95)
             ),
             45
+        );
+    }
+
+    #[test]
+    fn offtopic_claim_without_post_context_is_not_a_strong_signal() {
+        assert_eq!(
+            score_delta(
+                &json!({"direct_dm_offer":true,"offtopic_promo":true,"template_campaign":false,"relation_to_replied_post":"no_post_context"}),
+                0,
+                None
+            ),
+            0
         );
     }
 }
