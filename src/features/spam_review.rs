@@ -161,6 +161,7 @@ fn human_label(label: &str) -> &str {
         "personal_channel_external_link" => "в личном канале есть внешняя ссылка",
         "non_adjacent_emoji_message" => "нетипичный emoji в комментарии",
         "non_adjacent_emoji_message_ending" => "комментарий заканчивается emoji",
+        "first_message_spam_analysis" => "первое сообщение похоже на известную спам-кампанию",
         _ => label,
     }
 }

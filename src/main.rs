@@ -27,6 +27,7 @@ use features::avatar_analysis::service::{
     enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
 };
 use features::first_comment::pipeline::maybe_comment_post;
+use features::first_message_spam::analyze_first_message;
 use features::memory::service::process_next_history_entry;
 use features::new_user_analysis::analyze_new_user_profile;
 use features::spam_review::{apply_callback, create_high_risk_review, parse_callback, send_review};
@@ -153,6 +154,7 @@ fn spawn_message_author_profile_refresh(
     let pool = state.pool.clone();
     let profile_refresh_slots = state.profile_refresh_slots.clone();
     let avatar_classifier_enabled = state.config.avatar_classifier_enabled;
+    let state_config = state.config.clone();
     tokio::spawn(async move {
         match user_profile_needs_refresh(&pool, user_id).await {
             Ok(true) => {}
@@ -176,6 +178,11 @@ fn spawn_message_author_profile_refresh(
                 if let Err(err) = analyze_new_user_profile(&pool, chat_id, user_id).await {
                     tracing::warn!(%err, user_id, "failed to analyze new user profile");
                 } else {
+                    if let Err(err) =
+                        analyze_first_message(&pool, &state_config, chat_id, user_id).await
+                    {
+                        tracing::warn!(%err, user_id, "failed to analyze first message for spam");
+                    }
                     match create_high_risk_review(&pool, chat_id, user_id).await {
                         Ok(Some(review)) => {
                             if let Err(err) = send_review(&bot, &review).await {
