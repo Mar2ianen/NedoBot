@@ -2,7 +2,7 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
     types::{
-        ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
+        CallbackQuery, ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
         MessageReactionUpdated, ParseMode,
     },
 };
@@ -29,6 +29,7 @@ use features::avatar_analysis::service::{
 use features::first_comment::pipeline::maybe_comment_post;
 use features::memory::service::process_next_history_entry;
 use features::new_user_analysis::analyze_new_user_profile;
+use features::spam_review::{apply_callback, create_high_risk_review, parse_callback, send_review};
 use features::user_profiles::service::refresh_profile;
 use features::voice::pipeline::maybe_transcribe_voice;
 use state::AppState;
@@ -75,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
             Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
         )
         .branch(Update::filter_edited_message().endpoint(handle_edited_message))
+        .branch(Update::filter_callback_query().endpoint(handle_callback_query))
         .branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
@@ -173,6 +175,16 @@ fn spawn_message_author_profile_refresh(
             Ok(()) => {
                 if let Err(err) = analyze_new_user_profile(&pool, chat_id, user_id).await {
                     tracing::warn!(%err, user_id, "failed to analyze new user profile");
+                } else {
+                    match create_high_risk_review(&pool, chat_id, user_id).await {
+                        Ok(Some(review)) => {
+                            if let Err(err) = send_review(&bot, &review).await {
+                                tracing::warn!(%err, user_id, "failed to send spam review");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => tracing::warn!(%err, user_id, "failed to create spam review"),
+                    }
                 }
                 if avatar_classifier_enabled
                     && let Err(err) = enqueue_current_avatar_analysis(&pool, user_id).await
@@ -191,6 +203,48 @@ fn spawn_message_author_profile_refresh(
             }
         }
     });
+}
+
+async fn handle_callback_query(
+    bot: teloxide::adaptors::DefaultParseMode<Bot>,
+    query: CallbackQuery,
+    state: AppState,
+) -> ResponseResult<()> {
+    let Some(owner_id) = state.config.owner_telegram_id else {
+        return Ok(());
+    };
+    if query.from.id.0 as i64 != owner_id {
+        bot.answer_callback_query(query.id)
+            .text("Недостаточно прав.")
+            .await?;
+        return Ok(());
+    }
+    let Some((request_id, decision)) = query.data.as_deref().and_then(parse_callback) else {
+        return Ok(());
+    };
+    match apply_callback(&state.pool, request_id, decision, owner_id).await {
+        Ok(Some(text)) => {
+            bot.answer_callback_query(query.id.clone())
+                .text(text)
+                .await?;
+            if let Some(message) = query.regular_message() {
+                bot.edit_message_reply_markup(message.chat.id, message.id)
+                    .await?;
+            }
+        }
+        Ok(None) => {
+            bot.answer_callback_query(query.id)
+                .text("Решение уже принято или кнопка устарела.")
+                .await?;
+        }
+        Err(err) => {
+            tracing::error!(%err, request_id, "failed to apply spam review callback");
+            bot.answer_callback_query(query.id)
+                .text("Не удалось сохранить решение.")
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
