@@ -3,6 +3,7 @@
 pub mod ask;
 pub mod avatar_analysis;
 pub mod first_comment;
+pub mod first_message_spam;
 pub mod memory;
 pub mod new_user_analysis;
 pub mod search;
