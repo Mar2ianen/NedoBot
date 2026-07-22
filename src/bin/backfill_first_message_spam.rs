@@ -9,12 +9,15 @@ use tg_ai_bot_teloxide::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    let (chat_id, limit, only_spam) = parse_args()?;
+    let (chat_id, limit, only_spam, user_id) = parse_args()?;
     let config = Config::from_env();
     let chat_id = chat_id.unwrap_or(config.discussion_chat_id);
     let pool = build_pool().await?;
     migrate(&pool).await?;
-    let user_ids = candidates(&pool, chat_id, limit, only_spam).await?;
+    let user_ids = match user_id {
+        Some(user_id) => vec![user_id],
+        None => candidates(&pool, chat_id, limit, only_spam).await?,
+    };
     println!("first-message analysis: users={}", user_ids.len());
     for user_id in user_ids {
         match analyze_first_message(&pool, &config, chat_id, user_id).await {
@@ -51,10 +54,11 @@ async fn candidates(
     Ok(rows.into_iter().map(|(user_id,)| user_id).collect())
 }
 
-fn parse_args() -> anyhow::Result<(Option<i64>, i64, bool)> {
+fn parse_args() -> anyhow::Result<(Option<i64>, i64, bool, Option<i64>)> {
     let mut chat_id = None;
     let mut limit = 100;
     let mut only_spam = false;
+    let mut user_id = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -63,14 +67,17 @@ fn parse_args() -> anyhow::Result<(Option<i64>, i64, bool)> {
             }
             "--limit" => limit = args.next().context("--limit requires value")?.parse()?,
             "--only-spam" => only_spam = true,
+            "--user-id" => {
+                user_id = Some(args.next().context("--user-id requires value")?.parse()?)
+            }
             "-h" | "--help" => {
                 println!(
-                    "Usage: backfill_first_message_spam [--chat-id -100...] [--limit 100] [--only-spam]"
+                    "Usage: backfill_first_message_spam [--chat-id -100...] [--limit 100] [--only-spam] [--user-id ID]"
                 );
                 std::process::exit(0);
             }
             _ => bail!("unknown option: {arg}"),
         }
     }
-    Ok((chat_id, limit, only_spam))
+    Ok((chat_id, limit, only_spam, user_id))
 }
