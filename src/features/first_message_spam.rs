@@ -152,7 +152,7 @@ fn score_delta(assessment: &Value, template_matches: i32, similarity: Option<f64
     let offtopic = assessment["offtopic_promo"].as_bool().unwrap_or(false);
     let campaign = assessment["template_campaign"].as_bool().unwrap_or(false);
     let llm = match (direct, offtopic, campaign) {
-        (true, true, _) => 28,
+        (true, true, _) => 30,
         (true, _, true) => 24,
         (_, _, true) => 12,
         _ => 0,
