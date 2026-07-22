@@ -43,15 +43,7 @@ impl LlmClient for GeminiClient<'_> {
                 role: "user",
                 parts: request_parts(request.prompt, request.image_base64),
             }],
-            generation_config: GenerationConfig {
-                temperature: request.temperature,
-                max_output_tokens: request.num_predict.saturating_add(self.thinking_budget),
-                thinking_config: (self.thinking_budget > 0).then_some(ThinkingConfig {
-                    thinking_budget: self.thinking_budget,
-                }),
-                response_mime_type: request.structured_output.map(|_| "application/json"),
-                response_json_schema: request.structured_output.map(|output| output.schema),
-            },
+            generation_config: generation_config(&request, self.thinking_budget),
         };
 
         let response = http::client_with_proxy(Duration::from_secs(45), self.proxy_url)?
@@ -69,20 +61,23 @@ impl LlmClient for GeminiClient<'_> {
             .json::<GenerateContentResponse>()
             .await?;
 
-        let content = response
+        let candidate = response
             .candidates
             .into_iter()
             .next()
-            .map(|candidate| {
-                candidate
-                    .content
-                    .parts
-                    .into_iter()
-                    .filter_map(|part| part.text)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("empty Gemini response"))?;
+
+        if candidate.finish_reason.as_deref() == Some("MAX_TOKENS") {
+            anyhow::bail!("Gemini response stopped due to MAX_TOKENS");
+        }
+
+        let content = candidate
+            .content
+            .parts
+            .into_iter()
+            .filter_map(|part| (!part.thought).then_some(part.text).flatten())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         if content.trim().is_empty() {
             anyhow::bail!("empty Gemini response");
@@ -110,7 +105,8 @@ struct GeminiContent<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerationConfig<'a> {
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     max_output_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_config: Option<ThinkingConfig>,
@@ -123,7 +119,10 @@ struct GenerationConfig<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThinkingConfig {
-    thinking_budget: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -154,6 +153,8 @@ struct GenerateContentResponse {
 #[derive(Deserialize)]
 struct GeminiCandidate {
     content: GeminiResponseContent,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +166,36 @@ struct GeminiResponseContent {
 #[derive(Deserialize)]
 struct GeminiResponsePart {
     text: Option<String>,
+    #[serde(default)]
+    thought: bool,
+}
+
+fn generation_config<'a>(request: &LlmRequest<'a>, thinking_budget: u32) -> GenerationConfig<'a> {
+    let is_gemini_3 = request.model.trim().starts_with("gemini-3.");
+    let thinking_config = if is_gemini_3 {
+        // Gemini 3.x использует thinkingLevel, а temperature для него уже deprecated.
+        Some(ThinkingConfig {
+            thinking_budget: None,
+            thinking_level: Some("low"),
+        })
+    } else {
+        (thinking_budget > 0).then_some(ThinkingConfig {
+            thinking_budget: Some(thinking_budget),
+            thinking_level: None,
+        })
+    };
+
+    GenerationConfig {
+        temperature: (!is_gemini_3).then_some(request.temperature),
+        max_output_tokens: if is_gemini_3 {
+            request.num_predict
+        } else {
+            request.num_predict.saturating_add(thinking_budget)
+        },
+        thinking_config,
+        response_mime_type: request.structured_output.map(|_| "application/json"),
+        response_json_schema: request.structured_output.map(|output| output.schema),
+    }
 }
 
 fn request_parts<'a>(prompt: &'a str, image_base64: Option<&'a str>) -> Vec<GeminiPart<'a>> {
@@ -199,35 +230,74 @@ mod tests {
     }
 
     #[test]
-    fn generation_config_keeps_thinking_budget_separate_from_answer_budget() {
+    fn legacy_generation_config_keeps_thinking_budget_separate_from_answer_budget() {
         let output_budget = 90;
         let thinking_budget = 256;
-        let config = GenerationConfig {
+        let request = LlmRequest {
+            model: "gemini-2.5-flash",
+            system_prompt: None,
+            prompt: "hello",
+            image_base64: None,
             temperature: 0.35,
-            max_output_tokens: output_budget + thinking_budget,
-            thinking_config: Some(ThinkingConfig { thinking_budget }),
-            response_mime_type: None,
-            response_json_schema: None,
+            num_predict: output_budget,
+            structured_output: None,
         };
+        let config = generation_config(&request, thinking_budget);
 
         let value = serde_json::to_value(config).unwrap();
         assert_eq!(value["maxOutputTokens"], json!(346));
         assert_eq!(value["thinkingConfig"]["thinkingBudget"], json!(256));
+        assert!(
+            value["temperature"]
+                .as_f64()
+                .is_some_and(|value| (value - 0.35).abs() < 0.001)
+        );
     }
 
     #[test]
-    fn generation_config_serializes_structured_output_schema() {
+    fn gemini_3_generation_config_uses_current_api_parameters() {
         let schema = json!({"type": "object", "properties": {"comment": {"type": "string"}}});
-        let config = GenerationConfig {
+        let request = LlmRequest {
+            model: "gemini-3.6-flash",
+            system_prompt: None,
+            prompt: "hello",
+            image_base64: None,
             temperature: 0.35,
-            max_output_tokens: 90,
-            thinking_config: None,
-            response_mime_type: Some("application/json"),
-            response_json_schema: Some(&schema),
+            num_predict: 180,
+            structured_output: Some(crate::llm::types::StructuredOutput {
+                name: "comment",
+                schema: &schema,
+            }),
         };
+        let config = generation_config(&request, 1024);
 
         let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["maxOutputTokens"], json!(180));
+        assert_eq!(value["thinkingConfig"]["thinkingLevel"], json!("low"));
+        assert!(value.get("temperature").is_none());
+        assert!(value["thinkingConfig"].get("thinkingBudget").is_none());
         assert_eq!(value["responseMimeType"], json!("application/json"));
         assert_eq!(value["responseJsonSchema"], schema);
+    }
+
+    #[test]
+    fn response_parts_skip_thought_summaries() {
+        let response: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "internal", "thought": true},
+                    {"text": "answer"}
+                ]}
+            }]
+        }))
+        .unwrap();
+
+        let content = response.candidates[0]
+            .content
+            .parts
+            .iter()
+            .filter_map(|part| (!part.thought).then_some(part.text.as_deref()).flatten())
+            .collect::<Vec<_>>();
+        assert_eq!(content, ["answer"]);
     }
 }
