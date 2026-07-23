@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 pub mod ask;
 pub mod avatar_analysis;
+pub mod chat_retrieval;
 pub mod first_comment;
 pub mod first_message_spam;
 pub mod memory;
