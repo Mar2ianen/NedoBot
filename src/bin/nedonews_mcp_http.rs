@@ -1220,7 +1220,8 @@ fn safe_pg_type(value: &str) -> anyhow::Result<&str> {
         | "text"
         | "timestamp with time zone"
         | "jsonb"
-        | "text[]" => Ok(value),
+        | "text[]"
+        | "integer[]" => Ok(value),
         _ => bail!("unsupported PostgreSQL type in MCP manifest"),
     }
 }

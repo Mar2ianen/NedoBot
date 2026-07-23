@@ -120,7 +120,8 @@ fn normalize_type(data_type: &str, udt_name: &str) -> anyhow::Result<String> {
         | "text"
         | "timestamp with time zone"
         | "jsonb"
-        | "text[]" => Ok(value),
+        | "text[]"
+        | "integer[]" => Ok(value),
         _ => bail!("unsupported mcp_public type {value}"),
     }
 }

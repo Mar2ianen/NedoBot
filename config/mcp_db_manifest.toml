@@ -346,6 +346,10 @@ nullable = true
 pg_type = "integer"
 nullable = true
 
+[tables.llm_generations.columns.used_chat_message_ids]
+pg_type = "integer[]"
+nullable = true
+
 [tables.post_comment_jobs]
 description = "Проверенная публичная проекция post_comment_jobs"
 primary_key = ["id"]
