@@ -157,6 +157,10 @@ fn human_label(label: &str) -> &str {
         "reply_to_channel_post_not_comment" => "ответил прямо на пост, не на обсуждение",
         "display_name_reused_by_spammers" => "имя уже встречалось у размеченных спамеров",
         "username_random_suffix" => "username похож на автоматически созданный",
+        "mixed_script_profile_homoglyphs" => {
+            "в имени смешаны похожие латинские и кириллические буквы"
+        }
+        "explicit_adult_promo_bio" => "bio рекламирует adult-сервис через ссылку или воронку",
         "personal_channel_attached" => "подключён личный канал",
         "personal_channel_external_link" => "в личном канале есть внешняя ссылка",
         "non_adjacent_emoji_message" => "нетипичный emoji в комментарии",
