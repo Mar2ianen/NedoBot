@@ -23,7 +23,7 @@ pub async fn analyze_first_message(
     user_id: i64,
 ) -> anyhow::Result<bool> {
     let row = sqlx::query(
-        "select first_message_text, first_message_analysis_at from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+        "select first_message_text, first_message_analysis_at, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(chat_id)
     .bind(user_id)
@@ -44,14 +44,26 @@ pub async fn analyze_first_message(
     if text.trim().is_empty() {
         return Ok(false);
     }
+    let generic_feminine_name = row.get::<bool, _>("first_name_feminine_pattern");
 
     let embedding = embed_text(config, &text).await?;
     let embedding_literal = pgvector_literal(&embedding)?;
     let template_matches = template_match_count(pool, chat_id, user_id, &text).await?;
     let similarity = spam_similarity(pool, &embedding_literal).await?;
     let replied_post_context = replied_post_context(pool, chat_id, user_id).await?;
-    let assessment = classify_text(config, &text, replied_post_context.as_deref()).await?;
-    let delta = score_delta(&assessment, template_matches, similarity);
+    let assessment = classify_text(
+        config,
+        &text,
+        replied_post_context.as_deref(),
+        generic_feminine_name,
+    )
+    .await?;
+    let delta = score_delta(
+        &assessment,
+        template_matches,
+        similarity,
+        generic_feminine_name,
+    );
     let signal = json!({
         "class": "first_message_content",
         "label": "first_message_spam_analysis",
@@ -256,10 +268,12 @@ async fn classify_text(
     config: &Config,
     text: &str,
     replied_post_context: Option<&str>,
+    generic_feminine_name: bool,
 ) -> anyhow::Result<Value> {
     let prompt = serde_json::to_string(&json!({
         "untrusted_first_message": text,
         "trusted_replied_post_context": replied_post_context,
+        "generic_feminine_name_profile": generic_feminine_name,
         "prompt_version": PROMPT_VERSION
     }))?;
     let generation = generate_text_with_provider_checked(
@@ -291,8 +305,8 @@ fn output_schema() -> &'static Value {
             "properties": {
                 "direct_dm_offer":{"type":"boolean"}, "offtopic_promo":{"type":"boolean"}, "template_campaign":{"type":"boolean"},
                 "relation_to_replied_post":{"type":"string","enum":["on_topic","loosely_related","off_topic","no_post_context"]},
-                "markers":{"type":"array","items":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction"]}},
-                "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"marker":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction"]},"quote":{"type":"string"}},"required":["marker","quote"]}},
+                "markers":{"type":"array","items":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction","performative_feminine_persona"]}},
+                "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"marker":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction","performative_feminine_persona"]},"quote":{"type":"string"}},"required":["marker","quote"]}},
                 "explanation":{"type":"string"}
             }, "required":["direct_dm_offer","offtopic_promo","template_campaign","relation_to_replied_post","markers","evidence","explanation"]
         })
@@ -300,7 +314,12 @@ fn output_schema() -> &'static Value {
     &SCHEMA
 }
 
-fn score_delta(assessment: &Value, template_matches: i32, similarity: Option<f64>) -> i32 {
+fn score_delta(
+    assessment: &Value,
+    template_matches: i32,
+    similarity: Option<f64>,
+    generic_feminine_name: bool,
+) -> i32 {
     let direct = assessment["direct_dm_offer"].as_bool().unwrap_or(false);
     let offtopic = assessment["offtopic_promo"].as_bool().unwrap_or(false)
         && assessment["relation_to_replied_post"].as_str() == Some("off_topic");
@@ -310,6 +329,12 @@ fn score_delta(assessment: &Value, template_matches: i32, similarity: Option<f64
             .iter()
             .any(|marker| marker == "paid_easy_task_offer")
     });
+    let performative_feminine_persona = generic_feminine_name
+        && assessment["markers"].as_array().is_some_and(|markers| {
+            markers
+                .iter()
+                .any(|marker| marker == "performative_feminine_persona")
+        });
     let llm = if paid_task {
         30
     } else {
@@ -326,7 +351,8 @@ fn score_delta(assessment: &Value, template_matches: i32, similarity: Option<f64
         Some(value) if value >= 0.78 => 10,
         _ => 0,
     };
-    (llm + template + embedding).min(45)
+    let persona = if performative_feminine_persona { 12 } else { 0 };
+    (llm + persona + template + embedding).min(45)
 }
 
 fn token_set(text: &str) -> BTreeSet<String> {
@@ -385,7 +411,8 @@ mod tests {
             score_delta(
                 &json!({"direct_dm_offer":true,"offtopic_promo":true,"template_campaign":true,"relation_to_replied_post":"off_topic"}),
                 2,
-                Some(0.95)
+                Some(0.95),
+                false,
             ),
             45
         );
@@ -397,7 +424,8 @@ mod tests {
             score_delta(
                 &json!({"direct_dm_offer":true,"offtopic_promo":true,"template_campaign":false,"relation_to_replied_post":"no_post_context"}),
                 0,
-                None
+                None,
+                false,
             ),
             0
         );
@@ -414,8 +442,15 @@ mod tests {
     #[test]
     fn paid_easy_task_offer_is_a_strong_llm_marker() {
         assert_eq!(
-            score_delta(&json!({"markers":["paid_easy_task_offer"]}), 0, None),
+            score_delta(&json!({"markers":["paid_easy_task_offer"]}), 0, None, false),
             30
         );
+    }
+
+    #[test]
+    fn performative_feminine_persona_needs_matching_profile_pattern() {
+        let assessment = json!({"markers":["performative_feminine_persona"]});
+        assert_eq!(score_delta(&assessment, 0, None, true), 12);
+        assert_eq!(score_delta(&assessment, 0, None, false), 0);
     }
 }
