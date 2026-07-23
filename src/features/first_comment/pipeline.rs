@@ -22,7 +22,9 @@ use crate::features::first_comment::repo::{
     mark_post_comment_sent,
 };
 use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
-use crate::features::search::repo::{insert_search_run, save_chat_retrieval_candidates};
+use crate::features::search::repo::{
+    insert_search_run, save_chat_retrieval_candidates, save_expanded_chat_contexts,
+};
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
 use crate::llm::service::generate_text_checked_with_system_and_schema;
@@ -101,6 +103,21 @@ pub async fn maybe_comment_post(
             Ok(candidates) => {
                 if let Err(err) = save_chat_retrieval_candidates(pool, job_id, &candidates).await {
                     tracing::warn!(%err, "failed to save chat retrieval shadow run");
+                }
+                match crate::features::chat_retrieval::expand_shadow_contexts(
+                    pool,
+                    config.discussion_chat_id,
+                    &candidates,
+                )
+                .await
+                {
+                    Ok(contexts) => {
+                        if let Err(err) = save_expanded_chat_contexts(pool, job_id, &contexts).await
+                        {
+                            tracing::warn!(%err, "failed to save expanded chat contexts");
+                        }
+                    }
+                    Err(err) => tracing::warn!(%err, "failed to expand chat retrieval contexts"),
                 }
             }
             Err(err) => tracing::warn!(%err, "chat retrieval shadow run failed"),
