@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::features::chat_retrieval::RetrievalCandidate;
 use crate::features::memory::service::MemoryNote;
 use crate::features::search::mcp::is_safe_fetch_url;
 use crate::features::search::types::{SearchContext, SearchResult, SearchSource};
@@ -40,6 +41,7 @@ struct FirstCommentContext<'a> {
     topic_comments: Vec<String>,
     recent_comments: Vec<String>,
     search: SearchPromptContext,
+    chat_evidence: Vec<ChatEvidencePrompt>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -116,6 +118,13 @@ struct SearchPromptResult {
     content: String,
 }
 
+#[derive(Serialize)]
+struct ChatEvidencePrompt {
+    message_id: i32,
+    author_name: String,
+    text: String,
+}
+
 #[cfg(test)]
 fn build_llm_prompt(
     post_text: &str,
@@ -147,6 +156,28 @@ pub fn build_llm_prompt_parts(
     search_context: Option<&SearchContext>,
     directives: CommentDirectives,
 ) -> FirstCommentPrompt {
+    build_llm_prompt_parts_with_chat_evidence(
+        post_text,
+        chat_member_count,
+        memory_notes,
+        recent_comments,
+        topic_comments,
+        search_context,
+        directives,
+        &[],
+    )
+}
+
+pub fn build_llm_prompt_parts_with_chat_evidence(
+    post_text: &str,
+    chat_member_count: Option<u32>,
+    memory_notes: &[MemoryNote],
+    recent_comments: &[String],
+    topic_comments: &[String],
+    search_context: Option<&SearchContext>,
+    directives: CommentDirectives,
+    chat_evidence: &[(&RetrievalCandidate, String)],
+) -> FirstCommentPrompt {
     let system = include_str!("../../../prompts/first_comment.md").to_string();
     let user = build_llm_user_prompt(
         post_text,
@@ -156,6 +187,7 @@ pub fn build_llm_prompt_parts(
         topic_comments,
         search_context,
         directives,
+        chat_evidence,
     );
 
     FirstCommentPrompt { system, user }
@@ -169,6 +201,7 @@ fn build_llm_user_prompt(
     topic_comments: &[String],
     search_context: Option<&SearchContext>,
     directives: CommentDirectives,
+    chat_evidence: &[(&RetrievalCandidate, String)],
 ) -> String {
     let context = FirstCommentContext {
         post: post_text,
@@ -193,6 +226,15 @@ fn build_llm_user_prompt(
         topic_comments: comment_list(topic_comments, 6),
         recent_comments: comment_list(recent_comments, 12),
         search: render_search_context(search_context),
+        chat_evidence: chat_evidence
+            .iter()
+            .take(3)
+            .map(|(candidate, author_name)| ChatEvidencePrompt {
+                message_id: candidate.message_id,
+                author_name: author_name.clone(),
+                text: truncate_chars(&compact_text(&candidate.text), 500),
+            })
+            .collect(),
     };
 
     let json = serde_json::to_string(&context).expect("first-comment context must serialize");
