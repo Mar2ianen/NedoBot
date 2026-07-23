@@ -22,7 +22,7 @@ use crate::features::first_comment::repo::{
     mark_post_comment_sent,
 };
 use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
-use crate::features::search::repo::insert_search_run;
+use crate::features::search::repo::{insert_search_run, save_chat_retrieval_candidates};
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
 use crate::llm::service::generate_text_checked_with_system_and_schema;
@@ -88,6 +88,23 @@ pub async fn maybe_comment_post(
     let search_context = run_search(config, &clean_post, &memory_notes).await;
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
+    }
+    if let Some(plan) = search_context.plan.as_ref() {
+        match crate::features::chat_retrieval::run_shadow_retrieval(
+            pool,
+            config,
+            config.discussion_chat_id,
+            plan,
+        )
+        .await
+        {
+            Ok(candidates) => {
+                if let Err(err) = save_chat_retrieval_candidates(pool, job_id, &candidates).await {
+                    tracing::warn!(%err, "failed to save chat retrieval shadow run");
+                }
+            }
+            Err(err) => tracing::warn!(%err, "chat retrieval shadow run failed"),
+        }
     }
     let directives =
         CommentDirectives::for_post(candidate.source_message_id.0, Some(&search_context));

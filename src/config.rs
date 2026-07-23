@@ -54,6 +54,9 @@ pub struct Config {
     pub chat_retrieval_embeddings_enabled: bool,
     pub chat_retrieval_embedding_batch_size: usize,
     pub chat_retrieval_embedding_poll_sec: u64,
+    pub chat_retrieval_shadow_enabled: bool,
+    pub chat_retrieval_window_days: i64,
+    pub chat_retrieval_half_life_days: f64,
     pub search_enabled: bool,
     pub search_extract_provider: Option<String>,
     pub search_extract_model: Option<String>,
@@ -172,6 +175,9 @@ impl Config {
                 16,
             ),
             chat_retrieval_embedding_poll_sec: env_u64("CHAT_RETRIEVAL_EMBEDDING_POLL_SEC", 5),
+            chat_retrieval_shadow_enabled: env_bool("CHAT_RETRIEVAL_SHADOW_ENABLED", false),
+            chat_retrieval_window_days: env_i64("CHAT_RETRIEVAL_WINDOW_DAYS", 30),
+            chat_retrieval_half_life_days: env_f64("CHAT_RETRIEVAL_HALF_LIFE_DAYS", 7.0),
             search_enabled: env_bool("SEARCH_ENABLED", false),
             search_extract_provider: env_optional("SEARCH_EXTRACT_PROVIDER")
                 .or_else(|| Some("ollama".to_string())),
@@ -617,6 +623,13 @@ fn env_f32(key: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -685,6 +698,9 @@ mod tests {
             chat_retrieval_embeddings_enabled: false,
             chat_retrieval_embedding_batch_size: 16,
             chat_retrieval_embedding_poll_sec: 5,
+            chat_retrieval_shadow_enabled: false,
+            chat_retrieval_window_days: 30,
+            chat_retrieval_half_life_days: 7.0,
             search_enabled: false,
             search_extract_provider: Some("ollama".to_string()),
             search_extract_model: Some("gemma4:31b".to_string()),

@@ -47,3 +47,18 @@ pub async fn insert_search_run(
 
     Ok(())
 }
+
+pub async fn save_chat_retrieval_candidates(
+    pool: &PgPool,
+    post_comment_job_id: i64,
+    candidates: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update chat_research_runs set retrieval_candidates = $2, updated_at = now() where post_comment_job_id = $1",
+    )
+    .bind(post_comment_job_id)
+    .bind(serde_json::to_value(candidates)?)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
