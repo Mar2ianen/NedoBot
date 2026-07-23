@@ -121,8 +121,13 @@ pub(crate) fn parse_research_plan(value: &str, post: &str) -> anyhow::Result<Res
     plan.secondary_context = sanitize_items(plan.secondary_context, MAX_PLAN_ITEMS);
     plan.chat_semantic_queries =
         sanitize_items(plan.chat_semantic_queries, MAX_CHAT_SEMANTIC_QUERIES);
-    plan.chat_lexical_terms = sanitize_items(plan.chat_lexical_terms, MAX_PLAN_ITEMS);
-    for term in latin_fragments(post) {
+    let post_terms = latin_fragments(post);
+    let reserved_post_slots = post_terms.len().min(MAX_PLAN_ITEMS);
+    plan.chat_lexical_terms = sanitize_items(
+        plan.chat_lexical_terms,
+        MAX_PLAN_ITEMS.saturating_sub(reserved_post_slots),
+    );
+    for term in post_terms {
         push_unique(&mut plan.chat_lexical_terms, term, MAX_PLAN_ITEMS);
     }
     plan.web_queries = sanitize_items(plan.web_queries, MAX_PLAN_ITEMS);

@@ -24,7 +24,8 @@ use crate::features::first_comment::repo::{
 };
 use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
 use crate::features::search::repo::{
-    insert_search_run, save_chat_retrieval_candidates, save_expanded_chat_contexts,
+    insert_search_run, save_chat_evidence_outcome, save_chat_retrieval_candidates,
+    save_expanded_chat_contexts,
 };
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
@@ -128,7 +129,14 @@ pub async fn maybe_comment_post(
     }
     let directives =
         CommentDirectives::for_post(candidate.source_message_id.0, Some(&search_context));
-    let chat_candidate_ids = chat_candidates
+    let evidence_candidates = chat_candidates
+        .iter()
+        .filter(|candidate| {
+            config.chat_retrieval_evidence_enabled
+                && candidate.total_score >= config.chat_retrieval_evidence_min_score
+        })
+        .collect::<Vec<_>>();
+    let chat_candidate_ids = evidence_candidates
         .iter()
         .map(|candidate| candidate.message_id)
         .collect::<Vec<_>>();
@@ -138,15 +146,20 @@ pub async fn maybe_comment_post(
         &chat_candidate_ids,
     )
     .await?;
-    let chat_evidence = chat_candidates
-        .iter()
-        .filter_map(|candidate| {
-            chat_targets
+    let chat_evidence = config
+        .chat_retrieval_evidence_enabled
+        .then(|| {
+            evidence_candidates
                 .iter()
-                .find(|target| target.message_id == candidate.message_id)
-                .map(|target| (candidate, target.author_name.clone()))
+                .filter_map(|candidate| {
+                    chat_targets
+                        .iter()
+                        .find(|target| target.message_id == candidate.message_id)
+                        .map(|target| (*candidate, target.author_name.clone()))
+                })
+                .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
+        .unwrap_or_default();
     let prompt = build_llm_prompt_parts_with_chat_evidence(
         &clean_post,
         chat_member_count,
@@ -160,7 +173,10 @@ pub async fn maybe_comment_post(
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
     let source_policy = config.clone();
-    let allowed_chat_message_ids = chat_candidate_ids.clone();
+    let allowed_chat_message_ids = config
+        .chat_retrieval_evidence_enabled
+        .then_some(chat_candidate_ids.clone())
+        .unwrap_or_default();
     let validator = move |value: &str| {
         validate_first_comment_draft_with_search_policy_and_chat(
             value,
@@ -192,8 +208,30 @@ pub async fn maybe_comment_post(
     }
     let chat_targets = chat_targets
         .into_iter()
-        .filter(|target| draft.used_chat_message_ids.contains(&target.message_id))
+        .filter(|target| {
+            config.chat_retrieval_evidence_enabled
+                && draft.used_chat_message_ids.contains(&target.message_id)
+        })
         .collect::<Vec<_>>();
+    let evidence_rejection_reason = if !config.chat_retrieval_evidence_enabled {
+        Some("evidence_disabled")
+    } else if evidence_candidates.is_empty() {
+        Some("no_high_confidence_candidate")
+    } else if draft.used_chat_message_ids.is_empty() {
+        Some("model_declined_evidence")
+    } else {
+        None
+    };
+    if let Err(err) = save_chat_evidence_outcome(
+        pool,
+        job_id,
+        &draft.used_chat_message_ids,
+        evidence_rejection_reason,
+    )
+    .await
+    {
+        tracing::warn!(%err, "failed to save chat evidence outcome");
+    }
     let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;

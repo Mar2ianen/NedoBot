@@ -39,6 +39,13 @@ pub struct SourceLinkPlaceholder {
     pub label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatEvidencePlaceholder {
+    pub message_id: i32,
+    /// `None` means the renderer must take the display name from the confirmed DB target.
+    pub message_label: Option<String>,
+}
+
 static FIRST_COMMENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
@@ -135,10 +142,6 @@ pub fn validate_first_comment_draft_with_search_policy_and_chat(
     let draft = parse_first_comment_draft(value)?;
     let source_link = validate_comment_body(&draft, config, allowed_chat_message_ids)?;
 
-    if source_link_available && draft.used_search_result_id.is_none() {
-        anyhow::bail!("a usable search result is available; comment must cite one new source fact");
-    }
-
     if let Some(result_id) = draft.used_search_result_id {
         let result = search_result_by_id(search_results, result_id)?;
         if source_link.is_some()
@@ -183,6 +186,9 @@ fn validate_comment_body(
 ) -> anyhow::Result<Option<SourceLinkPlaceholder>> {
     let (visible_comment, source_link) = replace_source_link_placeholder(&draft.comment)?;
     let (visible_comment, evidence_ids) = replace_chat_evidence_placeholders(&visible_comment)?;
+    if evidence_ids != draft.used_chat_message_ids {
+        anyhow::bail!("used_chat_message_ids must exactly match chat evidence placeholders");
+    }
     if evidence_ids.is_empty() {
         validate_comment_output(&visible_comment)?;
     } else {
@@ -217,33 +223,59 @@ fn replace_chat_evidence_placeholders(text: &str) -> anyhow::Result<(String, Vec
             anyhow::bail!("unterminated chat evidence placeholder")
         };
         let token = &after_start[..=end];
-        let id = if let Some(value) = token
-            .strip_prefix("{CHAT_AUTHOR:")
-            .and_then(|value| value.strip_suffix('}'))
-        {
-            value.parse::<i32>().ok()
-        } else if let Some(value) = token
-            .strip_prefix("{CHAT_MESSAGE:")
-            .and_then(|value| value.strip_suffix('}'))
-        {
-            value
-                .split_once(':')
-                .and_then(|(id, label)| (!label.trim().is_empty()).then_some(id))
-                .and_then(|id| id.parse().ok())
-        } else {
-            None
-        };
-        let Some(id) = id.filter(|id| *id > 0) else {
-            anyhow::bail!("malformed chat evidence placeholder: {token}")
-        };
+        let placeholder = parse_chat_evidence_placeholder(token)?;
+        let id = placeholder.message_id;
         if !ids.contains(&id) {
             ids.push(id);
         }
-        visible.push(' ');
+        visible.push_str(placeholder.message_label.as_deref().unwrap_or(" "));
         rest = &after_start[end + 1..];
     }
     visible.push_str(rest);
     Ok((visible, ids))
+}
+
+pub fn parse_chat_evidence_placeholder(token: &str) -> anyhow::Result<ChatEvidencePlaceholder> {
+    if let Some(value) = token
+        .strip_prefix("{CHAT_AUTHOR:")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        let message_id = value
+            .parse::<i32>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| anyhow::anyhow!("malformed chat evidence placeholder: {token}"))?;
+        return Ok(ChatEvidencePlaceholder {
+            message_id,
+            message_label: None,
+        });
+    }
+
+    let value = token
+        .strip_prefix("{CHAT_MESSAGE:")
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| anyhow::anyhow!("malformed chat evidence placeholder: {token}"))?;
+    let (id, label) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("CHAT_MESSAGE must contain message ID and label"))?;
+    let message_id = id
+        .parse::<i32>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| anyhow::anyhow!("malformed chat evidence placeholder: {token}"))?;
+    let label = label.trim();
+    if label.is_empty()
+        || label.chars().count() > 40
+        || !label
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || ch == '-')
+    {
+        anyhow::bail!("CHAT_MESSAGE label contains unsupported characters");
+    }
+    Ok(ChatEvidencePlaceholder {
+        message_id,
+        message_label: Some(label.to_string()),
+    })
 }
 
 fn search_result_by_id(
@@ -404,6 +436,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_claimed_chat_provenance_without_placeholder() {
+        assert!(validate_first_comment_draft_with_search_policy_and_chat(
+            r#"{"comment":"TPM всё ещё горячая тема в {CHAT_LINK:чатике}","used_search_result_id":null,"used_chat_message_ids":[42]}"#,
+            &[], false, &Config::from_env(), &[42],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_chat_message_label_the_renderer_would_not_link() {
+        assert!(validate_first_comment_draft_with_search_policy_and_chat(
+            r#"{"comment":"Похожее обсуждение было в {CHAT_MESSAGE:42:<script>}","used_search_result_id":null,"used_chat_message_ids":[42]}"#,
+            &[], false, &Config::from_env(), &[42],
+        )
+        .is_err());
+    }
+
+    #[test]
     fn schema_requires_comment_and_search_provenance() {
         let schema = first_comment_output_schema();
         assert_eq!(
@@ -522,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unused_search_context_when_a_source_is_available() {
+    fn allows_ignoring_search_context_when_it_does_not_add_scope() {
         let results = vec![SearchResult {
             source: crate::features::search::types::SearchSource::Web,
             title: "Release notes".to_string(),
@@ -530,11 +580,11 @@ mod tests {
             snippet: "Version 2.0 is available.".to_string(),
         }];
 
-        assert!(validate_first_comment_draft_with_search(
+        validate_first_comment_draft_with_search(
             r#"{"comment":"Обновление уже вышло. Детали в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
             &results,
             true,
         )
-        .is_err());
+        .unwrap();
     }
 }

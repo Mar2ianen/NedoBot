@@ -105,6 +105,10 @@ SEARCH_MCP_TOOL_REDDIT=reddit_search
 SEARCH_MCP_TOOL_FETCH=web_fetch_exa
 SEARCH_FETCH_TOP_N=4
 SEARCH_FETCH_MAX_CHARS=16000
+CHAT_RETRIEVAL_EMBEDDINGS_ENABLED=false
+CHAT_RETRIEVAL_SHADOW_ENABLED=false
+CHAT_RETRIEVAL_EVIDENCE_ENABLED=false
+CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE=2.0
 SEARCH_GITHUB_MCP_COMMAND=
 SEARCH_GITHUB_MCP_ARGS=
 SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
@@ -188,6 +192,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - Ошибка extract превращается в skipped `SearchContext`; ошибка или таймаут отдельного MCP source оставляет успешные результаты других источников доступными для комментария.
 - Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. В промпт помещается до 24 результатов, до 16 000 символов на результат и до 160 000 символов суммарно; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
+- Chat retrieval работает отдельно: `CHAT_RETRIEVAL_SHADOW_ENABLED` сохраняет гибридные кандидаты и раскрытый контекст только для аудита. `CHAT_RETRIEVAL_EVIDENCE_ENABLED` по умолчанию выключен; включать его можно лишь после ручной оценки shadow-выборки. Даже при включении в prompt попадают только кандидаты не ниже `CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE`.
 
 Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
 

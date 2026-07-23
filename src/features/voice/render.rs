@@ -221,6 +221,8 @@ mod tests {
             chat_retrieval_embedding_batch_size: 16,
             chat_retrieval_embedding_poll_sec: 5,
             chat_retrieval_shadow_enabled: false,
+            chat_retrieval_evidence_enabled: false,
+            chat_retrieval_evidence_min_score: 2.0,
             chat_retrieval_window_days: 30,
             chat_retrieval_half_life_days: 7.0,
             search_enabled: false,
