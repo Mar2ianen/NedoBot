@@ -1,5 +1,6 @@
 use sqlx::PgPool;
 
+use crate::features::first_comment::render::ChatLinkTarget;
 use crate::text::{normalize_ai_markers, strip_links};
 
 pub struct LlmGenerationInsert<'a> {
@@ -108,6 +109,41 @@ pub async fn load_recent_bot_comments(pool: &PgPool) -> anyhow::Result<Vec<Strin
         .into_iter()
         .map(|(text,)| normalize_comment_text(&text))
         .filter(|text| !text.trim().is_empty())
+        .collect())
+}
+
+pub async fn load_chat_link_targets(
+    pool: &PgPool,
+    chat_id: i64,
+    message_ids: &[i32],
+) -> anyhow::Result<Vec<ChatLinkTarget>> {
+    let rows = sqlx::query_as::<_, (i32, String, Option<String>)>(
+        r#"
+        select m.message_id,
+               coalesce(nullif(trim(p.first_name), ''), nullif(trim(p.username), ''), 'Участник') as author_name,
+               nullif(trim(p.username), '') as author_username
+        from telegram_messages m
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        where m.chat_id = $1 and m.message_id = any($2)
+          and m.deleted_by_bot_at is null and m.spam_marked_at is null
+        "#,
+    )
+    .bind(chat_id)
+    .bind(message_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(message_id, author_name, author_username)| {
+            crate::features::ask::chat_search::message_url(chat_id, message_id).map(|message_url| {
+                ChatLinkTarget {
+                    message_id,
+                    author_name,
+                    author_username,
+                    message_url,
+                }
+            })
+        })
         .collect())
 }
 
