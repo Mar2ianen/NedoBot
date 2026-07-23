@@ -307,6 +307,7 @@ pub async fn enqueue_message_embedding(
     Ok(())
 }
 
+#[allow(dead_code)] // Used by the standalone resumable backfill binary.
 pub async fn enqueue_backfill_batch(
     pool: &PgPool,
     chat_id: i64,
