@@ -237,8 +237,7 @@ async fn handle_callback_query(
                 .text(text)
                 .await?;
             if let Some(message) = query.regular_message() {
-                bot.edit_message_reply_markup(message.chat.id, message.id)
-                    .await?;
+                bot.delete_message(message.chat.id, message.id).await?;
             }
         }
         Ok(None) => {
