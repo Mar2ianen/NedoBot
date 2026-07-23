@@ -5,6 +5,14 @@ use crate::features::search::{mcp::is_safe_fetch_url, policy::is_allowed_source_
 use crate::telegram::html::{Html, link};
 use crate::text::{normalize_ai_markers, strip_links};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatLinkTarget {
+    pub message_id: i32,
+    pub author_name: String,
+    pub author_username: Option<String>,
+    pub message_url: String,
+}
+
 pub fn build_comment_html(llm_body: &str, config: &Config) -> String {
     build_comment_html_with_sources(llm_body, config, &[])
 }
@@ -13,6 +21,15 @@ pub fn build_comment_html_with_sources(
     llm_body: &str,
     config: &Config,
     search_results: &[SearchResult],
+) -> String {
+    build_comment_html_with_context(llm_body, config, search_results, &[])
+}
+
+pub fn build_comment_html_with_context(
+    llm_body: &str,
+    config: &Config,
+    search_results: &[SearchResult],
+    chat_targets: &[ChatLinkTarget],
 ) -> String {
     // The model decides the wording; code owns links and custom emoji markup.
     let clean_body = normalize_ai_markers(&strip_links(llm_body))
@@ -23,7 +40,7 @@ pub fn build_comment_html_with_sources(
         return String::new();
     }
 
-    let body = render_link_placeholders(&clean_body, config, search_results);
+    let body = render_link_placeholders(&clean_body, config, search_results, chat_targets);
 
     match pick_comment_emoji(llm_body, config) {
         Some(custom_emoji_id) => {
@@ -79,7 +96,16 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
     }
 }
 
-fn render_link_placeholders(text: &str, config: &Config, search_results: &[SearchResult]) -> Html {
+fn render_link_placeholders(
+    text: &str,
+    config: &Config,
+    search_results: &[SearchResult],
+    chat_targets: &[ChatLinkTarget],
+) -> Html {
+    let targets = chat_targets
+        .iter()
+        .map(|target| (target.message_id, target))
+        .collect::<HashMap<_, _>>();
     let mut html = Html::empty();
     let mut rest = text;
     while let Some((start, kind)) = next_link_placeholder(rest) {
@@ -107,6 +133,20 @@ fn render_link_placeholders(text: &str, config: &Config, search_results: &[Searc
                     html.push(Html::text(token));
                 }
             }
+            LinkPlaceholderKind::ChatAuthor => {
+                if let Some((label, url)) = chat_author_target(token, &targets) {
+                    html.push(link(&label, &url));
+                } else {
+                    html.push(Html::text(token));
+                }
+            }
+            LinkPlaceholderKind::ChatMessage => {
+                if let Some((label, url)) = chat_message_target(token, &targets) {
+                    html.push(link(&label, &url));
+                } else {
+                    html.push(Html::text(token));
+                }
+            }
         }
 
         rest = &after_start[end + 1..];
@@ -121,16 +161,64 @@ fn render_link_placeholders(text: &str, config: &Config, search_results: &[Searc
 enum LinkPlaceholderKind {
     Chat,
     Source,
+    ChatAuthor,
+    ChatMessage,
 }
 
 fn next_link_placeholder(text: &str) -> Option<(usize, LinkPlaceholderKind)> {
-    match (text.find("{CHAT_LINK"), text.find("{SOURCE_LINK")) {
-        (Some(chat), Some(source)) if chat < source => Some((chat, LinkPlaceholderKind::Chat)),
-        (Some(_), Some(source)) => Some((source, LinkPlaceholderKind::Source)),
-        (Some(chat), None) => Some((chat, LinkPlaceholderKind::Chat)),
-        (None, Some(source)) => Some((source, LinkPlaceholderKind::Source)),
-        (None, None) => None,
+    [
+        (text.find("{CHAT_LINK"), LinkPlaceholderKind::Chat),
+        (text.find("{SOURCE_LINK"), LinkPlaceholderKind::Source),
+        (text.find("{CHAT_AUTHOR"), LinkPlaceholderKind::ChatAuthor),
+        (text.find("{CHAT_MESSAGE"), LinkPlaceholderKind::ChatMessage),
+    ]
+    .into_iter()
+    .filter_map(|(position, kind)| position.map(|position| (position, kind)))
+    .min_by_key(|(position, _)| *position)
+}
+
+fn chat_author_target(
+    token: &str,
+    targets: &HashMap<i32, &ChatLinkTarget>,
+) -> Option<(String, String)> {
+    let id = token
+        .strip_prefix("{CHAT_AUTHOR:")?
+        .strip_suffix('}')?
+        .parse()
+        .ok()?;
+    let target = targets.get(&id)?;
+    let url = target
+        .author_username
+        .as_deref()
+        .filter(|username| {
+            username
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .map(|username| format!("https://t.me/{username}"))
+        .unwrap_or_else(|| target.message_url.clone());
+    Some((target.author_name.clone(), url))
+}
+
+fn chat_message_target(
+    token: &str,
+    targets: &HashMap<i32, &ChatLinkTarget>,
+) -> Option<(String, String)> {
+    let value = token.strip_prefix("{CHAT_MESSAGE:")?.strip_suffix('}')?;
+    let (id, label) = value.split_once(':')?;
+    let id = id.parse().ok()?;
+    let label = label.trim();
+    if label.is_empty()
+        || label.chars().count() > 40
+        || !label
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || ch == '-')
+    {
+        return None;
     }
+    targets
+        .get(&id)
+        .map(|target| (label.to_string(), target.message_url.clone()))
 }
 
 fn source_link_target<'a>(
@@ -372,6 +460,34 @@ mod tests {
     }
 
     #[test]
+    fn renders_chat_author_from_allowed_database_target() {
+        let html = build_comment_html_with_context(
+            "{CHAT_AUTHOR:42} уже проверял TPM, продолжение в {CHAT_LINK:чатике}",
+            &config(),
+            &[],
+            &[ChatLinkTarget {
+                message_id: 42,
+                author_name: "Иван".to_string(),
+                author_username: Some("ivan_test".to_string()),
+                message_url: "https://t.me/c/123/42".to_string(),
+            }],
+        );
+        assert!(html.contains(r#"<a href="https://t.me/ivan_test">Иван</a>"#));
+    }
+
+    #[test]
+    fn leaves_unknown_chat_message_as_escaped_text() {
+        let html = build_comment_html_with_context(
+            "Старое {CHAT_MESSAGE:99:обсуждение} в {CHAT_LINK}",
+            &config(),
+            &[],
+            &[],
+        );
+        assert!(html.contains("{CHAT_MESSAGE:99:обсуждение}"));
+        assert!(!html.contains("https://t.me/c/"));
+    }
+
+    #[test]
     fn leaves_source_placeholder_as_text_when_url_is_unsafe() {
         let search_results = vec![SearchResult {
             source: crate::features::search::types::SearchSource::Web,
@@ -409,3 +525,4 @@ mod tests {
         assert!(!html.contains("meduza.io"));
     }
 }
+use std::collections::HashMap;
