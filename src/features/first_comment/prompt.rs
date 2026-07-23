@@ -393,6 +393,7 @@ mod tests {
     #[test]
     fn search_context_is_json_data_without_urls() {
         let search_context = SearchContext {
+            plan: None,
             queries: vec![SearchQuery {
                 source: SearchSource::Web,
                 text: "Rust release".to_string(),
@@ -455,6 +456,7 @@ mod tests {
     #[test]
     fn search_context_keeps_untrusted_text_as_data() {
         let search_context = SearchContext {
+            plan: None,
             queries: Vec::new(),
             results: vec![search_result(
                 "README.md",
@@ -484,6 +486,7 @@ mod tests {
     fn prompt_keeps_two_full_fetched_results_before_compacting_rest() {
         let long_snippet = "важный факт ".repeat(2_000);
         let search_context = SearchContext {
+            plan: None,
             queries: Vec::new(),
             results: (0..8)
                 .map(|index| {
@@ -549,6 +552,7 @@ mod tests {
     #[test]
     fn directives_prefer_additive_context_when_linkable_search_exists() {
         let search_context = SearchContext {
+            plan: None,
             queries: Vec::new(),
             results: vec![search_result("Source", "https://example.com", "fact")],
             skipped_reason: None,
@@ -579,6 +583,7 @@ mod tests {
     #[test]
     fn search_prompt_filters_unsafe_urls_without_renumbering_results() {
         let search_context = SearchContext {
+            plan: None,
             queries: Vec::new(),
             results: vec![
                 search_result("Unsafe", "http://127.0.0.1/private", "hidden"),
