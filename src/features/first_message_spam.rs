@@ -11,7 +11,7 @@ use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_check
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
 
-const PROMPT_VERSION: &str = "first-message-spam-v2";
+const PROMPT_VERSION: &str = "first-message-spam-v3";
 const POST_CONTEXT_LIMIT: usize = 700;
 const LEASE_SECONDS: i64 = 10 * 60;
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/first_message_spam_classification.md");
@@ -291,8 +291,8 @@ fn output_schema() -> &'static Value {
             "properties": {
                 "direct_dm_offer":{"type":"boolean"}, "offtopic_promo":{"type":"boolean"}, "template_campaign":{"type":"boolean"},
                 "relation_to_replied_post":{"type":"string","enum":["on_topic","loosely_related","off_topic","no_post_context"]},
-                "markers":{"type":"array","items":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action"]}},
-                "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"marker":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action"]},"quote":{"type":"string"}},"required":["marker","quote"]}},
+                "markers":{"type":"array","items":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction"]}},
+                "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"marker":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction"]},"quote":{"type":"string"}},"required":["marker","quote"]}},
                 "explanation":{"type":"string"}
             }, "required":["direct_dm_offer","offtopic_promo","template_campaign","relation_to_replied_post","markers","evidence","explanation"]
         })
@@ -305,11 +305,20 @@ fn score_delta(assessment: &Value, template_matches: i32, similarity: Option<f64
     let offtopic = assessment["offtopic_promo"].as_bool().unwrap_or(false)
         && assessment["relation_to_replied_post"].as_str() == Some("off_topic");
     let campaign = assessment["template_campaign"].as_bool().unwrap_or(false);
-    let llm = match (direct, offtopic, campaign) {
-        (true, true, _) => 30,
-        (true, _, true) => 24,
-        (_, _, true) => 12,
-        _ => 0,
+    let paid_task = assessment["markers"].as_array().is_some_and(|markers| {
+        markers
+            .iter()
+            .any(|marker| marker == "paid_easy_task_offer")
+    });
+    let llm = if paid_task {
+        30
+    } else {
+        match (direct, offtopic, campaign) {
+            (true, true, _) => 30,
+            (true, _, true) => 24,
+            (_, _, true) => 12,
+            _ => 0,
+        }
     };
     let template = if template_matches > 0 { 24 } else { 0 };
     let embedding = match similarity {
@@ -400,5 +409,13 @@ mod tests {
         assert_eq!(retry_delay_seconds(4), Some(300));
         assert_eq!(retry_delay_seconds(5), Some(86_400));
         assert_eq!(retry_delay_seconds(6), None);
+    }
+
+    #[test]
+    fn paid_easy_task_offer_is_a_strong_llm_marker() {
+        assert_eq!(
+            score_delta(&json!({"markers":["paid_easy_task_offer"]}), 0, None),
+            30
+        );
     }
 }

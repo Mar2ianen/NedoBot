@@ -142,17 +142,51 @@ fn human_signals(signals: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|signal| signal.get("label").and_then(Value::as_str))
-        .map(human_label)
+        .flat_map(|signal| {
+            let mut labels = signal
+                .get("label")
+                .and_then(Value::as_str)
+                .map(human_label)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if signal.get("label").and_then(Value::as_str) == Some("first_message_spam_analysis") {
+                labels.extend(
+                    signal["assessment"]["markers"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(human_marker),
+                );
+            }
+            labels
+        })
         .collect::<Vec<_>>();
     if labels.is_empty() {
         "—".to_string()
     } else {
         labels
             .into_iter()
-            .map(|label| format!("• {}", html::escape(label)))
+            .map(|label| format!("• {}", html::escape(&label)))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+fn human_marker(marker: &str) -> String {
+    match marker {
+        "paid_easy_task_offer" => "LLM: обещание лёгкой оплачиваемой работы".to_string(),
+        "external_promo_funnel" => "LLM: promo-воронка или внешний увод".to_string(),
+        "send_or_share_offer" => "LLM: предложение прислать материал".to_string(),
+        "direct_messages" => "LLM: перевод разговора в личные сообщения".to_string(),
+        "template_efficiency_narrative" => "LLM: шаблонный мотивирующий нарратив".to_string(),
+        "self_help_or_finance_promo" => "LLM: оффтопное self-help или финансовое promo".to_string(),
+        "masked_call_to_action" => "LLM: замаскированный призыв к действию".to_string(),
+        "generic_campaign_reaction" => {
+            "LLM: шаблонная реакция без самостоятельного штрафа".to_string()
+        }
+        other => format!("LLM: {other}"),
     }
 }
 
