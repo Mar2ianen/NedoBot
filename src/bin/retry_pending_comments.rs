@@ -220,6 +220,7 @@ async fn retry_job(
             final_html: &final_html,
             attempts: &attempts,
             used_search_result_id,
+            used_chat_message_ids: &draft.used_chat_message_ids,
         },
     )
     .await?;
