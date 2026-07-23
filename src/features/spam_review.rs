@@ -186,6 +186,7 @@ fn human_marker(marker: &str) -> String {
         "generic_campaign_reaction" => {
             "LLM: шаблонная реакция без самостоятельного штрафа".to_string()
         }
+        "performative_feminine_persona" => "LLM: нарочито женственный шаблонный образ".to_string(),
         other => format!("LLM: {other}"),
     }
 }
