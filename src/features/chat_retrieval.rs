@@ -402,7 +402,7 @@ async fn claim_embedding_jobs(
               and m.deleted_by_bot_at is null
               and m.spam_marked_at is null
             order by e.next_attempt_at, e.created_at
-            for update skip locked
+            for update of e skip locked
             limit $1
         )
         update telegram_message_embeddings e
