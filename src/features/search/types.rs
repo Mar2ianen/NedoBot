@@ -22,6 +22,44 @@ pub struct SearchQuery {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ResearchPlan {
+    pub primary_subject: String,
+    #[serde(default)]
+    pub primary_audience: Vec<String>,
+    #[serde(default)]
+    pub secondary_context: Vec<String>,
+    #[serde(default)]
+    pub chat_semantic_queries: Vec<String>,
+    #[serde(default)]
+    pub chat_lexical_terms: Vec<String>,
+    #[serde(default)]
+    pub web_queries: Vec<String>,
+    #[serde(default)]
+    pub reddit_queries: Vec<String>,
+    #[serde(default)]
+    pub github_queries: Vec<String>,
+}
+
+impl ResearchPlan {
+    pub fn external_queries(&self) -> Vec<SearchQuery> {
+        let mut queries = Vec::new();
+        for (source, source_queries) in [
+            (SearchSource::Web, &self.web_queries),
+            (SearchSource::Reddit, &self.reddit_queries),
+            (SearchSource::Github, &self.github_queries),
+        ] {
+            for text in source_queries {
+                queries.push(SearchQuery {
+                    source,
+                    text: text.clone(),
+                });
+            }
+        }
+        queries
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SearchResult {
     pub source: SearchSource,
@@ -32,6 +70,7 @@ pub struct SearchResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchContext {
+    pub plan: Option<ResearchPlan>,
     pub queries: Vec<SearchQuery>,
     pub results: Vec<SearchResult>,
     pub skipped_reason: Option<String>,
@@ -41,6 +80,7 @@ pub struct SearchContext {
 impl SearchContext {
     pub fn skipped(reason: impl Into<String>, latency_ms: u128) -> Self {
         Self {
+            plan: None,
             queries: Vec::new(),
             results: Vec::new(),
             skipped_reason: Some(reason.into()),

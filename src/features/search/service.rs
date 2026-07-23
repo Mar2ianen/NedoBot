@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 
 use crate::config::Config;
 use crate::features::memory::service::MemoryNote;
-use crate::features::search::extract::extract_search_queries;
+use crate::features::search::extract::{extract_research_plan, sanitize_external_queries};
 use crate::features::search::mcp::McpSearchProvider;
 use crate::features::search::policy::is_allowed_search_result;
 use crate::features::search::provider::SearchProvider;
@@ -35,16 +35,23 @@ async fn run_search_enabled(
     memory_notes: &[MemoryNote],
     started: Instant,
 ) -> SearchContext {
-    let queries = match extract_search_queries(config, clean_post, memory_notes).await {
-        Ok(queries) => queries,
+    let plan = match extract_research_plan(config, clean_post, memory_notes).await {
+        Ok(plan) => plan,
         Err(err) => {
             tracing::warn!(%err, "failed to extract search queries");
             return SearchContext::skipped("extract_failed", started.elapsed().as_millis());
         }
     };
 
+    let queries = sanitize_external_queries(&plan);
     if queries.is_empty() {
-        return SearchContext::skipped("no_search_needed", started.elapsed().as_millis());
+        return SearchContext {
+            plan: Some(plan),
+            queries,
+            results: Vec::new(),
+            skipped_reason: Some("no_search_needed".to_string()),
+            latency_ms: started.elapsed().as_millis(),
+        };
     }
 
     let results = run_queries_in_parallel(config, &queries).await;
@@ -57,6 +64,7 @@ async fn run_search_enabled(
     );
     if results.is_empty() {
         return SearchContext {
+            plan: Some(plan),
             queries,
             results,
             skipped_reason: Some("no_results".to_string()),
@@ -65,6 +73,7 @@ async fn run_search_enabled(
     }
 
     SearchContext {
+        plan: Some(plan),
         queries,
         results,
         skipped_reason: None,
