@@ -155,6 +155,7 @@ fn build_llm_prompt(
     .combined_for_log()
 }
 
+#[allow(dead_code)] // Compatibility builder retained for callers without chat evidence.
 pub fn build_llm_prompt_parts(
     post_text: &str,
     chat_member_count: Option<u32>,

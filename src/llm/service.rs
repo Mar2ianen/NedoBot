@@ -61,6 +61,7 @@ pub async fn generate_text_checked(
     .await
 }
 
+#[allow(dead_code)] // Compatibility wrapper for explicit provider generation.
 pub async fn generate_text_with_provider(
     config: &Config,
     provider_override: Option<&str>,
@@ -110,6 +111,7 @@ pub async fn generate_text_with_provider_and_system(
     .await
 }
 
+#[allow(dead_code)] // Compatibility wrapper for callers without structured output.
 pub async fn generate_text_checked_with_system(
     config: &Config,
     system_prompt: &str,

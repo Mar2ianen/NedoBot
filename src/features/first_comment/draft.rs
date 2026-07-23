@@ -95,6 +95,7 @@ fn looks_like_structured_output(value: &str) -> bool {
     value.starts_with('{') || value.starts_with('[') || value.starts_with("```")
 }
 
+#[allow(dead_code)] // Compatibility helper retained for focused validator tests.
 pub fn validate_first_comment_draft_with_search(
     value: &str,
     search_results: &[SearchResult],
@@ -108,6 +109,7 @@ pub fn validate_first_comment_draft_with_search(
     )
 }
 
+#[allow(dead_code)] // Compatibility helper retained for callers without chat evidence.
 pub fn validate_first_comment_draft_with_search_and_policy(
     value: &str,
     search_results: &[SearchResult],
