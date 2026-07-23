@@ -12,6 +12,7 @@ pub struct LlmGenerationInsert<'a> {
     pub final_html: &'a str,
     pub attempts: &'a serde_json::Value,
     pub used_search_result_id: Option<i32>,
+    pub used_chat_message_ids: &'a [i32],
 }
 
 pub async fn create_post_comment_job(
@@ -70,8 +71,8 @@ pub async fn insert_llm_generation(
     sqlx::query(
         r#"
         insert into llm_generations
-            (post_comment_job_id, provider, model, prompt, image_used, response, final_html, attempts, used_search_result_id)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (post_comment_job_id, provider, model, prompt, image_used, response, final_html, attempts, used_search_result_id, used_chat_message_ids)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(generation.job_id)
@@ -83,6 +84,7 @@ pub async fn insert_llm_generation(
     .bind(generation.final_html)
     .bind(generation.attempts)
     .bind(generation.used_search_result_id)
+    .bind(generation.used_chat_message_ids)
     .execute(pool)
     .await?;
 

@@ -29,6 +29,8 @@ const GENERIC_SOURCE_LINK_LABELS: &[&str] = &[
 pub struct FirstCommentDraft {
     pub comment: String,
     pub used_search_result_id: Option<usize>,
+    #[serde(default)]
+    pub used_chat_message_ids: Vec<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,9 +50,13 @@ static FIRST_COMMENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "used_search_result_id": {
                 "type": ["integer", "null"],
                 "description": "One-based ID of the search result used for a new factual addition, or null."
+            },
+            "used_chat_message_ids": {
+                "type": "array", "maxItems": 3,
+                "items": { "type": "integer", "minimum": 1 }
             }
         },
-        "required": ["comment", "used_search_result_id"],
+        "required": ["comment", "used_search_result_id", "used_chat_message_ids"],
         "additionalProperties": false
     })
 });
@@ -69,11 +75,17 @@ pub fn parse_first_comment_draft(value: &str) -> anyhow::Result<FirstCommentDraf
         Err(_) => FirstCommentDraft {
             comment: trimmed.to_string(),
             used_search_result_id: None,
+            used_chat_message_ids: Vec::new(),
         },
     };
 
     if draft.used_search_result_id == Some(0) {
         anyhow::bail!("used_search_result_id must start at 1");
+    }
+    if draft.used_chat_message_ids.len() > 3
+        || draft.used_chat_message_ids.iter().any(|id| *id <= 0)
+    {
+        anyhow::bail!("used_chat_message_ids must contain at most three positive IDs");
     }
 
     Ok(draft)
@@ -300,12 +312,13 @@ mod tests {
         let schema = first_comment_output_schema();
         assert_eq!(
             schema["required"],
-            serde_json::json!(["comment", "used_search_result_id"])
+            serde_json::json!(["comment", "used_search_result_id", "used_chat_message_ids"])
         );
         assert_eq!(
             schema["properties"]["used_search_result_id"]["type"],
             serde_json::json!(["integer", "null"])
         );
+        assert_eq!(schema["properties"]["used_chat_message_ids"]["maxItems"], 3);
     }
 
     #[test]
