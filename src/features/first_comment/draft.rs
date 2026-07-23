@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::features::first_comment::prompt::search_result_source_name;
 use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::search::mcp::is_safe_fetch_url;
 use crate::features::search::policy::{is_allowed_comment_text, is_allowed_source_url};
@@ -131,6 +132,14 @@ pub fn validate_first_comment_draft_with_search_and_policy(
         let result = search_result_by_id(search_results, source_link.result_id)?;
         if !is_safe_fetch_url(&result.url) || !is_allowed_source_url(config, &result.url) {
             anyhow::bail!("selected source link is not allowed by source policy");
+        }
+        let source_name = search_result_source_name(result);
+        if !source_link
+            .label
+            .to_lowercase()
+            .contains(&source_name.to_lowercase())
+        {
+            anyhow::bail!("SOURCE_LINK label must name the linked source: {source_name}");
         }
     }
 
@@ -309,7 +318,7 @@ mod tests {
         }];
 
         validate_first_comment_draft_with_search(
-            r#"{"comment":"Судя по {SOURCE_LINK:1:решению суда}, аккаунт вернули только после иска. Поддержка Xbox в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
+            r#"{"comment":"Судя по {SOURCE_LINK:1:решению суда Example}, аккаунт вернули только после иска. Поддержка Xbox в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
             &results,
             true,
         )
@@ -326,7 +335,7 @@ mod tests {
         }];
 
         assert!(validate_first_comment_draft_with_search(
-            r#"{"comment":"Судя по {SOURCE_LINK:1:решению суда}, аккаунт вернули только после иска. Поддержка Xbox в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
+            r#"{"comment":"Судя по {SOURCE_LINK:1:решению суда Example}, аккаунт вернули только после иска. Поддержка Xbox в {CHAT_LINK:чатике}","used_search_result_id":null}"#,
             &results,
             true,
         )
@@ -384,6 +393,23 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rejects_source_label_that_does_not_match_link_domain() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Reddit,
+            title: "Marketplace post".to_string(),
+            url: "https://amazon.com/example".to_string(),
+            snippet: String::new(),
+        }];
+
+        assert!(validate_first_comment_draft_with_search(
+            r#"{"comment":"Как пишет {SOURCE_LINK:1:Reddit}, товар уже появился. Покупки в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
+            &results,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
