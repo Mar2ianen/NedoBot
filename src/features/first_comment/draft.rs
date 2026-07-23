@@ -114,8 +114,24 @@ pub fn validate_first_comment_draft_with_search_and_policy(
     source_link_available: bool,
     config: &Config,
 ) -> anyhow::Result<()> {
+    validate_first_comment_draft_with_search_policy_and_chat(
+        value,
+        search_results,
+        source_link_available,
+        config,
+        &[],
+    )
+}
+
+pub fn validate_first_comment_draft_with_search_policy_and_chat(
+    value: &str,
+    search_results: &[SearchResult],
+    source_link_available: bool,
+    config: &Config,
+    allowed_chat_message_ids: &[i32],
+) -> anyhow::Result<()> {
     let draft = parse_first_comment_draft(value)?;
-    let source_link = validate_comment_body(&draft, config)?;
+    let source_link = validate_comment_body(&draft, config, allowed_chat_message_ids)?;
 
     if source_link_available && draft.used_search_result_id.is_none() {
         anyhow::bail!("a usable search result is available; comment must cite one new source fact");
@@ -161,13 +177,71 @@ pub fn validate_first_comment_draft_with_search_and_policy(
 fn validate_comment_body(
     draft: &FirstCommentDraft,
     config: &Config,
+    allowed_chat_message_ids: &[i32],
 ) -> anyhow::Result<Option<SourceLinkPlaceholder>> {
     let (visible_comment, source_link) = replace_source_link_placeholder(&draft.comment)?;
-    validate_comment_output(&visible_comment)?;
+    let (visible_comment, evidence_ids) = replace_chat_evidence_placeholders(&visible_comment)?;
+    if evidence_ids.is_empty() {
+        validate_comment_output(&visible_comment)?;
+    } else {
+        if evidence_ids.len() > 3
+            || evidence_ids
+                .iter()
+                .any(|id| !allowed_chat_message_ids.contains(id))
+            || draft.used_chat_message_ids != evidence_ids
+        {
+            anyhow::bail!("chat evidence IDs do not match the confirmed retrieval context");
+        }
+        validate_comment_output(&format!("{visible_comment} {{CHAT_LINK}}"))?;
+    }
     if !is_allowed_comment_text(config, &visible_comment) {
         anyhow::bail!("first comment contains a blocked term");
     }
     Ok(source_link)
+}
+
+fn replace_chat_evidence_placeholders(text: &str) -> anyhow::Result<(String, Vec<i32>)> {
+    let mut visible = String::with_capacity(text.len());
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(start) = [rest.find("{CHAT_AUTHOR"), rest.find("{CHAT_MESSAGE")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        let (before, after_start) = rest.split_at(start);
+        visible.push_str(before);
+        let Some(end) = after_start.find('}') else {
+            anyhow::bail!("unterminated chat evidence placeholder")
+        };
+        let token = &after_start[..=end];
+        let id = if let Some(value) = token
+            .strip_prefix("{CHAT_AUTHOR:")
+            .and_then(|value| value.strip_suffix('}'))
+        {
+            value.parse::<i32>().ok()
+        } else if let Some(value) = token
+            .strip_prefix("{CHAT_MESSAGE:")
+            .and_then(|value| value.strip_suffix('}'))
+        {
+            value
+                .split_once(':')
+                .and_then(|(id, label)| (!label.trim().is_empty()).then_some(id))
+                .and_then(|id| id.parse().ok())
+        } else {
+            None
+        };
+        let Some(id) = id.filter(|id| *id > 0) else {
+            anyhow::bail!("malformed chat evidence placeholder: {token}")
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        visible.push(' ');
+        rest = &after_start[end + 1..];
+    }
+    visible.push_str(rest);
+    Ok((visible, ids))
 }
 
 fn search_result_by_id(
@@ -304,7 +378,27 @@ mod tests {
         )
         .unwrap();
 
-        validate_comment_body(&draft, &Config::from_env()).unwrap();
+        validate_comment_body(&draft, &Config::from_env(), &[]).unwrap();
+    }
+
+    #[test]
+    fn chat_evidence_can_replace_invite_link_only_for_allowed_id() {
+        validate_first_comment_draft_with_search_policy_and_chat(
+            r#"{"comment":"{CHAT_AUTHOR:42} разбирал TPM, похожую боль можно продолжить здесь","used_search_result_id":null,"used_chat_message_ids":[42]}"#,
+            &[],
+            false,
+            &Config::from_env(),
+            &[42],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_chat_evidence_outside_retrieval_context() {
+        assert!(validate_first_comment_draft_with_search_policy_and_chat(
+            r#"{"comment":"{CHAT_AUTHOR:99} разбирал TPM, похожую боль можно продолжить здесь","used_search_result_id":null,"used_chat_message_ids":[99]}"#,
+            &[], false, &Config::from_env(), &[42],
+        ).is_err());
     }
 
     #[test]
