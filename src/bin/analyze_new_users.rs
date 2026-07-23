@@ -8,6 +8,7 @@ use tg_ai_bot_teloxide::{
 #[derive(Debug)]
 struct Args {
     chat_id: Option<i64>,
+    user_ids: Vec<i64>,
     limit: i64,
     max_messages: i64,
     include_analyzed: bool,
@@ -22,14 +23,19 @@ async fn main() -> anyhow::Result<()> {
     let pool = build_pool().await?;
     migrate(&pool).await?;
 
-    let user_ids = load_candidate_user_ids(
-        &pool,
-        chat_id,
-        args.limit,
-        args.max_messages,
-        args.include_analyzed,
-    )
-    .await?;
+    let user_ids = match args.user_ids.is_empty() {
+        true => {
+            load_candidate_user_ids(
+                &pool,
+                chat_id,
+                args.limit,
+                args.max_messages,
+                args.include_analyzed,
+            )
+            .await?
+        }
+        false => args.user_ids,
+    };
     println!(
         "analyze new users: chat_id={} users={} max_messages={} include_analyzed={}",
         chat_id,
@@ -91,6 +97,7 @@ async fn load_candidate_user_ids(
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut chat_id = None;
+    let mut user_ids = Vec::new();
     let mut limit = 200i64;
     let mut max_messages = 5i64;
     let mut include_analyzed = false;
@@ -106,6 +113,12 @@ fn parse_args() -> anyhow::Result<Args> {
                         .context("invalid --chat-id")?,
                 );
             }
+            "--user-id" => user_ids.push(
+                args.next()
+                    .context("--user-id requires value")?
+                    .parse()
+                    .context("invalid --user-id")?,
+            ),
             "--limit" => {
                 limit = args
                     .next()
@@ -123,7 +136,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--include-analyzed" => include_analyzed = true,
             "-h" | "--help" => {
                 println!(
-                    "Usage: analyze_new_users [--chat-id -100...] [--limit 200] [--max-messages 5] [--include-analyzed]"
+                    "Usage: analyze_new_users [--chat-id -100...] [--user-id ID]... [--limit 200] [--max-messages 5] [--include-analyzed]"
                 );
                 std::process::exit(0);
             }
@@ -133,6 +146,7 @@ fn parse_args() -> anyhow::Result<Args> {
 
     Ok(Args {
         chat_id,
+        user_ids,
         limit,
         max_messages,
         include_analyzed,
