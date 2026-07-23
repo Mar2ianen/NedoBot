@@ -48,16 +48,16 @@ pub async fn create_high_risk_review(
     let name: String = profile.get("name");
     let username: Option<String> = profile.get("username");
     let reasons = human_signals(&signals);
+    let profile_url = format!("tg://user?id={user_id}");
+    let profile_link = html::link(&name, &profile_url).into_string();
+    let id_link = html::link(format!("id={user_id}"), &profile_url).into_string();
     let username = username
-        .map(|value| format!("@{value}"))
+        .filter(|value| is_valid_telegram_username(value))
+        .map(|value| html::link(format!("@{value}"), format!("https://t.me/{value}")).into_string())
         .unwrap_or_else(|| "без username".into());
     let text = format!(
-        "@{OWNER_USERNAME}, <b>высокий риск спама</b>\n\n<b>{}</b> · {}\n<code>id={}</code> · риск: <b>{}</b>\n\n<b>Причины:</b>\n{}",
-        html::escape(&name),
-        html::escape(&username),
-        user_id,
-        score,
-        reasons
+        "@{OWNER_USERNAME}, <b>высокий риск спама</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Причины:</b>\n{}",
+        profile_link, username, id_link, score, reasons
     );
     Ok(Some(SpamReview {
         id,
@@ -65,6 +65,14 @@ pub async fn create_high_risk_review(
         first_message_id: profile.get("first_message_id"),
         text,
     }))
+}
+
+fn is_valid_telegram_username(value: &str) -> bool {
+    let len = value.chars().count();
+    (5..=32).contains(&len)
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 pub async fn send_review(bot: &Bot, review: &SpamReview) -> ResponseResult<()> {
