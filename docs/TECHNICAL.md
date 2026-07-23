@@ -424,6 +424,12 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 ## Prompt
 
+### Chat retrieval (shadow rollout)
+
+Gemma строит единый `ResearchPlan`: главный subject/audience, secondary context, chat semantic/lexical queries и запросы к внешним источникам. Shadow retrieval объединяет RuBERT vector, PostgreSQL full-text и безопасные literal-regex совпадения за 30 дней с geometric freshness. Кандидаты и ограниченные ветки сохраняются в `chat_research_runs`, но не меняют комментарий без ручной проверки.
+
+`CHAT_AUTHOR:id` и `CHAT_MESSAGE:id:label` разрешены только для ID из подтверждённого retrieval-контекста. Имя автора берётся только из `first_name`; при username ссылка ведёт на профиль, иначе на сообщение. Без evidence обязателен обычный `CHAT_LINK`.
+
 Основной prompt лежит в [prompts/first_comment.md](../prompts/first_comment.md).
 Короткий факт-чек/RAG для защиты от устаревших утверждений лежит в [prompts/tech_rag.md](../prompts/tech_rag.md).
 Cleanup prompt для расшифровки голосовых лежит в [prompts/voice_cleanup.md](../prompts/voice_cleanup.md).
