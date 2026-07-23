@@ -22,6 +22,60 @@ pub struct RetrievalCandidate {
     pub total_score: f64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ExpandedChatContext {
+    anchor_message_id: i32,
+    kind: &'static str,
+    messages: Vec<crate::features::ask::chat_search::ChatMessage>,
+}
+
+pub async fn expand_shadow_contexts(
+    pool: &PgPool,
+    chat_id: i64,
+    candidates: &[RetrievalCandidate],
+) -> anyhow::Result<Vec<ExpandedChatContext>> {
+    let mut contexts = Vec::new();
+    for candidate in candidates.iter().take(4) {
+        let reply_to = sqlx::query_scalar::<_, Option<i32>>(
+            "select reply_to_message_id from telegram_messages where chat_id = $1 and message_id = $2",
+        )
+        .bind(chat_id)
+        .bind(candidate.message_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+        let (kind, messages) = if reply_to.is_some() {
+            (
+                "reply_thread",
+                crate::features::ask::chat_search::reply_thread(
+                    pool,
+                    chat_id,
+                    candidate.message_id,
+                )
+                .await?,
+            )
+        } else {
+            (
+                "neighbor_context",
+                crate::features::ask::chat_search::message_context(
+                    pool,
+                    chat_id,
+                    candidate.message_id,
+                    3,
+                    3,
+                )
+                .await?,
+            )
+        };
+        contexts.push(ExpandedChatContext {
+            anchor_message_id: candidate.message_id,
+            kind,
+            messages,
+        });
+    }
+    Ok(contexts)
+}
+
 pub async fn run_shadow_retrieval(
     pool: &PgPool,
     config: &Config,
