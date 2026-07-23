@@ -16,7 +16,6 @@ use crate::features::first_comment::draft::{
     validate_first_comment_draft_with_search_and_policy,
 };
 use crate::features::first_comment::prompt::{CommentDirectives, build_llm_prompt_parts};
-use crate::features::first_comment::render::build_comment_html_with_sources;
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
     mark_post_comment_sent,
@@ -91,6 +90,7 @@ pub async fn maybe_comment_post(
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
+    let mut chat_candidate_ids = Vec::new();
     if let Some(plan) = search_context.plan.as_ref() {
         match crate::features::chat_retrieval::run_shadow_retrieval(
             pool,
@@ -101,6 +101,10 @@ pub async fn maybe_comment_post(
         .await
         {
             Ok(candidates) => {
+                chat_candidate_ids = candidates
+                    .iter()
+                    .map(|candidate| candidate.message_id)
+                    .collect();
                 if let Err(err) = save_chat_retrieval_candidates(pool, job_id, &candidates).await {
                     tracing::warn!(%err, "failed to save chat retrieval shadow run");
                 }
@@ -158,11 +162,28 @@ pub async fn maybe_comment_post(
     )
     .await?;
     let draft = parse_first_comment_draft(&generation.content)?;
+    if draft
+        .used_chat_message_ids
+        .iter()
+        .any(|id| !chat_candidate_ids.contains(id))
+    {
+        anyhow::bail!("first comment references a chat message outside retrieval context");
+    }
+    let chat_targets = crate::features::first_comment::repo::load_chat_link_targets(
+        pool,
+        config.discussion_chat_id,
+        &draft.used_chat_message_ids,
+    )
+    .await?;
     let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
-    let final_html =
-        build_comment_html_with_sources(&draft.comment, config, &search_context.results);
+    let final_html = crate::features::first_comment::render::build_comment_html_with_context(
+        &draft.comment,
+        config,
+        &search_context.results,
+        &chat_targets,
+    );
     ensure_comment_html(&final_html, &draft.comment)?;
 
     let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
