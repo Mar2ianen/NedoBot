@@ -81,6 +81,25 @@ const GENERIC_PHRASES: &[&str] = &[
     "залетайте",
 ];
 
+const INVENTED_CHAT_ACTIVITY_PHRASES: &[&str] = &[
+    "в чате уже",
+    "в чатике уже",
+    "в чате обсуждают",
+    "в чатике обсуждают",
+    "в чате спорят",
+    "в чатике спорят",
+    "в чате считают",
+    "в чатике считают",
+    "в чате шутят",
+    "в чатике шутят",
+    "в чате смеются",
+    "в чатике смеются",
+    "в чате удивлены",
+    "в чатике удивлены",
+    "в чате резонно замечают",
+    "в чатике резонно замечают",
+];
+
 const ALLOWED_CHAT_LINK_LABELS: &[&str] = &[
     "чат",
     "чате",
@@ -148,6 +167,12 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
         .find(|phrase| lower.contains(**phrase))
     {
         anyhow::bail!("first comment contains generic CTA phrase: {phrase}");
+    }
+    if let Some(phrase) = INVENTED_CHAT_ACTIVITY_PHRASES
+        .iter()
+        .find(|phrase| lower.contains(**phrase))
+    {
+        anyhow::bail!("first comment invents chat activity: {phrase}");
     }
     if let Some(phrase) = VICTIM_PHRASES
         .iter()
@@ -300,6 +325,24 @@ mod tests {
             "Интересная новость про рынок технологий, давайте обсудим это подробнее и поделитесь мнением, потому что тема важная для всех участников. Подробности в {CHAT_LINK:чате}.",
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_invented_chat_activity() {
+        assert!(
+            validate_comment_output(
+                "В чатике уже спорят, стоит ли менять карту. Апгрейды в {CHAT_LINK:чатике}"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_neutral_chat_navigation() {
+        validate_comment_output(
+            "Переход на новую карту стоит считать по реальным играм. Тесты можно разобрать в {CHAT_LINK:чатике}"
+        )
+        .unwrap();
     }
 
     #[test]

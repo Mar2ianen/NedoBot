@@ -258,12 +258,10 @@ fn render_search_results_for_prompt(results: &[SearchResult]) -> Vec<SearchPromp
     rendered
 }
 
-fn search_result_source_name(result: &SearchResult) -> String {
-    match result.source {
-        SearchSource::Github | SearchSource::Reddit => result.source.display_name().to_string(),
-        SearchSource::Web => source_name_from_url(&result.url)
-            .unwrap_or_else(|| result.source.display_name().to_string()),
-    }
+pub(crate) fn search_result_source_name(result: &SearchResult) -> String {
+    // SearchSource describes where the result was found, not necessarily where
+    // its link leads. Attribution must always follow the actual URL.
+    source_name_from_url(&result.url).unwrap_or_else(|| result.source.display_name().to_string())
 }
 
 fn source_name_from_url(url: &str) -> Option<String> {
@@ -431,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn github_results_keep_their_source_name_for_natural_attribution() {
+    fn source_name_follows_result_url_not_search_provider() {
         let result = SearchResult {
             source: SearchSource::Github,
             title: "Release".to_string(),
@@ -439,7 +437,19 @@ mod tests {
             snippet: "Release notes".to_string(),
         };
 
-        assert_eq!(search_result_source_name(&result), "GitHub");
+        assert_eq!(search_result_source_name(&result), "Github");
+    }
+
+    #[test]
+    fn source_name_does_not_call_non_reddit_url_reddit() {
+        let result = SearchResult {
+            source: SearchSource::Reddit,
+            title: "Marketplace post".to_string(),
+            url: "https://amazon.com/example".to_string(),
+            snippet: "Post found through a Reddit query".to_string(),
+        };
+
+        assert_eq!(search_result_source_name(&result), "Amazon");
     }
 
     #[test]
