@@ -1508,7 +1508,7 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
     let Some(first_name) = first_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
     };
-    let normalized = normalize_cyrillic_homoglyphs(first_name)
+    let normalized = canonicalize_feminine_name(first_name)
         .split_whitespace()
         .next()
         .unwrap_or_default()
@@ -1632,6 +1632,9 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
             | "нина"
             | "оксана"
             | "ольга"
+            | "оля"
+            | "olga"
+            | "olya"
             | "полина"
             | "светлана"
             | "софия"
@@ -1643,6 +1646,12 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
             | "юлия"
             | "яна"
     )
+}
+
+fn canonicalize_feminine_name(value: &str) -> String {
+    let normalized = normalize_cyrillic_homoglyphs(value).to_lowercase();
+    // После замены гомоглифов `Оlya` превращается в `оlуа`.
+    normalized.replace("lуа", "ля").replace("lя", "ля")
 }
 
 fn has_profile_photo(features: &NewUserFeatures) -> bool {
@@ -1972,6 +1981,8 @@ mod tests {
         assert!(looks_like_feminine_first_name(Some("Лана 💻")));
         assert!(looks_like_feminine_first_name(Some("Кора 🌊")));
         assert!(looks_like_feminine_first_name(Some("Tанюша")));
+        assert!(looks_like_feminine_first_name(Some("Оlya")));
+        assert!(looks_like_feminine_first_name(Some("Olya")));
         assert!(looks_like_feminine_first_name(Some("Alice")));
         assert!(looks_like_feminine_first_name(Some("Mary Johnson")));
         assert!(looks_like_feminine_first_name(Some("Sophia")));
