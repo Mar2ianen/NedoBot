@@ -15,7 +15,9 @@ use crate::features::first_comment::draft::{
     first_comment_output_schema, parse_first_comment_draft,
     validate_first_comment_draft_with_search_and_policy,
 };
-use crate::features::first_comment::prompt::{CommentDirectives, build_llm_prompt_parts};
+use crate::features::first_comment::prompt::{
+    CommentDirectives, build_llm_prompt_parts_with_chat_evidence,
+};
 use crate::features::first_comment::repo::{
     LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
     mark_post_comment_sent,
@@ -90,7 +92,7 @@ pub async fn maybe_comment_post(
     if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
-    let mut chat_candidate_ids = Vec::new();
+    let mut chat_candidates = Vec::new();
     if let Some(plan) = search_context.plan.as_ref() {
         match crate::features::chat_retrieval::run_shadow_retrieval(
             pool,
@@ -101,10 +103,7 @@ pub async fn maybe_comment_post(
         .await
         {
             Ok(candidates) => {
-                chat_candidate_ids = candidates
-                    .iter()
-                    .map(|candidate| candidate.message_id)
-                    .collect();
+                chat_candidates = candidates.clone();
                 if let Err(err) = save_chat_retrieval_candidates(pool, job_id, &candidates).await {
                     tracing::warn!(%err, "failed to save chat retrieval shadow run");
                 }
@@ -129,7 +128,26 @@ pub async fn maybe_comment_post(
     }
     let directives =
         CommentDirectives::for_post(candidate.source_message_id.0, Some(&search_context));
-    let prompt = build_llm_prompt_parts(
+    let chat_candidate_ids = chat_candidates
+        .iter()
+        .map(|candidate| candidate.message_id)
+        .collect::<Vec<_>>();
+    let chat_targets = crate::features::first_comment::repo::load_chat_link_targets(
+        pool,
+        config.discussion_chat_id,
+        &chat_candidate_ids,
+    )
+    .await?;
+    let chat_evidence = chat_candidates
+        .iter()
+        .filter_map(|candidate| {
+            chat_targets
+                .iter()
+                .find(|target| target.message_id == candidate.message_id)
+                .map(|target| (candidate, target.author_name.clone()))
+        })
+        .collect::<Vec<_>>();
+    let prompt = build_llm_prompt_parts_with_chat_evidence(
         &clean_post,
         chat_member_count,
         &memory_notes,
@@ -137,6 +155,7 @@ pub async fn maybe_comment_post(
         &topic_comments,
         config.search_enabled.then_some(&search_context),
         directives,
+        &chat_evidence,
     );
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
@@ -169,12 +188,10 @@ pub async fn maybe_comment_post(
     {
         anyhow::bail!("first comment references a chat message outside retrieval context");
     }
-    let chat_targets = crate::features::first_comment::repo::load_chat_link_targets(
-        pool,
-        config.discussion_chat_id,
-        &draft.used_chat_message_ids,
-    )
-    .await?;
+    let chat_targets = chat_targets
+        .into_iter()
+        .filter(|target| draft.used_chat_message_ids.contains(&target.message_id))
+        .collect::<Vec<_>>();
     let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
     let attempts = serde_json::to_value(&generation.attempts)?;
