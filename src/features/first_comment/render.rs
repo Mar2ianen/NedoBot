@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::features::first_comment::draft::parse_source_link_placeholder;
+use crate::features::first_comment::draft::{
+    parse_chat_evidence_placeholder, parse_source_link_placeholder,
+};
 use crate::features::search::types::SearchResult;
 use crate::features::search::{mcp::is_safe_fetch_url, policy::is_allowed_source_url};
 use crate::telegram::html::{Html, link};
@@ -181,11 +183,11 @@ fn chat_author_target(
     token: &str,
     targets: &HashMap<i32, &ChatLinkTarget>,
 ) -> Option<(String, String)> {
-    let id = token
-        .strip_prefix("{CHAT_AUTHOR:")?
-        .strip_suffix('}')?
-        .parse()
-        .ok()?;
+    let placeholder = parse_chat_evidence_placeholder(token).ok()?;
+    let id = placeholder
+        .message_label
+        .is_none()
+        .then_some(placeholder.message_id)?;
     let target = targets.get(&id)?;
     let url = target
         .author_username
@@ -204,21 +206,11 @@ fn chat_message_target(
     token: &str,
     targets: &HashMap<i32, &ChatLinkTarget>,
 ) -> Option<(String, String)> {
-    let value = token.strip_prefix("{CHAT_MESSAGE:")?.strip_suffix('}')?;
-    let (id, label) = value.split_once(':')?;
-    let id = id.parse().ok()?;
-    let label = label.trim();
-    if label.is_empty()
-        || label.chars().count() > 40
-        || !label
-            .chars()
-            .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || ch == '-')
-    {
-        return None;
-    }
+    let placeholder = parse_chat_evidence_placeholder(token).ok()?;
+    let label = placeholder.message_label?;
     targets
-        .get(&id)
-        .map(|target| (label.to_string(), target.message_url.clone()))
+        .get(&placeholder.message_id)
+        .map(|target| (label, target.message_url.clone()))
 }
 
 fn source_link_target<'a>(
@@ -293,6 +285,8 @@ mod tests {
             chat_retrieval_embedding_batch_size: 16,
             chat_retrieval_embedding_poll_sec: 5,
             chat_retrieval_shadow_enabled: false,
+            chat_retrieval_evidence_enabled: false,
+            chat_retrieval_evidence_min_score: 2.0,
             chat_retrieval_window_days: 30,
             chat_retrieval_half_life_days: 7.0,
             search_enabled: false,

@@ -36,15 +36,14 @@ pub async fn expand_shadow_contexts(
 ) -> anyhow::Result<Vec<ExpandedChatContext>> {
     let mut contexts = Vec::new();
     for candidate in candidates.iter().take(4) {
-        let reply_to = sqlx::query_scalar::<_, Option<i32>>(
-            "select reply_to_message_id from telegram_messages where chat_id = $1 and message_id = $2",
+        let belongs_to_thread = sqlx::query_scalar::<_, bool>(
+            "select exists (select 1 from telegram_messages m where m.chat_id = $1 and m.message_id = $2 and (m.reply_to_message_id is not null or exists (select 1 from telegram_messages child where child.chat_id = m.chat_id and child.reply_to_message_id = m.message_id)))",
         )
         .bind(chat_id)
         .bind(candidate.message_id)
-        .fetch_optional(pool)
-        .await?
-        .flatten();
-        let (kind, messages) = if reply_to.is_some() {
+        .fetch_one(pool)
+        .await?;
+        let (kind, messages) = if belongs_to_thread {
             (
                 "reply_thread",
                 crate::features::ask::chat_search::reply_thread(
@@ -179,10 +178,10 @@ async fn load_candidates(
 ) -> anyhow::Result<Vec<RetrievalCandidate>> {
     let rows = sqlx::query(r#"
         select m.message_id, m.text,
-               extract(epoch from (now() - m.created_at)) / 86400.0 as age_days,
-               case when $5 = 'semantic' then 1.0 - (e.embedding <=> $2::vector) else 0.0 end as semantic_score,
-               case when $5 = 'lexical' then greatest(ts_rank_cd(to_tsvector('russian', m.text), websearch_to_tsquery('russian', $2)), ts_rank_cd(to_tsvector('simple', m.text), websearch_to_tsquery('simple', $2))) else 0.0 end as lexical_score,
-               case when $5 = 'exact' then 1.0 else 0.0 end as exact_score
+               (extract(epoch from (now() - m.created_at)) / 86400.0)::double precision as age_days,
+               (case when $5 = 'semantic' then 1.0 - (e.embedding <=> $2::vector) else 0.0 end)::double precision as semantic_score,
+               (case when $5 = 'lexical' then greatest(ts_rank_cd(to_tsvector('russian', m.text), websearch_to_tsquery('russian', $2)), ts_rank_cd(to_tsvector('simple', m.text), websearch_to_tsquery('simple', $2))) else 0.0 end)::double precision as lexical_score,
+               (case when $5 = 'exact' then 1.0 else 0.0 end)::double precision as exact_score
         from telegram_messages m
         left join telegram_message_embeddings e on e.chat_id = m.chat_id and e.message_id = m.message_id and e.status = 'ready'
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
@@ -243,19 +242,33 @@ fn transliterate_latin(value: &str) -> String {
     value
         .chars()
         .map(|ch| match ch.to_ascii_lowercase() {
-            'a' => 'а',
-            'b' => 'б',
-            'c' => 'к',
-            'e' => 'е',
-            'h' => 'х',
-            'k' => 'к',
-            'm' => 'м',
-            'o' => 'о',
-            'p' => 'п',
-            't' => 'т',
-            'x' => 'х',
-            'y' => 'у',
-            _ => ch,
+            'a' => "а".to_string(),
+            'b' => "б".to_string(),
+            'c' => "к".to_string(),
+            'd' => "д".to_string(),
+            'e' => "е".to_string(),
+            'f' => "ф".to_string(),
+            'g' => "г".to_string(),
+            'h' => "х".to_string(),
+            'i' => "и".to_string(),
+            'j' => "дж".to_string(),
+            'k' => "к".to_string(),
+            'l' => "л".to_string(),
+            'm' => "м".to_string(),
+            'n' => "н".to_string(),
+            'o' => "о".to_string(),
+            'p' => "п".to_string(),
+            'q' => "к".to_string(),
+            'r' => "р".to_string(),
+            's' => "с".to_string(),
+            't' => "т".to_string(),
+            'u' => "у".to_string(),
+            'v' => "в".to_string(),
+            'w' => "в".to_string(),
+            'x' => "кс".to_string(),
+            'y' => "й".to_string(),
+            'z' => "з".to_string(),
+            _ => ch.to_string(),
         })
         .collect()
 }
@@ -426,14 +439,22 @@ async fn mark_embedding_ready(
     let embedding = pgvector_literal(embedding)?;
     sqlx::query(
         r#"
-        update telegram_message_embeddings
-        set embedding = $3::vector, embedding_model = $4, status = 'ready',
-            error_kind = null, lease_expires_at = null, updated_at = now()
-        where chat_id = $1 and message_id = $2 and status = 'processing'
+        update telegram_message_embeddings e
+        set embedding = case when m.text = $3 then $4::vector else null end,
+            embedding_model = case when m.text = $3 then $5 else null end,
+            status = case when m.text = $3 then 'ready' else 'pending' end,
+            error_kind = null,
+            next_attempt_at = case when m.text = $3 then e.next_attempt_at else now() end,
+            lease_expires_at = null,
+            updated_at = now()
+        from telegram_messages m
+        where e.chat_id = $1 and e.message_id = $2 and e.status = 'processing'
+          and m.chat_id = e.chat_id and m.message_id = e.message_id
         "#,
     )
     .bind(job.chat_id)
     .bind(job.message_id)
+    .bind(&job.text)
     .bind(embedding)
     .bind(model)
     .execute(pool)
@@ -488,6 +509,12 @@ mod tests {
     #[test]
     fn exact_terms_are_escaped_before_regex_search() {
         assert!(literal_variants("C++").iter().any(|term| term == "C\\+\\+"));
+    }
+
+    #[test]
+    fn transliteration_covers_common_latin_product_names() {
+        let variants = literal_variants("Windows Radeon");
+        assert!(variants.iter().any(|term| term == "виндовс радеон"));
     }
 
     #[test]

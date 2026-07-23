@@ -77,3 +77,20 @@ pub async fn save_expanded_chat_contexts(
     .await?;
     Ok(())
 }
+
+pub async fn save_chat_evidence_outcome(
+    pool: &PgPool,
+    post_comment_job_id: i64,
+    used_chat_message_ids: &[i32],
+    evidence_rejection_reason: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update chat_research_runs set used_chat_message_ids = $2, evidence_rejection_reason = $3, updated_at = now() where post_comment_job_id = $1",
+    )
+    .bind(post_comment_job_id)
+    .bind(used_chat_message_ids)
+    .bind(evidence_rejection_reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
