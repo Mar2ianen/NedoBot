@@ -20,6 +20,42 @@ pub fn normalize_ai_markers(text: &str) -> String {
         .to_string()
 }
 
+/// Replaces Latin letters visually indistinguishable from Cyrillic ones, but
+/// only in mixed Cyrillic/Latin text. Pure Latin identifiers stay unchanged.
+pub fn normalize_cyrillic_homoglyphs(text: &str) -> String {
+    if !text.chars().any(|ch| matches!(ch, '\u{0400}'..='\u{04ff}')) {
+        return text.to_string();
+    }
+    text.chars()
+        .map(|ch| match ch {
+            'A' => 'А',
+            'B' => 'В',
+            'C' => 'С',
+            'E' => 'Е',
+            'H' => 'Н',
+            'K' => 'К',
+            'M' => 'М',
+            'O' => 'О',
+            'P' => 'Р',
+            'T' => 'Т',
+            'X' => 'Х',
+            'Y' => 'У',
+            'a' => 'а',
+            'c' => 'с',
+            'e' => 'е',
+            'o' => 'о',
+            'p' => 'р',
+            'x' => 'х',
+            'y' => 'у',
+            _ => ch,
+        })
+        .collect()
+}
+
+pub fn has_mixed_script_homoglyphs(text: &str) -> bool {
+    normalize_cyrillic_homoglyphs(text) != text
+}
+
 pub fn strip_links(text: &str) -> String {
     text.split_whitespace()
         .filter(|word| {
@@ -47,5 +83,12 @@ mod tests {
     fn strip_links_handles_wrapping_punctuation() {
         assert_eq!(strip_links("смотри (https://example.com), ок"), "смотри ок");
         assert_eq!(strip_links("смотри https://example.com. ок"), "смотри ок");
+    }
+
+    #[test]
+    fn normalizes_latin_homoglyph_in_cyrillic_name() {
+        assert_eq!(normalize_cyrillic_homoglyphs("Tанюша"), "Танюша");
+        assert!(has_mixed_script_homoglyphs("Tанюша"));
+        assert_eq!(normalize_cyrillic_homoglyphs("Alice"), "Alice");
     }
 }

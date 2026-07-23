@@ -10,6 +10,7 @@ use teloxide::{
 
 use crate::config::Config;
 use crate::telegram::entities::{forwarded_channel_post, message_has_links, message_text};
+use crate::text::normalize_cyrillic_homoglyphs;
 
 struct MemberSnapshot {
     chat_id: i64,
@@ -113,6 +114,7 @@ fn normalize_profile_identifier(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .map(|value| value.trim_start_matches('@'))
+        .map(normalize_cyrillic_homoglyphs)
         .map(|value| value.replace('ё', "е").to_lowercase())
         .filter(|value| !value.is_empty())
 }

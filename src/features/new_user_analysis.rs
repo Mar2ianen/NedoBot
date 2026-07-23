@@ -3,6 +3,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
+use crate::text::{has_mixed_script_homoglyphs, normalize_cyrillic_homoglyphs};
+
 #[derive(Debug, Clone, Copy)]
 pub struct NewUserAnalysisConfig {
     pub recent_id_ratio_threshold: f64,
@@ -629,6 +631,7 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(display_name_signal(features));
     risk.add_optional(profile_photo_signal(features));
     risk.add_optional(feminine_name_signal(features));
+    risk.add_optional(homoglyph_profile_signal(features));
     risk.add_optional(message_texture_signal(features));
     risk.add_optional(chat_position_signal(features));
     for signal in message_style_signals(features) {
@@ -642,6 +645,7 @@ fn analyze_new_or_low_activity_user(
     }
 
     risk.add_optional(short_bio_signal(features));
+    risk.add_optional(explicit_adult_bio_signal(features));
     risk.add_optional(member_status_signal(features));
     risk.finish()
 }
@@ -784,6 +788,22 @@ fn feminine_name_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         }),
         _ => None,
     }
+}
+
+fn homoglyph_profile_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
+    let has_homoglyphs = [
+        features.first_name.as_deref(),
+        features.last_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(has_mixed_script_homoglyphs);
+    has_homoglyphs.then_some(RiskSignal {
+        class: SpamClass::LlmProfileBait,
+        coefficient: 3,
+        label: "mixed_script_profile_homoglyphs",
+        reason: "Profile name mixes Latin and Cyrillic look-alike letters",
+    })
 }
 
 fn message_texture_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1101,6 +1121,35 @@ fn short_bio_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         }),
         _ => None,
     }
+}
+
+fn explicit_adult_bio_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
+    let bio = features.bio.as_deref()?;
+    has_explicit_adult_promo_bio(bio).then_some(RiskSignal {
+        class: SpamClass::AdultPersonalChannel,
+        coefficient: 42,
+        label: "explicit_adult_promo_bio",
+        reason: "Profile bio promotes an explicit adult service together with a link or funnel cue",
+    })
+}
+
+fn has_explicit_adult_promo_bio(bio: &str) -> bool {
+    let raw = bio.to_lowercase();
+    let normalized = normalize_cyrillic_homoglyphs(bio).to_lowercase();
+    let adult_provider = ["onlyfans", "онлифанс", "fansly", "pornhub", "xvideos"]
+        .iter()
+        .any(|marker| raw.contains(marker) || normalized.contains(marker));
+    let promotional_context = [
+        "t.me/",
+        "telegram.me/",
+        "onlyfans.com",
+        "fansly.com",
+        "слив",
+        "hot",
+    ]
+    .iter()
+    .any(|marker| raw.contains(marker) || normalized.contains(marker));
+    adult_provider && promotional_context
 }
 
 fn member_status_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1459,7 +1508,7 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
     let Some(first_name) = first_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
     };
-    let normalized = first_name
+    let normalized = normalize_cyrillic_homoglyphs(first_name)
         .split_whitespace()
         .next()
         .unwrap_or_default()
@@ -1562,6 +1611,7 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
             | "инна"
             | "ирина"
             | "карина"
+            | "катя"
             | "кира"
             | "кора"
             | "ксения"
@@ -1586,6 +1636,8 @@ fn looks_like_feminine_first_name(first_name: Option<&str>) -> bool {
             | "светлана"
             | "софия"
             | "таисия"
+            | "таня"
+            | "танюша"
             | "татьяна"
             | "ульяна"
             | "юлия"
@@ -1919,6 +1971,7 @@ mod tests {
         assert!(looks_like_feminine_first_name(Some("Нино ❤️")));
         assert!(looks_like_feminine_first_name(Some("Лана 💻")));
         assert!(looks_like_feminine_first_name(Some("Кора 🌊")));
+        assert!(looks_like_feminine_first_name(Some("Tанюша")));
         assert!(looks_like_feminine_first_name(Some("Alice")));
         assert!(looks_like_feminine_first_name(Some("Mary Johnson")));
         assert!(looks_like_feminine_first_name(Some("Sophia")));
@@ -1930,6 +1983,19 @@ mod tests {
         assert!(!looks_like_feminine_first_name(Some("Илья")));
         assert!(!looks_like_feminine_first_name(Some("Дима")));
         assert!(!looks_like_feminine_first_name(Some("Чат")));
+    }
+
+    #[test]
+    fn adult_bio_requires_provider_and_funnel() {
+        assert!(has_explicit_adult_promo_bio(
+            "Канал с горячими сливами OnlyFans моделей 🔥 t.me/example"
+        ));
+        assert!(!has_explicit_adult_promo_bio(
+            "OnlyFans is a subscription platform"
+        ));
+        assert!(!has_explicit_adult_promo_bio(
+            "Горячие новости t.me/example"
+        ));
     }
 
     #[test]

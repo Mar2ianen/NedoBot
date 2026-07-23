@@ -2,15 +2,18 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
+use teloxide::prelude::*;
 
 use crate::config::Config;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
+use crate::features::spam_review::{create_high_risk_review, send_review};
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
 
 const PROMPT_VERSION: &str = "first-message-spam-v2";
 const POST_CONTEXT_LIMIT: usize = 700;
+const LEASE_SECONDS: i64 = 10 * 60;
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/first_message_spam_classification.md");
 
 pub async fn analyze_first_message(
@@ -78,6 +81,116 @@ pub async fn analyze_first_message(
     .bind(&config.rag_embedding_model).bind(similarity).bind(template_matches).bind(delta).bind(&signal)
     .fetch_optional(pool).await?;
     Ok(updated.is_some())
+}
+
+pub async fn enqueue_first_message_spam_analysis(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into first_message_spam_analysis_jobs (chat_id, telegram_user_id)
+        values ($1, $2)
+        on conflict (chat_id, telegram_user_id) do nothing
+        "#,
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn process_next_first_message_spam_analysis_job(
+    bot: &Bot,
+    pool: &PgPool,
+    config: &Config,
+) -> anyhow::Result<bool> {
+    let job = sqlx::query(
+        r#"
+        with candidate as (
+            select id
+            from first_message_spam_analysis_jobs
+            where (status in ('pending', 'retry_wait') and next_attempt_at <= now())
+               or (status = 'processing' and lease_expires_at <= now())
+            order by next_attempt_at, id
+            for update skip locked
+            limit 1
+        )
+        update first_message_spam_analysis_jobs job
+        set status = 'processing', attempts = job.attempts + 1,
+            processing_started_at = now(),
+            lease_expires_at = now() + ($1 * interval '1 second'), updated_at = now()
+        from candidate
+        where job.id = candidate.id
+        returning job.id, job.chat_id, job.telegram_user_id, job.attempts
+        "#,
+    )
+    .bind(LEASE_SECONDS)
+    .fetch_optional(pool)
+    .await?;
+    let Some(job) = job else { return Ok(false) };
+    let id: i64 = job.get("id");
+    let chat_id: i64 = job.get("chat_id");
+    let user_id: i64 = job.get("telegram_user_id");
+    let attempts: i32 = job.get("attempts");
+
+    match analyze_first_message(pool, config, chat_id, user_id).await {
+        Ok(_) => {
+            sqlx::query(
+                "update first_message_spam_analysis_jobs set status = 'succeeded', error_kind = null, lease_expires_at = null, updated_at = now() where id = $1 and status = 'processing'",
+            )
+            .bind(id)
+            .execute(pool)
+            .await?;
+            if let Some(review) = create_high_risk_review(pool, chat_id, user_id).await? {
+                send_review(bot, &review).await?;
+            }
+        }
+        Err(err) => {
+            let error_kind = if err.to_string().contains("429") {
+                "http_429"
+            } else {
+                "first_message_analysis_failed"
+            };
+            match retry_delay_seconds(attempts) {
+                Some(delay_seconds) => {
+                    sqlx::query(
+                        "update first_message_spam_analysis_jobs set status = 'retry_wait', error_kind = $2, next_attempt_at = now() + ($3 * interval '1 second'), lease_expires_at = null, updated_at = now() where id = $1 and status = 'processing'",
+                    )
+                    .bind(id)
+                    .bind(error_kind)
+                    .bind(delay_seconds)
+                    .execute(pool)
+                    .await?;
+                    tracing::warn!(%err, user_id, attempts, delay_seconds, "first-message spam analysis scheduled for retry");
+                }
+                None => {
+                    sqlx::query(
+                        "update first_message_spam_analysis_jobs set status = 'failed', error_kind = $2, lease_expires_at = null, updated_at = now() where id = $1 and status = 'processing'",
+                    )
+                    .bind(id)
+                    .bind(error_kind)
+                    .execute(pool)
+                    .await?;
+                    tracing::error!(%err, user_id, attempts, "first-message spam analysis failed permanently");
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn retry_delay_seconds(attempts: i32) -> Option<i64> {
+    match attempts {
+        1 => Some(15),
+        2 => Some(30),
+        3 => Some(60),
+        4 => Some(5 * 60),
+        5 => Some(24 * 60 * 60),
+        _ => None,
+    }
 }
 
 async fn replied_post_context(
@@ -279,5 +392,13 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn retry_schedule_reaches_one_day_then_fails() {
+        assert_eq!(retry_delay_seconds(1), Some(15));
+        assert_eq!(retry_delay_seconds(4), Some(300));
+        assert_eq!(retry_delay_seconds(5), Some(86_400));
+        assert_eq!(retry_delay_seconds(6), None);
     }
 }

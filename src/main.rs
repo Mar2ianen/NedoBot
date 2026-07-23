@@ -27,7 +27,9 @@ use features::avatar_analysis::service::{
     enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
 };
 use features::first_comment::pipeline::maybe_comment_post;
-use features::first_message_spam::analyze_first_message;
+use features::first_message_spam::{
+    enqueue_first_message_spam_analysis, process_next_first_message_spam_analysis_job,
+};
 use features::memory::service::process_next_history_entry;
 use features::new_user_analysis::analyze_new_user_profile;
 use features::spam_review::{apply_callback, create_high_risk_review, parse_callback, send_review};
@@ -60,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = AppState::new(pool, config);
     spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
+    spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
     spawn_post_history_worker(state.clone());
 
     let handler = dptree::entry()
@@ -154,7 +157,6 @@ fn spawn_message_author_profile_refresh(
     let pool = state.pool.clone();
     let profile_refresh_slots = state.profile_refresh_slots.clone();
     let avatar_classifier_enabled = state.config.avatar_classifier_enabled;
-    let state_config = state.config.clone();
     tokio::spawn(async move {
         match user_profile_needs_refresh(&pool, user_id).await {
             Ok(true) => {}
@@ -179,9 +181,9 @@ fn spawn_message_author_profile_refresh(
                     tracing::warn!(%err, user_id, "failed to analyze new user profile");
                 } else {
                     if let Err(err) =
-                        analyze_first_message(&pool, &state_config, chat_id, user_id).await
+                        enqueue_first_message_spam_analysis(&pool, chat_id, user_id).await
                     {
-                        tracing::warn!(%err, user_id, "failed to analyze first message for spam");
+                        tracing::warn!(%err, user_id, "failed to enqueue first-message spam analysis");
                     }
                     match create_high_risk_review(&pool, chat_id, user_id).await {
                         Ok(Some(review)) => {
@@ -272,6 +274,23 @@ fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
                 Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
                 Err(err) => {
                     tracing::warn!(%err, "avatar analysis worker failed to claim a job");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_first_message_spam_analysis_worker(bot: Bot, state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match process_next_first_message_spam_analysis_job(&bot, &state.pool, &state.config)
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                Err(err) => {
+                    tracing::warn!(%err, "first-message spam worker failed to claim a job");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
