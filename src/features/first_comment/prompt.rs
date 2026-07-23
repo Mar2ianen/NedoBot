@@ -42,6 +42,7 @@ struct FirstCommentContext<'a> {
     recent_comments: Vec<String>,
     search: SearchPromptContext,
     chat_evidence: Vec<ChatEvidencePrompt>,
+    scope: Option<ScopePromptContext>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -123,6 +124,13 @@ struct ChatEvidencePrompt {
     message_id: i32,
     author_name: String,
     text: String,
+}
+
+#[derive(Serialize)]
+struct ScopePromptContext {
+    primary_subject: String,
+    primary_audience: Vec<String>,
+    secondary_context: Vec<String>,
 }
 
 #[cfg(test)]
@@ -235,6 +243,13 @@ fn build_llm_user_prompt(
                 text: truncate_chars(&compact_text(&candidate.text), 500),
             })
             .collect(),
+        scope: search_context
+            .and_then(|context| context.plan.as_ref())
+            .map(|plan| ScopePromptContext {
+                primary_subject: plan.primary_subject.clone(),
+                primary_audience: plan.primary_audience.clone(),
+                secondary_context: plan.secondary_context.clone(),
+            }),
     };
 
     let json = serde_json::to_string(&context).expect("first-comment context must serialize");
