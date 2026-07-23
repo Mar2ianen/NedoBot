@@ -1227,9 +1227,18 @@ fn safe_pg_type(value: &str) -> anyhow::Result<&str> {
 }
 fn normalize_pg_type(data_type: &str, udt_name: &str) -> String {
     match data_type {
-        "ARRAY" => format!("{}[]", udt_name.trim_start_matches('_')),
+        "ARRAY" => format!("{}[]", normalize_array_type(udt_name)),
         "USER-DEFINED" => udt_name.into(),
         _ => data_type.into(),
+    }
+}
+
+fn normalize_array_type(udt_name: &str) -> &str {
+    match udt_name.trim_start_matches('_') {
+        "int4" => "integer",
+        "int8" => "bigint",
+        "int2" => "smallint",
+        other => other,
     }
 }
 fn sanitize_value(value: Value) -> Value {

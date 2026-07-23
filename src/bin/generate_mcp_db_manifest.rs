@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn normalize_type(data_type: &str, udt_name: &str) -> anyhow::Result<String> {
     let value = match data_type {
-        "ARRAY" => format!("{}[]", udt_name.trim_start_matches('_')),
+        "ARRAY" => format!("{}[]", normalize_array_type(udt_name)),
         "USER-DEFINED" => udt_name.into(),
         other => other.into(),
     };
@@ -123,6 +123,15 @@ fn normalize_type(data_type: &str, udt_name: &str) -> anyhow::Result<String> {
         | "text[]"
         | "integer[]" => Ok(value),
         _ => bail!("unsupported mcp_public type {value}"),
+    }
+}
+
+fn normalize_array_type(udt_name: &str) -> &str {
+    match udt_name.trim_start_matches('_') {
+        "int4" => "integer",
+        "int8" => "bigint",
+        "int2" => "smallint",
+        other => other,
     }
 }
 
