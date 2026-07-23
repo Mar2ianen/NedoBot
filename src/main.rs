@@ -26,6 +26,7 @@ use db::{build_pool, migrate};
 use features::avatar_analysis::service::{
     enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
 };
+use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::maybe_comment_post;
 use features::first_message_spam::{
     enqueue_first_message_spam_analysis, process_next_first_message_spam_analysis_job,
@@ -64,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
     spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
     spawn_post_history_worker(state.clone());
+    spawn_chat_retrieval_embedding_worker(state.clone());
 
     let handler = dptree::entry()
         .branch(
@@ -105,6 +107,32 @@ fn spawn_post_history_worker(state: AppState) {
                 Err(err) => {
                     tracing::warn!(%err, "post history worker failed");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_chat_retrieval_embedding_worker(state: AppState) {
+    if !state.config.chat_retrieval_embeddings_enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            match process_next_embedding_batch(&state.pool, &state.config).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        state.config.chat_retrieval_embedding_poll_sec,
+                    ))
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "chat retrieval embedding worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        state.config.chat_retrieval_embedding_poll_sec,
+                    ))
+                    .await;
                 }
             }
         }

@@ -12,6 +12,12 @@ struct EmbedRequest<'a> {
     truncate: bool,
 }
 
+#[derive(Serialize)]
+struct EmbedBatchRequest<'a> {
+    inputs: &'a [&'a str],
+    truncate: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum EmbedResponse {
@@ -54,6 +60,52 @@ pub async fn embed_text(config: &Config, text: &str) -> anyhow::Result<Vec<f32>>
         "RAG embedding completed"
     );
     Ok(embedding)
+}
+
+pub async fn embed_text_batch(config: &Config, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let started = Instant::now();
+    let response = http::client(Duration::from_secs(config.rag_embedding_timeout_sec))?
+        .post(format!(
+            "{}/embed",
+            config.rag_embedding_url.trim_end_matches('/')
+        ))
+        .json(&EmbedBatchRequest {
+            inputs: texts,
+            truncate: true,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<EmbedResponse>()
+        .await?;
+
+    let embeddings = match response {
+        EmbedResponse::Batch(rows) if rows.len() == texts.len() => rows,
+        EmbedResponse::Batch(rows) => {
+            anyhow::bail!(
+                "embedding service returned {} rows for {} inputs",
+                rows.len(),
+                texts.len()
+            )
+        }
+        EmbedResponse::Single(_) => {
+            anyhow::bail!("embedding service returned one row for batch input")
+        }
+    };
+    for embedding in &embeddings {
+        validate_embedding(embedding)?;
+    }
+    tracing::info!(
+        model = %config.rag_embedding_model,
+        inputs = texts.len(),
+        latency_ms = started.elapsed().as_millis(),
+        "RAG embedding batch completed"
+    );
+    Ok(embeddings)
 }
 
 pub fn pgvector_literal(values: &[f32]) -> anyhow::Result<String> {

@@ -9,6 +9,7 @@ use teloxide::{
 };
 
 use crate::config::Config;
+use crate::features::chat_retrieval::enqueue_message_embedding;
 use crate::telegram::entities::{forwarded_channel_post, message_has_links, message_text};
 use crate::text::normalize_cyrillic_homoglyphs;
 
@@ -198,6 +199,7 @@ pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Resu
 
     if inserted {
         upsert_chat_user_activity(pool, msg, source_channel_id).await?;
+        enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
     }
 
     Ok(())
@@ -258,6 +260,8 @@ pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyho
     .bind(edited_at)
     .execute(pool)
     .await?;
+
+    enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
 
     Ok(())
 }
