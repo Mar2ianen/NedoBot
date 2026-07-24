@@ -435,27 +435,46 @@ async fn claim_embedding_jobs_matching(
         with candidate as (
             select e.chat_id, e.message_id
             from telegram_message_embeddings e
-            join telegram_messages m on m.chat_id = e.chat_id and m.message_id = e.message_id
-            left join telegram_user_profiles p on p.telegram_user_id = m.user_id
             where ({predicate})
-              and nullif(trim(m.text), '') is not null
-              and m.user_id is not null
-              and coalesce(p.is_bot, false) = false
-              and m.is_automatic_forward = false
-              and m.deleted_by_bot_at is null
-              and m.spam_marked_at is null
             order by {order_by}
             for update of e skip locked
             limit $1
         )
         update telegram_message_embeddings e
-        set status = 'processing', attempts = e.attempts + 1,
-            processing_started_at = now(),
-            lease_expires_at = now() + ($2 * interval '1 second'), updated_at = now()
-        from candidate, telegram_messages m
+        set status = case when nullif(trim(m.text), '') is not null
+                              and m.user_id is not null
+                              and coalesce(p.is_bot, false) = false
+                              and m.is_automatic_forward = false
+                              and m.deleted_by_bot_at is null
+                              and m.spam_marked_at is null
+                          then 'processing' else 'ignored' end,
+            attempts = case when nullif(trim(m.text), '') is not null
+                                and m.user_id is not null
+                                and coalesce(p.is_bot, false) = false
+                                and m.is_automatic_forward = false
+                                and m.deleted_by_bot_at is null
+                                and m.spam_marked_at is null
+                            then e.attempts + 1 else e.attempts end,
+            processing_started_at = case when nullif(trim(m.text), '') is not null
+                                         and m.user_id is not null
+                                         and coalesce(p.is_bot, false) = false
+                                         and m.is_automatic_forward = false
+                                         and m.deleted_by_bot_at is null
+                                         and m.spam_marked_at is null
+                                     then now() else null end,
+            lease_expires_at = case when nullif(trim(m.text), '') is not null
+                                      and m.user_id is not null
+                                      and coalesce(p.is_bot, false) = false
+                                      and m.is_automatic_forward = false
+                                      and m.deleted_by_bot_at is null
+                                      and m.spam_marked_at is null
+                                  then now() + ($2 * interval '1 second') else null end,
+            updated_at = now()
+        from candidate
+        left join telegram_messages m on m.chat_id = candidate.chat_id and m.message_id = candidate.message_id
+        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         where e.chat_id = candidate.chat_id and e.message_id = candidate.message_id
-          and m.chat_id = e.chat_id and m.message_id = e.message_id
-        returning e.chat_id, e.message_id, m.text, e.attempts
+        returning e.status, e.chat_id, e.message_id, m.text, e.attempts
         "#
     );
     let rows = sqlx::query(&sql)
@@ -465,11 +484,13 @@ async fn claim_embedding_jobs_matching(
         .await?;
     Ok(rows
         .into_iter()
-        .map(|row| EmbeddingJob {
-            chat_id: row.get("chat_id"),
-            message_id: row.get("message_id"),
-            text: row.get("text"),
-            attempts: row.get("attempts"),
+        .filter_map(|row| {
+            (row.get::<String, _>("status") == "processing").then(|| EmbeddingJob {
+                chat_id: row.get("chat_id"),
+                message_id: row.get("message_id"),
+                text: row.get("text"),
+                attempts: row.get("attempts"),
+            })
         })
         .collect())
 }
