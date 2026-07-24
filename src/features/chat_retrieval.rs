@@ -386,22 +386,65 @@ async fn claim_embedding_jobs(
     pool: &PgPool,
     batch_size: usize,
 ) -> anyhow::Result<Vec<EmbeddingJob>> {
-    let rows = sqlx::query(
+    let jobs = claim_pending_embedding_jobs(pool, batch_size).await?;
+    if !jobs.is_empty() {
+        return Ok(jobs);
+    }
+    claim_expired_embedding_jobs(pool, batch_size).await
+}
+
+async fn claim_pending_embedding_jobs(
+    pool: &PgPool,
+    batch_size: usize,
+) -> anyhow::Result<Vec<EmbeddingJob>> {
+    claim_embedding_jobs_matching(
+        pool,
+        batch_size,
+        r#"
+            e.status in ('pending', 'retry_wait') and e.next_attempt_at <= now()
+        "#,
+        "e.next_attempt_at, e.created_at",
+    )
+    .await
+}
+
+async fn claim_expired_embedding_jobs(
+    pool: &PgPool,
+    batch_size: usize,
+) -> anyhow::Result<Vec<EmbeddingJob>> {
+    claim_embedding_jobs_matching(
+        pool,
+        batch_size,
+        r#"
+            e.status = 'processing' and e.lease_expires_at <= now()
+        "#,
+        "e.lease_expires_at, e.created_at",
+    )
+    .await
+}
+
+async fn claim_embedding_jobs_matching(
+    pool: &PgPool,
+    batch_size: usize,
+    predicate: &'static str,
+    order_by: &'static str,
+) -> anyhow::Result<Vec<EmbeddingJob>> {
+    // Both fragments are private constants, never user-controlled SQL.
+    let sql = format!(
         r#"
         with candidate as (
             select e.chat_id, e.message_id
             from telegram_message_embeddings e
             join telegram_messages m on m.chat_id = e.chat_id and m.message_id = e.message_id
             left join telegram_user_profiles p on p.telegram_user_id = m.user_id
-            where ((e.status in ('pending', 'retry_wait') and e.next_attempt_at <= now())
-                   or (e.status = 'processing' and e.lease_expires_at <= now()))
+            where ({predicate})
               and nullif(trim(m.text), '') is not null
               and m.user_id is not null
               and coalesce(p.is_bot, false) = false
               and m.is_automatic_forward = false
               and m.deleted_by_bot_at is null
               and m.spam_marked_at is null
-            order by e.next_attempt_at, e.created_at
+            order by {order_by}
             for update of e skip locked
             limit $1
         )
@@ -413,12 +456,13 @@ async fn claim_embedding_jobs(
         where e.chat_id = candidate.chat_id and e.message_id = candidate.message_id
           and m.chat_id = e.chat_id and m.message_id = e.message_id
         returning e.chat_id, e.message_id, m.text, e.attempts
-        "#,
-    )
-    .bind(batch_size.clamp(1, 64) as i64)
-    .bind(LEASE_SECONDS)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(batch_size.clamp(1, 64) as i64)
+        .bind(LEASE_SECONDS)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|row| EmbeddingJob {
