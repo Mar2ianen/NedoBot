@@ -168,9 +168,10 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!("first comment contains generic CTA phrase: {phrase}");
     }
+    let activity_text = placeholders.activity_text.to_lowercase();
     if let Some(phrase) = INVENTED_CHAT_ACTIVITY_PHRASES
         .iter()
-        .find(|phrase| lower.contains(**phrase))
+        .find(|phrase| activity_text.contains(**phrase))
     {
         anyhow::bail!("first comment invents chat activity: {phrase}");
     }
@@ -208,6 +209,7 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
 struct PlaceholderScan {
     valid_count: usize,
     visible_text: String,
+    activity_text: String,
 }
 
 fn ends_with_forbidden_final_punctuation(text: &str) -> bool {
@@ -224,33 +226,38 @@ fn find_number_word(text: &str) -> Option<&'static str> {
 fn scan_chat_link_placeholders(text: &str) -> anyhow::Result<PlaceholderScan> {
     let mut valid_count = 0;
     let mut visible = String::with_capacity(text.len());
+    let mut activity = String::with_capacity(text.len());
     let mut rest = text;
 
     while let Some(start) = rest.find("{CHAT_LINK") {
         let (before, after_start) = rest.split_at(start);
         visible.push_str(before);
+        activity.push_str(before);
 
         let Some(end) = after_start.find('}') else {
             anyhow::bail!("first comment contains unterminated CHAT_LINK placeholder");
         };
 
         let token = &after_start[..=end];
-        validate_chat_link_token(token)?;
+        let activity_label = chat_link_activity_label(token)?;
         valid_count += 1;
         visible.push(' ');
+        activity.push_str(activity_label);
         rest = &after_start[end + 1..];
     }
 
     visible.push_str(rest);
+    activity.push_str(rest);
     Ok(PlaceholderScan {
         valid_count,
         visible_text: visible,
+        activity_text: activity,
     })
 }
 
-fn validate_chat_link_token(token: &str) -> anyhow::Result<()> {
+fn chat_link_activity_label(token: &str) -> anyhow::Result<&str> {
     if token == "{CHAT_LINK}" {
-        return Ok(());
+        return Ok("чат");
     }
 
     let Some(label) = token
@@ -262,7 +269,7 @@ fn validate_chat_link_token(token: &str) -> anyhow::Result<()> {
     };
 
     if ALLOWED_CHAT_LINK_LABELS.contains(&label) {
-        Ok(())
+        Ok(label)
     } else {
         anyhow::bail!("first comment contains unsupported CHAT_LINK label: {label}");
     }
@@ -332,6 +339,16 @@ mod tests {
         assert!(
             validate_comment_output(
                 "В чатике уже спорят, стоит ли менять карту. Апгрейды в {CHAT_LINK:чатике}"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_invented_chat_activity_split_by_chat_link_placeholder() {
+        assert!(
+            validate_comment_output(
+                "В {CHAT_LINK:чатике} уже ностальгируют по плиткам. HMD без Microsoft не вытянет"
             )
             .is_err()
         );
