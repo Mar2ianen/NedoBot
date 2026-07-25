@@ -111,7 +111,7 @@ fn research_plan_schema() -> Value {
     })
 }
 
-pub(crate) fn parse_research_plan(value: &str, post: &str) -> anyhow::Result<ResearchPlan> {
+pub(crate) fn parse_research_plan(value: &str, _post: &str) -> anyhow::Result<ResearchPlan> {
     let mut plan: ResearchPlan = serde_json::from_str(strip_json_fence(value))?;
     plan.primary_subject = clean_item(&plan.primary_subject, MAX_QUERY_CHARS);
     if plan.primary_subject.is_empty() {
@@ -121,15 +121,7 @@ pub(crate) fn parse_research_plan(value: &str, post: &str) -> anyhow::Result<Res
     plan.secondary_context = sanitize_items(plan.secondary_context, MAX_PLAN_ITEMS);
     plan.chat_semantic_queries =
         sanitize_items(plan.chat_semantic_queries, MAX_CHAT_SEMANTIC_QUERIES);
-    let post_terms = latin_fragments(post);
-    let reserved_post_slots = post_terms.len().min(MAX_PLAN_ITEMS);
-    plan.chat_lexical_terms = sanitize_items(
-        plan.chat_lexical_terms,
-        MAX_PLAN_ITEMS.saturating_sub(reserved_post_slots),
-    );
-    for term in post_terms {
-        push_unique(&mut plan.chat_lexical_terms, term, MAX_PLAN_ITEMS);
-    }
+    plan.chat_lexical_terms = sanitize_items(plan.chat_lexical_terms, MAX_PLAN_ITEMS);
     plan.web_queries = sanitize_items(plan.web_queries, MAX_PLAN_ITEMS);
     plan.reddit_queries = sanitize_items(plan.reddit_queries, MAX_PLAN_ITEMS);
     plan.github_queries = sanitize_items(plan.github_queries, MAX_PLAN_ITEMS);
@@ -170,37 +162,6 @@ pub(crate) fn sanitize_external_queries(plan: &ResearchPlan) -> Vec<SearchQuery>
         }
     }
     sanitized
-}
-
-pub(crate) fn latin_fragments(text: &str) -> Vec<String> {
-    let mut fragments = Vec::new();
-    let mut current = String::new();
-    for character in text.chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-') {
-            current.push(character);
-        } else {
-            push_latin_fragment(&mut fragments, &mut current);
-        }
-    }
-    push_latin_fragment(&mut fragments, &mut current);
-    fragments
-}
-
-fn push_latin_fragment(fragments: &mut Vec<String>, current: &mut String) {
-    let fragment = current
-        .trim_matches(|character: char| matches!(character, '.' | '_' | '+' | '-'))
-        .to_string();
-    current.clear();
-    if fragment.len() >= 2
-        && fragment
-            .chars()
-            .any(|character| character.is_ascii_alphabetic())
-        && !fragments
-            .iter()
-            .any(|seen| seen.eq_ignore_ascii_case(&fragment))
-    {
-        fragments.push(fragment);
-    }
 }
 
 fn sanitize_items(items: Vec<String>, limit: usize) -> Vec<String> {
@@ -252,16 +213,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_keeps_latin_terms_from_post() {
+    fn plan_uses_only_deliberate_lexical_terms() {
         let plan = parse_research_plan(
             r#"{"primary_subject":"Windows activation","primary_audience":["users"],"secondary_context":["servers"],"chat_semantic_queries":["TPM activation"],"chat_lexical_terms":["KMS"],"web_queries":[],"reddit_queries":[],"github_queries":[]}"#,
             "TPM ломает KMSAuto и slmgr на Windows 11",
         )
         .unwrap();
-        assert_eq!(
-            plan.chat_lexical_terms,
-            ["KMS", "TPM", "KMSAuto", "slmgr", "Windows"]
-        );
+        assert_eq!(plan.chat_lexical_terms, ["KMS"]);
     }
 
     #[test]

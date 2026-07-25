@@ -10,6 +10,9 @@ use crate::features::search::types::ResearchPlan;
 const LEASE_SECONDS: i64 = 10 * 60;
 const MAX_RETRY_ATTEMPTS: i32 = 5;
 const SHADOW_CANDIDATE_LIMIT: i64 = 12;
+const MAX_CANDIDATES_PER_SIGNAL: usize = 4;
+const PRECISE_LITERAL_SCORE: f64 = 1.0;
+const BROAD_LITERAL_SCORE: f64 = 0.2;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RetrievalCandidate {
@@ -123,8 +126,45 @@ pub async fn run_shadow_retrieval(
             + candidate.freshness_score;
     }
     candidates.sort_by(|left, right| right.total_score.total_cmp(&left.total_score));
-    candidates.truncate(SHADOW_CANDIDATE_LIMIT as usize);
-    Ok(candidates)
+    Ok(select_diverse_candidates(
+        candidates,
+        SHADOW_CANDIDATE_LIMIT as usize,
+    ))
+}
+
+fn select_diverse_candidates(
+    candidates: Vec<RetrievalCandidate>,
+    limit: usize,
+) -> Vec<RetrievalCandidate> {
+    let mut selected = Vec::new();
+    let mut semantic_count = 0;
+    let mut lexical_count = 0;
+    let mut exact_count = 0;
+
+    for candidate in &candidates {
+        let semantic_available =
+            candidate.semantic_score > 0.0 && semantic_count < MAX_CANDIDATES_PER_SIGNAL;
+        let lexical_available =
+            candidate.lexical_score > 0.0 && lexical_count < MAX_CANDIDATES_PER_SIGNAL;
+        let exact_available =
+            candidate.exact_score > 0.0 && exact_count < MAX_CANDIDATES_PER_SIGNAL;
+        if !(semantic_available || lexical_available || exact_available) {
+            continue;
+        }
+        if candidate.semantic_score > 0.0 {
+            semantic_count += 1;
+        }
+        if candidate.lexical_score > 0.0 {
+            lexical_count += 1;
+        }
+        if candidate.exact_score > 0.0 {
+            exact_count += 1;
+        }
+        selected.push(candidate.clone());
+    }
+
+    selected.truncate(limit);
+    selected
 }
 
 fn merge_candidates(
@@ -149,7 +189,7 @@ async fn load_semantic_candidates(
     embedding: &str,
     config: &Config,
 ) -> anyhow::Result<Vec<RetrievalCandidate>> {
-    load_candidates(pool, chat_id, embedding, config, "semantic").await
+    load_candidates(pool, chat_id, embedding, config, "semantic", 0.0).await
 }
 
 async fn load_lexical_candidates(
@@ -159,12 +199,16 @@ async fn load_lexical_candidates(
     config: &Config,
     exact: bool,
 ) -> anyhow::Result<Vec<RetrievalCandidate>> {
+    let exact_score = exact
+        .then(|| literal_match_score(query))
+        .unwrap_or_default();
     load_candidates(
         pool,
         chat_id,
         query,
         config,
         if exact { "exact" } else { "lexical" },
+        exact_score,
     )
     .await
 }
@@ -175,13 +219,14 @@ async fn load_candidates(
     query: &str,
     config: &Config,
     kind: &str,
+    exact_score: f64,
 ) -> anyhow::Result<Vec<RetrievalCandidate>> {
     let rows = sqlx::query(r#"
         select m.message_id, m.text,
                (extract(epoch from (now() - m.created_at)) / 86400.0)::double precision as age_days,
                (case when $5 = 'semantic' then 1.0 - (e.embedding <=> $2::vector) else 0.0 end)::double precision as semantic_score,
                (case when $5 = 'lexical' then greatest(ts_rank_cd(to_tsvector('russian', m.text), websearch_to_tsquery('russian', $2)), ts_rank_cd(to_tsvector('simple', m.text), websearch_to_tsquery('simple', $2))) else 0.0 end)::double precision as lexical_score,
-               (case when $5 = 'exact' then 1.0 else 0.0 end)::double precision as exact_score
+               (case when $5 = 'exact' then $6 else 0.0 end)::double precision as exact_score
         from telegram_messages m
         left join telegram_message_embeddings e on e.chat_id = m.chat_id and e.message_id = m.message_id and e.status = 'ready'
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
@@ -191,7 +236,7 @@ async fn load_candidates(
           and (($5 = 'semantic' and e.embedding is not null) or ($5 = 'lexical' and (to_tsvector('russian', m.text) @@ websearch_to_tsquery('russian', $2) or to_tsvector('simple', m.text) @@ websearch_to_tsquery('simple', $2))) or ($5 = 'exact' and m.text ~* $2))
         order by case when $5 = 'semantic' then e.embedding <=> $2::vector end, m.created_at desc
         limit $4
-    "#).bind(chat_id).bind(query).bind(config.chat_retrieval_window_days.clamp(1, 90)).bind(SHADOW_CANDIDATE_LIMIT).bind(kind).fetch_all(pool).await?;
+    "#).bind(chat_id).bind(query).bind(config.chat_retrieval_window_days.clamp(1, 90)).bind(SHADOW_CANDIDATE_LIMIT).bind(kind).bind(exact_score).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .map(|row| RetrievalCandidate {
@@ -204,6 +249,17 @@ async fn load_candidates(
             total_score: 0.0,
         })
         .collect())
+}
+
+fn literal_match_score(term: &str) -> f64 {
+    let words = term.split_whitespace().count();
+    let has_digit = term.chars().any(|character| character.is_ascii_digit());
+    let has_identifier_punctuation = term.contains(['+', '_', '-']);
+    if words >= 2 || has_digit || has_identifier_punctuation {
+        PRECISE_LITERAL_SCORE
+    } else {
+        BROAD_LITERAL_SCORE
+    }
 }
 
 pub fn geometric_freshness(age_days: f64, half_life_days: f64) -> f64 {
@@ -560,7 +616,11 @@ fn retry_after(attempts: i32) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{geometric_freshness, literal_variants, retry_after};
+    use super::{
+        BROAD_LITERAL_SCORE, PRECISE_LITERAL_SCORE, geometric_freshness, literal_match_score,
+        literal_variants, retry_after, select_diverse_candidates,
+    };
+    use crate::features::chat_retrieval::RetrievalCandidate;
 
     #[test]
     fn retries_are_bounded_and_increase_geometrically() {
@@ -580,6 +640,43 @@ mod tests {
     fn transliteration_covers_common_latin_product_names() {
         let variants = literal_variants("Windows Radeon");
         assert!(variants.iter().any(|term| term == "виндовс радеон"));
+    }
+
+    #[test]
+    fn literal_score_requires_a_full_product_identifier_for_a_strong_boost() {
+        assert_eq!(literal_match_score("RTX"), BROAD_LITERAL_SCORE);
+        assert_eq!(literal_match_score("GIGABYTE"), BROAD_LITERAL_SCORE);
+        assert_eq!(literal_match_score("RTX 5060"), PRECISE_LITERAL_SCORE);
+        assert_eq!(literal_match_score("DDR5"), PRECISE_LITERAL_SCORE);
+        assert_eq!(literal_match_score("C++"), PRECISE_LITERAL_SCORE);
+    }
+
+    #[test]
+    fn diverse_selection_keeps_semantic_candidates_when_literal_matches_are_noisy() {
+        let mut candidates = (1..=5)
+            .map(|message_id| RetrievalCandidate {
+                message_id,
+                text: "generic literal match".to_string(),
+                semantic_score: 0.0,
+                lexical_score: 0.0,
+                exact_score: BROAD_LITERAL_SCORE,
+                freshness_score: 1.0,
+                total_score: 1.2,
+            })
+            .collect::<Vec<_>>();
+        candidates.push(RetrievalCandidate {
+            message_id: 6,
+            text: "semantic context".to_string(),
+            semantic_score: 0.7,
+            lexical_score: 0.0,
+            exact_score: 0.0,
+            freshness_score: 0.5,
+            total_score: 1.2,
+        });
+
+        let selected = select_diverse_candidates(candidates, 12);
+        assert!(selected.iter().any(|candidate| candidate.message_id == 6));
+        assert_eq!(selected.len(), 5);
     }
 
     #[test]
