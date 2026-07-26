@@ -1,5 +1,6 @@
 pub mod gemini;
 pub mod ollama;
 pub mod openai_compat;
+pub mod profiles;
 pub mod service;
 pub mod types;

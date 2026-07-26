@@ -202,6 +202,8 @@ mod tests {
             post_signature_marker: "marker".to_string(),
             llm_provider: "ollama".to_string(),
             llm_model: None,
+            llm_profiles_path: None,
+            llm_profiles: None,
             llm_supports_images: None,
             llm_temperature: 0.45,
             llm_max_tokens: 140,

@@ -26,6 +26,8 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
     "paperpaper.ru",
 ];
 
+use crate::llm::profiles::LlmProfiles;
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct Config {
@@ -36,6 +38,8 @@ pub struct Config {
     pub post_signature_marker: String,
     pub llm_provider: String,
     pub llm_model: Option<String>,
+    pub llm_profiles_path: Option<String>,
+    pub llm_profiles: Option<LlmProfiles>,
     pub llm_supports_images: Option<bool>,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
@@ -148,55 +152,65 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        Self {
-            source_channel_id: env_i64("SOURCE_CHANNEL_ID", -1001575496091),
-            discussion_chat_id: env_i64("DISCUSSION_CHAT_ID", -1001932061163),
+    pub fn from_env() -> anyhow::Result<Self> {
+        let llm_profiles_path = env_optional("LLM_PROFILES_PATH");
+        let llm_profiles = llm_profiles_path
+            .as_deref()
+            .map(LlmProfiles::from_path)
+            .transpose()?;
+
+        Ok(Self {
+            source_channel_id: env_i64("SOURCE_CHANNEL_ID", -1001575496091)?,
+            discussion_chat_id: env_i64("DISCUSSION_CHAT_ID", -1001932061163)?,
             chat_invite_url: env_or("CHAT_INVITE_URL", "https://t.me/+RxmPtw7Bs-IxNzEy"),
             chat_invite_label: env_or("CHAT_INVITE_LABEL", "Присоединяйтесь к чату"),
             post_signature_marker: env_or("POST_SIGNATURE_MARKER", "Не теряем связь"),
             llm_provider: env_or("LLM_PROVIDER", "ollama"),
             llm_model: env_optional("LLM_MODEL"),
-            llm_supports_images: env_optional("LLM_SUPPORTS_IMAGES")
-                .and_then(|value| value.parse().ok()),
-            llm_temperature: env_f32("LLM_TEMPERATURE", 0.45),
-            llm_max_tokens: env_u32("LLM_MAX_TOKENS", 180),
+            llm_profiles_path,
+            llm_profiles,
+            llm_supports_images: env_optional_bool("LLM_SUPPORTS_IMAGES")?,
+            llm_temperature: env_f32("LLM_TEMPERATURE", 0.45)?,
+            llm_max_tokens: env_u32("LLM_MAX_TOKENS", 180)?,
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
-            memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2),
-            memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220),
+            memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2)?,
+            memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220)?,
             memory_llm_provider: env_or("MEMORY_LLM_PROVIDER", "ollama"),
             memory_llm_model: env_optional("MEMORY_LLM_MODEL")
                 .or_else(|| Some("gemma4:31b".to_string())),
-            rag_enabled: env_bool("RAG_ENABLED", false),
+            rag_enabled: env_bool("RAG_ENABLED", false)?,
             rag_embedding_url: env_or("RAG_EMBEDDING_URL", "http://127.0.0.1:8788"),
             rag_embedding_model: env_or("RAG_EMBEDDING_MODEL", "cointegrated/rubert-tiny2"),
-            rag_embedding_timeout_sec: env_u64("RAG_EMBEDDING_TIMEOUT_SEC", 10),
-            rag_top_k: env_usize("RAG_TOP_K", 6),
-            rag_min_similarity: env_f32("RAG_MIN_SIMILARITY", 0.55),
-            rag_temporal_half_life_days: env_f32("RAG_TEMPORAL_HALF_LIFE_DAYS", 180.0),
-            chat_retrieval_embeddings_enabled: env_bool("CHAT_RETRIEVAL_EMBEDDINGS_ENABLED", false),
+            rag_embedding_timeout_sec: env_u64("RAG_EMBEDDING_TIMEOUT_SEC", 10)?,
+            rag_top_k: env_usize("RAG_TOP_K", 6)?,
+            rag_min_similarity: env_f32("RAG_MIN_SIMILARITY", 0.55)?,
+            rag_temporal_half_life_days: env_f32("RAG_TEMPORAL_HALF_LIFE_DAYS", 180.0)?,
+            chat_retrieval_embeddings_enabled: env_bool(
+                "CHAT_RETRIEVAL_EMBEDDINGS_ENABLED",
+                false,
+            )?,
             chat_retrieval_embedding_batch_size: env_usize(
                 "CHAT_RETRIEVAL_EMBEDDING_BATCH_SIZE",
                 16,
-            ),
-            chat_retrieval_embedding_poll_sec: env_u64("CHAT_RETRIEVAL_EMBEDDING_POLL_SEC", 5),
-            chat_retrieval_shadow_enabled: env_bool("CHAT_RETRIEVAL_SHADOW_ENABLED", false),
-            chat_retrieval_evidence_enabled: env_bool("CHAT_RETRIEVAL_EVIDENCE_ENABLED", false),
-            chat_retrieval_evidence_min_score: env_f64("CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE", 2.0),
-            chat_retrieval_window_days: env_i64("CHAT_RETRIEVAL_WINDOW_DAYS", 30),
-            chat_retrieval_half_life_days: env_f64("CHAT_RETRIEVAL_HALF_LIFE_DAYS", 7.0),
-            search_enabled: env_bool("SEARCH_ENABLED", false),
+            )?,
+            chat_retrieval_embedding_poll_sec: env_u64("CHAT_RETRIEVAL_EMBEDDING_POLL_SEC", 5)?,
+            chat_retrieval_shadow_enabled: env_bool("CHAT_RETRIEVAL_SHADOW_ENABLED", false)?,
+            chat_retrieval_evidence_enabled: env_bool("CHAT_RETRIEVAL_EVIDENCE_ENABLED", false)?,
+            chat_retrieval_evidence_min_score: env_f64("CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE", 2.0)?,
+            chat_retrieval_window_days: env_i64("CHAT_RETRIEVAL_WINDOW_DAYS", 30)?,
+            chat_retrieval_half_life_days: env_f64("CHAT_RETRIEVAL_HALF_LIFE_DAYS", 7.0)?,
+            search_enabled: env_bool("SEARCH_ENABLED", false)?,
             search_extract_provider: env_optional("SEARCH_EXTRACT_PROVIDER")
                 .or_else(|| Some("ollama".to_string())),
             search_extract_model: env_optional("SEARCH_EXTRACT_MODEL")
                 .or_else(|| Some("gemma4:31b".to_string())),
-            search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1),
-            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 900),
+            search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1)?,
+            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 900)?,
             search_mcp_command: env_optional("SEARCH_MCP_COMMAND"),
             search_mcp_args: env_args("SEARCH_MCP_ARGS"),
             search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
-            search_mcp_timeout_sec: env_u64("SEARCH_MCP_TIMEOUT_SEC", 8),
-            search_query_timeout_sec: env_u64("SEARCH_QUERY_TIMEOUT_SEC", 20),
+            search_mcp_timeout_sec: env_u64("SEARCH_MCP_TIMEOUT_SEC", 8)?,
+            search_query_timeout_sec: env_u64("SEARCH_QUERY_TIMEOUT_SEC", 20)?,
             search_mcp_tools: SearchMcpTools {
                 web: env_or("SEARCH_MCP_TOOL_WEB", "web_search"),
                 github: env_or("SEARCH_MCP_TOOL_GITHUB", "github_search"),
@@ -204,8 +218,8 @@ impl Config {
             },
             search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
                 .or_else(|| Some("web_fetch_exa".to_string())),
-            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 4),
-            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 16_000),
+            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 4)?,
+            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 16_000)?,
             comment_blocked_source_domains: env_list_csv_or(
                 "COMMENT_BLOCKED_SOURCE_DOMAINS",
                 DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS,
@@ -225,12 +239,12 @@ impl Config {
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
-            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true),
+            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true)?,
             avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
                 .or_else(|| Some("gemma-4-31b".to_string())),
-            avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900),
-            avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1),
-            first_message_spam_enabled: env_bool("FIRST_MESSAGE_SPAM_ENABLED", false),
+            avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900)?,
+            avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1)?,
+            first_message_spam_enabled: env_bool("FIRST_MESSAGE_SPAM_ENABLED", false)?,
             first_message_spam_provider: env_or("FIRST_MESSAGE_SPAM_PROVIDER", "cerebras"),
             first_message_spam_model: env_optional("FIRST_MESSAGE_SPAM_MODEL"),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
@@ -246,7 +260,7 @@ impl Config {
                 "gemini-3.1-flash-lite",
             ),
             gemini_tts_model: env_or("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
-            gemini_thinking_budget: env_u32("GEMINI_THINKING_BUDGET", 1024),
+            gemini_thinking_budget: env_u32("GEMINI_THINKING_BUDGET", 1024)?,
             ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
             ollama_api_key: env_or("OLLAMA_API_KEY", ""),
             openai_compat_base_url: env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
@@ -255,52 +269,48 @@ impl Config {
             vision_model: env_optional("VISION_MODEL")
                 .or_else(|| env_optional("OLLAMA_MODEL"))
                 .unwrap_or_else(|| "gemma4:31b".to_string()),
-            owner_telegram_id: env_optional("OWNER_TELEGRAM_ID")
-                .and_then(|value| value.parse().ok()),
-            send_owner_preview: env_or("SEND_OWNER_PREVIEW", "true") == "true",
-            ask_enabled: env_bool("ASK_ENABLED", false),
-            ask_allow_chat_admins: env_bool("ASK_ALLOW_CHAT_ADMINS", true),
-            ask_private_user_ids: env_list_csv("ASK_PRIVATE_USER_IDS")
-                .into_iter()
-                .filter_map(|value| value.parse().ok())
-                .collect(),
+            owner_telegram_id: env_optional_i64("OWNER_TELEGRAM_ID")?,
+            send_owner_preview: env_bool("SEND_OWNER_PREVIEW", true)?,
+            ask_enabled: env_bool("ASK_ENABLED", false)?,
+            ask_allow_chat_admins: env_bool("ASK_ALLOW_CHAT_ADMINS", true)?,
+            ask_private_user_ids: env_i64_list_csv("ASK_PRIVATE_USER_IDS")?,
             ask_llm_provider: env_optional("ASK_LLM_PROVIDER")
                 .unwrap_or_else(|| env_or("LLM_PROVIDER", "ollama")),
             ask_llm_model: env_optional("ASK_LLM_MODEL").or_else(|| env_optional("LLM_MODEL")),
-            ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2),
-            ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800),
-            ask_max_steps: env_usize("ASK_MAX_STEPS", 7),
-            ask_timeout_sec: env_u64("ASK_TIMEOUT_SEC", 45),
-            ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1),
+            ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2)?,
+            ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800)?,
+            ask_max_steps: env_usize("ASK_MAX_STEPS", 7)?,
+            ask_timeout_sec: env_u64("ASK_TIMEOUT_SEC", 45)?,
+            ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1)?,
             ask_db_mcp_command: env_optional("ASK_DB_MCP_COMMAND"),
             ask_db_mcp_args: env_args("ASK_DB_MCP_ARGS"),
             ask_db_mcp_env: env_list_csv_or("ASK_DB_MCP_ENV", &["ASK_DATABASE_URL"]),
-            ask_db_mcp_timeout_sec: env_u64("ASK_DB_MCP_TIMEOUT_SEC", 8),
-            profile_refresh_concurrency: env_usize("PROFILE_REFRESH_CONCURRENCY", 4),
+            ask_db_mcp_timeout_sec: env_u64("ASK_DB_MCP_TIMEOUT_SEC", 8)?,
+            profile_refresh_concurrency: env_usize("PROFILE_REFRESH_CONCURRENCY", 4)?,
             comment_custom_emoji_id: env_optional("COMMENT_CUSTOM_EMOJI_ID"),
-            first_comment_max_image_mb: env_u32("FIRST_COMMENT_MAX_IMAGE_MB", 10),
+            first_comment_max_image_mb: env_u32("FIRST_COMMENT_MAX_IMAGE_MB", 10)?,
             tech_custom_emoji_id: env_optional("TECH_CUSTOM_EMOJI_ID"),
             amd_custom_emoji_id: env_optional("AMD_CUSTOM_EMOJI_ID"),
             radeon_custom_emoji_id: env_optional("RADEON_CUSTOM_EMOJI_ID"),
             ryzen_custom_emoji_id: env_optional("RYZEN_CUSTOM_EMOJI_ID"),
-            voice_transcription_enabled: env_bool("VOICE_TRANSCRIPTION_ENABLED", false),
-            voice_auto_transcribe: env_bool("VOICE_AUTO_TRANSCRIBE", false),
-            voice_max_duration_sec: env_u32("VOICE_MAX_DURATION_SEC", 600),
-            voice_max_file_mb: env_u32("VOICE_MAX_FILE_MB", 20),
-            voice_short_text_max_chars: env_usize("VOICE_SHORT_TEXT_MAX_CHARS", 400),
+            voice_transcription_enabled: env_bool("VOICE_TRANSCRIPTION_ENABLED", false)?,
+            voice_auto_transcribe: env_bool("VOICE_AUTO_TRANSCRIBE", false)?,
+            voice_max_duration_sec: env_u32("VOICE_MAX_DURATION_SEC", 600)?,
+            voice_max_file_mb: env_u32("VOICE_MAX_FILE_MB", 20)?,
+            voice_short_text_max_chars: env_usize("VOICE_SHORT_TEXT_MAX_CHARS", 400)?,
             voice_language: env_or("VOICE_LANGUAGE", "ru"),
             voice_asr_provider: env_or("VOICE_ASR_PROVIDER", "groq"),
             voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3"),
-            voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0),
+            voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0)?,
             voice_cleanup_provider: env_optional("VOICE_CLEANUP_PROVIDER"),
             voice_cleanup_model: env_optional("VOICE_CLEANUP_MODEL"),
-            voice_cleanup_temperature: env_f32("VOICE_CLEANUP_TEMPERATURE", 0.2),
-            voice_cleanup_max_tokens: env_u32("VOICE_CLEANUP_MAX_TOKENS", 1800),
-            voice_render_expandable_chapters: env_bool("VOICE_RENDER_EXPANDABLE_CHAPTERS", true),
-            voice_send_full_file: env_bool("VOICE_SEND_FULL_FILE", true),
+            voice_cleanup_temperature: env_f32("VOICE_CLEANUP_TEMPERATURE", 0.2)?,
+            voice_cleanup_max_tokens: env_u32("VOICE_CLEANUP_MAX_TOKENS", 1800)?,
+            voice_render_expandable_chapters: env_bool("VOICE_RENDER_EXPANDABLE_CHAPTERS", true)?,
+            voice_send_full_file: env_bool("VOICE_SEND_FULL_FILE", true)?,
             public_base_url: env_optional("PUBLIC_BASE_URL"),
             static_files_dir: env_or("STATIC_FILES_DIR", "/opt/tg-ai-bot-teloxide/static"),
-        }
+        })
     }
 
     pub fn validate_runtime_secrets(&self) -> anyhow::Result<()> {
@@ -340,6 +350,7 @@ impl Config {
         if self.rag_enabled {
             self.validate_rag_config(&mut errors);
         }
+        self.validate_chat_retrieval_config(&mut errors);
 
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
@@ -447,8 +458,48 @@ impl Config {
         );
     }
 
+    fn validate_chat_retrieval_config(&self, errors: &mut Vec<String>) {
+        if self.chat_retrieval_evidence_enabled && !self.chat_retrieval_shadow_enabled {
+            errors.push(
+                "CHAT_RETRIEVAL_EVIDENCE_ENABLED=true requires CHAT_RETRIEVAL_SHADOW_ENABLED=true"
+                    .to_string(),
+            );
+        }
+        if self.chat_retrieval_shadow_enabled && !self.chat_retrieval_embeddings_enabled {
+            errors.push(
+                "CHAT_RETRIEVAL_SHADOW_ENABLED=true requires CHAT_RETRIEVAL_EMBEDDINGS_ENABLED=true"
+                    .to_string(),
+            );
+        }
+        if !self.chat_retrieval_embeddings_enabled {
+            return;
+        }
+
+        self.validate_embedding_config(errors);
+        require_positive(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_BATCH_SIZE",
+            self.chat_retrieval_embedding_batch_size,
+        );
+        require_positive(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_POLL_SEC",
+            self.chat_retrieval_embedding_poll_sec,
+        );
+        require_positive(
+            errors,
+            "CHAT_RETRIEVAL_WINDOW_DAYS",
+            self.chat_retrieval_window_days,
+        );
+        require_positive(
+            errors,
+            "CHAT_RETRIEVAL_HALF_LIFE_DAYS",
+            self.chat_retrieval_half_life_days,
+        );
+    }
+
     fn validate_embedding_config(&self, errors: &mut Vec<String>) {
-        require_non_empty(errors, "RAG_EMBEDDING_URL", &self.rag_embedding_url);
+        require_http_url(errors, "RAG_EMBEDDING_URL", &self.rag_embedding_url);
         require_non_empty(errors, "RAG_EMBEDDING_MODEL", &self.rag_embedding_model);
         require_positive(
             errors,
@@ -461,6 +512,18 @@ impl Config {
 fn require_non_empty(errors: &mut Vec<String>, key: &str, value: &str) {
     if value.trim().is_empty() {
         errors.push(format!("{key} must not be empty"));
+    }
+}
+
+fn require_http_url(errors: &mut Vec<String>, key: &str, value: &str) {
+    if value.trim().is_empty() {
+        errors.push(format!("{key} must not be empty"));
+        return;
+    }
+    let valid = reqwest::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    if !valid {
+        errors.push(format!("{key} must be an absolute HTTP(S) URL"));
     }
 }
 
@@ -611,57 +674,99 @@ fn require_secret(errors: &mut Vec<String>, key: &str, value: &str, context: &st
     }
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_bool(key: &str, default: bool) -> anyhow::Result<bool> {
+    Ok(env_value(key)
+        .map(|value| parse_bool(key, &value))
+        .transpose()?
+        .unwrap_or(default))
 }
 
-fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => anyhow::bail!("{key} must be true, false, 1, or 0"),
+    }
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_i64(key: &str, default: i64) -> anyhow::Result<i64> {
+    env_parse(key, default, "a signed 64-bit integer")
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_u32(key: &str, default: u32) -> anyhow::Result<u32> {
+    env_parse(key, default, "a non-negative 32-bit integer")
 }
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
+    env_parse(key, default, "a non-negative 64-bit integer")
 }
 
-fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {
+    env_parse(key, default, "a non-negative integer")
 }
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_f32(key: &str, default: f32) -> anyhow::Result<f32> {
+    env_parse(key, default, "a number")
+}
+
+fn env_f64(key: &str, default: f64) -> anyhow::Result<f64> {
+    env_parse(key, default, "a number")
+}
+
+fn env_parse<T>(key: &str, default: T, expected: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+{
+    let Some(value) = env_value(key) else {
+        return Ok(default);
+    };
+    parse_env_value(key, &value, expected)
+}
+
+fn parse_env_value<T>(key: &str, value: &str, expected: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{key} must be {expected}"))
+}
+
+fn env_optional_bool(key: &str) -> anyhow::Result<Option<bool>> {
+    env_optional(key)
+        .map(|value| parse_bool(key, &value))
+        .transpose()
+}
+
+fn env_optional_i64(key: &str) -> anyhow::Result<Option<i64>> {
+    let Some(value) = env_optional(key) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("{key} must be a signed 64-bit integer"))
+}
+
+fn env_i64_list_csv(key: &str) -> anyhow::Result<Vec<i64>> {
+    env_list_csv(key)
+        .into_iter()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{key} must contain only signed 64-bit integers"))
+        })
+        .collect()
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
 }
 
 fn env_optional(key: &str) -> Option<String> {
@@ -710,6 +815,8 @@ mod tests {
             post_signature_marker: "marker".to_string(),
             llm_provider: "ollama".to_string(),
             llm_model: Some("gemma4:31b".to_string()),
+            llm_profiles_path: None,
+            llm_profiles: None,
             llm_supports_images: Some(true),
             llm_temperature: 0.35,
             llm_max_tokens: 90,
@@ -831,6 +938,31 @@ mod tests {
     }
 
     #[test]
+    fn strict_bool_parser_accepts_documented_values_and_rejects_invalid_input() {
+        assert!(parse_bool("VOICE_AUTO_TRANSCRIBE", "true").unwrap());
+        assert!(parse_bool("VOICE_AUTO_TRANSCRIBE", "1").unwrap());
+        assert!(!parse_bool("VOICE_AUTO_TRANSCRIBE", "false").unwrap());
+        assert!(!parse_bool("VOICE_AUTO_TRANSCRIBE", "0").unwrap());
+
+        let error = parse_bool("VOICE_AUTO_TRANSCRIBE", "TRUE")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("VOICE_AUTO_TRANSCRIBE"));
+    }
+
+    #[test]
+    fn strict_integer_parser_rejects_invalid_input() {
+        let error = parse_env_value::<u64>(
+            "RAG_EMBEDDING_TIMEOUT_SEC",
+            "ten",
+            "a non-negative 64-bit integer",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("RAG_EMBEDDING_TIMEOUT_SEC"));
+    }
+
+    #[test]
     fn gemini_provider_requires_gemini_key_at_startup() {
         let mut config = config();
         config.llm_provider = "gemini".to_string();
@@ -913,6 +1045,47 @@ mod tests {
             error.contains("FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL")
         );
         assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
+    }
+
+    #[test]
+    fn shadow_retrieval_requires_embedding_ingestion_and_embedding_config() {
+        let mut config = config();
+        config.chat_retrieval_shadow_enabled = true;
+        config.rag_embedding_url.clear();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains(
+            "CHAT_RETRIEVAL_SHADOW_ENABLED=true requires CHAT_RETRIEVAL_EMBEDDINGS_ENABLED=true"
+        ));
+        assert!(!error.contains("RAG_EMBEDDING_URL must not be empty"));
+
+        config.chat_retrieval_embeddings_enabled = true;
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
+    }
+
+    #[test]
+    fn chat_retrieval_evidence_requires_shadow_retrieval() {
+        let mut config = config();
+        config.chat_retrieval_evidence_enabled = true;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains(
+            "CHAT_RETRIEVAL_EVIDENCE_ENABLED=true requires CHAT_RETRIEVAL_SHADOW_ENABLED=true"
+        ));
+    }
+
+    #[test]
+    fn embedding_ingestion_requires_an_absolute_http_endpoint() {
+        let mut config = config();
+        config.chat_retrieval_embeddings_enabled = true;
+        config.rag_embedding_url = "not a URL".to_string();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("RAG_EMBEDDING_URL must be an absolute HTTP(S) URL"));
     }
 
     #[test]

@@ -165,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_returns_skipped_disabled() {
-        let mut config = Config::from_env();
+        let mut config = Config::from_env().expect("test configuration must parse");
         config.search_enabled = false;
 
         let context = run_search(&config, "post", &[]).await;
@@ -177,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn extract_error_returns_skipped_extract_failed() {
-        let mut config = Config::from_env();
+        let mut config = Config::from_env().expect("test configuration must parse");
         config.search_enabled = true;
         config.search_extract_provider = Some("unsupported".to_string());
         config.search_mcp_command = Some("unused".to_string());

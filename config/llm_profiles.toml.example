@@ -1,0 +1,192 @@
+# LLM topology: provider transport -> model profile -> task route.
+# This file contains no API keys. api_key_env names the required environment variable.
+# It is an example only until LP2 connects it to startup loading.
+
+[providers.gemini]
+driver = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+
+[providers.ollama_cloud]
+driver = "ollama_native"
+base_url = "https://ollama.com"
+api_key_env = "OLLAMA_API_KEY"
+
+[providers.groq]
+driver = "openai_compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+
+[providers.cerebras]
+driver = "openai_compatible"
+base_url = "https://api.cerebras.ai/v1"
+api_key_env = "CEREBRAS_API_KEY"
+
+[providers.openrouter]
+driver = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.custom_openai]
+driver = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_COMPAT_API_KEY"
+
+[models.gemini_comment]
+provider = "gemini"
+model = "gemini-3.6-flash"
+
+[models.gemini_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_low"
+
+[models.gemini_flash_comment]
+provider = "gemini"
+model = "gemini-3.5-flash"
+
+[models.gemini_flash_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_low"
+
+[models.gemini_flash_lite_comment]
+provider = "gemini"
+model = "gemini-3.5-flash-lite"
+
+[models.gemini_flash_lite_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_low"
+
+[models.gemini_legacy_flash_lite_comment]
+provider = "gemini"
+model = "gemini-3.1-flash-lite"
+
+[models.gemini_legacy_flash_lite_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_low"
+
+[models.ollama_memory]
+provider = "ollama_cloud"
+model = "gemma4:31b"
+
+[models.ollama_memory.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 32768
+max_output_tokens = 4096
+request_timeout_sec = 120
+thinking = "none"
+
+[models.groq_cleanup]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+
+[models.groq_cleanup.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 131072
+max_output_tokens = 32768
+request_timeout_sec = 45
+thinking = "none"
+
+[models.cerebras_spam]
+provider = "cerebras"
+model = "gemma-4-31b"
+
+[models.cerebras_spam.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 131072
+max_output_tokens = 8192
+request_timeout_sec = 45
+thinking = "none"
+
+# Replace these IDs with the models selected for the existing GROQ_MODEL,
+# OPENROUTER_MODEL and OPENAI_COMPAT_MODEL settings during compatibility migration.
+[models.openrouter_general]
+provider = "openrouter"
+model = "openai/gpt-4.1-mini"
+
+[models.openrouter_general.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 128000
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "none"
+
+[models.custom_openai_general]
+provider = "custom_openai"
+model = "gpt-4.1-mini"
+
+[models.custom_openai_general.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 128000
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "none"
+
+[routes.first_comment]
+models = [
+  "gemini_comment",
+  "gemini_flash_comment",
+  "gemini_flash_lite_comment",
+  "gemini_legacy_flash_lite_comment",
+  "ollama_memory",
+]
+fallback_on_validation_failure = false
+
+[routes.memory]
+models = ["ollama_memory"]
+
+[routes.voice_cleanup]
+models = ["groq_cleanup", "ollama_memory"]
+
+[routes.first_message_spam]
+models = ["cerebras_spam", "ollama_memory"]
+
+[routes.search_extract]
+models = ["ollama_memory"]
+
+[routes.ask]
+models = ["gemini_comment", "groq_cleanup"]
+
+[routes.legacy_default]
+models = ["ollama_memory"]
+
+[routes.avatar_analysis]
+models = ["cerebras_spam"]

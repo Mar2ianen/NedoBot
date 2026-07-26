@@ -108,11 +108,12 @@ pub fn validate_first_comment_draft_with_search(
     search_results: &[SearchResult],
     source_link_available: bool,
 ) -> anyhow::Result<()> {
+    let config = Config::from_env()?;
     validate_first_comment_draft_with_search_and_policy(
         value,
         search_results,
         source_link_available,
-        &Config::from_env(),
+        &config,
     )
 }
 
@@ -412,7 +413,12 @@ mod tests {
         )
         .unwrap();
 
-        validate_comment_body(&draft, &Config::from_env(), &[]).unwrap();
+        validate_comment_body(
+            &draft,
+            &Config::from_env().expect("test configuration must parse"),
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -421,7 +427,7 @@ mod tests {
             r#"{"comment":"{CHAT_AUTHOR:42} разбирал TPM, похожую боль можно продолжить здесь","used_search_result_id":null,"used_chat_message_ids":[42]}"#,
             &[],
             false,
-            &Config::from_env(),
+            &Config::from_env().expect("test configuration must parse"),
             &[42],
         )
         .unwrap();
@@ -431,15 +437,22 @@ mod tests {
     fn rejects_chat_evidence_outside_retrieval_context() {
         assert!(validate_first_comment_draft_with_search_policy_and_chat(
             r#"{"comment":"{CHAT_AUTHOR:99} разбирал TPM, похожую боль можно продолжить здесь","used_search_result_id":null,"used_chat_message_ids":[99]}"#,
-            &[], false, &Config::from_env(), &[42],
-        ).is_err());
+            &[],
+            false,
+            &Config::from_env().expect("test configuration must parse"),
+            &[42],
+        )
+        .is_err());
     }
 
     #[test]
     fn rejects_claimed_chat_provenance_without_placeholder() {
         assert!(validate_first_comment_draft_with_search_policy_and_chat(
             r#"{"comment":"TPM всё ещё горячая тема в {CHAT_LINK:чатике}","used_search_result_id":null,"used_chat_message_ids":[42]}"#,
-            &[], false, &Config::from_env(), &[42],
+            &[],
+            false,
+            &Config::from_env().expect("test configuration must parse"),
+            &[42],
         )
         .is_err());
     }
@@ -448,7 +461,10 @@ mod tests {
     fn rejects_chat_message_label_the_renderer_would_not_link() {
         assert!(validate_first_comment_draft_with_search_policy_and_chat(
             r#"{"comment":"Похожее обсуждение было в {CHAT_MESSAGE:42:<script>}","used_search_result_id":null,"used_chat_message_ids":[42]}"#,
-            &[], false, &Config::from_env(), &[42],
+            &[],
+            false,
+            &Config::from_env().expect("test configuration must parse"),
+            &[42],
         )
         .is_err());
     }

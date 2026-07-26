@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let args = parse_args()?;
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     let chat_id = args.chat_id.unwrap_or(config.discussion_chat_id);
     let pool = build_pool().await?;
     migrate(&pool).await?;
