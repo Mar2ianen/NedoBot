@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmProfiles {
     pub providers: BTreeMap<String, ProviderProfile>,
     pub models: BTreeMap<String, ModelProfile>,
@@ -10,6 +11,7 @@ pub struct LlmProfiles {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderProfile {
     pub driver: LlmDriver,
     pub base_url: String,
@@ -25,6 +27,7 @@ pub enum LlmDriver {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProfile {
     pub provider: String,
     pub model: String,
@@ -32,6 +35,7 @@ pub struct ModelProfile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelCapabilities {
     pub supports_images: bool,
     pub supports_tools: bool,
@@ -60,6 +64,7 @@ pub enum ThinkingMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteProfile {
     pub models: Vec<String>,
     #[serde(default)]
@@ -314,6 +319,18 @@ models = ["ollama_memory"]
         let error = LlmProfiles::from_toml(&invalid).unwrap_err().to_string();
 
         assert!(error.contains("unknown model"));
+    }
+
+    #[test]
+    fn rejects_unknown_optional_route_field() {
+        let invalid = VALID_PROFILES.replace(
+            "models = [\"ollama_memory\"]",
+            "models = [\"ollama_memory\"]\nfallback_on_validation_faliure = true",
+        );
+
+        let error = LlmProfiles::from_toml(&invalid).unwrap_err().to_string();
+
+        assert!(error.contains("unknown field `fallback_on_validation_faliure`"));
     }
 
     #[test]

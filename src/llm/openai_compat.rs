@@ -18,7 +18,7 @@ use reqwest::header::USER_AGENT;
 
 use crate::config::Config;
 use crate::http;
-use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
+use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 pub struct OpenAiCompatClient {
     client: Client<OpenAIConfig>,
@@ -27,7 +27,7 @@ pub struct OpenAiCompatClient {
 impl OpenAiCompatClient {
     pub fn new(api_base: &str, api_key: &str, timeout: Duration) -> anyhow::Result<Self> {
         if api_key.trim().is_empty() {
-            anyhow::bail!("OpenAI-compatible API key is empty");
+            return Err(LlmTransportError::configuration().into());
         }
 
         let config = OpenAIConfig::new()
@@ -55,7 +55,12 @@ impl OpenAiCompatClient {
 #[async_trait]
 impl LlmClient for OpenAiCompatClient {
     async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
-        let response = self.client.chat().create(build_request(request)?).await?;
+        let response = self
+            .client
+            .chat()
+            .create(build_request(request)?)
+            .await
+            .map_err(map_openai_error)?;
         let content = response
             .choices
             .into_iter()
@@ -65,6 +70,19 @@ impl LlmClient for OpenAiCompatClient {
             .ok_or_else(|| anyhow::anyhow!("empty OpenAI-compatible response"))?;
 
         Ok(LlmResponse { content })
+    }
+}
+
+fn map_openai_error(error: OpenAIError) -> anyhow::Error {
+    match error {
+        OpenAIError::ApiError(response) => {
+            LlmTransportError::http_status(response.status_code.as_u16()).into()
+        }
+        OpenAIError::Reqwest(error) => match error.status() {
+            Some(status) => LlmTransportError::http_status(status.as_u16()).into(),
+            None => error.into(),
+        },
+        error => error.into(),
     }
 }
 

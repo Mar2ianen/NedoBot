@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::http;
-use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
+use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 pub struct OllamaClient<'a> {
     config: &'a Config,
@@ -56,10 +56,11 @@ impl LlmClient for OllamaClient<'_> {
             .bearer_auth(&self.config.ollama_api_key)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<OllamaChatResponse>()
             .await?;
+        if !response.status().is_success() {
+            return Err(LlmTransportError::http_status(response.status().as_u16()).into());
+        }
+        let response = response.json::<OllamaChatResponse>().await?;
 
         if let Some(error) = response.error {
             anyhow::bail!(error);
