@@ -185,6 +185,8 @@ fn spawn_message_author_profile_refresh(
     let pool = state.pool.clone();
     let profile_refresh_slots = state.profile_refresh_slots.clone();
     let avatar_classifier_enabled = state.config.avatar_classifier_enabled;
+    let first_message_spam_enabled = state.config.first_message_spam_enabled;
+    let spam_config = state.config.clone();
     tokio::spawn(async move {
         match user_profile_needs_refresh(&pool, user_id).await {
             Ok(true) => {}
@@ -208,8 +210,14 @@ fn spawn_message_author_profile_refresh(
                 if let Err(err) = analyze_new_user_profile(&pool, chat_id, user_id).await {
                     tracing::warn!(%err, user_id, "failed to analyze new user profile");
                 } else {
-                    if let Err(err) =
-                        enqueue_first_message_spam_analysis(&pool, chat_id, user_id).await
+                    if first_message_spam_enabled
+                        && let Err(err) = enqueue_first_message_spam_analysis(
+                            &pool,
+                            &spam_config,
+                            chat_id,
+                            user_id,
+                        )
+                        .await
                     {
                         tracing::warn!(%err, user_id, "failed to enqueue first-message spam analysis");
                     }
@@ -309,6 +317,10 @@ fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
 }
 
 fn spawn_first_message_spam_analysis_worker(bot: Bot, state: AppState) {
+    if !state.config.first_message_spam_enabled {
+        return;
+    }
+
     tokio::spawn(async move {
         loop {
             match process_next_first_message_spam_analysis_job(&bot, &state.pool, &state.config)

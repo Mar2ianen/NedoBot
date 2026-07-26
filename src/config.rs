@@ -87,6 +87,9 @@ pub struct Config {
     pub avatar_classifier_model: Option<String>,
     pub avatar_classifier_max_tokens: u32,
     pub avatar_classifier_concurrency: usize,
+    pub first_message_spam_enabled: bool,
+    pub first_message_spam_provider: String,
+    pub first_message_spam_model: Option<String>,
     pub openrouter_api_key: String,
     pub openrouter_model: Option<String>,
     pub gemini_api_key: String,
@@ -227,6 +230,9 @@ impl Config {
                 .or_else(|| Some("gemma-4-31b".to_string())),
             avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900),
             avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1),
+            first_message_spam_enabled: env_bool("FIRST_MESSAGE_SPAM_ENABLED", false),
+            first_message_spam_provider: env_or("FIRST_MESSAGE_SPAM_PROVIDER", "cerebras"),
+            first_message_spam_model: env_optional("FIRST_MESSAGE_SPAM_MODEL"),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
             openrouter_model: env_optional("OPENROUTER_MODEL"),
             gemini_api_key: env_optional("GEMINI_API_KEY")
@@ -355,6 +361,21 @@ impl Config {
             }
         }
 
+        if self.first_message_spam_enabled {
+            validate_llm_provider_secret(
+                &mut errors,
+                self,
+                &self.first_message_spam_provider,
+                "FIRST_MESSAGE_SPAM_PROVIDER",
+            );
+            if self.first_message_spam_model.is_none() {
+                errors.push(
+                    "FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL".to_string(),
+                );
+            }
+            self.validate_embedding_config(&mut errors);
+        }
+
         if self.ask_enabled {
             if self.owner_telegram_id.is_none() {
                 errors.push("ASK_ENABLED=true requires OWNER_TELEGRAM_ID".to_string());
@@ -416,18 +437,23 @@ impl Config {
             "MEMORY_LLM_MODEL",
         );
 
-        require_non_empty(errors, "RAG_EMBEDDING_URL", &self.rag_embedding_url);
+        self.validate_embedding_config(errors);
         require_positive(errors, "RAG_TOP_K", self.rag_top_k);
-        require_positive(
-            errors,
-            "RAG_EMBEDDING_TIMEOUT_SEC",
-            self.rag_embedding_timeout_sec,
-        );
         require_in_unit_interval(errors, "RAG_MIN_SIMILARITY", self.rag_min_similarity);
         require_positive(
             errors,
             "RAG_TEMPORAL_HALF_LIFE_DAYS",
             self.rag_temporal_half_life_days,
+        );
+    }
+
+    fn validate_embedding_config(&self, errors: &mut Vec<String>) {
+        require_non_empty(errors, "RAG_EMBEDDING_URL", &self.rag_embedding_url);
+        require_non_empty(errors, "RAG_EMBEDDING_MODEL", &self.rag_embedding_model);
+        require_positive(
+            errors,
+            "RAG_EMBEDDING_TIMEOUT_SEC",
+            self.rag_embedding_timeout_sec,
         );
     }
 }
@@ -743,6 +769,9 @@ mod tests {
             avatar_classifier_model: None,
             avatar_classifier_max_tokens: 900,
             avatar_classifier_concurrency: 1,
+            first_message_spam_enabled: false,
+            first_message_spam_provider: "cerebras".to_string(),
+            first_message_spam_model: None,
             openrouter_api_key: String::new(),
             openrouter_model: None,
             gemini_api_key: String::new(),
@@ -869,6 +898,21 @@ mod tests {
         assert!(error.contains("RAG_TOP_K"));
         assert!(error.contains("RAG_MIN_SIMILARITY"));
         assert!(error.contains("RAG_TEMPORAL_HALF_LIFE_DAYS"));
+    }
+
+    #[test]
+    fn enabled_first_message_spam_requires_its_model_secret_and_embedding_config() {
+        let mut config = config();
+        config.first_message_spam_enabled = true;
+        config.rag_embedding_url.clear();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("FIRST_MESSAGE_SPAM_PROVIDER requires non-empty CEREBRAS_API_KEY"));
+        assert!(
+            error.contains("FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL")
+        );
+        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
     }
 
     #[test]
