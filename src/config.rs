@@ -951,7 +951,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_integer_parser_rejects_invalid_input() {
+    fn scalar_env_parser_uses_default_only_when_variable_is_absent() {
+        const TEST_KEY: &str = "UNSET_CONFIG_TEST_VALUE";
+        assert!(std::env::var_os(TEST_KEY).is_none());
+        assert_eq!(env_parse(TEST_KEY, 42_u64, "a test number").unwrap(), 42);
+
         let error = parse_env_value::<u64>(
             "RAG_EMBEDDING_TIMEOUT_SEC",
             "ten",

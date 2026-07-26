@@ -18,23 +18,19 @@ mod text;
 
 use config::Config;
 use db::telegram::{
-    mark_user_profile_refresh_error, refresh_known_member_snapshots, save_chat_member_event,
-    save_edited_telegram_message, save_message_reaction, save_message_reaction_count,
-    user_profile_needs_refresh,
+    refresh_known_member_snapshots, save_chat_member_event, save_edited_telegram_message,
+    save_message_reaction, save_message_reaction_count,
 };
 use db::{build_pool, migrate};
-use features::avatar_analysis::service::{
-    enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
-};
+use features::avatar_analysis::service::process_next_avatar_analysis_job;
 use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
-use features::first_message_spam::{
-    enqueue_first_message_spam_analysis, process_next_first_message_spam_analysis_job,
-};
+use features::first_message_spam::process_next_first_message_spam_analysis_job;
 use features::memory::service::process_next_history_entry;
-use features::new_user_analysis::analyze_new_user_profile;
-use features::spam_review::{apply_callback, create_high_risk_review, parse_callback, send_review};
-use features::user_profiles::service::refresh_profile;
+use features::spam_review::{apply_callback, parse_callback};
+use features::user_profiles::enrichment::{
+    ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
+};
 use features::voice::pipeline::maybe_transcribe_voice;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
@@ -62,6 +58,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(%err, "failed to check reaction update availability");
     }
     let state = AppState::new(pool, config);
+    let profile_refresh_queue = spawn_profile_refresh_workers(
+        bot.inner().clone(),
+        state.pool.clone(),
+        state.config.clone(),
+    );
     spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
     spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
     spawn_post_comment_worker(bot.clone(), state.clone());
@@ -87,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![state])
+        .dependencies(dptree::deps![state, profile_refresh_queue])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -159,8 +160,9 @@ async fn handle_message(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     msg: Message,
     state: AppState,
+    profile_refresh_queue: ProfileRefreshQueue,
 ) -> ResponseResult<()> {
-    spawn_message_author_profile_refresh(&bot, &msg, &state);
+    enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
 
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
         return Ok(());
@@ -179,10 +181,10 @@ async fn handle_message(
     Ok(())
 }
 
-fn spawn_message_author_profile_refresh(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+fn enqueue_message_author_profile_refresh(
     msg: &Message,
     state: &AppState,
+    profile_refresh_queue: &ProfileRefreshQueue,
 ) {
     if msg.chat.id.0 != state.config.discussion_chat_id || msg.is_automatic_forward() {
         return;
@@ -196,74 +198,21 @@ fn spawn_message_author_profile_refresh(
     }
 
     let user_id = user.id.0 as i64;
-    let chat_id = msg.chat.id.0;
-    let bot = bot.inner().clone();
-    let pool = state.pool.clone();
-    let profile_refresh_slots = state.profile_refresh_slots.clone();
-    let avatar_classifier_enabled = state.config.avatar_classifier_enabled;
-    let first_message_spam_enabled = state.config.first_message_spam_enabled;
-    let spam_config = state.config.clone();
-    tokio::spawn(async move {
-        match user_profile_needs_refresh(&pool, user_id).await {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(err) => {
-                tracing::warn!(%err, user_id, "failed to check user profile refresh state");
-                return;
-            }
+    match profile_refresh_queue.try_enqueue(msg.chat.id.0, user_id) {
+        ProfileRefreshEnqueueResult::Queued => {}
+        ProfileRefreshEnqueueResult::Coalesced => {
+            tracing::debug!(user_id, "coalesced duplicate profile refresh event");
         }
-
-        let _permit = match profile_refresh_slots.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::warn!(user_id, "profile refresh limiter is closed");
-                return;
-            }
-        };
-
-        match refresh_profile(&bot, &pool, user_id).await {
-            Ok(()) => {
-                if let Err(err) = analyze_new_user_profile(&pool, chat_id, user_id).await {
-                    tracing::warn!(%err, user_id, "failed to analyze new user profile");
-                } else {
-                    if first_message_spam_enabled
-                        && let Err(err) = enqueue_first_message_spam_analysis(
-                            &pool,
-                            &spam_config,
-                            chat_id,
-                            user_id,
-                        )
-                        .await
-                    {
-                        tracing::warn!(%err, user_id, "failed to enqueue first-message spam analysis");
-                    }
-                    match create_high_risk_review(&pool, chat_id, user_id).await {
-                        Ok(Some(review)) => {
-                            if let Err(err) = send_review(&bot, &review).await {
-                                tracing::warn!(%err, user_id, "failed to send spam review");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(err) => tracing::warn!(%err, user_id, "failed to create spam review"),
-                    }
-                }
-                if avatar_classifier_enabled
-                    && let Err(err) = enqueue_current_avatar_analysis(&pool, user_id).await
-                {
-                    tracing::warn!(%err, user_id, "failed to enqueue avatar analysis");
-                }
-            }
-            Err(err) => {
-                let message = err.to_string();
-                if let Err(save_err) =
-                    mark_user_profile_refresh_error(&pool, user_id, &message).await
-                {
-                    tracing::warn!(%save_err, user_id, "failed to save profile refresh error");
-                }
-                tracing::warn!(%err, user_id, "failed to refresh message author profile");
-            }
+        ProfileRefreshEnqueueResult::Full => {
+            tracing::warn!(
+                user_id,
+                "skipped profile refresh because bounded queue is full"
+            );
         }
-    });
+        ProfileRefreshEnqueueResult::Closed => {
+            tracing::warn!(user_id, "skipped profile refresh because queue is closed");
+        }
+    }
 }
 
 async fn handle_callback_query(
