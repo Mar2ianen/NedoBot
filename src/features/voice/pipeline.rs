@@ -129,13 +129,13 @@ async fn process_voice_job(
     }
 
     mark_voice_job_status(&state.pool, job_id, "cleaning").await?;
-    let clean = cleanup_transcript(&state.config, &transcript).await?;
-    let rendered = render_transcript(&clean, &state.config);
+    let cleanup = cleanup_transcript(&state.config, &transcript).await?;
+    let rendered = render_transcript(&cleanup.transcript, &state.config);
     let sent = send_rendered_transcript(bot, msg, &rendered).await?;
     save_voice_result(
         &state.pool,
         job_id,
-        &clean,
+        &cleanup,
         &sent.html,
         sent.file_id.as_deref(),
     )

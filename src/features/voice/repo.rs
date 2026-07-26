@@ -2,7 +2,8 @@
 
 use sqlx::PgPool;
 
-use crate::features::voice::types::{AsrTranscript, CleanTranscript, VoiceMedia};
+use crate::features::voice::cleanup::CleanupResult;
+use crate::features::voice::types::{AsrTranscript, VoiceMedia};
 
 pub async fn create_voice_job(pool: &PgPool, media: &VoiceMedia) -> anyhow::Result<Option<i64>> {
     let row = sqlx::query_as::<_, (i64,)>(
@@ -98,7 +99,7 @@ pub async fn save_asr_result(
 pub async fn save_voice_result(
     pool: &PgPool,
     job_id: i64,
-    result: &CleanTranscript,
+    result: &CleanupResult,
     final_html: &str,
     full_text_file_id: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -106,19 +107,23 @@ pub async fn save_voice_result(
         r#"
         update voice_transcription_jobs
         set status = 'sent',
-            cleaned_text = $2,
-            render_mode = $3,
-            chapters_json = $4,
-            final_html = $5,
-            full_text_file_id = $6,
+            cleanup_provider = $2,
+            cleanup_model = $3,
+            cleaned_text = $4,
+            render_mode = $5,
+            chapters_json = $6,
+            final_html = $7,
+            full_text_file_id = $8,
             updated_at = now()
         where id = $1
         "#,
     )
     .bind(job_id)
-    .bind(&result.text)
-    .bind(result.mode.as_str())
-    .bind(serde_json::to_value(&result.chapters)?)
+    .bind(&result.provider)
+    .bind(&result.model)
+    .bind(&result.transcript.text)
+    .bind(result.transcript.mode.as_str())
+    .bind(serde_json::to_value(&result.transcript.chapters)?)
     .bind(final_html)
     .bind(full_text_file_id)
     .execute(pool)

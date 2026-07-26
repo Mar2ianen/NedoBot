@@ -11,24 +11,34 @@ const CLEANUP_PROMPT: &str = include_str!("../../../prompts/voice_cleanup.md");
 const MIN_CLEANUP_CONTENT_PERCENT: usize = 65;
 const MAX_CLEANUP_CONTENT_PERCENT: usize = 135;
 
+pub struct CleanupResult {
+    pub provider: String,
+    pub model: String,
+    pub transcript: CleanTranscript,
+}
+
 pub async fn cleanup_transcript(
     config: &Config,
     transcript: &AsrTranscript,
-) -> anyhow::Result<CleanTranscript> {
+) -> anyhow::Result<CleanupResult> {
     let prompt = build_user_prompt(config.voice_short_text_max_chars, transcript);
-    let content = match generate_cleanup_content(config, &prompt).await {
-        Ok(content) => content,
+    let generation = match generate_cleanup_content(config, &prompt).await {
+        Ok(generation) => generation,
         Err(err) => {
             tracing::warn!(%err, "all voice cleanup providers failed, using raw ASR transcript");
-            return Ok(normalize_cleanup(
-                plain_cleanup(&transcript.text),
-                transcript,
-                config.voice_short_text_max_chars,
-            ));
+            return Ok(CleanupResult {
+                provider: "raw_asr_fallback".to_string(),
+                model: "none".to_string(),
+                transcript: normalize_cleanup(
+                    plain_cleanup(&transcript.text),
+                    transcript,
+                    config.voice_short_text_max_chars,
+                ),
+            });
         }
     };
 
-    let clean = match parse_cleanup_json(&content)
+    let clean = match parse_cleanup_json(&generation.content)
         .and_then(|clean| validate_cleanup_against_asr(&clean, transcript).map(|_| clean))
     {
         Ok(clean) => clean,
@@ -38,14 +48,17 @@ pub async fn cleanup_transcript(
         }
     };
 
-    Ok(normalize_cleanup(
-        clean,
-        transcript,
-        config.voice_short_text_max_chars,
-    ))
+    Ok(CleanupResult {
+        provider: generation.provider,
+        model: generation.model,
+        transcript: normalize_cleanup(clean, transcript, config.voice_short_text_max_chars),
+    })
 }
 
-async fn generate_cleanup_content(config: &Config, prompt: &str) -> anyhow::Result<String> {
+async fn generate_cleanup_content(
+    config: &Config,
+    prompt: &str,
+) -> anyhow::Result<crate::llm::types::GeneratedText> {
     generate_cleanup_with_provider(
         config,
         config.voice_cleanup_provider.as_deref(),
@@ -60,8 +73,8 @@ async fn generate_cleanup_with_provider(
     provider: Option<&str>,
     model: Option<&str>,
     prompt: &str,
-) -> anyhow::Result<String> {
-    Ok(generate_text_with_provider_and_system(
+) -> anyhow::Result<crate::llm::types::GeneratedText> {
+    generate_text_with_provider_and_system(
         config,
         provider,
         model,
@@ -71,8 +84,7 @@ async fn generate_cleanup_with_provider(
         config.voice_cleanup_temperature,
         config.voice_cleanup_max_tokens,
     )
-    .await?
-    .content)
+    .await
 }
 
 fn build_user_prompt(short_limit: usize, transcript: &AsrTranscript) -> String {
