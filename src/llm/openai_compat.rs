@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
@@ -13,6 +14,7 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
+use reqwest::header::USER_AGENT;
 
 use crate::config::Config;
 use crate::http;
@@ -30,7 +32,11 @@ impl OpenAiCompatClient {
 
         let config = OpenAIConfig::new()
             .with_api_base(api_base.trim_end_matches('/'))
-            .with_api_key(api_key.trim());
+            .with_api_key(api_key.trim())
+            .with_header(USER_AGENT, "tg-ai-bot-teloxide/0.1")
+            .map_err(|err: OpenAIError| {
+                anyhow::anyhow!("failed to set OpenAI-compatible User-Agent: {err}")
+            })?;
         let http_client = http::client(timeout)?;
         Ok(Self {
             client: Client::with_config(config).with_http_client(http_client),
