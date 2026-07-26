@@ -504,6 +504,8 @@ mod tests {
             post_signature_marker: "marker".to_string(),
             llm_provider: "gemini".to_string(),
             llm_model: Some("gemini-3.5-flash".to_string()),
+            llm_profiles_path: None,
+            llm_profiles: None,
             llm_supports_images: Some(true),
             llm_temperature: 0.35,
             llm_max_tokens: 90,

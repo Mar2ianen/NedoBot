@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     fn blocks_exact_domain_and_subdomains_without_overmatching() {
-        let mut config = Config::from_env();
+        let mut config = Config::from_env().expect("test configuration must parse");
         config.comment_blocked_source_domains = vec!["meduza.io".to_string()];
 
         assert!(!is_allowed_source_url(
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn default_policy_contains_multiple_blocked_sources() {
-        let config = Config::from_env();
+        let config = Config::from_env().expect("test configuration must parse");
 
         assert!(!is_allowed_source_url(&config, "https://theins.ru/story"));
         assert!(!is_allowed_source_url(
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn blocks_configured_terms_in_comment_text() {
-        let mut config = Config::from_env();
+        let mut config = Config::from_env().expect("test configuration must parse");
         config.comment_blocked_terms = vec!["запрещенное название".to_string()];
 
         assert!(!is_allowed_comment_text(

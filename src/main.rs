@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     config.validate_runtime_secrets()?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
     let pool = build_pool().await?;

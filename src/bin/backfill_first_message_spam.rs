@@ -10,7 +10,7 @@ use tg_ai_bot_teloxide::{
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let (chat_id, limit, only_spam, user_id) = parse_args()?;
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     if !config.first_message_spam_enabled {
         bail!("backfill_first_message_spam requires FIRST_MESSAGE_SPAM_ENABLED=true");
     }

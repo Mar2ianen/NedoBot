@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let args = parse_args()?;
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     config.validate_runtime_secrets()?;
     let pool = build_pool().await?;
     migrate(&pool).await?;

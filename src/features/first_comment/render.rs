@@ -266,6 +266,8 @@ mod tests {
             post_signature_marker: "Не теряем связь".to_string(),
             llm_provider: "ollama".to_string(),
             llm_model: Some("gemma4:31b".to_string()),
+            llm_profiles_path: None,
+            llm_profiles: None,
             llm_supports_images: Some(true),
             llm_temperature: 0.45,
             llm_max_tokens: 140,

@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn fetch_urls_skips_blocked_source_domains() {
-        let config = Config::from_env();
+        let config = Config::from_env().expect("test configuration must parse");
         let results = vec![
             SearchResult {
                 source: SearchSource::Web,
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn github_tool_names_keep_only_readonly_search_tools() {
-        let mut config = Config::from_env();
+        let mut config = Config::from_env().expect("test configuration must parse");
         config.search_github_mcp_tools = vec![
             "search_issues".to_string(),
             "create_issue".to_string(),
