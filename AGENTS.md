@@ -205,6 +205,44 @@ VPS `vps-153`, systemd service `tg-ai-bot-teloxide`, Postgres в Podman `tg-ai-b
 - `anyhow::bail!("descriptive message")` — всегда с контекстом, не просто `"failed"`.
 - External API errors: логировать провайдер + модель + статус, но не тело ответа и не API ключ.
 
+### Запрещённые антипаттерны из аудита 2026-07-26
+
+#### Провайдеры и внешние API
+- **Не добавлять брендовые LLM-клиенты и ветки router-а** для OpenAI-compatible API: Groq, Cerebras, OpenRouter, Alibaba Model Studio/Qwen и аналогичные endpoint-ы должны быть profiles одного транспорта.
+- Для OpenAI-compatible Chat Completions использовать уже подключённый crate `async-openai` с `OpenAIConfig::with_api_base()` и `with_api_key()`. **Не писать новый клиент на `reqwest`** и не копировать `OpenAiCompatClient`.
+- Отдельный native client допустим только для действительно другого протокола (`Gemini GenerateContent`, `Ollama /api/chat`, ASR multipart и т. п.).
+- URL endpoint-а, имя env-переменной ключа, default model и capabilities должны быть в provider profile/config, а не в `match provider` или в коде. Секреты не хранить в TOML/profile и не логировать.
+- Возможности модели (`supports_images`, structured-output mode, timeout) задавать конфигурацией profile; не выводить их из названия модели эвристиками для новых провайдеров.
+
+#### MCP и публичные данные
+- **Не реализовывать вручную JSON-RPC/MCP transport, protocol structs и lifecycle** для новых MCP путей. Использовать `rmcp`; stdio и Streamable HTTP должны быть transport adapters над общим read-model слоем.
+- `rmcp` tools не получают произвольный SQL. Public и agent-only пути обязаны использовать разные allowlisted DTO/projections и явный scope.
+- Public MCP view с сообщениями должен фильтровать по `chat_id = discussion_chat_id`; одного `source_channel_id` недостаточно. Нельзя публиковать private/foreign-chat rows, raw Telegram JSON, file IDs, invite links и секреты.
+- Для public endpoint обязательны мягкие anti-spam limits (`limit_req`/`limit_conn` в Nginx либо эквивалентный rate limiter), body/timeout limits и безопасное логирование без request body.
+
+#### Конфигурация и feature flags
+- **Запрещён silent fallback при невалидной заданной env-переменной.** Если переменная есть, но не парсится, startup должен завершиться с понятной ошибкой; default разрешён только для отсутствующей переменной.
+- Новая feature обязана иметь явный enable flag, собственные provider/model/secret зависимости и startup validation. Нельзя скрыто использовать ключ, модель или endpoint другой feature.
+- Disabled feature не должна создавать фоновые jobs, постоянный backlog или выполнять внешние запросы. Перед enqueue и worker startup проверять один и тот же feature gate.
+- Зависимые flags валидируются явно: например, evidence требует retrieval, retrieval требует корректного embedding config.
+
+#### Фоновые задачи и retries
+- **Не создавать неограниченное число `tokio::spawn`, ожидающих semaphore.** Для массовых событий использовать bounded `mpsc` queue и фиксированное число workers; при переполнении — controlled skip/debounce и метрика.
+- Новая долговременная job обязана иметь deduplication, статус, claim с `FOR UPDATE SKIP LOCKED`, lease, bounded retry/backoff, terminal failure и безопасный error kind.
+- Нельзя оставлять job в `pending` после live failure и полагаться только на ручной bin для восстановления. Первый комментарий должен следовать той же lifecycle policy.
+- Не копировать новые retry/lease расписания по модулям: использовать общий policy/helper или документированное обоснование отличий.
+
+#### Архитектура, SQL и хардкоды
+- Renderer не выполняет SQL и не считает бизнес-метрики. HTML и Rich варианты одного отчёта получают общие typed DTO из repo/service слоя; **не дублировать queries между format paths**.
+- `main.rs` и `command_handler.rs` — wiring/authorization/transport. Не добавлять туда orchestration из нескольких domain actions; выносить в service/pipeline.
+- Не размазывать service IDs, poll intervals, lease durations, retry delays и spam thresholds. Повторяющиеся значения — именованные constants/policy. `777000` должен иметь единственный source of truth.
+- Исключение: public MCP scope IDs в reviewed migrations/manifest и protocol limits могут быть статическими, но не должны дублироваться в runtime без необходимости.
+- Не добавлять module-wide `#![allow(dead_code)]` и blanket `#[allow(clippy::...)]`. Временное точечное исключение допустимо только с комментарием о причине и условии удаления.
+
+#### Проверки
+- Для нетривиальной правки обязательны `cargo fmt`, `cargo test --all-targets` и `cargo clippy --all-targets -- -D warnings`.
+- Изменения public MCP projections, job lifecycle, config gates, risk transitions и shared stats data обязаны получать integration tests с PostgreSQL. Unit tests не заменяют проверку миграций и SQL scope.
+
 ## Дисциплина коммитов
 
 ### Формат
