@@ -27,7 +27,7 @@ use features::avatar_analysis::service::{
     enqueue_current_avatar_analysis, process_next_avatar_analysis_job,
 };
 use features::chat_retrieval::process_next_embedding_batch;
-use features::first_comment::pipeline::maybe_comment_post;
+use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
 use features::first_message_spam::{
     enqueue_first_message_spam_analysis, process_next_first_message_spam_analysis_job,
 };
@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, config);
     spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
     spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
+    spawn_post_comment_worker(bot.clone(), state.clone());
     spawn_post_history_worker(state.clone());
     spawn_chat_retrieval_embedding_worker(state.clone());
 
@@ -93,6 +94,21 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+fn spawn_post_comment_worker(bot: teloxide::adaptors::DefaultParseMode<Bot>, state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match process_next_post_comment_job(&bot, &state).await {
+                Ok(true) => continue,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                Err(err) => {
+                    tracing::warn!(%err, "post comment worker failed to claim a job");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_post_history_worker(state: AppState) {
@@ -156,7 +172,7 @@ async fn handle_message(
         Err(err) => tracing::error!(%err, "failed to process voice transcription"),
     }
 
-    if let Err(err) = maybe_comment_post(&bot, &msg, &state).await {
+    if let Err(err) = maybe_comment_post(&msg, &state).await {
         tracing::error!(%err, "failed to process message");
     }
 
