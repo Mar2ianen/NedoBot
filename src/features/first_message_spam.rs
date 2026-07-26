@@ -11,7 +11,7 @@ use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_check
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
 
-const PROMPT_VERSION: &str = "first-message-spam-v3";
+const PROMPT_VERSION: &str = "first-message-spam-v4";
 const POST_CONTEXT_LIMIT: usize = 700;
 const LEASE_SECONDS: i64 = 10 * 60;
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/first_message_spam_classification.md");
@@ -44,7 +44,7 @@ pub async fn analyze_first_message(
     if text.trim().is_empty() {
         return Ok(false);
     }
-    let generic_feminine_name = row.get::<bool, _>("first_name_feminine_pattern");
+    let feminine_profile_name = row.get::<bool, _>("first_name_feminine_pattern");
 
     let embedding = embed_text(config, &text).await?;
     let embedding_literal = pgvector_literal(&embedding)?;
@@ -55,14 +55,14 @@ pub async fn analyze_first_message(
         config,
         &text,
         replied_post_context.as_deref(),
-        generic_feminine_name,
+        feminine_profile_name,
     )
     .await?;
     let delta = score_delta(
         &assessment,
         template_matches,
         similarity,
-        generic_feminine_name,
+        feminine_profile_name,
     );
     let signal = json!({
         "class": "first_message_content",
@@ -268,12 +268,12 @@ async fn classify_text(
     config: &Config,
     text: &str,
     replied_post_context: Option<&str>,
-    generic_feminine_name: bool,
+    feminine_profile_name: bool,
 ) -> anyhow::Result<Value> {
     let prompt = serde_json::to_string(&json!({
         "untrusted_first_message": text,
         "trusted_replied_post_context": replied_post_context,
-        "generic_feminine_name_profile": generic_feminine_name,
+        "profile_name_grammar_hint": if feminine_profile_name { "feminine" } else { "unspecified" },
         "prompt_version": PROMPT_VERSION
     }))?;
     let generation = generate_text_with_provider_checked(
@@ -304,11 +304,13 @@ fn output_schema() -> &'static Value {
             "type":"object", "additionalProperties":false,
             "properties": {
                 "direct_dm_offer":{"type":"boolean"}, "offtopic_promo":{"type":"boolean"}, "template_campaign":{"type":"boolean"},
+                "self_reference_grammar":{"type":"string","enum":["masculine","feminine","none_or_unclear"]},
+                "profile_name_grammar_relation":{"type":"string","enum":["consistent","conflicts","not_applicable"]},
                 "relation_to_replied_post":{"type":"string","enum":["on_topic","loosely_related","off_topic","no_post_context"]},
                 "markers":{"type":"array","items":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction","performative_feminine_persona"]}},
                 "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"marker":{"type":"string","enum":["send_or_share_offer","direct_messages","self_help_or_finance_promo","template_efficiency_narrative","masked_call_to_action","paid_easy_task_offer","external_promo_funnel","generic_campaign_reaction","performative_feminine_persona"]},"quote":{"type":"string"}},"required":["marker","quote"]}},
                 "explanation":{"type":"string"}
-            }, "required":["direct_dm_offer","offtopic_promo","template_campaign","relation_to_replied_post","markers","evidence","explanation"]
+            }, "required":["direct_dm_offer","offtopic_promo","template_campaign","self_reference_grammar","profile_name_grammar_relation","relation_to_replied_post","markers","evidence","explanation"]
         })
     });
     &SCHEMA
@@ -318,7 +320,7 @@ fn score_delta(
     assessment: &Value,
     template_matches: i32,
     similarity: Option<f64>,
-    generic_feminine_name: bool,
+    feminine_profile_name: bool,
 ) -> i32 {
     let direct = assessment["direct_dm_offer"].as_bool().unwrap_or(false);
     let offtopic = assessment["offtopic_promo"].as_bool().unwrap_or(false)
@@ -329,7 +331,7 @@ fn score_delta(
             .iter()
             .any(|marker| marker == "paid_easy_task_offer")
     });
-    let performative_feminine_persona = generic_feminine_name
+    let performative_feminine_persona = feminine_profile_name
         && assessment["markers"].as_array().is_some_and(|markers| {
             markers
                 .iter()
@@ -352,7 +354,11 @@ fn score_delta(
         _ => 0,
     };
     let persona = if performative_feminine_persona { 12 } else { 0 };
-    (llm + persona + template + embedding).min(45)
+    let grammar_conflict = feminine_profile_name
+        && assessment["self_reference_grammar"].as_str() == Some("masculine")
+        && assessment["profile_name_grammar_relation"].as_str() == Some("conflicts");
+    let grammar = if grammar_conflict { 10 } else { 0 };
+    (llm + persona + grammar + template + embedding).min(45)
 }
 
 fn token_set(text: &str) -> BTreeSet<String> {
@@ -451,6 +457,16 @@ mod tests {
     fn performative_feminine_persona_needs_matching_profile_pattern() {
         let assessment = json!({"markers":["performative_feminine_persona"]});
         assert_eq!(score_delta(&assessment, 0, None, true), 12);
+        assert_eq!(score_delta(&assessment, 0, None, false), 0);
+    }
+
+    #[test]
+    fn explicit_masculine_self_reference_conflicting_with_feminine_name_is_weak_signal() {
+        let assessment = json!({
+            "self_reference_grammar": "masculine",
+            "profile_name_grammar_relation": "conflicts"
+        });
+        assert_eq!(score_delta(&assessment, 0, None, true), 10);
         assert_eq!(score_delta(&assessment, 0, None, false), 0);
     }
 }
