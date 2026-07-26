@@ -105,7 +105,22 @@ pub async fn enqueue_first_message_spam_analysis(
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<()> {
-    if !config.first_message_spam_enabled {
+    enqueue_first_message_spam_analysis_if_enabled(
+        pool,
+        config.first_message_spam_enabled,
+        chat_id,
+        user_id,
+    )
+    .await
+}
+
+pub async fn enqueue_first_message_spam_analysis_if_enabled(
+    pool: &PgPool,
+    first_message_spam_enabled: bool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    if !first_message_spam_enabled {
         return Ok(());
     }
 

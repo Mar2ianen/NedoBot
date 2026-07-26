@@ -265,11 +265,14 @@ FIRST_COMMENT_MAX_IMAGE_MB=10
 
 ## Локальный Запуск
 
-Поднять Postgres:
+Поднять изолированную локальную PostgreSQL development-базу:
 
 ```bash
-docker compose up -d postgres
+./scripts/dev_db.sh start
+DATABASE_URL=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_dev cargo run --bin migrate
 ```
+
+Контейнер `tg-ai-bot-postgres-dev` слушает только `127.0.0.1:5433` и использует отдельный volume; он не пересекается с production PostgreSQL. Полный сценарий reset и policy данных описаны в [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 Запустить бота:
 
@@ -282,6 +285,22 @@ cargo run
 ```bash
 cargo check
 ```
+
+## Тесты
+
+Быстрый набор без контейнеров:
+
+```bash
+cargo test --all-targets
+```
+
+Полный DB-aware suite:
+
+```bash
+./scripts/test.sh
+```
+
+Runner запускает локальный Podman PostgreSQL, пересоздаёт `tg_ai_bot_test`, применяет migrations и выполняет PostgreSQL integration tests. В CI используется такой же образ `pgvector/pgvector:0.8.2-pg16-bookworm`: migrations и ignored integration tests запускаются отдельными шагами.
 
 ## VPS Деплой
 

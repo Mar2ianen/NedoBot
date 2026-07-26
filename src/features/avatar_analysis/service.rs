@@ -187,7 +187,7 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
     }
 }
 
-async fn apply_avatar_risk_signal(
+pub async fn apply_avatar_risk_signal(
     pool: &PgPool,
     user_id: i64,
     profile_photo_file_unique_id: &str,
