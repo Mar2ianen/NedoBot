@@ -354,23 +354,35 @@ async fn generate_once(
     };
     let response = match provider {
         "groq" => {
-            OpenAiCompatClient::new(GROQ_OPENAI_BASE_URL, &config.groq_api_key)
-                .generate(request)
-                .await?
+            OpenAiCompatClient::new(
+                GROQ_OPENAI_BASE_URL,
+                &config.groq_api_key,
+                std::time::Duration::from_secs(45),
+            )?
+            .generate(request)
+            .await?
         }
         "cerebras" => {
-            OpenAiCompatClient::new(CEREBRAS_OPENAI_BASE_URL, &config.cerebras_api_key)
-                .generate(request)
-                .await?
+            OpenAiCompatClient::new(
+                CEREBRAS_OPENAI_BASE_URL,
+                &config.cerebras_api_key,
+                std::time::Duration::from_secs(45),
+            )?
+            .generate(request)
+            .await?
         }
         "openrouter" => {
-            OpenAiCompatClient::new(OPENROUTER_OPENAI_BASE_URL, &config.openrouter_api_key)
-                .generate(request)
-                .await?
+            OpenAiCompatClient::new(
+                OPENROUTER_OPENAI_BASE_URL,
+                &config.openrouter_api_key,
+                std::time::Duration::from_secs(45),
+            )?
+            .generate(request)
+            .await?
         }
         "gemini" => GeminiClient::new(config).generate(request).await?,
         "openai_compat" => {
-            OpenAiCompatClient::from_config(config)
+            OpenAiCompatClient::from_config(config)?
                 .generate(request)
                 .await?
         }
