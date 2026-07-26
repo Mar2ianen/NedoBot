@@ -678,6 +678,7 @@ fn analyze_new_or_low_activity_user(
 
     risk.add_optional(short_bio_signal(features));
     risk.add_optional(explicit_adult_bio_signal(features));
+    risk.add_optional(profile_bio_subscription_offer_signal(features));
     risk.add_optional(member_status_signal(features));
     risk.finish()
 }
@@ -1202,6 +1203,16 @@ fn explicit_adult_bio_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     })
 }
 
+fn profile_bio_subscription_offer_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
+    let bio = features.bio.as_deref()?;
+    has_subscription_offer_bio(bio).then_some(RiskSignal {
+        class: SpamClass::PromoDmBait,
+        coefficient: 45,
+        label: "profile_bio_subscription_invite_offer",
+        reason: "Profile bio advertises a paid digital subscription through a Telegram invite link",
+    })
+}
+
 fn has_explicit_adult_promo_bio(bio: &str) -> bool {
     let raw = bio.to_lowercase();
     let normalized = normalize_cyrillic_homoglyphs(bio).to_lowercase();
@@ -1219,6 +1230,31 @@ fn has_explicit_adult_promo_bio(bio: &str) -> bool {
     .iter()
     .any(|marker| raw.contains(marker) || normalized.contains(marker));
     adult_provider && promotional_context
+}
+
+fn has_subscription_offer_bio(bio: &str) -> bool {
+    let raw = bio.to_lowercase();
+    let normalized = normalize_cyrillic_homoglyphs(bio).to_lowercase();
+    let variants = [&raw, &normalized];
+    let has_invite_link = variants
+        .iter()
+        .any(|value| value.contains("t.me/+") || value.contains("telegram.me/+"));
+    let has_subscription_product = [
+        "gemini",
+        "gеmіni",
+        "chatgpt",
+        "openai",
+        "claude",
+        "midjourney",
+        "spotify",
+        "youtube premium",
+    ]
+    .iter()
+    .any(|marker| variants.iter().any(|value| value.contains(marker)));
+    let has_sales_term = ["pro", "подпис", "месяц", "год", "$", "руб", "₽", "за "]
+        .iter()
+        .any(|marker| variants.iter().any(|value| value.contains(marker)));
+    has_invite_link && has_subscription_product && has_sales_term
 }
 
 fn member_status_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -2178,6 +2214,16 @@ mod tests {
     fn cjk_detector_catches_foreign_invite_seed() {
         assert!(contains_cjk("只要節奏對了大肉吃飽"));
         assert!(!contains_cjk("обычный русский текст"));
+    }
+
+    #[test]
+    fn subscription_offer_bio_detects_homoglyph_gemini_invite() {
+        assert!(has_subscription_offer_bio(
+            "Gеmіni Pro на 1,5 года за 1$ закреп https://t.me/+Cz6_qO6kyCY5YTAy"
+        ));
+        assert!(!has_subscription_offer_bio(
+            "Gemini нормально отвечает на вопросы, пробую бесплатную версию"
+        ));
     }
 
     #[test]
