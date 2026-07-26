@@ -35,7 +35,7 @@ provider transport -> model profile -> task route
 - [~] **LP2 — config loading:** добавлен явный `LLM_PROFILES_PATH` и startup loading/schema validation; validation выбранных enabled routes будет добавлена вместе с их migration на resolver. Legacy `.env` пока определяет runtime routing.
 - [ ] **LP3 — compatibility profiles:** собрать встроенные profiles, эквивалентные текущим `GROQ_*`, `CEREBRAS_*`, `OPENROUTER_*`, Gemini и Ollama настройкам; проверить идентичность effective model/fallback chain.
 - [ ] **LP4 — route resolver:** добавить typed `LlmTask`, resolver primary/fallback chain и проверку task requirements против capabilities. Перенести Gemini fallback из `llm/service.rs` в route `first_comment`.
-- [ ] **LP5 — transport profiles:** перевести Groq, Cerebras, OpenRouter и custom endpoint на один `async-openai` transport с `OpenAIConfig::with_api_base()` и `with_api_key()`. Не добавлять брендовые clients. Gemini и native Ollama оставить отдельными drivers.
+- [~] **LP5 — transport profiles:** legacy Groq, Cerebras, OpenRouter и custom endpoint переведены на один `async-openai` transport с `OpenAIConfig::with_api_base()` и `with_api_key()`. Profile-driven provider resolution будет добавлен вместе с route migration. Gemini и native Ollama остаются отдельными drivers.
 - [ ] **LP6 — task migration:** последовательно переключить first comment, memory, search extract, voice cleanup, ask, avatar analysis и first-message spam на named routes.
 - [ ] **LP7 — cleanup:** удалить legacy provider/model env routing, `LLM_SUPPORTS_IMAGES`, model-name эвристики и hard-coded fallback chain после production migration.
 

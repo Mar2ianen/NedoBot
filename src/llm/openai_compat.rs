@@ -1,178 +1,129 @@
-use async_trait::async_trait;
-use reqwest::header::USER_AGENT;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::chat::{
+        ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ImageUrl, ResponseFormat,
+        ResponseFormatJsonSchema,
+    },
+};
+use async_trait::async_trait;
 
 use crate::config::Config;
 use crate::http;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
 
-pub struct OpenAiCompatClient<'a> {
-    api_base: &'a str,
-    api_key: &'a str,
+pub struct OpenAiCompatClient {
+    client: Client<OpenAIConfig>,
 }
 
-impl<'a> OpenAiCompatClient<'a> {
-    pub fn new(api_base: &'a str, api_key: &'a str) -> Self {
-        Self { api_base, api_key }
+impl OpenAiCompatClient {
+    pub fn new(api_base: &str, api_key: &str, timeout: Duration) -> anyhow::Result<Self> {
+        if api_key.trim().is_empty() {
+            anyhow::bail!("OpenAI-compatible API key is empty");
+        }
+
+        let config = OpenAIConfig::new()
+            .with_api_base(api_base.trim_end_matches('/'))
+            .with_api_key(api_key.trim());
+        let http_client = http::client(timeout)?;
+        Ok(Self {
+            client: Client::with_config(config).with_http_client(http_client),
+        })
     }
 
-    pub fn from_config(config: &'a Config) -> Self {
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         Self::new(
-            config.openai_compat_base_url.trim_end_matches('/'),
-            config.openai_compat_api_key.trim(),
+            &config.openai_compat_base_url,
+            &config.openai_compat_api_key,
+            Duration::from_secs(45),
         )
     }
 }
 
 #[async_trait]
-impl LlmClient for OpenAiCompatClient<'_> {
+impl LlmClient for OpenAiCompatClient {
     async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
-        if self.api_key.is_empty() {
-            anyhow::bail!("OpenAI-compatible API key is empty");
-        }
-
-        let mut messages = Vec::new();
-        if let Some(system_prompt) = request.system_prompt {
-            messages.push(ChatMessage {
-                role: "system",
-                content: MessageContent::Text(system_prompt),
-            });
-        }
-        messages.push(ChatMessage {
-            role: "user",
-            content: user_content(request.prompt, request.image_base64),
-        });
-
-        let body = ChatCompletionRequest {
-            model: request.model,
-            messages,
-            temperature: request.temperature,
-            max_completion_tokens: request.num_predict,
-            response_format: request
-                .structured_output
-                .map(|output| ResponseFormat::json_schema(output.name, output.schema)),
-        };
-
-        let response = http::client(Duration::from_secs(45))?
-            .post(format!(
-                "{}/chat/completions",
-                self.api_base.trim_end_matches('/')
-            ))
-            .header(USER_AGENT, "tg-ai-bot-teloxide/0.1")
-            .bearer_auth(self.api_key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ChatCompletionResponse>()
-            .await?;
-
+        let response = self.client.chat().create(build_request(request)?).await?;
         let content = response
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message.content)
-            .unwrap_or_default();
-
-        if content.trim().is_empty() {
-            anyhow::bail!("empty OpenAI-compatible response");
-        }
+            .and_then(|choice| choice.message.content)
+            .filter(|content| !content.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("empty OpenAI-compatible response"))?;
 
         Ok(LlmResponse { content })
     }
 }
 
-#[derive(Serialize)]
-struct ChatCompletionRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
-    max_completion_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat<'a>>,
-}
-
-#[derive(Serialize)]
-struct ResponseFormat<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    json_schema: JsonSchemaResponseFormat<'a>,
-}
-
-#[derive(Serialize)]
-struct JsonSchemaResponseFormat<'a> {
-    name: &'a str,
-    strict: bool,
-    schema: &'a serde_json::Value,
-}
-
-impl<'a> ResponseFormat<'a> {
-    fn json_schema(name: &'a str, schema: &'a serde_json::Value) -> Self {
-        Self {
-            kind: "json_schema",
-            json_schema: JsonSchemaResponseFormat {
-                name,
-                strict: true,
-                schema,
+fn build_request(request: LlmRequest<'_>) -> anyhow::Result<CreateChatCompletionRequest> {
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = request.system_prompt {
+        messages.push(ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.to_string()),
+                name: None,
             },
-        }
+        ));
+    }
+    messages.push(ChatCompletionRequestMessage::User(
+        ChatCompletionRequestUserMessage {
+            content: user_content(request.prompt, request.image_base64),
+            name: None,
+        },
+    ));
+
+    let mut builder = CreateChatCompletionRequestArgs::default();
+    builder
+        .model(request.model)
+        .messages(messages)
+        .temperature(request.temperature)
+        .max_completion_tokens(request.num_predict);
+    if let Some(output) = request.structured_output {
+        builder.response_format(response_format(output));
+    }
+    builder.build().map_err(Into::into)
+}
+
+fn response_format(output: crate::llm::types::StructuredOutput<'_>) -> ResponseFormat {
+    ResponseFormat::JsonSchema {
+        json_schema: ResponseFormatJsonSchema {
+            description: None,
+            name: output.name.to_string(),
+            schema: output.schema.clone(),
+            strict: Some(true),
+        },
     }
 }
 
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: MessageContent<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum MessageContent<'a> {
-    Text(&'a str),
-    Parts(Vec<MessageContentPart<'a>>),
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum MessageContentPart<'a> {
-    Text { text: &'a str },
-    ImageUrl { image_url: ImageUrl },
-}
-
-#[derive(Serialize)]
-struct ImageUrl {
-    url: String,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatResponseMessage {
-    #[serde(default)]
-    content: String,
-}
-
-fn user_content<'a>(prompt: &'a str, image_base64: Option<&'a str>) -> MessageContent<'a> {
+fn user_content(
+    prompt: &str,
+    image_base64: Option<&str>,
+) -> ChatCompletionRequestUserMessageContent {
     let Some(image_base64) = image_base64 else {
-        return MessageContent::Text(prompt);
+        return ChatCompletionRequestUserMessageContent::Text(prompt.to_string());
     };
 
-    MessageContent::Parts(vec![
-        MessageContentPart::Text { text: prompt },
-        MessageContentPart::ImageUrl {
-            image_url: ImageUrl {
-                url: format!("data:image/jpeg;base64,{image_base64}"),
+    ChatCompletionRequestUserMessageContent::Array(vec![
+        ChatCompletionRequestUserMessageContentPart::Text(
+            ChatCompletionRequestMessageContentPartText {
+                text: prompt.to_string(),
             },
-        },
+        ),
+        ChatCompletionRequestUserMessageContentPart::ImageUrl(
+            ChatCompletionRequestMessageContentPartImage {
+                image_url: ImageUrl {
+                    url: format!("data:image/jpeg;base64,{image_base64}"),
+                    detail: None,
+                },
+            },
+        ),
     ])
 }
 
@@ -181,30 +132,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn request(response_format: Option<ResponseFormat<'_>>) -> ChatCompletionRequest<'_> {
-        ChatCompletionRequest {
+    fn llm_request<'a>(
+        structured_output: Option<crate::llm::types::StructuredOutput<'a>>,
+    ) -> LlmRequest<'a> {
+        LlmRequest {
             model: "gemma-4",
-            messages: Vec::new(),
+            system_prompt: Some("system"),
+            prompt: "prompt",
+            image_base64: Some("base64-image"),
             temperature: 0.0,
-            max_completion_tokens: 256,
-            response_format,
+            num_predict: 256,
+            structured_output,
         }
     }
 
     #[test]
     fn text_request_omits_response_format() {
-        let body = serde_json::to_value(request(None)).unwrap();
+        let body = serde_json::to_value(build_request(llm_request(None)).unwrap()).unwrap();
+
         assert!(body.get("response_format").is_none());
+        assert_eq!(body["max_completion_tokens"], 256);
+        assert_eq!(
+            body["messages"][0],
+            json!({"role": "system", "content": "system"})
+        );
+        assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
     }
 
     #[test]
     fn structured_request_uses_strict_json_schema() {
         let schema = json!({"type": "object", "additionalProperties": false});
-        let body = serde_json::to_value(request(Some(ResponseFormat::json_schema(
-            "avatar_profile_assessment",
-            &schema,
-        ))))
-        .unwrap();
+        let request = llm_request(Some(crate::llm::types::StructuredOutput {
+            name: "avatar_profile_assessment",
+            schema: &schema,
+        }));
+        let body = serde_json::to_value(build_request(request).unwrap()).unwrap();
 
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(
