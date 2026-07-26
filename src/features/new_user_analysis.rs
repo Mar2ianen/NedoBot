@@ -246,6 +246,7 @@ impl RiskAccumulator {
     }
 
     fn finish(mut self) -> RiskAnalysis {
+        self.score = self.score.min(100);
         let level = match self.score {
             70.. => "high",
             40..=69 => "medium",
@@ -2184,5 +2185,17 @@ mod tests {
         let result = best_effort_profile_photo_dc(Some("AQADBAADb6sxG4x8AAEC"));
         assert!(result.dc_id.is_none());
         assert!(result.note.contains("dc_unavailable_from_bot_api"));
+    }
+
+    #[test]
+    fn risk_score_is_capped_at_one_hundred() {
+        let mut risk = RiskAccumulator::default();
+        risk.add(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 120,
+            label: "test",
+            reason: "test",
+        });
+        assert_eq!(risk.finish().score, 100);
     }
 }
