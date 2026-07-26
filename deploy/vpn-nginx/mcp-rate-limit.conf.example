@@ -1,0 +1,4 @@
+# Install as /etc/nedobot/nginx/mcp-rate-limit.conf.
+# Values are deployment policy: tune them from access logs without editing nginx.conf.
+limit_req_zone $binary_remote_addr zone=nedonews_mcp_requests_per_ip:10m rate=300r/m;
+limit_conn_zone $binary_remote_addr zone=nedonews_mcp_connections_per_ip:10m;
