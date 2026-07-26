@@ -2,7 +2,9 @@ use crate::config::{Config, normalize_llm_provider};
 use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
-use crate::llm::types::{GeneratedText, LlmAttempt, LlmClient, LlmRequest, StructuredOutput};
+use crate::llm::types::{
+    GeneratedText, LlmAttempt, LlmClient, LlmRequest, LlmTransportError, StructuredOutput,
+};
 use serde_json::Value;
 
 pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
@@ -311,24 +313,26 @@ pub async fn generate_text_with_provider_checked(
 }
 
 fn classify_attempt_error(error: &anyhow::Error) -> String {
-    let text = error.to_string().to_lowercase();
-    if text.contains("429") {
-        "http_429".to_string()
-    } else if text.contains("503") || text.contains("502") || text.contains("500") {
-        "http_5xx".to_string()
-    } else if text.contains("timeout") || text.contains("timed out") {
-        "timeout".to_string()
-    } else {
-        "error".to_string()
+    match error.downcast_ref::<LlmTransportError>() {
+        Some(LlmTransportError::HttpStatus(429)) => "http_429".to_string(),
+        Some(LlmTransportError::HttpStatus(status)) if *status >= 500 => "http_5xx".to_string(),
+        Some(LlmTransportError::HttpStatus(status)) => format!("http_{status}"),
+        Some(LlmTransportError::Configuration) => "configuration".to_string(),
+        None if error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout) =>
+        {
+            "timeout".to_string()
+        }
+        None => "error".to_string(),
     }
 }
 
 fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
-    let text = error.to_string().to_lowercase();
-    text.contains("400")
-        || text.contains("422")
-        || text.contains("schema")
-        || text.contains("format")
+    matches!(
+        error.downcast_ref::<LlmTransportError>(),
+        Some(LlmTransportError::HttpStatus(400 | 422))
+    )
 }
 
 async fn generate_once(
@@ -690,15 +694,13 @@ mod tests {
     }
 
     #[test]
-    fn detects_structured_output_rejections() {
-        assert!(is_structured_output_rejection(&anyhow::anyhow!(
-            "HTTP status client error (400 Bad Request)"
-        )));
-        assert!(is_structured_output_rejection(&anyhow::anyhow!(
-            "response JSON schema is unsupported"
-        )));
-        assert!(!is_structured_output_rejection(&anyhow::anyhow!(
-            "HTTP status server error (503 Service Unavailable)"
-        )));
+    fn detects_typed_structured_output_rejections() {
+        let bad_request = anyhow::Error::new(LlmTransportError::http_status(400));
+        let unprocessable = anyhow::Error::new(LlmTransportError::http_status(422));
+        let unavailable = anyhow::Error::new(LlmTransportError::http_status(503));
+
+        assert!(is_structured_output_rejection(&bad_request));
+        assert!(is_structured_output_rejection(&unprocessable));
+        assert!(!is_structured_output_rejection(&unavailable));
     }
 }

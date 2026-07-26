@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::http;
-use crate::llm::types::{LlmClient, LlmRequest, LlmResponse};
+use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -29,7 +29,7 @@ impl<'a> GeminiClient<'a> {
 impl LlmClient for GeminiClient<'_> {
     async fn generate(&self, request: LlmRequest<'_>) -> anyhow::Result<LlmResponse> {
         if self.api_key.is_empty() {
-            anyhow::bail!("GEMINI_API_KEY is empty");
+            return Err(LlmTransportError::configuration().into());
         }
 
         let body = GenerateContentRequest {
@@ -56,10 +56,11 @@ impl LlmClient for GeminiClient<'_> {
             .header("x-goog-api-key", self.api_key)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<GenerateContentResponse>()
             .await?;
+        if !response.status().is_success() {
+            return Err(LlmTransportError::http_status(response.status().as_u16()).into());
+        }
+        let response = response.json::<GenerateContentResponse>().await?;
 
         let candidate = response
             .candidates

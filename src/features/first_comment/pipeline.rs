@@ -161,8 +161,12 @@ async fn process_post_comment_job(
         .await
         .map_err(|_| CommentErrorKind::ImageUnavailable)?;
     let chat_member_count = get_chat_member_count(bot, config).await;
-    let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text).await?;
-    let recent_comments = load_recent_bot_comments(pool).await?;
+    let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text)
+        .await
+        .map_err(|_| CommentErrorKind::Transient)?;
+    let recent_comments = load_recent_bot_comments(pool)
+        .await
+        .map_err(|_| CommentErrorKind::Transient)?;
     let topic_comments = Vec::new();
     let search_context = run_search(config, &job.cleaned_post_text, &memory_notes).await;
     if let Err(err) = insert_search_run(pool, job.id, &search_context).await {
@@ -221,7 +225,8 @@ async fn process_post_comment_job(
         config.discussion_chat_id,
         &chat_candidate_ids,
     )
-    .await?;
+    .await
+    .map_err(|_| CommentErrorKind::Transient)?;
     let chat_evidence = config
         .chat_retrieval_evidence_enabled
         .then(|| {
@@ -278,7 +283,8 @@ async fn process_post_comment_job(
         "first_comment_draft",
         first_comment_output_schema(),
     )
-    .await?;
+    .await
+    .map_err(|error| CommentErrorKind::from_llm_error(&error))?;
     let draft = parse_first_comment_draft(&generation.content)
         .map_err(|_| CommentErrorKind::InvalidInput)?;
     if draft
@@ -331,7 +337,7 @@ async fn process_post_comment_job(
         final_html.clone(),
     )
     .await
-    .map_err(|_| CommentErrorKind::Transient)?;
+    .map_err(|error| CommentErrorKind::from_telegram_error(&error))?;
 
     Ok(JobOutcome::Prepared(CompletedComment {
         bot_comment_message_id: sent.id.0,

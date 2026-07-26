@@ -1,6 +1,40 @@
 use async_trait::async_trait;
+use std::fmt;
+
 use serde::Serialize;
 use serde_json::Value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmTransportError {
+    Configuration,
+    HttpStatus(u16),
+}
+
+impl LlmTransportError {
+    pub fn configuration() -> Self {
+        Self::Configuration
+    }
+
+    pub fn http_status(status: u16) -> Self {
+        Self::HttpStatus(status)
+    }
+}
+
+impl fmt::Display for LlmTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration => formatter.write_str("LLM transport configuration is invalid"),
+            Self::HttpStatus(status) => {
+                write!(
+                    formatter,
+                    "LLM transport request failed with HTTP status {status}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LlmTransportError {}
 
 #[derive(Clone, Copy)]
 pub struct StructuredOutput<'a> {

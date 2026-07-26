@@ -1,6 +1,8 @@
 use sqlx::PgPool;
+use teloxide::RequestError;
 
 use crate::features::first_comment::render::ChatLinkTarget;
+use crate::llm::types::LlmTransportError;
 use crate::text::{normalize_ai_markers, strip_links};
 
 const COMMENT_JOB_LEASE_SECONDS: i64 = 10 * 60;
@@ -25,6 +27,22 @@ impl CommentErrorKind {
         }
     }
 
+    pub fn from_llm_error(error: &anyhow::Error) -> Self {
+        match error.downcast_ref::<LlmTransportError>() {
+            Some(LlmTransportError::Configuration) => Self::Configuration,
+            Some(LlmTransportError::HttpStatus(status)) => Self::from_http_status(*status),
+            None => Self::Transient,
+        }
+    }
+
+    pub fn from_telegram_error(error: &RequestError) -> Self {
+        match error {
+            RequestError::RetryAfter(_) => Self::RateLimited,
+            RequestError::Api(teloxide::ApiError::InvalidToken) => Self::Configuration,
+            _ => Self::Transient,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Configuration => "configuration",
@@ -37,13 +55,6 @@ impl CommentErrorKind {
 
     fn is_retryable(self) -> bool {
         !matches!(self, Self::Configuration | Self::InvalidInput)
-    }
-}
-
-impl From<anyhow::Error> for CommentErrorKind {
-    fn from(_: anyhow::Error) -> Self {
-        // Untyped errors carry no trustworthy status; treat them as a retryable server failure.
-        Self::from_http_status(500)
     }
 }
 
@@ -328,5 +339,22 @@ mod tests {
         assert!(!CommentErrorKind::Configuration.is_retryable());
         assert!(!CommentErrorKind::InvalidInput.is_retryable());
         assert!(CommentErrorKind::Transient.is_retryable());
+    }
+
+    #[test]
+    fn llm_http_statuses_keep_their_job_error_kind() {
+        let rate_limited =
+            anyhow::Error::new(crate::llm::types::LlmTransportError::http_status(429));
+        let unauthorized =
+            anyhow::Error::new(crate::llm::types::LlmTransportError::http_status(401));
+
+        assert_eq!(
+            CommentErrorKind::from_llm_error(&rate_limited),
+            CommentErrorKind::RateLimited
+        );
+        assert_eq!(
+            CommentErrorKind::from_llm_error(&unauthorized),
+            CommentErrorKind::Configuration
+        );
     }
 }
