@@ -14,6 +14,7 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes.
     sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())
 }

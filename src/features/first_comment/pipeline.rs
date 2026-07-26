@@ -12,15 +12,16 @@ use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::draft::{
-    first_comment_output_schema, parse_first_comment_draft,
+    FirstCommentDraft, first_comment_output_schema, parse_first_comment_draft,
     validate_first_comment_draft_with_search_policy_and_chat,
 };
 use crate::features::first_comment::prompt::{
     CommentDirectives, build_llm_prompt_parts_with_chat_evidence,
 };
 use crate::features::first_comment::repo::{
-    LlmGenerationInsert, create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
-    mark_post_comment_sent,
+    CommentErrorKind, LlmGenerationInsert, PostCommentJob, claim_next_post_comment_job,
+    create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
+    mark_post_comment_failed, mark_post_comment_sent,
 };
 use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
 use crate::features::search::repo::{
@@ -33,11 +34,7 @@ use crate::llm::service::generate_text_checked_with_system_and_schema;
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
-pub async fn maybe_comment_post(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
-    state: &AppState,
-) -> anyhow::Result<()> {
+pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Result<()> {
     let pool = &state.pool;
     let config = &state.config;
 
@@ -60,6 +57,9 @@ pub async fn maybe_comment_post(
     }
 
     let clean_post = clean_post_for_llm(candidate.post_text, config);
+    let image = msg
+        .photo()
+        .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height));
     let job_id = create_post_comment_job(
         pool,
         config.discussion_chat_id,
@@ -67,30 +67,105 @@ pub async fn maybe_comment_post(
         candidate.source_channel_id,
         candidate.source_message_id.0,
         &clean_post,
+        image.map(|photo| photo.file.id.as_str()),
+        image.map(|photo| photo.file.unique_id.as_str()),
     )
     .await?;
 
-    let Some(job_id) = job_id else {
+    if let Some(job_id) = job_id {
+        tracing::info!(
+            job_id,
+            discussion_message_id = msg.id.0,
+            "comment job enqueued"
+        );
+    } else {
         tracing::info!(
             discussion_message_id = msg.id.0,
             "comment job already exists, skip"
         );
-        return Ok(());
+    }
+
+    Ok(())
+}
+
+enum JobOutcome {
+    Prepared(CompletedComment),
+    Completed,
+    Failed(CommentErrorKind),
+    LeaseLost,
+}
+
+struct CompletedComment {
+    bot_comment_message_id: i32,
+    generation: crate::llm::types::GeneratedText,
+    draft: FirstCommentDraft,
+    prompt_for_log: String,
+    final_html: String,
+    search_context: SearchContext,
+    used_search_result_id: Option<i32>,
+}
+
+pub async fn process_next_post_comment_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+) -> anyhow::Result<bool> {
+    let Some(job) = claim_next_post_comment_job(&state.pool).await? else {
+        return Ok(false);
     };
 
-    let image_base64 = match download_largest_photo_base64(bot, msg, config).await {
-        Ok(image) => image,
-        Err(err) => {
-            tracing::warn!(%err, "failed to download post image, continue text-only");
-            None
-        }
+    let outcome = match process_post_comment_job(bot, state, &job).await {
+        Ok(outcome) => outcome,
+        Err(error_kind) => JobOutcome::Failed(error_kind),
     };
+    match outcome {
+        JobOutcome::Prepared(completed) => {
+            if matches!(
+                finalize_completed_post_comment_job(bot, state, &job, completed).await?,
+                JobOutcome::LeaseLost
+            ) {
+                tracing::info!(
+                    job_id = job.id,
+                    "post comment worker lost processing lease after Telegram send"
+                );
+            }
+        }
+        JobOutcome::Completed => {}
+        JobOutcome::Failed(error_kind) => {
+            if mark_post_comment_failed(&state.pool, &job, error_kind).await? {
+                tracing::warn!(
+                    job_id = job.id,
+                    attempts = job.attempts,
+                    ?error_kind,
+                    "post comment job failed"
+                );
+            } else {
+                tracing::info!(job_id = job.id, "post comment worker lost processing lease");
+            }
+        }
+        JobOutcome::LeaseLost => {
+            tracing::info!(job_id = job.id, "post comment worker lost processing lease");
+        }
+    }
+
+    Ok(true)
+}
+
+async fn process_post_comment_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+    job: &PostCommentJob,
+) -> Result<JobOutcome, CommentErrorKind> {
+    let pool = &state.pool;
+    let config = &state.config;
+    let image_base64 = download_photo_base64(bot, job.image_file_id.as_deref(), config)
+        .await
+        .map_err(|_| CommentErrorKind::ImageUnavailable)?;
     let chat_member_count = get_chat_member_count(bot, config).await;
-    let memory_notes = load_relevant_memory_notes(pool, config, &clean_post).await?;
+    let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text).await?;
     let recent_comments = load_recent_bot_comments(pool).await?;
     let topic_comments = Vec::new();
-    let search_context = run_search(config, &clean_post, &memory_notes).await;
-    if let Err(err) = insert_search_run(pool, job_id, &search_context).await {
+    let search_context = run_search(config, &job.cleaned_post_text, &memory_notes).await;
+    if let Err(err) = insert_search_run(pool, job.id, &search_context).await {
         tracing::warn!(%err, "failed to save search run");
     }
     let mut chat_candidates = Vec::new();
@@ -106,7 +181,7 @@ pub async fn maybe_comment_post(
         {
             Ok(candidates) => {
                 chat_candidates = candidates.clone();
-                if let Err(err) = save_chat_retrieval_candidates(pool, job_id, &candidates).await {
+                if let Err(err) = save_chat_retrieval_candidates(pool, job.id, &candidates).await {
                     tracing::warn!(%err, "failed to save chat retrieval shadow run");
                 }
                 match crate::features::chat_retrieval::expand_shadow_contexts(
@@ -117,7 +192,7 @@ pub async fn maybe_comment_post(
                 .await
                 {
                     Ok(contexts) => {
-                        if let Err(err) = save_expanded_chat_contexts(pool, job_id, &contexts).await
+                        if let Err(err) = save_expanded_chat_contexts(pool, job.id, &contexts).await
                         {
                             tracing::warn!(%err, "failed to save expanded chat contexts");
                         }
@@ -129,8 +204,7 @@ pub async fn maybe_comment_post(
             Err(err) => tracing::warn!(%err, "chat retrieval shadow run failed"),
         }
     }
-    let directives =
-        CommentDirectives::for_post(candidate.source_message_id.0, Some(&search_context));
+    let directives = CommentDirectives::for_post(job.source_message_id, Some(&search_context));
     let evidence_candidates = chat_candidates
         .iter()
         .filter(|candidate| {
@@ -168,7 +242,7 @@ pub async fn maybe_comment_post(
         })
         .unwrap_or_default();
     let prompt = build_llm_prompt_parts_with_chat_evidence(
-        &clean_post,
+        &job.cleaned_post_text,
         chat_member_count,
         &memory_notes,
         &recent_comments,
@@ -205,13 +279,14 @@ pub async fn maybe_comment_post(
         first_comment_output_schema(),
     )
     .await?;
-    let draft = parse_first_comment_draft(&generation.content)?;
+    let draft = parse_first_comment_draft(&generation.content)
+        .map_err(|_| CommentErrorKind::InvalidInput)?;
     if draft
         .used_chat_message_ids
         .iter()
         .any(|id| !chat_candidate_ids.contains(id))
     {
-        anyhow::bail!("first comment references a chat message outside retrieval context");
+        return Err(CommentErrorKind::InvalidInput);
     }
     let chat_targets = chat_targets
         .into_iter()
@@ -231,7 +306,7 @@ pub async fn maybe_comment_post(
     };
     if let Err(err) = save_chat_evidence_outcome(
         pool,
-        job_id,
+        job.id,
         &draft.used_chat_message_ids,
         evidence_rejection_reason,
     )
@@ -241,72 +316,97 @@ pub async fn maybe_comment_post(
     }
     let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
-    let attempts = serde_json::to_value(&generation.attempts)?;
     let final_html = crate::features::first_comment::render::build_comment_html_with_context(
         &draft.comment,
         config,
         &search_context.results,
         &chat_targets,
     );
-    ensure_comment_html(&final_html, &draft.comment)?;
+    ensure_comment_html(&final_html, &draft.comment).map_err(|_| CommentErrorKind::InvalidInput)?;
 
-    let sent = send_html_reply(bot, msg.chat.id, msg.id, final_html.clone()).await?;
+    let sent = send_html_reply(
+        bot,
+        ChatId(job.discussion_chat_id),
+        MessageId(job.discussion_message_id),
+        final_html.clone(),
+    )
+    .await
+    .map_err(|_| CommentErrorKind::Transient)?;
 
-    mark_post_comment_sent(pool, job_id, sent.id.0).await?;
+    Ok(JobOutcome::Prepared(CompletedComment {
+        bot_comment_message_id: sent.id.0,
+        generation,
+        draft,
+        prompt_for_log,
+        final_html,
+        search_context,
+        used_search_result_id,
+    }))
+}
+
+async fn finalize_completed_post_comment_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+    job: &PostCommentJob,
+    completed: CompletedComment,
+) -> anyhow::Result<JobOutcome> {
+    if !mark_post_comment_sent(&state.pool, job, completed.bot_comment_message_id).await? {
+        return Ok(JobOutcome::LeaseLost);
+    }
+
+    let attempts = serde_json::to_value(&completed.generation.attempts)?;
     insert_llm_generation(
-        pool,
+        &state.pool,
         LlmGenerationInsert {
-            job_id,
-            provider: &generation.provider,
-            model: &generation.model,
-            prompt: &prompt_for_log,
-            image_used: generation.image_used,
-            response: &draft.comment,
-            final_html: &final_html,
+            job_id: job.id,
+            provider: &completed.generation.provider,
+            model: &completed.generation.model,
+            prompt: &completed.prompt_for_log,
+            image_used: completed.generation.image_used,
+            response: &completed.draft.comment,
+            final_html: &completed.final_html,
             attempts: &attempts,
-            used_search_result_id,
-            used_chat_message_ids: &draft.used_chat_message_ids,
+            used_search_result_id: completed.used_search_result_id,
+            used_chat_message_ids: &completed.draft.used_chat_message_ids,
         },
     )
     .await?;
 
-    if let Some(owner_id) = owner_preview_chat(config) {
+    if let Some(owner_id) = owner_preview_chat(&state.config) {
         send_owner_preview(
             bot,
             owner_id,
-            &final_html,
-            candidate.source_message_id,
-            &search_context,
-            used_search_result_id,
+            &completed.final_html,
+            MessageId(job.source_message_id),
+            &completed.search_context,
+            completed.used_search_result_id,
         )
         .await;
     }
 
     if let Err(err) = enqueue_post_history(
-        pool,
-        job_id,
-        candidate.source_channel_id,
-        candidate.source_message_id.0,
-        &clean_post,
-        &draft.comment,
-        draft
+        &state.pool,
+        job.id,
+        job.source_channel_id,
+        job.source_message_id,
+        &job.cleaned_post_text,
+        &completed.draft.comment,
+        completed
+            .draft
             .used_search_result_id
-            .and_then(|id| search_context.results.get(id.saturating_sub(1))),
+            .and_then(|id| completed.search_context.results.get(id.saturating_sub(1))),
     )
     .await
     {
         tracing::warn!(%err, "failed to enqueue post history entry");
     }
 
-    Ok(())
+    Ok(JobOutcome::Completed)
 }
 
-fn ensure_comment_html(final_html: &str, raw_response: &str) -> anyhow::Result<()> {
+fn ensure_comment_html(final_html: &str, _raw_response: &str) -> anyhow::Result<()> {
     if final_html.trim().is_empty() {
-        anyhow::bail!(
-            "empty rendered comment from LLM response: {}",
-            raw_response.chars().take(120).collect::<String>()
-        );
+        anyhow::bail!("empty rendered comment from LLM response");
     }
 
     Ok(())
@@ -358,14 +458,23 @@ pub(crate) async fn download_largest_photo_base64(
     msg: &Message,
     config: &Config,
 ) -> anyhow::Result<Option<String>> {
-    let Some(photo) = msg
+    let image_file_id = msg
         .photo()
         .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height))
-    else {
+        .map(|photo| photo.file.id.as_str());
+    download_photo_base64(bot, image_file_id, config).await
+}
+
+async fn download_photo_base64(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    image_file_id: Option<&str>,
+    config: &Config,
+) -> anyhow::Result<Option<String>> {
+    let Some(image_file_id) = image_file_id else {
         return Ok(None);
     };
 
-    let file = bot.get_file(photo.file.id.clone()).await?;
+    let file = bot.get_file(image_file_id.to_owned()).await?;
     let max_bytes = u64::from(config.first_comment_max_image_mb) * 1024 * 1024;
     if u64::from(file.size) > max_bytes {
         anyhow::bail!(
