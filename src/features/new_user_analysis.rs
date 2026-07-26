@@ -49,6 +49,8 @@ struct NewUserFeatures {
     message_style: MessageStyle,
     id_rank_ratio: Option<f64>,
     username: Option<String>,
+    username_reuse_count: i64,
+    username_reuse_spammer_count: i64,
     first_name: Option<String>,
     last_name: Option<String>,
     display_name: Option<String>,
@@ -64,6 +66,8 @@ struct NewUserFeatures {
     profile_photo_reuse_count: i64,
     profile_photo_width: Option<i32>,
     profile_photo_height: Option<i32>,
+    avatar_primary_class: Option<String>,
+    avatar_personal_photo_probability: Option<f64>,
     emoji_status_custom_emoji_id: Option<String>,
     profile_accent_color_id: Option<i16>,
     personal_channel_chat_id: Option<i64>,
@@ -430,6 +434,8 @@ async fn load_features(
             ms.avg_message_len,
             ir.ratio as id_rank_ratio,
             p.username,
+            coalesce(uns.reuse_count, 0)::bigint as username_reuse_count,
+            coalesce(uns.reuse_spammer_count, 0)::bigint as username_reuse_spammer_count,
             p.first_name,
             p.last_name,
             nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') as display_name,
@@ -445,6 +451,8 @@ async fn load_features(
             coalesce(pr.reuse_count, 0)::bigint as profile_photo_reuse_count,
             p.profile_photo_width,
             p.profile_photo_height,
+            avatar.observation_json ->> 'primary_class' as avatar_primary_class,
+            (avatar.observation_json ->> 'personal_photo_probability')::double precision as avatar_personal_photo_probability,
             p.emoji_status_custom_emoji_id,
             p.profile_accent_color_id,
             p.personal_channel_chat_id,
@@ -470,12 +478,30 @@ async fn load_features(
         from telegram_chat_users cu
         left join telegram_user_profiles p on p.telegram_user_id = cu.telegram_user_id
         left join telegram_chat_member_snapshots s on s.chat_id = cu.chat_id and s.telegram_user_id = cu.telegram_user_id
+        left join lateral (
+            select observation_json
+            from avatar_image_analyses
+            where profile_photo_file_unique_id = p.profile_photo_file_unique_id
+            order by analyzed_at desc
+            limit 1
+        ) avatar on true
         left join msg_stats ms on true
         left join first_msg fm on true
         left join last_msg lm on true
         left join texture_stats ts on true
         left join id_rank ir on true
         left join latest_join_event lje on true
+        left join lateral (
+            select
+                count(*)::bigint as reuse_count,
+                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+            from telegram_user_profiles p2
+            left join telegram_chat_users cu2
+              on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
+            where nullif(lower(trim(p.username)), '') is not null
+              and lower(trim(p2.username)) = lower(trim(p.username))
+              and p2.telegram_user_id <> p.telegram_user_id
+        ) uns on true
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
@@ -554,6 +580,8 @@ async fn load_features(
             message_style,
             id_rank_ratio: row.get("id_rank_ratio"),
             username: row.get("username"),
+            username_reuse_count: row.get("username_reuse_count"),
+            username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
             first_name: row.get("first_name"),
             last_name: row.get("last_name"),
             display_name: row.get("display_name"),
@@ -569,6 +597,8 @@ async fn load_features(
             profile_photo_reuse_count: row.get("profile_photo_reuse_count"),
             profile_photo_width: row.get("profile_photo_width"),
             profile_photo_height: row.get("profile_photo_height"),
+            avatar_primary_class: row.get("avatar_primary_class"),
+            avatar_personal_photo_probability: row.get("avatar_personal_photo_probability"),
             emoji_status_custom_emoji_id: row.get("emoji_status_custom_emoji_id"),
             profile_accent_color_id: row.get("profile_accent_color_id"),
             personal_channel_chat_id: row.get("personal_channel_chat_id"),
@@ -627,9 +657,10 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(link_signal(features));
     risk.add_optional(foreign_invite_link_signal(features));
     risk.add_optional(recent_id_signal(features, config));
-    risk.add_optional(username_signal(&username_stats));
+    risk.add_optional(username_signal(features, &username_stats));
     risk.add_optional(display_name_signal(features));
     risk.add_optional(profile_photo_signal(features));
+    risk.add_optional(avatar_visual_signal(features));
     risk.add_optional(feminine_name_signal(features));
     risk.add_optional(homoglyph_profile_signal(features));
     risk.add_optional(message_texture_signal(features));
@@ -721,7 +752,23 @@ fn recent_id_signal(
     }
 }
 
-fn username_signal(stats: &UsernameStats) -> Option<RiskSignal> {
+fn username_signal(features: &NewUserFeatures, stats: &UsernameStats) -> Option<RiskSignal> {
+    if features.username_reuse_spammer_count > 0 {
+        return Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 22,
+            label: "username_reused_by_spammers",
+            reason: "Username has already appeared on manually marked spammers",
+        });
+    }
+    if features.username_reuse_count > 0 && features.message_count <= 3 {
+        return Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 10,
+            label: "username_reused_by_new_accounts",
+            reason: "Username is reused by other seen accounts",
+        });
+    }
     match (stats.has_random_suffix, stats.has_digits, stats.digit_count) {
         (true, _, _) => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
@@ -772,6 +819,27 @@ fn profile_photo_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
             reason: "No visible profile photo via Bot API",
         }),
         true => None,
+    }
+}
+
+fn avatar_visual_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
+    match (
+        features.avatar_primary_class.as_deref(),
+        features.avatar_personal_photo_probability,
+    ) {
+        (Some("suggestive_bait"), _) => Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 8,
+            label: "suggestive_avatar_bait",
+            reason: "Avatar analysis found a suggestive bait-style portrait",
+        }),
+        (Some("ordinary_personal"), Some(probability)) if probability >= 0.8 => Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 3,
+            label: "photorealistic_personal_portrait",
+            reason: "Avatar analysis found a photorealistic personal portrait",
+        }),
+        _ => None,
     }
 }
 
@@ -1294,6 +1362,10 @@ async fn save_audit(
         "profile_photo_file_id_present": features.profile_photo_file_id.is_some(),
         "profile_photo_file_unique_id_present": features.profile_photo_file_unique_id.is_some(),
         "profile_photo_reuse_count": features.profile_photo_reuse_count,
+        "avatar_primary_class": features.avatar_primary_class,
+        "avatar_personal_photo_probability": features.avatar_personal_photo_probability,
+        "username_reuse_count": features.username_reuse_count,
+        "username_reuse_spammer_count": features.username_reuse_spammer_count,
         "first_name_feminine_pattern": looks_like_feminine_first_name(features.first_name.as_deref()),
         "chat_context": {
             "only_replies_or_comments": only_replies_or_comments(features),
