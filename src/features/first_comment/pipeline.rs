@@ -94,6 +94,7 @@ pub async fn maybe_comment_post(
         tracing::warn!(%err, "failed to save search run");
     }
     let mut chat_candidates = Vec::new();
+    let mut expanded_chat_contexts = Vec::new();
     if let Some(plan) = search_context.plan.as_ref() {
         match crate::features::chat_retrieval::run_shadow_retrieval(
             pool,
@@ -120,6 +121,7 @@ pub async fn maybe_comment_post(
                         {
                             tracing::warn!(%err, "failed to save expanded chat contexts");
                         }
+                        expanded_chat_contexts = contexts;
                     }
                     Err(err) => tracing::warn!(%err, "failed to expand chat retrieval contexts"),
                 }
@@ -155,7 +157,12 @@ pub async fn maybe_comment_post(
                     chat_targets
                         .iter()
                         .find(|target| target.message_id == candidate.message_id)
-                        .map(|target| (*candidate, target.author_name.clone()))
+                        .map(|target| {
+                            let context = expanded_chat_contexts
+                                .iter()
+                                .find(|context| context.anchor_message_id == candidate.message_id);
+                            (*candidate, target.author_name.clone(), context)
+                        })
                 })
                 .collect::<Vec<_>>()
         })
