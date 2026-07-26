@@ -136,7 +136,39 @@ fn user_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, header},
+        routing::post,
+    };
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
+
+    struct CapturedRequest {
+        headers: HeaderMap,
+        body: Value,
+    }
+
+    async fn capture_request(
+        State(sender): State<mpsc::UnboundedSender<CapturedRequest>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        sender.send(CapturedRequest { headers, body }).unwrap();
+        Json(json!({
+            "id": "test-completion",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": null
+        }))
+    }
 
     fn llm_request<'a>(
         structured_output: Option<crate::llm::types::StructuredOutput<'a>>,
@@ -163,6 +195,51 @@ mod tests {
             json!({"role": "system", "content": "system"})
         );
         assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+    }
+
+    #[tokio::test]
+    async fn client_emits_authorization_user_agent_image_and_schema_over_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_request))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let schema = json!({"type": "object", "additionalProperties": false});
+        let request = llm_request(Some(crate::llm::types::StructuredOutput {
+            name: "wire_schema",
+            schema: &schema,
+        }));
+        let client = OpenAiCompatClient::new(
+            &format!("http://{address}/v1"),
+            "test-compatible-key",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(client.generate(request).await.unwrap().content, "OK");
+        let captured = receiver.recv().await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            captured.headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer test-compatible-key"
+        );
+        assert_eq!(
+            captured.headers.get(header::USER_AGENT).unwrap(),
+            "tg-ai-bot-teloxide/0.1"
+        );
+        assert_eq!(captured.body["max_completion_tokens"], 256);
+        assert_eq!(
+            captured.body["messages"][1]["content"][1]["type"],
+            "image_url"
+        );
+        assert_eq!(
+            captured.body["response_format"]["json_schema"]["name"],
+            "wire_schema"
+        );
     }
 
     #[test]
