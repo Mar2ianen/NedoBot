@@ -29,7 +29,7 @@ pub async fn handle_command(
     let pool = &state.pool;
     let config = &state.config;
 
-    if let Err(err) = save_telegram_message(pool, &msg).await {
+    if let Err(err) = save_telegram_message(pool, &msg, config).await {
         tracing::error!(%err, "failed to save command message");
     }
 
@@ -464,7 +464,7 @@ pub async fn handle_reply_user_stats_command(
     let pool = &state.pool;
     let config = &state.config;
 
-    if let Err(err) = save_telegram_message(pool, &msg).await {
+    if let Err(err) = save_telegram_message(pool, &msg, config).await {
         tracing::error!(%err, "failed to save command message");
     }
 

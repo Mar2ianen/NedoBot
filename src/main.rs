@@ -348,7 +348,7 @@ async fn handle_message_reaction_count(
 }
 
 async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<()> {
-    if let Err(err) = save_edited_telegram_message(&state.pool, &msg).await {
+    if let Err(err) = save_edited_telegram_message(&state.pool, &msg, &state.config).await {
         tracing::error!(%err, "failed to save edited message");
     }
 

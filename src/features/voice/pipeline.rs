@@ -58,7 +58,7 @@ pub async fn maybe_transcribe_voice(
         return Ok(false);
     };
 
-    save_telegram_message(&state.pool, msg).await?;
+    save_telegram_message(&state.pool, msg, &state.config).await?;
 
     let Some(job_id) = create_voice_job(&state.pool, &media).await? else {
         tracing::debug!(
