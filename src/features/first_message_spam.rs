@@ -22,6 +22,10 @@ pub async fn analyze_first_message(
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<bool> {
+    if !config.first_message_spam_enabled {
+        return Ok(false);
+    }
+
     let row = sqlx::query(
         "select first_message_text, first_message_analysis_at, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )
@@ -97,9 +101,14 @@ pub async fn analyze_first_message(
 
 pub async fn enqueue_first_message_spam_analysis(
     pool: &PgPool,
+    config: &Config,
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<()> {
+    if !config.first_message_spam_enabled {
+        return Ok(());
+    }
+
     sqlx::query(
         r#"
         insert into first_message_spam_analysis_jobs (chat_id, telegram_user_id)
@@ -119,6 +128,10 @@ pub async fn process_next_first_message_spam_analysis_job(
     pool: &PgPool,
     config: &Config,
 ) -> anyhow::Result<bool> {
+    if !config.first_message_spam_enabled {
+        return Ok(false);
+    }
+
     let job = sqlx::query(
         r#"
         with candidate as (
@@ -279,8 +292,8 @@ async fn classify_text(
     let generation = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
-            provider_override: Some("cerebras"),
-            model_override: config.avatar_classifier_model.as_deref(),
+            provider_override: Some(&config.first_message_spam_provider),
+            model_override: config.first_message_spam_model.as_deref(),
             system_prompt: Some(SYSTEM_PROMPT),
             prompt: &prompt,
             image_base64: None,
