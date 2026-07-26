@@ -120,7 +120,11 @@ fn normalize_profile_identifier(value: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
+pub async fn save_telegram_message(
+    pool: &PgPool,
+    msg: &Message,
+    config: &Config,
+) -> anyhow::Result<()> {
     let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
         .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
         .unwrap_or((None, None));
@@ -199,13 +203,19 @@ pub async fn save_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Resu
 
     if inserted {
         upsert_chat_user_activity(pool, msg, source_channel_id).await?;
-        enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
+        if config.chat_retrieval_embeddings_enabled {
+            enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
+        }
     }
 
     Ok(())
 }
 
-pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyhow::Result<()> {
+pub async fn save_edited_telegram_message(
+    pool: &PgPool,
+    msg: &Message,
+    config: &Config,
+) -> anyhow::Result<()> {
     let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
     let new_text = message_text(msg);
     let new_raw_json = serde_json::to_value(msg)?;
@@ -213,7 +223,7 @@ pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyho
         .as_ref()
         .is_none_or(|old| old.text.as_deref() != new_text || old.raw_json != new_raw_json);
 
-    save_telegram_message(pool, msg).await?;
+    save_telegram_message(pool, msg, config).await?;
 
     if !changed {
         return Ok(());
@@ -261,7 +271,9 @@ pub async fn save_edited_telegram_message(pool: &PgPool, msg: &Message) -> anyho
     .execute(pool)
     .await?;
 
-    enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
+    if config.chat_retrieval_embeddings_enabled {
+        enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
+    }
 
     Ok(())
 }

@@ -41,7 +41,7 @@ pub async fn maybe_comment_post(
     let pool = &state.pool;
     let config = &state.config;
 
-    save_telegram_message(pool, msg).await?;
+    save_telegram_message(pool, msg, config).await?;
 
     // The bot should never react to random chat messages. A valid target is only
     // Telegram's automatic channel post copy in the linked discussion chat.
