@@ -9,7 +9,7 @@ use teloxide::{
 };
 
 use crate::config::Config;
-use crate::features::chat_retrieval::enqueue_message_embedding;
+use crate::features::chat_retrieval::enqueue_message_embedding_if_enabled;
 use crate::telegram::entities::{forwarded_channel_post, message_has_links, message_text};
 use crate::text::normalize_cyrillic_homoglyphs;
 
@@ -203,9 +203,13 @@ pub async fn save_telegram_message(
 
     if inserted {
         upsert_chat_user_activity(pool, msg, source_channel_id).await?;
-        if config.chat_retrieval_embeddings_enabled {
-            enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
-        }
+        enqueue_message_embedding_if_enabled(
+            pool,
+            config.chat_retrieval_embeddings_enabled,
+            msg.chat.id.0,
+            msg.id.0,
+        )
+        .await?;
     }
 
     Ok(())
@@ -271,9 +275,13 @@ pub async fn save_edited_telegram_message(
     .execute(pool)
     .await?;
 
-    if config.chat_retrieval_embeddings_enabled {
-        enqueue_message_embedding(pool, msg.chat.id.0, msg.id.0).await?;
-    }
+    enqueue_message_embedding_if_enabled(
+        pool,
+        config.chat_retrieval_embeddings_enabled,
+        msg.chat.id.0,
+        msg.id.0,
+    )
+    .await?;
 
     Ok(())
 }

@@ -337,6 +337,19 @@ struct EmbeddingJob {
     attempts: i32,
 }
 
+pub async fn enqueue_message_embedding_if_enabled(
+    pool: &PgPool,
+    embeddings_enabled: bool,
+    chat_id: i64,
+    message_id: i32,
+) -> anyhow::Result<()> {
+    if !embeddings_enabled {
+        return Ok(());
+    }
+
+    enqueue_message_embedding(pool, chat_id, message_id).await
+}
+
 pub async fn enqueue_message_embedding(
     pool: &PgPool,
     chat_id: i64,
