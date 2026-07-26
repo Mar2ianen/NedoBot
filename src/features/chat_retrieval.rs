@@ -27,9 +27,9 @@ pub struct RetrievalCandidate {
 
 #[derive(Debug, Serialize)]
 pub struct ExpandedChatContext {
-    anchor_message_id: i32,
-    kind: &'static str,
-    messages: Vec<crate::features::ask::chat_search::ChatMessage>,
+    pub anchor_message_id: i32,
+    pub kind: &'static str,
+    pub messages: Vec<crate::features::ask::chat_search::ChatMessage>,
 }
 
 pub async fn expand_shadow_contexts(
