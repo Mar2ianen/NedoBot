@@ -10,6 +10,7 @@ use crate::features::avatar_analysis::repo::{
     AvatarAnalysisJob, claim_next_avatar_analysis_job, enqueue_avatar_analysis_job,
     mark_avatar_analysis_failed, mark_avatar_analysis_succeeded,
 };
+use crate::features::spam_review::{create_high_risk_review, send_review};
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
@@ -107,7 +108,7 @@ pub async fn process_next_avatar_analysis_job(
 }
 
 async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnalysisJob) {
-    let result = async {
+    let result: anyhow::Result<()> = async {
         let avatar = cache_profile_avatar(
             bot,
             &config.static_files_dir,
@@ -156,13 +157,21 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
             &response,
         )
         .await?;
-        apply_avatar_risk_signal(
+        let affected_chat_ids = apply_avatar_risk_signal(
             pool,
             job.telegram_user_id,
             &job.profile_photo_file_unique_id,
             observation,
         )
-        .await
+        .await?;
+        for chat_id in affected_chat_ids {
+            if let Some(review) = create_high_risk_review(pool, chat_id, job.telegram_user_id).await?
+                && let Err(err) = send_review(bot, &review).await
+            {
+                tracing::warn!(%err, user_id = job.telegram_user_id, "failed to send avatar risk review");
+            }
+        }
+        Ok(())
     }
     .await;
     if let Err(err) = result {
@@ -183,7 +192,7 @@ async fn apply_avatar_risk_signal(
     user_id: i64,
     profile_photo_file_unique_id: &str,
     observation: &serde_json::Value,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<i64>> {
     let primary_class = observation
         .get("primary_class")
         .and_then(serde_json::Value::as_str);
@@ -202,7 +211,7 @@ async fn apply_avatar_risk_signal(
             "photorealistic_personal_portrait",
             "Avatar analysis found a photorealistic personal portrait",
         ),
-        _ => return Ok(()),
+        _ => return Ok(Vec::new()),
     };
     let signal = serde_json::json!({
         "class": "llm_profile_bait",
@@ -212,7 +221,7 @@ async fn apply_avatar_risk_signal(
         "warning_strength": "weak",
         "assessment": { "avatar_primary_class": primary_class, "personal_photo_probability": personal_photo_probability }
     });
-    sqlx::query(
+    let rows = sqlx::query(
         r#"
         update telegram_new_user_profile_audits audit
         set risk_score = least(100, audit.risk_score + $3),
@@ -229,6 +238,7 @@ async fn apply_avatar_risk_signal(
               from jsonb_array_elements(coalesce(audit.risk_signal_breakdown, '[]'::jsonb)) item
               where item ->> 'label' = $5
           )
+        returning audit.chat_id
         "#,
     )
     .bind(user_id)
@@ -236,7 +246,7 @@ async fn apply_avatar_risk_signal(
     .bind(coefficient)
     .bind(signal)
     .bind(label)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(())
+    Ok(rows.into_iter().map(|row| row.get("chat_id")).collect())
 }
