@@ -12,6 +12,20 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg16-bookworm
+        env:
+          POSTGRES_DB: tg_ai_bot_test
+          POSTGRES_USER: tg_ai_bot_dev
+          POSTGRES_PASSWORD: tg_ai_bot_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tg_ai_bot_dev -d tg_ai_bot_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,3 +41,13 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets
+
+      - name: Apply PostgreSQL migrations
+        env:
+          DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+        run: cargo run --bin migrate
+
+      - name: Run PostgreSQL integration tests
+        env:
+          TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+        run: cargo test --test postgres_migrations -- --ignored
