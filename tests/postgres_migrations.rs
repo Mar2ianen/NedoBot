@@ -1,4 +1,4 @@
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, query, query_as, query_scalar};
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
@@ -102,17 +102,22 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         .with_ymd_and_hms(2000, 1, 1, 12, 0, 0)
         .single()
         .expect("test inside timestamp must be valid");
+    let comment_at = window.end_at - Duration::minutes(5);
+    let reply_after_window = window.end_at + Duration::minutes(1);
     query(
         r#"
-        insert into telegram_messages (chat_id, message_id, user_id, text, created_at)
+        insert into telegram_messages
+            (chat_id, message_id, user_id, source_channel_id, reply_to_message_id, text, created_at)
         values
-            ($1, 901, 901, 'inside report window', $2),
-            ($1, 902, 902, 'outside report window', $3)
+            ($1, 901, 901, null, null, 'inside report window', $2),
+            ($1, 902, 902, -1001575496091, null, 'outside report window', $3),
+            ($1, 903, 903, null, 1911, 'cohort reply after report window', $4)
         "#,
     )
     .bind(CHAT_ID)
     .bind(inside_at)
     .bind(window.end_at)
+    .bind(reply_after_window)
     .execute(pool)
     .await
     .expect("windowed stats messages must be inserted");
@@ -127,7 +132,7 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         "#,
     )
     .bind(CHAT_ID)
-    .bind(inside_at)
+    .bind(comment_at)
     .bind(window.end_at)
     .execute(pool)
     .await
@@ -154,12 +159,21 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         "bot comments must use the fixed window"
     );
     assert_eq!(bot_comments[0].source_message_id, 911);
+    assert_eq!(
+        attraction.messages_30m, "1.00",
+        "cohort reply after the report boundary must count for 30 minutes"
+    );
+    assert_eq!(
+        attraction.messages_24h, "1.00",
+        "cohort reply after the report boundary must count for 24 hours"
+    );
     let data = ChatStatsReportData {
         period: StatsPeriod::Day,
         summary: summary.clone(),
         attraction: AttractionMetrics {
             messages_5m: attraction.messages_5m,
             messages_30m: attraction.messages_30m,
+            messages_24h: attraction.messages_24h,
             users_30m: attraction.users_30m,
         },
         top_users: Vec::new(),

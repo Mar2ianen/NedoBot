@@ -48,6 +48,7 @@ impl From<ChatStatsSummaryRow> for ChatStatsSummary {
 pub struct AttractionMetricsRow {
     pub messages_5m: String,
     pub messages_30m: String,
+    pub messages_24h: String,
     pub users_30m: String,
 }
 
@@ -242,16 +243,20 @@ pub async fn chat_attraction_metrics(
     discussion_chat_id: i64,
     window: ReportWindow,
 ) -> anyhow::Result<AttractionMetricsRow> {
+    // The fixed window selects comment cohorts. Their engagement windows deliberately
+    // continue past `window.end_at`, so a comment just before the editorial boundary
+    // retains its complete 5m/30m/24h follow-up.
     let sql = r#"
         with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at),
         metrics as (
             select j.source_message_id,
                    count(m.*) filter (where m.created_at <= j.created_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as messages_5m,
                    count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as messages_30m,
+                   count(m.*) filter (where m.created_at <= j.created_at + interval '24 hours' and coalesce(m.text,'') !~ '^/') as messages_24h,
                    count(distinct m.user_id) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m
             from post_comment_jobs j
             left join telegram_messages m on m.chat_id = j.discussion_chat_id
-                and m.created_at > j.created_at and m.created_at <= j.created_at + interval '30 minutes'
+                and m.created_at > j.created_at and m.created_at <= j.created_at + interval '24 hours'
                 and m.message_id <> j.bot_comment_message_id and m.source_channel_id is null
             where j.discussion_chat_id = $1
               and j.created_at >= (select start_at from bounds) and j.created_at < (select end_at from bounds)
@@ -259,6 +264,7 @@ pub async fn chat_attraction_metrics(
         )
         select coalesce(round(avg(messages_5m)::numeric, 2), 0)::text as messages_5m,
                coalesce(round(avg(messages_30m)::numeric, 2), 0)::text as messages_30m,
+               coalesce(round(avg(messages_24h)::numeric, 2), 0)::text as messages_24h,
                coalesce(round(avg(users_30m)::numeric, 2), 0)::text as users_30m
         from metrics
         "#;

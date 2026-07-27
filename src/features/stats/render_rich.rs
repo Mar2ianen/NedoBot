@@ -55,6 +55,13 @@ pub fn chat_stats(data: &ChatStatsReportData, discussion_chat_id: i64) -> String
                 ),
             ],
             vec![
+                "24 часа".into(),
+                format!(
+                    "<strong>{}</strong> сообщений",
+                    escape_html(&data.attraction.messages_24h)
+                ),
+            ],
+            vec![
                 "Людей за 30 минут".into(),
                 format!(
                     "<strong>{}</strong>",

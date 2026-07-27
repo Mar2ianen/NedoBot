@@ -51,6 +51,7 @@ pub async fn chat_stats_report_data(
         attraction: AttractionMetrics {
             messages_5m: attraction.messages_5m,
             messages_30m: attraction.messages_30m,
+            messages_24h: attraction.messages_24h,
             users_30m: attraction.users_30m,
         },
         top_users,

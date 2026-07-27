@@ -64,6 +64,7 @@ pub struct ChatStatsReportData {
 pub struct AttractionMetrics {
     pub messages_5m: String,
     pub messages_30m: String,
+    pub messages_24h: String,
     pub users_30m: String,
 }
 

@@ -10,7 +10,7 @@ pub fn chat_stats(data: &ChatStatsReportData) -> String {
     let summary = &data.summary;
     let attraction = &data.attraction;
     let mut report = format!(
-        "<b>Статистика за {}</b>\nПериод с <code>{}</code> МСК\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, людей 30м <b>{}</b>",
+        "<b>Статистика за {}</b>\nПериод с <code>{}</code> МСК\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, 24ч <b>{}</b>, людей 30м <b>{}</b>",
         data.period.title(),
         escape_html(&summary.start_label),
         summary.messages,
@@ -28,6 +28,7 @@ pub fn chat_stats(data: &ChatStatsReportData) -> String {
         summary.leaves,
         attraction.messages_5m,
         attraction.messages_30m,
+        attraction.messages_24h,
         attraction.users_30m,
     );
     if !data.top_users.is_empty() {
