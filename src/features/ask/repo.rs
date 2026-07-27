@@ -1,10 +1,10 @@
-use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::types::Json;
 
 use crate::config::Config;
+use crate::features::ask::types::{AskRunStatus, ToolCallAudit};
 
-pub struct CreateAskRun<'a> {
+pub struct CreateAskRunParams<'a> {
     pub chat_id: i64,
     pub command_message_id: i32,
     pub requester_user_id: i64,
@@ -12,55 +12,12 @@ pub struct CreateAskRun<'a> {
     pub reply_to_message_id: Option<i32>,
 }
 
-#[derive(Clone, Copy)]
-pub enum ToolCallStatus {
-    Completed,
-    Failed,
-    SkippedDuplicate,
-}
-
-impl ToolCallStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::SkippedDuplicate => "skipped_duplicate",
-        }
-    }
-}
-
-pub struct ToolCallAudit<'a> {
-    pub ask_run_id: i64,
-    pub step_number: i32,
-    pub tool_name: &'a str,
-    pub arguments: &'a Value,
-    pub status: ToolCallStatus,
-    pub result_count: Option<i64>,
-    pub latency_ms: Option<i64>,
-    pub error_kind: Option<&'a str>,
-}
-
-#[derive(Clone, Copy)]
-pub enum AskRunStatus {
-    Completed,
-    Failed,
-}
-
-impl AskRunStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
-    }
-}
-
 pub async fn create_run(
     pool: &PgPool,
     config: &Config,
-    input: CreateAskRun<'_>,
+    input: CreateAskRunParams<'_>,
 ) -> anyhow::Result<i64> {
-    let CreateAskRun {
+    let CreateAskRunParams {
         chat_id,
         command_message_id,
         requester_user_id,

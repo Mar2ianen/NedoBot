@@ -7,6 +7,7 @@ use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
 use crate::features::ask::repo;
 use crate::features::ask::rich_markdown;
+use crate::features::ask::types::AskRunStatus;
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
@@ -287,7 +288,7 @@ async fn handle_ask_command(
     let ask_run_id = match repo::create_run(
         &state.pool,
         config,
-        repo::CreateAskRun {
+        repo::CreateAskRunParams {
             chat_id: msg.chat.id.0,
             command_message_id: msg.id.0,
             requester_user_id: user.id.0 as i64,
@@ -357,7 +358,7 @@ async fn handle_ask_command(
                     finish_ask_run(
                         &state.pool,
                         ask_run_id,
-                        repo::AskRunStatus::Failed,
+                        AskRunStatus::Failed,
                         None,
                         Some("render_validation"),
                     )
@@ -370,7 +371,7 @@ async fn handle_ask_command(
             finish_ask_run(
                 &state.pool,
                 ask_run_id,
-                repo::AskRunStatus::Completed,
+                AskRunStatus::Completed,
                 Some(&markdown),
                 None,
             )
@@ -391,7 +392,7 @@ async fn handle_ask_command(
             finish_ask_run(
                 &state.pool,
                 ask_run_id,
-                repo::AskRunStatus::Failed,
+                AskRunStatus::Failed,
                 None,
                 Some(ask_error_kind(&err)),
             )
@@ -406,7 +407,7 @@ async fn handle_ask_command(
 async fn finish_ask_run(
     pool: &sqlx::PgPool,
     ask_run_id: Option<i64>,
-    status: repo::AskRunStatus,
+    status: AskRunStatus,
     answer_markdown: Option<&str>,
     error_kind: Option<&str>,
 ) {
