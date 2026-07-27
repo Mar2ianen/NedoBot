@@ -87,9 +87,12 @@ pub async fn send_user_stats(
     if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
         service::refresh_user_profile(bot, pool, config, user_id).await;
     }
-    let data = service::user_stats_report_data(bot, pool, config, target, reply_user_id)
+    let mut data = service::user_stats_report_data(pool, config, target, reply_user_id)
         .await
         .map_err(stats_error("failed to build user stats"))?;
+    if let (StatsRender::Rich, Some(data)) = (render, data.as_mut()) {
+        service::enrich_user_stats_avatar(bot, config, data).await;
+    }
     let report = match render {
         StatsRender::Html => {
             render_html::user_stats(data.as_ref(), target, config.discussion_chat_id)

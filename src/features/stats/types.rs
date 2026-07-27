@@ -117,6 +117,8 @@ pub struct UserStatsReportData {
     pub username: Option<String>,
     pub bio: Option<String>,
     pub avatar_url: Option<String>,
+    pub(crate) profile_photo_file_id: Option<String>,
+    pub(crate) profile_photo_file_unique_id: Option<String>,
     pub observed_at: Option<String>,
     pub written_tag: Option<String>,
     pub first_seen_at: String,

@@ -588,6 +588,30 @@ pub async fn resolve_user_id(
     Ok(row.map(|(user_id,)| user_id))
 }
 
-fn clean_target_arg(target: &str) -> &str {
-    target.trim().trim_start_matches('@')
+fn clean_target_arg(target: &str) -> String {
+    target
+        .split_whitespace()
+        .filter(|part| !matches!(*part, "-r" | "--rich" | "-p" | "--plain" | "--poor"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_target_arg;
+
+    #[test]
+    fn user_stats_target_ignores_render_flags_in_any_position() {
+        let cases = [
+            ("@vasya -r", "@vasya"),
+            ("--rich @vasya", "@vasya"),
+            ("123 --plain", "123"),
+            ("-r", ""),
+            ("  @vasya  --poor  ", "@vasya"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(clean_target_arg(input), expected, "input: {input}");
+        }
+    }
 }
