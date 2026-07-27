@@ -4,10 +4,15 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::CallToolRequestParams,
     schemars, tool, tool_handler, tool_router,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    transport::{
+        TokioChildProcess,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
     },
 };
+
+const STDIO_CHILD_ENV: &str = "RMCP_STDIO_ECHO_CHILD";
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +60,24 @@ fn result_text(result: &rmcp::model::CallToolResult) -> &str {
         .expect("echo result must contain text")
 }
 
+async fn serve_stdio_echo_child() -> Result<()> {
+    HarnessServer::new()
+        .serve(rmcp::transport::stdio())
+        .await?
+        .waiting()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_echo_child_server() -> Result<()> {
+    if std::env::var_os(STDIO_CHILD_ENV).is_none() {
+        return Ok(());
+    }
+
+    serve_stdio_echo_child().await
+}
+
 async fn streamable_response_json(response: reqwest::Response) -> Result<serde_json::Value> {
     let body = response.error_for_status()?.text().await?;
     if let Ok(json) = serde_json::from_str(&body) {
@@ -95,6 +118,32 @@ async fn duplex_transport_initializes_lists_calls_and_shuts_down() -> Result<()>
 
     client.close().await?;
     server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_process_stdio_transport_initializes_lists_calls_and_closes() -> Result<()> {
+    let current_test_binary = std::env::current_exe()?;
+    let mut command = tokio::process::Command::new(current_test_binary);
+    command
+        .env(STDIO_CHILD_ENV, "1")
+        .args(["--exact", "stdio_echo_child_server", "--nocapture"]);
+
+    let transport = TokioChildProcess::new(command)?;
+    let mut client = ().serve(transport).await?;
+    let tools = client.list_tools(None).await?;
+    assert_eq!(tools.tools.len(), 1);
+    assert_eq!(tools.tools[0].name, "echo");
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("echo")
+                .with_arguments(echo_arguments("child-process-stdio")),
+        )
+        .await?;
+    assert_eq!(result_text(&result), "child-process-stdio");
+
+    client.close().await?;
     Ok(())
 }
 
