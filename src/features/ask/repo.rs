@@ -4,26 +4,69 @@ use sqlx::types::Json;
 
 use crate::config::Config;
 
+pub struct CreateAskRun<'a> {
+    pub chat_id: i64,
+    pub command_message_id: i32,
+    pub requester_user_id: i64,
+    pub question: &'a str,
+    pub reply_to_message_id: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ToolCallStatus {
+    Completed,
+    Failed,
+    SkippedDuplicate,
+}
+
+impl ToolCallStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::SkippedDuplicate => "skipped_duplicate",
+        }
+    }
+}
+
 pub struct ToolCallAudit<'a> {
-    pub ask_run_id: Option<i64>,
+    pub ask_run_id: i64,
     pub step_number: i32,
     pub tool_name: &'a str,
     pub arguments: &'a Value,
-    pub status: &'a str,
+    pub status: ToolCallStatus,
     pub result_count: Option<i64>,
     pub latency_ms: Option<i64>,
     pub error_kind: Option<&'a str>,
 }
 
+#[derive(Clone, Copy)]
+pub enum AskRunStatus {
+    Completed,
+    Failed,
+}
+
+impl AskRunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 pub async fn create_run(
     pool: &PgPool,
     config: &Config,
-    chat_id: i64,
-    command_message_id: i32,
-    requester_user_id: i64,
-    question: &str,
-    reply_to_message_id: Option<i32>,
+    input: CreateAskRun<'_>,
 ) -> anyhow::Result<i64> {
+    let CreateAskRun {
+        chat_id,
+        command_message_id,
+        requester_user_id,
+        question,
+        reply_to_message_id,
+    } = input;
     sqlx::query_scalar(
         r#"
         insert into ask_runs (
@@ -47,9 +90,6 @@ pub async fn create_run(
 }
 
 pub async fn record_tool_call(pool: &PgPool, audit: ToolCallAudit<'_>) -> anyhow::Result<()> {
-    let Some(ask_run_id) = audit.ask_run_id else {
-        return Ok(());
-    };
     sqlx::query(
         r#"
         insert into ask_tool_calls (
@@ -59,11 +99,11 @@ pub async fn record_tool_call(pool: &PgPool, audit: ToolCallAudit<'_>) -> anyhow
         values ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
     )
-    .bind(ask_run_id)
+    .bind(audit.ask_run_id)
     .bind(audit.step_number)
     .bind(audit.tool_name)
     .bind(Json(audit.arguments))
-    .bind(audit.status)
+    .bind(audit.status.as_str())
     .bind(audit.result_count)
     .bind(audit.latency_ms)
     .bind(audit.error_kind)
@@ -75,7 +115,7 @@ pub async fn record_tool_call(pool: &PgPool, audit: ToolCallAudit<'_>) -> anyhow
 pub async fn finish_run(
     pool: &PgPool,
     ask_run_id: i64,
-    status: &str,
+    status: AskRunStatus,
     answer_markdown: Option<&str>,
     error_kind: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -95,7 +135,7 @@ pub async fn finish_run(
         "#,
     )
     .bind(ask_run_id)
-    .bind(status)
+    .bind(status.as_str())
     .bind(error_kind)
     .bind(answer_markdown)
     .execute(pool)

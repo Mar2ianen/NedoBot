@@ -46,6 +46,16 @@ pub struct AskRequest<'a> {
     pub progress: Option<&'a UnboundedSender<AskProgress>>,
 }
 
+struct PendingToolCallAudit<'a> {
+    step: usize,
+    tool_name: &'a str,
+    arguments: &'a Value,
+    status: repo::ToolCallStatus,
+    result_count: Option<i64>,
+    latency_ms: Option<i64>,
+    error_kind: Option<&'a str>,
+}
+
 impl AskProgress {
     pub fn message(self) -> &'static str {
         match self {
@@ -282,12 +292,12 @@ pub async fn answer(
                 if !tool_signatures.insert(signature) {
                     audit_tool_call(
                         pool,
-                        repo::ToolCallAudit {
-                            ask_run_id,
-                            step_number: i32::try_from(step + 1).unwrap_or(i32::MAX),
+                        ask_run_id,
+                        PendingToolCallAudit {
+                            step,
                             tool_name: tool,
                             arguments: &action.arguments,
-                            status: "skipped_duplicate",
+                            status: repo::ToolCallStatus::SkippedDuplicate,
                             result_count: None,
                             latency_ms: Some(0),
                             error_kind: Some("duplicate"),
@@ -320,12 +330,12 @@ pub async fn answer(
                     Ok(result) => {
                         audit_tool_call(
                             pool,
-                            repo::ToolCallAudit {
-                                ask_run_id,
-                                step_number: i32::try_from(step + 1).unwrap_or(i32::MAX),
+                            ask_run_id,
+                            PendingToolCallAudit {
+                                step,
                                 tool_name: tool,
                                 arguments: &tracking_arguments,
-                                status: "completed",
+                                status: repo::ToolCallStatus::Completed,
                                 result_count: tool_result_count(&result),
                                 latency_ms: elapsed_millis(started),
                                 error_kind: None,
@@ -341,12 +351,12 @@ pub async fn answer(
                     Err(err) => {
                         audit_tool_call(
                             pool,
-                            repo::ToolCallAudit {
-                                ask_run_id,
-                                step_number: i32::try_from(step + 1).unwrap_or(i32::MAX),
+                            ask_run_id,
+                            PendingToolCallAudit {
+                                step,
                                 tool_name: tool,
                                 arguments: &tracking_arguments,
-                                status: "failed",
+                                status: repo::ToolCallStatus::Failed,
                                 result_count: None,
                                 latency_ms: elapsed_millis(started),
                                 error_kind: Some("tool_error"),
@@ -571,12 +581,34 @@ fn allowed_mcp_tool(tool: &str) -> bool {
     MCP_TOOLS.contains(&tool)
 }
 
-async fn audit_tool_call(pool: &PgPool, audit: repo::ToolCallAudit<'_>) {
-    let ask_run_id = audit.ask_run_id;
-    let tool_name = audit.tool_name;
+async fn audit_tool_call(
+    pool: &PgPool,
+    ask_run_id: Option<i64>,
+    pending: PendingToolCallAudit<'_>,
+) {
+    let Some(ask_run_id) = ask_run_id else {
+        return;
+    };
+    let tool_name = pending.tool_name;
+    let audit = repo::ToolCallAudit {
+        ask_run_id,
+        step_number: audit_step_number(pending.step),
+        tool_name,
+        arguments: pending.arguments,
+        status: pending.status,
+        result_count: pending.result_count,
+        latency_ms: pending.latency_ms,
+        error_kind: pending.error_kind,
+    };
     if let Err(err) = repo::record_tool_call(pool, audit).await {
-        tracing::warn!(%err, ?ask_run_id, tool_name, "failed to audit ask tool call");
+        tracing::warn!(%err, ask_run_id, tool_name, "failed to audit ask tool call");
     }
+}
+
+fn audit_step_number(step: usize) -> i32 {
+    step.checked_add(1)
+        .and_then(|number| i32::try_from(number).ok())
+        .unwrap_or(i32::MAX)
 }
 
 fn elapsed_millis(started: Instant) -> Option<i64> {
