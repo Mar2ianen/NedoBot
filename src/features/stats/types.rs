@@ -13,7 +13,7 @@ pub enum StatsRender {
     Rich,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct ChatStatsSummary {
     pub start_label: String,
     pub messages: i64,
@@ -31,6 +31,119 @@ pub struct ChatStatsSummary {
     pub leaves: i64,
 }
 
+/// Complete period data shared by the Telegram HTML and Rich renderers.
+/// Renderer modules only format this model; SQL lives in `stats::repo`.
+#[derive(Clone)]
+pub struct ChatStatsReportData {
+    pub period: StatsPeriod,
+    pub summary: ChatStatsSummary,
+    pub attraction: AttractionMetrics,
+    pub top_users: Vec<PeriodTopUser>,
+    pub bot_comments: Vec<BotCommentStats>,
+}
+
+#[derive(Clone)]
+pub struct AttractionMetrics {
+    pub messages_5m: String,
+    pub messages_30m: String,
+    pub users_30m: String,
+}
+
+#[derive(Clone)]
+pub struct PeriodTopUser {
+    pub user: UserPresentation,
+    pub username: Option<String>,
+    pub messages: i64,
+    pub replies: i64,
+    pub links: i64,
+    pub media: i64,
+}
+
+#[derive(Clone)]
+pub struct BotCommentStats {
+    pub source_message_id: i32,
+    pub response: String,
+    pub messages_30m: i64,
+    pub direct_replies: i64,
+    pub reactions: i64,
+}
+
+#[derive(Clone)]
+pub struct TopMessagesReportData {
+    pub users: Vec<TopMessageUser>,
+}
+
+#[derive(Clone)]
+pub struct TopMessageUser {
+    pub user: UserPresentation,
+    pub username: Option<String>,
+    pub messages: i64,
+    pub replies: i64,
+    pub media: i64,
+    pub voices: i64,
+    pub links: i64,
+    pub reactions_received: i64,
+}
+
+#[derive(Clone)]
+pub struct TopReactedReportData {
+    pub messages: Vec<TopReactedMessage>,
+}
+
+#[derive(Clone)]
+pub struct TopReactedMessage {
+    pub message_id: i32,
+    pub user: UserPresentation,
+    pub username: Option<String>,
+    pub text: Option<String>,
+    pub media: MessageMediaPreview,
+    pub total_count: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct MessageMediaPreview {
+    pub has_photo: bool,
+    pub has_video: bool,
+    pub has_document: bool,
+    pub has_audio: bool,
+    pub has_voice: bool,
+    pub has_sticker: bool,
+    pub has_animation: bool,
+}
+
+#[derive(Clone)]
+pub struct UserStatsReportData {
+    pub user: UserPresentation,
+    pub username: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+    pub observed_at: Option<String>,
+    pub written_tag: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub first_message_id: String,
+    pub last_message_id: String,
+    pub first_seen_days_ago: Option<i64>,
+    pub last_seen_days_ago: Option<i64>,
+    pub totals: UserTotals,
+    pub reactions_given: i64,
+    pub reactions_received: i64,
+    pub top_words: Vec<(String, i64)>,
+}
+
+#[derive(Clone)]
+pub struct UserTotals {
+    pub messages: i64,
+    pub replies: i64,
+    pub links: i64,
+    pub media: i64,
+    pub post_comments: i64,
+    pub replies_to_bot: i64,
+    pub active_days: i64,
+    pub voices: i64,
+}
+
+#[derive(Clone)]
 pub struct UserPresentation {
     pub user_id: i64,
     pub display_name: String,

@@ -9,6 +9,10 @@ use tg_ai_bot_teloxide::features::{
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
     spam_review::create_high_risk_review,
+    stats::{
+        render_html, render_rich, repo as stats_repo,
+        types::{AttractionMetrics, ChatStatsReportData, StatsPeriod},
+    },
 };
 
 #[tokio::test]
@@ -22,6 +26,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
 
     assert_clean_database_migrations(&pool).await;
     assert_public_mcp_scope(&pool).await;
+    assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_high_risk_review_deduplication(&pool).await;
@@ -80,6 +85,36 @@ async fn assert_public_mcp_scope(pool: &PgPool) {
     .expect("public MCP view query must succeed");
 
     assert_eq!(public_messages, vec!["discussion message"]);
+}
+
+async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    let summary = stats_repo::chat_stats_summary(pool, CHAT_ID, StatsPeriod::Day)
+        .await
+        .expect("period summary query must succeed");
+    let attraction = stats_repo::chat_attraction_metrics(pool, CHAT_ID, StatsPeriod::Day)
+        .await
+        .expect("attraction query must succeed");
+    let data = ChatStatsReportData {
+        period: StatsPeriod::Day,
+        summary: summary.clone(),
+        attraction: AttractionMetrics {
+            messages_5m: attraction.messages_5m,
+            messages_30m: attraction.messages_30m,
+            users_30m: attraction.users_30m,
+        },
+        top_users: Vec::new(),
+        bot_comments: Vec::new(),
+    };
+
+    let html = render_html::chat_stats(&data);
+    let rich = render_rich::chat_stats(&data, CHAT_ID);
+    let messages = format!("{}", summary.messages);
+    let active_users = format!("{}", summary.active_users);
+    assert!(html.contains(&messages));
+    assert!(rich.contains(&messages));
+    assert!(html.contains(&active_users));
+    assert!(rich.contains(&active_users));
 }
 
 async fn assert_feature_gated_jobs(pool: &PgPool) {
