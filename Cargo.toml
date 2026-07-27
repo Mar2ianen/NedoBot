@@ -10,6 +10,7 @@ axum = "0.8"
 async-openai = { version = "0.41", features = ["chat-completion"] }
 async-trait = "0.1"
 base64 = "0.22"
+chrono = "0.4"
 dotenvy = "0.15"
 reqwest = { version = "0.13", features = ["json", "multipart", "socks"] }
 serde = { version = "1", features = ["derive"] }

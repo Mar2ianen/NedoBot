@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 use crate::telegram::html::Html;
 
 #[derive(Clone, Copy)]
@@ -11,6 +13,22 @@ pub enum StatsPeriod {
 pub enum StatsRender {
     Html,
     Rich,
+}
+
+/// Fixed bounds shared by every query of one period report.
+///
+/// The repository computes the editorial 05:00 Moscow start; callers bind both
+/// timestamps rather than independently evaluating `now()` in each query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReportWindow {
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+}
+
+impl ReportWindow {
+    pub const fn new(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Self {
+        Self { start_at, end_at }
+    }
 }
 
 #[derive(Clone)]

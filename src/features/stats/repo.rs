@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use crate::features::stats::types::{ChatStatsSummary, StatsPeriod};
+use crate::features::stats::types::{ChatStatsSummary, ReportWindow, StatsPeriod};
 
 /// Telegram's built-in service account. It is excluded from human activity rankings.
 pub const TELEGRAM_SERVICE_USER_ID: i64 = 777_000;
@@ -164,15 +164,30 @@ pub struct UserTotals {
     pub voices: i64,
 }
 
+/// Resolves the editorial period once so all report queries use identical bounds.
+pub async fn report_window(pool: &PgPool, period: StatsPeriod) -> anyhow::Result<ReportWindow> {
+    #[derive(sqlx::FromRow)]
+    struct ReportWindowRow {
+        start_at: chrono::DateTime<chrono::Utc>,
+        end_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    let sql = format!(
+        "select {} as start_at, now() as end_at",
+        period_start_sql(period)
+    );
+    let row: ReportWindowRow = sqlx::query_as(&sql).fetch_one(pool).await?;
+    Ok(ReportWindow::new(row.start_at, row.end_at))
+}
+
 pub async fn chat_stats_summary(
     pool: &PgPool,
     discussion_chat_id: i64,
-    period: StatsPeriod,
+    window: ReportWindow,
 ) -> anyhow::Result<ChatStatsSummary> {
-    let sql = format!(
-        r#"
+    let sql = r#"
         with bounds as (
-            select {} as start_at, now() as end_at
+            select $2::timestamptz as start_at, $3::timestamptz as end_at
         ),
         messages as (
             select m.* from telegram_messages m, bounds b
@@ -197,7 +212,7 @@ pub async fn chat_stats_summary(
         select
             to_char((select start_at from bounds) at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as start_label,
             count(*)::bigint as messages,
-            count(distinct user_id) filter (where source_channel_id is null and coalesce(user_id, 0) <> $2)::bigint as active_users,
+            count(distinct user_id) filter (where source_channel_id is null and coalesce(user_id, 0) <> $4)::bigint as active_users,
             count(*) filter (where reply_to_message_id is not null)::bigint as replies,
             count(*) filter (where has_links)::bigint as links,
             count(*) filter (where has_photo or has_video or has_document or has_audio or has_voice or has_sticker or has_animation)::bigint as media,
@@ -210,12 +225,12 @@ pub async fn chat_stats_summary(
             (select count(*) from member_events where old_status in ('left', 'banned') and new_status not in ('left', 'banned'))::bigint as joins,
             (select count(*) from member_events where old_status not in ('left', 'banned') and new_status in ('left', 'banned'))::bigint as leaves
         from messages
-        "#,
-        period_start_sql(period)
-    );
+        "#;
 
-    let row: ChatStatsSummaryRow = sqlx::query_as(&sql)
+    let row: ChatStatsSummaryRow = sqlx::query_as(sql)
         .bind(discussion_chat_id)
+        .bind(window.start_at)
+        .bind(window.end_at)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .fetch_one(pool)
         .await?;
@@ -225,11 +240,10 @@ pub async fn chat_stats_summary(
 pub async fn chat_attraction_metrics(
     pool: &PgPool,
     discussion_chat_id: i64,
-    period: StatsPeriod,
+    window: ReportWindow,
 ) -> anyhow::Result<AttractionMetricsRow> {
-    let sql = format!(
-        r#"
-        with bounds as (select {} as start_at, now() as end_at),
+    let sql = r#"
+        with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at),
         metrics as (
             select j.source_message_id,
                    count(m.*) filter (where m.created_at <= j.created_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as messages_5m,
@@ -247,12 +261,12 @@ pub async fn chat_attraction_metrics(
                coalesce(round(avg(messages_30m)::numeric, 2), 0)::text as messages_30m,
                coalesce(round(avg(users_30m)::numeric, 2), 0)::text as users_30m
         from metrics
-        "#,
-        period_start_sql(period)
-    );
+        "#;
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sql)
         .bind(discussion_chat_id)
+        .bind(window.start_at)
+        .bind(window.end_at)
         .fetch_one(pool)
         .await
         .map_err(Into::into)
@@ -261,12 +275,11 @@ pub async fn chat_attraction_metrics(
 pub async fn period_top_users(
     pool: &PgPool,
     discussion_chat_id: i64,
-    period: StatsPeriod,
+    window: ReportWindow,
     limit: i64,
 ) -> anyhow::Result<Vec<PeriodTopUserRow>> {
-    let sql = format!(
-        r#"
-        with bounds as (select {} as start_at, now() as end_at)
+    let sql = r#"
+        with bounds as (select $3::timestamptz as start_at, $4::timestamptz as end_at)
         select m.user_id, p.username, p.first_name, p.last_name,
                count(*)::bigint as messages,
                count(*) filter (where m.reply_to_message_id is not null)::bigint as replies,
@@ -282,14 +295,14 @@ pub async fn period_top_users(
           and m.created_at >= (select start_at from bounds) and m.created_at < (select end_at from bounds)
         group by m.user_id, p.username, p.first_name, p.last_name, s.status, s.is_admin, s.is_present
         order by messages desc
-        limit $3
-        "#,
-        period_start_sql(period)
-    );
+        limit $5
+        "#;
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sql)
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
+        .bind(window.start_at)
+        .bind(window.end_at)
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -299,12 +312,11 @@ pub async fn period_top_users(
 pub async fn bot_comments_for_period(
     pool: &PgPool,
     discussion_chat_id: i64,
-    period: StatsPeriod,
+    window: ReportWindow,
     limit: i64,
 ) -> anyhow::Result<Vec<BotCommentStatsRow>> {
-    let sql = format!(
-        r#"
-        with bounds as (select {} as start_at, now() as end_at)
+    let sql = r#"
+        with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at)
         select j.source_message_id, coalesce(g.response, '') as response,
                count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/')::bigint as messages_30m,
                count(m.*) filter (where m.reply_to_message_id = j.bot_comment_message_id)::bigint as direct_replies,
@@ -319,13 +331,13 @@ pub async fn bot_comments_for_period(
           and j.created_at >= (select start_at from bounds) and j.created_at < (select end_at from bounds)
         group by j.source_message_id, g.response
         order by messages_30m desc, direct_replies desc, reactions desc
-        limit $2
-        "#,
-        period_start_sql(period)
-    );
+        limit $4
+        "#;
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sql)
         .bind(discussion_chat_id)
+        .bind(window.start_at)
+        .bind(window.end_at)
         .bind(limit)
         .fetch_all(pool)
         .await
