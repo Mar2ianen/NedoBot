@@ -92,15 +92,19 @@ pub async fn claim_next_avatar_analysis_job(
     }))
 }
 
+pub struct AvatarAnalysisSuccess<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub input_hash: &'a str,
+    pub observation: &'a Value,
+    pub assessment: &'a Value,
+    pub response: &'a Value,
+}
+
 pub async fn mark_avatar_analysis_succeeded(
     pool: &PgPool,
     job: &AvatarAnalysisJob,
-    provider: &str,
-    model: &str,
-    input_hash: &str,
-    observation: &Value,
-    assessment: &Value,
-    response: &Value,
+    success: AvatarAnalysisSuccess<'_>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -115,11 +119,11 @@ pub async fn mark_avatar_analysis_succeeded(
     )
     .bind(&job.profile_photo_file_unique_id)
     .bind(&job.prompt_version)
-    .bind(provider)
-    .bind(model)
-    .bind(input_hash)
-    .bind(observation)
-    .bind(response)
+    .bind(success.provider)
+    .bind(success.model)
+    .bind(success.input_hash)
+    .bind(success.observation)
+    .bind(success.response)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -136,11 +140,11 @@ pub async fn mark_avatar_analysis_succeeded(
     .bind(&job.profile_photo_file_unique_id)
     .bind(&job.features_snapshot_hash)
     .bind(&job.prompt_version)
-    .bind(provider)
-    .bind(model)
-    .bind(input_hash)
-    .bind(assessment)
-    .bind(response)
+    .bind(success.provider)
+    .bind(success.model)
+    .bind(success.input_hash)
+    .bind(success.assessment)
+    .bind(success.response)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
@@ -152,8 +156,8 @@ pub async fn mark_avatar_analysis_succeeded(
         "#,
     )
     .bind(job.id)
-    .bind(provider)
-    .bind(model)
+    .bind(success.provider)
+    .bind(success.model)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

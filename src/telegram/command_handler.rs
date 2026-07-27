@@ -305,13 +305,15 @@ async fn handle_ask_command(
     let answer = agent::answer(
         config,
         &state.pool,
-        ask_run_id,
-        user.id.0 as i64,
-        &requester_identity,
-        question,
-        reply_context.as_deref(),
-        reply_image.as_deref(),
-        progress_message.as_ref().map(|_| &progress_tx),
+        agent::AskRequest {
+            ask_run_id,
+            requester_user_id: user.id.0 as i64,
+            requester_identity: &requester_identity,
+            question,
+            reply_context: reply_context.as_deref(),
+            image_base64: reply_image.as_deref(),
+            progress: progress_message.as_ref().map(|_| &progress_tx),
+        },
     );
     tokio::pin!(answer);
     let mut progress_open = progress_message.is_some();

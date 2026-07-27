@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::features::voice::types::{
     AsrTranscript, CleanTranscript, TranscriptChapter, TranscriptRenderMode,
 };
-use crate::llm::service::generate_text_with_provider_and_system;
+use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 
 const CLEANUP_PROMPT: &str = include_str!("../../../prompts/voice_cleanup.md");
 const MIN_CLEANUP_CONTENT_PERCENT: usize = 65;
@@ -74,15 +74,19 @@ async fn generate_cleanup_with_provider(
     model: Option<&str>,
     prompt: &str,
 ) -> anyhow::Result<crate::llm::types::GeneratedText> {
-    generate_text_with_provider_and_system(
+    generate_text_with_provider_checked(
         config,
-        provider,
-        model,
-        Some(CLEANUP_PROMPT),
-        prompt,
-        None,
-        config.voice_cleanup_temperature,
-        config.voice_cleanup_max_tokens,
+        GenerateTextOptions {
+            provider_override: provider,
+            model_override: model,
+            system_prompt: Some(CLEANUP_PROMPT),
+            prompt,
+            image_base64: None,
+            temperature: config.voice_cleanup_temperature,
+            num_predict: config.voice_cleanup_max_tokens,
+            output_validator: None,
+            structured_output: None,
+        },
     )
     .await
 }

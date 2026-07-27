@@ -24,46 +24,50 @@ pub async fn transcribe_audio(
         anyhow::bail!("GROQ_API_KEY is empty");
     }
 
-    transcribe_groq_audio(
+    transcribe_groq_audio(GroqTranscriptionRequest {
         path,
         filename,
         mime_type,
-        config.groq_api_key.trim(),
-        &config.voice_asr_model,
-        &config.voice_language,
-        config.voice_asr_temperature,
-        GROQ_TRANSCRIPTIONS_URL,
-    )
+        api_key: config.groq_api_key.trim(),
+        model: &config.voice_asr_model,
+        language: &config.voice_language,
+        temperature: config.voice_asr_temperature,
+        endpoint: GROQ_TRANSCRIPTIONS_URL,
+    })
     .await
 }
 
-async fn transcribe_groq_audio(
-    path: &Path,
-    filename: &str,
-    mime_type: Option<&str>,
-    api_key: &str,
-    model: &str,
-    language: &str,
+struct GroqTranscriptionRequest<'a> {
+    path: &'a Path,
+    filename: &'a str,
+    mime_type: Option<&'a str>,
+    api_key: &'a str,
+    model: &'a str,
+    language: &'a str,
     temperature: f32,
-    endpoint: &str,
+    endpoint: &'a str,
+}
+
+async fn transcribe_groq_audio(
+    request: GroqTranscriptionRequest<'_>,
 ) -> anyhow::Result<AsrTranscript> {
-    let bytes = tokio::fs::read(path).await?;
-    let mut file_part = Part::bytes(bytes).file_name(filename.to_string());
-    if let Some(mime_type) = mime_type {
+    let bytes = tokio::fs::read(request.path).await?;
+    let mut file_part = Part::bytes(bytes).file_name(request.filename.to_string());
+    if let Some(mime_type) = request.mime_type {
         file_part = file_part.mime_str(mime_type)?;
     }
 
     let form = Form::new()
-        .text("model", model.to_string())
+        .text("model", request.model.to_string())
         .text("response_format", "verbose_json")
-        .text("language", language.to_string())
-        .text("temperature", temperature.to_string())
+        .text("language", request.language.to_string())
+        .text("temperature", request.temperature.to_string())
         .text("timestamp_granularities[]", "segment")
         .part("file", file_part);
 
     let response = http::client(Duration::from_secs(120))?
-        .post(endpoint)
-        .bearer_auth(api_key)
+        .post(request.endpoint)
+        .bearer_auth(request.api_key)
         .multipart(form)
         .send()
         .await?
@@ -76,7 +80,7 @@ async fn transcribe_groq_audio(
 
     Ok(AsrTranscript {
         provider: "groq".to_string(),
-        model: model.to_string(),
+        model: request.model.to_string(),
         request_id: response.x_groq.and_then(|value| value.id),
         text,
         segments: response
@@ -178,16 +182,16 @@ mod tests {
         std::fs::write(audio_file.path(), audio_bytes).unwrap();
         let endpoint = format!("http://{address}/audio/transcriptions");
 
-        let transcript = transcribe_groq_audio(
-            audio_file.path(),
-            "voice-message.ogg",
-            Some("audio/ogg"),
-            "test-groq-key",
-            "whisper-large-v3-turbo",
-            "ru",
-            0.0,
-            &endpoint,
-        )
+        let transcript = transcribe_groq_audio(GroqTranscriptionRequest {
+            path: audio_file.path(),
+            filename: "voice-message.ogg",
+            mime_type: Some("audio/ogg"),
+            api_key: "test-groq-key",
+            model: "whisper-large-v3-turbo",
+            language: "ru",
+            temperature: 0.0,
+            endpoint: &endpoint,
+        })
         .await
         .unwrap();
 

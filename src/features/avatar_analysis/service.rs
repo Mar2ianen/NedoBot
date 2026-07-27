@@ -7,8 +7,8 @@ use crate::features::avatar_analysis::prompt::{
     PROMPT_VERSION, build_input, output_schema, system_prompt,
 };
 use crate::features::avatar_analysis::repo::{
-    AvatarAnalysisJob, claim_next_avatar_analysis_job, enqueue_avatar_analysis_job,
-    mark_avatar_analysis_failed, mark_avatar_analysis_succeeded,
+    AvatarAnalysisJob, AvatarAnalysisSuccess, claim_next_avatar_analysis_job,
+    enqueue_avatar_analysis_job, mark_avatar_analysis_failed, mark_avatar_analysis_succeeded,
 };
 use crate::features::spam_review::{create_high_risk_review, send_review};
 use crate::features::user_profiles::avatar::cache_profile_avatar;
@@ -149,12 +149,14 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
         mark_avatar_analysis_succeeded(
             pool,
             &job,
-            &generation.provider,
-            &generation.model,
-            &input_hash,
-            observation,
-            assessment,
-            &response,
+            AvatarAnalysisSuccess {
+                provider: &generation.provider,
+                model: &generation.model,
+                input_hash: &input_hash,
+                observation,
+                assessment,
+                response: &response,
+            },
         )
         .await?;
         let affected_chat_ids = apply_avatar_risk_signal(

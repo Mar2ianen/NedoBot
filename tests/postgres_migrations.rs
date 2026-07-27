@@ -4,8 +4,8 @@ use tg_ai_bot_teloxide::features::{
     avatar_analysis::service::apply_avatar_risk_signal,
     chat_retrieval::enqueue_message_embedding_if_enabled,
     first_comment::repo::{
-        CommentErrorKind, claim_next_post_comment_job, create_post_comment_job,
-        mark_post_comment_failed, mark_post_comment_sent,
+        CommentErrorKind, CreatePostCommentJobParams, claim_next_post_comment_job,
+        create_post_comment_job, mark_post_comment_failed, mark_post_comment_sent,
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
     spam_review::create_high_risk_review,
@@ -431,13 +431,15 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
 async fn create_job(pool: &PgPool, sequence: i32) -> i64 {
     create_post_comment_job(
         pool,
-        -1001932061163,
-        sequence,
-        -1001575496091,
-        sequence,
-        "Тестовый пост",
-        None,
-        None,
+        CreatePostCommentJobParams {
+            discussion_chat_id: -1001932061163,
+            discussion_message_id: sequence,
+            source_channel_id: -1001575496091,
+            source_message_id: sequence,
+            cleaned_post_text: "Тестовый пост",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
     )
     .await
     .expect("job insert must succeed")
