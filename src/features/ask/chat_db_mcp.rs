@@ -32,6 +32,7 @@ struct JsonRpcRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolCallParams {
     name: String,
     #[serde(default)]
@@ -39,6 +40,7 @@ struct ToolCallParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchArguments {
     query: String,
     user_id: Option<i64>,
@@ -56,6 +58,7 @@ struct SearchArguments {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecentArguments {
     user_id: Option<i64>,
     date_from: Option<String>,
@@ -69,6 +72,7 @@ struct RecentArguments {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchSearchArguments {
     queries: Vec<String>,
     user_id: Option<i64>,
@@ -91,6 +95,7 @@ struct BatchSearchResult {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContextArguments {
     message_id: i32,
     #[serde(default)]
@@ -100,17 +105,20 @@ struct ContextArguments {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UserNotesArguments {
     telegram_user_id: i64,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolveUserArguments {
     query: Option<String>,
     telegram_user_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UserInteractionsArguments {
     first_user_id: i64,
     second_user_id: i64,
@@ -118,6 +126,7 @@ struct UserInteractionsArguments {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UserProfileArguments {
     telegram_user_id: i64,
 }
@@ -727,6 +736,41 @@ fn failure(id: Value) -> JsonRpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_and_tool_schemas_match_contract_snapshot() {
+        use sha2::{Digest, Sha256};
+
+        let contract =
+            json!({"initialize": initialize_result(), "tools/list": tools_list_result()});
+        let snapshot = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&contract).unwrap())
+        );
+        assert_eq!(
+            snapshot,
+            "65d82c1c6a94185c635bd5613853664cc367ae3fcf58fd98300f1c4f1e8d7baa"
+        );
+    }
+
+    #[test]
+    fn tool_arguments_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<SearchArguments>(json!({
+                "query": "test",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ToolCallParams>(json!({
+                "name": TOOL_SEARCH_MESSAGES,
+                "arguments": {},
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn exposes_only_read_tools() {

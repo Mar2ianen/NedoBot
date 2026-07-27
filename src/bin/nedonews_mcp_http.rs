@@ -95,6 +95,7 @@ struct RpcError {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolCall {
     name: String,
     #[serde(default)]
@@ -102,11 +103,13 @@ struct ToolCall {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DescribeArgs {
     table: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SelectArgs {
     table: String,
     #[serde(default)]
@@ -120,23 +123,27 @@ struct SelectArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FetchArgs {
     table: String,
     key: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatMessageArgs {
     chat_id: i64,
     message_id: i32,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UserProfileArgs {
     telegram_user_id: i64,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CountArgs {
     table: String,
     #[serde(default)]
@@ -144,6 +151,7 @@ struct CountArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AggregateArgs {
     table: String,
     operation: String,
@@ -155,6 +163,7 @@ struct AggregateArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchTextArgs {
     table: String,
     column: Option<String>,
@@ -176,6 +185,7 @@ enum SearchMatchMode {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Filter {
     column: String,
     op: String,
@@ -188,6 +198,7 @@ struct Filter {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OrderBy {
     column: String,
     direction: String,
@@ -1357,6 +1368,43 @@ fn sanitize_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protocol_and_tool_schemas_match_contract_snapshot() {
+        use sha2::{Digest, Sha256};
+
+        let contract = json!({
+            "initialize": {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"nedonews-readonly-db","version":env!("CARGO_PKG_VERSION")}},
+            "tools/list": {"tools": tools_list()},
+        });
+        let snapshot = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&contract).unwrap())
+        );
+        assert_eq!(
+            snapshot,
+            "686e52844c47a4ceb828cc192ad6539907b426623de3ea507e10e35a2a06fc22"
+        );
+    }
+
+    #[test]
+    fn tool_arguments_reject_unknown_fields() {
+        assert!(
+            decode::<SelectArgs>(json!({
+                "table": "telegram_messages",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            decode::<Filter>(json!({
+                "column": "text",
+                "op": "contains",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+    }
+
     #[test]
     fn cursor_round_trip() {
         assert_eq!(decode_cursor(Some(&encode_cursor(42))).unwrap(), 42)
