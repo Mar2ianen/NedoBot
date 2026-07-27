@@ -1,0 +1,1019 @@
+{
+  "initialize": {
+    "capabilities": {
+      "tools": {}
+    },
+    "protocolVersion": "2025-11-25",
+    "serverInfo": {
+      "name": "nedonews-readonly-db"
+    }
+  },
+  "tools/list": {
+    "tools": [
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает каталог разрешённых публичных view и их primary key. Используй перед любой универсальной DB-выборкой; другие таблицы недоступны.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "db.list_tables",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "tables": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "tables"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Показывает колонки, типы, primary key и разрешённые операторы одной публичной view. Используй перед db.select, если не знаешь точные поля.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "table": {
+              "description": "Имя разрешённой публичной view из db.list_tables.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "table"
+          ],
+          "type": "object"
+        },
+        "name": "db.describe_table",
+        "outputSchema": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Выполняет read-only выборку из разрешённой публичной view с проверенными фильтрами, сортировкой, лимитом и cursor pagination. Не принимает произвольный SQL.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "columns": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 40,
+              "type": "array"
+            },
+            "cursor": {
+              "description": "Opaque cursor from the previous page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "filters": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "case_sensitive": {
+                    "default": false,
+                    "description": "Для text pattern operators: учитывать регистр.",
+                    "type": "boolean"
+                  },
+                  "column": {
+                    "type": "string"
+                  },
+                  "op": {
+                    "enum": [
+                      "eq",
+                      "ne",
+                      "lt",
+                      "lte",
+                      "gt",
+                      "gte",
+                      "in",
+                      "not_in",
+                      "is_null",
+                      "is_not_null",
+                      "contains",
+                      "starts_with",
+                      "ends_with",
+                      "between"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {},
+                  "values": {
+                    "maxItems": 100,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "column",
+                  "op"
+                ],
+                "type": "object"
+              },
+              "maxItems": 12,
+              "type": "array"
+            },
+            "limit": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "order_by": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "column": {
+                    "type": "string"
+                  },
+                  "direction": {
+                    "enum": [
+                      "asc",
+                      "desc"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "column",
+                  "direction"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "table": {
+              "description": "Имя разрешённой публичной view из db.list_tables.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "table"
+          ],
+          "type": "object"
+        },
+        "name": "db.select",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает одну строку по полному primary key разрешённой view. Для неизвестного сообщения сначала используй поиск.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "table": {
+              "description": "Имя разрешённой публичной view из db.list_tables.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "table",
+            "key"
+          ],
+          "type": "object"
+        },
+        "name": "db.fetch_row",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "row": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "row"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Считает строки разрешённой публичной view по структурированным фильтрам без выгрузки содержимого.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "filters": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "case_sensitive": {
+                    "default": false,
+                    "description": "Для text pattern operators: учитывать регистр.",
+                    "type": "boolean"
+                  },
+                  "column": {
+                    "type": "string"
+                  },
+                  "op": {
+                    "enum": [
+                      "eq",
+                      "ne",
+                      "lt",
+                      "lte",
+                      "gt",
+                      "gte",
+                      "in",
+                      "not_in",
+                      "is_null",
+                      "is_not_null",
+                      "contains",
+                      "starts_with",
+                      "ends_with",
+                      "between"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {},
+                  "values": {
+                    "maxItems": 100,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "column",
+                  "op"
+                ],
+                "type": "object"
+              },
+              "maxItems": 12,
+              "type": "array"
+            },
+            "table": {
+              "description": "Имя разрешённой публичной view из db.list_tables.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "table"
+          ],
+          "type": "object"
+        },
+        "name": "db.count",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "count": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Выполняет безопасную count/min/max/sum/avg агрегацию с максимум тремя group_by полями.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "filters": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "case_sensitive": {
+                    "default": false,
+                    "description": "Для text pattern operators: учитывать регистр.",
+                    "type": "boolean"
+                  },
+                  "column": {
+                    "type": "string"
+                  },
+                  "op": {
+                    "enum": [
+                      "eq",
+                      "ne",
+                      "lt",
+                      "lte",
+                      "gt",
+                      "gte",
+                      "in",
+                      "not_in",
+                      "is_null",
+                      "is_not_null",
+                      "contains",
+                      "starts_with",
+                      "ends_with",
+                      "between"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {},
+                  "values": {
+                    "maxItems": 100,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "column",
+                  "op"
+                ],
+                "type": "object"
+              },
+              "maxItems": 12,
+              "type": "array"
+            },
+            "group_by": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 3,
+              "type": "array"
+            },
+            "operation": {
+              "enum": [
+                "count",
+                "count_distinct",
+                "min",
+                "max",
+                "sum",
+                "avg"
+              ],
+              "type": "string"
+            },
+            "table": {
+              "description": "Имя разрешённой публичной view из db.list_tables.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "table",
+            "operation"
+          ],
+          "type": "object"
+        },
+        "name": "db.aggregate",
+        "outputSchema": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Ищет подстроку в одной разрешённой text-колонке публичной view. Для структурированных фильтров и гибкой сортировки используй db.select.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "case_sensitive": {
+              "default": false,
+              "description": "Учитывать регистр при text search.",
+              "type": "boolean"
+            },
+            "column": {
+              "description": "Разрешённая text-колонка.",
+              "type": "string"
+            },
+            "cursor": {
+              "description": "Opaque cursor from the previous page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "match_mode": {
+              "default": "contains",
+              "description": "contains ищет подстроку; whole_word ищет отдельное слово или фразу с границами слов.",
+              "enum": [
+                "contains",
+                "whole_word"
+              ],
+              "type": "string"
+            },
+            "query": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "table": {
+              "description": "Имя разрешённой публичной view из db.list_tables.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "table",
+            "column",
+            "query"
+          ],
+          "type": "object"
+        },
+        "name": "db.search_text",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Ищет текст среди сообщений публичного НедоNews Chat. Возвращает страницы сообщений; для точного сообщения используй chat.get_message.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "case_sensitive": {
+              "default": false,
+              "description": "Учитывать регистр при text search.",
+              "type": "boolean"
+            },
+            "column": {
+              "default": "text",
+              "type": "string"
+            },
+            "cursor": {
+              "description": "Opaque cursor from the previous page.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "match_mode": {
+              "default": "contains",
+              "description": "contains ищет подстроку; whole_word ищет отдельное слово или фразу с границами слов.",
+              "enum": [
+                "contains",
+                "whole_word"
+              ],
+              "type": "string"
+            },
+            "query": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "name": "chat.search_messages",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает одно сообщение публичного Telegram-чата по точной паре chat_id и message_id. Используй после поиска или когда IDs уже известны.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "chat_id": {
+              "description": "Telegram ID публичного чата; сейчас -1001932061163.",
+              "type": "integer"
+            },
+            "message_id": {
+              "description": "ID сообщения внутри чата.",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "chat_id",
+            "message_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_message",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "author_id": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "chat_id": {
+              "type": "integer"
+            },
+            "created_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "found": {
+              "type": "boolean"
+            },
+            "message": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "message_id": {
+              "type": "integer"
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "found",
+            "chat_id",
+            "message_id",
+            "author_id",
+            "text",
+            "created_at",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает полную безопасную typed-проекцию публичного профиля участника. Raw payload и Telegram file_id не возвращаются.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "telegram_user_id": {
+              "description": "Telegram ID участника публичного чата.",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "telegram_user_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_user_profile",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "found": {
+              "type": "boolean"
+            },
+            "profile": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "found",
+            "profile"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает публичную HTTPS-ссылку на уже кэшированную аватарку участника. Не раскрывает Telegram file_id.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "telegram_user_id": {
+              "description": "Telegram ID участника публичного чата.",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "telegram_user_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_user_avatar",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "avatar_url": {
+              "format": "uri",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "found": {
+              "type": "boolean"
+            },
+            "telegram_user_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "found",
+            "telegram_user_id",
+            "avatar_url"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает размеченных спамеров публичного чата, их score, labels и причины. Обычные сообщения чата не возвращает.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "moderation.list_spammers",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает последние публичные запуски /ask со статусом, временем, моделью и итогом. Используй для аудита работы ассистента, не для поиска сообщений.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "ask.list_runs",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Расшифровки голосовых из публичного чата.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "voice.list_transcripts",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Возвращает атомарные RAG-карточки публичных постов: саммари, сущности, использованный ракурс и внешний факт. Не возвращает исходный текст поста, комментарий бота или embedding.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "memory.list_notes",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Запуски поиска для комментариев.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "search.list_runs",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Генерации комментариев.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "llm.list_generations",
+        "outputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "has_more": {
+              "type": "boolean"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rows",
+            "next_cursor",
+            "has_more"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  }
+}

@@ -738,17 +738,12 @@ mod tests {
 
     #[test]
     fn protocol_and_tool_schemas_match_contract_snapshot() {
-        use sha2::{Digest, Sha256};
-
         let contract =
             json!({"initialize": initialize_result(), "tools/list": tools_list_result()});
-        let snapshot = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&contract).unwrap())
-        );
+        let actual = serde_json::to_string_pretty(&contract).unwrap();
         assert_eq!(
-            snapshot,
-            "65d82c1c6a94185c635bd5613853664cc367ae3fcf58fd98300f1c4f1e8d7baa"
+            actual,
+            include_str!("../../../tests/fixtures/mcp/chat_db_mcp.json").trim()
         );
     }
 
