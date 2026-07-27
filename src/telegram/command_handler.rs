@@ -619,6 +619,7 @@ mod tests {
             ("@vasya -r", Some("@vasya"), StatsRender::Rich),
             ("--rich @vasya", Some("@vasya"), StatsRender::Rich),
             ("123 --plain", Some("123"), StatsRender::Html),
+            ("--rich --plain 123", Some("123"), StatsRender::Html),
             ("-r", None, StatsRender::Rich),
             ("", None, StatsRender::Rich),
         ];
@@ -626,10 +627,7 @@ mod tests {
         for (input, expected_target, expected_render) in cases {
             let args = parse_user_stats_args(input);
             assert_eq!(args.target.as_deref(), expected_target, "input: {input}");
-            assert!(
-                args.render == expected_render,
-                "unexpected render for input: {input}"
-            );
+            assert_eq!(args.render, expected_render, "input: {input}");
         }
     }
 

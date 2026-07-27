@@ -6,6 +6,45 @@ use crate::features::stats::types::{ChatStatsSummary, StatsPeriod};
 pub const TELEGRAM_SERVICE_USER_ID: i64 = 777_000;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+struct ChatStatsSummaryRow {
+    start_label: String,
+    messages: i64,
+    active_users: i64,
+    replies: i64,
+    links: i64,
+    media: i64,
+    channel_posts: i64,
+    bot_comments: i64,
+    replies_to_bot: i64,
+    reaction_events: i64,
+    reaction_count_updates: i64,
+    bot_comment_reactions: i64,
+    joins: i64,
+    leaves: i64,
+}
+
+impl From<ChatStatsSummaryRow> for ChatStatsSummary {
+    fn from(row: ChatStatsSummaryRow) -> Self {
+        Self {
+            start_label: row.start_label,
+            messages: row.messages,
+            active_users: row.active_users,
+            replies: row.replies,
+            links: row.links,
+            media: row.media,
+            channel_posts: row.channel_posts,
+            bot_comments: row.bot_comments,
+            replies_to_bot: row.replies_to_bot,
+            reaction_events: row.reaction_events,
+            reaction_count_updates: row.reaction_count_updates,
+            bot_comment_reactions: row.bot_comment_reactions,
+            joins: row.joins,
+            leaves: row.leaves,
+        }
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AttractionMetrics {
     pub messages_5m: String,
     pub messages_30m: String,
@@ -172,15 +211,15 @@ pub async fn chat_stats_summary(
             (select count(*) from member_events where old_status not in ('left', 'banned') and new_status in ('left', 'banned'))::bigint as leaves
         from messages
         "#,
-        period.start_sql()
+        period_start_sql(period)
     );
 
-    sqlx::query_as(&sql)
+    let row: ChatStatsSummaryRow = sqlx::query_as(&sql)
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .fetch_one(pool)
-        .await
-        .map_err(Into::into)
+        .await?;
+    Ok(row.into())
 }
 
 pub async fn chat_attraction_metrics(
@@ -209,7 +248,7 @@ pub async fn chat_attraction_metrics(
                coalesce(round(avg(users_30m)::numeric, 2), 0)::text as users_30m
         from metrics
         "#,
-        period.start_sql()
+        period_start_sql(period)
     );
 
     sqlx::query_as(&sql)
@@ -245,7 +284,7 @@ pub async fn period_top_users(
         order by messages desc
         limit $3
         "#,
-        period.start_sql()
+        period_start_sql(period)
     );
 
     sqlx::query_as(&sql)
@@ -282,7 +321,7 @@ pub async fn bot_comments_for_period(
         order by messages_30m desc, direct_replies desc, reactions desc
         limit $2
         "#,
-        period.start_sql()
+        period_start_sql(period)
     );
 
     sqlx::query_as(&sql)
@@ -586,6 +625,22 @@ pub async fn resolve_user_id(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(user_id,)| user_id))
+}
+
+fn period_start_sql(period: StatsPeriod) -> &'static str {
+    // The chat day is editorial, not calendar: 05:00 Moscow time is the
+    // boundary for day/week/month reports.
+    match period {
+        StatsPeriod::Day => {
+            "(date_trunc('day', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+        }
+        StatsPeriod::Week => {
+            "(date_trunc('week', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+        }
+        StatsPeriod::Month => {
+            "(date_trunc('month', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
+        }
+    }
 }
 
 fn clean_target_arg(target: &str) -> &str {

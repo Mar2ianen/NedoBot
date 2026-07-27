@@ -7,13 +7,13 @@ pub enum StatsPeriod {
     Month,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatsRender {
     Html,
     Rich,
 }
 
-#[derive(Clone, sqlx::FromRow)]
+#[derive(Clone)]
 pub struct ChatStatsSummary {
     pub start_label: String,
     pub messages: i64,
@@ -237,22 +237,6 @@ impl StatsPeriod {
             Self::Day => "день",
             Self::Week => "неделю",
             Self::Month => "месяц",
-        }
-    }
-
-    pub fn start_sql(self) -> &'static str {
-        // The chat day is editorial, not calendar: 05:00 Moscow time is the
-        // boundary for day/week/month reports.
-        match self {
-            Self::Day => {
-                "(date_trunc('day', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
-            }
-            Self::Week => {
-                "(date_trunc('week', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
-            }
-            Self::Month => {
-                "(date_trunc('month', now() at time zone 'Europe/Moscow' - interval '5 hours') + interval '5 hours') at time zone 'Europe/Moscow'"
-            }
         }
     }
 }
