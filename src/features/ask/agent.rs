@@ -1146,20 +1146,30 @@ impl Drop for McpClient {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retries_once_after_a_timeout() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let recorded_attempts = std::sync::Arc::clone(&attempts);
-        let result = retry_once_on_timeout(Duration::from_millis(5), move || {
-            let attempt = recorded_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move {
-                if attempt == 0 {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+        let (first_attempt_started, first_attempt_started_rx) = tokio::sync::oneshot::channel();
+        let mut first_attempt_started = Some(first_attempt_started);
+        let retry = tokio::spawn(async move {
+            retry_once_on_timeout(Duration::from_secs(5), move || {
+                recorded_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let first_attempt_started = first_attempt_started.take();
+                async move {
+                    if let Some(first_attempt_started) = first_attempt_started {
+                        first_attempt_started.send(()).unwrap();
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    Ok("generated")
                 }
-                Ok("generated")
-            }
-        })
-        .await;
+            })
+            .await
+        });
+
+        first_attempt_started_rx.await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let result = retry.await.unwrap();
 
         assert!(matches!(result, Ok("generated")));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
