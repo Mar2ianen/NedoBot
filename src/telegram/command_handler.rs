@@ -126,10 +126,7 @@ pub async fn handle_command(
         }
         Command::UserStats(target) | Command::UserStatus(target) => {
             let raw_args = raw_message_args(&msg).unwrap_or(target.as_str());
-            let render = render_from_message_or_args(&msg, &target);
-            let target = strip_render_flag(raw_args);
-            let target = target.trim();
-            let explicit_target = (!target.is_empty()).then_some(target);
+            let args = parse_user_stats_args(raw_args);
             let fallback_user_id = reply_user_id(&msg).or_else(|| sender_user_id(&msg));
 
             send_user_stats(
@@ -137,9 +134,9 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                explicit_target,
+                args.target.as_deref(),
                 fallback_user_id,
-                render,
+                args.render,
             )
             .await?;
         }
@@ -529,6 +526,19 @@ fn raw_message_args(msg: &Message) -> Option<&str> {
         .and_then(raw_command_args)
 }
 
+struct UserStatsArgs {
+    target: Option<String>,
+    render: StatsRender,
+}
+
+fn parse_user_stats_args(args: &str) -> UserStatsArgs {
+    let target = strip_render_flag(args);
+    UserStatsArgs {
+        target: (!target.is_empty()).then_some(target),
+        render: render_from_args(args),
+    }
+}
+
 fn render_from_args(args: &str) -> StatsRender {
     if args.split_whitespace().any(is_plain_render_flag) {
         StatsRender::Html
@@ -604,11 +614,23 @@ mod tests {
     }
 
     #[test]
-    fn strips_render_flags_from_user_target() {
-        assert_eq!(strip_render_flag("@Chechulinm -r"), "@Chechulinm");
-        assert_eq!(strip_render_flag("-r 445144708"), "445144708");
-        assert_eq!(strip_render_flag("445144708 --poor"), "445144708");
-        assert_eq!(strip_render_flag("--plain @Chechulinm"), "@Chechulinm");
+    fn parses_user_stats_target_and_render_flags_in_any_position() {
+        let cases = [
+            ("@vasya -r", Some("@vasya"), StatsRender::Rich),
+            ("--rich @vasya", Some("@vasya"), StatsRender::Rich),
+            ("123 --plain", Some("123"), StatsRender::Html),
+            ("-r", None, StatsRender::Rich),
+            ("", None, StatsRender::Rich),
+        ];
+
+        for (input, expected_target, expected_render) in cases {
+            let args = parse_user_stats_args(input);
+            assert_eq!(args.target.as_deref(), expected_target, "input: {input}");
+            assert!(
+                args.render == expected_render,
+                "unexpected render for input: {input}"
+            );
+        }
     }
 
     #[test]

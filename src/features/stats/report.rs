@@ -125,7 +125,7 @@ fn stats_error(message: &'static str) -> impl FnOnce(anyhow::Error) -> teloxide:
 }
 
 fn numeric_target_user_id(target: Option<&str>) -> Option<i64> {
-    target?.split_whitespace().next()?.parse().ok()
+    target?.parse().ok()
 }
 
 #[cfg(test)]
