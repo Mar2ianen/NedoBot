@@ -48,6 +48,22 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
             .expect("post_comment_jobs lookup must succeed");
     assert_eq!(post_comment_jobs.as_deref(), Some("post_comment_jobs"));
 
+    let sent_at_column: bool = query_scalar(
+        r#"
+        select exists (
+            select 1 from information_schema.columns
+            where table_schema = 'public' and table_name = 'post_comment_jobs' and column_name = 'sent_at'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("sent_at column lookup must succeed");
+    assert!(
+        sent_at_column,
+        "sent comment timestamp migration must be applied"
+    );
+
     let public_messages_view: Option<String> =
         query_scalar("select to_regclass('mcp_public.telegram_messages')::text")
             .fetch_one(pool)
@@ -103,6 +119,8 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         .single()
         .expect("test inside timestamp must be valid");
     let comment_at = window.end_at - Duration::minutes(5);
+    let job_created_at = comment_at - Duration::minutes(1);
+    let message_before_comment_was_sent = comment_at - Duration::seconds(30);
     let reply_after_window = window.end_at + Duration::minutes(1);
     query(
         r#"
@@ -111,13 +129,15 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         values
             ($1, 901, 901, null, null, 'inside report window', $2),
             ($1, 902, 902, -1001575496091, null, 'outside report window', $3),
-            ($1, 903, 903, null, 1911, 'cohort reply after report window', $4)
+            ($1, 903, 903, null, 1911, 'cohort reply after report window', $4),
+            ($1, 904, 904, null, null, 'message before comment was sent', $5)
         "#,
     )
     .bind(CHAT_ID)
     .bind(inside_at)
     .bind(window.end_at)
     .bind(reply_after_window)
+    .bind(message_before_comment_was_sent)
     .execute(pool)
     .await
     .expect("windowed stats messages must be inserted");
@@ -125,15 +145,16 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         r#"
         insert into post_comment_jobs
             (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
-             cleaned_post_text, status, bot_comment_message_id, created_at)
+             cleaned_post_text, status, bot_comment_message_id, created_at, sent_at)
         values
-            ($1, 911, -1001575496091, 911, 'inside comment', 'sent', 1911, $2),
-            ($1, 912, -1001575496091, 912, 'outside comment', 'sent', 1912, $3)
+            ($1, 911, -1001575496091, 911, 'inside comment', 'sent', 1911, $4, $2),
+            ($1, 912, -1001575496091, 912, 'not yet sent at report end', 'sent', 1912, $4, $3)
         "#,
     )
     .bind(CHAT_ID)
     .bind(comment_at)
     .bind(window.end_at)
+    .bind(job_created_at)
     .execute(pool)
     .await
     .expect("windowed comment jobs must be inserted");
@@ -150,9 +171,12 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     let bot_comments = stats_repo::bot_comments_for_period(pool, CHAT_ID, window, 10)
         .await
         .expect("period bot comments query must succeed");
-    assert_eq!(summary.messages, 1, "summary must use the fixed window");
-    assert_eq!(summary.bot_comments, 1, "summary must use the fixed window");
-    assert_eq!(top_users.len(), 1, "top users must use the fixed window");
+    assert_eq!(summary.messages, 2, "summary must use the fixed window");
+    assert_eq!(
+        summary.bot_comments, 1,
+        "summary must include only comments sent inside the fixed window"
+    );
+    assert_eq!(top_users.len(), 2, "top users must use the fixed window");
     assert_eq!(
         bot_comments.len(),
         1,
@@ -160,12 +184,24 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     );
     assert_eq!(bot_comments[0].source_message_id, 911);
     assert_eq!(
-        attraction.messages_30m, "1.00",
-        "cohort reply after the report boundary must count for 30 minutes"
+        attraction.messages_5m, "0.00",
+        "the mature five-minute cohort must start when the comment was sent"
     );
     assert_eq!(
-        attraction.messages_24h, "1.00",
-        "cohort reply after the report boundary must count for 24 hours"
+        attraction.messages_30m, "-",
+        "an incomplete 30-minute cohort must not be reported as zero"
+    );
+    assert_eq!(
+        attraction.messages_24h, "-",
+        "an incomplete 24-hour cohort must not be reported as zero"
+    );
+    assert_eq!(
+        attraction.users_30m, "-",
+        "an incomplete 30-minute user cohort must be unavailable"
+    );
+    assert_eq!(
+        bot_comments[0].messages_30m, 1,
+        "per-comment engagement must exclude activity before sent_at"
     );
     let data = ChatStatsReportData {
         period: StatsPeriod::Day,
@@ -499,6 +535,16 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
             .expect("current worker finalization query must succeed")
     );
     assert_job_state(pool, reclaimed_job.id, "sent", None, false).await;
+    let sent_at: Option<chrono::DateTime<Utc>> =
+        query_scalar("select sent_at from post_comment_jobs where id = $1")
+            .bind(reclaimed_job.id)
+            .fetch_one(pool)
+            .await
+            .expect("sent job timestamp query must succeed");
+    assert!(
+        sent_at.is_some(),
+        "sending a claimed job must atomically set sent_at"
+    );
 }
 
 async fn create_job(pool: &PgPool, sequence: i32) -> i64 {
