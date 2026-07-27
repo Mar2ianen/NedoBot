@@ -45,14 +45,14 @@ impl From<ChatStatsSummaryRow> for ChatStatsSummary {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct AttractionMetrics {
+pub struct AttractionMetricsRow {
     pub messages_5m: String,
     pub messages_30m: String,
     pub users_30m: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct PeriodTopUser {
+pub struct PeriodTopUserRow {
     pub user_id: i64,
     pub username: Option<String>,
     pub first_name: Option<String>,
@@ -67,7 +67,7 @@ pub struct PeriodTopUser {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct BotCommentStats {
+pub struct BotCommentStatsRow {
     pub source_message_id: i32,
     pub response: String,
     pub messages_30m: i64,
@@ -226,7 +226,7 @@ pub async fn chat_attraction_metrics(
     pool: &PgPool,
     discussion_chat_id: i64,
     period: StatsPeriod,
-) -> anyhow::Result<AttractionMetrics> {
+) -> anyhow::Result<AttractionMetricsRow> {
     let sql = format!(
         r#"
         with bounds as (select {} as start_at, now() as end_at),
@@ -263,7 +263,7 @@ pub async fn period_top_users(
     discussion_chat_id: i64,
     period: StatsPeriod,
     limit: i64,
-) -> anyhow::Result<Vec<PeriodTopUser>> {
+) -> anyhow::Result<Vec<PeriodTopUserRow>> {
     let sql = format!(
         r#"
         with bounds as (select {} as start_at, now() as end_at)
@@ -301,7 +301,7 @@ pub async fn bot_comments_for_period(
     discussion_chat_id: i64,
     period: StatsPeriod,
     limit: i64,
-) -> anyhow::Result<Vec<BotCommentStats>> {
+) -> anyhow::Result<Vec<BotCommentStatsRow>> {
     let sql = format!(
         r#"
         with bounds as (select {} as start_at, now() as end_at)
