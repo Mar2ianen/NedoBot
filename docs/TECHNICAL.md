@@ -445,7 +445,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 `/stats_day`, `/stats_week` и `/stats_month` показывают имена пользователей как скрытые ссылки на Telegram-профиль, без видимого ID. Рядом выводятся короткие бейджи: `админ`, `в чате`, `не в чате`, `бот` или `статус неизвестен`.
 
-`/userstats` принимает числовой Telegram ID, уже виденный ботом username или reply на сообщение пользователя. Без аргумента команда показывает отправителя. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
+`/userstats` принимает числовой Telegram ID, уже виденный ботом username или reply на сообщение пользователя. Без аргумента команда показывает отправителя. Render-флаги `-r`/`--rich` и `-p`/`--plain` можно поставить до или после target: они не считаются частью username; команда только с флагом сохраняет reply/sender fallback. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
 
 ## Prompt
 
@@ -595,7 +595,8 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 - `/userstats` дополнительно показывает первое и последнее увиденное ботом сообщение пользователя по `telegram_chat_users`; без аргумента выбирается отправитель команды, а если команду отправить reply на сообщение, пользователь выбирается из reply.
 - `Завлечение после коммента` считает среднее число некомандных сообщений после комментария бота за 5 и 30 минут, плюс среднее число уникальных людей за 30 минут.
 - `Комменты бота` сортируются по обсуждению за 30 минут, прямым реплаям и реакциям. Текст очищается от HTML/AI-маркеров и обрезается до короткого превью.
-- Данные period-отчёта собираются один раз в `features/stats/service.rs` в `ChatStatsReportData`; `render_html.rs` и `render_rich.rs` получают одну typed-модель и не выполняют SQL. SQL и repository DTO находятся в `features/stats/repo.rs`.
+- Period-данные собирает `features/stats/service.rs` в `ChatStatsReportData`; `render_html.rs` и `render_rich.rs` получают одну typed-модель и не выполняют SQL. SQL и repository DTO находятся в `features/stats/repo.rs`.
+- Аватар в `/userstats` обогащается только для Rich-отчёта; plain HTML-вариант не вызывает Telegram API и локальный avatar cache ради неиспользуемого изображения.
 
 Что важно помнить по данным:
 
