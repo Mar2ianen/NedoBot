@@ -1,0 +1,312 @@
+{
+  "initialize": {
+    "capabilities": {
+      "tools": {}
+    },
+    "protocolVersion": "2024-11-05",
+    "serverInfo": {
+      "name": "chat-db-mcp",
+      "version": "0.1.0"
+    }
+  },
+  "tools/list": {
+    "tools": [
+      {
+        "description": "Ищет сообщения только в разрешённом чате. full_text ищет слова и выражения, literal — точную подстроку.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "date_from": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "date_to": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "has_links": {
+              "type": "boolean"
+            },
+            "has_media": {
+              "type": "boolean"
+            },
+            "limit": {
+              "maximum": 20,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "match_mode": {
+              "enum": [
+                "full_text",
+                "literal"
+              ],
+              "type": "string"
+            },
+            "query": {
+              "maxLength": 240,
+              "type": "string"
+            },
+            "reply_to_message_id": {
+              "type": "integer"
+            },
+            "sort": {
+              "enum": [
+                "relevance",
+                "newest",
+                "oldest"
+              ],
+              "type": "string"
+            },
+            "user_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "name": "chat.search_messages"
+      },
+      {
+        "description": "Выполняет 1–6 независимых поисковых запросов с общими фильтрами. Используй для синонимов и разных формулировок вместо склеивания всех слов в один AND-запрос.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "date_from": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "date_to": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "has_links": {
+              "type": "boolean"
+            },
+            "has_media": {
+              "type": "boolean"
+            },
+            "limit_per_query": {
+              "maximum": 5,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "match_mode": {
+              "enum": [
+                "full_text",
+                "literal"
+              ],
+              "type": "string"
+            },
+            "queries": {
+              "items": {
+                "maxLength": 240,
+                "type": "string"
+              },
+              "maxItems": 6,
+              "minItems": 1,
+              "type": "array"
+            },
+            "sort": {
+              "enum": [
+                "relevance",
+                "newest",
+                "oldest"
+              ],
+              "type": "string"
+            },
+            "user_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "queries"
+          ],
+          "type": "object"
+        },
+        "name": "chat.search_messages_batch"
+      },
+      {
+        "description": "Возвращает последние или первые сообщения чата без поискового запроса, с фильтрами по автору и времени.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "date_from": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "date_to": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "has_links": {
+              "type": "boolean"
+            },
+            "has_media": {
+              "type": "boolean"
+            },
+            "limit": {
+              "maximum": 20,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "sort": {
+              "enum": [
+                "newest",
+                "oldest"
+              ],
+              "type": "string"
+            },
+            "user_id": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "name": "chat.get_recent_messages"
+      },
+      {
+        "description": "Возвращает одно сообщение по ID в разрешённом чате.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "message_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "message_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_message"
+      },
+      {
+        "description": "Возвращает ограниченный контекст вокруг найденного сообщения.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "before": {
+              "maximum": 5,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "message_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_message_context"
+      },
+      {
+        "description": "Возвращает родителей и дочерние ответы ветки вокруг сообщения (до 20 сообщений).",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "message_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "message_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_reply_thread"
+      },
+      {
+        "description": "Находит участника разрешённого чата по точному Telegram ID, username или отображаемому имени. Перед вопросом о конкретном человеке сначала используй этот инструмент.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "query": {
+              "maxLength": 80,
+              "type": "string"
+            },
+            "telegram_user_id": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "name": "chat.resolve_user"
+      },
+      {
+        "description": "Возвращает последние прямые reply-взаимодействия между двумя участниками разрешённого чата. Для каждого reply включает и ответ, и сообщение, на которое отвечали.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "first_user_id": {
+              "type": "integer"
+            },
+            "limit": {
+              "maximum": 20,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "second_user_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "first_user_id",
+            "second_user_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_user_interactions"
+      },
+      {
+        "description": "Возвращает безопасный профиль и агрегированную активность участника разрешённого чата.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "telegram_user_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "telegram_user_id"
+          ],
+          "type": "object"
+        },
+        "name": "chat.get_user_profile"
+      },
+      {
+        "description": "Возвращает активные общие заметки разрешённого чата.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        },
+        "name": "notes.list_chat"
+      },
+      {
+        "description": "Возвращает активные заметки указанного пользователя в разрешённом чате.",
+        "inputSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "telegram_user_id": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "telegram_user_id"
+          ],
+          "type": "object"
+        },
+        "name": "notes.list_user"
+      }
+    ]
+  }
+}

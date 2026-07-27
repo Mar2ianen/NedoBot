@@ -1369,19 +1369,14 @@ mod tests {
     use super::*;
     #[test]
     fn protocol_and_tool_schemas_match_contract_snapshot() {
-        use sha2::{Digest, Sha256};
-
         let contract = json!({
-            "initialize": {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"nedonews-readonly-db","version":env!("CARGO_PKG_VERSION")}},
+            "initialize": {"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"nedonews-readonly-db"}},
             "tools/list": {"tools": tools_list()},
         });
-        let snapshot = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&contract).unwrap())
-        );
+        let actual = serde_json::to_string_pretty(&contract).unwrap();
         assert_eq!(
-            snapshot,
-            "686e52844c47a4ceb828cc192ad6539907b426623de3ea507e10e35a2a06fc22"
+            actual,
+            include_str!("../../tests/fixtures/mcp/nedonews_mcp_http.json").trim()
         );
     }
 
