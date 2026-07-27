@@ -597,10 +597,10 @@ fn resolve_query_variants(query: &str) -> Vec<String> {
         .filter(|character| character.is_alphanumeric() || *character == '_')
         .collect::<String>();
     let mut variants = vec![normalized, compact.clone()];
-    if compact.chars().count() >= 4 {
-        if let Some(stem) = compact.strip_suffix('и') {
-            variants.extend([stem.to_string(), format!("{stem}а"), format!("{stem}я")]);
-        }
+    if compact.chars().count() >= 4
+        && let Some(stem) = compact.strip_suffix('и')
+    {
+        variants.extend([stem.to_string(), format!("{stem}а"), format!("{stem}я")]);
     }
     let transliterated = variants
         .iter()

@@ -199,9 +199,11 @@ async fn load_lexical_candidates(
     config: &Config,
     exact: bool,
 ) -> anyhow::Result<Vec<RetrievalCandidate>> {
-    let exact_score = exact
-        .then(|| literal_match_score(query))
-        .unwrap_or_default();
+    let exact_score = if exact {
+        literal_match_score(query)
+    } else {
+        Default::default()
+    };
     load_candidates(
         pool,
         chat_id,

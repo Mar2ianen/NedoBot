@@ -104,16 +104,16 @@ struct McpProcessConfig {
 
 impl McpProcessConfig {
     fn for_query(config: &Config, query: &SearchQuery) -> anyhow::Result<Self> {
-        if query.source == SearchSource::Github {
-            if let Some(command) = config.search_github_mcp_command.as_deref() {
-                return Ok(Self {
-                    command: command.to_string(),
-                    args: config.search_github_mcp_args.clone(),
-                    env: config.search_github_mcp_env.clone(),
-                    tool_names: github_tool_names(config),
-                    fetch_tool: None,
-                });
-            }
+        if query.source == SearchSource::Github
+            && let Some(command) = config.search_github_mcp_command.as_deref()
+        {
+            return Ok(Self {
+                command: command.to_string(),
+                args: config.search_github_mcp_args.clone(),
+                env: config.search_github_mcp_env.clone(),
+                tool_names: github_tool_names(config),
+                fetch_tool: None,
+            });
         }
 
         let command = config
@@ -665,9 +665,10 @@ fn parse_text_result(source: SearchSource, block: &str) -> Option<SearchResult> 
         } else if let Some(value) = line.strip_prefix("Content:") {
             snippet = value.trim().to_string();
             in_highlights = true;
-        } else if line.starts_with("Published:") || line.starts_with("Author:") {
-            in_highlights = false;
-        } else if line.ends_with(':') {
+        } else if line.starts_with("Published:")
+            || line.starts_with("Author:")
+            || line.ends_with(':')
+        {
             in_highlights = false;
         } else if !line.is_empty() && (in_highlights || can_collect_body) {
             if !snippet.is_empty() {
@@ -803,10 +804,10 @@ fn collect_github_text_fields(value: &Value, fields: &mut Vec<String>) {
     match value {
         Value::Object(object) => {
             for (key, value) in object {
-                if matches!(key.as_str(), "body" | "description" | "text" | "content") {
-                    if let Some(text) = value.as_str() {
-                        fields.push(text.to_string());
-                    }
+                if matches!(key.as_str(), "body" | "description" | "text" | "content")
+                    && let Some(text) = value.as_str()
+                {
+                    fields.push(text.to_string());
                 }
                 collect_github_text_fields(value, fields);
             }
@@ -826,15 +827,14 @@ fn normalize_github_text_field(text: String) -> Option<String> {
         return None;
     }
 
-    if looks_like_base64(trimmed) {
-        if let Ok(decoded) = BASE64.decode(trimmed.replace('\n', "")) {
-            if let Ok(decoded_text) = String::from_utf8(decoded) {
-                return Some(truncate_chars(
-                    decoded_text.trim(),
-                    MAX_RESULT_SNIPPET_CHARS,
-                ));
-            }
-        }
+    if looks_like_base64(trimmed)
+        && let Ok(decoded) = BASE64.decode(trimmed.replace('\n', ""))
+        && let Ok(decoded_text) = String::from_utf8(decoded)
+    {
+        return Some(truncate_chars(
+            decoded_text.trim(),
+            MAX_RESULT_SNIPPET_CHARS,
+        ));
     }
 
     Some(truncate_chars(trimmed, MAX_RESULT_SNIPPET_CHARS))
@@ -857,14 +857,13 @@ fn first_text_field<'a>(item: &'a Value, fields: &[&str]) -> &'a str {
         }
     }
 
-    if fields.contains(&"full_name") {
-        if let Some(value) = item
+    if fields.contains(&"full_name")
+        && let Some(value) = item
             .get("repository")
             .and_then(|repository| repository.get("full_name"))
             .and_then(Value::as_str)
-        {
-            return value.trim();
-        }
+    {
+        return value.trim();
     }
 
     ""

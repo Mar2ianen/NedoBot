@@ -362,15 +362,15 @@ pub async fn answer(
             ActionGenerationError::Request(err) => err,
             ActionGenerationError::Invalid => anyhow::anyhow!("ask LLM returned an invalid action"),
         })?;
-    if action.kind == ActionKind::Final {
-        if let Some(markdown) = non_empty(action.markdown.as_deref()) {
-            report_progress(progress, AskProgress::FormingAnswer);
-            return Ok(embed_bare_message_links(
-                markdown,
-                &evidence,
-                config.discussion_chat_id,
-            ));
-        }
+    if action.kind == ActionKind::Final
+        && let Some(markdown) = non_empty(action.markdown.as_deref())
+    {
+        report_progress(progress, AskProgress::FormingAnswer);
+        return Ok(embed_bare_message_links(
+            markdown,
+            &evidence,
+            config.discussion_chat_id,
+        ));
     }
     anyhow::bail!("ask agent did not produce a final answer")
 }
@@ -710,20 +710,19 @@ fn collect_message_evidence(result: &str, evidence: &mut Evidence) {
 }
 
 fn collect_message_evidence_value(value: &Value, evidence: &mut Evidence) {
-    if let Some(item) = value.as_object() {
-        if let Some(message_id) = item
+    if let Some(item) = value.as_object()
+        && let Some(message_id) = item
             .get("message_id")
             .and_then(Value::as_i64)
             .and_then(|id| i32::try_from(id).ok())
-        {
-            if !evidence.message_ids.contains(&message_id) {
-                evidence.message_ids.push(message_id);
-            }
-            if let Some(user_id) = item.get("user_id").and_then(Value::as_i64) {
-                let ids = evidence.message_ids_by_user.entry(user_id).or_default();
-                if !ids.contains(&message_id) {
-                    ids.push(message_id);
-                }
+    {
+        if !evidence.message_ids.contains(&message_id) {
+            evidence.message_ids.push(message_id);
+        }
+        if let Some(user_id) = item.get("user_id").and_then(Value::as_i64) {
+            let ids = evidence.message_ids_by_user.entry(user_id).or_default();
+            if !ids.contains(&message_id) {
+                ids.push(message_id);
             }
         }
     }
@@ -854,10 +853,10 @@ fn cited_message_ids(markdown: &str) -> Vec<i32> {
             .chars()
             .take_while(char::is_ascii_digit)
             .collect::<String>();
-        if let Ok(id) = digits.parse::<i32>() {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+        if let Ok(id) = digits.parse::<i32>()
+            && !ids.contains(&id)
+        {
+            ids.push(id);
         }
     }
     ids
@@ -880,12 +879,11 @@ fn embed_bare_message_links(markdown: &str, evidence: &Evidence, chat_id: i64) -
         if let Some(message_id) = message_id
             .filter(|message_id| evidence.message_ids.contains(message_id))
             .filter(|_| !after.starts_with('('))
+            && let Some(url) = message_url(chat_id, message_id)
         {
-            if let Some(url) = message_url(chat_id, message_id) {
-                result.push_str(&format!("[в этом сообщении]({url})"));
-                remainder = after;
-                continue;
-            }
+            result.push_str(&format!("[в этом сообщении]({url})"));
+            remainder = after;
+            continue;
         }
         result.push_str(&candidate[..=end]);
         remainder = after;
