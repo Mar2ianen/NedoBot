@@ -16,12 +16,12 @@ use crate::features::first_comment::draft::{
     validate_first_comment_draft_with_search_policy_and_chat,
 };
 use crate::features::first_comment::prompt::{
-    CommentDirectives, build_llm_prompt_parts_with_chat_evidence,
+    CommentDirectives, FirstCommentPromptInput, build_llm_prompt_parts_with_chat_evidence,
 };
 use crate::features::first_comment::repo::{
-    CommentErrorKind, LlmGenerationInsert, PostCommentJob, claim_next_post_comment_job,
-    create_post_comment_job, insert_llm_generation, load_recent_bot_comments,
-    mark_post_comment_failed, mark_post_comment_sent,
+    CommentErrorKind, CreatePostCommentJobParams, LlmGenerationInsert, PostCommentJob,
+    claim_next_post_comment_job, create_post_comment_job, insert_llm_generation,
+    load_recent_bot_comments, mark_post_comment_failed, mark_post_comment_sent,
 };
 use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
 use crate::features::search::repo::{
@@ -30,7 +30,7 @@ use crate::features::search::repo::{
 };
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
-use crate::llm::service::generate_text_checked_with_system_and_schema;
+use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
@@ -62,13 +62,15 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
         .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height));
     let job_id = create_post_comment_job(
         pool,
-        config.discussion_chat_id,
-        msg.id.0,
-        candidate.source_channel_id,
-        candidate.source_message_id.0,
-        &clean_post,
-        image.map(|photo| photo.file.id.as_str()),
-        image.map(|photo| photo.file.unique_id.as_str()),
+        CreatePostCommentJobParams {
+            discussion_chat_id: config.discussion_chat_id,
+            discussion_message_id: msg.id.0,
+            source_channel_id: candidate.source_channel_id,
+            source_message_id: candidate.source_message_id.0,
+            cleaned_post_text: &clean_post,
+            image_file_id: image.map(|photo| photo.file.id.as_str()),
+            image_file_unique_id: image.map(|photo| photo.file.unique_id.as_str()),
+        },
     )
     .await?;
 
@@ -89,7 +91,7 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
 }
 
 enum JobOutcome {
-    Prepared(CompletedComment),
+    Prepared(Box<CompletedComment>),
     Completed,
     Failed(CommentErrorKind),
     LeaseLost,
@@ -245,16 +247,16 @@ async fn process_post_comment_job(
     } else {
         Default::default()
     };
-    let prompt = build_llm_prompt_parts_with_chat_evidence(
-        &job.cleaned_post_text,
+    let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+        post_text: &job.cleaned_post_text,
         chat_member_count,
-        &memory_notes,
-        &recent_comments,
-        &topic_comments,
-        config.search_enabled.then_some(&search_context),
+        memory_notes: &memory_notes,
+        recent_comments: &recent_comments,
+        topic_comments: &topic_comments,
+        search_context: config.search_enabled.then_some(&search_context),
         directives,
-        &chat_evidence,
-    );
+        chat_evidence: &chat_evidence,
+    });
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
     let source_policy = config.clone();
@@ -272,16 +274,22 @@ async fn process_post_comment_job(
             &allowed_chat_message_ids,
         )
     };
-    let generation = generate_text_checked_with_system_and_schema(
+    let generation = generate_text_with_provider_checked(
         config,
-        &prompt.system,
-        &prompt.user,
-        image_base64.as_deref(),
-        config.llm_temperature,
-        config.llm_max_tokens,
-        Some(&validator),
-        "first_comment_draft",
-        first_comment_output_schema(),
+        GenerateTextOptions {
+            provider_override: None,
+            model_override: None,
+            system_prompt: Some(&prompt.system),
+            prompt: &prompt.user,
+            image_base64: image_base64.as_deref(),
+            temperature: config.llm_temperature,
+            num_predict: config.llm_max_tokens,
+            output_validator: Some(&validator),
+            structured_output: Some(crate::llm::types::StructuredOutput {
+                name: "first_comment_draft",
+                schema: first_comment_output_schema(),
+            }),
+        },
     )
     .await
     .map_err(|error| CommentErrorKind::from_llm_error(&error))?;
@@ -339,7 +347,7 @@ async fn process_post_comment_job(
     .await
     .map_err(|error| CommentErrorKind::from_telegram_error(&error))?;
 
-    Ok(JobOutcome::Prepared(CompletedComment {
+    Ok(JobOutcome::Prepared(Box::new(CompletedComment {
         bot_comment_message_id: sent.id.0,
         generation,
         draft,
@@ -347,14 +355,14 @@ async fn process_post_comment_job(
         final_html,
         search_context,
         used_search_result_id,
-    }))
+    })))
 }
 
 async fn finalize_completed_post_comment_job(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     state: &AppState,
     job: &PostCommentJob,
-    completed: CompletedComment,
+    completed: Box<CompletedComment>,
 ) -> anyhow::Result<JobOutcome> {
     if !mark_post_comment_sent(&state.pool, job, completed.bot_comment_message_id).await? {
         return Ok(JobOutcome::LeaseLost);

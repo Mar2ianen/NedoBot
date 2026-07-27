@@ -4,6 +4,17 @@ use sqlx::types::Json;
 
 use crate::config::Config;
 
+pub struct ToolCallAudit<'a> {
+    pub ask_run_id: Option<i64>,
+    pub step_number: i32,
+    pub tool_name: &'a str,
+    pub arguments: &'a Value,
+    pub status: &'a str,
+    pub result_count: Option<i64>,
+    pub latency_ms: Option<i64>,
+    pub error_kind: Option<&'a str>,
+}
+
 pub async fn create_run(
     pool: &PgPool,
     config: &Config,
@@ -35,17 +46,10 @@ pub async fn create_run(
     .map_err(Into::into)
 }
 
-pub async fn record_tool_call(
-    pool: &PgPool,
-    ask_run_id: i64,
-    step_number: i32,
-    tool_name: &str,
-    arguments: &Value,
-    status: &str,
-    result_count: Option<i64>,
-    latency_ms: Option<i64>,
-    error_kind: Option<&str>,
-) -> anyhow::Result<()> {
+pub async fn record_tool_call(pool: &PgPool, audit: ToolCallAudit<'_>) -> anyhow::Result<()> {
+    let Some(ask_run_id) = audit.ask_run_id else {
+        return Ok(());
+    };
     sqlx::query(
         r#"
         insert into ask_tool_calls (
@@ -56,13 +60,13 @@ pub async fn record_tool_call(
         "#,
     )
     .bind(ask_run_id)
-    .bind(step_number)
-    .bind(tool_name)
-    .bind(Json(arguments))
-    .bind(status)
-    .bind(result_count)
-    .bind(latency_ms)
-    .bind(error_kind)
+    .bind(audit.step_number)
+    .bind(audit.tool_name)
+    .bind(Json(audit.arguments))
+    .bind(audit.status)
+    .bind(audit.result_count)
+    .bind(audit.latency_ms)
+    .bind(audit.error_kind)
     .execute(pool)
     .await?;
     Ok(())

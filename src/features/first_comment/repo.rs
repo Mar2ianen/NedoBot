@@ -83,15 +83,19 @@ pub struct LlmGenerationInsert<'a> {
     pub used_chat_message_ids: &'a [i32],
 }
 
+pub struct CreatePostCommentJobParams<'a> {
+    pub discussion_chat_id: i64,
+    pub discussion_message_id: i32,
+    pub source_channel_id: i64,
+    pub source_message_id: i32,
+    pub cleaned_post_text: &'a str,
+    pub image_file_id: Option<&'a str>,
+    pub image_file_unique_id: Option<&'a str>,
+}
+
 pub async fn create_post_comment_job(
     pool: &PgPool,
-    discussion_chat_id: i64,
-    discussion_message_id: i32,
-    source_channel_id: i64,
-    source_message_id: i32,
-    cleaned_post_text: &str,
-    image_file_id: Option<&str>,
-    image_file_unique_id: Option<&str>,
+    params: CreatePostCommentJobParams<'_>,
 ) -> anyhow::Result<Option<i64>> {
     let row: Option<(i64,)> = sqlx::query_as(
         r#"
@@ -103,13 +107,13 @@ pub async fn create_post_comment_job(
         returning id
         "#,
     )
-    .bind(discussion_chat_id)
-    .bind(discussion_message_id)
-    .bind(source_channel_id)
-    .bind(source_message_id)
-    .bind(cleaned_post_text)
-    .bind(image_file_id)
-    .bind(image_file_unique_id)
+    .bind(params.discussion_chat_id)
+    .bind(params.discussion_message_id)
+    .bind(params.source_channel_id)
+    .bind(params.source_message_id)
+    .bind(params.cleaned_post_text)
+    .bind(params.image_file_id)
+    .bind(params.image_file_unique_id)
     .fetch_optional(pool)
     .await?;
 

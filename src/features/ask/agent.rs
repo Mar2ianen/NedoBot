@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -33,6 +34,16 @@ pub enum AskProgress {
     CheckingExternalSources,
     CheckingNotes,
     FormingAnswer,
+}
+
+pub struct AskRequest<'a> {
+    pub ask_run_id: Option<i64>,
+    pub requester_user_id: i64,
+    pub requester_identity: &'a str,
+    pub question: &'a str,
+    pub reply_context: Option<&'a str>,
+    pub image_base64: Option<&'a str>,
+    pub progress: Option<&'a UnboundedSender<AskProgress>>,
 }
 
 impl AskProgress {
@@ -158,14 +169,17 @@ impl ResearchState {
 pub async fn answer(
     config: &Config,
     pool: &PgPool,
-    ask_run_id: Option<i64>,
-    requester_user_id: i64,
-    requester_identity: &str,
-    question: &str,
-    reply_context: Option<&str>,
-    image_base64: Option<&str>,
-    progress: Option<&UnboundedSender<AskProgress>>,
+    request: AskRequest<'_>,
 ) -> anyhow::Result<String> {
+    let AskRequest {
+        ask_run_id,
+        requester_user_id,
+        requester_identity,
+        question,
+        reply_context,
+        image_base64,
+        progress,
+    } = request;
     report_progress(progress, AskProgress::Preparing);
     let mut mcp = McpClient::start(config).await?;
     let mut observations = Vec::new();
@@ -268,14 +282,16 @@ pub async fn answer(
                 if !tool_signatures.insert(signature) {
                     audit_tool_call(
                         pool,
-                        ask_run_id,
-                        step + 1,
-                        tool,
-                        &action.arguments,
-                        "skipped_duplicate",
-                        None,
-                        Some(0),
-                        Some("duplicate"),
+                        repo::ToolCallAudit {
+                            ask_run_id,
+                            step_number: i32::try_from(step + 1).unwrap_or(i32::MAX),
+                            tool_name: tool,
+                            arguments: &action.arguments,
+                            status: "skipped_duplicate",
+                            result_count: None,
+                            latency_ms: Some(0),
+                            error_kind: Some("duplicate"),
+                        },
                     )
                     .await;
                     push_observation(
@@ -304,14 +320,16 @@ pub async fn answer(
                     Ok(result) => {
                         audit_tool_call(
                             pool,
-                            ask_run_id,
-                            step + 1,
-                            tool,
-                            &tracking_arguments,
-                            "completed",
-                            tool_result_count(&result),
-                            elapsed_millis(started),
-                            None,
+                            repo::ToolCallAudit {
+                                ask_run_id,
+                                step_number: i32::try_from(step + 1).unwrap_or(i32::MAX),
+                                tool_name: tool,
+                                arguments: &tracking_arguments,
+                                status: "completed",
+                                result_count: tool_result_count(&result),
+                                latency_ms: elapsed_millis(started),
+                                error_kind: None,
+                            },
                         )
                         .await;
                         research.record(tool, &tracking_arguments, &result);
@@ -323,14 +341,16 @@ pub async fn answer(
                     Err(err) => {
                         audit_tool_call(
                             pool,
-                            ask_run_id,
-                            step + 1,
-                            tool,
-                            &tracking_arguments,
-                            "failed",
-                            None,
-                            elapsed_millis(started),
-                            Some("tool_error"),
+                            repo::ToolCallAudit {
+                                ask_run_id,
+                                step_number: i32::try_from(step + 1).unwrap_or(i32::MAX),
+                                tool_name: tool,
+                                arguments: &tracking_arguments,
+                                status: "failed",
+                                result_count: None,
+                                latency_ms: elapsed_millis(started),
+                                error_kind: Some("tool_error"),
+                            },
                         )
                         .await;
                         tracing::warn!(%err, tool, "ask tool call failed");
@@ -398,62 +418,26 @@ async fn generate_action(
     let action_schema = action_schema();
     let timeout_secs = config.ask_timeout_sec.min(ACTION_TIMEOUT_CAP_SECS);
     let validator = |value: &str| validate_agent_action_output(value);
-    let generated = loop {
-        let result = timeout(
-            Duration::from_secs(timeout_secs),
-            generate_text_with_provider_checked(
-                config,
-                GenerateTextOptions {
-                    provider_override: Some(&config.ask_llm_provider),
-                    model_override: config.ask_llm_model.as_deref(),
-                    system_prompt: Some(SYSTEM_PROMPT),
-                    prompt,
-                    image_base64,
-                    temperature: config.ask_llm_temperature,
-                    num_predict: config.ask_llm_max_tokens,
-                    output_validator: Some(&validator),
-                    structured_output: Some(StructuredOutput {
-                        name: "ask_action",
-                        schema: &action_schema,
-                    }),
-                },
-            ),
+    let generated = retry_once_on_timeout(Duration::from_secs(timeout_secs), || {
+        generate_text_with_provider_checked(
+            config,
+            GenerateTextOptions {
+                provider_override: Some(&config.ask_llm_provider),
+                model_override: config.ask_llm_model.as_deref(),
+                system_prompt: Some(SYSTEM_PROMPT),
+                prompt,
+                image_base64,
+                temperature: config.ask_llm_temperature,
+                num_predict: config.ask_llm_max_tokens,
+                output_validator: Some(&validator),
+                structured_output: Some(StructuredOutput {
+                    name: "ask_action",
+                    schema: &action_schema,
+                }),
+            },
         )
-        .await;
-        match result {
-            Ok(Ok(generated)) => break generated,
-            Ok(Err(err)) => return Err(ActionGenerationError::Request(err)),
-            Err(_) => {
-                tracing::warn!(timeout_secs, "ask LLM action timed out; retrying once");
-                let retry = timeout(
-                    Duration::from_secs(timeout_secs),
-                    generate_text_with_provider_checked(
-                        config,
-                        GenerateTextOptions {
-                            provider_override: Some(&config.ask_llm_provider),
-                            model_override: config.ask_llm_model.as_deref(),
-                            system_prompt: Some(SYSTEM_PROMPT),
-                            prompt,
-                            image_base64,
-                            temperature: config.ask_llm_temperature,
-                            num_predict: config.ask_llm_max_tokens,
-                            output_validator: Some(&validator),
-                            structured_output: Some(StructuredOutput {
-                                name: "ask_action",
-                                schema: &action_schema,
-                            }),
-                        },
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    ActionGenerationError::Request(anyhow::anyhow!("ask LLM timed out twice"))
-                })?
-                .map_err(ActionGenerationError::Request)?;
-                break retry;
-            }
-        }
-    };
+    })
+    .await?;
     parse_agent_action(&generated.content).map_err(|_| {
         #[cfg(test)]
         eprintln!(
@@ -462,6 +446,33 @@ async fn generate_action(
         );
         ActionGenerationError::Invalid
     })
+}
+
+async fn retry_once_on_timeout<T, F, Fut>(
+    timeout_duration: Duration,
+    mut generate: F,
+) -> Result<T, ActionGenerationError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    match timeout(timeout_duration, generate()).await {
+        Ok(Ok(generated)) => Ok(generated),
+        Ok(Err(err)) => Err(ActionGenerationError::Request(err)),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = timeout_duration.as_secs(),
+                "ask LLM action timed out; retrying once"
+            );
+            match timeout(timeout_duration, generate()).await {
+                Ok(Ok(generated)) => Ok(generated),
+                Ok(Err(err)) => Err(ActionGenerationError::Request(err)),
+                Err(_) => Err(ActionGenerationError::Request(anyhow::anyhow!(
+                    "ask LLM timed out twice"
+                ))),
+            }
+        }
+    }
 }
 
 fn action_schema() -> Value {
@@ -560,35 +571,11 @@ fn allowed_mcp_tool(tool: &str) -> bool {
     MCP_TOOLS.contains(&tool)
 }
 
-async fn audit_tool_call(
-    pool: &PgPool,
-    ask_run_id: Option<i64>,
-    step_number: usize,
-    tool_name: &str,
-    arguments: &Value,
-    status: &str,
-    result_count: Option<i64>,
-    latency_ms: Option<i64>,
-    error_kind: Option<&str>,
-) {
-    let Some(ask_run_id) = ask_run_id else {
-        return;
-    };
-    let step_number = i32::try_from(step_number).unwrap_or(i32::MAX);
-    if let Err(err) = repo::record_tool_call(
-        pool,
-        ask_run_id,
-        step_number,
-        tool_name,
-        arguments,
-        status,
-        result_count,
-        latency_ms,
-        error_kind,
-    )
-    .await
-    {
-        tracing::warn!(%err, ask_run_id, tool_name, "failed to audit ask tool call");
+async fn audit_tool_call(pool: &PgPool, audit: repo::ToolCallAudit<'_>) {
+    let ask_run_id = audit.ask_run_id;
+    let tool_name = audit.tool_name;
+    if let Err(err) = repo::record_tool_call(pool, audit).await {
+        tracing::warn!(%err, ?ask_run_id, tool_name, "failed to audit ask tool call");
     }
 }
 
@@ -1164,6 +1151,40 @@ impl Drop for McpClient {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn retries_once_after_a_timeout() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_attempts = std::sync::Arc::clone(&attempts);
+        let result = retry_once_on_timeout(Duration::from_millis(5), move || {
+            let attempt = recorded_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok("generated")
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Ok("generated")));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_request_errors() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_attempts = std::sync::Arc::clone(&attempts);
+        let result: Result<(), ActionGenerationError> =
+            retry_once_on_timeout(Duration::from_secs(1), move || {
+                recorded_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow::anyhow!("provider failed")) }
+            })
+            .await;
+
+        assert!(matches!(result, Err(ActionGenerationError::Request(_))));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn prompt_is_generic_and_marks_tool_data_as_untrusted() {
         let prompt = build_prompt(
@@ -1350,13 +1371,15 @@ mod tests {
         let result = answer(
             &config,
             &pool,
-            None,
-            requester_user_id,
-            &requester_identity,
-            &question,
-            None,
-            None,
-            None,
+            AskRequest {
+                ask_run_id: None,
+                requester_user_id,
+                requester_identity: &requester_identity,
+                question: &question,
+                reply_context: None,
+                image_base64: None,
+                progress: None,
+            },
         )
         .await?;
         println!("{result}");

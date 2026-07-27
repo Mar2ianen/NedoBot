@@ -5,7 +5,6 @@ use crate::llm::openai_compat::OpenAiCompatClient;
 use crate::llm::types::{
     GeneratedText, LlmAttempt, LlmClient, LlmRequest, LlmTransportError, StructuredOutput,
 };
-use serde_json::Value;
 
 pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
@@ -73,35 +72,12 @@ pub async fn generate_text_with_provider(
     temperature: f32,
     num_predict: u32,
 ) -> anyhow::Result<GeneratedText> {
-    generate_text_with_provider_and_system(
-        config,
-        provider_override,
-        model_override,
-        None,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-    )
-    .await
-}
-
-pub async fn generate_text_with_provider_and_system(
-    config: &Config,
-    provider_override: Option<&str>,
-    model_override: Option<&str>,
-    system_prompt: Option<&str>,
-    prompt: &str,
-    image_base64: Option<&str>,
-    temperature: f32,
-    num_predict: u32,
-) -> anyhow::Result<GeneratedText> {
     generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
             provider_override,
             model_override,
-            system_prompt,
+            system_prompt: None,
             prompt,
             image_base64,
             temperature,
@@ -140,37 +116,6 @@ pub async fn generate_text_checked_with_system(
     .await
 }
 
-pub async fn generate_text_checked_with_system_and_schema(
-    config: &Config,
-    system_prompt: &str,
-    prompt: &str,
-    image_base64: Option<&str>,
-    temperature: f32,
-    num_predict: u32,
-    output_validator: Option<&OutputValidator>,
-    schema_name: &str,
-    schema: &Value,
-) -> anyhow::Result<GeneratedText> {
-    generate_text_with_provider_checked(
-        config,
-        GenerateTextOptions {
-            provider_override: None,
-            model_override: None,
-            system_prompt: Some(system_prompt),
-            prompt,
-            image_base64,
-            temperature,
-            num_predict,
-            output_validator,
-            structured_output: Some(StructuredOutput {
-                name: schema_name,
-                schema,
-            }),
-        },
-    )
-    .await
-}
-
 pub async fn generate_text_with_provider_checked(
     config: &Config,
     options: GenerateTextOptions<'_>,
@@ -191,14 +136,16 @@ pub async fn generate_text_with_provider_checked(
         for attempt in 0..=VALIDATION_RETRY_ATTEMPTS {
             let generation = generate_once(
                 config,
-                fallback.provider,
-                fallback.model,
-                options.system_prompt,
-                &attempt_prompt,
-                options.image_base64,
-                options.temperature,
-                options.num_predict,
-                options.structured_output,
+                GenerateOnceRequest {
+                    provider: fallback.provider,
+                    model: fallback.model,
+                    system_prompt: options.system_prompt,
+                    prompt: &attempt_prompt,
+                    image_base64: options.image_base64,
+                    temperature: options.temperature,
+                    num_predict: options.num_predict,
+                    structured_output: options.structured_output,
+                },
             )
             .await;
             let generation = match generation {
@@ -215,14 +162,16 @@ pub async fn generate_text_with_provider_checked(
                     );
                     generate_once(
                         config,
-                        fallback.provider,
-                        fallback.model,
-                        options.system_prompt,
-                        &attempt_prompt,
-                        options.image_base64,
-                        options.temperature,
-                        options.num_predict,
-                        None,
+                        GenerateOnceRequest {
+                            provider: fallback.provider,
+                            model: fallback.model,
+                            system_prompt: options.system_prompt,
+                            prompt: &attempt_prompt,
+                            image_base64: options.image_base64,
+                            temperature: options.temperature,
+                            num_predict: options.num_predict,
+                            structured_output: None,
+                        },
                     )
                     .await
                     .map(|mut generation| {
@@ -335,17 +284,31 @@ fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
     )
 }
 
-async fn generate_once(
-    config: &Config,
-    provider: &str,
-    model: &str,
-    system_prompt: Option<&str>,
-    prompt: &str,
-    image_base64: Option<&str>,
+struct GenerateOnceRequest<'a> {
+    provider: &'a str,
+    model: &'a str,
+    system_prompt: Option<&'a str>,
+    prompt: &'a str,
+    image_base64: Option<&'a str>,
     temperature: f32,
     num_predict: u32,
-    structured_output: Option<StructuredOutput<'_>>,
+    structured_output: Option<StructuredOutput<'a>>,
+}
+
+async fn generate_once(
+    config: &Config,
+    request: GenerateOnceRequest<'_>,
 ) -> anyhow::Result<GeneratedText> {
+    let GenerateOnceRequest {
+        provider,
+        model,
+        system_prompt,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+        structured_output,
+    } = request;
     let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
     let request = LlmRequest {
         model,

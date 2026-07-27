@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::features::chat_retrieval::RetrievalCandidate;
+use crate::features::chat_retrieval::{ExpandedChatContext, RetrievalCandidate};
 use crate::features::memory::service::MemoryNote;
 use crate::features::search::mcp::is_safe_fetch_url;
 use crate::features::search::types::{SearchContext, SearchResult, SearchSource};
@@ -51,6 +51,23 @@ pub struct CommentDirectives {
     chat_link_position: &'static str,
     search_usage: &'static str,
     source_link: &'static str,
+}
+
+pub type ChatEvidence<'a> = (
+    &'a RetrievalCandidate,
+    String,
+    Option<&'a ExpandedChatContext>,
+);
+
+pub struct FirstCommentPromptInput<'a> {
+    pub post_text: &'a str,
+    pub chat_member_count: Option<u32>,
+    pub memory_notes: &'a [MemoryNote],
+    pub recent_comments: &'a [String],
+    pub topic_comments: &'a [String],
+    pub search_context: Option<&'a SearchContext>,
+    pub directives: CommentDirectives,
+    pub chat_evidence: &'a [ChatEvidence<'a>],
 }
 
 impl CommentDirectives {
@@ -176,7 +193,7 @@ pub fn build_llm_prompt_parts(
     search_context: Option<&SearchContext>,
     directives: CommentDirectives,
 ) -> FirstCommentPrompt {
-    build_llm_prompt_parts_with_chat_evidence(
+    build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
         post_text,
         chat_member_count,
         memory_notes,
@@ -184,60 +201,28 @@ pub fn build_llm_prompt_parts(
         topic_comments,
         search_context,
         directives,
-        &[],
-    )
+        chat_evidence: &[],
+    })
 }
 
 pub fn build_llm_prompt_parts_with_chat_evidence(
-    post_text: &str,
-    chat_member_count: Option<u32>,
-    memory_notes: &[MemoryNote],
-    recent_comments: &[String],
-    topic_comments: &[String],
-    search_context: Option<&SearchContext>,
-    directives: CommentDirectives,
-    chat_evidence: &[(
-        &RetrievalCandidate,
-        String,
-        Option<&crate::features::chat_retrieval::ExpandedChatContext>,
-    )],
+    input: FirstCommentPromptInput<'_>,
 ) -> FirstCommentPrompt {
     let system = include_str!("../../../prompts/first_comment.md").to_string();
-    let user = build_llm_user_prompt(
-        post_text,
-        chat_member_count,
-        memory_notes,
-        recent_comments,
-        topic_comments,
-        search_context,
-        directives,
-        chat_evidence,
-    );
+    let user = build_llm_user_prompt(&input);
 
     FirstCommentPrompt { system, user }
 }
 
-fn build_llm_user_prompt(
-    post_text: &str,
-    chat_member_count: Option<u32>,
-    memory_notes: &[MemoryNote],
-    recent_comments: &[String],
-    topic_comments: &[String],
-    search_context: Option<&SearchContext>,
-    directives: CommentDirectives,
-    chat_evidence: &[(
-        &RetrievalCandidate,
-        String,
-        Option<&crate::features::chat_retrieval::ExpandedChatContext>,
-    )],
-) -> String {
+fn build_llm_user_prompt(input: &FirstCommentPromptInput<'_>) -> String {
     let context = FirstCommentContext {
-        post: post_text,
-        chat_member_count,
-        directives,
+        post: input.post_text,
+        chat_member_count: input.chat_member_count,
+        directives: input.directives,
         rag: RagPromptContext {
             manual_fact_reference: include_str!("../../../prompts/tech_rag.md"),
-            memory_notes: memory_notes
+            memory_notes: input
+                .memory_notes
                 .iter()
                 .map(|note| MemoryPromptNote {
                     source_message_id: note.source_message_id,
@@ -251,10 +236,11 @@ fn build_llm_user_prompt(
                 })
                 .collect(),
         },
-        topic_comments: comment_list(topic_comments, 6),
-        recent_comments: comment_list(recent_comments, 12),
-        search: render_search_context(search_context),
-        chat_evidence: chat_evidence
+        topic_comments: comment_list(input.topic_comments, 6),
+        recent_comments: comment_list(input.recent_comments, 12),
+        search: render_search_context(input.search_context),
+        chat_evidence: input
+            .chat_evidence
             .iter()
             .take(3)
             .map(|(candidate, author_name, expanded)| ChatEvidencePrompt {
@@ -279,7 +265,8 @@ fn build_llm_user_prompt(
                     .unwrap_or_default(),
             })
             .collect(),
-        scope: search_context
+        scope: input
+            .search_context
             .and_then(|context| context.plan.as_ref())
             .map(|plan| ScopePromptContext {
                 primary_subject: plan.primary_subject.clone(),
@@ -502,16 +489,17 @@ mod tests {
                 message_url: None,
             }],
         };
-        let prompt = build_llm_prompt_parts_with_chat_evidence(
-            "Пост",
-            None,
-            &[],
-            &[],
-            &[],
-            None,
-            CommentDirectives::for_post(1, None),
-            &[(&candidate, "Луна".to_string(), Some(&expanded))],
-        );
+        let chat_evidence = [(&candidate, "Луна".to_string(), Some(&expanded))];
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: None,
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: None,
+            directives: CommentDirectives::for_post(1, None),
+            chat_evidence: &chat_evidence,
+        });
         let context = context_json(&prompt);
 
         assert_eq!(context["chat_evidence"][0]["message_id"], 42);
