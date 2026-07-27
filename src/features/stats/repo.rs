@@ -196,7 +196,8 @@ pub async fn chat_stats_summary(
         ),
         bot_comments as (
             select j.* from post_comment_jobs j, bounds b
-            where j.discussion_chat_id = $1 and j.created_at >= b.start_at and j.created_at < b.end_at
+            where j.discussion_chat_id = $1 and j.status = 'sent'
+              and j.sent_at >= b.start_at and j.sent_at < b.end_at
         ),
         reactions as (
             select r.* from telegram_message_reactions r, bounds b
@@ -222,7 +223,7 @@ pub async fn chat_stats_summary(
             (select count(*) from messages m join bot_comments j on m.reply_to_message_id = j.bot_comment_message_id)::bigint as replies_to_bot,
             (select count(*) from reactions)::bigint as reaction_events,
             (select count(*) from reaction_counts)::bigint as reaction_count_updates,
-            (select coalesce(sum(rc.total_count), 0)::bigint from reaction_counts rc join post_comment_jobs j on j.discussion_chat_id = rc.chat_id and j.bot_comment_message_id = rc.message_id)::bigint as bot_comment_reactions,
+            (select coalesce(sum(rc.total_count), 0)::bigint from reaction_counts rc join post_comment_jobs j on j.discussion_chat_id = rc.chat_id and j.bot_comment_message_id = rc.message_id and j.status = 'sent')::bigint as bot_comment_reactions,
             (select count(*) from member_events where old_status in ('left', 'banned') and new_status not in ('left', 'banned'))::bigint as joins,
             (select count(*) from member_events where old_status not in ('left', 'banned') and new_status in ('left', 'banned'))::bigint as leaves
         from messages
@@ -243,29 +244,29 @@ pub async fn chat_attraction_metrics(
     discussion_chat_id: i64,
     window: ReportWindow,
 ) -> anyhow::Result<AttractionMetricsRow> {
-    // The fixed window selects comment cohorts. Their engagement windows deliberately
-    // continue past `window.end_at`, so a comment just before the editorial boundary
-    // retains its complete 5m/30m/24h follow-up.
+    // Cohorts start when Telegram confirms a comment was sent. A window contributes
+    // only after it is complete at the fixed report boundary; otherwise `-` avoids
+    // presenting a partial cohort as a zero-engagement result.
     let sql = r#"
         with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at),
         metrics as (
-            select j.source_message_id,
-                   count(m.*) filter (where m.created_at <= j.created_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as messages_5m,
-                   count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as messages_30m,
-                   count(m.*) filter (where m.created_at <= j.created_at + interval '24 hours' and coalesce(m.text,'') !~ '^/') as messages_24h,
-                   count(distinct m.user_id) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m
+            select j.sent_at,
+                   count(m.*) filter (where m.created_at <= j.sent_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as messages_5m,
+                   count(m.*) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as messages_30m,
+                   count(m.*) filter (where m.created_at <= j.sent_at + interval '24 hours' and coalesce(m.text,'') !~ '^/') as messages_24h,
+                   count(distinct m.user_id) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m
             from post_comment_jobs j
             left join telegram_messages m on m.chat_id = j.discussion_chat_id
-                and m.created_at > j.created_at and m.created_at <= j.created_at + interval '24 hours'
+                and m.created_at > j.sent_at and m.created_at <= j.sent_at + interval '24 hours'
                 and m.message_id <> j.bot_comment_message_id and m.source_channel_id is null
-            where j.discussion_chat_id = $1
-              and j.created_at >= (select start_at from bounds) and j.created_at < (select end_at from bounds)
-            group by j.source_message_id, j.created_at, j.bot_comment_message_id
+            where j.discussion_chat_id = $1 and j.status = 'sent'
+              and j.sent_at >= (select start_at from bounds) and j.sent_at < (select end_at from bounds)
+            group by j.sent_at, j.bot_comment_message_id
         )
-        select coalesce(round(avg(messages_5m)::numeric, 2), 0)::text as messages_5m,
-               coalesce(round(avg(messages_30m)::numeric, 2), 0)::text as messages_30m,
-               coalesce(round(avg(messages_24h)::numeric, 2), 0)::text as messages_24h,
-               coalesce(round(avg(users_30m)::numeric, 2), 0)::text as users_30m
+        select coalesce(round((avg(messages_5m) filter (where sent_at + interval '5 minutes' <= (select end_at from bounds)))::numeric, 2)::text, '-') as messages_5m,
+               coalesce(round((avg(messages_30m) filter (where sent_at + interval '30 minutes' <= (select end_at from bounds)))::numeric, 2)::text, '-') as messages_30m,
+               coalesce(round((avg(messages_24h) filter (where sent_at + interval '24 hours' <= (select end_at from bounds)))::numeric, 2)::text, '-') as messages_24h,
+               coalesce(round((avg(users_30m) filter (where sent_at + interval '30 minutes' <= (select end_at from bounds)))::numeric, 2)::text, '-') as users_30m
         from metrics
         "#;
 
@@ -324,18 +325,18 @@ pub async fn bot_comments_for_period(
     let sql = r#"
         with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at)
         select j.source_message_id, coalesce(g.response, '') as response,
-               count(m.*) filter (where m.created_at <= j.created_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/')::bigint as messages_30m,
+               count(m.*) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/')::bigint as messages_30m,
                count(m.*) filter (where m.reply_to_message_id = j.bot_comment_message_id)::bigint as direct_replies,
                coalesce(max(rc.total_count), 0)::bigint as reactions
         from post_comment_jobs j
         left join llm_generations g on g.post_comment_job_id = j.id
         left join telegram_messages m on m.chat_id = j.discussion_chat_id
-            and m.created_at > j.created_at and m.created_at <= j.created_at + interval '30 minutes'
+            and m.created_at > j.sent_at and m.created_at <= j.sent_at + interval '30 minutes'
             and m.message_id <> j.bot_comment_message_id and m.source_channel_id is null
         left join telegram_message_reaction_counts rc on rc.chat_id = j.discussion_chat_id and rc.message_id = j.bot_comment_message_id
-        where j.discussion_chat_id = $1
-          and j.created_at >= (select start_at from bounds) and j.created_at < (select end_at from bounds)
-        group by j.source_message_id, g.response
+        where j.discussion_chat_id = $1 and j.status = 'sent'
+          and j.sent_at >= (select start_at from bounds) and j.sent_at < (select end_at from bounds)
+        group by j.source_message_id, g.response, j.sent_at
         order by messages_30m desc, direct_replies desc, reactions desc
         limit $4
         "#;

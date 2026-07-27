@@ -180,8 +180,8 @@ pub async fn mark_post_comment_sent(
     sqlx::query(
         r#"
         update post_comment_jobs
-        set status = 'sent', bot_comment_message_id = $2, error_kind = null,
-            lease_expires_at = null, updated_at = now()
+        set status = 'sent', bot_comment_message_id = $2, sent_at = now(),
+            error_kind = null, lease_expires_at = null, updated_at = now()
         where id = $1 and status = 'processing' and attempts = $3
         "#,
     )
