@@ -345,7 +345,7 @@ async fn cached_profile_photo_url(
     ))
 }
 
-fn period_top_user(row: repo::PeriodTopUser) -> PeriodTopUser {
+fn period_top_user(row: repo::PeriodTopUserRow) -> PeriodTopUser {
     PeriodTopUser {
         user: UserPresentation {
             user_id: row.user_id,
