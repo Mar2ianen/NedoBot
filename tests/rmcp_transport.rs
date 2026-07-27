@@ -89,7 +89,7 @@ async fn streamable_response_json(response: reqwest::Response) -> Result<serde_j
         .map(str::trim)
         .filter(|data| !data.is_empty())
         .map(serde_json::from_str)
-        .last()
+        .next_back()
         .transpose()?
         .ok_or_else(|| anyhow::anyhow!("Streamable HTTP response did not contain JSON: {body}"))
 }
