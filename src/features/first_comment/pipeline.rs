@@ -16,7 +16,8 @@ use crate::features::first_comment::draft::{
     validate_first_comment_draft_with_search_policy_and_chat,
 };
 use crate::features::first_comment::prompt::{
-    CommentDirectives, FirstCommentPromptInput, build_llm_prompt_parts_with_chat_evidence,
+    ChatEvidence, CommentDirectives, FirstCommentPromptInput,
+    build_llm_prompt_parts_with_chat_evidence,
 };
 use crate::features::first_comment::repo::{
     CommentErrorKind, CreatePostCommentJobParams, LlmGenerationInsert, PostCommentJob,
@@ -240,7 +241,11 @@ async fn process_post_comment_job(
                         let context = expanded_chat_contexts
                             .iter()
                             .find(|context| context.anchor_message_id == candidate.message_id);
-                        (*candidate, target.author_name.clone(), context)
+                        ChatEvidence {
+                            candidate,
+                            author_name: &target.author_name,
+                            context,
+                        }
                     })
             })
             .collect::<Vec<_>>()

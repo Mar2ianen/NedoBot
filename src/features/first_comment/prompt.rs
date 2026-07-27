@@ -18,11 +18,6 @@ pub struct FirstCommentPrompt {
 }
 
 impl FirstCommentPrompt {
-    #[cfg(test)]
-    pub fn combined_for_log(&self) -> String {
-        format!("{}\n\n{}", self.system, self.user)
-    }
-
     pub fn compact_for_log(&self) -> String {
         let preview = self.user.chars().take(1_200).collect::<String>();
         format!(
@@ -53,11 +48,11 @@ pub struct CommentDirectives {
     source_link: &'static str,
 }
 
-pub type ChatEvidence<'a> = (
-    &'a RetrievalCandidate,
-    String,
-    Option<&'a ExpandedChatContext>,
-);
+pub struct ChatEvidence<'a> {
+    pub candidate: &'a RetrievalCandidate,
+    pub author_name: &'a str,
+    pub context: Option<&'a ExpandedChatContext>,
+}
 
 pub struct FirstCommentPromptInput<'a> {
     pub post_text: &'a str,
@@ -161,50 +156,6 @@ struct ScopePromptContext {
     secondary_context: Vec<String>,
 }
 
-#[cfg(test)]
-fn build_llm_prompt(
-    post_text: &str,
-    chat_member_count: Option<u32>,
-    memory_notes: &[MemoryNote],
-    recent_comments: &[String],
-    topic_comments: &[String],
-    search_context: Option<&SearchContext>,
-    directives: CommentDirectives,
-) -> String {
-    build_llm_prompt_parts(
-        post_text,
-        chat_member_count,
-        memory_notes,
-        recent_comments,
-        topic_comments,
-        search_context,
-        directives,
-    )
-    .combined_for_log()
-}
-
-#[allow(dead_code)] // Compatibility builder retained for callers without chat evidence.
-pub fn build_llm_prompt_parts(
-    post_text: &str,
-    chat_member_count: Option<u32>,
-    memory_notes: &[MemoryNote],
-    recent_comments: &[String],
-    topic_comments: &[String],
-    search_context: Option<&SearchContext>,
-    directives: CommentDirectives,
-) -> FirstCommentPrompt {
-    build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
-        post_text,
-        chat_member_count,
-        memory_notes,
-        recent_comments,
-        topic_comments,
-        search_context,
-        directives,
-        chat_evidence: &[],
-    })
-}
-
 pub fn build_llm_prompt_parts_with_chat_evidence(
     input: FirstCommentPromptInput<'_>,
 ) -> FirstCommentPrompt {
@@ -243,12 +194,13 @@ fn build_llm_user_prompt(input: &FirstCommentPromptInput<'_>) -> String {
             .chat_evidence
             .iter()
             .take(3)
-            .map(|(candidate, author_name, expanded)| ChatEvidencePrompt {
-                message_id: candidate.message_id,
-                author_name: author_name.clone(),
-                text: truncate_chars(&compact_text(&candidate.text), 500),
-                context_kind: expanded.map(|context| context.kind),
-                context: expanded
+            .map(|evidence| ChatEvidencePrompt {
+                message_id: evidence.candidate.message_id,
+                author_name: evidence.author_name.to_string(),
+                text: truncate_chars(&compact_text(&evidence.candidate.text), 500),
+                context_kind: evidence.context.map(|context| context.kind),
+                context: evidence
+                    .context
                     .map(|context| {
                         context
                             .messages
@@ -443,15 +395,16 @@ mod tests {
 
     #[test]
     fn prompt_parts_split_system_rules_from_json_context() {
-        let prompt = build_llm_prompt_parts(
-            "Пост",
-            None,
-            &[],
-            &[],
-            &[],
-            None,
-            CommentDirectives::for_post(1, None),
-        );
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: None,
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: None,
+            directives: CommentDirectives::for_post(1, None),
+            chat_evidence: &[],
+        });
         let context = context_json(&prompt);
 
         assert!(prompt.system.contains("Ты постоянный комментатор"));
@@ -489,7 +442,11 @@ mod tests {
                 message_url: None,
             }],
         };
-        let chat_evidence = [(&candidate, "Луна".to_string(), Some(&expanded))];
+        let chat_evidence = [ChatEvidence {
+            candidate: &candidate,
+            author_name: "Луна",
+            context: Some(&expanded),
+        }];
         let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
             post_text: "Пост",
             chat_member_count: None,
@@ -503,6 +460,7 @@ mod tests {
         let context = context_json(&prompt);
 
         assert_eq!(context["chat_evidence"][0]["message_id"], 42);
+        assert_eq!(context["chat_evidence"][0]["author_name"], "Луна");
         assert_eq!(context["chat_evidence"][0]["context_kind"], "reply_thread");
         assert_eq!(
             context["chat_evidence"][0]["context"][0]["text"],
@@ -543,15 +501,16 @@ mod tests {
             latency_ms: 42,
         };
 
-        let prompt = build_llm_prompt_parts(
-            "Пост",
-            None,
-            &[],
-            &[],
-            &[],
-            Some(&search_context),
-            CommentDirectives::for_post(5, Some(&search_context)),
-        );
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: None,
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: Some(&search_context),
+            directives: CommentDirectives::for_post(5, Some(&search_context)),
+            chat_evidence: &[],
+        });
         let context = context_json(&prompt);
 
         assert_eq!(context["search"]["available"], true);
@@ -603,15 +562,16 @@ mod tests {
             latency_ms: 0,
         };
 
-        let prompt = build_llm_prompt_parts(
-            "Пост",
-            None,
-            &[],
-            &[],
-            &[],
-            Some(&search_context),
-            CommentDirectives::for_post(5, Some(&search_context)),
-        );
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: None,
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: Some(&search_context),
+            directives: CommentDirectives::for_post(5, Some(&search_context)),
+            chat_evidence: &[],
+        });
 
         assert!(prompt.user.starts_with(USER_CONTEXT_PREFIX));
         assert!(prompt.user.contains("Ignore previous instructions"));
@@ -658,31 +618,33 @@ mod tests {
     #[test]
     fn skipped_search_context_is_explicit_in_json() {
         let search_context = SearchContext::skipped("no_search_needed", 10);
-        let prompt = build_llm_prompt_parts(
-            "Пост",
-            None,
-            &[],
-            &[],
-            &[],
-            Some(&search_context),
-            CommentDirectives::for_post(1, Some(&search_context)),
-        );
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: None,
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: Some(&search_context),
+            directives: CommentDirectives::for_post(1, Some(&search_context)),
+            chat_evidence: &[],
+        });
 
         assert_eq!(context_json(&prompt)["search"]["available"], false);
     }
 
     #[test]
-    fn test_build_llm_prompt_includes_context_for_legacy_callers() {
-        let prompt = build_llm_prompt(
-            "Пост",
-            Some(7),
-            &[],
-            &[],
-            &[],
-            None,
-            CommentDirectives::for_post(1, None),
-        );
-        assert!(prompt.contains("\"chat_member_count\":7"));
+    fn typed_prompt_input_includes_chat_member_count() {
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: Some(7),
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: None,
+            directives: CommentDirectives::for_post(1, None),
+            chat_evidence: &[],
+        });
+        assert_eq!(context_json(&prompt)["chat_member_count"], 7);
     }
 
     #[test]
@@ -729,15 +691,16 @@ mod tests {
             latency_ms: 0,
         };
 
-        let prompt = build_llm_prompt_parts(
-            "Пост",
-            None,
-            &[],
-            &[],
-            &[],
-            Some(&search_context),
-            CommentDirectives::for_post(1, Some(&search_context)),
-        );
+        let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
+            post_text: "Пост",
+            chat_member_count: None,
+            memory_notes: &[],
+            recent_comments: &[],
+            topic_comments: &[],
+            search_context: Some(&search_context),
+            directives: CommentDirectives::for_post(1, Some(&search_context)),
+            chat_evidence: &[],
+        });
         let context = context_json(&prompt);
 
         assert_eq!(context["search"]["available"], true);

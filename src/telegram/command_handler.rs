@@ -287,11 +287,13 @@ async fn handle_ask_command(
     let ask_run_id = match repo::create_run(
         &state.pool,
         config,
-        msg.chat.id.0,
-        msg.id.0,
-        user.id.0 as i64,
-        question,
-        msg.reply_to_message().map(|reply| reply.id.0),
+        repo::CreateAskRun {
+            chat_id: msg.chat.id.0,
+            command_message_id: msg.id.0,
+            requester_user_id: user.id.0 as i64,
+            question,
+            reply_to_message_id: msg.reply_to_message().map(|reply| reply.id.0),
+        },
     )
     .await
     {
@@ -355,7 +357,7 @@ async fn handle_ask_command(
                     finish_ask_run(
                         &state.pool,
                         ask_run_id,
-                        "failed",
+                        repo::AskRunStatus::Failed,
                         None,
                         Some("render_validation"),
                     )
@@ -365,7 +367,14 @@ async fn handle_ask_command(
                     )));
                 }
             };
-            finish_ask_run(&state.pool, ask_run_id, "completed", Some(&markdown), None).await;
+            finish_ask_run(
+                &state.pool,
+                ask_run_id,
+                repo::AskRunStatus::Completed,
+                Some(&markdown),
+                None,
+            )
+            .await;
             if send_rich_markdown_reply(msg.chat.id, msg.id, markdown)
                 .await
                 .is_ok()
@@ -382,7 +391,7 @@ async fn handle_ask_command(
             finish_ask_run(
                 &state.pool,
                 ask_run_id,
-                "failed",
+                repo::AskRunStatus::Failed,
                 None,
                 Some(ask_error_kind(&err)),
             )
@@ -397,7 +406,7 @@ async fn handle_ask_command(
 async fn finish_ask_run(
     pool: &sqlx::PgPool,
     ask_run_id: Option<i64>,
-    status: &str,
+    status: repo::AskRunStatus,
     answer_markdown: Option<&str>,
     error_kind: Option<&str>,
 ) {
