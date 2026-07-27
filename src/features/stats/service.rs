@@ -526,7 +526,6 @@ pub async fn top_reacted_report_data(
 }
 
 pub async fn user_stats_report_data(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
     config: &Config,
     target: Option<&str>,
@@ -550,18 +549,6 @@ pub async fn user_stats_report_data(
         repo::user_top_words(pool, chat_id, user_id, &stop_words, USER_TOP_WORDS_LIMIT).await?;
 
     let user = user_presentation(user_id, profile.as_ref(), member.as_ref());
-    let avatar_url = cached_profile_photo_url(
-        bot,
-        config,
-        user_id,
-        profile
-            .as_ref()
-            .and_then(|value| value.profile_photo_file_id.as_deref()),
-        profile
-            .as_ref()
-            .and_then(|value| value.profile_photo_file_unique_id.as_deref()),
-    )
-    .await;
     if let Some(stats) = cached.as_ref() {
         totals.messages = totals.messages.max(stats.messages);
         totals.replies = totals.replies.max(stats.replies);
@@ -616,7 +603,13 @@ pub async fn user_stats_report_data(
     Ok(Some(UserStatsReportData {
         username: profile.as_ref().and_then(|value| value.username.clone()),
         bio: profile.as_ref().and_then(|value| value.bio.clone()),
-        avatar_url,
+        avatar_url: None,
+        profile_photo_file_id: profile
+            .as_ref()
+            .and_then(|value| value.profile_photo_file_id.clone()),
+        profile_photo_file_unique_id: profile
+            .as_ref()
+            .and_then(|value| value.profile_photo_file_unique_id.clone()),
         observed_at: member.as_ref().and_then(|value| value.observed_at.clone()),
         written_tag: member.as_ref().and_then(|value| value.written_tag.clone()),
         user,
@@ -631,6 +624,23 @@ pub async fn user_stats_report_data(
         reactions_received,
         top_words,
     }))
+}
+
+/// Rich reports may show an avatar. Keep this network and file-cache work out of
+/// the plain HTML path, where the result would be discarded.
+pub async fn enrich_user_stats_avatar(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+    data: &mut UserStatsReportData,
+) {
+    data.avatar_url = cached_profile_photo_url(
+        bot,
+        config,
+        data.user.user_id,
+        data.profile_photo_file_id.as_deref(),
+        data.profile_photo_file_unique_id.as_deref(),
+    )
+    .await;
 }
 
 pub async fn refresh_user_profile(
