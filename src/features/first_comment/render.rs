@@ -251,6 +251,7 @@ fn allowed_chat_link_label(label: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests {
@@ -524,4 +525,3 @@ mod tests {
         assert!(!html.contains("meduza.io"));
     }
 }
-use std::collections::HashMap;

@@ -227,25 +227,24 @@ async fn process_post_comment_job(
     )
     .await
     .map_err(|_| CommentErrorKind::Transient)?;
-    let chat_evidence = config
-        .chat_retrieval_evidence_enabled
-        .then(|| {
-            evidence_candidates
-                .iter()
-                .filter_map(|candidate| {
-                    chat_targets
-                        .iter()
-                        .find(|target| target.message_id == candidate.message_id)
-                        .map(|target| {
-                            let context = expanded_chat_contexts
-                                .iter()
-                                .find(|context| context.anchor_message_id == candidate.message_id);
-                            (*candidate, target.author_name.clone(), context)
-                        })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let chat_evidence = if config.chat_retrieval_evidence_enabled {
+        evidence_candidates
+            .iter()
+            .filter_map(|candidate| {
+                chat_targets
+                    .iter()
+                    .find(|target| target.message_id == candidate.message_id)
+                    .map(|target| {
+                        let context = expanded_chat_contexts
+                            .iter()
+                            .find(|context| context.anchor_message_id == candidate.message_id);
+                        (*candidate, target.author_name.clone(), context)
+                    })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Default::default()
+    };
     let prompt = build_llm_prompt_parts_with_chat_evidence(
         &job.cleaned_post_text,
         chat_member_count,
@@ -259,10 +258,11 @@ async fn process_post_comment_job(
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
     let source_policy = config.clone();
-    let allowed_chat_message_ids = config
-        .chat_retrieval_evidence_enabled
-        .then_some(chat_candidate_ids.clone())
-        .unwrap_or_default();
+    let allowed_chat_message_ids = if config.chat_retrieval_evidence_enabled {
+        chat_candidate_ids.clone()
+    } else {
+        Vec::new()
+    };
     let validator = move |value: &str| {
         validate_first_comment_draft_with_search_policy_and_chat(
             value,

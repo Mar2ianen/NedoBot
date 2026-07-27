@@ -323,15 +323,14 @@ async fn handle_ask_command(
                 match update {
                     Some(update) if update != last_progress => {
                         last_progress = update;
-                        if let Some(progress_message) = &progress_message {
-                            if let Err(err) = bot.edit_message_text(
+                        if let Some(progress_message) = &progress_message
+                            && let Err(err) = bot.edit_message_text(
                                 msg.chat.id,
                                 progress_message.id,
                                 update.message(),
                             ).await {
                                 tracing::debug!(%err, "failed to update ask progress message");
                             }
-                        }
                     }
                     Some(_) => {}
                     None => progress_open = false,
@@ -340,10 +339,10 @@ async fn handle_ask_command(
         }
     };
     drop(permit);
-    if let Some(progress_message) = progress_message {
-        if let Err(err) = bot.delete_message(msg.chat.id, progress_message.id).await {
-            tracing::debug!(%err, "failed to remove ask progress message");
-        }
+    if let Some(progress_message) = progress_message
+        && let Err(err) = bot.delete_message(msg.chat.id, progress_message.id).await
+    {
+        tracing::debug!(%err, "failed to remove ask progress message");
     }
     match answer {
         Ok(answer) => {
@@ -542,8 +541,6 @@ fn parse_user_stats_args(args: &str) -> UserStatsArgs {
 fn render_from_args(args: &str) -> StatsRender {
     if args.split_whitespace().any(is_plain_render_flag) {
         StatsRender::Html
-    } else if args.split_whitespace().any(is_rich_render_flag) {
-        StatsRender::Rich
     } else {
         StatsRender::Rich
     }
