@@ -95,7 +95,6 @@ struct RpcError {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ToolCall {
     name: String,
     #[serde(default)]
@@ -1402,6 +1401,15 @@ mod tests {
                 "unexpected": true,
             }))
             .is_err()
+        );
+        assert!(
+            decode::<ToolCall>(json!({
+                "name": "db.list_tables",
+                "arguments": {},
+                "_meta": {"progressToken": 1},
+                "task": {"ttl": 60},
+            }))
+            .is_ok()
         );
     }
 

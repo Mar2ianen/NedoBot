@@ -32,7 +32,6 @@ struct JsonRpcRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ToolCallParams {
     name: String,
     #[serde(default)]
@@ -766,9 +765,10 @@ mod tests {
             serde_json::from_value::<ToolCallParams>(json!({
                 "name": TOOL_SEARCH_MESSAGES,
                 "arguments": {},
-                "unexpected": true,
+                "_meta": {"progressToken": 1},
+                "task": {"ttl": 60},
             }))
-            .is_err()
+            .is_ok()
         );
     }
 
