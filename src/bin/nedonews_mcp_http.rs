@@ -159,8 +159,20 @@ struct SearchTextArgs {
     table: String,
     column: Option<String>,
     query: String,
+    #[serde(default)]
+    match_mode: SearchMatchMode,
+    #[serde(default)]
+    case_sensitive: bool,
     limit: Option<i64>,
     cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchMatchMode {
+    #[default]
+    Contains,
+    WholeWord,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +183,8 @@ struct Filter {
     value: Option<Value>,
     #[serde(default)]
     values: Vec<Value>,
+    #[serde(default)]
+    case_sensitive: bool,
 }
 
 #[derive(Deserialize)]
@@ -457,7 +471,7 @@ fn input_schema(name: &str) -> Value {
     let limit = json!({"type":"integer","minimum":1,"maximum":200,"default":50});
     let cursor =
         json!({"type":["string","null"],"description":"Opaque cursor from the previous page."});
-    let filters = json!({"type":"array","maxItems":12,"items":{"type":"object","properties":{"column":{"type":"string"},"op":{"type":"string","enum":["eq","ne","lt","lte","gt","gte","in","not_in","is_null","is_not_null","contains","starts_with","ends_with","between"]},"value":{},"values":{"type":"array","maxItems":100}},"required":["column","op"],"additionalProperties":false}});
+    let filters = json!({"type":"array","maxItems":12,"items":{"type":"object","properties":{"column":{"type":"string"},"op":{"type":"string","enum":["eq","ne","lt","lte","gt","gte","in","not_in","is_null","is_not_null","contains","starts_with","ends_with","between"]},"value":{},"values":{"type":"array","maxItems":100},"case_sensitive":{"type":"boolean","default":false,"description":"Для text pattern operators: учитывать регистр."}},"required":["column","op"],"additionalProperties":false}});
     match name {
         "db.list_tables"
         | "ask.list_runs"
@@ -489,10 +503,10 @@ fn input_schema(name: &str) -> Value {
             json!({"type":"object","properties":{"table":table,"operation":{"type":"string","enum":["count","count_distinct","min","max","sum","avg"]},"column":{"type":"string"},"group_by":{"type":"array","maxItems":3,"items":{"type":"string"}},"filters":filters},"required":["table","operation"],"additionalProperties":false})
         }
         "db.search_text" => {
-            json!({"type":"object","properties":{"table":table,"column":{"type":"string","description":"Разрешённая text-колонка."},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["table","column","query"],"additionalProperties":false})
+            json!({"type":"object","properties":{"table":table,"column":{"type":"string","description":"Разрешённая text-колонка."},"query":{"type":"string","minLength":1},"match_mode":{"type":"string","enum":["contains","whole_word"],"default":"contains","description":"contains ищет подстроку; whole_word ищет отдельное слово или фразу с границами слов."},"case_sensitive":{"type":"boolean","default":false,"description":"Учитывать регистр при text search."},"limit":limit,"cursor":cursor},"required":["table","column","query"],"additionalProperties":false})
         }
         "chat.search_messages" => {
-            json!({"type":"object","properties":{"column":{"type":"string","default":"text"},"query":{"type":"string","minLength":1},"limit":limit,"cursor":cursor},"required":["query"],"additionalProperties":false})
+            json!({"type":"object","properties":{"column":{"type":"string","default":"text"},"query":{"type":"string","minLength":1},"match_mode":{"type":"string","enum":["contains","whole_word"],"default":"contains","description":"contains ищет подстроку; whole_word ищет отдельное слово или фразу с границами слов."},"case_sensitive":{"type":"boolean","default":false,"description":"Учитывать регистр при text search."},"limit":limit,"cursor":cursor},"required":["query"],"additionalProperties":false})
         }
         "moderation.list_spammers" => {
             json!({"type":"object","properties":{},"additionalProperties":false})
@@ -596,6 +610,7 @@ async fn call_tool(state: &AppState, name: &str, arguments: Value) -> Result<Val
                         op: "eq".into(),
                         value: Some(Value::Bool(true)),
                         values: vec![],
+                        case_sensitive: false,
                     }],
                     order_by: vec![OrderBy {
                         column: "spam_score".into(),
@@ -802,6 +817,7 @@ async fn fetch_row(pool: &PgPool, manifest: &Manifest, args: FetchArgs) -> Resul
             op: "eq".into(),
             value: args.key.get(key).cloned(),
             values: vec![],
+            case_sensitive: false,
         })
         .collect();
     let result = select_rows(
@@ -1004,9 +1020,14 @@ async fn search_text(
             columns: vec![],
             filters: vec![Filter {
                 column: column_name,
-                op: "contains".into(),
+                op: match args.match_mode {
+                    SearchMatchMode::Contains => "contains",
+                    SearchMatchMode::WholeWord => "whole_word",
+                }
+                .into(),
                 value: Some(Value::String(args.query)),
                 values: vec![],
+                case_sensitive: args.case_sensitive,
             }],
             order_by: vec![],
             limit: args.limit,
@@ -1086,21 +1107,43 @@ fn append_filters(
                     "%{}%",
                     value_to_text(filter.value.as_ref().ok_or("filter value is required")?)?
                 ));
-                format!("{}::text ilike ${}", name, binds.len())
+                let operator = if filter.case_sensitive {
+                    "like"
+                } else {
+                    "ilike"
+                };
+                format!("{}::text {} ${}", name, operator, binds.len())
+            }
+            "whole_word" => {
+                let query =
+                    value_to_text(filter.value.as_ref().ok_or("filter value is required")?)?;
+                binds.push(format!(r"\m{}\M", escape_pg_regex_literal(&query)));
+                let operator = if filter.case_sensitive { "~" } else { "~*" };
+                format!("{}::text {} ${}", name, operator, binds.len())
             }
             "starts_with" => {
                 binds.push(format!(
                     "{}%",
                     value_to_text(filter.value.as_ref().ok_or("filter value is required")?)?
                 ));
-                format!("{}::text ilike ${}", name, binds.len())
+                let operator = if filter.case_sensitive {
+                    "like"
+                } else {
+                    "ilike"
+                };
+                format!("{}::text {} ${}", name, operator, binds.len())
             }
             "ends_with" => {
                 binds.push(format!(
                     "%{}",
                     value_to_text(filter.value.as_ref().ok_or("filter value is required")?)?
                 ));
-                format!("{}::text ilike ${}", name, binds.len())
+                let operator = if filter.case_sensitive {
+                    "like"
+                } else {
+                    "ilike"
+                };
+                format!("{}::text {} ${}", name, operator, binds.len())
             }
             "between" => {
                 if filter.values.len() != 2 {
@@ -1143,6 +1186,33 @@ fn append_filters(
     }
     sql.push_str(&parts.join(" and "));
     Ok(())
+}
+
+fn escape_pg_regex_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.'
+                | '^'
+                | '$'
+                | '|'
+                | '?'
+                | '*'
+                | '+'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '-'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 async fn run_json_rows(pool: &PgPool, sql: &str, binds: &[String]) -> Result<Vec<Value>, String> {
@@ -1306,6 +1376,14 @@ mod tests {
         let find = |name| tools.iter().find(|tool| tool["name"] == name).unwrap();
         let search = find("db.search_text");
         assert!(search["inputSchema"]["properties"]["query"].is_object());
+        assert_eq!(
+            search["inputSchema"]["properties"]["match_mode"]["enum"],
+            json!(["contains", "whole_word"])
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["case_sensitive"]["default"],
+            false
+        );
         assert!(
             search["inputSchema"]["required"]
                 .as_array()
@@ -1318,5 +1396,10 @@ mod tests {
         assert!(message["inputSchema"]["properties"]["chat_id"].is_object());
         assert!(message["inputSchema"]["properties"]["message_id"].is_object());
         assert!(message["outputSchema"]["properties"]["message_id"].is_object());
+    }
+
+    #[test]
+    fn whole_word_search_escapes_postgres_regex_metacharacters() {
+        assert_eq!(escape_pg_regex_literal("C++ (test)"), r"C\+\+ \(test\)");
     }
 }
