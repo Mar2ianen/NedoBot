@@ -4,3 +4,4 @@ pub mod chat_search;
 pub mod notes;
 pub mod repo;
 pub mod rich_markdown;
+pub mod types;
