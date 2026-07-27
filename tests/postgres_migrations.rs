@@ -1,3 +1,4 @@
+use chrono::{TimeZone, Utc};
 use sqlx::{PgPool, query, query_as, query_scalar};
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
@@ -11,7 +12,7 @@ use tg_ai_bot_teloxide::features::{
     spam_review::create_high_risk_review,
     stats::{
         render_html, render_rich, repo as stats_repo,
-        types::{AttractionMetrics, ChatStatsReportData, StatsPeriod},
+        types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
     },
 };
 
@@ -89,12 +90,70 @@ async fn assert_public_mcp_scope(pool: &PgPool) {
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
-    let summary = stats_repo::chat_stats_summary(pool, CHAT_ID, StatsPeriod::Day)
+    let window = ReportWindow::new(
+        Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0)
+            .single()
+            .expect("test start timestamp must be valid"),
+        Utc.with_ymd_and_hms(2000, 1, 2, 0, 0, 0)
+            .single()
+            .expect("test end timestamp must be valid"),
+    );
+    let inside_at = Utc
+        .with_ymd_and_hms(2000, 1, 1, 12, 0, 0)
+        .single()
+        .expect("test inside timestamp must be valid");
+    query(
+        r#"
+        insert into telegram_messages (chat_id, message_id, user_id, text, created_at)
+        values
+            ($1, 901, 901, 'inside report window', $2),
+            ($1, 902, 902, 'outside report window', $3)
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(inside_at)
+    .bind(window.end_at)
+    .execute(pool)
+    .await
+    .expect("windowed stats messages must be inserted");
+    query(
+        r#"
+        insert into post_comment_jobs
+            (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
+             cleaned_post_text, status, bot_comment_message_id, created_at)
+        values
+            ($1, 911, -1001575496091, 911, 'inside comment', 'sent', 1911, $2),
+            ($1, 912, -1001575496091, 912, 'outside comment', 'sent', 1912, $3)
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(inside_at)
+    .bind(window.end_at)
+    .execute(pool)
+    .await
+    .expect("windowed comment jobs must be inserted");
+
+    let summary = stats_repo::chat_stats_summary(pool, CHAT_ID, window)
         .await
         .expect("period summary query must succeed");
-    let attraction = stats_repo::chat_attraction_metrics(pool, CHAT_ID, StatsPeriod::Day)
+    let attraction = stats_repo::chat_attraction_metrics(pool, CHAT_ID, window)
         .await
         .expect("attraction query must succeed");
+    let top_users = stats_repo::period_top_users(pool, CHAT_ID, window, 10)
+        .await
+        .expect("period top users query must succeed");
+    let bot_comments = stats_repo::bot_comments_for_period(pool, CHAT_ID, window, 10)
+        .await
+        .expect("period bot comments query must succeed");
+    assert_eq!(summary.messages, 1, "summary must use the fixed window");
+    assert_eq!(summary.bot_comments, 1, "summary must use the fixed window");
+    assert_eq!(top_users.len(), 1, "top users must use the fixed window");
+    assert_eq!(
+        bot_comments.len(),
+        1,
+        "bot comments must use the fixed window"
+    );
+    assert_eq!(bot_comments[0].source_message_id, 911);
     let data = ChatStatsReportData {
         period: StatsPeriod::Day,
         summary: summary.clone(),

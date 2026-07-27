@@ -178,7 +178,7 @@ voice::asr parses Groq verbose_json with segments
 - Для `audio` Telegram metadata обычно есть, но если duration/file_size внезапно отсутствуют, файл может дойти до API и упасть там.
 - `render_mode=file` парсится как enum value, но renderer не имеет отдельной ветки для file-only режима; сейчас это не проблема, потому что prompt просит только `short | chapters`.
 - В `render_preview` считается длина по уже HTML-escaped строкам плюс chunk; это достаточно для MVP, но не полноценный entity-aware splitter.
-- CI/status checks на GitHub не настроены, поэтому сборку надо подтверждать локально через `cargo check`.
+- CI запускает форматирование, unit/integration tests и Clippy; живой Telegram/Groq smoke по-прежнему нужно подтверждать вручную.
 
 ## Не делать сейчас
 

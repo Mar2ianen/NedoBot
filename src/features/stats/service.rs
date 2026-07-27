@@ -25,14 +25,15 @@ pub async fn chat_stats_report_data(
     period: crate::features::stats::types::StatsPeriod,
 ) -> anyhow::Result<ChatStatsReportData> {
     let chat_id = config.discussion_chat_id;
-    let summary = repo::chat_stats_summary(pool, chat_id, period).await?;
-    let attraction = repo::chat_attraction_metrics(pool, chat_id, period).await?;
-    let top_users = repo::period_top_users(pool, chat_id, period, PERIOD_TOP_USERS_LIMIT)
+    let window = repo::report_window(pool, period).await?;
+    let summary = repo::chat_stats_summary(pool, chat_id, window).await?;
+    let attraction = repo::chat_attraction_metrics(pool, chat_id, window).await?;
+    let top_users = repo::period_top_users(pool, chat_id, window, PERIOD_TOP_USERS_LIMIT)
         .await?
         .into_iter()
         .map(period_top_user)
         .collect();
-    let bot_comments = repo::bot_comments_for_period(pool, chat_id, period, BOT_COMMENTS_LIMIT)
+    let bot_comments = repo::bot_comments_for_period(pool, chat_id, window, BOT_COMMENTS_LIMIT)
         .await?
         .into_iter()
         .map(|row| BotCommentStats {
