@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, fs};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 use super::{policy, types::ChatReadScope};
@@ -74,6 +75,39 @@ impl PublicCatalog {
             discussion_chat_id: self.scope.discussion_chat_id,
             source_channel_id: self.scope.source_channel_id,
         }
+    }
+
+    /// Returns the reviewed public catalog without exposing its mutable internals.
+    pub fn list_tables(&self) -> Vec<Value> {
+        self.tables
+            .iter()
+            .map(|(name, table)| {
+                json!({
+                    "name": name,
+                    "description": table.description,
+                    "primary_key": table.primary_key,
+                    "approximate_rows": table.approximate_rows,
+                })
+            })
+            .collect()
+    }
+
+    /// Describes exactly one reviewed public view.
+    pub fn describe_table(&self, name: &str) -> Option<Value> {
+        self.tables.get(name).map(|table| {
+            json!({
+                "name": name,
+                "description": table.description,
+                "primary_key": table.primary_key,
+                "columns": table.columns.iter().map(|(name, column)| json!({
+                    "name": name,
+                    "type": column.pg_type,
+                    "nullable": column.nullable,
+                })).collect::<Vec<_>>(),
+                "filter_operators": ["eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "is_null", "is_not_null", "contains", "starts_with", "ends_with", "between"],
+                "max_limit": 200,
+            })
+        })
     }
 
     pub async fn validate_views(&self, pool: &PgPool) -> anyhow::Result<()> {
