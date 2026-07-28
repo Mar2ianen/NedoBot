@@ -11,7 +11,7 @@ use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
 use crate::features::ask::chat_search::message_url;
-use crate::features::ask::mcp_client::McpClient;
+use crate::features::ask::mcp_client::{LOCAL_AGENT_TOOLS, McpClient, structured_preview};
 use crate::features::ask::notes::add_user_note_from_search;
 use crate::features::ask::repo;
 use crate::features::ask::types::PendingToolCallAudit;
@@ -21,6 +21,7 @@ use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_check
 use crate::llm::types::StructuredOutput;
 
 const MAX_OBSERVATION_CHARS: usize = 12_000;
+const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
 const ACTION_TIMEOUT_CAP_SECS: u64 = 20;
@@ -84,8 +85,6 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата встраивай ссылку на message_url прямо в фразу: «[Михаил написал](URL)», «[в этом сообщении](URL)». Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
 - На каждом шаге верни ровно один JSON-объект без code fence: {"kind":"tool","tool":"имя","arguments":{...}} либо {"kind":"final","markdown":"ответ"}."#;
 
-const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github.search"];
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum ActionKind {
@@ -113,6 +112,21 @@ enum ActionGenerationError {
 struct Evidence {
     message_ids: Vec<i32>,
     message_ids_by_user: HashMap<i64, Vec<i32>>,
+}
+
+#[derive(Default)]
+struct ToolResult {
+    value: Value,
+    agent_preview: String,
+}
+
+impl ToolResult {
+    fn from_value(value: Value) -> anyhow::Result<Self> {
+        Ok(Self {
+            agent_preview: structured_preview(&value, MAX_TOOL_PREVIEW_CHARS)?,
+            value,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -289,15 +303,15 @@ pub async fn answer(
                                 step,
                                 tool,
                                 &tracking_arguments,
-                                tool_result_count(&result),
+                                tool_result_count(&result.value),
                                 elapsed_millis(started),
                             ),
                         )
                         .await;
-                        research.record(tool, &tracking_arguments, &result);
+                        research.record(tool, &tracking_arguments, &result.value);
                         push_observation(
                             &mut observations,
-                            format!("TOOL_RESULT_UNTRUSTED {tool}:\n{result}"),
+                            format!("TOOL_RESULT_UNTRUSTED {tool}:\n{}", result.agent_preview),
                         );
                     }
                     Err(err) => {
@@ -553,8 +567,7 @@ fn elapsed_millis(started: Instant) -> Option<i64> {
     i64::try_from(started.elapsed().as_millis()).ok()
 }
 
-fn tool_result_count(result: &str) -> Option<i64> {
-    let value = serde_json::from_str::<Value>(result).ok()?;
+fn tool_result_count(value: &Value) -> Option<i64> {
     let count = match value {
         Value::Array(items) => items.len(),
         Value::Object(object) => object
@@ -611,12 +624,15 @@ async fn call_tool(
     mcp: &McpClient,
     tool: &str,
     arguments: Value,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ToolResult> {
     match tool {
         tool if mcp.has_tool(tool) => {
             let result = mcp.call(tool, arguments).await?;
-            collect_message_evidence(&result, evidence);
-            Ok(result)
+            collect_message_evidence_value(&result.value, evidence);
+            Ok(ToolResult {
+                value: result.value,
+                agent_preview: result.agent_preview,
+            })
         }
         "notes.add_user" => {
             let user_id = arguments
@@ -641,19 +657,12 @@ async fn call_tool(
                 source_message_ids,
             )
             .await?;
-            Ok("{\"saved\":true}".to_string())
+            ToolResult::from_value(json!({"saved": true}))
         }
         "web.search" => external_search(config, SearchSource::Web, arguments).await,
         "github.search" => external_search(config, SearchSource::Github, arguments).await,
         _ => anyhow::bail!("ask agent requested a forbidden tool"),
     }
-}
-
-fn collect_message_evidence(result: &str, evidence: &mut Evidence) {
-    let Ok(value) = serde_json::from_str::<Value>(result) else {
-        return;
-    };
-    collect_message_evidence_value(&value, evidence);
 }
 
 fn collect_message_evidence_value(value: &Value, evidence: &mut Evidence) {
@@ -689,7 +698,7 @@ fn collect_message_evidence_value(value: &Value, evidence: &mut Evidence) {
 }
 
 impl ResearchState {
-    fn record(&mut self, tool: &str, arguments: &Value, result: &str) {
+    fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
         match tool {
             "chat.search_messages" | "chat.search_messages_batch" => {
                 let searches = if tool == "chat.search_messages_batch" {
@@ -778,12 +787,9 @@ impl ResearchState {
     }
 }
 
-fn message_ids_in_json(value: &str) -> Vec<i32> {
-    let Ok(value) = serde_json::from_str::<Value>(value) else {
-        return Vec::new();
-    };
+fn message_ids_in_json(value: &Value) -> Vec<i32> {
     let mut evidence = Evidence::default();
-    collect_message_evidence_value(&value, &mut evidence);
+    collect_message_evidence_value(value, &mut evidence);
     evidence.message_ids
 }
 
@@ -931,18 +937,12 @@ fn overconfident_personal_inference(markdown: &str) -> bool {
         .any(|marker| markdown.contains(marker))
 }
 
-fn json_array_len(value: &str) -> usize {
-    serde_json::from_str::<Value>(value)
-        .ok()
-        .and_then(|value| value.as_array().map(Vec::len))
-        .unwrap_or(0)
+fn json_array_len(value: &Value) -> usize {
+    value.as_array().map(Vec::len).unwrap_or(0)
 }
 
-fn count_message_results(value: &str) -> usize {
-    serde_json::from_str::<Value>(value)
-        .ok()
-        .map(|value| count_message_results_value(&value))
-        .unwrap_or(0)
+fn count_message_results(value: &Value) -> usize {
+    count_message_results_value(value)
 }
 
 fn count_message_results_value(value: &Value) -> usize {
@@ -1007,15 +1007,15 @@ async fn external_search(
     config: &Config,
     source: SearchSource,
     arguments: Value,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ToolResult> {
     let query = arguments
         .get("query")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .ok_or_else(|| anyhow::anyhow!("external search requires query"))?;
-    Ok(serde_json::to_string(
-        &search_for_ask(config, source, query).await?,
+    ToolResult::from_value(serde_json::to_value(
+        search_for_ask(config, source, query).await?,
     )?)
 }
 
@@ -1121,8 +1121,8 @@ mod tests {
     #[test]
     fn note_evidence_is_scoped_to_message_author() {
         let mut evidence = Evidence::default();
-        collect_message_evidence(
-            r#"[{"message_id":10,"user_id":1},{"message_id":11,"user_id":2}]"#,
+        collect_message_evidence_value(
+            &json!([{"message_id": 10, "user_id": 1}, {"message_id": 11, "user_id": 2}]),
             &mut evidence,
         );
         assert_eq!(evidence.message_ids_by_user[&1], vec![10]);
@@ -1155,7 +1155,7 @@ mod tests {
         research.record(
             "chat.search_messages",
             &json!({"user_id": 42, "query": "тема"}),
-            r#"[{"message_id":1}]"#,
+            &json!([{"message_id": 1}]),
         );
         assert!(
             research
@@ -1166,7 +1166,7 @@ mod tests {
         research.record(
             "chat.search_messages",
             &json!({"user_id": 42, "query": "другая формулировка"}),
-            "[]",
+            &json!([]),
         );
         assert!(
             research
@@ -1177,7 +1177,7 @@ mod tests {
         research.record(
             "chat.get_message_context",
             &json!({"message_id": 1}),
-            r#"[{"message_id":1}]"#,
+            &json!([{"message_id": 1}]),
         );
         assert!(research.follow_up_instruction("Итог").is_none());
     }

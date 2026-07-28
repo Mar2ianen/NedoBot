@@ -8,14 +8,37 @@ use rmcp::{
     service::RunningService,
     transport::TokioChildProcess,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::config::Config;
 
-const MAX_TOOL_RESULT_CHARS: usize = 12_000;
+// Reserve space for the agent's untrusted-result envelope; never raw-truncate JSON there.
+const MAX_TOOL_RESULT_CHARS: usize = 11_000;
 const MAX_TOOL_CATALOG_CHARS: usize = 12_000;
+
+pub const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github.search"];
+pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
+    "chat.resolve_user",
+    "chat.get_user_profile",
+    "chat.search_messages",
+    "chat.search_messages_batch",
+    "chat.get_recent_messages",
+    "chat.get_message",
+    "chat.get_message_context",
+    "chat.get_reply_thread",
+    "chat.get_user_interactions",
+    "notes.list_chat",
+    "notes.list_user",
+];
+
+/// Full MCP value for policy, audit, and evidence processing plus a bounded,
+/// syntactically valid JSON preview that is safe to give to the agent.
+pub struct McpToolResult {
+    pub value: Value,
+    pub agent_preview: String,
+}
 
 /// RMCP client for the scoped chat read-model child process.
 ///
@@ -57,19 +80,17 @@ impl McpClient {
         let tools = timeout(timeout_duration, service.list_all_tools())
             .await
             .map_err(|_| anyhow::anyhow!("chat DB MCP tools/list timed out"))??;
-        let tool_names = tools
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect::<HashSet<_>>();
+        reject_local_tool_collisions(&tools)?;
+        let catalog = format_tool_catalog(&tools)?;
         anyhow::ensure!(
-            !tool_names.is_empty(),
-            "chat DB MCP did not advertise any tools"
+            !catalog.tool_names.is_empty(),
+            "chat DB MCP did not advertise an ASK-policy tool"
         );
 
         Ok(Self {
             service,
-            tool_names,
-            tool_catalog: format_tool_catalog(&tools)?,
+            tool_names: catalog.tool_names,
+            tool_catalog: catalog.rendered,
             timeout: timeout_duration,
         })
     }
@@ -92,7 +113,7 @@ impl McpClient {
         }
     }
 
-    pub async fn call(&self, tool: &str, arguments: Value) -> anyhow::Result<String> {
+    pub async fn call(&self, tool: &str, arguments: Value) -> anyhow::Result<McpToolResult> {
         anyhow::ensure!(
             self.has_tool(tool),
             "ask agent requested an unavailable MCP tool"
@@ -105,46 +126,161 @@ impl McpClient {
         let result = timeout(self.timeout, self.service.call_tool(request))
             .await
             .map_err(|_| anyhow::anyhow!("chat DB MCP tool call timed out"))??;
-        render_tool_result(result)
+        parse_tool_result(result)
     }
 }
 
-fn format_tool_catalog(tools: &[Tool]) -> anyhow::Result<String> {
-    let mut catalog = String::new();
-    for tool in tools {
-        let description = tool
-            .description
-            .as_deref()
-            .unwrap_or("описание отсутствует");
-        let input_schema = serde_json::to_string(&tool.input_schema)?;
-        catalog.push_str(&format!(
-            "- {}: {description}\n  input_schema: {input_schema}\n",
+struct ToolCatalog {
+    tool_names: HashSet<String>,
+    rendered: String,
+}
+
+fn reject_local_tool_collisions(tools: &[Tool]) -> anyhow::Result<()> {
+    if let Some(tool) = tools
+        .iter()
+        .find(|tool| LOCAL_AGENT_TOOLS.contains(&tool.name.as_ref()))
+    {
+        anyhow::bail!(
+            "chat DB MCP tool {:?} collides with a local ASK tool",
             tool.name
-        ));
+        );
     }
-    Ok(limit_chars(&catalog, MAX_TOOL_CATALOG_CHARS))
+    Ok(())
 }
 
-fn render_tool_result(result: rmcp::model::CallToolResult) -> anyhow::Result<String> {
+fn format_tool_catalog(tools: &[Tool]) -> anyhow::Result<ToolCatalog> {
+    let mut allowed_tools = tools
+        .iter()
+        .filter(|tool| ASK_MCP_TOOL_ALLOWLIST.contains(&tool.name.as_ref()))
+        .collect::<Vec<_>>();
+    allowed_tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let mut tool_names = HashSet::new();
+    let mut rendered = String::new();
+    for tool in allowed_tools {
+        let entry = format_tool_catalog_entry(tool)?;
+        if rendered.chars().count() + entry.chars().count() > MAX_TOOL_CATALOG_CHARS {
+            continue;
+        }
+        tool_names.insert(tool.name.to_string());
+        rendered.push_str(&entry);
+    }
+    Ok(ToolCatalog {
+        tool_names,
+        rendered,
+    })
+}
+
+fn format_tool_catalog_entry(tool: &Tool) -> anyhow::Result<String> {
+    let description = tool
+        .description
+        .as_deref()
+        .unwrap_or("описание отсутствует");
+    let input_schema = serde_json::to_string(&tool.input_schema)?;
+    Ok(format!(
+        "- {}: {description}\n  input_schema: {input_schema}\n",
+        tool.name
+    ))
+}
+
+fn parse_tool_result(result: rmcp::model::CallToolResult) -> anyhow::Result<McpToolResult> {
     anyhow::ensure!(
         result.is_error != Some(true),
         "chat DB MCP returned a tool-level error"
     );
-    if let Some(structured_content) = result.structured_content {
-        return Ok(limit_chars(
-            &serde_json::to_string(&structured_content)?,
-            MAX_TOOL_RESULT_CHARS,
-        ));
+    let value = if let Some(structured_content) = result.structured_content {
+        structured_content
+    } else {
+        let content = result
+            .content
+            .iter()
+            .filter_map(content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::ensure!(!content.is_empty(), "chat DB MCP returned no text result");
+        serde_json::from_str(&content).unwrap_or(Value::String(content))
+    };
+    Ok(McpToolResult {
+        agent_preview: structured_preview(&value, MAX_TOOL_RESULT_CHARS)?,
+        value,
+    })
+}
+
+pub(crate) fn structured_preview(value: &Value, limit: usize) -> anyhow::Result<String> {
+    let rendered = serde_json::to_string(value)?;
+    if rendered.chars().count() <= limit {
+        return Ok(rendered);
     }
 
-    let content = result
-        .content
-        .iter()
-        .filter_map(content_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    anyhow::ensure!(!content.is_empty(), "chat DB MCP returned no text result");
-    Ok(limit_chars(&content, MAX_TOOL_RESULT_CHARS))
+    for (string_limit, collection_limit, depth_limit) in
+        [(2_000, 32, 8), (800, 12, 5), (240, 4, 3), (80, 2, 2)]
+    {
+        let preview = truncate_value(value, string_limit, collection_limit, depth_limit, 0);
+        let rendered = serde_json::to_string(&preview)?;
+        if rendered.chars().count() <= limit {
+            return Ok(rendered);
+        }
+    }
+
+    Ok(
+        json!({"_truncated": true, "summary": "результат MCP превышает лимит предпросмотра"})
+            .to_string(),
+    )
+}
+
+fn truncate_value(
+    value: &Value,
+    string_limit: usize,
+    collection_limit: usize,
+    depth_limit: usize,
+    depth: usize,
+) -> Value {
+    if depth >= depth_limit {
+        return json!({"_truncated": true});
+    }
+    match value {
+        Value::String(value) => Value::String(truncate_string(value, string_limit)),
+        Value::Array(items) => {
+            let mut preview = items
+                .iter()
+                .take(collection_limit)
+                .map(|item| {
+                    truncate_value(item, string_limit, collection_limit, depth_limit, depth + 1)
+                })
+                .collect::<Vec<_>>();
+            if items.len() > collection_limit {
+                preview.push(json!({"_truncated_items": items.len() - collection_limit}));
+            }
+            Value::Array(preview)
+        }
+        Value::Object(items) => {
+            let mut preview = serde_json::Map::new();
+            for (key, item) in items.iter().take(collection_limit) {
+                preview.insert(
+                    truncate_string(key, string_limit),
+                    truncate_value(item, string_limit, collection_limit, depth_limit, depth + 1),
+                );
+            }
+            if items.len() > collection_limit {
+                preview.insert(
+                    "_truncated_fields".to_string(),
+                    json!(items.len() - collection_limit),
+                );
+            }
+            Value::Object(preview)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn truncate_string(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let result = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{result}…")
+    } else {
+        result
+    }
 }
 
 fn content_text(content: &ContentBlock) -> Option<String> {
@@ -155,23 +291,41 @@ fn content_text(content: &ContentBlock) -> Option<String> {
     }
 }
 
-fn limit_chars(value: &str, limit: usize) -> String {
-    let mut chars = value.chars();
-    let result = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{result}\n[результат MCP обрезан до безопасного лимита]")
-    } else {
-        result
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn bounds_long_tool_results() {
-        let value = limit_chars("а".repeat(10).as_str(), 4);
-        assert_eq!(value, "аааа\n[результат MCP обрезан до безопасного лимита]");
+    fn preview_truncates_json_structurally() {
+        let preview =
+            structured_preview(&json!({"messages": ["а".repeat(20_000)]}), 1_000).unwrap();
+        let parsed: Value = serde_json::from_str(&preview).unwrap();
+        assert!(parsed["messages"][0].as_str().unwrap().ends_with('…'));
+        assert!(preview.chars().count() <= 1_000);
+    }
+
+    #[test]
+    fn catalog_only_includes_policy_tools_as_whole_entries() {
+        let tools = vec![
+            Tool::new("chat.resolve_user", "schema", serde_json::Map::new()),
+            Tool::new("db.select", "schema", serde_json::Map::new()),
+        ];
+        let catalog = format_tool_catalog(&tools).unwrap();
+        assert!(catalog.tool_names.contains("chat.resolve_user"));
+        assert!(!catalog.tool_names.contains("db.select"));
+        assert!(catalog.rendered.contains("chat.resolve_user"));
+        assert!(!catalog.rendered.contains("db.select"));
+    }
+
+    #[test]
+    fn local_tool_collision_is_rejected() {
+        let error = reject_local_tool_collisions(&[Tool::new(
+            "web.search",
+            "schema",
+            serde_json::Map::new(),
+        )])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("collides"));
     }
 }
