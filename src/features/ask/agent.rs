@@ -405,14 +405,6 @@ async fn generate_action(
 ) -> Result<AgentAction, ActionGenerationError> {
     let action_schema = action_schema(agent_tools);
     let timeout_secs = config.ask_timeout_sec;
-    let validator: &crate::llm::service::OutputValidator =
-        &|value: &str| validate_agent_action_output(value);
-    #[cfg(test)]
-    let output_validator = (!std::env::var("ASK_DIAGNOSTIC_ALLOW_INVALID_ACTION")
-        .is_ok_and(|value| value == "1"))
-    .then_some(validator);
-    #[cfg(not(test))]
-    let output_validator = Some(validator);
     let generated = retry_once_on_timeout(Duration::from_secs(timeout_secs), || {
         generate_text_with_provider_checked(
             config,
@@ -424,7 +416,9 @@ async fn generate_action(
                 image_base64,
                 temperature: config.ask_llm_temperature,
                 num_predict: config.ask_llm_max_tokens,
-                output_validator,
+                // Native JSON mode ограничивает provider. Parse failure обрабатывается
+                // agent loop: он запрашивает исправленное действие с текущим контекстом.
+                output_validator: None,
                 structured_output: Some(StructuredOutput {
                     name: "ask_action",
                     schema: &action_schema,
@@ -434,10 +428,9 @@ async fn generate_action(
     })
     .await?;
     parse_agent_action(&generated.content).map_err(|_| {
-        #[cfg(test)]
-        eprintln!(
-            "invalid live ask action shape={}",
-            invalid_action_shape(&generated.content)
+        tracing::warn!(
+            shape = invalid_action_shape(&generated.content),
+            "ask LLM returned an invalid action; requesting correction"
         );
         ActionGenerationError::Invalid
     })
@@ -517,7 +510,6 @@ fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
     }
 }
 
-#[cfg(test)]
 fn invalid_action_shape(value: &str) -> &'static str {
     let value = value.trim();
     let value = value
@@ -543,6 +535,7 @@ fn invalid_action_shape(value: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn validate_agent_action_output(value: &str) -> anyhow::Result<()> {
     parse_agent_action(value)
         .map(|_| ())
