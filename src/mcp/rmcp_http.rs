@@ -12,7 +12,7 @@ use anyhow::{Context, bail};
 use axum::{
     Router,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, header::ORIGIN},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -105,6 +105,9 @@ fn parse_allowed_hosts(value: Option<&str>) -> anyhow::Result<Vec<String>> {
         );
     }
     for host in &hosts {
+        if host.contains('@') {
+            bail!("MCP_ALLOWED_HOSTS must not contain userinfo in authority {host:?}");
+        }
         host.parse::<axum::http::uri::Authority>()
             .with_context(|| format!("MCP_ALLOWED_HOSTS contains invalid authority {host:?}"))?;
     }
@@ -160,7 +163,7 @@ fn router(
             Default::default(),
             StreamableHttpServerConfig::default()
                 .with_allowed_hosts(allowed_hosts)
-                .with_allowed_origins(allowed_origins)
+                .with_allowed_origins(allowed_origins.clone())
                 .with_legacy_session_mode(false)
                 .with_max_request_body_bytes(MAX_REQUEST_BODY_BYTES)
                 .with_json_response(true)
@@ -169,7 +172,30 @@ fn router(
 
     Router::new()
         .route_service(path, service)
+        .layer(middleware::from_fn_with_state(
+            allowed_origins,
+            enforce_origin_policy,
+        ))
         .layer(middleware::from_fn_with_state((), enforce_request_timeout))
+}
+
+async fn enforce_origin_policy(
+    State(allowed_origins): State<Vec<String>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Some(_) = request.headers().get(ORIGIN) else {
+        return next.run(request).await;
+    };
+
+    // RMCP intentionally disables its origin validation for an empty list. Keep
+    // that mode safe for server clients without an Origin header, but reject
+    // browser-originated requests before handing them to RMCP.
+    if allowed_origins.is_empty() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    next.run(request).await
 }
 
 async fn enforce_request_timeout(
@@ -310,10 +336,48 @@ mod tests {
         assert!(parse_allowed_hosts(Some("")).is_err());
         assert!(parse_allowed_hosts(Some("localhost,,example.com")).is_err());
         assert!(parse_allowed_hosts(Some("https://public.example")).is_err());
+        assert!(parse_allowed_hosts(Some("trusted.example@evil.example")).is_err());
         assert_eq!(
             parse_allowed_hosts(Some("mcp.example.com,mcp.example.com:8443")).unwrap(),
             ["mcp.example.com", "mcp.example.com:8443"]
         );
+    }
+
+    #[tokio::test]
+    async fn absent_or_empty_origin_allowlist_rejects_untrusted_origin() -> Result<()> {
+        for allowed_origins in [
+            parse_allowed_origins(None)?,
+            parse_allowed_origins(Some("  "))?,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+            let app = router(
+                test_server(),
+                "/mcp",
+                vec!["127.0.0.1".to_owned()],
+                allowed_origins,
+            );
+            let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<()>();
+            let http = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_signal.await;
+                    })
+                    .await
+            });
+
+            let response = reqwest::Client::new()
+                .post(&endpoint)
+                .header("Origin", "https://untrusted.example")
+                .body("{}")
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+            let _ = shutdown.send(());
+            http.await??;
+        }
+        Ok(())
     }
 
     #[test]
