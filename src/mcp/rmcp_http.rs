@@ -213,11 +213,20 @@ async fn enforce_request_timeout(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
 
     use anyhow::Result;
+    use reqwest::header::{HeaderName, HeaderValue};
     use rmcp::{
-        ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport,
+        ServiceExt,
+        model::CallToolRequestParams,
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
     };
     use sqlx::postgres::PgPoolOptions;
 
@@ -377,6 +386,76 @@ mod tests {
             let _ = shutdown.send(());
             http.await??;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_trusted_origin_reaches_rmcp_lifecycle() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+        let trusted_origin = "https://trusted.example";
+        let app = router(
+            test_server(),
+            "/mcp",
+            vec!["127.0.0.1".to_owned()],
+            vec![trusted_origin.to_owned()],
+        );
+        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<()>();
+        let http = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_signal.await;
+                })
+                .await
+        });
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderName::from_static("origin"),
+            HeaderValue::from_static(trusted_origin),
+        );
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint).custom_headers(headers),
+        );
+        let mut client = ().serve(transport).await?;
+        let tools = client.list_tools(None).await?;
+        assert!(tools.tools.iter().any(|tool| tool.name == "db.list_tables"));
+        client.close().await?;
+
+        let _ = shutdown.send(());
+        http.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_untrusted_origin_gets_forbidden() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+        let app = router(
+            test_server(),
+            "/mcp",
+            vec!["127.0.0.1".to_owned()],
+            vec!["https://trusted.example".to_owned()],
+        );
+        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<()>();
+        let http = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_signal.await;
+                })
+                .await
+        });
+
+        let response = reqwest::Client::new()
+            .post(&endpoint)
+            .header("Origin", "https://untrusted.example")
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let _ = shutdown.send(());
+        http.await??;
         Ok(())
     }
 
