@@ -395,33 +395,41 @@ mod tests {
     }
 
     #[test]
-    fn shared_rmcp_tool_list_contains_catalog_and_semantic_tools() {
-        let tools = ChatMcpServer::tool_router().list_all();
-        let names = tools
-            .iter()
-            .map(|tool| tool.name.as_ref())
+    fn public_rmcp_tool_set_is_exact() {
+        let mut actual = ChatMcpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        for expected in [
-            "db.list_tables",
-            "db.describe_table",
-            "db.select",
-            "db.fetch_row",
-            "db.count",
-            "db.aggregate",
-            "db.search_text",
-            "chat.search_messages",
-            "chat.get_user_profile",
-            "chat.resolve_user",
-            "notes.list_chat",
-            "notes.list_user",
-            "moderation.list_spammers",
-            "ask.list_runs",
-            "voice.list_transcripts",
-            "memory.list_notes",
-            "search.list_runs",
-            "llm.list_generations",
-        ] {
-            assert!(names.contains(&expected), "missing {expected}");
-        }
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            [
+                "ask.list_runs",
+                "chat.get_message",
+                "chat.get_message_context",
+                "chat.get_recent_messages",
+                "chat.get_reply_thread",
+                "chat.get_user_interactions",
+                "chat.get_user_profile",
+                "chat.resolve_user",
+                "chat.search_messages",
+                "chat.search_messages_batch",
+                "db.aggregate",
+                "db.count",
+                "db.describe_table",
+                "db.fetch_row",
+                "db.list_tables",
+                "db.search_text",
+                "db.select",
+                "llm.list_generations",
+                "memory.list_notes",
+                "moderation.list_spammers",
+                "notes.list_chat",
+                "notes.list_user",
+                "search.list_runs",
+                "voice.list_transcripts",
+            ]
+        );
     }
 }
