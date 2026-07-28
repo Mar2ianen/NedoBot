@@ -182,6 +182,7 @@ pub async fn answer(
     let mut observations = Vec::new();
     let mut evidence = Evidence::default();
     let mut research = ResearchState::for_question(question);
+    let mut pending_final = None;
     let mut tool_signatures = HashSet::new();
     let mut tool_call_count = 0usize;
     if let Some(reply_context) = reply_context.filter(|value| !value.trim().is_empty()) {
@@ -213,30 +214,15 @@ pub async fn answer(
             }
             Err(ActionGenerationError::Request(err)) => return Err(err),
         };
-        #[cfg(test)]
-        eprintln!(
-            "live ask decoded action: kind={:?} tool={:?} arguments={} markdown={}",
-            action.kind,
-            action.tool,
-            action.arguments,
-            action
-                .markdown
-                .as_deref()
-                .map(|value| first_chars(value, 240))
-                .unwrap_or_default()
-        );
         match action.kind {
             ActionKind::Final => {
                 if let Some(markdown) = non_empty(action.markdown.as_deref()) {
                     if let Some(instruction) = research.follow_up_instruction(markdown) {
+                        pending_final = Some(markdown.to_owned());
                         push_observation(&mut observations, instruction);
                         continue;
                     }
-                    report_progress(progress, AskProgress::FormingAnswer);
-                    let answer =
-                        embed_bare_message_links(markdown, &evidence, config.discussion_chat_id);
-                    mcp.shutdown().await;
-                    return Ok(answer);
+                    return finish_answer(mcp, progress, markdown, &evidence, config).await;
                 }
                 push_observation(
                     &mut observations,
@@ -323,6 +309,11 @@ pub async fn answer(
                         )
                         .await;
                         research.record(tool, &tracking_arguments, &result.value);
+                        if let Some(markdown) = pending_final.as_deref()
+                            && research.follow_up_instruction(markdown).is_none()
+                        {
+                            return finish_answer(mcp, progress, markdown, &evidence, config).await;
+                        }
                         push_observation(
                             &mut observations,
                             format!("TOOL_RESULT_UNTRUSTED {tool}:\n{}", result.agent_preview),
@@ -380,6 +371,19 @@ pub async fn answer(
         return Ok(answer);
     }
     anyhow::bail!("ask agent did not produce a final answer")
+}
+
+async fn finish_answer(
+    mcp: McpClient,
+    progress: Option<&UnboundedSender<AskProgress>>,
+    markdown: &str,
+    evidence: &Evidence,
+    config: &Config,
+) -> anyhow::Result<String> {
+    report_progress(progress, AskProgress::FormingAnswer);
+    let answer = embed_bare_message_links(markdown, evidence, config.discussion_chat_id);
+    mcp.shutdown().await;
+    Ok(answer)
 }
 
 fn report_progress(progress: Option<&UnboundedSender<AskProgress>>, update: AskProgress) {
