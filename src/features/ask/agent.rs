@@ -24,7 +24,6 @@ const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
-const ACTION_TIMEOUT_CAP_SECS: u64 = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskProgress {
@@ -405,7 +404,7 @@ async fn generate_action(
     agent_tools: &[String],
 ) -> Result<AgentAction, ActionGenerationError> {
     let action_schema = action_schema(agent_tools);
-    let timeout_secs = config.ask_timeout_sec.min(ACTION_TIMEOUT_CAP_SECS);
+    let timeout_secs = config.ask_timeout_sec;
     let validator: &crate::llm::service::OutputValidator =
         &|value: &str| validate_agent_action_output(value);
     #[cfg(test)]
