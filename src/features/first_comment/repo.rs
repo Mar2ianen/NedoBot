@@ -30,6 +30,7 @@ impl CommentErrorKind {
     pub fn from_llm_error(error: &anyhow::Error) -> Self {
         match error.downcast_ref::<LlmTransportError>() {
             Some(LlmTransportError::Configuration) => Self::Configuration,
+            Some(LlmTransportError::EmptyResponse) => Self::Transient,
             Some(LlmTransportError::HttpStatus(status)) => Self::from_http_status(*status),
             None => Self::Transient,
         }

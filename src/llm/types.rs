@@ -7,6 +7,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmTransportError {
     Configuration,
+    EmptyResponse,
     HttpStatus(u16),
 }
 
@@ -18,12 +19,17 @@ impl LlmTransportError {
     pub fn http_status(status: u16) -> Self {
         Self::HttpStatus(status)
     }
+
+    pub fn empty_response() -> Self {
+        Self::EmptyResponse
+    }
 }
 
 impl fmt::Display for LlmTransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration => formatter.write_str("LLM transport configuration is invalid"),
+            Self::EmptyResponse => formatter.write_str("LLM returned an empty response"),
             Self::HttpStatus(status) => {
                 write!(
                     formatter,

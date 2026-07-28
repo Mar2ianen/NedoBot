@@ -72,7 +72,7 @@ impl LlmClient for OllamaClient<'_> {
             .unwrap_or_default();
 
         if content.trim().is_empty() {
-            anyhow::bail!("empty Ollama response");
+            return Err(LlmTransportError::empty_response().into());
         }
 
         Ok(LlmResponse { content })
