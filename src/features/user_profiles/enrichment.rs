@@ -14,7 +14,7 @@ use crate::{
         avatar_analysis::service::enqueue_current_avatar_analysis,
         first_message_spam::enqueue_first_message_spam_analysis,
         new_user_analysis::analyze_new_user_profile,
-        spam_review::{create_high_risk_review, send_review},
+        spam_review::{create_review, send_review},
         user_profiles::service::refresh_profile,
     },
 };
@@ -157,7 +157,7 @@ async fn process_refreshed_profile(
         {
             tracing::warn!(%err, user_id = job.user_id, "failed to enqueue first-message spam analysis");
         }
-        match create_high_risk_review(pool, job.chat_id, job.user_id).await {
+        match create_review(pool, job.chat_id, job.user_id).await {
             Ok(Some(review)) => {
                 if let Err(err) = send_review(bot, &review).await {
                     tracing::warn!(%err, user_id = job.user_id, "failed to send spam review");

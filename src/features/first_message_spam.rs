@@ -6,7 +6,7 @@ use teloxide::prelude::*;
 
 use crate::config::Config;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
-use crate::features::spam_review::{create_high_risk_review, send_review};
+use crate::features::spam_review::{create_review, send_review};
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
@@ -184,7 +184,7 @@ pub async fn process_next_first_message_spam_analysis_job(
             .bind(id)
             .execute(pool)
             .await?;
-            if let Some(review) = create_high_risk_review(pool, chat_id, user_id).await? {
+            if let Some(review) = create_review(pool, chat_id, user_id).await? {
                 send_review(bot, &review).await?;
             }
         }

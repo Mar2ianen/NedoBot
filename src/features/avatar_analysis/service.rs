@@ -10,7 +10,7 @@ use crate::features::avatar_analysis::repo::{
     AvatarAnalysisJob, AvatarAnalysisSuccess, claim_next_avatar_analysis_job,
     enqueue_avatar_analysis_job, mark_avatar_analysis_failed, mark_avatar_analysis_succeeded,
 };
-use crate::features::spam_review::{create_high_risk_review, send_review};
+use crate::features::spam_review::{create_review, send_review};
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
@@ -167,7 +167,7 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
         )
         .await?;
         for chat_id in affected_chat_ids {
-            if let Some(review) = create_high_risk_review(pool, chat_id, job.telegram_user_id).await?
+            if let Some(review) = create_review(pool, chat_id, job.telegram_user_id).await?
                 && let Err(err) = send_review(bot, &review).await
             {
                 tracing::warn!(%err, user_id = job.telegram_user_id, "failed to send avatar risk review");

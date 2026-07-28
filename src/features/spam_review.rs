@@ -16,7 +16,7 @@ pub struct SpamReview {
     pub text: String,
 }
 
-pub async fn create_high_risk_review(
+pub async fn create_review(
     pool: &PgPool,
     chat_id: i64,
     user_id: i64,
@@ -26,7 +26,7 @@ pub async fn create_high_risk_review(
         insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals)
         select a.chat_id, a.telegram_user_id, a.risk_score, a.risk_signal_breakdown
         from telegram_new_user_profile_audits a
-        where a.chat_id = $1 and a.telegram_user_id = $2 and a.risk_level = 'high'
+        where a.chat_id = $1 and a.telegram_user_id = $2
         on conflict (chat_id, telegram_user_id) do nothing
         returning id, chat_id, telegram_user_id, risk_score, risk_signals
     "#,
@@ -56,7 +56,7 @@ pub async fn create_high_risk_review(
         .map(|value| html::link(format!("@{value}"), format!("https://t.me/{value}")).into_string())
         .unwrap_or_else(|| "без username".into());
     let text = format!(
-        "@{OWNER_USERNAME}, <b>высокий риск спама</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Причины:</b>\n{}",
+        "@{OWNER_USERNAME}, <b>проверка нового участника</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Сигналы:</b>\n{}",
         profile_link, username, id_link, score, reasons
     );
     Ok(Some(SpamReview {
