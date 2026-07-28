@@ -331,7 +331,7 @@ ssh vps-153 'podman ps'
 
 - Миграция `20260717180000_mcp_public_views.sql` задаёт scope и explicit-колонки. Private chat/DM и raw Telegram JSON не публикуются; полный reviewed inventory опубликованных view и полей находится в [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md).
 - `config/mcp_db_manifest.toml` — проверяемый allowlist views, колонок и их типов, а [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md) — его human-readable snapshot. При старте MCP сверяет manifest с БД и отказывается стартовать при schema drift.
-- Внешнему клиенту доступны только структурированные `db.*` и read-only domain tools; значения передаются bind-параметрами, лимит одной страницы — 200, соединений с БД — два, `statement_timeout` — 5 секунд.
+- Внешнему клиенту доступны только структурированные `db.*` и read-only domain tools; значения передаются bind-параметрами, лимит одной страницы — 200, effective column list — 40, итог generic-ответа — 1 MiB. Широкие views требуют явно передать `columns`, а текстовые, JSONB и array значения ограничиваются до сериализации. Соединений с БД — два, `statement_timeout` — 5 секунд.
 - `db.search_text` и `chat.search_messages` принимают `match_mode`: `contains` (дефолтный поиск подстроки) или `whole_word` (точное слово/фраза с PostgreSQL word boundaries). Флаг `case_sensitive=false` по умолчанию; для имён и терминов без ложных совпадений вроде `Оля`/`доля` использовать `match_mode: "whole_word"`.
 - JSON рекурсивно очищается от ключей наподобие `token`, `secret`, `authorization`, `database_url` и `invite_link`. В логах сохраняются только tool, table/columns/operators, количество строк и latency — без текстов сообщений и значений фильтров.
 

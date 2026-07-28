@@ -27,6 +27,8 @@ pub struct SelectInput {
 pub struct FetchRowInput {
     pub table: String,
     pub key: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub columns: Vec<String>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +54,8 @@ pub struct SearchTextInput {
     pub table: String,
     pub column: String,
     pub query: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
     pub match_mode: Option<SearchMatchMode>,
     pub case_sensitive: Option<bool>,
     pub limit: Option<i64>,
@@ -214,7 +218,7 @@ pub async fn fetch_row(api: &ChatReadApi, input: FetchRowInput) -> Result<Value,
     }
     let request = query::SelectRequest {
         table: input.table,
-        columns: vec![],
+        columns: input.columns,
         filters: input
             .key
             .into_iter()
@@ -275,7 +279,7 @@ pub async fn search_text(
         api,
         SelectInput {
             table: input.table,
-            columns: vec![],
+            columns: input.columns,
             filters: vec![FilterInput {
                 column: input.column,
                 op: match input.match_mode.unwrap_or(SearchMatchMode::Contains) {
