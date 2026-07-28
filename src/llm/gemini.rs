@@ -66,7 +66,7 @@ impl LlmClient for GeminiClient<'_> {
             .candidates
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("empty Gemini response"))?;
+            .ok_or_else(LlmTransportError::empty_response)?;
 
         if candidate.finish_reason.as_deref() == Some("MAX_TOKENS") {
             anyhow::bail!("Gemini response stopped due to MAX_TOKENS");
@@ -81,7 +81,7 @@ impl LlmClient for GeminiClient<'_> {
             .join("\n");
 
         if content.trim().is_empty() {
-            anyhow::bail!("empty Gemini response");
+            return Err(LlmTransportError::empty_response().into());
         }
 
         Ok(LlmResponse { content })

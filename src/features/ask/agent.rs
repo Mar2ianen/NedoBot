@@ -14,7 +14,7 @@ use crate::features::ask::chat_search::message_url;
 use crate::features::ask::mcp_client::{LOCAL_AGENT_TOOLS, McpClient, structured_preview};
 use crate::features::ask::notes::add_user_note_from_search;
 use crate::features::ask::repo;
-use crate::features::ask::types::PendingToolCallAudit;
+use crate::features::ask::types::{AskProgress, PendingToolCallAudit};
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
@@ -24,16 +24,7 @@ const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AskProgress {
-    Preparing,
-    ResolvingPerson,
-    SearchingChat,
-    CheckingExternalSources,
-    CheckingNotes,
-    FormingAnswer,
-}
+const RESEARCH_BUDGET_EXHAUSTED_FALLBACK: &str = "Не могу дать надёжный ответ: для проверки нужны дополнительные поиски или контекст сообщений, но лимит исследования исчерпан. Лучше повторите вопрос с более узкими деталями.";
 
 pub struct AskRequest<'a> {
     pub ask_run_id: Option<i64>,
@@ -45,19 +36,6 @@ pub struct AskRequest<'a> {
     pub progress: Option<&'a UnboundedSender<AskProgress>>,
     /// Production `/ask` может сохранять проверенные заметки; diagnostic replay остаётся read-only.
     pub allow_mutations: bool,
-}
-
-impl AskProgress {
-    pub fn message(self) -> &'static str {
-        match self {
-            Self::Preparing => "⏳ Подготавливаю ответ…",
-            Self::ResolvingPerson => "🔎 Нахожу участника и проверяю профиль…",
-            Self::SearchingChat => "🔎 Ищу и сверяю сообщения в истории чата…",
-            Self::CheckingExternalSources => "🌐 Проверяю внешние источники…",
-            Self::CheckingNotes => "📝 Проверяю сохранённые заметки…",
-            Self::FormingAnswer => "✍️ Формирую ответ…",
-        }
-    }
 }
 
 const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник Telegram-чата «НедоNews Chat». Это активный русскоязычный чат о технологиях, ПК, играх, смартфонах, софте, новостях и повседневных темах. Отвечай на сам вопрос, а инструменты используй только когда они добавляют нужные факты.
@@ -165,6 +143,19 @@ pub async fn answer(
     pool: &PgPool,
     request: AskRequest<'_>,
 ) -> anyhow::Result<String> {
+    timeout(
+        Duration::from_secs(config.ask_total_timeout_sec),
+        answer_within_deadline(config, pool, request),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ask total deadline exceeded"))?
+}
+
+async fn answer_within_deadline(
+    config: &Config,
+    pool: &PgPool,
+    request: AskRequest<'_>,
+) -> anyhow::Result<String> {
     let AskRequest {
         ask_run_id,
         requester_user_id,
@@ -182,7 +173,6 @@ pub async fn answer(
     let mut observations = Vec::new();
     let mut evidence = Evidence::default();
     let mut research = ResearchState::for_question(question);
-    let mut pending_final = None;
     let mut tool_signatures = HashSet::new();
     let mut tool_call_count = 0usize;
     if let Some(reply_context) = reply_context.filter(|value| !value.trim().is_empty()) {
@@ -218,7 +208,10 @@ pub async fn answer(
             ActionKind::Final => {
                 if let Some(markdown) = non_empty(action.markdown.as_deref()) {
                     if let Some(instruction) = research.follow_up_instruction(markdown) {
-                        pending_final = Some(markdown.to_owned());
+                        push_observation(
+                            &mut observations,
+                            format!("DRAFT_FINAL_UNTRUSTED:\n{markdown}"),
+                        );
                         push_observation(&mut observations, instruction);
                         continue;
                     }
@@ -309,11 +302,6 @@ pub async fn answer(
                         )
                         .await;
                         research.record(tool, &tracking_arguments, &result.value);
-                        if let Some(markdown) = pending_final.as_deref()
-                            && research.follow_up_instruction(markdown).is_none()
-                        {
-                            return finish_answer(mcp, progress, markdown, &evidence, config).await;
-                        }
                         push_observation(
                             &mut observations,
                             format!("TOOL_RESULT_UNTRUSTED {tool}:\n{}", result.agent_preview),
@@ -365,12 +353,24 @@ pub async fn answer(
     if action.kind == ActionKind::Final
         && let Some(markdown) = non_empty(action.markdown.as_deref())
     {
-        report_progress(progress, AskProgress::FormingAnswer);
-        let answer = embed_bare_message_links(markdown, &evidence, config.discussion_chat_id);
-        mcp.shutdown().await;
-        return Ok(answer);
+        return finish_answer(
+            mcp,
+            progress,
+            forced_final_markdown(&research, markdown),
+            &evidence,
+            config,
+        )
+        .await;
     }
     anyhow::bail!("ask agent did not produce a final answer")
+}
+
+fn forced_final_markdown<'a>(research: &ResearchState, markdown: &'a str) -> &'a str {
+    if research.follow_up_instruction(markdown).is_some() {
+        RESEARCH_BUDGET_EXHAUSTED_FALLBACK
+    } else {
+        markdown
+    }
 }
 
 async fn finish_answer(
@@ -408,7 +408,7 @@ async fn generate_action(
     agent_tools: &[String],
 ) -> Result<AgentAction, ActionGenerationError> {
     let action_schema = action_schema(agent_tools);
-    let timeout_secs = config.ask_timeout_sec;
+    let timeout_secs = config.ask_action_timeout_sec;
     let generated = retry_once_on_timeout(Duration::from_secs(timeout_secs), || {
         generate_text_with_provider_checked(
             config,
@@ -490,19 +490,16 @@ fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
         .and_then(|value| value.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed);
-    let parsed = serde_json::from_str(without_fence)
-        .or_else(|_| serde_json::from_str(&escape_json_string_controls(without_fence)))
-        .or_else(|_| {
-            let start = without_fence.find('{').ok_or(())?;
-            let end = without_fence.rfind('}').ok_or(())?;
-            let object = &without_fence[start..=end];
-            serde_json::from_str(object)
-                .or_else(|_| serde_json::from_str(&escape_json_string_controls(object)))
-                .map_err(|_| ())
-        });
+    let extracted_object = extract_json_object(without_fence);
+    let parsed = parse_json_action(without_fence).or_else(|_| {
+        extracted_object
+            .filter(|object| *object != without_fence)
+            .ok_or(())
+            .and_then(parse_json_action)
+    });
     match parsed {
         Ok(action) => Ok(action),
-        Err(()) if !without_fence.is_empty() && !without_fence.contains("\"kind\"") => {
+        Err(()) if !without_fence.is_empty() && !looks_like_json(without_fence) => {
             Ok(AgentAction {
                 kind: ActionKind::Final,
                 tool: None,
@@ -512,6 +509,24 @@ fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
         }
         Err(()) => Err(()),
     }
+}
+
+fn parse_json_action(value: &str) -> Result<AgentAction, ()> {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_str(&escape_json_string_controls(value)))
+        .map_err(|_| ())
+}
+
+fn extract_json_object(value: &str) -> Option<&str> {
+    let start = value.find('{')?;
+    let end = value.rfind('}')?;
+    (start <= end).then_some(&value[start..=end])
+}
+
+fn looks_like_json(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_ok()
+        || matches!(value.chars().next(), Some('{' | '[' | '"'))
+        || extract_json_object(value).is_some()
 }
 
 fn invalid_action_shape(value: &str) -> &'static str {
@@ -740,22 +755,26 @@ impl ResearchState {
     fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
         match tool {
             "chat.search_messages" | "chat.search_messages_batch" => {
-                let searches = if tool == "chat.search_messages_batch" {
-                    arguments
-                        .get("queries")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or(1)
-                } else {
-                    1
-                };
+                let executed_batch = (tool == "chat.search_messages_batch")
+                    .then(|| batch_search_execution(result))
+                    .flatten();
+                let argument_queries = argument_queries(arguments);
+                let searches = executed_batch
+                    .as_ref()
+                    .map(|execution| execution.count)
+                    .unwrap_or_else(|| requested_search_count(tool, arguments));
+                let executed_queries = executed_batch
+                    .as_ref()
+                    .map(|execution| execution.queries.as_slice())
+                    .unwrap_or(&argument_queries);
                 self.message_searches += searches;
                 if arguments.get("user_id").and_then(Value::as_i64).is_some() {
                     self.targeted_message_searches += searches;
                 }
                 self.message_results += count_message_results(result);
-                self.personal_statement_searches += personal_statement_query_count(arguments);
-                self.personal_topic_searches += personal_topic_query_count(arguments);
+                self.personal_statement_searches +=
+                    personal_statement_query_count_values(executed_queries);
+                self.personal_topic_searches += personal_topic_query_count_values(executed_queries);
             }
             "chat.get_recent_messages" => {
                 self.message_results += json_array_len(result);
@@ -884,18 +903,47 @@ fn embed_bare_message_links(markdown: &str, evidence: &Evidence, chat_id: i64) -
     result
 }
 
-fn personal_statement_query_count(arguments: &Value) -> usize {
-    let queries = arguments
+struct BatchSearchExecution<'a> {
+    count: usize,
+    queries: Vec<&'a Value>,
+}
+
+fn batch_search_execution(result: &Value) -> Option<BatchSearchExecution<'_>> {
+    let results = result.get("results")?.as_array()?;
+    Some(BatchSearchExecution {
+        count: results.len(),
+        queries: results
+            .iter()
+            .filter_map(|item| item.get("query"))
+            .collect(),
+    })
+}
+
+fn requested_search_count(tool: &str, arguments: &Value) -> usize {
+    if tool == "chat.search_messages_batch" {
+        arguments
+            .get("queries")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+fn argument_queries(arguments: &Value) -> Vec<&Value> {
+    arguments
         .get("queries")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_else(|| {
-            arguments
-                .get("query")
-                .cloned()
-                .into_iter()
-                .collect::<Vec<_>>()
-        });
+        .map(|queries| queries.iter().collect())
+        .unwrap_or_else(|| arguments.get("query").into_iter().collect())
+}
+
+fn personal_statement_query_count(arguments: &Value) -> usize {
+    personal_statement_query_count_values(&argument_queries(arguments))
+}
+
+fn personal_statement_query_count_values(queries: &[&Value]) -> usize {
     const MARKERS: &[&str] = &[
         "у меня",
         "мой",
@@ -907,27 +955,16 @@ fn personal_statement_query_count(arguments: &Value) -> usize {
     ];
     queries
         .iter()
-        .filter_map(Value::as_str)
+        .filter_map(|query| query.as_str())
         .map(|query| query.trim().to_lowercase())
         .filter(|query| MARKERS.contains(&query.as_str()))
         .count()
 }
 
-fn personal_topic_query_count(arguments: &Value) -> usize {
-    let queries = arguments
-        .get("queries")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_else(|| {
-            arguments
-                .get("query")
-                .cloned()
-                .into_iter()
-                .collect::<Vec<_>>()
-        });
+fn personal_topic_query_count_values(queries: &[&Value]) -> usize {
     queries
         .iter()
-        .filter_map(Value::as_str)
+        .filter_map(|query| query.as_str())
         .map(|query| query.trim().to_lowercase())
         .filter(|query| !is_personal_statement_marker(query))
         .count()
@@ -1172,6 +1209,15 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_malformed_or_missing_kind_json_instead_of_plain_text_fallback() {
+        assert!(parse_agent_action(r#"{"markdown":"ответ"}"#).is_err());
+        assert!(parse_agent_action(r#"{"kind":"final","markdown": }"#).is_err());
+        assert!(parse_agent_action("Префикс: {\"markdown\":\"ответ\"}").is_err());
+        assert!(parse_agent_action("{невалидный JSON").is_err());
+        assert!(parse_agent_action("Обычный текст без JSON").is_ok());
+    }
+
+    #[test]
     fn local_agent_tools_only_allow_declared_tools() {
         assert!(!LOCAL_AGENT_TOOLS.contains(&"chat.raw_sql"));
         assert!(LOCAL_AGENT_TOOLS.contains(&"notes.add_user"));
@@ -1293,6 +1339,41 @@ mod tests {
         assert_eq!(json_array_len(&value), 2);
         assert_eq!(tool_result_count(&value), Some(2));
         assert_eq!(count_message_results(&value), 2);
+    }
+
+    #[test]
+    fn batch_search_research_uses_actual_executed_queries() {
+        let arguments = json!({
+            "user_id": 42,
+            "queries": ["у меня", "мой", "процессор", "купил", "лишний"]
+        });
+        let result = json!({
+            "results": [
+                {"query": "у меня", "messages": []},
+                {"query": "мой", "messages": []},
+                {"query": "процессор", "messages": []}
+            ]
+        });
+        let mut research = ResearchState::default();
+
+        research.record("chat.search_messages_batch", &arguments, &result);
+
+        assert_eq!(research.message_searches, 3);
+        assert_eq!(research.targeted_message_searches, 3);
+        assert_eq!(research.personal_statement_searches, 2);
+        assert_eq!(research.personal_topic_searches, 1);
+    }
+
+    #[test]
+    fn forced_final_research_validation_uses_controlled_fallback() {
+        let research = ResearchState::for_question("какой процессор у него?");
+        let unchecked_markdown = "У него Ryzen 9";
+
+        assert_eq!(
+            forced_final_markdown(&research, unchecked_markdown),
+            RESEARCH_BUDGET_EXHAUSTED_FALLBACK
+        );
+        assert!(!RESEARCH_BUDGET_EXHAUSTED_FALLBACK.contains(unchecked_markdown));
     }
 
     #[test]

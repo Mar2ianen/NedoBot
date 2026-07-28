@@ -169,9 +169,7 @@ pub async fn search_messages_batch(
     api: &ChatReadApi,
     input: SearchMessagesBatchInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
-    if input.queries.is_empty() {
-        return Err(invalid_arguments("queries must not be empty"));
-    }
+    validate_batch_queries(&input.queries)?;
     let date_from = parse_timestamp(input.date_from)?;
     let date_to = parse_timestamp(input.date_to)?;
     let limit = input
@@ -179,7 +177,7 @@ pub async fn search_messages_batch(
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_BATCH_LIMIT);
     let mut results = Vec::new();
-    for query in input.queries.into_iter().take(MAX_BATCH_QUERIES) {
+    for query in input.queries {
         let messages = api
             .search_messages(&MessageSearchRequest {
                 query: query.clone(),
@@ -206,6 +204,16 @@ pub async fn search_messages_batch(
         });
     }
     Ok(serde_json::json!({"results": results}))
+}
+
+fn validate_batch_queries(queries: &[String]) -> Result<(), rmcp::ErrorData> {
+    if queries.is_empty() {
+        return Err(invalid_arguments("queries must not be empty"));
+    }
+    if queries.len() > MAX_BATCH_QUERIES {
+        return Err(invalid_arguments("queries must contain at most six items"));
+    }
+    Ok(())
 }
 
 pub async fn recent_messages(
@@ -347,6 +355,15 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn batch_search_rejects_more_than_six_queries_before_database_access() {
+        let queries = (0..=MAX_BATCH_QUERIES)
+            .map(|index| format!("query-{index}"))
+            .collect::<Vec<_>>();
+        let error = validate_batch_queries(&queries).unwrap_err();
+        assert_eq!(error.message, "queries must contain at most six items");
     }
 
     #[test]

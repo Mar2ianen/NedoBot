@@ -2,12 +2,10 @@ use teloxide::{prelude::*, types::ReplyParameters, utils::command::BotCommands};
 use tokio::sync::mpsc;
 
 use crate::db::telegram::save_telegram_message;
-use crate::features::ask::agent;
 use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
-use crate::features::ask::repo;
-use crate::features::ask::rich_markdown;
-use crate::features::ask::types::AskRunStatus;
+use crate::features::ask::service::AskService;
+use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress};
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
@@ -222,12 +220,89 @@ async fn handle_ask_command(
             teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy"))
         })?;
     let progress_message = bot
-        .send_message(msg.chat.id, agent::AskProgress::Preparing.message())
+        .send_message(msg.chat.id, ask_progress_message(AskProgress::Preparing))
         .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
         .await
         .ok();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let reply_context = msg.reply_to_message().map(|reply| {
+    let reply_context = build_ask_reply_context(msg, config.discussion_chat_id);
+    let reply_image_base64 = match msg.reply_to_message() {
+        Some(reply) => match download_largest_photo_base64(bot, reply, config).await {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::warn!(%err, "failed to download /ask reply image");
+                None
+            }
+        },
+        None => None,
+    };
+    let input = AskCommandInput {
+        chat_id: msg.chat.id.0,
+        command_message_id: msg.id.0,
+        requester_user_id: user.id.0 as i64,
+        requester_identity: requester_identity(user),
+        question: question.to_owned(),
+        reply_to_message_id: msg.reply_to_message().map(|reply| reply.id.0),
+        reply_context,
+        reply_image_base64,
+        allow_mutations: true,
+    };
+    let ask_service = AskService::new(&state.pool, config);
+    let answer = ask_service.execute(input, progress_message.as_ref().map(|_| &progress_tx));
+    tokio::pin!(answer);
+    let mut progress_open = progress_message.is_some();
+    let mut last_progress = AskProgress::Preparing;
+    let answer = loop {
+        tokio::select! {
+            answer = &mut answer => break answer,
+            update = progress_rx.recv(), if progress_open => match update {
+                Some(update) if update != last_progress => {
+                    last_progress = update;
+                    if let Some(progress_message) = &progress_message
+                        && let Err(err) = bot.edit_message_text(
+                            msg.chat.id,
+                            progress_message.id,
+                            ask_progress_message(update),
+                        ).await
+                    {
+                        tracing::debug!(%err, "failed to update ask progress message");
+                    }
+                }
+                Some(_) => {}
+                None => progress_open = false,
+            }
+        }
+    };
+    drop(permit);
+    if let Some(progress_message) = progress_message
+        && let Err(err) = bot.delete_message(msg.chat.id, progress_message.id).await
+    {
+        tracing::debug!(%err, "failed to remove ask progress message");
+    }
+    match answer {
+        Ok(answer) => {
+            if send_rich_markdown_reply(msg.chat.id, msg.id, answer.markdown.clone())
+                .await
+                .is_ok()
+            {
+                Ok(())
+            } else {
+                send_html(bot, msg.chat.id, escape_html(&answer.markdown))
+                    .await
+                    .map(|_| ())
+            }
+        }
+        Err(err) => {
+            tracing::warn!(%err, error_kind = err.kind.as_str(), "ask assistant failed");
+            send_html(bot, msg.chat.id, ask_failure_message(err.kind))
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
+fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<String> {
+    msg.reply_to_message().map(|reply| {
         let author = reply
             .from
             .as_ref()
@@ -263,8 +338,8 @@ async fn handle_ask_command(
             "message_id={}\nauthor={}\nmessage_url={}\nmedia={}\ntext={}",
             reply.id.0,
             author,
-            (reply.chat.id.0 == config.discussion_chat_id)
-                .then(|| message_url(config.discussion_chat_id, reply.id.0))
+            (reply.chat.id.0 == discussion_chat_id)
+                .then(|| message_url(discussion_chat_id, reply.id.0))
                 .flatten()
                 .as_deref()
                 .unwrap_or("нет"),
@@ -274,163 +349,17 @@ async fn handle_ask_command(
                 .or_else(|| reply.caption())
                 .unwrap_or("[нет текста]")
         )
-    });
-    let reply_image = match msg.reply_to_message() {
-        Some(reply) => match download_largest_photo_base64(bot, reply, config).await {
-            Ok(image) => image,
-            Err(err) => {
-                tracing::warn!(%err, "failed to download /ask reply image");
-                None
-            }
-        },
-        None => None,
-    };
-    let ask_run_id = match repo::create_run(
-        &state.pool,
-        config,
-        repo::CreateAskRunParams {
-            chat_id: msg.chat.id.0,
-            command_message_id: msg.id.0,
-            requester_user_id: user.id.0 as i64,
-            question,
-            reply_to_message_id: msg.reply_to_message().map(|reply| reply.id.0),
-        },
-    )
-    .await
-    {
-        Ok(ask_run_id) => Some(ask_run_id),
-        Err(err) => {
-            tracing::warn!(%err, "failed to start ask audit run");
-            None
-        }
-    };
-    let requester_identity = requester_identity(user);
-    let answer = agent::answer(
-        config,
-        &state.pool,
-        agent::AskRequest {
-            ask_run_id,
-            requester_user_id: user.id.0 as i64,
-            requester_identity: &requester_identity,
-            question,
-            reply_context: reply_context.as_deref(),
-            image_base64: reply_image.as_deref(),
-            progress: progress_message.as_ref().map(|_| &progress_tx),
-            allow_mutations: true,
-        },
-    );
-    tokio::pin!(answer);
-    let mut progress_open = progress_message.is_some();
-    let mut last_progress = agent::AskProgress::Preparing;
-    let answer = loop {
-        tokio::select! {
-            answer = &mut answer => break answer,
-            update = progress_rx.recv(), if progress_open => {
-                match update {
-                    Some(update) if update != last_progress => {
-                        last_progress = update;
-                        if let Some(progress_message) = &progress_message
-                            && let Err(err) = bot.edit_message_text(
-                                msg.chat.id,
-                                progress_message.id,
-                                update.message(),
-                            ).await {
-                                tracing::debug!(%err, "failed to update ask progress message");
-                            }
-                    }
-                    Some(_) => {}
-                    None => progress_open = false,
-                }
-            }
-        }
-    };
-    drop(permit);
-    if let Some(progress_message) = progress_message
-        && let Err(err) = bot.delete_message(msg.chat.id, progress_message.id).await
-    {
-        tracing::debug!(%err, "failed to remove ask progress message");
-    }
-    match answer {
-        Ok(answer) => {
-            let markdown = match rich_markdown::validate(&answer) {
-                Ok(markdown) => markdown,
-                Err(err) => {
-                    tracing::warn!(%err, "ask assistant returned unsafe markdown");
-                    finish_ask_run(
-                        &state.pool,
-                        ask_run_id,
-                        AskRunStatus::Failed,
-                        None,
-                        Some("render_validation"),
-                    )
-                    .await;
-                    return Err(teloxide::RequestError::Io(std::io::Error::other(
-                        "ask markdown is invalid",
-                    )));
-                }
-            };
-            finish_ask_run(
-                &state.pool,
-                ask_run_id,
-                AskRunStatus::Completed,
-                Some(&markdown),
-                None,
-            )
-            .await;
-            if send_rich_markdown_reply(msg.chat.id, msg.id, markdown)
-                .await
-                .is_ok()
-            {
-                Ok(())
-            } else {
-                send_html(bot, msg.chat.id, escape_html(&answer))
-                    .await
-                    .map(|_| ())
-            }
-        }
-        Err(err) => {
-            tracing::warn!(%err, "ask assistant failed");
-            finish_ask_run(
-                &state.pool,
-                ask_run_id,
-                AskRunStatus::Failed,
-                None,
-                Some(ask_error_kind(&err)),
-            )
-            .await;
-            send_html(bot, msg.chat.id, ask_failure_message(&err))
-                .await
-                .map(|_| ())
-        }
-    }
+    })
 }
 
-async fn finish_ask_run(
-    pool: &sqlx::PgPool,
-    ask_run_id: Option<i64>,
-    status: AskRunStatus,
-    answer_markdown: Option<&str>,
-    error_kind: Option<&str>,
-) {
-    let Some(ask_run_id) = ask_run_id else {
-        return;
-    };
-    if let Err(err) = repo::finish_run(pool, ask_run_id, status, answer_markdown, error_kind).await
-    {
-        tracing::warn!(%err, ask_run_id, "failed to finish ask audit run");
-    }
-}
-
-fn ask_error_kind(error: &anyhow::Error) -> &'static str {
-    let error = error.to_string().to_lowercase();
-    if error.contains("timed out") {
-        "timeout"
-    } else if error.contains("mcp") || error.contains("database") {
-        "tool_error"
-    } else if error.contains("invalid action") || error.contains("final answer") {
-        "invalid_action"
-    } else {
-        "generation_error"
+fn ask_progress_message(progress: AskProgress) -> &'static str {
+    match progress {
+        AskProgress::Preparing => "⏳ Подготавливаю ответ…",
+        AskProgress::ResolvingPerson => "🔎 Нахожу участника и проверяю профиль…",
+        AskProgress::SearchingChat => "🔎 Ищу и сверяю сообщения в истории чата…",
+        AskProgress::CheckingExternalSources => "🌐 Проверяю внешние источники…",
+        AskProgress::CheckingNotes => "📝 Проверяю сохранённые заметки…",
+        AskProgress::FormingAnswer => "✍️ Формирую ответ…",
     }
 }
 
@@ -448,16 +377,20 @@ fn requester_identity(user: &teloxide::types::User) -> String {
     identity.chars().take(120).collect()
 }
 
-fn ask_failure_message(error: &anyhow::Error) -> &'static str {
-    let error = error.to_string().to_lowercase();
-    if error.contains("timed out") {
-        "Помощник не уложился в таймаут. Попробуй сузить вопрос или повторить позже."
-    } else if error.contains("mcp") || error.contains("database") {
-        "Сейчас недоступен поиск по истории чата. Попробуй повторить запрос позже."
-    } else if error.contains("invalid action") || error.contains("final answer") {
-        "Модель не смогла завершить агентный ответ. Запрос можно повторить без изменений."
-    } else {
-        "Не смог подготовить ответ из-за временной ошибки модели или инструмента. Попробуй ещё раз чуть позже."
+fn ask_failure_message(kind: AskFailureKind) -> &'static str {
+    match kind {
+        AskFailureKind::Timeout => {
+            "Помощник не уложился в таймаут. Попробуй сузить вопрос или повторить позже."
+        }
+        AskFailureKind::ToolError => {
+            "Сейчас недоступен поиск по истории чата. Попробуй повторить запрос позже."
+        }
+        AskFailureKind::InvalidAction => {
+            "Модель не смогла завершить агентный ответ. Запрос можно повторить без изменений."
+        }
+        AskFailureKind::InvalidOutput | AskFailureKind::GenerationError => {
+            "Не смог подготовить ответ из-за временной ошибки модели или инструмента. Попробуй ещё раз чуть позже."
+        }
     }
 }
 

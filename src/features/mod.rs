@@ -9,6 +9,7 @@ pub mod chat_read_api;
 pub mod chat_retrieval;
 pub mod first_comment;
 pub mod first_message_spam;
+pub mod jobs;
 pub mod memory;
 pub mod new_user_analysis;
 pub mod search;

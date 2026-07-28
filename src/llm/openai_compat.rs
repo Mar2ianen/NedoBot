@@ -67,7 +67,7 @@ impl LlmClient for OpenAiCompatClient {
             .next()
             .and_then(|choice| choice.message.content)
             .filter(|content| !content.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("empty OpenAI-compatible response"))?;
+            .ok_or_else(LlmTransportError::empty_response)?;
 
         Ok(LlmResponse { content })
     }

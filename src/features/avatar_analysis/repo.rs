@@ -3,7 +3,8 @@
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
-const LEASE_SECONDS: i64 = 10 * 60;
+use crate::features::jobs::claim::CasResult;
+use crate::features::jobs::policy::{ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE};
 
 #[derive(Debug, Clone)]
 pub struct AvatarAnalysisJob {
@@ -76,7 +77,7 @@ pub async fn claim_next_avatar_analysis_job(
                   job.features_json, job.prompt_version, job.attempts
         "#,
     )
-    .bind(LEASE_SECONDS)
+    .bind(EXTERNAL_REQUEST_LEASE.seconds())
     .fetch_optional(pool)
     .await?;
 
@@ -105,8 +106,27 @@ pub async fn mark_avatar_analysis_succeeded(
     pool: &PgPool,
     job: &AvatarAnalysisJob,
     success: AvatarAnalysisSuccess<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CasResult> {
     let mut tx = pool.begin().await?;
+    let update = sqlx::query(
+        r#"
+        update avatar_analysis_jobs
+        set status = 'succeeded', provider = $3, model = $4, error_kind = null,
+            lease_expires_at = null, updated_at = now()
+        where id = $1 and attempts = $2 and status = 'processing'
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.attempts)
+    .bind(success.provider)
+    .bind(success.model)
+    .execute(&mut *tx)
+    .await?;
+    let result = CasResult::from_rows_affected(update.rows_affected())?;
+    if result == CasResult::LeaseLost {
+        tx.rollback().await?;
+        return Ok(result);
+    }
     sqlx::query(
         r#"
         insert into avatar_image_analyses
@@ -147,21 +167,8 @@ pub async fn mark_avatar_analysis_succeeded(
     .bind(success.response)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        r#"
-        update avatar_analysis_jobs
-        set status = 'succeeded', provider = $2, model = $3, error_kind = null,
-            lease_expires_at = null, updated_at = now()
-        where id = $1 and status = 'processing'
-        "#,
-    )
-    .bind(job.id)
-    .bind(success.provider)
-    .bind(success.model)
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(result)
 }
 
 pub async fn mark_avatar_analysis_failed(
@@ -169,76 +176,45 @@ pub async fn mark_avatar_analysis_failed(
     job: &AvatarAnalysisJob,
     error_kind: &str,
     retry_after_seconds: Option<i64>,
-) -> anyhow::Result<()> {
-    let delay_seconds = retry_after_seconds.unwrap_or(0).max(0);
-    let Some(next_delay) = retry_delay_seconds(job.attempts, delay_seconds) else {
-        return mark_avatar_analysis_terminally_failed(pool, job.id, error_kind).await;
+) -> anyhow::Result<CasResult> {
+    let Some(next_delay) = ANALYSIS_RETRY.delay_seconds(job.attempts, retry_after_seconds) else {
+        return mark_avatar_analysis_terminally_failed(pool, job, error_kind).await;
     };
-    sqlx::query(
+    let update = sqlx::query(
         r#"
         update avatar_analysis_jobs
-        set status = $2, error_kind = $3,
-            next_attempt_at = now() + ($4 * interval '1 second'),
+        set status = $3, error_kind = $4,
+            next_attempt_at = now() + ($5 * interval '1 second'),
             lease_expires_at = null, updated_at = now()
-        where id = $1 and status = 'processing'
+        where id = $1 and attempts = $2 and status = 'processing'
         "#,
     )
     .bind(job.id)
+    .bind(job.attempts)
     .bind("retry_wait")
     .bind(error_kind)
     .bind(next_delay)
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-fn retry_delay_seconds(attempts: i32, retry_after_seconds: i64) -> Option<i64> {
-    let scheduled_delay = match attempts {
-        1 => 15,
-        2 => 30,
-        3 => 60,
-        4 => 5 * 60,
-        5 => 24 * 60 * 60,
-        _ => return None,
-    };
-    Some(scheduled_delay.max(retry_after_seconds))
+    CasResult::from_rows_affected(update.rows_affected())
 }
 
 async fn mark_avatar_analysis_terminally_failed(
     pool: &PgPool,
-    job_id: i64,
+    job: &AvatarAnalysisJob,
     error_kind: &str,
-) -> anyhow::Result<()> {
-    sqlx::query(
+) -> anyhow::Result<CasResult> {
+    let update = sqlx::query(
         r#"
         update avatar_analysis_jobs
-        set status = 'failed', error_kind = $2, lease_expires_at = null, updated_at = now()
-        where id = $1 and status = 'processing'
+        set status = 'failed', error_kind = $3, lease_expires_at = null, updated_at = now()
+        where id = $1 and attempts = $2 and status = 'processing'
         "#,
     )
-    .bind(job_id)
+    .bind(job.id)
+    .bind(job.attempts)
     .bind(error_kind)
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::retry_delay_seconds;
-
-    #[test]
-    fn retries_429_quickly_before_long_backoff() {
-        assert_eq!(retry_delay_seconds(1, 0), Some(15));
-        assert_eq!(retry_delay_seconds(2, 0), Some(30));
-        assert_eq!(retry_delay_seconds(3, 0), Some(60));
-        assert_eq!(retry_delay_seconds(4, 0), Some(300));
-        assert_eq!(retry_delay_seconds(5, 0), Some(86_400));
-        assert_eq!(retry_delay_seconds(6, 0), None);
-    }
-
-    #[test]
-    fn retry_after_never_shortens_provider_backoff() {
-        assert_eq!(retry_delay_seconds(1, 75), Some(75));
-    }
+    CasResult::from_rows_affected(update.rows_affected())
 }

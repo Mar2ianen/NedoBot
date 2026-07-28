@@ -159,7 +159,7 @@ async fn process_refreshed_profile(
         }
         match create_review(pool, job.chat_id, job.user_id).await {
             Ok(Some(review)) => {
-                if let Err(err) = send_review(bot, &review).await {
+                if let Err(err) = send_review(bot, pool, &review).await {
                     tracing::warn!(%err, user_id = job.user_id, "failed to send spam review");
                 }
             }
