@@ -12,6 +12,11 @@ const MAX_FILTERS: usize = 12;
 const MAX_COLUMNS: usize = 40;
 pub const MAX_ORDER_COLUMNS: usize = 8;
 const MAX_GROUPS: usize = 3;
+const MAX_TEXT_CELL_CHARS: usize = 128;
+const MAX_JSON_CELL_BYTES: usize = 512;
+const MAX_TEXT_ARRAY_ITEMS: usize = 8;
+const MAX_INTEGER_ARRAY_ITEMS: usize = 128;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SelectRequest {
@@ -97,25 +102,12 @@ pub async fn select(
     validate_select(catalog, &request)?;
     let definition = table(catalog, &request.table)?;
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
-    let columns = if request.columns.is_empty() {
-        definition.columns.keys().cloned().collect()
-    } else {
-        request.columns
-    };
-    for column_name in &columns {
-        column(definition, column_name)?;
-    }
-
+    let columns = effective_columns(definition, &request.columns)?;
     let selections = columns
         .iter()
         .map(|column_name| {
             let field = column(definition, column_name)?;
-            let quoted = quote(column_name);
-            Ok(if field.pg_type == "text" {
-                format!("left({quoted}, 20000) as {quoted}")
-            } else {
-                quoted
-            })
+            selection(column_name, field)
         })
         .collect::<anyhow::Result<Vec<_>>>()?
         .join(", ");
@@ -127,8 +119,9 @@ pub async fn select(
     let mut rows = json_rows(pool, &sql, &binds).await?;
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
+    let rows = sanitize_rows_within_budget(rows)?;
     Ok(Page {
-        rows: rows.into_iter().map(sanitize).collect(),
+        rows,
         next_offset: has_more.then_some(request.offset + limit),
         has_more,
     })
@@ -167,7 +160,7 @@ pub async fn aggregate(
                 .column
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("aggregate column is required"))?;
-            column(definition, column_name)?;
+            let field = column(definition, column_name)?;
             let operation = match request.operation {
                 Aggregate::CountDistinct => "count(distinct",
                 Aggregate::Min => "min",
@@ -178,13 +171,20 @@ pub async fn aggregate(
             };
             if request.operation == Aggregate::CountDistinct {
                 format!("{operation} {})", quote(column_name))
+            } else if field.pg_type == "text"
+                && matches!(request.operation, Aggregate::Min | Aggregate::Max)
+            {
+                format!(
+                    "left({operation}({}), {MAX_TEXT_CELL_CHARS})",
+                    quote(column_name)
+                )
             } else {
                 format!("{operation}({})", quote(column_name))
             }
         }
     };
     for group in &request.group_by {
-        column(definition, group)?;
+        validate_group_column(column(definition, group)?)?;
     }
     let groups = request
         .group_by
@@ -208,28 +208,20 @@ pub async fn aggregate(
     if !groups.is_empty() {
         append_group_order(&mut sql, &groups);
     }
-    Ok(json_rows(pool, &sql, &binds)
-        .await?
-        .into_iter()
-        .map(sanitize)
-        .collect())
+    sanitize_rows_within_budget(json_rows(pool, &sql, &binds).await?)
 }
 
 pub fn validate_select(catalog: &PublicCatalog, request: &SelectRequest) -> anyhow::Result<()> {
-    ensure!(
-        request.filters.len() <= MAX_FILTERS && request.columns.len() <= MAX_COLUMNS,
-        "too many filters or columns"
-    );
+    ensure!(request.filters.len() <= MAX_FILTERS, "too many filters");
     let definition = table(catalog, &request.table)?;
+    effective_columns(definition, &request.columns)?;
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
     ensure!(
         (1..=MAX_LIMIT).contains(&limit),
         "limit must be between 1 and {MAX_LIMIT}"
     );
     ensure!(request.offset >= 0, "offset must not be negative");
-    for column_name in &request.columns {
-        column(definition, column_name)?;
-    }
+
     let mut sql = String::new();
     let mut binds = Vec::new();
     append_filters(&mut sql, definition, &request.filters, &mut binds)?;
@@ -274,7 +266,7 @@ pub fn validate_aggregate(
         }
     }
     for group in &request.group_by {
-        column(definition, group)?;
+        validate_group_column(column(definition, group)?)?;
     }
     let mut sql = String::new();
     let mut binds = Vec::new();
@@ -296,6 +288,44 @@ fn column<'a>(
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("unknown column"))
 }
+
+fn effective_columns(
+    definition: &CatalogTable,
+    requested: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let columns = if requested.is_empty() {
+        definition.columns.keys().cloned().collect()
+    } else {
+        requested.to_vec()
+    };
+    ensure!(
+        columns.len() <= MAX_COLUMNS,
+        "too many effective columns (maximum is {MAX_COLUMNS})"
+    );
+    for name in &columns {
+        column(definition, name)?;
+    }
+    Ok(columns)
+}
+
+fn selection(name: &str, field: &CatalogColumn) -> anyhow::Result<String> {
+    let quoted = quote(name);
+    let expression = match field.pg_type.as_str() {
+        "text" => format!("left({quoted}, {MAX_TEXT_CELL_CHARS})"),
+        "jsonb" => format!(
+            "case when octet_length({quoted}::text) > {MAX_JSON_CELL_BYTES} then jsonb_build_object('_truncated', true) else {quoted} end"
+        ),
+        "text[]" => format!(
+            "case when {quoted} is null then null else array(select left(item, {MAX_TEXT_CELL_CHARS}) from unnest({quoted}) as item limit {MAX_TEXT_ARRAY_ITEMS}) end"
+        ),
+        "integer[]" => format!(
+            "case when cardinality({quoted}) > {MAX_INTEGER_ARRAY_ITEMS} then {quoted}[1:{MAX_INTEGER_ARRAY_ITEMS}] else {quoted} end"
+        ),
+        _ => quoted.clone(),
+    };
+    Ok(format!("{expression} as {quoted}"))
+}
+
 fn quote(value: &str) -> String {
     format!("\"{value}\"")
 }
@@ -494,6 +524,22 @@ fn column_kind(field: &CatalogColumn) -> anyhow::Result<ColumnKind> {
         "text[]" | "integer[]" => Ok(ColumnKind::Array),
         _ => bail!("unsupported manifest column type"),
     }
+}
+
+fn validate_group_column(field: &CatalogColumn) -> anyhow::Result<()> {
+    ensure!(
+        matches!(
+            column_kind(field)?,
+            ColumnKind::BigInteger
+                | ColumnKind::Integer
+                | ColumnKind::SmallInteger
+                | ColumnKind::Double
+                | ColumnKind::Boolean
+                | ColumnKind::Timestamp
+        ),
+        "grouping variable-size columns is not supported"
+    );
+    Ok(())
 }
 
 fn validate_aggregate_column(operation: Aggregate, field: &CatalogColumn) -> anyhow::Result<()> {
@@ -777,6 +823,21 @@ fn sensitive_key_suffix(key: &str) -> bool {
     )
 }
 
+fn sanitize_rows_within_budget(rows: Vec<Value>) -> anyhow::Result<Vec<Value>> {
+    let mut bytes = 2;
+    let mut sanitized = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = sanitize(row);
+        bytes += serde_json::to_vec(&row)?.len() + 1;
+        ensure!(
+            bytes <= MAX_RESPONSE_BYTES,
+            "public query response exceeds {MAX_RESPONSE_BYTES} bytes"
+        );
+        sanitized.push(row);
+    }
+    Ok(sanitized)
+}
+
 fn sanitize(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(sanitize).collect()),
@@ -933,6 +994,36 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(validate_order_columns(&order).is_err());
+    }
+
+    #[test]
+    fn validation_caps_default_columns_for_wide_tables() {
+        let mut catalog = catalog(&[]);
+        let definition = catalog.tables.get_mut("test").unwrap();
+        for index in 0..=MAX_COLUMNS {
+            definition.columns.insert(
+                format!("column_{index}"),
+                CatalogColumn {
+                    pg_type: "text".to_string(),
+                    nullable: true,
+                },
+            );
+        }
+        let request = SelectRequest {
+            table: "test".to_string(),
+            columns: vec![],
+            filters: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: 0,
+        };
+        assert!(validate_select(&catalog, &request).is_err());
+    }
+
+    #[test]
+    fn response_budget_rejects_oversized_rows() {
+        let rows = vec![json!({"text": "а".repeat(MAX_RESPONSE_BYTES)})];
+        assert!(sanitize_rows_within_budget(rows).is_err());
     }
 
     #[test]
