@@ -109,8 +109,8 @@ impl PublicCatalog {
                     "name": name,
                     "type": column.pg_type,
                     "nullable": column.nullable,
+                    "filter_operators": filter_operators(&column.pg_type),
                 })).collect::<Vec<_>>(),
-                "filter_operators": ["eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "is_null", "is_not_null", "contains", "starts_with", "ends_with", "between", "whole_word"],
                 "max_limit": 200,
             })
         })
@@ -158,6 +158,50 @@ pub(crate) fn ensure_identifier(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn filter_operators(pg_type: &str) -> &'static [&'static str] {
+    const NULL_OPERATORS: &[&str] = &["is_null", "is_not_null"];
+    const EQUALITY_OPERATORS: &[&str] = &["eq", "ne", "in", "not_in", "is_null", "is_not_null"];
+    const COMPARISON_OPERATORS: &[&str] = &[
+        "eq",
+        "ne",
+        "lt",
+        "lte",
+        "gt",
+        "gte",
+        "in",
+        "not_in",
+        "between",
+        "is_null",
+        "is_not_null",
+    ];
+    const TEXT_OPERATORS: &[&str] = &[
+        "eq",
+        "ne",
+        "lt",
+        "lte",
+        "gt",
+        "gte",
+        "in",
+        "not_in",
+        "between",
+        "contains",
+        "starts_with",
+        "ends_with",
+        "whole_word",
+        "is_null",
+        "is_not_null",
+    ];
+    match pg_type {
+        "bigint" | "integer" | "smallint" | "double precision" | "timestamp with time zone" => {
+            COMPARISON_OPERATORS
+        }
+        "text" => TEXT_OPERATORS,
+        "boolean" | "jsonb" => EQUALITY_OPERATORS,
+        "text[]" | "integer[]" => NULL_OPERATORS,
+        _ => &[],
+    }
+}
+
 fn safe_pg_type(value: &str) -> anyhow::Result<()> {
     match value {
         "bigint"
@@ -195,7 +239,7 @@ fn normalize_array_type(udt_name: &str) -> &str {
 mod tests {
     use std::io::Write;
 
-    use super::PublicCatalog;
+    use super::{PublicCatalog, filter_operators};
 
     fn manifest(table: &str) -> String {
         format!(
@@ -219,18 +263,24 @@ pg_type = "bigint"
     }
 
     #[test]
-    fn describe_table_advertises_whole_word_filter() {
+    fn describe_table_advertises_column_compatible_filters() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(manifest("messages").as_bytes()).unwrap();
+        file.write_all(
+            manifest("messages")
+                .replace("pg_type = \"bigint\"", "pg_type = \"text[]\"")
+                .as_bytes(),
+        )
+        .unwrap();
         let catalog = PublicCatalog::load(file.path().to_str().unwrap()).unwrap();
         let description = catalog.describe_table("messages").unwrap();
-        let operators = description["filter_operators"]
+        let operators = description["columns"][0]["filter_operators"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(serde_json::Value::as_str)
             .collect::<Vec<_>>();
-        assert!(operators.contains(&"whole_word"));
+        assert_eq!(operators, ["is_null", "is_not_null"]);
+        assert!(filter_operators("text").contains(&"whole_word"));
     }
 
     #[test]
