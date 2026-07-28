@@ -2246,6 +2246,7 @@ dependencies = [
  "pin-project-lite",
  "process-wrap",
  "rand 0.10.2",
+ "reqwest 0.13.4",
  "rmcp-macros",
  "schemars",
  "serde",
