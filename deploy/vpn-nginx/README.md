@@ -1,15 +1,13 @@
 # Nginx deployment for public NedoNews MCP
 
-Before testing or reloading `nginx.conf`, install the rate-limit policy file:
+`vpn-nginx-decoy` монтирует только `nginx.conf` в контейнер. Rate-limit policy находится в этом файле рядом с public MCP route, поэтому перед reload достаточно проверить конфигурацию внутри контейнера:
 
 ```sh
-install -D -m 0644 deploy/vpn-nginx/mcp-rate-limit.conf.example /etc/nedobot/nginx/mcp-rate-limit.conf
-install -D -m 0644 deploy/vpn-nginx/mcp-rate-limit-location.conf.example /etc/nedobot/nginx/mcp-rate-limit-location.conf
-nginx -t
-systemctl reload nginx
+podman exec vpn-nginx-decoy nginx -t
+podman exec vpn-nginx-decoy nginx -s reload
 ```
 
-The files under `/etc/nedobot/nginx/` are intentionally deployment configuration. Tune their `rate`, `burst`, and connection limit from access logs without changing the public MCP route or Rust service.
+Настраивать `rate`, `burst` и connection limit нужно в `deploy/vpn-nginx/nginx.conf`, затем выкладывать именно этот mounted config.
 
 The committed starting policy is deliberately soft:
 
