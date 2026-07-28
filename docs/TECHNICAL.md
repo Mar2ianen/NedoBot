@@ -327,7 +327,7 @@ ssh vps-153 'podman ps'
 
 ## Публичный Read-only MCP
 
-`https://nedobot.chickenkiller.com/mcp/nedonews` — намеренно публичный MCP Streamable HTTP endpoint с данными только `НедоNews Chat`. Он не даёт ни SQL, ни shell, ни доступ к `public.*`: отдельная PostgreSQL-роль `nedobot_mcp_ro` читает лишь явно перечисленные views схемы `mcp_public`.
+`https://nedobot.chickenkiller.com/mcp/nedonews/v2` — намеренно публичный MCP Streamable HTTP endpoint с данными только `НедоNews Chat`. Версия в URL отделяет RMCP-контракт от удалённого legacy JSON-RPC API: внешний клиент обязан выполнить `tools/list`, а не переиспользовать старые input/output schemas. Endpoint не даёт ни SQL, ни shell, ни доступ к `public.*`: отдельная PostgreSQL-роль `nedobot_mcp_ro` читает лишь явно перечисленные views схемы `mcp_public`.
 
 - Миграция `20260717180000_mcp_public_views.sql` задаёт scope и explicit-колонки. Private chat/DM и raw Telegram JSON не публикуются; полный reviewed inventory опубликованных view и полей находится в [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md).
 - `config/mcp_db_manifest.toml` — проверяемый allowlist views, колонок и их типов, а [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md) — его human-readable snapshot. При старте MCP сверяет manifest с БД и отказывается стартовать при schema drift.
@@ -350,7 +350,7 @@ podman exec -i tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot \
   -f - < deploy/nedonews-mcp/bootstrap-role.sql
 ```
 
-Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; туда не передаются Telegram или LLM secrets. Nginx проксирует исключительно `/mcp/nedonews` на `127.0.0.1:8787`.
+Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; туда не передаются Telegram или LLM secrets и ему не нужен writable checkout. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
 
 Ручной redeploy из локальной папки:
 

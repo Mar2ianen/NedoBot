@@ -26,7 +26,8 @@ use super::{
 };
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
-const DEFAULT_PATH: &str = "/mcp/nedonews";
+// RMCP заменяет несовместимый legacy-контракт, поэтому URL содержит версию API.
+const DEFAULT_PATH: &str = "/mcp/nedonews/v2";
 const DEFAULT_MANIFEST_PATH: &str = "config/mcp_db_manifest.toml";
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -461,8 +462,8 @@ mod tests {
     #[test]
     fn static_route_validation_rejects_axum_parameter_syntax_and_prefix_routes() {
         assert_eq!(
-            parse_static_route("/mcp/nedonews").unwrap(),
-            "/mcp/nedonews"
+            parse_static_route("/mcp/nedonews/v2").unwrap(),
+            "/mcp/nedonews/v2"
         );
         for invalid in [
             "",

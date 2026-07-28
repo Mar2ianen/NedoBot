@@ -3,4 +3,5 @@
 limit_req zone=nedonews_mcp_requests_per_ip burst=600 nodelay;
 limit_req_status 429;
 limit_conn nedonews_mcp_connections_per_ip 40;
+limit_conn nedonews_mcp_connections_global 8;
 limit_conn_status 429;

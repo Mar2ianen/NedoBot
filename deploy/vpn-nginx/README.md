@@ -15,6 +15,7 @@ The committed starting policy is deliberately soft:
 
 - 300 requests/minute/IP sustained;
 - burst of 600 requests with `nodelay`;
-- 40 simultaneous connections/IP.
+- 40 simultaneous connections/IP;
+- 8 simultaneous connections across the public MCP virtual host.
 
-The endpoint continues to enforce a 1 MiB request-body limit and upstream connect/send/read timeouts. Add a separate stricter zone for expensive tools only after access logs show that it is needed.
+The endpoint and Nginx both enforce a 64 KiB request-body limit. The 70-second Nginx read timeout is deliberately longer than the 60-second application deadline, so clients receive the controlled application response. Tune the limits from access logs and DB pool saturation before raising them.
