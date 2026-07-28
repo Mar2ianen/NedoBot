@@ -131,7 +131,7 @@ impl ChatMcpServer {
     async fn search_messages_batch(
         &self,
         Parameters(input): Parameters<chat::SearchMessagesBatchInput>,
-    ) -> Result<Json<Vec<chat::BatchSearchResult>>, rmcp::ErrorData> {
+    ) -> Result<Json<Value>, rmcp::ErrorData> {
         chat::search_messages_batch(&self.api, input)
             .await
             .map(Json)
