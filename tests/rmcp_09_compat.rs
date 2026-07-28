@@ -292,6 +292,10 @@ async fn rmcp_09_preferred_lifecycle_calls_safe_catalog_tools_without_database()
         ErrorCode::INVALID_PARAMS,
         "unknown catalog table must return JSON-RPC InvalidParams (-32602)"
     );
+    assert_eq!(
+        error.message, "unknown table",
+        "unknown catalog table must identify the invalid table in its error message"
+    );
 
     client.close().await?;
     server.await??;
