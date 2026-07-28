@@ -12,11 +12,14 @@ const MAX_FILTERS: usize = 12;
 pub const MAX_COLUMNS: usize = 40;
 pub const MAX_ORDER_COLUMNS: usize = 8;
 const MAX_GROUPS: usize = 3;
-const MAX_TEXT_CELL_CHARS: usize = 128;
-const MAX_JSON_CELL_BYTES: usize = 512;
-const MAX_TEXT_ARRAY_ITEMS: usize = 8;
+const MAX_TEXT_CELL_CHARS: usize = 2_048;
+const MAX_JSON_CELL_BYTES: usize = 4_096;
+const MAX_TEXT_ARRAY_ITEMS: usize = 16;
+const MAX_TEXT_ARRAY_ITEM_CHARS: usize = 256;
 const MAX_INTEGER_ARRAY_ITEMS: usize = 128;
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+// RMCP дублирует результат в text и structured content, поэтому оставляем запас для wire envelope.
+const MAX_LOGICAL_ROWS_BYTES: usize = 480 * 1024;
+const TRUNCATION_MARKER_PREFIX: &str = "__mcp_truncated__";
 
 #[derive(Clone, Debug)]
 pub struct SelectRequest {
@@ -110,6 +113,9 @@ pub async fn select(
             selection(column_name, field)
         })
         .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
         .join(", ");
     let mut sql = format!("select {selections} from mcp_public.{}", request.table);
     let mut binds = Vec::new();
@@ -117,12 +123,13 @@ pub async fn select(
     append_order(&mut sql, definition, &request.order_by)?;
     sql.push_str(&format!(" limit {} offset {}", limit + 1, request.offset));
     let mut rows = json_rows(pool, &sql, &binds).await?;
-    let has_more = rows.len() as i64 > limit;
+    let database_has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
-    let rows = sanitize_rows_within_budget(rows)?;
+    let (rows, budget_has_more) = sanitize_rows_within_budget(rows)?;
+    let has_more = database_has_more || budget_has_more;
     Ok(Page {
+        next_offset: has_more.then_some(request.offset + rows.len() as i64),
         rows,
-        next_offset: has_more.then_some(request.offset + limit),
         has_more,
     })
 }
@@ -208,7 +215,12 @@ pub async fn aggregate(
     if !groups.is_empty() {
         append_group_order(&mut sql, &groups);
     }
-    sanitize_rows_within_budget(json_rows(pool, &sql, &binds).await?)
+    let (rows, truncated) = sanitize_rows_within_budget(json_rows(pool, &sql, &binds).await?)?;
+    ensure!(
+        !truncated,
+        "public aggregate response exceeds {MAX_LOGICAL_ROWS_BYTES} bytes"
+    );
+    Ok(rows)
 }
 
 pub fn validate_select(catalog: &PublicCatalog, request: &SelectRequest) -> anyhow::Result<()> {
@@ -308,22 +320,41 @@ fn effective_columns(
     Ok(columns)
 }
 
-fn selection(name: &str, field: &CatalogColumn) -> anyhow::Result<String> {
+fn selection(name: &str, field: &CatalogColumn) -> anyhow::Result<Vec<String>> {
     let quoted = quote(name);
-    let expression = match field.pg_type.as_str() {
-        "text" => format!("left({quoted}, {MAX_TEXT_CELL_CHARS})"),
-        "jsonb" => format!(
-            "case when octet_length({quoted}::text) > {MAX_JSON_CELL_BYTES} then jsonb_build_object('_truncated', true) else {quoted} end"
+    let marker = quote(&format!("{TRUNCATION_MARKER_PREFIX}{name}"));
+    let (expression, truncated) = match field.pg_type.as_str() {
+        "text" => (
+            format!(
+                "case when char_length({quoted}) > {MAX_TEXT_CELL_CHARS} then left({quoted}, {}) || '…' else {quoted} end",
+                MAX_TEXT_CELL_CHARS - 1
+            ),
+            format!("char_length({quoted}) > {MAX_TEXT_CELL_CHARS}"),
         ),
-        "text[]" => format!(
-            "case when {quoted} is null then null else array(select left(item, {MAX_TEXT_CELL_CHARS}) from unnest({quoted}) as item limit {MAX_TEXT_ARRAY_ITEMS}) end"
+        "jsonb" => (
+            format!(
+                "case when octet_length({quoted}::text) > {MAX_JSON_CELL_BYTES} then jsonb_build_object('_truncated', true) else {quoted} end"
+            ),
+            format!("octet_length({quoted}::text) > {MAX_JSON_CELL_BYTES}"),
         ),
-        "integer[]" => format!(
-            "case when cardinality({quoted}) > {MAX_INTEGER_ARRAY_ITEMS} then {quoted}[1:{MAX_INTEGER_ARRAY_ITEMS}] else {quoted} end"
+        "text[]" => (
+            format!(
+                "case when {quoted} is null then null else array(select left(item, {MAX_TEXT_ARRAY_ITEM_CHARS}) from unnest({quoted}) as item limit {MAX_TEXT_ARRAY_ITEMS}) end"
+            ),
+            format!("cardinality({quoted}) > {MAX_TEXT_ARRAY_ITEMS}"),
         ),
-        _ => quoted.clone(),
+        "integer[]" => (
+            format!(
+                "case when cardinality({quoted}) > {MAX_INTEGER_ARRAY_ITEMS} then {quoted}[1:{MAX_INTEGER_ARRAY_ITEMS}] else {quoted} end"
+            ),
+            format!("cardinality({quoted}) > {MAX_INTEGER_ARRAY_ITEMS}"),
+        ),
+        _ => return Ok(vec![format!("{quoted} as {quoted}")]),
     };
-    Ok(format!("{expression} as {quoted}"))
+    Ok(vec![
+        format!("{expression} as {quoted}"),
+        format!("{truncated} as {marker}"),
+    ])
 }
 
 fn quote(value: &str) -> String {
@@ -823,40 +854,49 @@ fn sensitive_key_suffix(key: &str) -> bool {
     )
 }
 
-fn sanitize_rows_within_budget(rows: Vec<Value>) -> anyhow::Result<Vec<Value>> {
+fn sanitize_rows_within_budget(rows: Vec<Value>) -> anyhow::Result<(Vec<Value>, bool)> {
     let mut bytes = 2;
     let mut sanitized = Vec::with_capacity(rows.len());
     for row in rows {
         let row = sanitize(row);
-        bytes += serde_json::to_vec(&row)?.len() + 1;
-        ensure!(
-            bytes <= MAX_RESPONSE_BYTES,
-            "public query response exceeds {MAX_RESPONSE_BYTES} bytes"
-        );
+        let row_bytes = serde_json::to_vec(&row)?.len() + 1;
+        if bytes + row_bytes > MAX_LOGICAL_ROWS_BYTES {
+            return Ok((sanitized, true));
+        }
+        bytes += row_bytes;
         sanitized.push(row);
     }
-    Ok(sanitized)
+    Ok((sanitized, false))
 }
 
 fn sanitize(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(sanitize).collect()),
-        Value::Object(values) => Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| {
-                    let hidden = is_sensitive_key(&key);
-                    (
-                        key,
-                        if hidden {
-                            Value::String("<redacted>".into())
-                        } else {
-                            sanitize(value)
-                        },
-                    )
-                })
-                .collect(),
-        ),
+        Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            let mut truncated_fields = Vec::new();
+            for (key, value) in values {
+                if let Some(field) = key.strip_prefix(TRUNCATION_MARKER_PREFIX) {
+                    if value == Value::Bool(true) {
+                        truncated_fields.push(Value::String(field.to_owned()));
+                    }
+                    continue;
+                }
+                let value = if is_sensitive_key(&key) {
+                    Value::String("<redacted>".into())
+                } else {
+                    sanitize(value)
+                };
+                sanitized.insert(key, value);
+            }
+            if !truncated_fields.is_empty() {
+                sanitized.insert(
+                    "_truncated_fields".to_owned(),
+                    Value::Array(truncated_fields),
+                );
+            }
+            Value::Object(sanitized)
+        }
         other => other,
     }
 }
@@ -1021,9 +1061,26 @@ mod tests {
     }
 
     #[test]
-    fn response_budget_rejects_oversized_rows() {
-        let rows = vec![json!({"text": "а".repeat(MAX_RESPONSE_BYTES)})];
-        assert!(sanitize_rows_within_budget(rows).is_err());
+    fn response_budget_returns_a_partial_page() {
+        let rows = vec![
+            json!({"text": "a".repeat(MAX_LOGICAL_ROWS_BYTES / 2 + 100)}),
+            json!({"text": "b".repeat(MAX_LOGICAL_ROWS_BYTES / 2 + 100)}),
+        ];
+        let (rows, has_more) = sanitize_rows_within_budget(rows).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn sanitizer_exposes_truncated_fields_without_internal_markers() {
+        assert_eq!(
+            sanitize(json!({
+                "text": "preview…",
+                "__mcp_truncated__text": true,
+                "__mcp_truncated__json": false,
+            })),
+            json!({"text": "preview…", "_truncated_fields": ["text"]})
+        );
     }
 
     #[test]
