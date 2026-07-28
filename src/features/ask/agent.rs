@@ -406,7 +406,14 @@ async fn generate_action(
 ) -> Result<AgentAction, ActionGenerationError> {
     let action_schema = action_schema(agent_tools);
     let timeout_secs = config.ask_timeout_sec.min(ACTION_TIMEOUT_CAP_SECS);
-    let validator = |value: &str| validate_agent_action_output(value);
+    let validator: &crate::llm::service::OutputValidator =
+        &|value: &str| validate_agent_action_output(value);
+    #[cfg(test)]
+    let output_validator = (!std::env::var("ASK_DIAGNOSTIC_ALLOW_INVALID_ACTION")
+        .is_ok_and(|value| value == "1"))
+    .then_some(validator);
+    #[cfg(not(test))]
+    let output_validator = Some(validator);
     let generated = retry_once_on_timeout(Duration::from_secs(timeout_secs), || {
         generate_text_with_provider_checked(
             config,
@@ -418,7 +425,7 @@ async fn generate_action(
                 image_base64,
                 temperature: config.ask_llm_temperature,
                 num_predict: config.ask_llm_max_tokens,
-                output_validator: Some(&validator),
+                output_validator,
                 structured_output: Some(StructuredOutput {
                     name: "ask_action",
                     schema: &action_schema,
@@ -430,8 +437,8 @@ async fn generate_action(
     parse_agent_action(&generated.content).map_err(|_| {
         #[cfg(test)]
         eprintln!(
-            "invalid live ask action: {}",
-            first_chars(&generated.content, 2_000)
+            "invalid live ask action shape={}",
+            invalid_action_shape(&generated.content)
         );
         ActionGenerationError::Invalid
     })
@@ -508,6 +515,32 @@ fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
             })
         }
         Err(()) => Err(()),
+    }
+}
+
+#[cfg(test)]
+fn invalid_action_shape(value: &str) -> &'static str {
+    let value = value.trim();
+    let value = value
+        .find('{')
+        .zip(value.rfind('}'))
+        .filter(|(start, end)| start <= end)
+        .map(|(start, end)| &value[start..=end])
+        .unwrap_or(value);
+    let Ok(value) = serde_json::from_str::<Value>(value) else {
+        return "not_json";
+    };
+    let Some(object) = value.as_object() else {
+        return "not_object";
+    };
+    match object.get("kind").and_then(Value::as_str) {
+        None => "missing_kind",
+        Some("tool") if object.get("tool").and_then(Value::as_str).is_none() => "tool_missing_name",
+        Some("tool") if !object.get("arguments").is_none_or(Value::is_object) => {
+            "tool_arguments_not_object"
+        }
+        Some("tool" | "final") => "malformed_fields",
+        Some(_) => "unknown_kind",
     }
 }
 
@@ -1119,6 +1152,20 @@ mod tests {
         assert_eq!(
             plain.markdown.as_deref(),
             Some("**Короткий ответ:** готово")
+        );
+    }
+
+    #[test]
+    fn diagnostic_invalid_action_shape_does_not_expose_model_content() {
+        assert_eq!(invalid_action_shape("не JSON"), "not_json");
+        assert_eq!(invalid_action_shape("[]"), "not_object");
+        assert_eq!(
+            invalid_action_shape(r#"{"tool":"chat.search_messages"}"#),
+            "missing_kind"
+        );
+        assert_eq!(
+            invalid_action_shape(r#"{"kind":"unknown"}"#),
+            "unknown_kind"
         );
     }
 
