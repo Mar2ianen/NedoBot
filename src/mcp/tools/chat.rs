@@ -162,13 +162,13 @@ pub async fn search_messages(
         .search_messages(&search_request(input)?)
         .await
         .map_err(|_| read_error("chat search failed"))?;
-    serde_json::to_value(messages).map_err(|_| read_error("cannot encode chat result"))
+    messages_output("messages", messages)
 }
 
 pub async fn search_messages_batch(
     api: &ChatReadApi,
     input: SearchMessagesBatchInput,
-) -> Result<Vec<BatchSearchResult>, rmcp::ErrorData> {
+) -> Result<serde_json::Value, rmcp::ErrorData> {
     if input.queries.is_empty() {
         return Err(invalid_arguments("queries must not be empty"));
     }
@@ -205,7 +205,7 @@ pub async fn search_messages_batch(
                 .map_err(|_| read_error("cannot encode chat result"))?,
         });
     }
-    Ok(results)
+    Ok(serde_json::json!({"results": results}))
 }
 
 pub async fn recent_messages(
@@ -224,30 +224,36 @@ pub async fn recent_messages(
         })
         .await
         .map_err(|_| read_error("recent message lookup failed"))?;
-    serde_json::to_value(messages).map_err(|_| read_error("cannot encode chat result"))
+    messages_output("messages", messages)
 }
 
 pub async fn get_message(
     api: &ChatReadApi,
     input: MessageIdInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
-    context(api, input.message_id, 0, 0).await
+    let messages = context_messages(api, input.message_id, 0, 0).await?;
+    let message = messages
+        .as_array()
+        .and_then(|messages| messages.first())
+        .cloned();
+    Ok(serde_json::json!({"found": message.is_some(), "message": message}))
 }
 
 pub async fn message_context(
     api: &ChatReadApi,
     input: MessageContextInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
-    context(
+    let context = context_messages(
         api,
         input.message_id,
         input.before.unwrap_or(DEFAULT_CONTEXT_WINDOW),
         input.after.unwrap_or(DEFAULT_CONTEXT_WINDOW),
     )
-    .await
+    .await?;
+    Ok(serde_json::json!({"context": context}))
 }
 
-async fn context(
+async fn context_messages(
     api: &ChatReadApi,
     message_id: i32,
     before: i64,
@@ -268,7 +274,7 @@ pub async fn reply_thread(
         .reply_thread(input.message_id)
         .await
         .map_err(|_| read_error("reply thread lookup failed"))?;
-    serde_json::to_value(messages).map_err(|_| read_error("cannot encode chat result"))
+    messages_output("thread", messages)
 }
 
 pub async fn user_interactions(
@@ -286,7 +292,16 @@ pub async fn user_interactions(
         )
         .await
         .map_err(|_| read_error("user interaction lookup failed"))?;
-    serde_json::to_value(interactions).map_err(|_| read_error("cannot encode chat result"))
+    messages_output("interactions", interactions)
+}
+
+fn messages_output(
+    field: &'static str,
+    values: impl serde::Serialize,
+) -> Result<serde_json::Value, rmcp::ErrorData> {
+    let values =
+        serde_json::to_value(values).map_err(|_| read_error("cannot encode chat result"))?;
+    Ok(serde_json::json!({field: values}))
 }
 
 pub async fn user_profile(
@@ -303,6 +318,14 @@ pub async fn user_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_results_have_an_object_root() {
+        let result =
+            messages_output("messages", vec![serde_json::json!({"message_id": 1})]).unwrap();
+        assert_eq!(result, serde_json::json!({"messages": [{"message_id": 1}]}));
+        assert!(result.is_object());
+    }
 
     #[test]
     fn message_id_input_rejects_context_window_fields() {
