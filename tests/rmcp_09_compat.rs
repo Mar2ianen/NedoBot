@@ -10,7 +10,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rmcp::{ServiceExt, model::CallToolRequestParams};
+use rmcp::{
+    ServiceError, ServiceExt,
+    model::{CallToolRequestParams, ErrorCode},
+};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tg_ai_bot_teloxide::{
@@ -130,6 +133,20 @@ fn text_result(result: &rmcp::model::CallToolResult) -> Result<&str> {
         .context("tool result must contain text content")
 }
 
+fn structured_content_matches_first_text(result: &rmcp::model::CallToolResult) -> Result<Value> {
+    let structured_content = result
+        .structured_content
+        .as_ref()
+        .context("tool result must include structured_content")?;
+    let text_content: Value = serde_json::from_str(text_result(result)?)
+        .context("first tool text content must contain JSON")?;
+    assert_eq!(
+        structured_content, &text_content,
+        "structured_content must semantically match the first text content"
+    );
+    Ok(text_content)
+}
+
 fn arguments(value: Value) -> serde_json::Map<String, Value> {
     value
         .as_object()
@@ -243,7 +260,7 @@ async fn rmcp_09_preferred_lifecycle_calls_safe_catalog_tools_without_database()
         .call_tool(CallToolRequestParams::new("db.list_tables"))
         .await?;
     assert!(!listed.is_error.unwrap_or(false));
-    let tables: Value = serde_json::from_str(text_result(&listed)?)?;
+    let tables = structured_content_matches_first_text(&listed)?;
     let table = tables["tables"]
         .as_array()
         .and_then(|tables| tables.first())
@@ -257,7 +274,7 @@ async fn rmcp_09_preferred_lifecycle_calls_safe_catalog_tools_without_database()
         )
         .await?;
     assert!(!described.is_error.unwrap_or(false));
-    let description: Value = serde_json::from_str(text_result(&described)?)?;
+    let description = structured_content_matches_first_text(&described)?;
     assert_eq!(description["name"], table);
 
     let rejected = client
@@ -267,7 +284,14 @@ async fn rmcp_09_preferred_lifecycle_calls_safe_catalog_tools_without_database()
         )
         .await
         .expect_err("unknown catalog table must produce an RMCP invalid-params error");
-    assert!(rejected.to_string().contains("unknown table"));
+    let ServiceError::McpError(error) = rejected else {
+        anyhow::bail!("unknown catalog table must produce an RMCP protocol error");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::INVALID_PARAMS,
+        "unknown catalog table must return JSON-RPC InvalidParams (-32602)"
+    );
 
     client.close().await?;
     server.await??;
