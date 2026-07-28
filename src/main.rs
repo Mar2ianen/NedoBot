@@ -12,6 +12,9 @@ mod db;
 mod features;
 mod http;
 mod llm;
+mod mcp {
+    pub mod stdio;
+}
 mod state;
 mod telegram;
 mod text;

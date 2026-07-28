@@ -7,8 +7,11 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::features::chat_read_api::service::{
-    MessageMatch, MessageSearchRequest, MessageSort, RecentMessagesRequest, message_context,
-    recent_messages, reply_thread, search_messages, user_interactions, user_profile,
+    message_context, recent_messages, reply_thread, search_messages, user_interactions,
+    user_profile,
+};
+use crate::features::chat_read_api::types::{
+    MessageMatch, MessageSearchRequest, MessageSort, RecentMessagesRequest,
 };
 
 const TOOL_SEARCH_MESSAGES: &str = "chat.search_messages";
@@ -174,10 +177,10 @@ struct JsonRpcError {
 pub async fn run_stdio_server() -> anyhow::Result<()> {
     let database_url = env::var("ASK_DATABASE_URL")
         .map_err(|_| anyhow::anyhow!("ASK_DATABASE_URL is required for chat_db_mcp"))?;
-    let chat_id = env::var("DISCUSSION_CHAT_ID")
-        .map_err(|_| anyhow::anyhow!("DISCUSSION_CHAT_ID is required for chat_db_mcp"))?
-        .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("DISCUSSION_CHAT_ID must be an integer"))?;
+    let scope = crate::features::chat_read_api::types::ChatReadScope {
+        discussion_chat_id: crate::features::chat_read_api::policy::DISCUSSION_CHAT_ID,
+        source_channel_id: crate::features::chat_read_api::policy::SOURCE_CHANNEL_ID,
+    };
     let pool = build_readonly_pool(&database_url).await?;
 
     let stdin = tokio::io::stdin();
@@ -193,7 +196,7 @@ pub async fn run_stdio_server() -> anyhow::Result<()> {
             continue;
         };
 
-        let response = handle_request(&pool, chat_id, request, id).await;
+        let response = handle_request(&pool, scope.discussion_chat_id, request, id).await;
         let encoded = serde_json::to_string(&response)?;
         stdout.write_all(encoded.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
@@ -251,8 +254,8 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             let date_to = parse_timestamp(arguments.date_to)?;
             let messages = search_messages(
                 pool,
+                chat_id,
                 &MessageSearchRequest {
-                    chat_id,
                     query: arguments.query,
                     user_id: arguments.user_id,
                     date_from,
@@ -282,8 +285,8 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             for query in queries {
                 let messages = search_messages(
                     pool,
+                    chat_id,
                     &MessageSearchRequest {
-                        chat_id,
                         query: query.clone(),
                         user_id: arguments.user_id,
                         date_from,
@@ -313,8 +316,8 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
                 serde_json::from_value(params.arguments).map_err(|_| ())?;
             let messages = recent_messages(
                 pool,
+                chat_id,
                 &RecentMessagesRequest {
-                    chat_id,
                     user_id: arguments.user_id,
                     date_from: parse_timestamp(arguments.date_from)?,
                     date_to: parse_timestamp(arguments.date_to)?,
@@ -389,14 +392,14 @@ async fn call_tool(pool: &PgPool, chat_id: i64, params: Value) -> Result<Value, 
             )
         }
         TOOL_LIST_CHAT_NOTES => {
-            let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
+            let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from mcp_public.telegram_chat_notes where chat_id = $1 and status = 'active' order by created_at desc limit 20")
                 .bind(chat_id).fetch_all(pool).await.map_err(|_| ())?;
             tool_text_result(&notes)
         }
         TOOL_LIST_USER_NOTES => {
             let arguments: UserNotesArguments =
                 serde_json::from_value(params.arguments).map_err(|_| ())?;
-            let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and status = 'active' order by created_at desc limit 20")
+            let notes = sqlx::query_as::<_, NoteRow>("select id, note, created_by_user_id, created_at::text as created_at from mcp_public.telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and status = 'active' order by created_at desc limit 20")
                 .bind(chat_id).bind(arguments.telegram_user_id).fetch_all(pool).await.map_err(|_| ())?;
             tool_text_result(&notes)
         }
@@ -428,11 +431,11 @@ async fn resolve_user(pool: &PgPool, chat_id: i64, arguments: Value) -> Result<V
                    else 3
                end as match_rank,
                coalesce(cu.message_count, 0) as message_count
-        from telegram_user_profiles p
-        left join telegram_chat_users cu
+        from mcp_public.telegram_user_profiles p
+        left join mcp_public.telegram_chat_users cu
           on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
         where exists (
-            select 1 from telegram_messages m
+            select 1 from mcp_public.telegram_messages m
             where m.chat_id = $1 and m.user_id = p.telegram_user_id
         )
           and ($2::bigint is null or p.telegram_user_id = $2)
@@ -498,11 +501,11 @@ async fn fuzzy_resolve_users(
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
                         nullif(p.username, ''), 'Неизвестный пользователь') as display_name,
                coalesce(cu.message_count, 0) as message_count
-        from telegram_user_profiles p
-        left join telegram_chat_users cu
+        from mcp_public.telegram_user_profiles p
+        left join mcp_public.telegram_chat_users cu
           on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
         where exists (
-            select 1 from telegram_messages m
+            select 1 from mcp_public.telegram_messages m
             where m.chat_id = $1 and m.user_id = p.telegram_user_id
         )
         order by coalesce(cu.message_count, 0) desc, p.last_seen_at desc
@@ -743,7 +746,7 @@ mod tests {
         let actual = serde_json::to_string_pretty(&contract).unwrap();
         assert_eq!(
             actual,
-            include_str!("../../../tests/fixtures/mcp/chat_db_mcp.json").trim()
+            include_str!("../../tests/fixtures/mcp/chat_db_mcp.json").trim()
         );
     }
 

@@ -1,114 +1,13 @@
-use serde::{Deserialize, Serialize};
 use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
+
+use super::types::{
+    ChatInteraction, ChatMessage, ChatUserProfile, MessageSearchRequest, RecentMessagesRequest,
+};
 
 const MAX_QUERY_CHARS: usize = 240;
 const MAX_RESULT_LIMIT: i64 = 20;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageMatch {
-    FullText,
-    Literal,
-}
-
-impl MessageMatch {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::FullText => "full_text",
-            Self::Literal => "literal",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageSort {
-    Relevance,
-    Newest,
-    Oldest,
-}
-
-impl MessageSort {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Relevance => "relevance",
-            Self::Newest => "newest",
-            Self::Oldest => "oldest",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MessageSearchRequest {
-    pub chat_id: i64,
-    pub query: String,
-    pub user_id: Option<i64>,
-    pub date_from: Option<DateTime<Utc>>,
-    pub date_to: Option<DateTime<Utc>>,
-    pub reply_to_message_id: Option<i32>,
-    pub has_links: Option<bool>,
-    pub has_media: Option<bool>,
-    pub match_mode: MessageMatch,
-    pub sort: MessageSort,
-    pub limit: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ChatMessage {
-    pub message_id: i32,
-    pub user_id: Option<i64>,
-    pub author: String,
-    pub author_url: Option<String>,
-    pub text: String,
-    pub reply_to_message_id: Option<i32>,
-    pub created_at: String,
-    pub relevance: i32,
-    pub source_id: String,
-    pub message_url: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ChatInteraction {
-    pub message: ChatMessage,
-    pub replied_to: Option<ChatMessage>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RecentMessagesRequest {
-    pub chat_id: i64,
-    pub user_id: Option<i64>,
-    pub date_from: Option<DateTime<Utc>>,
-    pub date_to: Option<DateTime<Utc>>,
-    pub has_links: Option<bool>,
-    pub has_media: Option<bool>,
-    pub sort: MessageSort,
-    pub limit: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, FromRow)]
-pub struct ChatUserProfile {
-    pub telegram_user_id: i64,
-    pub username: Option<String>,
-    pub display_name: String,
-    pub author_url: Option<String>,
-    pub bio: Option<String>,
-    pub is_bot: bool,
-    pub is_premium: Option<bool>,
-    pub language_code: Option<String>,
-    pub message_count: i64,
-    pub message_rank: i64,
-    pub reply_count: i64,
-    pub link_count: i64,
-    pub media_count: i64,
-    pub first_seen_at: Option<String>,
-    pub last_seen_at: Option<String>,
-    pub member_status: Option<String>,
-    pub is_admin: bool,
-    pub admin_title: Option<String>,
-    pub is_present: Option<bool>,
-}
 
 #[derive(FromRow)]
 struct MessageRow {
@@ -141,6 +40,7 @@ struct InteractionRow {
 
 pub async fn search_messages(
     pool: &PgPool,
+    chat_id: i64,
     request: &MessageSearchRequest,
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let query = normalized_query(&request.query)?;
@@ -161,8 +61,8 @@ pub async fn search_messages(
                     ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
                  ) else case when position(lower($2) in lower(coalesce(m.text, ''))) > 0 then 1::real else 0::real end
             end as relevance
-        from telegram_messages m
-        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        from mcp_public.telegram_messages m
+        left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1
           and m.text is not null
           and m.deleted_by_bot_at is null
@@ -190,7 +90,7 @@ pub async fn search_messages(
         limit $10
         "#,
     )
-    .bind(request.chat_id)
+    .bind(chat_id)
     .bind(&query)
     .bind(request.user_id)
     .bind(request.date_from)
@@ -204,11 +104,12 @@ pub async fn search_messages(
     .fetch_all(pool)
     .await?;
 
-    Ok(map_rows(request.chat_id, rows))
+    Ok(map_rows(chat_id, rows))
 }
 
 pub async fn recent_messages(
     pool: &PgPool,
+    chat_id: i64,
     request: &RecentMessagesRequest,
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let rows = sqlx::query_as::<_, MessageRow>(
@@ -218,8 +119,8 @@ pub async fn recent_messages(
                nullif(p.username, '') as author_username,
                coalesce(m.text, '[медиа без текста]') as text,
                m.reply_to_message_id, m.created_at, 0::real as relevance
-        from telegram_messages m
-        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        from mcp_public.telegram_messages m
+        left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
@@ -236,7 +137,7 @@ pub async fn recent_messages(
         limit $8
         "#,
     )
-    .bind(request.chat_id)
+    .bind(chat_id)
     .bind(request.user_id)
     .bind(request.date_from)
     .bind(request.date_to)
@@ -246,7 +147,7 @@ pub async fn recent_messages(
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
     .fetch_all(pool)
     .await?;
-    Ok(map_rows(request.chat_id, rows))
+    Ok(map_rows(chat_id, rows))
 }
 
 pub async fn message_context(
@@ -269,8 +170,8 @@ pub async fn message_context(
             m.reply_to_message_id,
             m.created_at,
             0::real as relevance
-        from telegram_messages m
-        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+        from mcp_public.telegram_messages m
+        left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
@@ -296,22 +197,22 @@ pub async fn reply_thread(
     let rows = sqlx::query_as::<_, MessageRow>(r#"
         with recursive ancestors as (
             select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at, 0 as depth
-            from telegram_messages m
+            from mcp_public.telegram_messages m
             where m.chat_id = $1 and m.message_id = $2 and m.deleted_by_bot_at is null and m.spam_marked_at is null
             union all
             select parent.message_id, parent.user_id, parent.text, parent.reply_to_message_id, parent.created_at, ancestors.depth + 1
-            from telegram_messages parent join ancestors on ancestors.reply_to_message_id = parent.message_id
+            from mcp_public.telegram_messages parent join ancestors on ancestors.reply_to_message_id = parent.message_id
             where parent.chat_id = $1 and ancestors.depth < 5 and parent.deleted_by_bot_at is null and parent.spam_marked_at is null
         ), descendants as (
             select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at, 0 as depth
-            from telegram_messages m
+            from mcp_public.telegram_messages m
             where m.chat_id = $1 and m.message_id = $2 and m.deleted_by_bot_at is null and m.spam_marked_at is null
             union all
             select child.message_id, child.user_id, child.text, child.reply_to_message_id, child.created_at, descendants.depth + 1
             from descendants
             join lateral (
                 select candidate.message_id, candidate.user_id, candidate.text, candidate.reply_to_message_id, candidate.created_at
-                from telegram_messages candidate
+                from mcp_public.telegram_messages candidate
                 where candidate.chat_id = $1
                   and candidate.reply_to_message_id = descendants.message_id
                   and candidate.deleted_by_bot_at is null
@@ -328,7 +229,7 @@ pub async fn reply_thread(
         select thread.message_id, thread.user_id, coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''), nullif(p.username, ''), 'Неизвестный пользователь') as author,
                nullif(p.username, '') as author_username,
                coalesce(thread.text, '[медиа без текста]') as text, thread.reply_to_message_id, thread.created_at, 0::real as relevance
-        from thread left join telegram_user_profiles p on p.telegram_user_id = thread.user_id
+        from thread left join mcp_public.telegram_user_profiles p on p.telegram_user_id = thread.user_id
         order by thread.created_at asc, thread.message_id asc
         limit 20
     "#).bind(chat_id).bind(message_id).fetch_all(pool).await?;
@@ -357,11 +258,11 @@ pub async fn user_interactions(
                nullif(replied_profile.username, '') as replied_to_username,
                coalesce(replied.text, '[медиа без текста]') as replied_to_text,
                replied.created_at as replied_to_created_at
-        from telegram_messages m
-        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
-        left join telegram_messages replied
+        from mcp_public.telegram_messages m
+        left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
+        left join mcp_public.telegram_messages replied
           on replied.chat_id = m.chat_id and replied.message_id = m.reply_to_message_id
-        left join telegram_user_profiles replied_profile on replied_profile.telegram_user_id = replied.user_id
+        left join mcp_public.telegram_user_profiles replied_profile on replied_profile.telegram_user_id = replied.user_id
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
@@ -435,8 +336,8 @@ pub async fn user_profile(
                coalesce(cu.message_count, 0) as message_count, coalesce(cu.reply_count, 0) as reply_count,
                1 + (
                    select count(*)
-                   from telegram_chat_users ranked
-                   left join telegram_user_profiles ranked_profile
+                   from mcp_public.telegram_chat_users ranked
+                   left join mcp_public.telegram_user_profiles ranked_profile
                      on ranked_profile.telegram_user_id = ranked.telegram_user_id
                    where ranked.chat_id = $1
                      and not coalesce(ranked_profile.is_bot, false)
@@ -445,14 +346,14 @@ pub async fn user_profile(
                coalesce(cu.link_count, 0) as link_count, coalesce(cu.media_count, 0) as media_count,
                cu.first_seen_at::text as first_seen_at, cu.last_seen_at::text as last_seen_at,
                cu.member_status, coalesce(cu.is_admin, false) as is_admin,
-               nullif(member_snapshot.raw_json ->> 'custom_title', '') as admin_title,
+               member_snapshot.admin_title,
                cu.is_present
-        from telegram_user_profiles p
-        left join telegram_chat_users cu on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
-        left join telegram_chat_member_snapshots member_snapshot
+        from mcp_public.telegram_user_profiles p
+        left join mcp_public.telegram_chat_users cu on cu.chat_id = $1 and cu.telegram_user_id = p.telegram_user_id
+        left join mcp_public.telegram_chat_member_snapshots member_snapshot
           on member_snapshot.chat_id = $1 and member_snapshot.telegram_user_id = p.telegram_user_id
         where p.telegram_user_id = $2
-          and exists (select 1 from telegram_messages m where m.chat_id = $1 and m.user_id = p.telegram_user_id)
+          and exists (select 1 from mcp_public.telegram_messages m where m.chat_id = $1 and m.user_id = p.telegram_user_id)
         "#,
     )
     .bind(chat_id)
