@@ -4,7 +4,7 @@ use anyhow::{bail, ensure};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
-use super::catalog::{CatalogTable, PublicCatalog};
+use super::catalog::{CatalogColumn, CatalogTable, PublicCatalog};
 
 pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
@@ -206,7 +206,7 @@ pub async fn aggregate(
     let mut binds = Vec::new();
     append_filters(&mut sql, definition, &request.filters, &mut binds)?;
     if !groups.is_empty() {
-        sql.push_str(&format!(" group by {groups} limit 500"));
+        append_group_order(&mut sql, &groups);
     }
     Ok(json_rows(pool, &sql, &binds)
         .await?
@@ -260,7 +260,7 @@ pub fn validate_aggregate(
     );
     let definition = table(catalog, &request.table)?;
     match request.operation {
-        Aggregate::Count => {}
+        Aggregate::Count => ensure!(request.column.is_none(), "count does not accept a column"),
         Aggregate::CountDistinct
         | Aggregate::Min
         | Aggregate::Max
@@ -270,7 +270,7 @@ pub fn validate_aggregate(
                 .column
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("aggregate column is required"))?;
-            column(definition, column_name)?;
+            validate_aggregate_column(request.operation, column(definition, column_name)?)?;
         }
     }
     for group in &request.group_by {
@@ -306,6 +306,12 @@ fn validate_order_columns(order: &[OrderBy]) -> anyhow::Result<()> {
         "too many order columns (maximum is {MAX_ORDER_COLUMNS})"
     );
     Ok(())
+}
+
+fn append_group_order(sql: &mut String, groups: &str) {
+    sql.push_str(&format!(
+        " group by {groups} order by {groups} asc limit 500"
+    ));
 }
 
 fn append_order(
@@ -359,6 +365,8 @@ fn append_filters(
     let mut parts = Vec::new();
     for filter in filters {
         let field = column(definition, &filter.column)?;
+        validate_filter(field, filter)?;
+        let kind = column_kind(field)?;
         let name = quote(&filter.column);
         let cast = safe_type(&field.pg_type)?;
         let single = |value: &Option<Value>, binds: &mut Vec<String>| -> anyhow::Result<String> {
@@ -366,6 +374,7 @@ fn append_filters(
                 value
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("filter value is required"))?,
+                kind,
             )?);
             Ok(format!("${}::{cast}", binds.len()))
         };
@@ -384,6 +393,7 @@ fn append_filters(
                         .value
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("filter value is required"))?,
+                    kind,
                 )?;
                 let pattern = match filter.op {
                     FilterOp::Contains => format!("%{value}%"),
@@ -408,6 +418,7 @@ fn append_filters(
                         .value
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("filter value is required"))?,
+                    kind,
                 )?;
                 binds.push(format!(r"\m{}\M", regex_literal(&value)));
                 format!(
@@ -418,9 +429,9 @@ fn append_filters(
             }
             FilterOp::Between => {
                 ensure!(filter.values.len() == 2, "between requires two values");
-                binds.push(value_text(&filter.values[0])?);
+                binds.push(value_text(&filter.values[0], kind)?);
                 let first = binds.len();
-                binds.push(value_text(&filter.values[1])?);
+                binds.push(value_text(&filter.values[1], kind)?);
                 format!(
                     "{name} between ${first}::{cast} and ${}::{cast}",
                     binds.len()
@@ -435,7 +446,7 @@ fn append_filters(
                     .values
                     .iter()
                     .map(|value| {
-                        binds.push(value_text(value)?);
+                        binds.push(value_text(value, kind)?);
                         Ok(format!("${}::{cast}", binds.len()))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -457,6 +468,158 @@ fn append_filters(
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ColumnKind {
+    Integer,
+    SmallInteger,
+    Double,
+    Boolean,
+    Text,
+    Timestamp,
+    Json,
+    Array,
+}
+
+fn column_kind(field: &CatalogColumn) -> anyhow::Result<ColumnKind> {
+    match field.pg_type.as_str() {
+        "bigint" | "integer" => Ok(ColumnKind::Integer),
+        "smallint" => Ok(ColumnKind::SmallInteger),
+        "double precision" => Ok(ColumnKind::Double),
+        "boolean" => Ok(ColumnKind::Boolean),
+        "text" => Ok(ColumnKind::Text),
+        "timestamp with time zone" => Ok(ColumnKind::Timestamp),
+        "jsonb" => Ok(ColumnKind::Json),
+        "text[]" | "integer[]" => Ok(ColumnKind::Array),
+        _ => bail!("unsupported manifest column type"),
+    }
+}
+
+fn validate_aggregate_column(operation: Aggregate, field: &CatalogColumn) -> anyhow::Result<()> {
+    let kind = column_kind(field)?;
+    let supported = match operation {
+        Aggregate::CountDistinct => true,
+        Aggregate::Min | Aggregate::Max => matches!(
+            kind,
+            ColumnKind::Integer
+                | ColumnKind::SmallInteger
+                | ColumnKind::Double
+                | ColumnKind::Text
+                | ColumnKind::Timestamp
+        ),
+        Aggregate::Sum | Aggregate::Avg => matches!(
+            kind,
+            ColumnKind::Integer | ColumnKind::SmallInteger | ColumnKind::Double
+        ),
+        Aggregate::Count => unreachable!(),
+    };
+    ensure!(supported, "aggregate is not supported for this column type");
+    Ok(())
+}
+
+fn validate_filter(field: &CatalogColumn, filter: &Filter) -> anyhow::Result<()> {
+    let kind = column_kind(field)?;
+    let requires_value = matches!(
+        filter.op,
+        FilterOp::Eq
+            | FilterOp::Ne
+            | FilterOp::Lt
+            | FilterOp::Lte
+            | FilterOp::Gt
+            | FilterOp::Gte
+            | FilterOp::Contains
+            | FilterOp::StartsWith
+            | FilterOp::EndsWith
+            | FilterOp::WholeWord
+    );
+    if requires_value {
+        ensure!(filter.value.is_some(), "filter value is required");
+        ensure!(filter.values.is_empty(), "filter does not accept values");
+    }
+    if matches!(filter.op, FilterOp::In | FilterOp::NotIn) {
+        ensure!(filter.value.is_none(), "in filter does not accept value");
+        ensure!(
+            !filter.values.is_empty() && filter.values.len() <= 100,
+            "in requires 1 to 100 values"
+        );
+    }
+    if filter.op == FilterOp::Between {
+        ensure!(
+            filter.value.is_none(),
+            "between filter does not accept value"
+        );
+        ensure!(filter.values.len() == 2, "between requires two values");
+    }
+    if matches!(filter.op, FilterOp::IsNull | FilterOp::IsNotNull) {
+        ensure!(
+            filter.value.is_none() && filter.values.is_empty(),
+            "null filter does not accept values"
+        );
+        return Ok(());
+    }
+    ensure!(
+        kind != ColumnKind::Array,
+        "filtering array columns is not supported"
+    );
+    if matches!(
+        filter.op,
+        FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith | FilterOp::WholeWord
+    ) {
+        ensure!(
+            kind == ColumnKind::Text,
+            "text matching requires a text column"
+        );
+    }
+    if matches!(
+        filter.op,
+        FilterOp::Lt | FilterOp::Lte | FilterOp::Gt | FilterOp::Gte | FilterOp::Between
+    ) {
+        ensure!(
+            matches!(
+                kind,
+                ColumnKind::Integer
+                    | ColumnKind::SmallInteger
+                    | ColumnKind::Double
+                    | ColumnKind::Text
+                    | ColumnKind::Timestamp
+            ),
+            "comparison is not supported for this column type"
+        );
+    }
+    if let Some(value) = &filter.value {
+        validate_value(kind, value)?;
+    }
+    for value in &filter.values {
+        validate_value(kind, value)?;
+    }
+    Ok(())
+}
+
+fn validate_value(kind: ColumnKind, value: &Value) -> anyhow::Result<()> {
+    ensure!(!value.is_null(), "null must use is_null");
+    match kind {
+        ColumnKind::Integer => ensure!(value.as_i64().is_some(), "expected an integer value"),
+        ColumnKind::SmallInteger => ensure!(
+            value
+                .as_i64()
+                .is_some_and(|value| i16::try_from(value).is_ok()),
+            "expected a smallint value"
+        ),
+        ColumnKind::Double => ensure!(value.is_number(), "expected a numeric value"),
+        ColumnKind::Boolean => ensure!(value.is_boolean(), "expected a boolean value"),
+        ColumnKind::Text => ensure!(value.is_string(), "expected a text value"),
+        ColumnKind::Timestamp => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("expected an RFC 3339 timestamp"))?;
+            sqlx::types::chrono::DateTime::parse_from_rfc3339(value)
+                .map_err(|_| anyhow::anyhow!("expected an RFC 3339 timestamp"))?;
+        }
+        ColumnKind::Json => {}
+        ColumnKind::Array => bail!("filtering array columns is not supported"),
+    }
+    Ok(())
+}
+
 fn safe_type(value: &str) -> anyhow::Result<&str> {
     match value {
         "bigint"
@@ -472,13 +635,16 @@ fn safe_type(value: &str) -> anyhow::Result<&str> {
         _ => bail!("unsupported manifest column type"),
     }
 }
-fn value_text(value: &Value) -> anyhow::Result<String> {
+fn value_text(value: &Value, kind: ColumnKind) -> anyhow::Result<String> {
+    if kind == ColumnKind::Json {
+        return Ok(serde_json::to_string(value)?);
+    }
     match value {
         Value::String(value) => Ok(value.clone()),
         Value::Number(value) => Ok(value.to_string()),
         Value::Bool(value) => Ok(value.to_string()),
         Value::Null => bail!("null must use is_null"),
-        _ => Ok(serde_json::to_string(value)?),
+        _ => bail!("expected a scalar value"),
     }
 }
 fn regex_literal(value: &str) -> String {
@@ -537,7 +703,7 @@ fn is_sensitive_key(key: &str) -> bool {
         .filter(u8::is_ascii_alphanumeric)
         .map(|byte| byte.to_ascii_lowercase())
         .collect::<Vec<_>>();
-    [
+    if [
         "token",
         "bottoken",
         "accesstoken",
@@ -557,6 +723,45 @@ fn is_sensitive_key(key: &str) -> bool {
     ]
     .iter()
     .any(|name| normalized == name.as_bytes())
+    {
+        return true;
+    }
+
+    sensitive_key_suffix(key)
+}
+
+fn sensitive_key_suffix(key: &str) -> bool {
+    let mut previous = None;
+    let mut segment = String::new();
+    let mut segments = Vec::new();
+    let mut chars = key.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if !ch.is_ascii_alphanumeric() {
+            if !segment.is_empty() {
+                segments.push(std::mem::take(&mut segment));
+            }
+            previous = None;
+            continue;
+        }
+        let next_is_lowercase = chars.peek().is_some_and(|next| next.is_ascii_lowercase());
+        if ch.is_ascii_uppercase()
+            && !segment.is_empty()
+            && (previous.is_some_and(|previous: char| previous.is_ascii_lowercase())
+                || (previous.is_some_and(|previous: char| previous.is_ascii_uppercase())
+                    && next_is_lowercase))
+        {
+            segments.push(std::mem::take(&mut segment));
+        }
+        segment.push(ch.to_ascii_lowercase());
+        previous = Some(ch);
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    matches!(
+        segments.last().map(String::as_str),
+        Some("key" | "token" | "secret" | "password")
+    )
 }
 
 fn sanitize(value: Value) -> Value {
@@ -607,7 +812,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::features::chat_read_api::catalog::{CatalogColumn, CatalogTable};
+    use crate::features::chat_read_api::catalog::{
+        CatalogColumn, CatalogScope, CatalogTable, PublicCatalog,
+    };
 
     fn table(primary_key: &[&str]) -> CatalogTable {
         let mut columns = BTreeMap::new();
@@ -625,6 +832,39 @@ mod tests {
             primary_key: primary_key.iter().map(ToString::to_string).collect(),
             approximate_rows: None,
             columns,
+        }
+    }
+
+    fn catalog(columns: &[(&str, &str)]) -> PublicCatalog {
+        let mut definition = table(&["id"]);
+        for (name, pg_type) in columns {
+            definition.columns.insert(
+                (*name).to_string(),
+                CatalogColumn {
+                    pg_type: (*pg_type).to_string(),
+                    nullable: true,
+                },
+            );
+        }
+        PublicCatalog {
+            version: 1,
+            source_schema: "public".to_string(),
+            public_schema: "mcp_public".to_string(),
+            scope: CatalogScope {
+                discussion_chat_id: 1,
+                source_channel_id: 2,
+            },
+            tables: BTreeMap::from([("test".to_string(), definition)]),
+        }
+    }
+
+    fn filter(column: &str, op: FilterOp, value: Option<Value>, values: Vec<Value>) -> Filter {
+        Filter {
+            column: column.to_string(),
+            op,
+            value,
+            values,
+            case_sensitive: false,
         }
     }
 
@@ -684,11 +924,106 @@ mod tests {
 
     #[test]
     fn sanitizer_normalizes_sensitive_key_separators_and_camel_case() {
-        for key in ["api-key", "bot_token", "clientSecret", "private-key"] {
+        for key in [
+            "api-key",
+            "bot_token",
+            "clientSecret",
+            "private-key",
+            "openai_api_key",
+            "anthropicApiKey",
+            "openAIKey",
+        ] {
             assert!(is_sensitive_key(key), "{key} should be redacted");
         }
-        for key in ["token_count", "secretary", "client_secret_name"] {
+        for key in ["token_count", "secretary", "client_secret_name", "monkey"] {
             assert!(!is_sensitive_key(key), "{key} should remain visible");
         }
+        assert_eq!(
+            sanitize(json!({"openai_api_key": "secret", "model": "gpt"})),
+            json!({"openai_api_key": "<redacted>", "model": "gpt"})
+        );
+    }
+
+    #[test]
+    fn validation_rejects_mismatched_filter_values_before_database_access() {
+        let catalog = catalog(&[
+            ("enabled", "boolean"),
+            ("created", "timestamp with time zone"),
+        ]);
+        let request = SelectRequest {
+            table: "test".to_string(),
+            columns: vec![],
+            filters: vec![filter("enabled", FilterOp::Eq, Some(json!("true")), vec![])],
+            order_by: vec![],
+            limit: None,
+            offset: 0,
+        };
+        assert!(validate_select(&catalog, &request).is_err());
+
+        let request = SelectRequest {
+            filters: vec![filter(
+                "created",
+                FilterOp::Gte,
+                Some(json!("not-a-date")),
+                vec![],
+            )],
+            ..request
+        };
+        assert!(validate_select(&catalog, &request).is_err());
+    }
+
+    #[test]
+    fn jsonb_filter_values_are_serialized_as_json() {
+        assert_eq!(
+            value_text(&json!("value"), ColumnKind::Json).unwrap(),
+            "\"value\""
+        );
+        assert_eq!(
+            value_text(&json!({"key": "value"}), ColumnKind::Json).unwrap(),
+            "{\"key\":\"value\"}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_array_filters_except_null_checks() {
+        let catalog = catalog(&[("tags", "text[]")]);
+        let request = SelectRequest {
+            table: "test".to_string(),
+            columns: vec![],
+            filters: vec![filter("tags", FilterOp::Eq, Some(json!(["rust"])), vec![])],
+            order_by: vec![],
+            limit: None,
+            offset: 0,
+        };
+        assert!(validate_select(&catalog, &request).is_err());
+
+        let request = SelectRequest {
+            filters: vec![filter("tags", FilterOp::IsNull, None, vec![])],
+            ..request
+        };
+        assert!(validate_select(&catalog, &request).is_ok());
+    }
+
+    #[test]
+    fn aggregate_validation_rejects_sum_of_text_before_database_access() {
+        let catalog = catalog(&[("body", "text")]);
+        let request = AggregateRequest {
+            table: "test".to_string(),
+            operation: Aggregate::Sum,
+            column: Some("body".to_string()),
+            group_by: vec![],
+            filters: vec![],
+        };
+        assert!(validate_aggregate(&catalog, &request).is_err());
+    }
+
+    #[test]
+    fn grouped_aggregate_sql_orders_by_group_columns() {
+        let mut sql = "select count(*)".to_string();
+        append_group_order(&mut sql, "\"created_at\", \"message_id\"");
+        assert_eq!(
+            sql,
+            "select count(*) group by \"created_at\", \"message_id\" order by \"created_at\", \"message_id\" asc limit 500"
+        );
     }
 }
