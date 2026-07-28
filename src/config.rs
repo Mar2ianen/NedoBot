@@ -807,7 +807,41 @@ fn env_args(name: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        ffi::OsString,
+        sync::{LazyLock, Mutex},
+    };
+
     use super::*;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original_value: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let original_value = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self {
+                key,
+                original_value,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_value {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn config() -> Config {
         Config {
@@ -938,6 +972,19 @@ mod tests {
             public_base_url: None,
             static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
+    }
+
+    #[test]
+    fn from_env_defaults_ask_db_mcp_env_to_database_url_and_manifest() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .expect("environment test lock must not be poisoned");
+        let _ask_db_mcp_env = EnvVarGuard::unset("ASK_DB_MCP_ENV");
+
+        let config =
+            Config::from_env().expect("configuration must parse with default MCP environment");
+
+        assert_eq!(config.ask_db_mcp_env, ["ASK_DATABASE_URL", "MCP_MANIFEST"]);
     }
 
     #[test]
