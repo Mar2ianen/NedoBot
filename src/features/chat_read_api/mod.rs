@@ -5,6 +5,8 @@ use sqlx::PgPool;
 
 pub mod catalog;
 pub mod policy;
+pub mod query;
+pub mod semantic;
 pub mod service;
 pub mod types;
 
@@ -43,6 +45,16 @@ impl ChatReadApi {
 
     pub fn catalog(&self) -> &PublicCatalog {
         &self.catalog
+    }
+
+    /// Lists only views reviewed in the public MCP manifest.
+    pub fn list_public_tables(&self) -> Vec<serde_json::Value> {
+        self.catalog.list_tables()
+    }
+
+    /// Describes one reviewed public view, if it is in the manifest.
+    pub fn describe_public_table(&self, table: &str) -> Option<serde_json::Value> {
+        self.catalog.describe_table(table)
     }
 
     pub async fn search_messages(
@@ -100,5 +112,49 @@ impl ChatReadApi {
         telegram_user_id: i64,
     ) -> anyhow::Result<Option<ChatUserProfile>> {
         service::user_profile(&self.pool, self.scope.discussion_chat_id, telegram_user_id).await
+    }
+
+    pub async fn resolve_users(
+        &self,
+        telegram_user_id: Option<i64>,
+        query: Option<&str>,
+    ) -> anyhow::Result<Vec<semantic::ResolvedUser>> {
+        semantic::resolve_users(
+            &self.pool,
+            self.scope.discussion_chat_id,
+            telegram_user_id,
+            query,
+        )
+        .await
+    }
+
+    pub async fn chat_notes(&self) -> anyhow::Result<Vec<semantic::Note>> {
+        semantic::chat_notes(&self.pool, self.scope.discussion_chat_id).await
+    }
+
+    pub async fn user_notes(&self, telegram_user_id: i64) -> anyhow::Result<Vec<semantic::Note>> {
+        semantic::user_notes(&self.pool, self.scope.discussion_chat_id, telegram_user_id).await
+    }
+
+    pub async fn select_public(
+        &self,
+        request: query::SelectRequest,
+    ) -> anyhow::Result<query::Page> {
+        query::select(&self.pool, &self.catalog, request).await
+    }
+
+    pub async fn count_public(
+        &self,
+        table: String,
+        filters: Vec<query::Filter>,
+    ) -> anyhow::Result<i64> {
+        query::count(&self.pool, &self.catalog, table, filters).await
+    }
+
+    pub async fn aggregate_public(
+        &self,
+        request: query::AggregateRequest,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        query::aggregate(&self.pool, &self.catalog, request).await
     }
 }

@@ -4,4 +4,6 @@
 //! remains transport-neutral.
 
 pub mod http;
+pub mod server;
 pub mod stdio;
+pub mod tools;
