@@ -110,7 +110,7 @@ impl PublicCatalog {
                     "type": column.pg_type,
                     "nullable": column.nullable,
                 })).collect::<Vec<_>>(),
-                "filter_operators": ["eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "is_null", "is_not_null", "contains", "starts_with", "ends_with", "between"],
+                "filter_operators": ["eq", "ne", "lt", "lte", "gt", "gte", "in", "not_in", "is_null", "is_not_null", "contains", "starts_with", "ends_with", "between", "whole_word"],
                 "max_limit": 200,
             })
         })
@@ -216,6 +216,21 @@ primary_key = ["id"]
 pg_type = "bigint"
 "#
         )
+    }
+
+    #[test]
+    fn describe_table_advertises_whole_word_filter() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(manifest("messages").as_bytes()).unwrap();
+        let catalog = PublicCatalog::load(file.path().to_str().unwrap()).unwrap();
+        let description = catalog.describe_table("messages").unwrap();
+        let operators = description["filter_operators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(operators.contains(&"whole_word"));
     }
 
     #[test]
