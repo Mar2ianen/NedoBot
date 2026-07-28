@@ -6,14 +6,13 @@
 //! static-avatar lookup is deliberately not exposed here: `ChatMcpServer` has no
 //! static-file resolver, so this canary must not advertise an unverifiable URL tool.
 
-use std::{collections::BTreeSet, env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, bail};
 use axum::{
     Router,
-    body::{Body, to_bytes},
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -32,17 +31,14 @@ const DEFAULT_PATH: &str = "/mcp/nedonews";
 const DEFAULT_MANIFEST_PATH: &str = "config/mcp_db_manifest.toml";
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Clone)]
-struct HttpBoundaryConfig {
-    allowed_origins: Arc<BTreeSet<String>>,
-}
+const DEFAULT_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
 
 struct RmcpHttpConfig {
     bootstrap: RmcpStdioConfig,
     bind: SocketAddr,
     path: String,
-    boundary: HttpBoundaryConfig,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
 }
 
 impl RmcpHttpConfig {
@@ -54,26 +50,18 @@ impl RmcpHttpConfig {
             .unwrap_or_else(|_| DEFAULT_BIND.to_owned())
             .parse()
             .context("MCP_BIND must be a socket address")?;
-        let path = env::var("MCP_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_owned());
-        if !path.starts_with('/') || path.trim().is_empty() {
-            bail!("MCP_PATH must be a non-empty absolute path");
-        }
-
-        let allowed_origins = env::var("MCP_ALLOWED_ORIGINS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|origin| !origin.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let path =
+            parse_static_route(&env::var("MCP_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_owned()))?;
+        let allowed_hosts = parse_allowed_hosts(env::var("MCP_ALLOWED_HOSTS").ok().as_deref())?;
+        let allowed_origins =
+            parse_allowed_origins(env::var("MCP_ALLOWED_ORIGINS").ok().as_deref())?;
 
         Ok(Self {
             bootstrap: RmcpStdioConfig::new(database_url, manifest_path)?,
             bind,
             path,
-            boundary: HttpBoundaryConfig {
-                allowed_origins: Arc::new(allowed_origins),
-            },
+            allowed_hosts,
+            allowed_origins,
         })
     }
 }
@@ -84,6 +72,56 @@ fn required_env(name: &str) -> anyhow::Result<String> {
         bail!("{name} must not be empty");
     }
     Ok(value)
+}
+
+fn parse_static_route(value: &str) -> anyhow::Result<String> {
+    let path = value.trim();
+    if path.is_empty() || !path.starts_with('/') {
+        bail!("MCP_PATH must be a non-empty absolute path");
+    }
+    if path == "/" || path.contains([':', '*', '{', '}', '?', '#']) || path.contains("//") {
+        bail!(
+            "MCP_PATH must be a static Axum route without parameters, wildcards, queries, or fragments"
+        );
+    }
+    if path.split('/').skip(1).any(str::is_empty) {
+        bail!("MCP_PATH must not contain empty path segments");
+    }
+    Ok(path.to_owned())
+}
+
+fn parse_allowed_hosts(value: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_ALLOWED_HOSTS
+            .iter()
+            .map(ToString::to_string)
+            .collect());
+    };
+
+    let hosts: Vec<_> = value.split(',').map(str::trim).map(str::to_owned).collect();
+    if hosts.is_empty() || hosts.iter().any(|host| host.is_empty()) {
+        bail!(
+            "MCP_ALLOWED_HOSTS must be a non-empty comma-separated list of host or host:port authorities"
+        );
+    }
+    for host in &hosts {
+        host.parse::<axum::http::uri::Authority>()
+            .with_context(|| format!("MCP_ALLOWED_HOSTS contains invalid authority {host:?}"))?;
+    }
+    Ok(hosts)
+}
+
+fn parse_allowed_origins(value: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    Ok(value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Runs the isolated RMCP Streamable HTTP canary.
@@ -97,7 +135,12 @@ pub async fn run_public_http() -> anyhow::Result<()> {
 
     let config = RmcpHttpConfig::from_env()?;
     let server = build_chat_mcp_server(config.bootstrap).await?;
-    let app = router(server, &config.path, config.boundary);
+    let app = router(
+        server,
+        &config.path,
+        config.allowed_hosts,
+        config.allowed_origins,
+    );
 
     info!(bind = %config.bind, path = %config.path, "NedoNews RMCP HTTP canary started");
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
@@ -105,65 +148,46 @@ pub async fn run_public_http() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn router(server: ChatMcpServer, path: &str, boundary: HttpBoundaryConfig) -> Router {
+fn router(
+    server: ChatMcpServer,
+    path: &str,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+) -> Router {
     let service: StreamableHttpService<ChatMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Default::default(),
             StreamableHttpServerConfig::default()
+                .with_allowed_hosts(allowed_hosts)
+                .with_allowed_origins(allowed_origins)
+                .with_legacy_session_mode(false)
+                .with_max_request_body_bytes(MAX_REQUEST_BODY_BYTES)
                 .with_json_response(true)
                 .with_sse_keep_alive(None),
         );
 
     Router::new()
-        .nest_service(path, service)
-        .layer(middleware::from_fn_with_state(
-            boundary,
-            enforce_http_boundary,
-        ))
+        .route_service(path, service)
+        .layer(middleware::from_fn_with_state((), enforce_request_timeout))
 }
 
-async fn enforce_http_boundary(
-    State(config): State<HttpBoundaryConfig>,
+async fn enforce_request_timeout(
+    State(()): State<()>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !origin_allowed(request.headers(), &config.allowed_origins) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_REQUEST_BODY_BYTES)
-    {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-
-    let (parts, body) = request.into_parts();
-    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
-    let request = axum::http::Request::from_parts(parts, Body::from(body));
-
+    // `next` owns the request body; this timeout therefore covers streaming,
+    // parsing, and RMCP handler execution without buffering the body ourselves.
     match tokio::time::timeout(REQUEST_TIMEOUT, next.run(request)).await {
         Ok(response) => response,
         Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
     }
 }
 
-fn origin_allowed(headers: &HeaderMap, allowed: &BTreeSet<String>) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN) else {
-        return true;
-    };
-    allowed.contains(origin.to_str().unwrap_or_default())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use anyhow::Result;
     use rmcp::{
@@ -228,9 +252,8 @@ mod tests {
         let app = router(
             test_server(),
             "/mcp",
-            HttpBoundaryConfig {
-                allowed_origins: Arc::new(BTreeSet::new()),
-            },
+            vec!["127.0.0.1".to_owned()],
+            Vec::new(),
         );
         let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<()>();
         let http = tokio::spawn(async move {
@@ -241,7 +264,7 @@ mod tests {
                 .await
         });
 
-        let transport = StreamableHttpClientTransport::from_uri(endpoint);
+        let transport = StreamableHttpClientTransport::from_uri(endpoint.clone());
         let mut client = ().serve(transport).await?;
         let tools = client.list_tools(None).await?;
         assert!(tools.tools.iter().any(|tool| tool.name == "db.list_tables"));
@@ -258,20 +281,60 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false));
 
         client.close().await?;
+
+        let rejected_host = reqwest::Client::new()
+            .post(&endpoint)
+            .header("Host", "untrusted.example")
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(rejected_host.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let wrong_path = reqwest::Client::new()
+            .get(format!("{endpoint}/unexpected"))
+            .send()
+            .await?;
+        assert_eq!(wrong_path.status(), reqwest::StatusCode::NOT_FOUND);
+
         let _ = shutdown.send(());
         http.await??;
         Ok(())
     }
 
     #[test]
-    fn origin_allowlist_rejects_unlisted_browser_origin() {
-        let headers = HeaderMap::from_iter([(
-            header::ORIGIN,
-            "https://untrusted.example".parse().expect("valid header"),
-        )]);
-        assert!(!origin_allowed(
-            &headers,
-            &BTreeSet::from(["https://trusted.example".to_owned()]),
-        ));
+    fn host_allowlist_uses_loopback_only_when_unset_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_allowed_hosts(None).unwrap(),
+            ["localhost", "127.0.0.1", "[::1]"]
+        );
+        assert!(parse_allowed_hosts(Some("")).is_err());
+        assert!(parse_allowed_hosts(Some("localhost,,example.com")).is_err());
+        assert!(parse_allowed_hosts(Some("https://public.example")).is_err());
+        assert_eq!(
+            parse_allowed_hosts(Some("mcp.example.com,mcp.example.com:8443")).unwrap(),
+            ["mcp.example.com", "mcp.example.com:8443"]
+        );
+    }
+
+    #[test]
+    fn static_route_validation_rejects_axum_parameter_syntax_and_prefix_routes() {
+        assert_eq!(
+            parse_static_route("/mcp/nedonews").unwrap(),
+            "/mcp/nedonews"
+        );
+        for invalid in [
+            "",
+            "mcp",
+            "/",
+            "/mcp/:id",
+            "/mcp/{id}",
+            "/mcp/*rest",
+            "/mcp//v1",
+        ] {
+            assert!(
+                parse_static_route(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 }
