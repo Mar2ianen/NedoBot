@@ -9,7 +9,7 @@ use super::catalog::{CatalogColumn, CatalogTable, PublicCatalog};
 pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 const MAX_FILTERS: usize = 12;
-const MAX_COLUMNS: usize = 40;
+pub const MAX_COLUMNS: usize = 40;
 pub const MAX_ORDER_COLUMNS: usize = 8;
 const MAX_GROUPS: usize = 3;
 const MAX_TEXT_CELL_CHARS: usize = 128;

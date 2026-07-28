@@ -66,10 +66,11 @@ pub async fn list_view(
     order_column: &'static str,
     filters: Vec<query::Filter>,
 ) -> Result<Value, rmcp::ErrorData> {
+    let columns = list_view_columns(api, table, order_column)?;
     let page = api
         .select_public(query::SelectRequest {
             table: table.into(),
-            columns: vec![],
+            columns,
             filters,
             order_by: vec![query::OrderBy {
                 column: order_column.into(),
@@ -81,6 +82,31 @@ pub async fn list_view(
         .await
         .map_err(|_| read_error("public list failed"))?;
     Ok(query::page_json(page))
+}
+
+fn list_view_columns(
+    api: &ChatReadApi,
+    table_name: &str,
+    order_column: &str,
+) -> Result<Vec<String>, rmcp::ErrorData> {
+    let table = api
+        .catalog()
+        .tables
+        .get(table_name)
+        .ok_or_else(|| read_error("invalid public list catalog"))?;
+    let mut columns = table.primary_key.clone();
+    if !columns.iter().any(|column| column == order_column) {
+        columns.push(order_column.to_owned());
+    }
+    for column in table.columns.keys() {
+        if columns.len() == query::MAX_COLUMNS {
+            break;
+        }
+        if !columns.iter().any(|selected| selected == column) {
+            columns.push(column.clone());
+        }
+    }
+    Ok(columns)
 }
 
 fn public_username_url(username: Option<&str>) -> Option<String> {
