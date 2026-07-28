@@ -22,7 +22,6 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=/opt/tg-ai-bot-teloxide
 
 [Install]
 WantedBy=multi-user.target

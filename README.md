@@ -87,7 +87,7 @@
 
 ## Публичная база для исследования
 
-Для внешних MCP-клиентов доступен публичный read-only endpoint: `https://nedobot.chickenkiller.com/mcp/nedonews`. Он выдаёт reviewed projections истории публичного чата, профилей, spam-разметки, заметок, расшифровок и аудита `/ask`, но не даёт SQL, записи, приватные чаты или raw Telegram payload. Точный опубликованный data surface зафиксирован в [MCP public data inventory](docs/MCP_PUBLIC_DATA.md); правила публикации новых данных — в [технической документации](docs/TECHNICAL.md#публичный-read-only-mcp).
+Для внешних MCP-клиентов доступен публичный read-only endpoint v2: `https://nedobot.chickenkiller.com/mcp/nedonews/v2`. Он выдаёт reviewed projections истории публичного чата, профилей, spam-разметки, заметок, расшифровок и аудита `/ask`, но не даёт SQL, записи, приватные чаты или raw Telegram payload. URL v2 намеренно отделён от удалённого legacy JSON-RPC-контракта: клиенты должны выполнить новое MCP discovery через `tools/list`. Точный опубликованный data surface зафиксирован в [MCP public data inventory](docs/MCP_PUBLIC_DATA.md); правила публикации новых данных — в [технической документации](docs/TECHNICAL.md#публичный-read-only-mcp).
 
 ## Вайб
 
