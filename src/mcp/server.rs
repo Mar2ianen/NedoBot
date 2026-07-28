@@ -153,7 +153,7 @@ impl ChatMcpServer {
     )]
     async fn get_message(
         &self,
-        Parameters(input): Parameters<chat::MessageContextInput>,
+        Parameters(input): Parameters<chat::MessageIdInput>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         chat::get_message(&self.api, input).await.map(Json)
     }
@@ -175,7 +175,7 @@ impl ChatMcpServer {
     )]
     async fn reply_thread(
         &self,
-        Parameters(input): Parameters<chat::MessageContextInput>,
+        Parameters(input): Parameters<chat::MessageIdInput>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         chat::reply_thread(&self.api, input).await.map(Json)
     }

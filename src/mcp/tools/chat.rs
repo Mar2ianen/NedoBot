@@ -94,6 +94,12 @@ pub struct RecentMessagesInput {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct MessageIdInput {
+    pub message_id: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MessageContextInput {
     pub message_id: i32,
     pub before: Option<i64>,
@@ -223,7 +229,7 @@ pub async fn recent_messages(
 
 pub async fn get_message(
     api: &ChatReadApi,
-    input: MessageContextInput,
+    input: MessageIdInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
     context(api, input.message_id, 0, 0).await
 }
@@ -256,7 +262,7 @@ async fn context(
 
 pub async fn reply_thread(
     api: &ChatReadApi,
-    input: MessageContextInput,
+    input: MessageIdInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
     let messages = api
         .reply_thread(input.message_id)
@@ -297,6 +303,17 @@ pub async fn user_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_id_input_rejects_context_window_fields() {
+        assert!(
+            serde_json::from_value::<MessageIdInput>(serde_json::json!({
+                "message_id": 1,
+                "before": 3,
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn search_input_rejects_unknown_fields() {

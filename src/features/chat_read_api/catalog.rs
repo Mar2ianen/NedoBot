@@ -59,12 +59,18 @@ impl PublicCatalog {
         }
         for (table, definition) in &catalog.tables {
             ensure_identifier(table)?;
-            if definition.columns.is_empty() {
-                bail!("manifest table {table} has no columns");
+            if definition.columns.is_empty() || definition.primary_key.is_empty() {
+                bail!("manifest table {table} has no columns or primary key");
             }
             for (column, field) in &definition.columns {
                 ensure_identifier(column)?;
                 safe_pg_type(&field.pg_type)?;
+            }
+            for key in &definition.primary_key {
+                ensure_identifier(key)?;
+                if !definition.columns.contains_key(key) {
+                    bail!("manifest primary key {table}.{key} is not a reviewed column");
+                }
             }
         }
         Ok(catalog)
@@ -182,5 +188,57 @@ fn normalize_array_type(udt_name: &str) -> &str {
         "int8" => "bigint",
         "int2" => "smallint",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::PublicCatalog;
+
+    fn manifest(table: &str) -> String {
+        format!(
+            r#"
+version = 1
+source_schema = "public"
+public_schema = "mcp_public"
+
+[scope]
+discussion_chat_id = -1001932061163
+source_channel_id = -1001575496091
+
+[tables.{table}]
+description = "test"
+primary_key = ["id"]
+
+[tables.{table}.columns.id]
+pg_type = "bigint"
+"#
+        )
+    }
+
+    #[test]
+    fn manifest_rejects_empty_primary_key() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            manifest("messages")
+                .replace("primary_key = [\"id\"]", "primary_key = []")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(PublicCatalog::load(file.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_primary_key_outside_reviewed_columns() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            manifest("messages")
+                .replace("primary_key = [\"id\"]", "primary_key = [\"missing\"]")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(PublicCatalog::load(file.path().to_str().unwrap()).is_err());
     }
 }
