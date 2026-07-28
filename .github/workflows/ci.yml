@@ -58,4 +58,4 @@ jobs:
       - name: Run RMCP PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --test chat_db_mcp_rmcp -- --ignored
+        run: cargo test --test chat_db_mcp -- --ignored

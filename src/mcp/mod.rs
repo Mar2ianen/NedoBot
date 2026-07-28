@@ -4,9 +4,7 @@
 //! remains transport-neutral.
 
 pub mod bootstrap;
-pub mod http;
 pub mod rmcp_http;
 pub mod rmcp_stdio;
 pub mod server;
-pub mod stdio;
 pub mod tools;
