@@ -1,8 +1,112 @@
-//! Публичные typed DTO read-model.
-//!
-//! Пока DTO остаются в `service`, чтобы сохранить прежний API `chat_search`
-//! без изменений. Этот модуль зарезервирован для общих transport-neutral типов.
-pub use super::service::{
-    ChatInteraction, ChatMessage, ChatUserProfile, MessageMatch, MessageSearchRequest, MessageSort,
-    RecentMessagesRequest,
-};
+//! Transport-neutral DTOs and the reviewed read-model scope.
+
+use serde::{Deserialize, Serialize};
+use sqlx::types::chrono::{DateTime, Utc};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatReadScope {
+    pub discussion_chat_id: i64,
+    pub source_channel_id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageMatch {
+    FullText,
+    Literal,
+}
+
+impl MessageMatch {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::FullText => "full_text",
+            Self::Literal => "literal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSort {
+    Relevance,
+    Newest,
+    Oldest,
+}
+
+impl MessageSort {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Relevance => "relevance",
+            Self::Newest => "newest",
+            Self::Oldest => "oldest",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageSearchRequest {
+    pub query: String,
+    pub user_id: Option<i64>,
+    pub date_from: Option<DateTime<Utc>>,
+    pub date_to: Option<DateTime<Utc>>,
+    pub reply_to_message_id: Option<i32>,
+    pub has_links: Option<bool>,
+    pub has_media: Option<bool>,
+    pub match_mode: MessageMatch,
+    pub sort: MessageSort,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ChatMessage {
+    pub message_id: i32,
+    pub user_id: Option<i64>,
+    pub author: String,
+    pub author_url: Option<String>,
+    pub text: String,
+    pub reply_to_message_id: Option<i32>,
+    pub created_at: String,
+    pub relevance: i32,
+    pub source_id: String,
+    pub message_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ChatInteraction {
+    pub message: ChatMessage,
+    pub replied_to: Option<ChatMessage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecentMessagesRequest {
+    pub user_id: Option<i64>,
+    pub date_from: Option<DateTime<Utc>>,
+    pub date_to: Option<DateTime<Utc>>,
+    pub has_links: Option<bool>,
+    pub has_media: Option<bool>,
+    pub sort: MessageSort,
+    pub limit: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, sqlx::FromRow)]
+pub struct ChatUserProfile {
+    pub telegram_user_id: i64,
+    pub username: Option<String>,
+    pub display_name: String,
+    pub author_url: Option<String>,
+    pub bio: Option<String>,
+    pub is_bot: bool,
+    pub is_premium: Option<bool>,
+    pub language_code: Option<String>,
+    pub message_count: i64,
+    pub message_rank: i64,
+    pub reply_count: i64,
+    pub link_count: i64,
+    pub media_count: i64,
+    pub first_seen_at: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub member_status: Option<String>,
+    pub is_admin: bool,
+    pub admin_title: Option<String>,
+    pub is_present: Option<bool>,
+}

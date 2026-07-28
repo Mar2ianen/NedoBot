@@ -558,6 +558,10 @@ approximate_rows = 133
 pg_type = "bigint"
 nullable = true
 
+[tables.telegram_chat_member_snapshots.columns.admin_title]
+pg_type = "text"
+nullable = true
+
 [tables.telegram_chat_member_snapshots.columns.is_admin]
 pg_type = "boolean"
 nullable = true
