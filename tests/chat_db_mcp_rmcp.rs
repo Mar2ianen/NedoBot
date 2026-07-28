@@ -1,7 +1,7 @@
 use std::{future::Future, path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
+use tg_ai_bot_teloxide::{config::Config, features::ask::mcp_client::McpClient};
 
 const E2E_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -17,37 +17,38 @@ fn manifest_path() -> PathBuf {
 
 #[ignore = "requires TEST_DATABASE_URL and a migrated local PostgreSQL database"]
 #[tokio::test]
-async fn rmcp_child_binary_initializes_lists_calls_and_closes() -> Result<()> {
-    within_timeout("chat_db_mcp_rmcp child lifecycle", async {
+async fn ask_mcp_client_starts_real_rmcp_child_with_env_clear_allowlist() -> Result<()> {
+    within_timeout("McpClient real RMCP child lifecycle", async {
         let database_url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
-        let working_directory = tempfile::tempdir()?;
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_chat_db_mcp_rmcp"));
-        command
-            .env("ASK_DATABASE_URL", database_url)
-            .env("MCP_MANIFEST", manifest_path())
-            .current_dir(&working_directory);
+        let manifest = manifest_path();
 
-        let transport = TokioChildProcess::new(command)?;
-        let mut client = ().serve(transport).await?;
+        // McpClient clears the child environment. These are the only two inherited
+        // settings the real stdio server needs, so this also catches allowlist drift.
+        unsafe {
+            std::env::set_var("ASK_DATABASE_URL", &database_url);
+            std::env::set_var("MCP_MANIFEST", &manifest);
+        }
+        let mut config = Config::from_env()?;
+        config.ask_db_mcp_command = Some(env!("CARGO_BIN_EXE_chat_db_mcp_rmcp").to_string());
+        config.ask_db_mcp_args = Vec::new();
+        config.ask_db_mcp_env = vec!["ASK_DATABASE_URL".to_string(), "MCP_MANIFEST".to_string()];
+        config.ask_db_mcp_timeout_sec = E2E_TIMEOUT.as_secs();
 
-        let tools = client.list_tools(None).await?;
-        assert!(tools.tools.iter().any(|tool| tool.name == "db.list_tables"));
+        let client = McpClient::start(&config).await?;
+        assert!(client.has_tool("chat.resolve_user"));
+        assert!(!client.has_tool("db.list_tables"));
 
         let result = client
-            .call_tool(CallToolRequestParams::new("db.list_tables"))
+            .call(
+                "chat.resolve_user",
+                serde_json::json!({"query": "unlikely-user"}),
+            )
             .await?;
-        assert!(!result.is_error.unwrap_or(false));
-        assert!(
-            result
-                .content
-                .first()
-                .and_then(|content| content.as_text())
-                .is_some(),
-            "catalog tool must return a text result"
-        );
+        assert!(result.value.is_object());
+        assert!(serde_json::from_str::<serde_json::Value>(&result.agent_preview).is_ok());
 
-        client.close().await?;
+        client.shutdown().await;
         Ok(())
     })
     .await
