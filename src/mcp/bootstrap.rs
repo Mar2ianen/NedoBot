@@ -82,8 +82,11 @@ mod tests {
 
     #[test]
     fn required_value_rejects_blank_value() {
-        let error = required_value("RMCP_MANIFEST", " \t".into())
+        let error = required_value(MANIFEST_PATH_ENV, " \t".into())
             .expect_err("blank required variable must fail");
-        assert!(error.to_string().contains("MCP_MANIFEST must not be empty"));
+        assert_eq!(
+            error.to_string(),
+            format!("{MANIFEST_PATH_ENV} must not be empty")
+        );
     }
 }
