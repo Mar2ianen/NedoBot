@@ -9,7 +9,7 @@ use tg_ai_bot_teloxide::features::{
         create_post_comment_job, mark_post_comment_failed, mark_post_comment_sent,
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
-    spam_review::create_high_risk_review,
+    spam_review::create_review,
     stats::{
         render_html, render_rich, repo as stats_repo,
         types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
@@ -31,7 +31,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
-    assert_high_risk_review_deduplication(&pool).await;
+    assert_review_deduplication(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
 }
 
@@ -379,7 +379,7 @@ async fn assert_agent_note_contract(pool: &PgPool) {
     assert_eq!(note_count, 1);
 }
 
-async fn assert_high_risk_review_deduplication(pool: &PgPool) {
+async fn assert_review_deduplication(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 42;
 
@@ -411,6 +411,21 @@ async fn assert_high_risk_review_deduplication(pool: &PgPool) {
     .await
     .expect("medium-risk audit must be inserted");
 
+    let first_review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("review creation must succeed");
+    assert!(
+        first_review.is_some(),
+        "medium-risk audit must create a review"
+    );
+    let duplicate_review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("duplicate review check must succeed");
+    assert!(
+        duplicate_review.is_none(),
+        "review creation must be idempotent"
+    );
+
     let affected_chat_ids = apply_avatar_risk_signal(
         pool,
         USER_ID,
@@ -434,21 +449,6 @@ async fn assert_high_risk_review_deduplication(pool: &PgPool) {
     .expect("updated risk audit must exist");
     assert_eq!(risk_score, 73);
     assert_eq!(risk_level, "high");
-
-    let first_review = create_high_risk_review(pool, CHAT_ID, USER_ID)
-        .await
-        .expect("review creation must succeed");
-    assert!(
-        first_review.is_some(),
-        "high-risk audit must create a review"
-    );
-    let duplicate_review = create_high_risk_review(pool, CHAT_ID, USER_ID)
-        .await
-        .expect("duplicate review check must succeed");
-    assert!(
-        duplicate_review.is_none(),
-        "review creation must be idempotent"
-    );
 
     let review_count: i64 = query_scalar(
         "select count(*) from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
