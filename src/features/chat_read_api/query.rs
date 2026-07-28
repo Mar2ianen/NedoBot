@@ -167,7 +167,7 @@ pub async fn aggregate(
                 .column
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("aggregate column is required"))?;
-            let field = column(definition, column_name)?;
+            column(definition, column_name)?;
             let operation = match request.operation {
                 Aggregate::CountDistinct => "count(distinct",
                 Aggregate::Min => "min",
@@ -178,13 +178,6 @@ pub async fn aggregate(
             };
             if request.operation == Aggregate::CountDistinct {
                 format!("{operation} {})", quote(column_name))
-            } else if field.pg_type == "text"
-                && matches!(request.operation, Aggregate::Min | Aggregate::Max)
-            {
-                format!(
-                    "left({operation}({}), {MAX_TEXT_CELL_CHARS})",
-                    quote(column_name)
-                )
             } else {
                 format!("{operation}({})", quote(column_name))
             }
@@ -339,9 +332,12 @@ fn selection(name: &str, field: &CatalogColumn) -> anyhow::Result<Vec<String>> {
         ),
         "text[]" => (
             format!(
-                "case when {quoted} is null then null else array(select left(item, {MAX_TEXT_ARRAY_ITEM_CHARS}) from unnest({quoted}) as item limit {MAX_TEXT_ARRAY_ITEMS}) end"
+                "case when {quoted} is null then null else array(select case when char_length(item) > {MAX_TEXT_ARRAY_ITEM_CHARS} then left(item, {}) || '…' else item end from unnest({quoted}) as item limit {MAX_TEXT_ARRAY_ITEMS}) end",
+                MAX_TEXT_ARRAY_ITEM_CHARS - 1
             ),
-            format!("cardinality({quoted}) > {MAX_TEXT_ARRAY_ITEMS}"),
+            format!(
+                "cardinality({quoted}) > {MAX_TEXT_ARRAY_ITEMS} or exists (select 1 from unnest({quoted}) as item where char_length(item) > {MAX_TEXT_ARRAY_ITEM_CHARS})"
+            ),
         ),
         "integer[]" => (
             format!(
@@ -861,6 +857,10 @@ fn sanitize_rows_within_budget(rows: Vec<Value>) -> anyhow::Result<(Vec<Value>, 
         let row = sanitize(row);
         let row_bytes = serde_json::to_vec(&row)?.len() + 1;
         if bytes + row_bytes > MAX_LOGICAL_ROWS_BYTES {
+            ensure!(
+                !sanitized.is_empty(),
+                "single public query row exceeds logical rows budget"
+            );
             return Ok((sanitized, true));
         }
         bytes += row_bytes;
@@ -1069,6 +1069,25 @@ mod tests {
         let (rows, has_more) = sanitize_rows_within_budget(rows).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(has_more);
+    }
+
+    #[test]
+    fn response_budget_rejects_a_single_oversized_row() {
+        let rows = vec![json!({"text": "a".repeat(MAX_LOGICAL_ROWS_BYTES)})];
+        assert!(sanitize_rows_within_budget(rows).is_err());
+    }
+
+    #[test]
+    fn text_array_selection_marks_item_and_cardinality_truncation() {
+        let field = CatalogColumn {
+            pg_type: "text[]".to_string(),
+            nullable: true,
+        };
+        let sql = selection("entities", &field).unwrap().join(", ");
+        assert!(sql.contains("char_length(item) > 256"));
+        assert!(sql.contains("|| '…'"));
+        assert!(sql.contains("cardinality(\"entities\") > 16"));
+        assert!(sql.contains("exists (select 1 from unnest(\"entities\")"));
     }
 
     #[test]
