@@ -1,19 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::process::Stdio;
 use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
 use crate::features::ask::chat_search::message_url;
+use crate::features::ask::mcp_client::McpClient;
 use crate::features::ask::notes::add_user_note_from_search;
 use crate::features::ask::repo;
 use crate::features::ask::types::PendingToolCallAudit;
@@ -86,36 +84,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата встраивай ссылку на message_url прямо в фразу: «[Михаил написал](URL)», «[в этом сообщении](URL)». Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
 - На каждом шаге верни ровно один JSON-объект без code fence: {"kind":"tool","tool":"имя","arguments":{...}} либо {"kind":"final","markdown":"ответ"}."#;
 
-const MCP_TOOLS: &[&str] = &[
-    "chat.resolve_user",
-    "chat.get_user_profile",
-    "chat.search_messages",
-    "chat.search_messages_batch",
-    "chat.get_recent_messages",
-    "chat.get_message",
-    "chat.get_message_context",
-    "chat.get_reply_thread",
-    "chat.get_user_interactions",
-    "notes.list_chat",
-    "notes.list_user",
-];
-
-const AGENT_TOOLS: &[&str] = &[
-    "chat.resolve_user",
-    "chat.get_user_profile",
-    "chat.search_messages",
-    "chat.search_messages_batch",
-    "chat.get_recent_messages",
-    "chat.get_message",
-    "chat.get_message_context",
-    "chat.get_reply_thread",
-    "chat.get_user_interactions",
-    "notes.list_chat",
-    "notes.list_user",
-    "notes.add_user",
-    "web.search",
-    "github.search",
-];
+const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github.search"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -182,7 +151,9 @@ pub async fn answer(
         progress,
     } = request;
     report_progress(progress, AskProgress::Preparing);
-    let mut mcp = McpClient::start(config).await?;
+    let mcp = McpClient::start(config).await?;
+    let agent_tools = agent_tool_names(&mcp);
+    let tool_catalog = tool_catalog(mcp.tool_catalog());
     let mut observations = Vec::new();
     let mut evidence = Evidence::default();
     let mut research = ResearchState::for_question(question);
@@ -204,8 +175,9 @@ pub async fn answer(
             question,
             &observations,
             remaining_steps,
+            &tool_catalog,
         );
-        let action = match generate_action(config, &prompt, image_base64).await {
+        let action = match generate_action(config, &prompt, image_base64, &agent_tools).await {
             Ok(action) => action,
             Err(ActionGenerationError::Invalid) => {
                 push_observation(
@@ -236,11 +208,10 @@ pub async fn answer(
                         continue;
                     }
                     report_progress(progress, AskProgress::FormingAnswer);
-                    return Ok(embed_bare_message_links(
-                        markdown,
-                        &evidence,
-                        config.discussion_chat_id,
-                    ));
+                    let answer =
+                        embed_bare_message_links(markdown, &evidence, config.discussion_chat_id);
+                    mcp.shutdown().await;
+                    return Ok(answer);
                 }
                 push_observation(
                     &mut observations,
@@ -255,7 +226,7 @@ pub async fn answer(
                     );
                     continue;
                 };
-                if !allowed_agent_tool(tool) {
+                if !allowed_agent_tool(&mcp, tool) {
                     push_observation(
                         &mut observations,
                         format!("SYSTEM: инструмент {tool:?} не разрешён. Выбери его из каталога."),
@@ -304,7 +275,7 @@ pub async fn answer(
                     pool,
                     requester_user_id,
                     &mut evidence,
-                    &mut mcp,
+                    &mcp,
                     tool,
                     action.arguments,
                 )
@@ -361,11 +332,12 @@ pub async fn answer(
         question,
         &observations,
         0,
+        &tool_catalog,
     );
     let final_prompt = format!(
         "{prompt}\n\nSYSTEM: лимит инструментов исчерпан. Сейчас верни kind=final с лучшим честным ответом по уже полученным данным. Не вызывай новый инструмент."
     );
-    let action = generate_action(config, &final_prompt, image_base64)
+    let action = generate_action(config, &final_prompt, image_base64, &agent_tools)
         .await
         .map_err(|error| match error {
             ActionGenerationError::Request(err) => err,
@@ -375,11 +347,9 @@ pub async fn answer(
         && let Some(markdown) = non_empty(action.markdown.as_deref())
     {
         report_progress(progress, AskProgress::FormingAnswer);
-        return Ok(embed_bare_message_links(
-            markdown,
-            &evidence,
-            config.discussion_chat_id,
-        ));
+        let answer = embed_bare_message_links(markdown, &evidence, config.discussion_chat_id);
+        mcp.shutdown().await;
+        return Ok(answer);
     }
     anyhow::bail!("ask agent did not produce a final answer")
 }
@@ -403,8 +373,9 @@ async fn generate_action(
     config: &Config,
     prompt: &str,
     image_base64: Option<&str>,
+    agent_tools: &[String],
 ) -> Result<AgentAction, ActionGenerationError> {
-    let action_schema = action_schema();
+    let action_schema = action_schema(agent_tools);
     let timeout_secs = config.ask_timeout_sec.min(ACTION_TIMEOUT_CAP_SECS);
     let validator = |value: &str| validate_agent_action_output(value);
     let generated = retry_once_on_timeout(Duration::from_secs(timeout_secs), || {
@@ -464,14 +435,14 @@ where
     }
 }
 
-fn action_schema() -> Value {
+fn action_schema(agent_tools: &[String]) -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["kind"],
         "properties": {
             "kind": {"type": "string", "enum": ["tool", "final"]},
-            "tool": {"type": "string", "enum": AGENT_TOOLS},
+            "tool": {"type": "string", "enum": agent_tools},
             "arguments": {"type": "object"},
             "markdown": {"type": "string"}
         }
@@ -552,12 +523,16 @@ fn escape_json_string_controls(value: &str) -> String {
     result
 }
 
-fn allowed_agent_tool(tool: &str) -> bool {
-    AGENT_TOOLS.contains(&tool)
+fn agent_tool_names(mcp: &McpClient) -> Vec<String> {
+    let mut tools = mcp.tool_names().map(str::to_owned).collect::<Vec<_>>();
+    tools.extend(LOCAL_AGENT_TOOLS.iter().map(|tool| (*tool).to_string()));
+    tools.sort_unstable();
+    tools.dedup();
+    tools
 }
 
-fn allowed_mcp_tool(tool: &str) -> bool {
-    MCP_TOOLS.contains(&tool)
+fn allowed_agent_tool(mcp: &McpClient, tool: &str) -> bool {
+    mcp.has_tool(tool) || LOCAL_AGENT_TOOLS.contains(&tool)
 }
 
 async fn audit_tool_call(
@@ -603,6 +578,7 @@ fn build_prompt(
     question: &str,
     observations: &[String],
     remaining_steps: usize,
+    tool_catalog: &str,
 ) -> String {
     let observations = observations
         .iter()
@@ -612,7 +588,7 @@ fn build_prompt(
     format!(
         "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nАвтор вопроса: {requester_identity} (Telegram ID: {requester_user_id})\nЕсли вопрос называет только имя и оно совпадает с автором вопроса, сначала разреши автора по его Telegram ID; не проси уточнение без необходимости.\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\n\nВопрос пользователя:\n{question}\n\nДоступные инструменты:\n{}\n\nНаблюдения:\n{}",
         Utc::now().to_rfc3339(),
-        tool_catalog(),
+        tool_catalog,
         if observations.is_empty() {
             "пока нет"
         } else {
@@ -621,21 +597,10 @@ fn build_prompt(
     )
 }
 
-fn tool_catalog() -> &'static str {
-    r#"- chat.resolve_user: {query? | telegram_user_id?} — найти участника по ID, username или имени; recommended=true означает лучшего кандидата по совпадению и активности
-- chat.get_user_profile: {telegram_user_id} — безопасный профиль, агрегаты активности, место по числу сообщений, статус администратора и его title
-- chat.search_messages: {query, user_id?, date_from?, date_to?, reply_to_message_id?, has_links?, has_media?, match_mode?: full_text|literal, sort?: relevance|newest|oldest, limit?}
-- chat.search_messages_batch: {queries: [1..6 независимых запросов], user_id?, date_from?, date_to?, has_links?, has_media?, match_mode?, sort?, limit_per_query?: 1..5}
-- chat.get_recent_messages: {user_id?, date_from?, date_to?, has_links?, has_media?, sort?: newest|oldest, limit?}
-- chat.get_message: {message_id}
-- chat.get_message_context: {message_id, before?: 0..5, after?: 0..5}
-- chat.get_reply_thread: {message_id} — родители и ответы вокруг сообщения
-- chat.get_user_interactions: {first_user_id, second_user_id, limit?} — прямые reply, в каждом результате есть ответ и исходное сообщение
-- notes.list_chat: {}
-- notes.list_user: {telegram_user_id}
-- notes.add_user: {telegram_user_id, note} — только подтверждённый сообщениями факт
-- web.search: {query} — web-поиск с чтением найденных страниц; URL можно включить в query
-- github.search: {query} — публичные GitHub code/issues"#
+fn tool_catalog(mcp_catalog: &str) -> String {
+    format!(
+        "Инструменты MCP (получены через tools/list):\n{mcp_catalog}\n\nЛокальные инструменты:\n- notes.add_user: {{telegram_user_id, note}} — только подтверждённый сообщениями факт\n- web.search: {{query}} — web-поиск с чтением найденных страниц; URL можно включить в query\n- github.search: {{query}} — публичные GitHub code/issues"
+    )
 }
 
 async fn call_tool(
@@ -643,12 +608,12 @@ async fn call_tool(
     pool: &PgPool,
     requester_user_id: i64,
     evidence: &mut Evidence,
-    mcp: &mut McpClient,
+    mcp: &McpClient,
     tool: &str,
     arguments: Value,
 ) -> anyhow::Result<String> {
     match tool {
-        tool if allowed_mcp_tool(tool) => {
+        tool if mcp.has_tool(tool) => {
             let result = mcp.call(tool, arguments).await?;
             collect_message_evidence(&result, evidence);
             Ok(result)
@@ -1054,94 +1019,6 @@ async fn external_search(
     )?)
 }
 
-struct McpClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    next_id: u64,
-    timeout: Duration,
-}
-
-impl McpClient {
-    async fn start(config: &Config) -> anyhow::Result<Self> {
-        let command = config
-            .ask_db_mcp_command
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("ASK_DB_MCP_COMMAND is not configured"))?;
-        let mut process = Command::new(command);
-        process
-            .args(&config.ask_db_mcp_args)
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        for name in &config.ask_db_mcp_env {
-            if let Ok(value) = std::env::var(name) {
-                process.env(name, value);
-            }
-        }
-        process.env("DISCUSSION_CHAT_ID", config.discussion_chat_id.to_string());
-        let mut child = process.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("chat DB MCP stdin is unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("chat DB MCP stdout is unavailable"))?;
-        let mut client = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout).lines(),
-            next_id: 1,
-            timeout: Duration::from_secs(config.ask_db_mcp_timeout_sec),
-        };
-        client.request("initialize", json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"tg-ai-bot-teloxide","version":"0.1.0"}})).await?;
-        Ok(client)
-    }
-
-    async fn call(&mut self, tool: &str, arguments: Value) -> anyhow::Result<String> {
-        if !allowed_mcp_tool(tool) {
-            anyhow::bail!("ask agent requested a forbidden tool");
-        }
-        let response = self
-            .request("tools/call", json!({"name":tool,"arguments":arguments}))
-            .await?;
-        response["result"]["content"][0]["text"]
-            .as_str()
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow::anyhow!("chat DB MCP returned invalid tool result"))
-    }
-
-    async fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        self.stdin
-            .write_all(serde_json::to_string(&request)?.as_bytes())
-            .await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
-        let line = timeout(self.timeout, self.stdout.next_line())
-            .await
-            .map_err(|_| anyhow::anyhow!("chat DB MCP timed out"))??
-            .ok_or_else(|| anyhow::anyhow!("chat DB MCP closed stdout"))?;
-        let response: Value = serde_json::from_str(&line)?;
-        if response.get("error").is_some() {
-            anyhow::bail!("chat DB MCP rejected request");
-        }
-        Ok(response)
-    }
-}
-
-impl Drop for McpClient {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +1075,7 @@ mod tests {
             "что обсуждали?",
             &["данные".to_string()],
             3,
+            "- chat.get_recent_messages: последние сообщения",
         );
         assert!(prompt.contains("UNTRUSTED"));
         assert!(prompt.contains("chat.get_recent_messages"));
@@ -1234,11 +1112,10 @@ mod tests {
     }
 
     #[test]
-    fn allowlists_only_declared_tools() {
-        assert!(!allowed_agent_tool("chat.raw_sql"));
-        assert!(allowed_agent_tool("chat.get_recent_messages"));
-        assert!(allowed_mcp_tool("chat.get_user_profile"));
-        assert!(!allowed_mcp_tool("notes.add_user"));
+    fn local_agent_tools_only_allow_declared_tools() {
+        assert!(!LOCAL_AGENT_TOOLS.contains(&"chat.raw_sql"));
+        assert!(LOCAL_AGENT_TOOLS.contains(&"notes.add_user"));
+        assert!(!LOCAL_AGENT_TOOLS.contains(&"chat.get_user_profile"));
     }
 
     #[test]
