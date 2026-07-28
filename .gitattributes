@@ -1,0 +1,2 @@
+# Shell-скрипты остаются в репозитории, но не должны влиять на GitHub language bar.
+*.sh linguist-detectable=false
