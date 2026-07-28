@@ -470,6 +470,7 @@ fn append_filters(
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ColumnKind {
+    BigInteger,
     Integer,
     SmallInteger,
     Double,
@@ -482,7 +483,8 @@ enum ColumnKind {
 
 fn column_kind(field: &CatalogColumn) -> anyhow::Result<ColumnKind> {
     match field.pg_type.as_str() {
-        "bigint" | "integer" => Ok(ColumnKind::Integer),
+        "bigint" => Ok(ColumnKind::BigInteger),
+        "integer" => Ok(ColumnKind::Integer),
         "smallint" => Ok(ColumnKind::SmallInteger),
         "double precision" => Ok(ColumnKind::Double),
         "boolean" => Ok(ColumnKind::Boolean),
@@ -500,7 +502,8 @@ fn validate_aggregate_column(operation: Aggregate, field: &CatalogColumn) -> any
         Aggregate::CountDistinct => true,
         Aggregate::Min | Aggregate::Max => matches!(
             kind,
-            ColumnKind::Integer
+            ColumnKind::BigInteger
+                | ColumnKind::Integer
                 | ColumnKind::SmallInteger
                 | ColumnKind::Double
                 | ColumnKind::Text
@@ -508,7 +511,10 @@ fn validate_aggregate_column(operation: Aggregate, field: &CatalogColumn) -> any
         ),
         Aggregate::Sum | Aggregate::Avg => matches!(
             kind,
-            ColumnKind::Integer | ColumnKind::SmallInteger | ColumnKind::Double
+            ColumnKind::BigInteger
+                | ColumnKind::Integer
+                | ColumnKind::SmallInteger
+                | ColumnKind::Double
         ),
         Aggregate::Count => unreachable!(),
     };
@@ -576,7 +582,8 @@ fn validate_filter(field: &CatalogColumn, filter: &Filter) -> anyhow::Result<()>
         ensure!(
             matches!(
                 kind,
-                ColumnKind::Integer
+                ColumnKind::BigInteger
+                    | ColumnKind::Integer
                     | ColumnKind::SmallInteger
                     | ColumnKind::Double
                     | ColumnKind::Text
@@ -597,7 +604,13 @@ fn validate_filter(field: &CatalogColumn, filter: &Filter) -> anyhow::Result<()>
 fn validate_value(kind: ColumnKind, value: &Value) -> anyhow::Result<()> {
     ensure!(!value.is_null(), "null must use is_null");
     match kind {
-        ColumnKind::Integer => ensure!(value.as_i64().is_some(), "expected an integer value"),
+        ColumnKind::BigInteger => ensure!(value.as_i64().is_some(), "expected a bigint value"),
+        ColumnKind::Integer => ensure!(
+            value
+                .as_i64()
+                .is_some_and(|value| i32::try_from(value).is_ok()),
+            "expected an integer value"
+        ),
         ColumnKind::SmallInteger => ensure!(
             value
                 .as_i64()
@@ -970,6 +983,22 @@ mod tests {
             ..request
         };
         assert!(validate_select(&catalog, &request).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_out_of_range_integer_filters_before_database_access() {
+        let catalog = catalog(&[("sequence", "integer")]);
+        for value in [json!(2_147_483_648_i64), json!(-2_147_483_649_i64)] {
+            let request = SelectRequest {
+                table: "test".to_string(),
+                columns: vec![],
+                filters: vec![filter("sequence", FilterOp::Eq, Some(value), vec![])],
+                order_by: vec![],
+                limit: None,
+                offset: 0,
+            };
+            assert!(validate_select(&catalog, &request).is_err());
+        }
     }
 
     #[test]
