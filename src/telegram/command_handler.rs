@@ -316,6 +316,7 @@ async fn handle_ask_command(
             reply_context: reply_context.as_deref(),
             image_base64: reply_image.as_deref(),
             progress: progress_message.as_ref().map(|_| &progress_tx),
+            allow_mutations: true,
         },
     );
     tokio::pin!(answer);

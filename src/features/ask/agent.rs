@@ -44,6 +44,8 @@ pub struct AskRequest<'a> {
     pub reply_context: Option<&'a str>,
     pub image_base64: Option<&'a str>,
     pub progress: Option<&'a UnboundedSender<AskProgress>>,
+    /// Production `/ask` может сохранять проверенные заметки; diagnostic replay остаётся read-only.
+    pub allow_mutations: bool,
 }
 
 impl AskProgress {
@@ -120,6 +122,15 @@ struct ToolResult {
     agent_preview: String,
 }
 
+struct ToolCallContext<'a> {
+    config: &'a Config,
+    pool: &'a PgPool,
+    requester_user_id: i64,
+    evidence: &'a mut Evidence,
+    mcp: &'a McpClient,
+    allow_mutations: bool,
+}
+
 impl ToolResult {
     fn from_value(value: Value) -> anyhow::Result<Self> {
         Ok(Self {
@@ -163,6 +174,7 @@ pub async fn answer(
         reply_context,
         image_base64,
         progress,
+        allow_mutations,
     } = request;
     report_progress(progress, AskProgress::Preparing);
     let mcp = McpClient::start(config).await?;
@@ -285,11 +297,14 @@ pub async fn answer(
                 let started = Instant::now();
                 report_progress(progress, progress_for_tool(tool));
                 match call_tool(
-                    config,
-                    pool,
-                    requester_user_id,
-                    &mut evidence,
-                    &mcp,
+                    ToolCallContext {
+                        config,
+                        pool,
+                        requester_user_id,
+                        evidence: &mut evidence,
+                        mcp: &mcp,
+                        allow_mutations,
+                    },
                     tool,
                     action.arguments,
                 )
@@ -570,16 +585,9 @@ fn elapsed_millis(started: Instant) -> Option<i64> {
 fn tool_result_count(value: &Value) -> Option<i64> {
     let count = match value {
         Value::Array(items) => items.len(),
-        Value::Object(object) => object
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .or_else(|| {
-                object
-                    .get("results")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-            })?,
+        Value::Object(object) => ["messages", "results", "context", "thread", "interactions"]
+            .iter()
+            .find_map(|field| object.get(*field).and_then(Value::as_array).map(Vec::len))?,
         _ => return None,
     };
     i64::try_from(count).ok()
@@ -617,23 +625,24 @@ fn tool_catalog(mcp_catalog: &str) -> String {
 }
 
 async fn call_tool(
-    config: &Config,
-    pool: &PgPool,
-    requester_user_id: i64,
-    evidence: &mut Evidence,
-    mcp: &McpClient,
+    context: ToolCallContext<'_>,
     tool: &str,
     arguments: Value,
 ) -> anyhow::Result<ToolResult> {
     match tool {
-        tool if mcp.has_tool(tool) => {
-            let result = mcp.call(tool, arguments).await?;
-            collect_message_evidence_value(&result.value, evidence);
+        tool if context.mcp.has_tool(tool) => {
+            let result = context.mcp.call(tool, arguments).await?;
+            collect_message_evidence_value(&result.value, context.evidence);
             Ok(ToolResult {
                 value: result.value,
                 agent_preview: result.agent_preview,
             })
         }
+        "notes.add_user" if !context.allow_mutations => ToolResult::from_value(json!({
+            "saved": false,
+            "dry_run": true,
+            "reason": "диагностический replay не сохраняет заметки"
+        })),
         "notes.add_user" => {
             let user_id = arguments
                 .get("telegram_user_id")
@@ -643,24 +652,25 @@ async fn call_tool(
                 .get("note")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("notes.add_user requires note"))?;
-            let source_message_ids = evidence
+            let source_message_ids = context
+                .evidence
                 .message_ids_by_user
                 .get(&user_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             add_user_note_from_search(
-                pool,
-                config.discussion_chat_id,
+                context.pool,
+                context.config.discussion_chat_id,
                 user_id,
-                requester_user_id,
+                context.requester_user_id,
                 note,
                 source_message_ids,
             )
             .await?;
             ToolResult::from_value(json!({"saved": true}))
         }
-        "web.search" => external_search(config, SearchSource::Web, arguments).await,
-        "github.search" => external_search(config, SearchSource::Github, arguments).await,
+        "web.search" => external_search(context.config, SearchSource::Web, arguments).await,
+        "github.search" => external_search(context.config, SearchSource::Github, arguments).await,
         _ => anyhow::bail!("ask agent requested a forbidden tool"),
     }
 }
@@ -938,7 +948,14 @@ fn overconfident_personal_inference(markdown: &str) -> bool {
 }
 
 fn json_array_len(value: &Value) -> usize {
-    value.as_array().map(Vec::len).unwrap_or(0)
+    match value {
+        Value::Array(items) => items.len(),
+        Value::Object(object) => ["messages", "results", "context", "thread", "interactions"]
+            .iter()
+            .find_map(|field| object.get(*field).and_then(Value::as_array).map(Vec::len))
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn count_message_results(value: &Value) -> usize {
@@ -1228,6 +1245,14 @@ mod tests {
     }
 
     #[test]
+    fn object_root_collections_count_for_research_and_audit() {
+        let value = json!({"context": [{"message_id": 1}, {"message_id": 2}]});
+        assert_eq!(json_array_len(&value), 2);
+        assert_eq!(tool_result_count(&value), Some(2));
+        assert_eq!(count_message_results(&value), 2);
+    }
+
+    #[test]
     fn rejects_overconfident_current_state_from_indirect_events() {
         assert!(overconfident_personal_inference(
             "После заказа у него должен быть новый процессор"
@@ -1261,6 +1286,7 @@ mod tests {
                 reply_context: None,
                 image_base64: None,
                 progress: None,
+                allow_mutations: false,
             },
         )
         .await?;
