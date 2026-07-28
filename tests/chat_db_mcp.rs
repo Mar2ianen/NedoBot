@@ -17,7 +17,7 @@ fn manifest_path() -> PathBuf {
 
 #[ignore = "requires TEST_DATABASE_URL and a migrated local PostgreSQL database"]
 #[tokio::test]
-async fn ask_mcp_client_starts_real_rmcp_child_with_env_clear_allowlist() -> Result<()> {
+async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -> Result<()> {
     within_timeout("McpClient real RMCP child lifecycle", async {
         let database_url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
@@ -30,7 +30,7 @@ async fn ask_mcp_client_starts_real_rmcp_child_with_env_clear_allowlist() -> Res
             std::env::set_var("MCP_MANIFEST", &manifest);
         }
         let mut config = Config::from_env()?;
-        config.ask_db_mcp_command = Some(env!("CARGO_BIN_EXE_chat_db_mcp_rmcp").to_string());
+        config.ask_db_mcp_command = Some(env!("CARGO_BIN_EXE_chat_db_mcp").to_string());
         config.ask_db_mcp_args = Vec::new();
         config.ask_db_mcp_env = vec!["ASK_DATABASE_URL".to_string(), "MCP_MANIFEST".to_string()];
         config.ask_db_mcp_timeout_sec = E2E_TIMEOUT.as_secs();

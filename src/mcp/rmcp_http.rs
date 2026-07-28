@@ -1,10 +1,9 @@
-//! Canary public Streamable HTTP adapter backed by the official RMCP service.
+//! Public Streamable HTTP adapter backed by the official RMCP service.
 //!
-//! This intentionally does not replace the legacy handwritten HTTP adapter.
-//! Both adapters expose the same reviewed `ChatMcpServer` read-model, while this
-//! module owns only listener configuration and HTTP boundary checks. The legacy
-//! static-avatar lookup is deliberately not exposed here: `ChatMcpServer` has no
-//! static-file resolver, so this canary must not advertise an unverifiable URL tool.
+//! The adapter owns only listener configuration and HTTP boundary checks; SQL,
+//! catalog policy, and tool execution belong to the shared `ChatMcpServer`
+//! read-model. Static-avatar lookup is deliberately not exposed because the server
+//! has no static-file resolver and must not advertise an unverifiable URL tool.
 
 use std::{env, net::SocketAddr, time::Duration};
 
@@ -127,7 +126,7 @@ fn parse_allowed_origins(value: Option<&str>) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// Runs the isolated RMCP Streamable HTTP canary.
+/// Runs the public RMCP Streamable HTTP server.
 ///
 /// The service factory clones a server whose API shares the validated read-only
 /// pool. RMCP still creates independent protocol handlers per HTTP session.
@@ -145,7 +144,7 @@ pub async fn run_public_http() -> anyhow::Result<()> {
         config.allowed_origins,
     );
 
-    info!(bind = %config.bind, path = %config.path, "NedoNews RMCP HTTP canary started");
+    info!(bind = %config.bind, path = %config.path, "NedoNews RMCP HTTP started");
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -281,7 +280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn official_rmcp_client_lists_and_calls_tools_through_canary_adapter() -> Result<()> {
+    async fn official_rmcp_client_lists_and_calls_tools_through_http_adapter() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/mcp", listener.local_addr()?);
         let app = router(
