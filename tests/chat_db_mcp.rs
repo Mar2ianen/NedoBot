@@ -1,4 +1,4 @@
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, future::Future, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -65,6 +65,15 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         let user_id = message["user_id"]
             .as_i64()
             .context("user_id must be an integer")?;
+        let user_ids = messages
+            .iter()
+            .filter_map(|message| message["user_id"].as_i64())
+            .collect::<BTreeSet<_>>();
+        let second_user_id = user_ids
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != user_id)
+            .context("test database must contain messages from two public users")?;
 
         let search = call_object(
             &client,
@@ -102,6 +111,13 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         )
         .await?;
         assert!(thread["thread"].is_array());
+        let interactions = call_object(
+            &client,
+            "chat.get_user_interactions",
+            json!({"first_user_id": user_id, "second_user_id": second_user_id, "limit": 1}),
+        )
+        .await?;
+        assert!(interactions["interactions"].is_array());
         let profile = call_object(
             &client,
             "chat.get_user_profile",
