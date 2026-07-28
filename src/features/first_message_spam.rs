@@ -5,15 +5,17 @@ use sqlx::{PgPool, Row};
 use teloxide::prelude::*;
 
 use crate::config::Config;
+use crate::features::jobs::claim::CasResult;
+use crate::features::jobs::policy::{ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE};
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
-use crate::features::spam_review::{create_review, send_review};
+use crate::features::spam_review::{claim_next_review_delivery, create_review, send_review};
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
 
 const PROMPT_VERSION: &str = "first-message-spam-v4";
 const POST_CONTEXT_LIMIT: usize = 700;
-const LEASE_SECONDS: i64 = 10 * 60;
+
 const SYSTEM_PROMPT: &str = include_str!("../../prompts/first_message_spam_classification.md");
 
 pub async fn analyze_first_message(
@@ -143,6 +145,10 @@ pub async fn process_next_first_message_spam_analysis_job(
     pool: &PgPool,
     config: &Config,
 ) -> anyhow::Result<bool> {
+    if let Some(review) = claim_next_review_delivery(pool).await? {
+        send_review(bot, pool, &review).await?;
+        return Ok(true);
+    }
     if !config.first_message_spam_enabled {
         return Ok(false);
     }
@@ -167,7 +173,7 @@ pub async fn process_next_first_message_spam_analysis_job(
         returning job.id, job.chat_id, job.telegram_user_id, job.attempts
         "#,
     )
-    .bind(LEASE_SECONDS)
+    .bind(EXTERNAL_REQUEST_LEASE.seconds())
     .fetch_optional(pool)
     .await?;
     let Some(job) = job else { return Ok(false) };
@@ -178,14 +184,25 @@ pub async fn process_next_first_message_spam_analysis_job(
 
     match analyze_first_message(pool, config, chat_id, user_id).await {
         Ok(_) => {
-            sqlx::query(
-                "update first_message_spam_analysis_jobs set status = 'succeeded', error_kind = null, lease_expires_at = null, updated_at = now() where id = $1 and status = 'processing'",
+            let update = sqlx::query(
+                "update first_message_spam_analysis_jobs set status = 'succeeded', error_kind = null, lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing'",
             )
             .bind(id)
+            .bind(attempts)
             .execute(pool)
             .await?;
-            if let Some(review) = create_review(pool, chat_id, user_id).await? {
-                send_review(bot, &review).await?;
+            if CasResult::from_rows_affected(update.rows_affected())? == CasResult::LeaseLost {
+                tracing::warn!(
+                    job_id = id,
+                    attempts,
+                    "first-message spam analysis lease was reclaimed before finalization"
+                );
+                return Ok(true);
+            }
+            if let Some(review) = create_review(pool, chat_id, user_id).await?
+                && let Err(err) = send_review(bot, pool, &review).await
+            {
+                tracing::warn!(%err, user_id, "failed to send first-message spam review");
             }
         }
         Err(err) => {
@@ -194,43 +211,52 @@ pub async fn process_next_first_message_spam_analysis_job(
             } else {
                 "first_message_analysis_failed"
             };
-            match retry_delay_seconds(attempts) {
+            match ANALYSIS_RETRY.delay_seconds(attempts, None) {
                 Some(delay_seconds) => {
-                    sqlx::query(
-                        "update first_message_spam_analysis_jobs set status = 'retry_wait', error_kind = $2, next_attempt_at = now() + ($3 * interval '1 second'), lease_expires_at = null, updated_at = now() where id = $1 and status = 'processing'",
+                    let update = sqlx::query(
+                        "update first_message_spam_analysis_jobs set status = 'retry_wait', error_kind = $3, next_attempt_at = now() + ($4 * interval '1 second'), lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing'",
                     )
                     .bind(id)
+                    .bind(attempts)
                     .bind(error_kind)
                     .bind(delay_seconds)
                     .execute(pool)
                     .await?;
-                    tracing::warn!(%err, user_id, attempts, delay_seconds, "first-message spam analysis scheduled for retry");
+                    match CasResult::from_rows_affected(update.rows_affected())? {
+                        CasResult::Applied => {
+                            tracing::warn!(%err, user_id, attempts, delay_seconds, "first-message spam analysis scheduled for retry")
+                        }
+                        CasResult::LeaseLost => tracing::warn!(
+                            job_id = id,
+                            attempts,
+                            "first-message spam analysis retry ignored after lease was reclaimed"
+                        ),
+                    }
                 }
                 None => {
-                    sqlx::query(
-                        "update first_message_spam_analysis_jobs set status = 'failed', error_kind = $2, lease_expires_at = null, updated_at = now() where id = $1 and status = 'processing'",
+                    let update = sqlx::query(
+                        "update first_message_spam_analysis_jobs set status = 'failed', error_kind = $3, lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing'",
                     )
                     .bind(id)
+                    .bind(attempts)
                     .bind(error_kind)
                     .execute(pool)
                     .await?;
-                    tracing::error!(%err, user_id, attempts, "first-message spam analysis failed permanently");
+                    match CasResult::from_rows_affected(update.rows_affected())? {
+                        CasResult::Applied => {
+                            tracing::error!(%err, user_id, attempts, "first-message spam analysis failed permanently")
+                        }
+                        CasResult::LeaseLost => tracing::warn!(
+                            job_id = id,
+                            attempts,
+                            "first-message spam analysis failure ignored after lease was reclaimed"
+                        ),
+                    }
                 }
             }
         }
     }
     Ok(true)
-}
-
-fn retry_delay_seconds(attempts: i32) -> Option<i64> {
-    match attempts {
-        1 => Some(15),
-        2 => Some(30),
-        3 => Some(60),
-        4 => Some(5 * 60),
-        5 => Some(24 * 60 * 60),
-        _ => None,
-    }
 }
 
 async fn replied_post_context(
@@ -467,10 +493,10 @@ mod tests {
 
     #[test]
     fn retry_schedule_reaches_one_day_then_fails() {
-        assert_eq!(retry_delay_seconds(1), Some(15));
-        assert_eq!(retry_delay_seconds(4), Some(300));
-        assert_eq!(retry_delay_seconds(5), Some(86_400));
-        assert_eq!(retry_delay_seconds(6), None);
+        assert_eq!(ANALYSIS_RETRY.delay_seconds(1, None), Some(15));
+        assert_eq!(ANALYSIS_RETRY.delay_seconds(4, None), Some(300));
+        assert_eq!(ANALYSIS_RETRY.delay_seconds(5, None), Some(86_400));
+        assert_eq!(ANALYSIS_RETRY.delay_seconds(6, None), None);
     }
 
     #[test]

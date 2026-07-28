@@ -26,6 +26,7 @@ use features::avatar_analysis::service::process_next_avatar_analysis_job;
 use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
 use features::first_message_spam::process_next_first_message_spam_analysis_job;
+use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
 use features::memory::service::process_next_history_entry;
 use features::spam_review::{apply_callback, parse_callback};
 use features::user_profiles::enrichment::{
@@ -271,10 +272,18 @@ fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
             drop(permit);
             match processed {
                 Ok(true) => continue,
-                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
+                    ))
+                    .await
+                }
                 Err(err) => {
                     tracing::warn!(%err, "avatar analysis worker failed to claim a job");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
                 }
             }
         }
@@ -282,20 +291,26 @@ fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
 }
 
 fn spawn_first_message_spam_analysis_worker(bot: Bot, state: AppState) {
-    if !state.config.first_message_spam_enabled {
-        return;
-    }
-
+    // Review-card delivery is independent from optional LLM first-message analysis.
+    // The worker therefore remains active to retry pending Telegram notifications.
     tokio::spawn(async move {
         loop {
             match process_next_first_message_spam_analysis_job(&bot, &state.pool, &state.config)
                 .await
             {
                 Ok(true) => continue,
-                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
+                    ))
+                    .await
+                }
                 Err(err) => {
-                    tracing::warn!(%err, "first-message spam worker failed to claim a job");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tracing::warn!(%err, "spam review or first-message analysis worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
                 }
             }
         }

@@ -1,7 +1,6 @@
 use sqlx::PgPool;
 use sqlx::types::Json;
 
-use crate::config::Config;
 use crate::features::ask::types::{AskRunStatus, ToolCallAudit};
 
 pub struct CreateAskRunParams<'a> {
@@ -10,19 +9,19 @@ pub struct CreateAskRunParams<'a> {
     pub requester_user_id: i64,
     pub question: &'a str,
     pub reply_to_message_id: Option<i32>,
+    pub provider: &'a str,
+    pub model: Option<&'a str>,
 }
 
-pub async fn create_run(
-    pool: &PgPool,
-    config: &Config,
-    input: CreateAskRunParams<'_>,
-) -> anyhow::Result<i64> {
+pub async fn create_run(pool: &PgPool, input: CreateAskRunParams<'_>) -> anyhow::Result<i64> {
     let CreateAskRunParams {
         chat_id,
         command_message_id,
         requester_user_id,
         question,
         reply_to_message_id,
+        provider,
+        model,
     } = input;
     sqlx::query_scalar(
         r#"
@@ -39,8 +38,8 @@ pub async fn create_run(
     .bind(requester_user_id)
     .bind(question)
     .bind(reply_to_message_id)
-    .bind(&config.ask_llm_provider)
-    .bind(config.ask_llm_model.as_deref())
+    .bind(provider)
+    .bind(model)
     .fetch_one(pool)
     .await
     .map_err(Into::into)

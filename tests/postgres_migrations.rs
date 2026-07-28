@@ -2,7 +2,13 @@ use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, query, query_as, query_scalar};
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
-    avatar_analysis::service::apply_avatar_risk_signal,
+    avatar_analysis::{
+        repo::{
+            claim_next_avatar_analysis_job, enqueue_avatar_analysis_job,
+            mark_avatar_analysis_failed,
+        },
+        service::apply_avatar_risk_signal,
+    },
     chat_retrieval::enqueue_message_embedding_if_enabled,
     first_comment::repo::{
         CommentErrorKind, CreatePostCommentJobParams, claim_next_post_comment_job,
@@ -33,6 +39,68 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
+    assert_avatar_job_finalization_requires_current_claim(&pool).await;
+}
+
+async fn assert_avatar_job_finalization_requires_current_claim(pool: &PgPool) {
+    let user_id = 9_000_001_i64;
+    let unique_id = "avatar-cas-regression";
+    let features = serde_json::json!({ "test": true });
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Avatar CAS')")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("avatar job user profile must exist");
+    enqueue_avatar_analysis_job(
+        pool,
+        user_id,
+        "avatar-file-id",
+        unique_id,
+        "avatar-snapshot",
+        &features,
+        "test-prompt",
+    )
+    .await
+    .expect("avatar job must be enqueued");
+
+    let first_claim = claim_next_avatar_analysis_job(pool)
+        .await
+        .expect("first avatar claim must succeed")
+        .expect("avatar job must be claimed");
+    query("update avatar_analysis_jobs set lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(first_claim.id)
+        .execute(pool)
+        .await
+        .expect("avatar lease must be expired for regression test");
+    let second_claim = claim_next_avatar_analysis_job(pool)
+        .await
+        .expect("reclaimed avatar job must be claimable")
+        .expect("avatar job must be reclaimed");
+    assert!(second_claim.attempts > first_claim.attempts);
+
+    let stale_result = mark_avatar_analysis_failed(pool, &first_claim, "test_failure", None)
+        .await
+        .expect("stale avatar finalization query must execute");
+    assert_eq!(
+        stale_result,
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
+    );
+
+    let status: (String, i32) =
+        query_as("select status, attempts from avatar_analysis_jobs where id = $1")
+            .bind(second_claim.id)
+            .fetch_one(pool)
+            .await
+            .expect("reclaimed avatar job must remain present");
+    assert_eq!(status, ("processing".to_string(), second_claim.attempts));
+
+    let current_result = mark_avatar_analysis_failed(pool, &second_claim, "test_failure", None)
+        .await
+        .expect("current avatar finalization query must execute");
+    assert_eq!(
+        current_result,
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
+    );
 }
 
 async fn assert_clean_database_migrations(pool: &PgPool) {
@@ -418,6 +486,15 @@ async fn assert_review_deduplication(pool: &PgPool) {
         first_review.is_some(),
         "medium-risk audit must create a review"
     );
+    query(
+        "update spam_review_requests set notification_status = 'sent', notification_message_id = 900, notified_risk_score = 65, notified_risk_signals = '[]'::jsonb, notification_lease_expires_at = null where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("initial review delivery must be recorded");
+
     let duplicate_review = create_review(pool, CHAT_ID, USER_ID)
         .await
         .expect("duplicate review check must succeed");
@@ -438,6 +515,11 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .await
     .expect("avatar risk signal must be applied");
     assert_eq!(affected_chat_ids, vec![CHAT_ID]);
+    let updated_review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("avatar risk must refresh review delivery")
+        .expect("changed sent review must be claimed for an edit");
+    assert_eq!(updated_review.notification_message_id, Some(900));
 
     let (risk_score, risk_level): (i32, String) = query_as(
         "select risk_score, risk_level from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
@@ -449,6 +531,97 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .expect("updated risk audit must exist");
     assert_eq!(risk_score, 73);
     assert_eq!(risk_level, "high");
+
+    let (review_score, review_signals): (i32, serde_json::Value) = query_as(
+        "select risk_score, risk_signals from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("review snapshot must be refreshed after an avatar risk signal");
+    assert_eq!(review_score, 73);
+    assert!(
+        review_signals
+            .as_array()
+            .is_some_and(|signals| signals.iter().any(|signal| {
+                signal.get("label").and_then(serde_json::Value::as_str)
+                    == Some("suggestive_avatar_bait")
+            })),
+        "review snapshot must include the later avatar signal: {review_signals}"
+    );
+
+    let (notification_status, notification_attempts, notification_message_id): (String, i32, Option<i32>) = query_as(
+        "select notification_status, notification_attempts, notification_message_id from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("changed sent review must be queued for an edit");
+    assert_eq!(notification_status, "processing");
+    assert_eq!(notification_attempts, 2);
+    assert_eq!(notification_message_id, Some(900));
+
+    query(
+        "update spam_review_requests set notification_status = 'retry_wait', notification_next_attempt_at = now(), notification_lease_expires_at = null where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("failed review edit must remain retryable");
+    let retried_review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("retryable review delivery claim must succeed");
+    assert!(
+        retried_review.is_some(),
+        "a pending failed notification must be claimable again"
+    );
+    let (notification_status, notification_attempts, notification_message_id): (String, i32, Option<i32>) = query_as(
+        "select notification_status, notification_attempts, notification_message_id from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("review delivery lifecycle must be persisted");
+    assert_eq!(notification_status, "processing");
+    assert_eq!(notification_attempts, 3);
+    assert_eq!(notification_message_id, Some(900));
+
+    query(
+        "update spam_review_requests set status = 'confirmed_not_spam', notification_status = 'sent' where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("review must be confirmable");
+    query(
+        "update telegram_new_user_profile_audits set risk_score = 90, risk_signal_breakdown = '[{\"label\": \"later_signal\"}]'::jsonb where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("later audit snapshot must be writable");
+    let confirmed_review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("confirmed review snapshot refresh must succeed");
+    assert!(confirmed_review.is_none());
+    let (confirmed_status, confirmed_notification_status, confirmed_score): (String, String, i32) =
+        query_as(
+            "select status, notification_status, risk_score from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+        )
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .fetch_one(pool)
+        .await
+        .expect("confirmed review must remain stored");
+    assert_eq!(confirmed_status, "confirmed_not_spam");
+    assert_eq!(confirmed_notification_status, "sent");
+    assert_eq!(confirmed_score, 90);
 
     let review_count: i64 = query_scalar(
         "select count(*) from spam_review_requests where chat_id = $1 and telegram_user_id = $2",

@@ -119,7 +119,8 @@ pub struct Config {
     pub ask_llm_temperature: f32,
     pub ask_llm_max_tokens: u32,
     pub ask_max_steps: usize,
-    pub ask_timeout_sec: u64,
+    pub ask_action_timeout_sec: u64,
+    pub ask_total_timeout_sec: u64,
     pub ask_max_concurrency: usize,
     pub ask_db_mcp_command: Option<String>,
     pub ask_db_mcp_args: Vec<String>,
@@ -280,7 +281,12 @@ impl Config {
             ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2)?,
             ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800)?,
             ask_max_steps: env_usize("ASK_MAX_STEPS", 7)?,
-            ask_timeout_sec: env_u64("ASK_TIMEOUT_SEC", 45)?,
+            ask_action_timeout_sec: env_u64_with_legacy(
+                "ASK_ACTION_TIMEOUT_SEC",
+                "ASK_TIMEOUT_SEC",
+                45,
+            )?,
+            ask_total_timeout_sec: env_u64("ASK_TOTAL_TIMEOUT_SEC", 180)?,
             ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1)?,
             ask_db_mcp_command: env_optional("ASK_DB_MCP_COMMAND"),
             ask_db_mcp_args: env_args("ASK_DB_MCP_ARGS"),
@@ -411,8 +417,11 @@ impl Config {
             if self.ask_max_steps == 0 {
                 errors.push("ASK_MAX_STEPS must be greater than 0".to_string());
             }
-            if self.ask_timeout_sec == 0 {
-                errors.push("ASK_TIMEOUT_SEC must be greater than 0".to_string());
+            if self.ask_action_timeout_sec == 0 {
+                errors.push("ASK_ACTION_TIMEOUT_SEC must be greater than 0".to_string());
+            }
+            if self.ask_total_timeout_sec == 0 {
+                errors.push("ASK_TOTAL_TIMEOUT_SEC must be greater than 0".to_string());
             }
             if self.ask_max_concurrency == 0 {
                 errors.push("ASK_MAX_CONCURRENCY must be greater than 0".to_string());
@@ -704,6 +713,18 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     env_parse(key, default, "a non-negative 64-bit integer")
 }
 
+/// `ASK_TIMEOUT_SEC` is accepted only as a parsed compatibility alias while
+/// deployments migrate to the explicit action/total deadline split.
+fn env_u64_with_legacy(key: &str, legacy_key: &str, default: u64) -> anyhow::Result<u64> {
+    if let Some(value) = env_value(key) {
+        return parse_env_value(key, &value, "a non-negative 64-bit integer");
+    }
+    if let Some(value) = env_value(legacy_key) {
+        return parse_env_value(legacy_key, &value, "a non-negative 64-bit integer");
+    }
+    Ok(default)
+}
+
 fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {
     env_parse(key, default, "a non-negative integer")
 }
@@ -941,7 +962,8 @@ mod tests {
             ask_llm_temperature: 0.2,
             ask_llm_max_tokens: 1800,
             ask_max_steps: 5,
-            ask_timeout_sec: 45,
+            ask_action_timeout_sec: 45,
+            ask_total_timeout_sec: 180,
             ask_max_concurrency: 1,
             ask_db_mcp_command: None,
             ask_db_mcp_args: Vec::new(),

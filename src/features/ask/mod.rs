@@ -4,4 +4,5 @@ pub mod mcp_client;
 pub mod notes;
 pub mod repo;
 pub mod rich_markdown;
+pub mod service;
 pub mod types;

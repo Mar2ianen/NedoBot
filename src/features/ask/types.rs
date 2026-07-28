@@ -1,5 +1,67 @@
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AskProgress {
+    Preparing,
+    ResolvingPerson,
+    SearchingChat,
+    CheckingExternalSources,
+    CheckingNotes,
+    FormingAnswer,
+}
+
+pub struct AskCommandInput {
+    pub chat_id: i64,
+    pub command_message_id: i32,
+    pub requester_user_id: i64,
+    pub requester_identity: String,
+    pub question: String,
+    pub reply_to_message_id: Option<i32>,
+    pub reply_context: Option<String>,
+    pub reply_image_base64: Option<String>,
+    /// Production `/ask` may save verified notes; diagnostic replay remains read-only.
+    pub allow_mutations: bool,
+}
+
+pub struct AskAnswer {
+    pub markdown: String,
+    pub ask_run_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AskFailureKind {
+    Timeout,
+    ToolError,
+    InvalidAction,
+    InvalidOutput,
+    GenerationError,
+}
+
+impl AskFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ToolError => "tool_error",
+            Self::InvalidAction => "invalid_action",
+            Self::InvalidOutput => "render_validation",
+            Self::GenerationError => "generation_error",
+        }
+    }
+
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        let error = error.to_string().to_lowercase();
+        if error.contains("timed out") {
+            Self::Timeout
+        } else if error.contains("mcp") || error.contains("database") {
+            Self::ToolError
+        } else if error.contains("invalid action") || error.contains("final answer") {
+            Self::InvalidAction
+        } else {
+            Self::GenerationError
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ToolCallStatus {
     Completed,

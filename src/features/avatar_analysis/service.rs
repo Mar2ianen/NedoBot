@@ -10,6 +10,7 @@ use crate::features::avatar_analysis::repo::{
     AvatarAnalysisJob, AvatarAnalysisSuccess, claim_next_avatar_analysis_job,
     enqueue_avatar_analysis_job, mark_avatar_analysis_failed, mark_avatar_analysis_succeeded,
 };
+use crate::features::jobs::claim::CasResult;
 use crate::features::spam_review::{create_review, send_review};
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
@@ -146,7 +147,7 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
         let assessment = response
             .get("profile_assessment")
             .ok_or_else(|| anyhow::anyhow!("missing profile assessment"))?;
-        mark_avatar_analysis_succeeded(
+        let finalized = mark_avatar_analysis_succeeded(
             pool,
             &job,
             AvatarAnalysisSuccess {
@@ -159,6 +160,10 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
             },
         )
         .await?;
+        if finalized == CasResult::LeaseLost {
+            tracing::warn!(job_id = job.id, attempts = job.attempts, "avatar analysis lease was reclaimed before finalization");
+            return Ok(());
+        }
         let affected_chat_ids = apply_avatar_risk_signal(
             pool,
             job.telegram_user_id,
@@ -168,7 +173,7 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
         .await?;
         for chat_id in affected_chat_ids {
             if let Some(review) = create_review(pool, chat_id, job.telegram_user_id).await?
-                && let Err(err) = send_review(bot, &review).await
+                && let Err(err) = send_review(bot, pool, &review).await
             {
                 tracing::warn!(%err, user_id = job.telegram_user_id, "failed to send avatar risk review");
             }
@@ -182,10 +187,21 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
         } else {
             "error"
         };
-        if let Err(save_err) = mark_avatar_analysis_failed(pool, &job, kind, None).await {
-            tracing::warn!(%save_err, job_id = job.id, "failed to persist avatar analysis error");
+        match mark_avatar_analysis_failed(pool, &job, kind, None).await {
+            Ok(CasResult::Applied) => {
+                tracing::warn!(job_id = job.id, error_kind = kind, "avatar analysis failed");
+            }
+            Ok(CasResult::LeaseLost) => {
+                tracing::warn!(
+                    job_id = job.id,
+                    attempts = job.attempts,
+                    "avatar analysis failure ignored after lease was reclaimed"
+                );
+            }
+            Err(save_err) => {
+                tracing::warn!(%save_err, job_id = job.id, "failed to persist avatar analysis error");
+            }
         }
-        tracing::warn!(job_id = job.id, error_kind = kind, "avatar analysis failed");
     }
 }
 

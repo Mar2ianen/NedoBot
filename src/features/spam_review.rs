@@ -8,11 +8,15 @@ use teloxide::{
 use crate::telegram::html;
 
 const OWNER_USERNAME: &str = "Chechulinm";
+const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
 
 pub struct SpamReview {
     pub id: i64,
     pub chat_id: i64,
     pub first_message_id: Option<i32>,
+    pub notification_message_id: Option<i32>,
+    pub risk_score: i32,
+    pub risk_signals: Value,
     pub text: String,
 }
 
@@ -21,24 +25,102 @@ pub async fn create_review(
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<Option<SpamReview>> {
-    let row = sqlx::query(
+    let request_id = sqlx::query_scalar(
         r#"
         insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals)
         select a.chat_id, a.telegram_user_id, a.risk_score, a.risk_signal_breakdown
         from telegram_new_user_profile_audits a
         where a.chat_id = $1 and a.telegram_user_id = $2
-        on conflict (chat_id, telegram_user_id) do nothing
-        returning id, chat_id, telegram_user_id, risk_score, risk_signals
-    "#,
+        on conflict (chat_id, telegram_user_id) do update
+        set risk_score = excluded.risk_score,
+            risk_signals = excluded.risk_signals,
+            notification_status = case
+                when spam_review_requests.status = 'pending'
+                 and spam_review_requests.notification_status <> 'processing'
+                 and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                     is distinct from (excluded.risk_score, excluded.risk_signals)
+                    then 'retry_wait'
+                else spam_review_requests.notification_status
+            end,
+            notification_next_attempt_at = case
+                when spam_review_requests.status = 'pending'
+                 and spam_review_requests.notification_status <> 'processing'
+                 and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                     is distinct from (excluded.risk_score, excluded.risk_signals)
+                    then now()
+                else spam_review_requests.notification_next_attempt_at
+            end,
+            notification_error_kind = case
+                when spam_review_requests.status = 'pending'
+                 and spam_review_requests.notification_status <> 'processing'
+                 and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                     is distinct from (excluded.risk_score, excluded.risk_signals)
+                    then null
+                else spam_review_requests.notification_error_kind
+            end
+        returning id
+        "#,
     )
     .bind(chat_id)
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
+    let Some(request_id) = request_id else {
+        return Ok(None);
+    };
+    claim_review_delivery(pool, Some(request_id)).await
+}
+
+pub async fn claim_next_review_delivery(pool: &PgPool) -> anyhow::Result<Option<SpamReview>> {
+    claim_review_delivery(pool, None).await
+}
+
+async fn claim_review_delivery(
+    pool: &PgPool,
+    request_id: Option<i64>,
+) -> anyhow::Result<Option<SpamReview>> {
+    let row = sqlx::query(
+        r#"
+        with candidate as (
+            select id
+            from spam_review_requests
+            where status = 'pending'
+              and ($1::bigint is null or id = $1)
+              and (
+                  (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
+                  or (notification_status = 'processing' and notification_lease_expires_at <= now())
+              )
+            order by notification_next_attempt_at, id
+            for update skip locked
+            limit 1
+        )
+        update spam_review_requests request
+        set notification_status = 'processing',
+            notification_attempts = request.notification_attempts + 1,
+            notification_processing_started_at = now(),
+            notification_lease_expires_at = now() + ($2 * interval '1 second'),
+            notification_error_kind = null
+        from candidate
+        where request.id = candidate.id
+        returning request.id, request.chat_id, request.telegram_user_id,
+                  request.risk_score, request.risk_signals, request.notification_message_id
+        "#,
+    )
+    .bind(request_id)
+    .bind(DELIVERY_LEASE_SECONDS)
+    .fetch_optional(pool)
+    .await?;
     let Some(row) = row else { return Ok(None) };
+    review_from_row(pool, row).await.map(Some)
+}
+
+async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::Result<SpamReview> {
     let id: i64 = row.get("id");
+    let chat_id: i64 = row.get("chat_id");
+    let user_id: i64 = row.get("telegram_user_id");
     let score: i32 = row.get("risk_score");
     let signals: Value = row.get("risk_signals");
+    let notification_message_id: Option<i32> = row.get("notification_message_id");
     let profile = sqlx::query(r#"
         select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
@@ -59,12 +141,15 @@ pub async fn create_review(
         "@{OWNER_USERNAME}, <b>проверка нового участника</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Сигналы:</b>\n{}",
         profile_link, username, id_link, score, reasons
     );
-    Ok(Some(SpamReview {
+    Ok(SpamReview {
         id,
         chat_id,
         first_message_id: profile.get("first_message_id"),
+        notification_message_id,
+        risk_score: score,
+        risk_signals: signals,
         text,
-    }))
+    })
 }
 
 fn is_valid_telegram_username(value: &str) -> bool {
@@ -75,24 +160,104 @@ fn is_valid_telegram_username(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-pub async fn send_review(bot: &Bot, review: &SpamReview) -> ResponseResult<()> {
-    let keyboard = InlineKeyboardMarkup::new([[
-        InlineKeyboardButton::callback("Верно: спамер", format!("spam_review:{}:spam", review.id)),
+pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyhow::Result<()> {
+    let result = if let Some(message_id) = review.notification_message_id {
+        bot.edit_message_text(ChatId(review.chat_id), MessageId(message_id), &review.text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(review_keyboard(review.id))
+            .await
+            .map(|_| message_id)
+    } else {
+        let mut request = bot
+            .send_message(ChatId(review.chat_id), &review.text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(review_keyboard(review.id));
+        if let Some(message_id) = review.first_message_id {
+            request = request.reply_parameters(
+                ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
+            );
+        }
+        request.await.map(|message| message.id.0)
+    };
+
+    match result {
+        Ok(message_id) => mark_review_delivery_succeeded(pool, review, message_id).await,
+        Err(err) => {
+            if let Err(save_err) = mark_review_delivery_failed(pool, review.id).await {
+                tracing::warn!(%save_err, request_id = review.id, "failed to persist spam review delivery failure");
+            }
+            Err(err.into())
+        }
+    }
+}
+
+fn review_keyboard(request_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[
+        InlineKeyboardButton::callback("Верно: спамер", format!("spam_review:{request_id}:spam")),
         InlineKeyboardButton::callback(
             "Неверно: не спамер",
-            format!("spam_review:{}:normal", review.id),
+            format!("spam_review:{request_id}:normal"),
         ),
-    ]]);
-    let mut request = bot
-        .send_message(ChatId(review.chat_id), &review.text)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(keyboard);
-    if let Some(message_id) = review.first_message_id {
-        request = request.reply_parameters(
-            ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
-        );
-    }
-    request.await?;
+    ]])
+}
+
+async fn mark_review_delivery_succeeded(
+    pool: &PgPool,
+    review: &SpamReview,
+    message_id: i32,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_status = case
+                when (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
+                    then 'retry_wait'
+                else 'sent'
+            end,
+            notified_at = now(), notification_message_id = $2,
+            notified_risk_score = $3, notified_risk_signals = $4,
+            notification_next_attempt_at = case
+                when (risk_score, risk_signals) is distinct from ($3, $4::jsonb) then now()
+                else notification_next_attempt_at
+            end,
+            notification_processing_started_at = null,
+            notification_lease_expires_at = null,
+            notification_error_kind = null
+        where id = $1 and status = 'pending' and notification_status = 'processing'
+        "#,
+    )
+    .bind(review.id)
+    .bind(message_id)
+    .bind(review.risk_score)
+    .bind(&review.risk_signals)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_review_delivery_failed(pool: &PgPool, request_id: i64) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_status = 'retry_wait',
+            notification_next_attempt_at = now() + (
+                case notification_attempts
+                    when 1 then 15
+                    when 2 then 30
+                    when 3 then 60
+                    when 4 then 300
+                    else 86400
+                end * interval '1 second'
+            ),
+            notification_processing_started_at = null,
+            notification_lease_expires_at = null,
+            notification_error_kind = 'telegram_send_failed'
+        where id = $1 and status = 'pending' and notification_status = 'processing'
+        "#,
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
