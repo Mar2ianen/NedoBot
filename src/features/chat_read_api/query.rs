@@ -10,6 +10,7 @@ pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 const MAX_FILTERS: usize = 12;
 const MAX_COLUMNS: usize = 40;
+pub const MAX_ORDER_COLUMNS: usize = 8;
 const MAX_GROUPS: usize = 3;
 
 #[derive(Clone, Debug)]
@@ -93,17 +94,9 @@ pub async fn select(
     catalog: &PublicCatalog,
     request: SelectRequest,
 ) -> anyhow::Result<Page> {
-    ensure!(
-        request.filters.len() <= MAX_FILTERS && request.columns.len() <= MAX_COLUMNS,
-        "too many filters or columns"
-    );
+    validate_select(catalog, &request)?;
     let definition = table(catalog, &request.table)?;
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
-    ensure!(
-        (1..=MAX_LIMIT).contains(&limit),
-        "limit must be between 1 and {MAX_LIMIT}"
-    );
-    ensure!(request.offset >= 0, "offset must not be negative");
     let columns = if request.columns.is_empty() {
         definition.columns.keys().cloned().collect()
     } else {
@@ -147,7 +140,7 @@ pub async fn count(
     table_name: String,
     filters: Vec<Filter>,
 ) -> anyhow::Result<i64> {
-    ensure!(filters.len() <= MAX_FILTERS, "too many filters");
+    validate_count(catalog, &table_name, &filters)?;
     let definition = table(catalog, &table_name)?;
     let mut sql = format!("select count(*)::bigint as count from mcp_public.{table_name}");
     let mut binds = Vec::new();
@@ -161,10 +154,7 @@ pub async fn aggregate(
     catalog: &PublicCatalog,
     request: AggregateRequest,
 ) -> anyhow::Result<Vec<Value>> {
-    ensure!(
-        request.filters.len() <= MAX_FILTERS && request.group_by.len() <= MAX_GROUPS,
-        "too many filters or grouping columns"
-    );
+    validate_aggregate(catalog, &request)?;
     let definition = table(catalog, &request.table)?;
     let expression = match request.operation {
         Aggregate::Count => "count(*)".to_owned(),
@@ -225,6 +215,72 @@ pub async fn aggregate(
         .collect())
 }
 
+pub fn validate_select(catalog: &PublicCatalog, request: &SelectRequest) -> anyhow::Result<()> {
+    ensure!(
+        request.filters.len() <= MAX_FILTERS && request.columns.len() <= MAX_COLUMNS,
+        "too many filters or columns"
+    );
+    let definition = table(catalog, &request.table)?;
+    let limit = request.limit.unwrap_or(DEFAULT_LIMIT);
+    ensure!(
+        (1..=MAX_LIMIT).contains(&limit),
+        "limit must be between 1 and {MAX_LIMIT}"
+    );
+    ensure!(request.offset >= 0, "offset must not be negative");
+    for column_name in &request.columns {
+        column(definition, column_name)?;
+    }
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    append_filters(&mut sql, definition, &request.filters, &mut binds)?;
+    validate_order_columns(&request.order_by)?;
+    append_order(&mut sql, definition, &request.order_by)?;
+    Ok(())
+}
+
+pub fn validate_count(
+    catalog: &PublicCatalog,
+    table_name: &str,
+    filters: &[Filter],
+) -> anyhow::Result<()> {
+    ensure!(filters.len() <= MAX_FILTERS, "too many filters");
+    let definition = table(catalog, table_name)?;
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    append_filters(&mut sql, definition, filters, &mut binds)
+}
+
+pub fn validate_aggregate(
+    catalog: &PublicCatalog,
+    request: &AggregateRequest,
+) -> anyhow::Result<()> {
+    ensure!(
+        request.filters.len() <= MAX_FILTERS && request.group_by.len() <= MAX_GROUPS,
+        "too many filters or grouping columns"
+    );
+    let definition = table(catalog, &request.table)?;
+    match request.operation {
+        Aggregate::Count => {}
+        Aggregate::CountDistinct
+        | Aggregate::Min
+        | Aggregate::Max
+        | Aggregate::Sum
+        | Aggregate::Avg => {
+            let column_name = request
+                .column
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("aggregate column is required"))?;
+            column(definition, column_name)?;
+        }
+    }
+    for group in &request.group_by {
+        column(definition, group)?;
+    }
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    append_filters(&mut sql, definition, &request.filters, &mut binds)
+}
+
 fn table<'a>(catalog: &'a PublicCatalog, name: &str) -> anyhow::Result<&'a CatalogTable> {
     catalog
         .tables
@@ -244,17 +300,25 @@ fn quote(value: &str) -> String {
     format!("\"{value}\"")
 }
 
+fn validate_order_columns(order: &[OrderBy]) -> anyhow::Result<()> {
+    ensure!(
+        order.len() <= MAX_ORDER_COLUMNS,
+        "too many order columns (maximum is {MAX_ORDER_COLUMNS})"
+    );
+    Ok(())
+}
+
 fn append_order(
     sql: &mut String,
     definition: &CatalogTable,
     order: &[OrderBy],
 ) -> anyhow::Result<()> {
-    let values = if order.is_empty() {
+    let mut values = if order.is_empty() {
         definition
             .primary_key
             .iter()
-            .map(|name| Ok(quote(name)))
-            .collect::<anyhow::Result<Vec<_>>>()?
+            .map(|name| quote(name))
+            .collect()
     } else {
         order
             .iter()
@@ -271,6 +335,13 @@ fn append_order(
             })
             .collect::<anyhow::Result<Vec<_>>>()?
     };
+    if !order.is_empty() {
+        for key in &definition.primary_key {
+            if !order.iter().any(|item| item.column == *key) {
+                values.push(format!("{} asc", quote(key)));
+            }
+        }
+    }
     sql.push_str(" order by ");
     sql.push_str(&values.join(", "));
     Ok(())
@@ -460,6 +531,34 @@ fn bind_all<'a>(
     }
     query
 }
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    [
+        "token",
+        "bottoken",
+        "accesstoken",
+        "refreshtoken",
+        "apikey",
+        "secret",
+        "password",
+        "authorization",
+        "cookie",
+        "databaseurl",
+        "dsn",
+        "privatekey",
+        "clientsecret",
+        "webhooksecret",
+        "invitelink",
+        "signedurl",
+    ]
+    .iter()
+    .any(|name| normalized == name.as_bytes())
+}
+
 fn sanitize(value: Value) -> Value {
     match value {
         Value::Array(values) => Value::Array(values.into_iter().map(sanitize).collect()),
@@ -467,26 +566,7 @@ fn sanitize(value: Value) -> Value {
             values
                 .into_iter()
                 .map(|(key, value)| {
-                    let hidden = [
-                        "token",
-                        "access_token",
-                        "refresh_token",
-                        "api_key",
-                        "apikey",
-                        "secret",
-                        "password",
-                        "authorization",
-                        "cookie",
-                        "database_url",
-                        "dsn",
-                        "private_key",
-                        "client_secret",
-                        "webhook_secret",
-                        "invite_link",
-                        "signed_url",
-                    ]
-                    .iter()
-                    .any(|name| key.eq_ignore_ascii_case(name));
+                    let hidden = is_sensitive_key(&key);
                     (
                         key,
                         if hidden {
@@ -524,13 +604,91 @@ pub fn decode_cursor(cursor: Option<&str>) -> anyhow::Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::features::chat_read_api::catalog::{CatalogColumn, CatalogTable};
+
+    fn table(primary_key: &[&str]) -> CatalogTable {
+        let mut columns = BTreeMap::new();
+        for name in ["id", "created_at", "message_id"] {
+            columns.insert(
+                name.to_string(),
+                CatalogColumn {
+                    pg_type: "bigint".to_string(),
+                    nullable: false,
+                },
+            );
+        }
+        CatalogTable {
+            description: "test".to_string(),
+            primary_key: primary_key.iter().map(ToString::to_string).collect(),
+            approximate_rows: None,
+            columns,
+        }
+    }
+
     #[test]
     fn cursor_round_trip() {
         assert_eq!(decode_cursor(Some(&encode_cursor(42))).unwrap(), 42);
     }
+
     #[test]
     fn regex_literal_escapes_metacharacters() {
         assert_eq!(regex_literal("a+b"), "a\\+b");
+    }
+
+    #[test]
+    fn user_order_appends_missing_primary_key_columns() {
+        let mut sql = String::new();
+        append_order(
+            &mut sql,
+            &table(&["id", "message_id"]),
+            &[OrderBy {
+                column: "created_at".to_string(),
+                direction: OrderDirection::Desc,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            " order by \"created_at\" desc, \"id\" asc, \"message_id\" asc"
+        );
+    }
+
+    #[test]
+    fn user_order_does_not_repeat_primary_key_columns() {
+        let mut sql = String::new();
+        append_order(
+            &mut sql,
+            &table(&["id", "message_id"]),
+            &[OrderBy {
+                column: "id".to_string(),
+                direction: OrderDirection::Desc,
+            }],
+        )
+        .unwrap();
+        assert_eq!(sql, " order by \"id\" desc, \"message_id\" asc");
+    }
+
+    #[test]
+    fn caps_order_columns() {
+        let order = (0..=MAX_ORDER_COLUMNS)
+            .map(|_| OrderBy {
+                column: "id".to_string(),
+                direction: OrderDirection::Asc,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_order_columns(&order).is_err());
+    }
+
+    #[test]
+    fn sanitizer_normalizes_sensitive_key_separators_and_camel_case() {
+        for key in ["api-key", "bot_token", "clientSecret", "private-key"] {
+            assert!(is_sensitive_key(key), "{key} should be redacted");
+        }
+        for key in ["token_count", "secretary", "client_secret_name"] {
+            assert!(!is_sensitive_key(key), "{key} should remain visible");
+        }
     }
 }

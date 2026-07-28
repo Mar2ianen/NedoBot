@@ -173,22 +173,25 @@ fn filters(values: Vec<FilterInput>) -> Vec<query::Filter> {
 pub async fn select(api: &ChatReadApi, input: SelectInput) -> Result<Value, rmcp::ErrorData> {
     let offset = query::decode_cursor(input.cursor.as_deref())
         .map_err(|_| invalid_arguments("invalid cursor"))?;
+    let request = query::SelectRequest {
+        table: input.table,
+        columns: input.columns,
+        filters: filters(input.filters),
+        order_by: input
+            .order_by
+            .into_iter()
+            .map(|value| query::OrderBy {
+                column: value.column,
+                direction: value.direction.into(),
+            })
+            .collect(),
+        limit: input.limit,
+        offset,
+    };
+    query::validate_select(api.catalog(), &request)
+        .map_err(|err| invalid_arguments(err.to_string()))?;
     let page = api
-        .select_public(query::SelectRequest {
-            table: input.table,
-            columns: input.columns,
-            filters: filters(input.filters),
-            order_by: input
-                .order_by
-                .into_iter()
-                .map(|value| query::OrderBy {
-                    column: value.column,
-                    direction: value.direction.into(),
-                })
-                .collect(),
-            limit: input.limit,
-            offset,
-        })
+        .select_public(request)
         .await
         .map_err(|_| read_error("public select failed"))?;
     Ok(query::page_json(page))
@@ -209,45 +212,54 @@ pub async fn fetch_row(api: &ChatReadApi, input: FetchRowInput) -> Result<Value,
             "key must contain exactly the full primary key",
         ));
     }
+    let request = query::SelectRequest {
+        table: input.table,
+        columns: vec![],
+        filters: input
+            .key
+            .into_iter()
+            .map(|(column, value)| query::Filter {
+                column,
+                op: query::FilterOp::Eq,
+                value: Some(value),
+                values: vec![],
+                case_sensitive: false,
+            })
+            .collect(),
+        order_by: vec![],
+        limit: Some(1),
+        offset: 0,
+    };
+    query::validate_select(api.catalog(), &request)
+        .map_err(|err| invalid_arguments(err.to_string()))?;
     let page = api
-        .select_public(query::SelectRequest {
-            table: input.table,
-            columns: vec![],
-            filters: input
-                .key
-                .into_iter()
-                .map(|(column, value)| query::Filter {
-                    column,
-                    op: query::FilterOp::Eq,
-                    value: Some(value),
-                    values: vec![],
-                    case_sensitive: false,
-                })
-                .collect(),
-            order_by: vec![],
-            limit: Some(1),
-            offset: 0,
-        })
+        .select_public(request)
         .await
         .map_err(|_| read_error("public row lookup failed"))?;
     Ok(json!({"row": page.rows.into_iter().next()}))
 }
 pub async fn count(api: &ChatReadApi, input: CountInput) -> Result<Value, rmcp::ErrorData> {
+    let filters = filters(input.filters);
+    query::validate_count(api.catalog(), &input.table, &filters)
+        .map_err(|err| invalid_arguments(err.to_string()))?;
     let count = api
-        .count_public(input.table, filters(input.filters))
+        .count_public(input.table, filters)
         .await
         .map_err(|_| read_error("public count failed"))?;
     Ok(json!({"count": count}))
 }
 pub async fn aggregate(api: &ChatReadApi, input: AggregateInput) -> Result<Value, rmcp::ErrorData> {
+    let request = query::AggregateRequest {
+        table: input.table,
+        operation: input.operation.into(),
+        column: input.column,
+        group_by: input.group_by,
+        filters: filters(input.filters),
+    };
+    query::validate_aggregate(api.catalog(), &request)
+        .map_err(|err| invalid_arguments(err.to_string()))?;
     let rows = api
-        .aggregate_public(query::AggregateRequest {
-            table: input.table,
-            operation: input.operation.into(),
-            column: input.column,
-            group_by: input.group_by,
-            filters: filters(input.filters),
-        })
+        .aggregate_public(request)
         .await
         .map_err(|_| read_error("public aggregate failed"))?;
     Ok(json!({"rows": rows}))
