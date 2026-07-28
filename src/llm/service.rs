@@ -146,6 +146,7 @@ pub async fn generate_text_with_provider_checked(
                     return Ok(generation);
                 }
                 Err(err) => {
+                    let empty_response = is_empty_response(&err);
                     tracing::warn!(
                         %err,
                         fallback_index,
@@ -161,6 +162,13 @@ pub async fn generate_text_with_provider_checked(
                         outcome: classify_attempt_error(&err),
                     });
                     last_error = Some(err);
+                    if empty_response && attempt < VALIDATION_RETRY_ATTEMPTS {
+                        attempt_prompt = validation_retry_prompt(
+                            options.prompt,
+                            "модель вернула пустой ответ; верни полный ответ по исходному контракту",
+                        );
+                        continue;
+                    }
                     break;
                 }
             }
@@ -176,6 +184,7 @@ fn classify_attempt_error(error: &anyhow::Error) -> String {
         Some(LlmTransportError::HttpStatus(status)) if *status >= 500 => "http_5xx".to_string(),
         Some(LlmTransportError::HttpStatus(status)) => format!("http_{status}"),
         Some(LlmTransportError::Configuration) => "configuration".to_string(),
+        Some(LlmTransportError::EmptyResponse) => "empty_response".to_string(),
         None if error
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout) =>
@@ -184,6 +193,13 @@ fn classify_attempt_error(error: &anyhow::Error) -> String {
         }
         None => "error".to_string(),
     }
+}
+
+fn is_empty_response(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<LlmTransportError>(),
+        Some(LlmTransportError::EmptyResponse)
+    )
 }
 
 fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
@@ -563,6 +579,13 @@ mod tests {
                 model: "gemini-3.6-flash",
             }]
         );
+    }
+
+    #[test]
+    fn classifies_typed_empty_responses_for_retry() {
+        let empty = anyhow::Error::new(LlmTransportError::empty_response());
+        assert!(is_empty_response(&empty));
+        assert_eq!(classify_attempt_error(&empty), "empty_response");
     }
 
     #[test]
