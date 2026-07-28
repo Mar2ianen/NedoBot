@@ -6,7 +6,7 @@
 
 Rust-бот для Telegram-чата `НедоNews Chat`. Первый комментарий под постом канала, память контекста, статистика, расшифровка голосовых.
 
-- **Стек**: Rust 2024 edition, teloxide 0.13, sqlx 0.8 (PostgreSQL), reqwest 0.12
+- **Стек**: Rust 2024 edition, teloxide 0.13 (параллельно готовится отдельный fork/upgrade для Bot API 10.2), sqlx 0.8 (PostgreSQL), reqwest 0.12
 - **LLM-провайдеры**: Gemini (основной), Groq, Cerebras, OpenRouter, Ollama, OpenAI-compatible
 - **ASR**: Groq Whisper
 - **Бот**: `@nedostraj_bot`, чат `-1001932061163`, канал `-1001575496091`
@@ -22,8 +22,8 @@ src/text.rs                          — normalize_ai_markers, strip_links, firs
 src/db/mod.rs                        — build_pool, migrate
 src/db/telegram.rs                    — CRUD: сообщения, пользователи, реакции, member events
 src/telegram/commands.rs             — enum Command (BotCommands derive)
-src/telegram/command_handler.rs      — dispatch команд, /userstats reply detection
-src/telegram/render.rs               — send_html, send_rich_html (Bot API 10.1), escape_html
+src/telegram/command_handler.rs      — dispatch команд и Telegram-adapter для /ask
+src/telegram/render.rs               — send_html, Rich Message helpers, escape_html
 src/telegram/html.rs                 — Html builder (text/bold/code/link/custom_emoji/expandable_blockquote)
 src/telegram/entities.rs             — forwarded_channel_post, message_text, custom_emoji_ids, message_has_links
 src/telegram/custom_emoji.rs         — /emojiids diagnostic command
@@ -53,12 +53,21 @@ src/features/voice/render.rs            — plain text / chapters / preview+file
 src/features/voice/types.rs             — VoiceMedia, AsrTranscript, CleanTranscript, TranscriptChapter
 src/features/voice/repo.rs              — voice_transcription_jobs CRUD
 src/features/user_profiles/service.rs   — refresh_profile: get_chat, get_user_profile_photos, getUserPersonalChatMessages
+src/features/user_profiles/enrichment.rs — bounded queue: profile refresh → audit → spam/review/avatar jobs
 src/features/new_user_analysis.rs       — new user audit: features, risk scoring, spam classification
+src/features/first_message_spam.rs      — optional LLM-анализ первого сообщения нового пользователя
+src/features/avatar_analysis/           — очередь и классификация аватаров
+src/features/spam_review.rs             — idempotent review-карточки для новых пользователей
+src/features/ask/                       — /ask agent, audit и RMCP child client
+src/features/chat_read_api/             — transport-agnostic public read-model и manifest catalog
+src/mcp/                                — ChatMcpServer и RMCP stdio/Streamable HTTP adapters
 src/bin/import_telegram_export.rs       — CLI: импорт Telegram Desktop export
 src/bin/refresh_chat_members.rs         — CLI: refresh member snapshots
 src/bin/refresh_user_profiles.rs        — CLI: batch profile refresh
 src/bin/retry_pending_comments.rs      — CLI: retry failed comment jobs
 src/bin/analyze_new_users.rs            — CLI: batch new user analysis
+src/bin/chat_db_mcp.rs                  — internal RMCP stdio server для /ask
+src/bin/nedonews_mcp_http.rs             — public RMCP Streamable HTTP server
 prompts/first_comment.md                — system prompt для первого комментария
 prompts/tech_rag.md                     — ручной техно-RAG (release notes, version facts)
 prompts/voice_cleanup.md                — system prompt для cleanup ASR transcript
@@ -78,6 +87,9 @@ migrations/                            — sqlx compile-time миграции
 | `/emojiids` | Показать custom_emoji_id из сообщения |
 | `/format_test <text>` | Тест рендера первого комментария |
 | `/memory` | Последние заметки памяти |
+| `/ask <вопрос>` | Агентный поиск по истории чата и публичному read-model |
+| `/chat_note <текст>` | Добавить общую заметку чата |
+| `/user_note <текст>` | Добавить заметку о пользователе reply |
 | `/stats_day [-r\|-p]` | Статистика дня (05:00 МСК) |
 | `/stats_week [-r\|-p]` | Статистика недели |
 | `/stats_month [-r\|-p]` | Статистика месяца |
@@ -91,11 +103,11 @@ migrations/                            — sqlx compile-time миграции
 
 ## Конфигурация
 
-Все через `.env`. Шаблон: `.env.example`. Валидация секретов на старте в `Config::validate_runtime_secrets`.
+Все через локальный `.env`, он не коммитится. Полный перечень переменных и безопасные примеры приведены в `docs/TECHNICAL.md`; валидация секретов выполняется на старте в `Config::validate_runtime_secrets`.
 
 **LLM routing**: `LLM_PROVIDER` определяет основной провайдер. Модель через `LLM_MODEL` или provider-specific переменную (`GROQ_MODEL`, `CEREBRAS_MODEL`, и т.д.). Для Gemini: fallback chain → flash-lite → ollama. Для других провайдеров — без fallback (fail-fast на старте, если модель не задана).
 
-**Thinking budget**: Gemini `GEMINI_THINKING_BUDGET` добавляется к `LLM_MAX_TOKENS` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
+**Thinking budget**: для Gemini 3.x бот использует `thinkingLevel=low` и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `GEMINI_THINKING_BUDGET` добавляется к `LLM_MAX_TOKENS` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
 
 **Proxy**: `LLM_PROXY_URL` — SOCKS5/HTTP proxy только для LLM запросов, не для Telegram polling.
 
@@ -124,7 +136,7 @@ migrations/                            — sqlx compile-time миграции
 - Токен в URL для raw API calls (`getUserPersonalChatMessages`, `sendRichMessage`) — ок, но не логировать URL при ошибках.
 
 ### Telegram Bot API 10.1
-- `sendRichMessage` / `InputRichMessage` — реализовано, но `#[allow(dead_code)]`, не используется в production.
+- `sendRichMessage` / `InputRichMessage` используются в production для rich stats, `/ask` и длинных расшифровок голосовых; при ошибке доступен безопасный HTML/file fallback.
 - `getUserPersonalChatMessages` — используется в profile refresh (Bot API 10.1, June 11, 2026).
 - `chatFullInfo` поля (`emoji_status_custom_emoji_id`, `profile_accent_color_id`) — используются.
 
@@ -173,7 +185,7 @@ Test fixtures: каждая тестовая модуль определяет `
 
 ## Деплой
 
-VPS `vps-153`, systemd service `tg-ai-bot-teloxide`, Postgres в Podman `tg-ai-bot-postgres`. См. `docs/LOCAL_WORKFLOW.md` для команд.
+VPS `vps-153`, systemd service `tg-ai-bot-teloxide`, Postgres в Podman `tg-ai-bot-postgres`. Проверенные общие команды и ограничения деплоя описаны в `docs/TECHNICAL.md`; `docs/LOCAL_WORKFLOW.md` остаётся локальным, некоммитящимся файлом для machine-specific заметок.
 
 ## Стиль кода
 
@@ -216,7 +228,7 @@ VPS `vps-153`, systemd service `tg-ai-bot-teloxide`, Postgres в Podman `tg-ai-b
 
 #### MCP и публичные данные
 - **Не реализовывать вручную JSON-RPC/MCP transport, protocol structs и lifecycle** для новых MCP путей. Использовать `rmcp`; stdio и Streamable HTTP должны быть transport adapters над общим read-model слоем.
-- `rmcp` tools не получают произвольный SQL. Public и agent-only пути обязаны использовать разные allowlisted DTO/projections и явный scope.
+- `rmcp` tools не получают произвольный SQL. Internal stdio и public HTTP используют один намеренно публичный allowlisted read-model и явный scope; возможная отдельная agent memory должна оставаться самостоятельным backend/tool set и не публиковаться через HTTP автоматически.
 - Public MCP view с сообщениями должен фильтровать по `chat_id = discussion_chat_id`; одного `source_channel_id` недостаточно. Нельзя публиковать private/foreign-chat rows, raw Telegram JSON, file IDs, invite links и секреты.
 - Для public endpoint обязательны мягкие anti-spam limits (`limit_req`/`limit_conn` в Nginx либо эквивалентный rate limiter), body/timeout limits и безопасное логирование без request body.
 
@@ -271,7 +283,7 @@ docs: update TECHNICAL.md with voice pipeline details
 - Перед коммитом: `cargo fmt && cargo test`.
 - Если меняем промпт — отдельный коммит с описанием что и почему.
 - Если меняем SQL-миграцию — отдельный коммит. Проверить backward compatibility.
-- Если меняем Config (новые поля) — обновить struct + from_env + все test fixtures + .env.example.
+- Если меняем Config (новые поля) — обновить struct + from_env + все test fixtures + техническую документацию и tracked config template, если он добавлен в репозиторий.
 - Commit message тело (если нужно): описать контекст, мотивацию, что пробовалось. Не dump diff.
 
 ## Bot API 10.1 — локальные изменения
@@ -292,7 +304,7 @@ Body: { "user_id": i64, "limit": 5 }
 - Ошибки: `USER_PERSONAL_CHANNEL_MISSING` — канал отсутствует, считается definitive
 
 ### sendRichMessage
-**Где:** `src/telegram/render.rs:44-212` (`#[allow(dead_code)]` — не используется в production)
+**Где:** `src/telegram/render.rs`
 
 ```
 POST https://api.telegram.org/bot{token}/sendRichMessage
@@ -304,7 +316,7 @@ Rich Messages — структурированный текст до 32 KB с в
 - `send_rich_html()`, `send_rich_html_reply()`
 - `normalize_rich_text()` с лимитом 32 768 символов
 
-Задел для будущих rich-отчётов статистики.
+Используется в production для rich-отчётов статистики, `/ask` и длинных расшифровок голосовых. Если Rich API недоступен или ответ не проходит его лимит, вызывающий pipeline использует безопасный fallback.
 
 ### chatFullInfo поля
 **Где:** `src/features/user_profiles/service.rs:185-187`
@@ -329,7 +341,7 @@ teloxide оборачивает эти поля из `ChatFullInfo` (Bot API 10.
 1. **Не коммитить `.env`**, токены, экспорты Telegram, дампы БД.
 2. **Изменять промпты аккуратно** — они определяют поведение бота в проде. Правка промпта = redeploy.
 3. **SQL-миграции**: новый файл в `migrations/` с timestamp prefix. После добавления — `touch src/db/mod.rs` для sqlx recompile.
-4. **Новые Config-поля**: добавить в struct, `from_env()`, все test `fn config()`, `.env.example`, docs.
+4. **Новые Config-поля**: добавить в struct, `from_env()`, все test `fn config()`, документацию и tracked config template, если он существует.
 5. **Новые команды**: enum `Command` в `commands.rs` + handler в `command_handler.rs` + обновить README и TECHNICAL.
 6. **Новые LLM-провайдеры**: реализовать `LlmClient` trait, добавить в `generate_once` match + `model_for_provider` + `validate_llm_provider_secret`.
 7. **Не ломать backward compatibility**: бот работает в проде, старые записи в БД. Миграции только additive.

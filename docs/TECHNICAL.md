@@ -57,7 +57,7 @@ curl "https://api.telegram.org/bot$TELOXIDE_TOKEN/getMe"
 
 ## Конфиг
 
-Локальный `.env` не коммитится. Шаблон лежит в [.env.example](../.env.example).
+Локальный `.env` не коммитится. Безопасные примеры и полный перечень переменных приведены в этом разделе; секреты задаются только в локальном окружении или в защищённом server-side environment file.
 
 Основные переменные:
 
@@ -141,6 +141,12 @@ OPENAI_COMPAT_MODEL=
 
 OWNER_TELEGRAM_ID=
 SEND_OWNER_PREVIEW=true
+ASK_ENABLED=false
+ASK_MAX_STEPS=7
+ASK_ACTION_TIMEOUT_SEC=45
+ASK_TOTAL_TIMEOUT_SEC=180
+ASK_MAX_CONCURRENCY=1
+ASK_DB_MCP_TIMEOUT_SEC=8
 PROFILE_REFRESH_CONCURRENCY=4
 ```
 
@@ -166,6 +172,8 @@ deploy hook перезагружает контейнерный Nginx после
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
+
+`/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает одну генерацию действия LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Значения `0` запрещены. Старый `ASK_TIMEOUT_SEC` временно поддерживается только как совместимый alias для action timeout, пока production environment files переезжают на явное имя.
 
 ### Поиск фактов для первого комментария
 
