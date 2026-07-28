@@ -26,6 +26,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
@@ -72,6 +73,28 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
     assert_eq!(
         public_messages_view.as_deref(),
         Some("mcp_public.telegram_messages")
+    );
+}
+
+async fn assert_sent_comment_requires_sent_at(pool: &PgPool) {
+    let error = query(
+        r#"
+        insert into post_comment_jobs
+            (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
+             cleaned_post_text, status)
+        values
+            (-1001932061163, 990001, -1001575496091, 990001, 'invalid sent comment', 'sent')
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect_err("sent comment without sent_at must violate the database constraint");
+
+    assert!(
+        error.as_database_error().is_some_and(|database_error| {
+            database_error.constraint() == Some("post_comment_jobs_sent_requires_sent_at")
+        }),
+        "sent comment must fail the sent_at constraint: {error}"
     );
 }
 
