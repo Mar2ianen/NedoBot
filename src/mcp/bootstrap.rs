@@ -22,9 +22,17 @@ pub struct RmcpStdioConfig {
 impl RmcpStdioConfig {
     /// Reads every child-process setting explicitly; this binary never loads `.env`.
     pub fn from_env() -> anyhow::Result<Self> {
+        Self::new(
+            required_env(DATABASE_URL_ENV)?,
+            required_env(MANIFEST_PATH_ENV)?,
+        )
+    }
+
+    /// Creates shared RMCP bootstrap settings after validating both required values.
+    pub fn new(database_url: String, manifest_path: String) -> anyhow::Result<Self> {
         Ok(Self {
-            database_url: required_env(DATABASE_URL_ENV)?,
-            manifest_path: required_env(MANIFEST_PATH_ENV)?,
+            database_url: required_value(DATABASE_URL_ENV, database_url)?,
+            manifest_path: required_value(MANIFEST_PATH_ENV, manifest_path)?,
         })
     }
 }

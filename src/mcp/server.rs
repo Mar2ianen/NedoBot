@@ -19,6 +19,7 @@ use super::tools::{catalog, chat, db, semantic};
 ///
 /// The server has no database handle of its own: every data operation is
 /// delegated to `ChatReadApi`, which owns scope enforcement and read policy.
+#[derive(Clone)]
 pub struct ChatMcpServer {
     api: Arc<ChatReadApi>,
 }
