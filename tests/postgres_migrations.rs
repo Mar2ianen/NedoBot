@@ -9,12 +9,18 @@ use tg_ai_bot_teloxide::features::{
         },
         service::apply_avatar_risk_signal,
     },
-    chat_retrieval::enqueue_message_embedding_if_enabled,
+    chat_retrieval::{
+        EmbeddingJob, enqueue_message_embedding_if_enabled, mark_embedding_failed,
+        mark_embedding_ready,
+    },
     first_comment::repo::{
-        CommentErrorKind, CreatePostCommentJobParams, claim_next_post_comment_job,
-        create_post_comment_job, mark_post_comment_failed, mark_post_comment_sent,
+        CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
+        begin_post_comment_delivery, claim_next_post_comment_job, create_post_comment_job,
+        finalize_post_comment_sent, mark_post_comment_delivery_unknown,
+        mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
+    jobs::claim::CasResult,
     spam_review::{claim_next_review_delivery, create_review, mark_review_delivery_succeeded},
     stats::{
         render_html, render_rich, repo as stats_repo,
@@ -43,6 +49,131 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_avatar_job_finalization_requires_current_claim(&pool).await;
+    assert_embedding_job_finalization_requires_current_claim(&pool).await;
+}
+
+async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const STALE_MESSAGE_ID: i32 = 9_300_001;
+    const RETRY_MESSAGE_ID: i32 = 9_300_002;
+    const FAILED_MESSAGE_ID: i32 = 9_300_003;
+    const TEXT: &str = "embedding finalization CAS";
+
+    for message_id in [STALE_MESSAGE_ID, RETRY_MESSAGE_ID, FAILED_MESSAGE_ID] {
+        query("insert into telegram_messages (chat_id, message_id, text) values ($1, $2, $3)")
+            .bind(CHAT_ID)
+            .bind(message_id)
+            .bind(TEXT)
+            .execute(pool)
+            .await
+            .expect("embedding source message must be inserted");
+    }
+    query(
+        "insert into telegram_message_embeddings (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', 2, now(), now() + interval '10 minutes')",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_MESSAGE_ID)
+    .execute(pool)
+    .await
+    .expect("reclaimed embedding job must be inserted");
+
+    let stale_claim = EmbeddingJob {
+        chat_id: CHAT_ID,
+        message_id: STALE_MESSAGE_ID,
+        text: TEXT.to_string(),
+        attempts: 1,
+    };
+    assert_eq!(
+        mark_embedding_ready(pool, &stale_claim, &vec![0.0; 312], "test-model")
+            .await
+            .expect("stale ready finalization must execute"),
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
+    );
+    assert_eq!(
+        mark_embedding_failed(pool, &stale_claim, "test_failure")
+            .await
+            .expect("stale failure finalization must execute"),
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
+    );
+    let reclaimed_state: (String, i32, bool, bool) = query_as(
+        "select status, attempts, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("reclaimed embedding job must remain stored");
+    assert_eq!(reclaimed_state, ("processing".to_string(), 2, true, true));
+
+    let current_claim = EmbeddingJob {
+        attempts: 2,
+        ..stale_claim
+    };
+    assert_eq!(
+        mark_embedding_ready(pool, &current_claim, &vec![0.0; 312], "test-model")
+            .await
+            .expect("current ready finalization must execute"),
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
+    );
+    let ready_state: (String, bool, bool) = query_as(
+        "select status, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("ready embedding job must remain stored");
+    assert_eq!(ready_state, ("ready".to_string(), false, false));
+
+    assert_embedding_failure_clears_claim(pool, CHAT_ID, RETRY_MESSAGE_ID, 1, "retry_wait").await;
+    assert_embedding_failure_clears_claim(pool, CHAT_ID, FAILED_MESSAGE_ID, 5, "failed").await;
+}
+
+async fn assert_embedding_failure_clears_claim(
+    pool: &PgPool,
+    chat_id: i64,
+    message_id: i32,
+    attempts: i32,
+    expected_status: &str,
+) {
+    query(
+        "insert into telegram_message_embeddings (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', $3, now(), now() + interval '10 minutes')",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .bind(attempts)
+    .execute(pool)
+    .await
+    .expect("processing embedding job must be inserted");
+    let job = EmbeddingJob {
+        chat_id,
+        message_id,
+        text: "embedding finalization CAS".to_string(),
+        attempts,
+    };
+    assert_eq!(
+        mark_embedding_failed(pool, &job, "test_failure")
+            .await
+            .expect("current failure finalization must execute"),
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
+    );
+    let state: (String, Option<String>, bool, bool) = query_as(
+        "select status, error_kind, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings where chat_id = $1 and message_id = $2",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .expect("failed embedding job must remain stored");
+    assert_eq!(
+        state,
+        (
+            expected_status.to_string(),
+            Some("test_failure".to_string()),
+            false,
+            false
+        )
+    );
 }
 
 async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
@@ -826,17 +957,12 @@ async fn assert_review_deduplication(pool: &PgPool) {
 }
 
 async fn assert_comment_job_lifecycle(pool: &PgPool) {
-    let retry_job_id = create_job(pool, 1).await;
-    let retry_job = claim_next_post_comment_job(pool)
-        .await
-        .expect("claim must succeed")
-        .expect("pending job must be claimed");
-    assert_eq!(retry_job.id, retry_job_id);
-    assert_eq!(retry_job.attempts, 1);
-    assert!(
-        mark_post_comment_failed(pool, &retry_job, CommentErrorKind::Transient)
+    let retry_job = claim_created_job(pool, 1).await;
+    assert_eq!(
+        mark_post_comment_pre_send_failed(pool, &retry_job, CommentErrorKind::Transient)
             .await
-            .expect("transient failure update must succeed")
+            .expect("pre-send failure must execute"),
+        CasResult::Applied
     );
     assert_job_state(pool, retry_job.id, "retry_wait", Some("transient"), true).await;
 
@@ -845,93 +971,200 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         .await
         .expect("second claim must succeed")
         .expect("retry job must be claimable");
-    assert_eq!(retry_job.attempts, 2);
-    assert!(
-        mark_post_comment_failed(pool, &retry_job, CommentErrorKind::RateLimited)
+    assert_eq!(
+        mark_post_comment_pre_send_failed(pool, &retry_job, CommentErrorKind::RateLimited)
             .await
-            .expect("rate limit failure update must succeed")
+            .expect("rate limit failure must execute"),
+        CasResult::Applied
     );
     assert_job_state(pool, retry_job.id, "retry_wait", Some("rate_limited"), true).await;
 
-    make_ready_for_retry(pool, retry_job.id).await;
-    let retry_job = claim_next_post_comment_job(pool)
+    let stale_job = claim_created_job(pool, 2).await;
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(stale_job.id)
+    .execute(pool)
+    .await
+    .expect("processing lease must expire");
+    let current_job = claim_next_post_comment_job(pool)
         .await
-        .expect("third claim must succeed")
-        .expect("second retry job must be claimable");
-    assert_eq!(retry_job.attempts, 3);
-    assert!(
-        mark_post_comment_failed(pool, &retry_job, CommentErrorKind::Transient)
+        .expect("reclaim must succeed")
+        .expect("expired processing job must be reclaimed");
+    assert_eq!(current_job.id, stale_job.id);
+    assert_eq!(
+        begin_post_comment_delivery(pool, &stale_job)
             .await
-            .expect("terminal transient failure update must succeed")
+            .expect("stale delivery transition must execute"),
+        CasResult::LeaseLost
     );
-    assert_job_state(pool, retry_job.id, "failed", Some("transient"), false).await;
-
-    let configuration_job_id = create_job(pool, 2).await;
-    let configuration_job = claim_next_post_comment_job(pool)
-        .await
-        .expect("configuration claim must succeed")
-        .expect("configuration job must be claimable");
-    assert_eq!(configuration_job.id, configuration_job_id);
-    assert!(
-        mark_post_comment_failed(pool, &configuration_job, CommentErrorKind::Configuration)
+    assert_eq!(
+        mark_post_comment_pre_send_failed(pool, &stale_job, CommentErrorKind::Transient)
             .await
-            .expect("configuration failure update must succeed")
+            .expect("stale pre-send finalizer must execute"),
+        CasResult::LeaseLost
+    );
+    assert_eq!(
+        begin_post_comment_delivery(pool, &current_job)
+            .await
+            .expect("current delivery transition must execute"),
+        CasResult::Applied
+    );
+    assert_eq!(
+        finalize_test_comment(pool, &stale_job, 9001).await,
+        CasResult::LeaseLost,
+        "stale claim cannot finalize the newer delivery attempt"
+    );
+    let sending_state: (String, bool, bool) = query_as(
+        "select status, sending_started_at is not null, lease_expires_at > now() from post_comment_jobs where id = $1",
+    )
+    .bind(current_job.id)
+    .fetch_one(pool)
+    .await
+    .expect("sending job state must exist");
+    assert_eq!(sending_state, ("sending".into(), true, true));
+
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(current_job.id)
+    .execute(pool)
+    .await
+    .expect("sending lease must expire");
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("claim after expired send must execute")
+            .is_none(),
+        "expired sending must become delivery_unknown rather than be reclaimed"
     );
     assert_job_state(
         pool,
-        configuration_job.id,
-        "failed",
-        Some("configuration"),
+        current_job.id,
+        "delivery_unknown",
+        Some("delivery_unknown"),
         false,
     )
     .await;
 
-    let lease_job_id = create_job(pool, 3).await;
-    let stale_job = claim_next_post_comment_job(pool)
+    let rejected_job = claim_created_job(pool, 3).await;
+    assert_eq!(
+        begin_post_comment_delivery(pool, &rejected_job)
+            .await
+            .unwrap(),
+        CasResult::Applied
+    );
+    assert_eq!(
+        mark_post_comment_send_rejected(
+            pool,
+            &rejected_job,
+            CommentErrorKind::RateLimited,
+            Some(120),
+        )
         .await
-        .expect("lease claim must succeed")
-        .expect("lease job must be claimable");
-    assert_eq!(stale_job.id, lease_job_id);
-    query(
-        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+        .expect("confirmed rejection must execute"),
+        CasResult::Applied
+    );
+    let rejection_state: (String, bool) = query_as(
+        "select status, next_attempt_at >= now() + interval '119 seconds' from post_comment_jobs where id = $1",
     )
-    .bind(lease_job_id)
-    .execute(pool)
+    .bind(rejected_job.id)
+    .fetch_one(pool)
     .await
-    .expect("lease expiry setup must succeed");
+    .expect("retry-after state must exist");
+    assert_eq!(rejection_state, ("retry_wait".into(), true));
 
-    let reclaimed_job = claim_next_post_comment_job(pool)
+    let unknown_job = claim_created_job(pool, 4).await;
+    assert_eq!(
+        begin_post_comment_delivery(pool, &unknown_job)
+            .await
+            .unwrap(),
+        CasResult::Applied
+    );
+    assert_eq!(
+        mark_post_comment_delivery_unknown(pool, &unknown_job)
+            .await
+            .expect("ambiguous delivery finalizer must execute"),
+        CasResult::Applied
+    );
+    assert_job_state(
+        pool,
+        unknown_job.id,
+        "delivery_unknown",
+        Some("delivery_unknown"),
+        false,
+    )
+    .await;
+
+    let sent_job = claim_created_job(pool, 5).await;
+    assert_eq!(
+        begin_post_comment_delivery(pool, &sent_job).await.unwrap(),
+        CasResult::Applied
+    );
+    assert_eq!(
+        finalize_test_comment(pool, &sent_job, 9002).await,
+        CasResult::Applied
+    );
+    let final_counts: (String, Option<i32>, i64, i64) = query_as(
+        "select j.status, j.bot_comment_message_id, (select count(*) from llm_generations where post_comment_job_id = j.id), (select count(*) from post_history_entries where post_comment_job_id = j.id) from post_comment_jobs j where j.id = $1",
+    )
+    .bind(sent_job.id)
+    .fetch_one(pool)
+    .await
+    .expect("sent transaction effects must exist");
+    assert_eq!(final_counts, ("sent".into(), Some(9002), 1, 1));
+    assert_eq!(
+        finalize_test_comment(pool, &sent_job, 9003).await,
+        CasResult::LeaseLost,
+        "a completed send cannot be finalized twice"
+    );
+}
+
+async fn claim_created_job(
+    pool: &PgPool,
+    sequence: i32,
+) -> tg_ai_bot_teloxide::features::first_comment::repo::PostCommentJob {
+    let id = create_job(pool, sequence).await;
+    let job = claim_next_post_comment_job(pool)
         .await
-        .expect("expired lease claim must succeed")
-        .expect("expired lease job must be reclaimed");
-    assert_eq!(reclaimed_job.id, stale_job.id);
-    assert_eq!(reclaimed_job.attempts, stale_job.attempts + 1);
-    assert!(
-        !mark_post_comment_sent(pool, &stale_job, 9001)
-            .await
-            .expect("stale finalization query must succeed")
-    );
-    assert!(
-        !mark_post_comment_failed(pool, &stale_job, CommentErrorKind::Transient)
-            .await
-            .expect("stale failure query must succeed")
-    );
-    assert!(
-        mark_post_comment_sent(pool, &reclaimed_job, 9002)
-            .await
-            .expect("current worker finalization query must succeed")
-    );
-    assert_job_state(pool, reclaimed_job.id, "sent", None, false).await;
-    let sent_at: Option<chrono::DateTime<Utc>> =
-        query_scalar("select sent_at from post_comment_jobs where id = $1")
-            .bind(reclaimed_job.id)
-            .fetch_one(pool)
-            .await
-            .expect("sent job timestamp query must succeed");
-    assert!(
-        sent_at.is_some(),
-        "sending a claimed job must atomically set sent_at"
-    );
+        .expect("claim must succeed")
+        .expect("created job must be claimable");
+    assert_eq!(job.id, id);
+    job
+}
+
+async fn finalize_test_comment(
+    pool: &PgPool,
+    job: &tg_ai_bot_teloxide::features::first_comment::repo::PostCommentJob,
+    message_id: i32,
+) -> CasResult {
+    let attempts = serde_json::json!([]);
+    finalize_post_comment_sent(
+        pool,
+        job,
+        FinalizePostCommentSent {
+            bot_comment_message_id: message_id,
+            generation: LlmGenerationInsert {
+                job_id: job.id,
+                provider: "test",
+                model: "test",
+                prompt: "test prompt",
+                image_used: false,
+                response: "test comment",
+                final_html: "test comment",
+                attempts: &attempts,
+                used_search_result_id: None,
+                used_chat_message_ids: &[],
+            },
+            history_used_search_result: None,
+            source_channel_id: job.source_channel_id,
+            source_message_id: job.source_message_id,
+            cleaned_post_text: &job.cleaned_post_text,
+            bot_comment: "test comment",
+        },
+    )
+    .await
+    .expect("confirmed send finalization must execute")
 }
 
 async fn create_job(pool: &PgPool, sequence: i32) -> i64 {

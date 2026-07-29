@@ -4,6 +4,7 @@ use serde::Serialize;
 use sqlx::{PgPool, Row};
 
 use crate::config::Config;
+use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_text_batch, pgvector_literal};
 use crate::features::search::types::ResearchPlan;
 
@@ -332,11 +333,11 @@ fn transliterate_latin(value: &str) -> String {
 }
 
 #[derive(Debug)]
-struct EmbeddingJob {
-    chat_id: i64,
-    message_id: i32,
-    text: String,
-    attempts: i32,
+pub struct EmbeddingJob {
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub text: String,
+    pub attempts: i32,
 }
 
 pub async fn enqueue_message_embedding_if_enabled(
@@ -433,10 +434,26 @@ pub async fn process_next_embedding_batch(pool: &PgPool, config: &Config) -> any
 
     let texts = jobs.iter().map(|job| job.text.as_str()).collect::<Vec<_>>();
     match embed_text_batch(config, &texts).await {
-        Ok(embeddings) => {
+        Ok(embeddings) if embedding_batch_matches_claimed_jobs(&jobs, &embeddings) => {
             for (job, embedding) in jobs.iter().zip(embeddings) {
-                mark_embedding_ready(pool, job, &embedding, &config.rag_embedding_model).await?;
+                if mark_embedding_ready(pool, job, &embedding, &config.rag_embedding_model).await?
+                    == CasResult::LeaseLost
+                {
+                    tracing::debug!(
+                        chat_id = job.chat_id,
+                        message_id = job.message_id,
+                        "chat retrieval embedding ready finalization lost lease"
+                    );
+                }
             }
+        }
+        Ok(embeddings) => {
+            tracing::warn!(
+                claimed_jobs = jobs.len(),
+                returned_embeddings = embeddings.len(),
+                "chat retrieval embedding batch cardinality mismatch"
+            );
+            finalize_embedding_failures(pool, &jobs, "embedding_batch_cardinality").await?;
         }
         Err(err) => {
             let error_kind = if err.to_string().contains("429") {
@@ -444,9 +461,7 @@ pub async fn process_next_embedding_batch(pool: &PgPool, config: &Config) -> any
             } else {
                 "embedding_failed"
             };
-            for job in &jobs {
-                mark_embedding_failed(pool, job, error_kind).await?;
-            }
+            finalize_embedding_failures(pool, &jobs, error_kind).await?;
             tracing::warn!(%err, jobs = jobs.len(), "chat retrieval embedding batch failed");
         }
     }
@@ -566,14 +581,35 @@ async fn claim_embedding_jobs_matching(
         .collect())
 }
 
-async fn mark_embedding_ready(
+fn embedding_batch_matches_claimed_jobs(jobs: &[EmbeddingJob], embeddings: &[Vec<f32>]) -> bool {
+    jobs.len() == embeddings.len()
+}
+
+async fn finalize_embedding_failures(
+    pool: &PgPool,
+    jobs: &[EmbeddingJob],
+    error_kind: &str,
+) -> anyhow::Result<()> {
+    for job in jobs {
+        if mark_embedding_failed(pool, job, error_kind).await? == CasResult::LeaseLost {
+            tracing::debug!(
+                chat_id = job.chat_id,
+                message_id = job.message_id,
+                "chat retrieval embedding failure finalization lost lease"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn mark_embedding_ready(
     pool: &PgPool,
     job: &EmbeddingJob,
     embedding: &[f32],
     model: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CasResult> {
     let embedding = pgvector_literal(embedding)?;
-    sqlx::query(
+    let update = sqlx::query(
         r#"
         update telegram_message_embeddings e
         set embedding = case when m.text = $3 then $4::vector else null end,
@@ -581,10 +617,11 @@ async fn mark_embedding_ready(
             status = case when m.text = $3 then 'ready' else 'pending' end,
             error_kind = null,
             next_attempt_at = case when m.text = $3 then e.next_attempt_at else now() end,
+            processing_started_at = null,
             lease_expires_at = null,
             updated_at = now()
         from telegram_messages m
-        where e.chat_id = $1 and e.message_id = $2 and e.status = 'processing'
+        where e.chat_id = $1 and e.message_id = $2 and e.attempts = $6 and e.status = 'processing'
           and m.chat_id = e.chat_id and m.message_id = e.message_id
         "#,
     )
@@ -593,26 +630,28 @@ async fn mark_embedding_ready(
     .bind(&job.text)
     .bind(embedding)
     .bind(model)
+    .bind(job.attempts)
     .execute(pool)
     .await?;
-    Ok(())
+    CasResult::from_rows_affected(update.rows_affected())
 }
 
-async fn mark_embedding_failed(
+pub async fn mark_embedding_failed(
     pool: &PgPool,
     job: &EmbeddingJob,
     error_kind: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CasResult> {
     let (status, delay) = retry_after(job.attempts)
         .map(|delay| ("retry_wait", delay))
         .unwrap_or(("failed", 0));
-    sqlx::query(
+    let update = sqlx::query(
         r#"
         update telegram_message_embeddings
         set status = $3, error_kind = $4,
             next_attempt_at = now() + ($5 * interval '1 second'),
+            processing_started_at = null,
             lease_expires_at = null, updated_at = now()
-        where chat_id = $1 and message_id = $2 and status = 'processing'
+        where chat_id = $1 and message_id = $2 and attempts = $6 and status = 'processing'
         "#,
     )
     .bind(job.chat_id)
@@ -620,9 +659,10 @@ async fn mark_embedding_failed(
     .bind(status)
     .bind(error_kind)
     .bind(delay)
+    .bind(job.attempts)
     .execute(pool)
     .await?;
-    Ok(())
+    CasResult::from_rows_affected(update.rows_affected())
 }
 
 fn retry_after(attempts: i32) -> Option<i64> {
@@ -632,10 +672,39 @@ fn retry_after(attempts: i32) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BROAD_LITERAL_SCORE, PRECISE_LITERAL_SCORE, geometric_freshness, literal_match_score,
+        BROAD_LITERAL_SCORE, EmbeddingJob, PRECISE_LITERAL_SCORE,
+        embedding_batch_matches_claimed_jobs, geometric_freshness, literal_match_score,
         literal_variants, retry_after, select_diverse_candidates,
     };
     use crate::features::chat_retrieval::RetrievalCandidate;
+
+    #[test]
+    fn embedding_batch_cardinality_must_match_claimed_jobs() {
+        let jobs = vec![
+            EmbeddingJob {
+                chat_id: 1,
+                message_id: 1,
+                text: "one".to_string(),
+                attempts: 1,
+            },
+            EmbeddingJob {
+                chat_id: 1,
+                message_id: 2,
+                text: "two".to_string(),
+                attempts: 1,
+            },
+        ];
+
+        assert!(embedding_batch_matches_claimed_jobs(
+            &jobs,
+            &[vec![0.0], vec![0.0]]
+        ));
+        assert!(!embedding_batch_matches_claimed_jobs(&jobs, &[vec![0.0]]));
+        assert!(!embedding_batch_matches_claimed_jobs(
+            &jobs,
+            &[vec![0.0], vec![0.0], vec![0.0]]
+        ));
+    }
 
     #[test]
     fn retries_are_bounded_and_increase_geometrically() {

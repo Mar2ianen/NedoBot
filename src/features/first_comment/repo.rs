@@ -1,11 +1,13 @@
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use teloxide::RequestError;
 
 use crate::features::first_comment::render::ChatLinkTarget;
+use crate::features::jobs::claim::CasResult;
 use crate::llm::types::LlmTransportError;
 use crate::text::{normalize_ai_markers, strip_links};
 
-const COMMENT_JOB_LEASE_SECONDS: i64 = 10 * 60;
+const POST_COMMENT_PROCESSING_LEASE_SECONDS: i64 = 10 * 60;
+const POST_COMMENT_DELIVERY_LEASE_SECONDS: i64 = 60;
 const MAX_COMMENT_JOB_ATTEMPTS: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,10 +38,9 @@ impl CommentErrorKind {
         }
     }
 
-    pub fn from_telegram_error(error: &RequestError) -> Self {
+    fn from_telegram_api_error(error: &teloxide::ApiError) -> Self {
         match error {
-            RequestError::RetryAfter(_) => Self::RateLimited,
-            RequestError::Api(teloxide::ApiError::InvalidToken) => Self::Configuration,
+            teloxide::ApiError::InvalidToken => Self::Configuration,
             _ => Self::Transient,
         }
     }
@@ -56,6 +57,35 @@ impl CommentErrorKind {
 
     fn is_retryable(self) -> bool {
         !matches!(self, Self::Configuration | Self::InvalidInput)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailure {
+    Confirmed {
+        error_kind: CommentErrorKind,
+        retry_after_seconds: Option<i64>,
+    },
+    DeliveryUnknown,
+}
+
+pub fn classify_send_error(error: &RequestError) -> SendFailure {
+    match error {
+        RequestError::RetryAfter(seconds) => SendFailure::Confirmed {
+            error_kind: CommentErrorKind::RateLimited,
+            retry_after_seconds: Some(i64::from(seconds.seconds())),
+        },
+        RequestError::Api(error) => SendFailure::Confirmed {
+            error_kind: CommentErrorKind::from_telegram_api_error(error),
+            retry_after_seconds: None,
+        },
+        RequestError::MigrateToChatId(_) => SendFailure::Confirmed {
+            error_kind: CommentErrorKind::Transient,
+            retry_after_seconds: None,
+        },
+        RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_) => {
+            SendFailure::DeliveryUnknown
+        }
     }
 }
 
@@ -82,6 +112,16 @@ pub struct LlmGenerationInsert<'a> {
     pub attempts: &'a serde_json::Value,
     pub used_search_result_id: Option<i32>,
     pub used_chat_message_ids: &'a [i32],
+}
+
+pub struct FinalizePostCommentSent<'a> {
+    pub bot_comment_message_id: i32,
+    pub generation: LlmGenerationInsert<'a>,
+    pub history_used_search_result: Option<&'a serde_json::Value>,
+    pub source_channel_id: i64,
+    pub source_message_id: i32,
+    pub cleaned_post_text: &'a str,
+    pub bot_comment: &'a str,
 }
 
 pub struct CreatePostCommentJobParams<'a> {
@@ -124,7 +164,14 @@ pub async fn create_post_comment_job(
 pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option<PostCommentJob>> {
     let row = sqlx::query_as::<_, (i64, i64, i32, i64, i32, String, Option<String>, i32)>(
         r#"
-        with candidate as (
+        with expired_sends as (
+            update post_comment_jobs
+            set status = 'delivery_unknown',
+                error_kind = 'delivery_unknown',
+                lease_expires_at = null,
+                updated_at = now()
+            where status = 'sending' and lease_expires_at <= now()
+        ), candidate as (
             select id
             from post_comment_jobs
             where (status in ('pending', 'retry_wait') and next_attempt_at <= now())
@@ -137,6 +184,7 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
         set status = 'processing',
             attempts = job.attempts + 1,
             processing_started_at = now(),
+            sending_started_at = null,
             lease_expires_at = now() + ($1 * interval '1 second'),
             updated_at = now()
         from candidate
@@ -146,7 +194,7 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
                   job.image_file_id, job.attempts
         "#,
     )
-    .bind(COMMENT_JOB_LEASE_SECONDS)
+    .bind(POST_COMMENT_PROCESSING_LEASE_SECONDS)
     .fetch_optional(pool)
     .await?;
 
@@ -173,84 +221,157 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
     ))
 }
 
-pub async fn mark_post_comment_sent(
+pub async fn begin_post_comment_delivery(
     pool: &PgPool,
     job: &PostCommentJob,
-    bot_comment_message_id: i32,
-) -> anyhow::Result<bool> {
-    sqlx::query(
+) -> anyhow::Result<CasResult> {
+    let result = sqlx::query(
         r#"
         update post_comment_jobs
-        set status = 'sent', bot_comment_message_id = $2, sent_at = now(),
-            error_kind = null, lease_expires_at = null, updated_at = now()
-        where id = $1 and status = 'processing' and attempts = $3
+        set status = 'sending',
+            sending_started_at = now(),
+            lease_expires_at = now() + ($3 * interval '1 second'),
+            updated_at = now()
+        where id = $1 and status = 'processing' and attempts = $2
+          and lease_expires_at > now()
         "#,
     )
     .bind(job.id)
-    .bind(bot_comment_message_id)
     .bind(job.attempts)
+    .bind(POST_COMMENT_DELIVERY_LEASE_SECONDS)
     .execute(pool)
-    .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(Into::into)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
 }
 
-pub async fn mark_post_comment_failed(
+pub async fn mark_post_comment_pre_send_failed(
     pool: &PgPool,
     job: &PostCommentJob,
     error_kind: CommentErrorKind,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<CasResult> {
+    mark_post_comment_failed(pool, job, "processing", error_kind, None).await
+}
+
+pub async fn mark_post_comment_send_rejected(
+    pool: &PgPool,
+    job: &PostCommentJob,
+    error_kind: CommentErrorKind,
+    retry_after_seconds: Option<i64>,
+) -> anyhow::Result<CasResult> {
+    mark_post_comment_failed(pool, job, "sending", error_kind, retry_after_seconds).await
+}
+
+async fn mark_post_comment_failed(
+    pool: &PgPool,
+    job: &PostCommentJob,
+    expected_status: &str,
+    error_kind: CommentErrorKind,
+    retry_after_seconds: Option<i64>,
+) -> anyhow::Result<CasResult> {
     let retry_delay_seconds = error_kind
         .is_retryable()
-        .then(|| retry_delay_seconds(job.attempts))
+        .then(|| retry_delay_seconds(job.attempts, retry_after_seconds))
         .flatten();
     let (status, delay_seconds) = match retry_delay_seconds {
         Some(delay_seconds) => ("retry_wait", delay_seconds),
         None => ("failed", 0),
     };
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         update post_comment_jobs
-        set status = $3,
-            error_kind = $4,
-            next_attempt_at = now() + ($5 * interval '1 second'),
+        set status = $4,
+            error_kind = $5,
+            next_attempt_at = now() + ($6 * interval '1 second'),
             lease_expires_at = null,
             updated_at = now()
-        where id = $1 and status = 'processing' and attempts = $2
+        where id = $1 and attempts = $2 and status = $3
         "#,
     )
     .bind(job.id)
     .bind(job.attempts)
+    .bind(expected_status)
     .bind(status)
     .bind(error_kind.as_str())
     .bind(delay_seconds)
     .execute(pool)
-    .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(Into::into)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
 }
 
-fn retry_delay_seconds(attempts: i32) -> Option<i64> {
-    if attempts >= MAX_COMMENT_JOB_ATTEMPTS {
-        return None;
-    }
-
-    match attempts {
-        1 => Some(15),
-        2 => Some(60),
-        _ => None,
-    }
-}
-
-pub async fn insert_llm_generation(
+pub async fn mark_post_comment_delivery_unknown(
     pool: &PgPool,
-    generation: LlmGenerationInsert<'_>,
+    job: &PostCommentJob,
+) -> anyhow::Result<CasResult> {
+    let result = sqlx::query(
+        r#"
+        update post_comment_jobs
+        set status = 'delivery_unknown',
+            error_kind = 'delivery_unknown',
+            lease_expires_at = null,
+            updated_at = now()
+        where id = $1 and status = 'sending' and attempts = $2
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.attempts)
+    .execute(pool)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
+}
+
+pub async fn finalize_post_comment_sent(
+    pool: &PgPool,
+    job: &PostCommentJob,
+    completed: FinalizePostCommentSent<'_>,
+) -> anyhow::Result<CasResult> {
+    // History persistence must share this transaction with the delivery CAS.
+    // Keep the established pool-based helper linked for non-transactional callers.
+    let _legacy_enqueue = crate::features::memory::service::enqueue_post_history;
+    let mut transaction = pool.begin().await?;
+    let result =
+        finalize_post_comment_sent_in_transaction(&mut transaction, job, &completed).await?;
+    if result == CasResult::LeaseLost {
+        transaction.rollback().await?;
+        return Ok(result);
+    }
+
+    insert_llm_generation_in_transaction(&mut transaction, &completed.generation).await?;
+    enqueue_post_history_in_transaction(&mut transaction, &completed).await?;
+    transaction.commit().await?;
+    Ok(CasResult::Applied)
+}
+
+async fn finalize_post_comment_sent_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    job: &PostCommentJob,
+    completed: &FinalizePostCommentSent<'_>,
+) -> anyhow::Result<CasResult> {
+    let result = sqlx::query(
+        r#"
+        update post_comment_jobs
+        set status = 'sent', bot_comment_message_id = $2, sent_at = now(),
+            error_kind = null, lease_expires_at = null, updated_at = now()
+        where id = $1 and status = 'sending' and attempts = $3
+        "#,
+    )
+    .bind(job.id)
+    .bind(completed.bot_comment_message_id)
+    .bind(job.attempts)
+    .execute(&mut **transaction)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
+}
+
+async fn insert_llm_generation_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    generation: &LlmGenerationInsert<'_>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         insert into llm_generations
             (post_comment_job_id, provider, model, prompt, image_used, response, final_html, attempts, used_search_result_id, used_chat_message_ids)
         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        on conflict (post_comment_job_id) where post_comment_job_id is not null do nothing
         "#,
     )
     .bind(generation.job_id)
@@ -263,10 +384,45 @@ pub async fn insert_llm_generation(
     .bind(generation.attempts)
     .bind(generation.used_search_result_id)
     .bind(generation.used_chat_message_ids)
-    .execute(pool)
+    .execute(&mut **transaction)
     .await?;
-
     Ok(())
+}
+
+async fn enqueue_post_history_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    completed: &FinalizePostCommentSent<'_>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into post_history_entries
+            (post_comment_job_id, source_channel_id, source_message_id, post_text,
+             bot_comment, used_search_result)
+        values ($1, $2, $3, $4, $5, $6)
+        on conflict (source_channel_id, source_message_id) do nothing
+        "#,
+    )
+    .bind(completed.generation.job_id)
+    .bind(completed.source_channel_id)
+    .bind(completed.source_message_id)
+    .bind(completed.cleaned_post_text)
+    .bind(completed.bot_comment)
+    .bind(completed.history_used_search_result)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn retry_delay_seconds(attempts: i32, minimum_delay_seconds: Option<i64>) -> Option<i64> {
+    if attempts >= MAX_COMMENT_JOB_ATTEMPTS {
+        return None;
+    }
+    let delay = match attempts {
+        1 => 15,
+        2 => 60,
+        _ => return None,
+    };
+    Some(delay.max(minimum_delay_seconds.unwrap_or_default()))
 }
 
 pub async fn load_recent_bot_comments(pool: &PgPool) -> anyhow::Result<Vec<String>> {
@@ -334,9 +490,15 @@ mod tests {
 
     #[test]
     fn comment_job_retries_are_bounded() {
-        assert_eq!(retry_delay_seconds(1), Some(15));
-        assert_eq!(retry_delay_seconds(2), Some(60));
-        assert_eq!(retry_delay_seconds(3), None);
+        assert_eq!(retry_delay_seconds(1, None), Some(15));
+        assert_eq!(retry_delay_seconds(2, None), Some(60));
+        assert_eq!(retry_delay_seconds(3, None), None);
+    }
+
+    #[test]
+    fn retry_after_is_a_lower_bound_for_comment_retry_delay() {
+        assert_eq!(retry_delay_seconds(1, Some(30)), Some(30));
+        assert_eq!(retry_delay_seconds(2, Some(30)), Some(60));
     }
 
     #[test]
