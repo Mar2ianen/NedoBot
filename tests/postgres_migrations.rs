@@ -34,6 +34,10 @@ use tg_ai_bot_teloxide::features::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
     },
+    new_user_audit::repo::{
+        claim_next_new_user_audit_job, enqueue_new_user_audit_job, mark_new_user_audit_failed,
+        mark_new_user_audit_retry, mark_new_user_audit_succeeded,
+    },
     spam_review::{
         claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
     },
@@ -62,6 +66,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
+    assert_new_user_audit_job_lifecycle(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
@@ -713,6 +718,91 @@ async fn assert_low_risk_review_delivery_is_blocked_by_database(pool: &PgPool) {
             .contains("spam_review_requests_low_risk_delivery_forbidden"),
         "unexpected database error: {error}"
     );
+}
+
+async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_098;
+    let input = serde_json::json!({"schema_version": "fixture-v1"});
+
+    enqueue_new_user_audit_job(pool, CHAT_ID, USER_ID, "snapshot-a", "prompt-v1", &input)
+        .await
+        .expect("new audit job enqueue must succeed");
+    enqueue_new_user_audit_job(pool, CHAT_ID, USER_ID, "snapshot-a", "prompt-v1", &input)
+        .await
+        .expect("identical audit job enqueue must be idempotent");
+
+    let count: i64 = query_scalar(
+        "select count(*) from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("audit job dedup count must be queryable");
+    assert_eq!(count, 1);
+
+    let first_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("first audit claim must execute")
+        .expect("audit job must be claimed");
+    query("update new_user_audit_jobs set lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(first_claim.id)
+        .execute(pool)
+        .await
+        .expect("audit lease must expire");
+
+    let second_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("reclaimed audit claim must execute")
+        .expect("expired audit job must be reclaimed");
+    assert!(second_claim.attempts > first_claim.attempts);
+    assert_eq!(
+        mark_new_user_audit_succeeded(pool, &first_claim)
+            .await
+            .expect("stale audit finalizer must execute"),
+        CasResult::LeaseLost
+    );
+    assert_eq!(
+        mark_new_user_audit_retry(pool, &second_claim, "fixture_retry", None)
+            .await
+            .expect("current audit retry finalizer must execute"),
+        CasResult::Applied
+    );
+
+    let retry_state: (String, i32) =
+        query_as("select status, attempts from new_user_audit_jobs where id = $1")
+            .bind(second_claim.id)
+            .fetch_one(pool)
+            .await
+            .expect("audit retry state must be stored");
+    assert_eq!(
+        retry_state,
+        ("retry_wait".to_string(), second_claim.attempts)
+    );
+
+    query("update new_user_audit_jobs set next_attempt_at = now() where id = $1")
+        .bind(second_claim.id)
+        .execute(pool)
+        .await
+        .expect("audit retry must be made due");
+    let final_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("final audit claim must execute")
+        .expect("audit retry must be claimed");
+    assert_eq!(
+        mark_new_user_audit_failed(pool, &final_claim, "fixture_terminal")
+            .await
+            .expect("terminal audit finalizer must execute"),
+        CasResult::Applied
+    );
+    let terminal_status: String =
+        query_scalar("select status from new_user_audit_jobs where id = $1")
+            .bind(final_claim.id)
+            .fetch_one(pool)
+            .await
+            .expect("terminal audit status must be stored");
+    assert_eq!(terminal_status, "failed");
 }
 
 async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {
