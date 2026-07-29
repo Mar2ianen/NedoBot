@@ -713,9 +713,9 @@ async fn assert_low_risk_review_delivery_is_blocked_by_database(pool: &PgPool) {
     .await
     .expect_err("database must reject a low-risk delivery claim");
     assert!(
-        error
-            .to_string()
-            .contains("spam_review_requests_low_risk_delivery_forbidden"),
+        error.to_string().contains(
+            "cannot transition spam review request into processing with risk_score below 70"
+        ),
         "unexpected database error: {error}"
     );
 }
