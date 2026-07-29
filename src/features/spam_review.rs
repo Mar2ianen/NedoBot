@@ -111,6 +111,8 @@ async fn claim_review_delivery(
         update spam_review_requests request
         set notification_status = 'processing',
             notification_attempts = request.notification_attempts + 1,
+            notification_lease_reclaim_count = request.notification_lease_reclaim_count
+                + case when request.notification_status = 'processing' then 1 else 0 end,
             notification_processing_started_at = now(),
             notification_lease_expires_at = now() + ($2 * interval '1 second'),
             notification_error_kind = null

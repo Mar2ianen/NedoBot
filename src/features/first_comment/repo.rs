@@ -217,6 +217,8 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
         update post_comment_jobs job
         set status = 'processing',
             attempts = job.attempts + 1,
+            lease_reclaim_count = job.lease_reclaim_count
+                + case when job.status = 'processing' then 1 else 0 end,
             processing_started_at = now(),
             sending_started_at = null,
             lease_expires_at = now() + ($1 * interval '1 second'),
@@ -486,21 +488,45 @@ pub async fn mark_operator_retry_post_comment_terminal_failed(
     job: &PostCommentJob,
     error_kind: CommentErrorKind,
 ) -> anyhow::Result<CasResult> {
-    let result = sqlx::query(
+    let mut transaction = pool.begin().await?;
+    let previous_status = sqlx::query_scalar::<_, String>(
         r#"
-        update post_comment_jobs
+        with claimed as materialized (
+            select id, status
+            from post_comment_jobs
+            where id = $1 and status in ('processing', 'sending') and attempts = $2
+              and operator_retry_only
+            for update
+        )
+        update post_comment_jobs job
         set status = 'failed', error_kind = $3, processing_started_at = null,
-            sending_started_at = null, lease_expires_at = null, updated_at = now()
-        where id = $1 and status in ('processing', 'sending') and attempts = $2
-          and operator_retry_only
+            sending_started_at = null, lease_expires_at = null, operator_retry_only = false,
+            updated_at = now()
+        from claimed
+        where job.id = claimed.id
+        returning claimed.status
         "#,
     )
     .bind(job.id)
     .bind(job.attempts)
     .bind(error_kind.as_str())
-    .execute(pool)
+    .fetch_optional(&mut *transaction)
     .await?;
-    CasResult::from_rows_affected(result.rows_affected())
+    let Some(previous_status) = previous_status else {
+        transaction.rollback().await?;
+        return Ok(CasResult::LeaseLost);
+    };
+
+    insert_operator_retry_outcome_audit(
+        &mut transaction,
+        job.id,
+        &previous_status,
+        "failed",
+        Some(error_kind.as_str()),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(CasResult::Applied)
 }
 
 // Reached through the reconciliation-only public transitions above.
@@ -520,6 +546,33 @@ async fn insert_operator_audit(
     .bind(previous_status).bind(resulting_status)
     .execute(&mut **transaction).await?;
     Ok(())
+}
+
+async fn insert_operator_retry_outcome_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+    previous_status: &str,
+    resulting_status: &str,
+    error_kind: Option<&str>,
+) -> anyhow::Result<()> {
+    let reason = match error_kind {
+        Some(error_kind) => format!("operator retry outcome: {resulting_status} ({error_kind})"),
+        None => format!("operator retry outcome: {resulting_status}"),
+    };
+    // The committed audit CHECK permits only `retry` for this operator-driven lifecycle.
+    let audit = OperatorAuditParams {
+        actor: "operator-retry",
+        reason: &reason,
+    };
+    insert_operator_audit(
+        transaction,
+        job_id,
+        "retry",
+        previous_status,
+        resulting_status,
+        &audit,
+    )
+    .await
 }
 
 // Reached through the reconciliation-only public transitions above.
@@ -615,6 +668,7 @@ pub async fn mark_post_comment_delivery_unknown(
     pool: &PgPool,
     job: &PostCommentJob,
 ) -> anyhow::Result<CasResult> {
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         r#"
         update post_comment_jobs
@@ -627,9 +681,24 @@ pub async fn mark_post_comment_delivery_unknown(
     )
     .bind(job.id)
     .bind(job.attempts)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
-    CasResult::from_rows_affected(result.rows_affected())
+    if result.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(CasResult::LeaseLost);
+    }
+    if job.operator_retry_only {
+        insert_operator_retry_outcome_audit(
+            &mut transaction,
+            job.id,
+            "sending",
+            "delivery_unknown",
+            None,
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(CasResult::Applied)
 }
 
 pub async fn finalize_post_comment_sent(
@@ -650,6 +719,10 @@ pub async fn finalize_post_comment_sent(
 
     insert_llm_generation_in_transaction(&mut transaction, &completed.generation).await?;
     enqueue_post_history_in_transaction(&mut transaction, &completed).await?;
+    if job.operator_retry_only {
+        insert_operator_retry_outcome_audit(&mut transaction, job.id, "sending", "sent", None)
+            .await?;
+    }
     transaction.commit().await?;
     Ok(CasResult::Applied)
 }
@@ -663,7 +736,8 @@ async fn finalize_post_comment_sent_in_transaction(
         r#"
         update post_comment_jobs
         set status = 'sent', bot_comment_message_id = $2, sent_at = now(),
-            error_kind = null, lease_expires_at = null, updated_at = now()
+            error_kind = null, lease_expires_at = null, operator_retry_only = false,
+            updated_at = now()
         where id = $1 and status = 'sending' and attempts = $3
         "#,
     )

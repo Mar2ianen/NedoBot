@@ -542,6 +542,8 @@ async fn claim_embedding_jobs_matching(
                                 and m.deleted_by_bot_at is null
                                 and m.spam_marked_at is null
                             then e.attempts + 1 else e.attempts end,
+            lease_reclaim_count = e.lease_reclaim_count
+                + case when e.status = 'processing' then 1 else 0 end,
             processing_started_at = case when nullif(trim(m.text), '') is not null
                                          and m.user_id is not null
                                          and coalesce(p.is_bot, false) = false
