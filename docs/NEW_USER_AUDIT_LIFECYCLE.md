@@ -57,11 +57,12 @@ final_score = clamp(baseline_score + first_message_delta + avatar_delta, 0, 100)
 ## Rollout без потери jobs
 
 1. Добавить additive `new_user_audit_jobs` с `chat_id`, `telegram_user_id`, state, attempts, lease, snapshot hash и typed stage states.
-2. Добавить worker и integration tests, но оставить его в shadow mode: он не меняет authoritative score и не создаёт review.
-3. Перенести pending/retry legacy first-message jobs в новую per-chat очередь; старые rows отметить `migrated`, чтобы исключить dual claim.
-4. Для avatar jobs создать per-chat jobs только для существующих audit rows; global image cache по `profile_photo_file_unique_id + prompt_version` остаётся reusable. Legacy avatar jobs без chat audit остаются в legacy drain.
-5. После сверки score/results переключить producer после profile refresh на один unified enqueue.
-6. Только затем убрать старые workers и старые call sites отдельным change.
+2. Добавить worker и integration tests, но оставить его в shadow mode: он не меняет authoritative score и не создаёт review. Producer enqueue'ит unified job параллельно с legacy pipeline; legacy остаётся authoritative.
+3. Сверить shadow results со score и решениями legacy pipeline.
+4. Реализовать final transaction unified pipeline: materialize score/signals и upsert review request без Telegram delivery.
+5. Только после этого переключить producer после profile refresh на один unified enqueue и отдельно убрать старые workers/call sites.
+
+Пока не выполнен пункт 4, `NEW_USER_AUDIT_ENABLED=true` означает именно shadow mode и не отключает `FIRST_MESSAGE_SPAM_ENABLED` или `AVATAR_CLASSIFIER_ENABLED`.
 
 Legacy `processing` rows не reclaim-ятся новым worker-ом до истечения старой lease или controlled drain.
 

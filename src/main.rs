@@ -66,10 +66,11 @@ async fn main() -> anyhow::Result<()> {
         state.config.clone(),
     );
     if state.config.new_user_audit_enabled {
+        // До финального cutover unified worker только собирает shadow assessments.
         spawn_new_user_audit_worker(state.clone());
-    } else {
-        spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
     }
+    // Legacy avatar worker остаётся authoritative в shadow-режиме unified audit.
+    spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
     // Delivery review-карточек не зависит от optional first-message analysis.
     spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
     spawn_post_comment_worker(bot.clone(), state.clone());

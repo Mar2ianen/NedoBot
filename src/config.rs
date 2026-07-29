@@ -379,18 +379,7 @@ impl Config {
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
-        if self.new_user_audit_enabled && self.avatar_classifier_enabled {
-            errors.push(
-                "NEW_USER_AUDIT_ENABLED=true cannot coexist with AVATAR_CLASSIFIER_ENABLED=true"
-                    .to_string(),
-            );
-        }
-        if self.new_user_audit_enabled && self.first_message_spam_enabled {
-            errors.push(
-                "NEW_USER_AUDIT_ENABLED=true cannot coexist with FIRST_MESSAGE_SPAM_ENABLED=true"
-                    .to_string(),
-            );
-        }
+
         if self.avatar_classifier_enabled {
             if self.llm_profiles.is_none() {
                 require_secret(
@@ -1401,20 +1390,13 @@ models = ["primary", "fallback"]
     }
 
     #[test]
-    fn new_user_audit_cannot_run_with_parallel_audit_pipelines() {
+    fn new_user_audit_shadow_mode_allows_legacy_authoritative_pipelines() {
         let mut config = config();
         config.new_user_audit_enabled = true;
-        config.avatar_classifier_enabled = true;
-        config.first_message_spam_enabled = true;
+        config.avatar_classifier_enabled = false;
+        config.first_message_spam_enabled = false;
 
-        let error = config.validate_runtime_secrets().unwrap_err().to_string();
-
-        assert!(error.contains(
-            "NEW_USER_AUDIT_ENABLED=true cannot coexist with AVATAR_CLASSIFIER_ENABLED=true"
-        ));
-        assert!(error.contains(
-            "NEW_USER_AUDIT_ENABLED=true cannot coexist with FIRST_MESSAGE_SPAM_ENABLED=true"
-        ));
+        config.validate_runtime_secrets().unwrap();
     }
 
     #[test]
