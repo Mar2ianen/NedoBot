@@ -19,6 +19,7 @@ pub struct SpamReview {
     pub first_message_id: Option<i32>,
     pub notification_message_id: Option<i32>,
     pub notification_attempts: i32,
+    pub notification_consecutive_failures: i32,
     pub risk_score: i32,
     pub risk_signals: Value,
     pub text: String,
@@ -40,7 +41,7 @@ pub async fn create_review(
             risk_signals = excluded.risk_signals,
             notification_status = case
                 when spam_review_requests.status = 'pending'
-                 and spam_review_requests.notification_status <> 'processing'
+                 and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
                  and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
                      is distinct from (excluded.risk_score, excluded.risk_signals)
                     then 'retry_wait'
@@ -48,7 +49,7 @@ pub async fn create_review(
             end,
             notification_next_attempt_at = case
                 when spam_review_requests.status = 'pending'
-                 and spam_review_requests.notification_status <> 'processing'
+                 and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
                  and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
                      is distinct from (excluded.risk_score, excluded.risk_signals)
                     then now()
@@ -56,11 +57,19 @@ pub async fn create_review(
             end,
             notification_error_kind = case
                 when spam_review_requests.status = 'pending'
-                 and spam_review_requests.notification_status <> 'processing'
+                 and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
                  and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
                      is distinct from (excluded.risk_score, excluded.risk_signals)
                     then null
                 else spam_review_requests.notification_error_kind
+            end,
+            notification_consecutive_failures = case
+                when spam_review_requests.status = 'pending'
+                 and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
+                 and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                     is distinct from (excluded.risk_score, excluded.risk_signals)
+                    then 0
+                else spam_review_requests.notification_consecutive_failures
             end
         returning id
         "#,
@@ -109,7 +118,7 @@ async fn claim_review_delivery(
         where request.id = candidate.id
         returning request.id, request.chat_id, request.telegram_user_id,
                   request.risk_score, request.risk_signals, request.notification_message_id,
-                  request.notification_attempts
+                  request.notification_attempts, request.notification_consecutive_failures
         "#,
     )
     .bind(request_id)
@@ -128,6 +137,7 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
     let signals: Value = row.get("risk_signals");
     let notification_message_id: Option<i32> = row.get("notification_message_id");
     let notification_attempts: i32 = row.get("notification_attempts");
+    let notification_consecutive_failures: i32 = row.get("notification_consecutive_failures");
     let profile = sqlx::query(r#"
         select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
@@ -154,6 +164,7 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
         first_message_id: profile.get("first_message_id"),
         notification_message_id,
         notification_attempts,
+        notification_consecutive_failures,
         risk_score: score,
         risk_signals: signals,
         text,
@@ -266,7 +277,8 @@ pub async fn mark_review_delivery_succeeded(
             end,
             notification_processing_started_at = null,
             notification_lease_expires_at = null,
-            notification_error_kind = null
+            notification_error_kind = null,
+            notification_consecutive_failures = 0
         where id = $1
           and notification_attempts = $5
           and status = 'pending'
@@ -285,15 +297,17 @@ pub async fn mark_review_delivery_succeeded(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryFailure {
-    Retryable,
+    Retryable { retry_after_seconds: Option<i64> },
     ReplaceMessage,
     Terminal(&'static str),
     AlreadyApplied,
 }
 
 fn classify_delivery_error(error: &teloxide::RequestError) -> DeliveryFailure {
-    if matches!(error, teloxide::RequestError::RetryAfter(_)) {
-        return DeliveryFailure::Retryable;
+    if let teloxide::RequestError::RetryAfter(seconds) = error {
+        return DeliveryFailure::Retryable {
+            retry_after_seconds: Some(i64::from(seconds.seconds())),
+        };
     }
     if matches!(
         error,
@@ -312,7 +326,9 @@ fn classify_delivery_error(error: &teloxide::RequestError) -> DeliveryFailure {
     } else if message.contains("forbidden") || message.contains("chat not found") {
         DeliveryFailure::Terminal("telegram_forbidden")
     } else {
-        DeliveryFailure::Retryable
+        DeliveryFailure::Retryable {
+            retry_after_seconds: None,
+        }
     }
 }
 
@@ -321,17 +337,30 @@ async fn mark_review_delivery_failed(
     review: &SpamReview,
     failure: DeliveryFailure,
 ) -> anyhow::Result<CasResult> {
-    let (status, error_kind, clear_message_id, delay_seconds) = match failure {
-        DeliveryFailure::Retryable => {
-            match ANALYSIS_RETRY.delay_seconds(review.notification_attempts, None) {
-                Some(delay) => ("retry_wait", "telegram_send_failed", false, Some(delay)),
-                None => ("failed", "telegram_retry_exhausted", false, None),
-            }
-        }
-        DeliveryFailure::ReplaceMessage => {
-            ("retry_wait", "telegram_message_missing", true, Some(0))
-        }
-        DeliveryFailure::Terminal(kind) => ("failed", kind, false, None),
+    let (status, error_kind, clear_message_id, delay_seconds, increment_failures) = match failure {
+        DeliveryFailure::Retryable {
+            retry_after_seconds,
+        } => match ANALYSIS_RETRY.delay_seconds(
+            review.notification_consecutive_failures + 1,
+            retry_after_seconds,
+        ) {
+            Some(delay) => (
+                "retry_wait",
+                "telegram_send_failed",
+                false,
+                Some(delay),
+                true,
+            ),
+            None => ("failed", "telegram_retry_exhausted", false, None, true),
+        },
+        DeliveryFailure::ReplaceMessage => (
+            "retry_wait",
+            "telegram_message_missing",
+            true,
+            Some(0),
+            false,
+        ),
+        DeliveryFailure::Terminal(kind) => ("failed", kind, false, None, false),
         DeliveryFailure::AlreadyApplied => {
             anyhow::bail!("already-applied delivery must be finalized as success")
         }
@@ -344,9 +373,10 @@ async fn mark_review_delivery_failed(
             notification_message_id = case when $4 then null else notification_message_id end,
             notification_processing_started_at = null,
             notification_lease_expires_at = null,
-            notification_error_kind = $5
+            notification_error_kind = $5,
+            notification_consecutive_failures = notification_consecutive_failures + case when $6 then 1 else 0 end
         where id = $1
-          and notification_attempts = $6
+          and notification_attempts = $7
           and status = 'pending'
           and notification_status = 'processing'
         "#,
@@ -356,6 +386,7 @@ async fn mark_review_delivery_failed(
     .bind(delay_seconds)
     .bind(clear_message_id)
     .bind(error_kind)
+    .bind(increment_failures)
     .bind(review.notification_attempts)
     .execute(pool)
     .await?;
@@ -487,6 +518,19 @@ mod tests {
         assert_eq!(parse_callback("spam_review:42:spam"), Some((42, "spam")));
         assert_eq!(parse_callback("spam_review:42:spam:x"), None);
     }
+    #[test]
+    fn keeps_telegram_retry_after_for_delivery_delay() {
+        let failure = classify_delivery_error(&teloxide::RequestError::RetryAfter(
+            teloxide::types::Seconds::from_seconds(75),
+        ));
+        assert_eq!(
+            failure,
+            DeliveryFailure::Retryable {
+                retry_after_seconds: Some(75)
+            }
+        );
+    }
+
     #[test]
     fn renders_human_signal() {
         assert_eq!(

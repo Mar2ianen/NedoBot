@@ -32,6 +32,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
@@ -39,8 +40,73 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
+    assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_avatar_job_finalization_requires_current_claim(&pool).await;
+}
+
+async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const HISTORICAL_USER_ID: i64 = 9_000_010;
+    const CURRENT_USER_ID: i64 = 9_000_011;
+    let lifecycle_installed_on: chrono::DateTime<Utc> =
+        query_scalar("select installed_on from _sqlx_migrations where version = 20260729100000")
+            .fetch_one(pool)
+            .await
+            .expect("lifecycle migration timestamp must exist");
+    for (user_id, notified_at) in [
+        (
+            HISTORICAL_USER_ID,
+            lifecycle_installed_on - Duration::seconds(1),
+        ),
+        (
+            CURRENT_USER_ID,
+            lifecycle_installed_on + Duration::seconds(1),
+        ),
+    ] {
+        query("insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals, notified_at, notification_status, notification_attempts, notified_risk_score, notified_risk_signals) values ($1, $2, 80, '[{\"label\": \"fixture\"}]'::jsonb, $3, 'pending', 0, null, null)")
+            .bind(CHAT_ID)
+            .bind(user_id)
+            .bind(notified_at)
+            .execute(pool)
+            .await
+            .expect("review upgrade fixture must be inserted");
+    }
+    query("update spam_review_requests set risk_score = 65 where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(CURRENT_USER_ID)
+        .execute(pool)
+        .await
+        .expect("post-lifecycle fixture must not be claimable by high-risk delivery worker");
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260729102000_spam_review_delivery_safety.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("safety migration must backfill the staged upgrade fixture");
+    let historical: (String, Option<i32>, Option<serde_json::Value>) = query_as(
+        "select notification_status, notified_risk_score, notified_risk_signals from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(HISTORICAL_USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("historical review fixture must remain queryable");
+    assert_eq!(historical.0, "sent");
+    assert_eq!(historical.1, Some(80));
+    assert_eq!(
+        historical.2,
+        Some(serde_json::json!([{"label": "fixture"}]))
+    );
+    let current: (String, Option<i32>) = query_as(
+        "select notification_status, notified_risk_score from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(CURRENT_USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("post-lifecycle review fixture must remain queryable");
+    assert_eq!(current, ("pending".into(), None));
 }
 
 async fn assert_avatar_job_finalization_requires_current_claim(pool: &PgPool) {
@@ -165,6 +231,58 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
             Some(1002)
         )
     );
+}
+
+async fn assert_terminal_review_delivery_stays_closed(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_003;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("terminal review chat user must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Terminal review')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("terminal review profile must exist");
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("terminal high-risk audit must exist");
+    let review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("terminal review creation must succeed")
+        .expect("high-risk review must be claimed");
+    query("update spam_review_requests set notification_status = 'failed', notification_consecutive_failures = 5, notified_risk_score = null, notified_risk_signals = null where id = $1")
+        .bind(review.id)
+        .execute(pool)
+        .await
+        .expect("terminal delivery state must be writable");
+    query("update telegram_new_user_profile_audits set risk_score = 90, risk_signal_breakdown = '[{\"label\": \"late_signal\"}]'::jsonb where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("late audit signal must be writable");
+    assert!(
+        create_review(pool, CHAT_ID, USER_ID)
+            .await
+            .expect("terminal review refresh must succeed")
+            .is_none(),
+        "terminal delivery must not be reopened by enrichment"
+    );
+    let state: (String, i32) = query_as(
+        "select notification_status, notification_consecutive_failures from spam_review_requests where id = $1",
+    )
+    .bind(review.id)
+    .fetch_one(pool)
+    .await
+    .expect("terminal delivery state must remain stored");
+    assert_eq!(state, ("failed".into(), 5));
 }
 
 async fn assert_clean_database_migrations(pool: &PgPool) {
