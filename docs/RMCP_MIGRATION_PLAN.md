@@ -10,10 +10,9 @@
 
 - internal stdio transport для `/ask`;
 - public Streamable HTTP transport для внешних MCP-клиентов;
-- один tool router и один публичный read-model;
-- без изменения текущих имён tools, схем, результатов поиска и permissions.
+- один tool router и один публичный read-model.
 
-Миграция меняет protocol/transport слой, но не продуктовую семантику tools.
+> Историческая цель первоначально предполагала сохранение legacy имён tools, схем и результатов. В ходе migration review это оказалось несовместимо с typed RMCP contract, поэтому был сознательно выполнен breaking cutover на отдельный `/v2` route. Legacy URL не является alias нового API; фактический контракт задают текущие RMCP schemas и golden snapshot tools/list.
 
 ## Принятые решения
 
