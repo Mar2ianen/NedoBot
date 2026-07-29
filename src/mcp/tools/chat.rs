@@ -220,7 +220,10 @@ fn normalize_batch_queries(queries: Vec<String>) -> Result<Vec<String>, rmcp::Er
         if query.is_empty() {
             return Err(invalid_arguments("queries must not contain empty items"));
         }
-        if normalized.contains(&query) {
+        if normalized
+            .iter()
+            .any(|existing: &String| existing.to_lowercase() == query.to_lowercase())
+        {
             return Err(invalid_arguments("queries must not contain duplicates"));
         }
         normalized.push(query);
@@ -391,7 +394,7 @@ mod tests {
             "queries must not contain empty items"
         );
         assert_eq!(
-            normalize_batch_queries(vec!["один запрос".into(), " один   запрос ".into()])
+            normalize_batch_queries(vec!["один запрос".into(), " Один   Запрос ".into()])
                 .unwrap_err()
                 .message,
             "queries must not contain duplicates"
