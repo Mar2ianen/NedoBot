@@ -61,6 +61,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
+    assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
@@ -686,6 +687,34 @@ async fn assert_avatar_job_finalization_requires_current_claim(pool: &PgPool) {
     );
 }
 
+async fn assert_low_risk_review_delivery_is_blocked_by_database(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_099;
+    query(
+        "insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals) values ($1, $2, 69, '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("low-risk audit snapshot must be stored");
+
+    let error = query(
+        "update spam_review_requests set notification_attempts = 1, notification_status = 'processing' where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect_err("database must reject a low-risk delivery claim");
+    assert!(
+        error
+            .to_string()
+            .contains("spam_review_requests_low_risk_delivery_forbidden"),
+        "unexpected database error: {error}"
+    );
+}
+
 async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_002;
@@ -1299,22 +1328,6 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .await
     .expect("medium-risk review record must be queryable");
     assert_eq!(review_count, 1);
-    query(
-        "update spam_review_requests set notification_status = 'sent', notification_message_id = 900, notified_risk_score = 65, notified_risk_signals = '[]'::jsonb, notification_lease_expires_at = null where chat_id = $1 and telegram_user_id = $2",
-    )
-    .bind(CHAT_ID)
-    .bind(USER_ID)
-    .execute(pool)
-    .await
-    .expect("initial review delivery must be recorded");
-
-    let duplicate_review = create_review(pool, CHAT_ID, USER_ID)
-        .await
-        .expect("duplicate review check must succeed");
-    assert!(
-        duplicate_review.is_none(),
-        "review creation must be idempotent"
-    );
 
     let affected_chat_ids = apply_avatar_risk_signal(
         pool,
@@ -1331,8 +1344,8 @@ async fn assert_review_deduplication(pool: &PgPool) {
     let updated_review = create_review(pool, CHAT_ID, USER_ID)
         .await
         .expect("avatar risk must refresh review delivery")
-        .expect("changed sent review must be claimed for an edit");
-    assert_eq!(updated_review.notification_message_id, Some(900));
+        .expect("high-risk review must be claimed for its first delivery");
+    assert_eq!(updated_review.notification_message_id, None);
 
     let (risk_score, risk_level): (i32, String) = query_as(
         "select risk_score, risk_level from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
@@ -1371,10 +1384,10 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .bind(USER_ID)
     .fetch_one(pool)
     .await
-    .expect("changed sent review must be queued for an edit");
+    .expect("high-risk review must be queued for its first delivery");
     assert_eq!(notification_status, "processing");
     assert_eq!(notification_attempts, 1);
-    assert_eq!(notification_message_id, Some(900));
+    assert_eq!(notification_message_id, None);
 
     query(
         "update spam_review_requests set notification_status = 'retry_wait', notification_next_attempt_at = now(), notification_lease_expires_at = null where chat_id = $1 and telegram_user_id = $2",
@@ -1401,7 +1414,7 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .expect("review delivery lifecycle must be persisted");
     assert_eq!(notification_status, "processing");
     assert_eq!(notification_attempts, 2);
-    assert_eq!(notification_message_id, Some(900));
+    assert_eq!(notification_message_id, None);
 
     query(
         "update spam_review_requests set status = 'confirmed_not_spam', notification_status = 'sent' where chat_id = $1 and telegram_user_id = $2",

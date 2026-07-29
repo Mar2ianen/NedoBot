@@ -11,6 +11,7 @@ use crate::{
 };
 
 const OWNER_USERNAME: &str = "Chechulinm";
+const REVIEW_DELIVERY_RISK_THRESHOLD: i32 = 70;
 const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
 
 pub struct SpamReview {
@@ -98,7 +99,7 @@ async fn claim_review_delivery(
             select id
             from spam_review_requests
             where status = 'pending'
-              and risk_score >= 70
+              and risk_score >= $3
               and ($1::bigint is null or id = $1)
               and (
                   (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
@@ -125,6 +126,7 @@ async fn claim_review_delivery(
     )
     .bind(request_id)
     .bind(DELIVERY_LEASE_SECONDS)
+    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
@@ -181,7 +183,20 @@ fn is_valid_telegram_username(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+fn can_deliver_review(risk_score: i32) -> bool {
+    risk_score >= REVIEW_DELIVERY_RISK_THRESHOLD
+}
+
 pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyhow::Result<()> {
+    if !can_deliver_review(review.risk_score) {
+        tracing::error!(
+            request_id = review.id,
+            risk_score = review.risk_score,
+            "refusing Telegram spam-review delivery below the risk threshold"
+        );
+        return Ok(());
+    }
+
     let result = if let Some(message_id) = review.notification_message_id {
         bot.edit_message_text(ChatId(review.chat_id), MessageId(message_id), &review.text)
             .parse_mode(ParseMode::Html)
@@ -520,6 +535,13 @@ mod tests {
         assert_eq!(parse_callback("spam_review:42:spam"), Some((42, "spam")));
         assert_eq!(parse_callback("spam_review:42:spam:x"), None);
     }
+    #[test]
+    fn blocks_telegram_delivery_below_risk_threshold() {
+        assert!(!can_deliver_review(0));
+        assert!(!can_deliver_review(69));
+        assert!(can_deliver_review(70));
+    }
+
     #[test]
     fn keeps_telegram_retry_after_for_delivery_delay() {
         let failure = classify_delivery_error(&teloxide::RequestError::RetryAfter(
