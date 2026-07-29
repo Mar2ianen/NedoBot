@@ -85,6 +85,7 @@ async fn claim_review_delivery(
             select id
             from spam_review_requests
             where status = 'pending'
+              and risk_score >= 70
               and ($1::bigint is null or id = $1)
               and (
                   (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())

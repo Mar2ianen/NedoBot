@@ -483,9 +483,18 @@ async fn assert_review_deduplication(pool: &PgPool) {
         .await
         .expect("review creation must succeed");
     assert!(
-        first_review.is_some(),
-        "medium-risk audit must create a review"
+        first_review.is_none(),
+        "medium-risk audit must be recorded without queuing a Telegram card"
     );
+    let review_count: i64 = query_scalar(
+        "select count(*) from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("medium-risk review record must be queryable");
+    assert_eq!(review_count, 1);
     query(
         "update spam_review_requests set notification_status = 'sent', notification_message_id = 900, notified_risk_score = 65, notified_risk_signals = '[]'::jsonb, notification_lease_expires_at = null where chat_id = $1 and telegram_user_id = $2",
     )
@@ -560,7 +569,7 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .await
     .expect("changed sent review must be queued for an edit");
     assert_eq!(notification_status, "processing");
-    assert_eq!(notification_attempts, 2);
+    assert_eq!(notification_attempts, 1);
     assert_eq!(notification_message_id, Some(900));
 
     query(
@@ -587,7 +596,7 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .await
     .expect("review delivery lifecycle must be persisted");
     assert_eq!(notification_status, "processing");
-    assert_eq!(notification_attempts, 3);
+    assert_eq!(notification_attempts, 2);
     assert_eq!(notification_message_id, Some(900));
 
     query(
