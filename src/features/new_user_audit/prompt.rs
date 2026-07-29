@@ -30,6 +30,7 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                             "adult_level": { "type": "string", "enum": ["none", "suggestive", "explicit", "unclear"] },
                             "visual_motifs": { "type": "array", "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 600 } },
                             "description": { "type": "string", "minLength": 1, "maxLength": 600 },
+                            "personal_photo_probability": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
                             "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                         },
                         "required": ["primary_class", "secondary_classes", "face_visibility", "adult_level", "visual_motifs", "description", "confidence"]
@@ -44,12 +45,17 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                         "additionalProperties": false,
                         "properties": {
                             "relation_to_chat": { "type": "string", "enum": ["on_topic", "loosely_related", "off_topic", "no_message_context"] },
+                            "direct_dm_offer": { "type": "boolean" },
+                            "offtopic_promo": { "type": "boolean" },
+                            "template_campaign": { "type": "boolean" },
+                            "self_reference_grammar": { "type": "string", "enum": ["masculine", "feminine", "none_or_unclear"] },
+                            "profile_name_grammar_relation": { "type": "string", "enum": ["consistent", "conflicts", "not_applicable"] },
                             "risk_markers": { "type": "array", "maxItems": 8, "items": { "type": "string", "enum": ["send_or_share_offer", "direct_messages", "self_help_or_finance_promo", "template_efficiency_narrative", "masked_call_to_action", "paid_easy_task_offer", "external_promo_funnel", "generic_campaign_reaction", "performative_feminine_persona"] } },
                             "evidence": { "type": "array", "maxItems": 10, "items": { "type": "object", "additionalProperties": false, "properties": { "marker": { "type": "string", "enum": ["send_or_share_offer", "direct_messages", "self_help_or_finance_promo", "template_efficiency_narrative", "masked_call_to_action", "paid_easy_task_offer", "external_promo_funnel", "generic_campaign_reaction", "performative_feminine_persona"] }, "quote": { "type": "string", "minLength": 1, "maxLength": 600 } }, "required": ["marker", "quote"] } },
                             "summary": { "type": "string", "minLength": 1, "maxLength": 600 },
                             "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                         },
-                        "required": ["relation_to_chat", "risk_markers", "evidence", "summary", "confidence"]
+                        "required": ["relation_to_chat", "direct_dm_offer", "offtopic_promo", "template_campaign", "self_reference_grammar", "profile_name_grammar_relation", "risk_markers", "evidence", "summary", "confidence"]
                     }
                 ]
             },

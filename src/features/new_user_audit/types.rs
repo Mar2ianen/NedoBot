@@ -27,6 +27,7 @@ pub struct NewUserAuditAssessment {
 #[serde(deny_unknown_fields)]
 pub struct AvatarObservation {
     pub primary_class: AvatarClass,
+    pub personal_photo_probability: Option<f64>,
     pub secondary_classes: Vec<AvatarClass>,
     pub face_visibility: FaceVisibility,
     pub adult_level: AdultLevel,
@@ -70,6 +71,11 @@ pub enum AdultLevel {
 #[serde(deny_unknown_fields)]
 pub struct FirstMessageAssessment {
     pub relation_to_chat: MessageRelation,
+    pub direct_dm_offer: bool,
+    pub offtopic_promo: bool,
+    pub template_campaign: bool,
+    pub self_reference_grammar: SelfReferenceGrammar,
+    pub profile_name_grammar_relation: ProfileNameGrammarRelation,
     pub risk_markers: Vec<FirstMessageRiskMarker>,
     pub evidence: Vec<FirstMessageEvidence>,
     pub summary: String,
@@ -83,6 +89,22 @@ pub enum MessageRelation {
     LooselyRelated,
     OffTopic,
     NoMessageContext,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfReferenceGrammar {
+    Masculine,
+    Feminine,
+    NoneOrUnclear,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileNameGrammarRelation {
+    Consistent,
+    Conflicts,
+    NotApplicable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
