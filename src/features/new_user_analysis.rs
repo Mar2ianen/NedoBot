@@ -320,6 +320,142 @@ pub async fn analyze_new_user_profile_with_config(
     save_audit(pool, &features, &risk, &config).await
 }
 
+/// Возвращает канонический безопасный снимок для unified audit.
+///
+/// SQL и правила оценки остаются единым источником истины: используются те же
+/// `load_features` и `analyze_risk`, что и у персистентного аудита. Проекция
+/// намеренно не содержит invite URLs, Telegram file IDs и сохранённые raw JSON.
+///
+/// Временно не вызывается до подключения unified-audit consumer в отдельной правке.
+#[allow(dead_code)]
+pub(crate) async fn load_unified_user_audit_snapshot(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<Option<Value>> {
+    let Some(features) = load_features(pool, chat_id, user_id).await? else {
+        return Ok(None);
+    };
+    let config = NewUserAnalysisConfig::default();
+    let is_old_active_user = features.message_count >= config.old_user_message_threshold;
+    let risk = analyze_risk(&features, &config, is_old_active_user);
+
+    Ok(Some(project_unified_user_audit_snapshot(&features, &risk)))
+}
+
+const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
+const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
+
+fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAnalysis) -> Value {
+    json!({
+        "schema_version": 1,
+        "subject": {
+            "chat_id": features.chat_id,
+            "telegram_user_id": features.telegram_user_id,
+        },
+        "profile": {
+            "username": bounded_audit_text(features.username.as_deref()),
+            "display_name": bounded_audit_text(features.display_name.as_deref()),
+            "is_bot": features.is_bot,
+            "is_premium": features.is_premium,
+            "language_code": bounded_audit_text(features.language_code.as_deref()),
+            "bio_preview": bounded_audit_text(features.bio.as_deref()),
+            "has_profile_photo": has_profile_photo(features),
+            "profile_photo_reuse_count": features.profile_photo_reuse_count,
+            "avatar_primary_class": features.avatar_primary_class,
+            "avatar_personal_photo_probability": features.avatar_personal_photo_probability,
+        },
+        "activity": {
+            "first_seen_at": features.first_seen_at.map(|value| value.to_rfc3339()),
+            "last_seen_at": features.last_seen_at.map(|value| value.to_rfc3339()),
+            "account_seen_age_sec": features.account_seen_age_sec,
+            "chat_age_sec": features.chat_age_sec,
+            "message_count": features.message_count,
+            "reply_count": features.reply_count,
+            "link_count": features.link_count,
+            "media_count": features.media_count,
+            "voice_count": features.voice_count,
+            "message_count_24h": features.message_count_24h,
+            "link_count_24h": features.link_count_24h,
+            "burst_messages_per_min": features.burst_messages_per_min,
+            "only_replies_or_comments": only_replies_or_comments(features),
+            "only_channel_post_comments": only_channel_post_comments(features),
+        },
+        "text": {
+            "first_message_preview": bounded_audit_text(features.first_message_text.as_deref()),
+            "last_message_preview": bounded_audit_text(features.last_message_text.as_deref()),
+            "recent_message_previews": features.recent_message_texts.iter()
+                .take(UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT)
+                .map(|text| bounded_audit_text(Some(text)))
+                .collect::<Vec<_>>(),
+            "repetitive_pattern": features.text_texture.repetitive_pattern,
+            "max_pairwise_similarity": features.text_texture.max_pairwise_similarity,
+        },
+        "personal_channel": {
+            "present": features.personal_channel_chat_id.is_some(),
+            "title_preview": bounded_audit_text(features.personal_channel_title.as_deref()),
+            "username": bounded_audit_text(features.personal_channel_username.as_deref()),
+            "message_count": features.personal_channel_message_count,
+            "has_adult_links": features.personal_channel_has_adult_links,
+            "has_invite_link": personal_channel_has_invite_link(features),
+            "has_external_link": personal_channel_has_external_link(features),
+        },
+        "membership": {
+            "status": bounded_audit_text(features.member_status.as_deref()),
+            "is_present": features.member_is_present,
+            "is_admin": features.member_is_admin,
+            "join_event_seen": features.join_event_seen,
+            "via_chat_folder_invite_link": features.via_chat_folder_invite_link,
+        },
+        "risk": {
+            "score": risk.score,
+            "level": risk.level,
+            "primary_class": risk.primary_class,
+            "class_scores": risk.class_scores,
+            "labels": risk.labels,
+            "reasons": risk.reasons,
+            "signals": risk.signals,
+        },
+    })
+}
+
+fn bounded_audit_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = redact_urls(&normalized);
+    let mut preview = redacted
+        .chars()
+        .take(UNIFIED_AUDIT_TEXT_LIMIT)
+        .collect::<String>();
+    if redacted.chars().count() > UNIFIED_AUDIT_TEXT_LIMIT {
+        preview.push('…');
+    }
+    Some(preview)
+}
+
+fn redact_urls(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            let normalized = token
+                .trim_start_matches(['(', '[', '{', '<', '"', '\''])
+                .to_ascii_lowercase();
+            if ["http://", "https://", "t.me/", "telegram.me/"]
+                .iter()
+                .any(|prefix| normalized.contains(prefix))
+            {
+                "[link]"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn load_features(
     pool: &PgPool,
     chat_id: i64,
@@ -2243,5 +2379,26 @@ mod tests {
             reason: "test",
         });
         assert_eq!(risk.finish().score, 100);
+    }
+
+    #[test]
+    fn bounded_audit_text_redacts_links_and_normalizes_whitespace() {
+        assert_eq!(
+            bounded_audit_text(Some("  promo https://t.me/+secret\nnext  ")),
+            Some("promo [link] next".to_string())
+        );
+        assert_eq!(
+            bounded_audit_text(Some("(telegram.me/+secret)")),
+            Some("[link]".to_string())
+        );
+    }
+
+    #[test]
+    fn bounded_audit_text_truncates_by_characters() {
+        let input = "я".repeat(UNIFIED_AUDIT_TEXT_LIMIT + 1);
+        let preview = bounded_audit_text(Some(&input)).expect("non-empty preview");
+
+        assert_eq!(preview.chars().count(), UNIFIED_AUDIT_TEXT_LIMIT + 1);
+        assert!(preview.ends_with('…'));
     }
 }
