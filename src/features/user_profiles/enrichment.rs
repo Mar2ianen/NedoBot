@@ -195,7 +195,7 @@ async fn enqueue_unified_new_user_audit(pool: &PgPool, job: ProfileRefreshJob) {
             return;
         }
     };
-    let snapshot_hash = match serde_json::to_vec(&snapshot) {
+    let snapshot_hash = match serde_json::to_vec(&snapshot.material_revision) {
         Ok(bytes) => format!("{:x}", Sha256::digest(bytes)),
         Err(err) => {
             tracing::warn!(%err, user_id = job.user_id, "failed to serialize unified new user audit snapshot");
@@ -208,9 +208,9 @@ async fn enqueue_unified_new_user_audit(pool: &PgPool, job: ProfileRefreshJob) {
         telegram_user_id: job.user_id,
         snapshot_hash: &snapshot_hash,
         prompt_version: PROMPT_VERSION,
-        input_json: &snapshot,
-        avatar_file_id: None,
-        avatar_file_unique_id: None,
+        input_json: &snapshot.input_json,
+        avatar_file_id: snapshot.avatar_file_id.as_deref(),
+        avatar_file_unique_id: snapshot.avatar_file_unique_id.as_deref(),
     };
     if let Err(err) = enqueue_new_user_audit_job(pool, params).await {
         tracing::warn!(%err, user_id = job.user_id, "failed to enqueue unified new user audit");

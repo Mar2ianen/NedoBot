@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     );
     if state.config.new_user_audit_enabled {
         // До финального cutover unified worker только собирает shadow assessments.
-        spawn_new_user_audit_worker(state.clone());
+        spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
     // Legacy avatar worker остаётся authoritative в shadow-режиме unified audit.
     spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
@@ -272,10 +272,10 @@ async fn handle_callback_query(
     Ok(())
 }
 
-fn spawn_new_user_audit_worker(state: AppState) {
+fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
-            match process_next_new_user_audit_job(&state.pool, &state.config).await {
+            match process_next_new_user_audit_job(&bot, &state.pool, &state.config).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     tokio::time::sleep(std::time::Duration::from_secs(
