@@ -328,11 +328,18 @@ pub async fn analyze_new_user_profile_with_config(
 ///
 /// Временно не вызывается до подключения unified-audit consumer в отдельной правке.
 #[allow(dead_code)]
+pub(crate) struct UnifiedUserAuditSnapshot {
+    pub input_json: Value,
+    pub material_revision: Value,
+    pub avatar_file_id: Option<String>,
+    pub avatar_file_unique_id: Option<String>,
+}
+
 pub(crate) async fn load_unified_user_audit_snapshot(
     pool: &PgPool,
     chat_id: i64,
     user_id: i64,
-) -> anyhow::Result<Option<Value>> {
+) -> anyhow::Result<Option<UnifiedUserAuditSnapshot>> {
     let Some(features) = load_features(pool, chat_id, user_id).await? else {
         return Ok(None);
     };
@@ -340,11 +347,45 @@ pub(crate) async fn load_unified_user_audit_snapshot(
     let is_old_active_user = features.message_count >= config.old_user_message_threshold;
     let risk = analyze_risk(&features, &config, is_old_active_user);
 
-    Ok(Some(project_unified_user_audit_snapshot(&features, &risk)))
+    Ok(Some(UnifiedUserAuditSnapshot {
+        input_json: project_unified_user_audit_snapshot(&features, &risk),
+        material_revision: project_unified_user_audit_material_revision(&features),
+        avatar_file_id: features.profile_photo_file_id.clone(),
+        avatar_file_unique_id: features.profile_photo_file_unique_id.clone(),
+    }))
 }
 
 const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
 const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
+
+fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> Value {
+    // Только факты, заметно меняющие вход LLM. Временные поля, live-счётчики и
+    // последние сообщения исключены, чтобы transient refresh не создавал job на
+    // каждое новое сообщение.
+    json!({
+        "schema_version": 1,
+        "subject": {
+            "chat_id": features.chat_id,
+            "telegram_user_id": features.telegram_user_id,
+        },
+        "profile": {
+            "username": bounded_audit_text(features.username.as_deref()),
+            "display_name": bounded_audit_text(features.display_name.as_deref()),
+            "bio_preview": bounded_audit_text(features.bio.as_deref()),
+            "profile_photo_unique_id": features.profile_photo_file_unique_id,
+        },
+        "first_message": bounded_audit_text(features.first_message_text.as_deref()),
+        "personal_channel": {
+            "title_preview": bounded_audit_text(features.personal_channel_title.as_deref()),
+            "username": bounded_audit_text(features.personal_channel_username.as_deref()),
+            "has_adult_links": features.personal_channel_has_adult_links,
+        },
+        "membership": {
+            "status": bounded_audit_text(features.member_status.as_deref()),
+            "is_admin": features.member_is_admin,
+        },
+    })
+}
 
 fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAnalysis) -> Value {
     json!({
@@ -361,6 +402,7 @@ fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAn
             "language_code": bounded_audit_text(features.language_code.as_deref()),
             "bio_preview": bounded_audit_text(features.bio.as_deref()),
             "has_profile_photo": has_profile_photo(features),
+            "avatar_image_available": false,
             "profile_photo_reuse_count": features.profile_photo_reuse_count,
             "avatar_primary_class": features.avatar_primary_class,
             "avatar_personal_photo_probability": features.avatar_personal_photo_probability,

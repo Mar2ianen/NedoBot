@@ -1,4 +1,6 @@
+use serde_json::Value;
 use sqlx::PgPool;
+use teloxide::prelude::Bot;
 
 use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
@@ -8,6 +10,7 @@ use crate::features::new_user_audit::repo::{
     finalize_new_user_audit_job, mark_new_user_audit_failed, mark_new_user_audit_retry,
 };
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
+use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::{LlmTransportError, StructuredOutput};
 
@@ -16,6 +19,7 @@ use crate::llm::types::{LlmTransportError, StructuredOutput};
 /// Снимок в job уже является каноническим входом: worker не читает профиль,
 /// не скачивает аватар и не меняет модерационные оценки.
 pub async fn process_next_new_user_audit_job(
+    bot: &Bot,
     pool: &PgPool,
     config: &Config,
 ) -> anyhow::Result<bool> {
@@ -23,12 +27,12 @@ pub async fn process_next_new_user_audit_job(
         return Ok(false);
     };
 
-    process_job(pool, config, &job).await;
+    process_job(bot, pool, config, &job).await;
     Ok(true)
 }
 
-async fn process_job(pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
-    let result = generate_and_finalize(pool, config, job).await;
+async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
+    let result = generate_and_finalize(bot, pool, config, job).await;
     let Err(error) = result else { return };
 
     let failure = classify_audit_failure(&error);
@@ -71,12 +75,21 @@ async fn process_job(pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
 }
 
 async fn generate_and_finalize(
+    bot: &Bot,
     pool: &PgPool,
     config: &Config,
     job: &NewUserAuditJob,
 ) -> anyhow::Result<()> {
-    let prompt = build_input(&job.input_json)?;
-    let has_avatar_input = job.avatar_file_id.is_some();
+    let image_base64 = load_avatar_input(bot, config, job).await?;
+    let has_avatar_input = image_base64.is_some();
+    let mut input_json = job.input_json.clone();
+    if let Some(profile) = input_json.get_mut("profile").and_then(Value::as_object_mut) {
+        profile.insert(
+            "avatar_image_available".to_string(),
+            Value::Bool(has_avatar_input),
+        );
+    }
+    let prompt = build_input(&input_json)?;
     let output_validator = move |output: &str| {
         NewUserAuditAssessment::parse_for_input(output, has_avatar_input).map(|_| ())
     };
@@ -90,8 +103,7 @@ async fn generate_and_finalize(
             model_override: config.llm_model.as_deref(),
             system_prompt: Some(system_prompt()),
             prompt: &prompt,
-            // Avatar download is deliberately outside this runtime-only slice.
-            image_base64: None,
+            image_base64: image_base64.as_deref(),
             temperature: 0.0,
             num_predict: config.llm_max_tokens,
             output_validator: Some(&output_validator),
@@ -123,6 +135,42 @@ async fn generate_and_finalize(
         );
     }
     Ok(())
+}
+
+async fn load_avatar_input(
+    bot: &Bot,
+    config: &Config,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<Option<String>> {
+    let cached = match cache_profile_avatar(
+        bot,
+        &config.static_files_dir,
+        job.telegram_user_id,
+        job.avatar_file_id.as_deref(),
+        job.avatar_file_unique_id.as_deref(),
+    )
+    .await
+    {
+        Ok(cached) => cached,
+        // Telegram may have discarded an old file reference. This is an expected
+        // text-only audit state, not a reason to burn the whole retry budget.
+        Err(error)
+            if error
+                .downcast_ref::<teloxide::RequestError>()
+                .is_some_and(|error| matches!(error, teloxide::RequestError::Api(_))) =>
+        {
+            tracing::info!(
+                job_id = job.id,
+                "unified audit avatar is unavailable; continuing without image"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    Ok(Some(cached.base64().await?))
 }
 
 #[derive(Clone, Copy)]
