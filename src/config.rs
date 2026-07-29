@@ -331,22 +331,12 @@ impl Config {
             validate_llm_provider_secret(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
             validate_llm_provider_model(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
 
-            if self.voice_transcription_enabled && self.voice_auto_transcribe {
-                validate_voice_asr_secret(&mut errors, self);
-                if let Some(provider) = self.voice_cleanup_provider.as_deref() {
-                    validate_llm_provider_secret(
-                        &mut errors,
-                        self,
-                        provider,
-                        "VOICE_CLEANUP_PROVIDER",
-                    );
-                    validate_llm_provider_model(
-                        &mut errors,
-                        self,
-                        provider,
-                        "VOICE_CLEANUP_PROVIDER",
-                    );
-                }
+            if self.voice_transcription_enabled
+                && self.voice_auto_transcribe
+                && let Some(provider) = self.voice_cleanup_provider.as_deref()
+            {
+                validate_llm_provider_secret(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
+                validate_llm_provider_model(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
             }
         }
 
@@ -372,8 +362,15 @@ impl Config {
             }
         }
 
+        if self.voice_transcription_enabled && self.voice_auto_transcribe {
+            validate_voice_asr_secret(&mut errors, self);
+        }
+
         if self.rag_enabled {
-            self.validate_rag_config(&mut errors);
+            self.validate_rag_retrieval_config(&mut errors);
+            if self.llm_profiles.is_none() {
+                self.validate_legacy_memory_llm(&mut errors);
+            }
         }
         self.validate_chat_retrieval_config(&mut errors);
 
@@ -472,15 +469,25 @@ impl Config {
         let Some(profiles) = self.llm_profiles.as_ref() else {
             return;
         };
-        let mut routes = vec![(
-            "first_comment",
-            RouteRequirements {
-                requires_images: true,
-                requires_system_prompt: true,
-                num_predict: Some(self.llm_max_tokens),
-                ..RouteRequirements::default()
-            },
-        )];
+        let mut routes = vec![
+            (
+                "first_comment",
+                RouteRequirements {
+                    requires_system_prompt: true,
+                    num_predict: Some(self.llm_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ),
+            (
+                "first_comment",
+                RouteRequirements {
+                    requires_images: true,
+                    requires_system_prompt: true,
+                    num_predict: Some(self.llm_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ),
+        ];
         if self.rag_enabled {
             routes.push((
                 "memory",
@@ -533,29 +540,27 @@ impl Config {
             ));
         }
         if self.ask_enabled {
-            routes.push((
-                "ask",
-                RouteRequirements {
-                    requires_images: true,
-                    requires_system_prompt: true,
-                    num_predict: Some(self.ask_llm_max_tokens),
-                    ..RouteRequirements::default()
-                },
-            ));
+            for requires_images in [false, true] {
+                routes.push((
+                    "ask",
+                    RouteRequirements {
+                        requires_images,
+                        requires_system_prompt: true,
+                        num_predict: Some(self.ask_llm_max_tokens),
+                        ..RouteRequirements::default()
+                    },
+                ));
+            }
         }
 
+        let mut required_secrets = std::collections::BTreeMap::new();
         for (route, requirements) in routes {
             match profiles.resolve_route(route, &requirements) {
                 Ok(resolved) => {
                     for selection in resolved.selections {
-                        let configured = std::env::var(&selection.provider.api_key_env)
-                            .is_ok_and(|value| !value.trim().is_empty());
-                        if !configured {
-                            errors.push(format!(
-                                "LLM profile route {route:?} requires non-empty {} for provider {:?}",
-                                selection.provider.api_key_env, selection.provider_key
-                            ));
-                        }
+                        required_secrets
+                            .entry(selection.provider.api_key_env.as_str())
+                            .or_insert((selection.provider_key, route));
                     }
                 }
                 Err(error) => {
@@ -563,9 +568,17 @@ impl Config {
                 }
             }
         }
+        for (api_key_env, (provider_key, route)) in required_secrets {
+            let configured = std::env::var(api_key_env).is_ok_and(|value| !value.trim().is_empty());
+            if !configured {
+                errors.push(format!(
+                    "LLM profile route {route:?} requires non-empty {api_key_env} for provider {provider_key:?}"
+                ));
+            }
+        }
     }
 
-    fn validate_rag_config(&self, errors: &mut Vec<String>) {
+    fn validate_legacy_memory_llm(&self, errors: &mut Vec<String>) {
         validate_llm_provider_secret(
             errors,
             self,
@@ -580,7 +593,9 @@ impl Config {
             self.memory_llm_model.as_deref(),
             "MEMORY_LLM_MODEL",
         );
+    }
 
+    fn validate_rag_retrieval_config(&self, errors: &mut Vec<String>) {
         self.validate_embedding_config(errors);
         require_positive(errors, "RAG_TOP_K", self.rag_top_k);
         require_in_unit_interval(errors, "RAG_MIN_SIMILARITY", self.rag_min_similarity);
@@ -1205,7 +1220,7 @@ thinking = "none"
 provider = "fallback"
 model = "fallback-model"
 [models.fallback.capabilities]
-supports_images = true
+supports_images = false
 supports_tools = false
 supports_system_prompt = true
 structured_output = "prompt_only"
@@ -1227,6 +1242,56 @@ models = ["primary", "fallback"]
         assert!(error.contains("PROFILE_FALLBACK_TEST_KEY"));
         drop(primary);
         drop(fallback);
+    }
+
+    #[test]
+    fn profile_mode_keeps_voice_asr_secret_validation() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
+        let ollama = EnvVarGuard::unset("OLLAMA_API_KEY");
+        let groq = EnvVarGuard::unset("GROQ_API_KEY");
+        unsafe {
+            std::env::set_var("GEMINI_API_KEY", "test-key");
+            std::env::set_var("OLLAMA_API_KEY", "test-key");
+        }
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(include_str!("../config/llm_profiles.toml.example")).unwrap(),
+        );
+        config.voice_transcription_enabled = true;
+        config.voice_auto_transcribe = true;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("VOICE_ASR_PROVIDER=groq requires non-empty GROQ_API_KEY"));
+        drop(gemini);
+        drop(ollama);
+        drop(groq);
+    }
+
+    #[test]
+    fn profile_mode_does_not_validate_ignored_legacy_memory_llm() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
+        let ollama = EnvVarGuard::unset("OLLAMA_API_KEY");
+        let openai = EnvVarGuard::unset("OPENAI_COMPAT_API_KEY");
+        unsafe {
+            std::env::set_var("GEMINI_API_KEY", "test-key");
+            std::env::set_var("OLLAMA_API_KEY", "test-key");
+        }
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(include_str!("../config/llm_profiles.toml.example")).unwrap(),
+        );
+        config.rag_enabled = true;
+        config.memory_llm_provider = "openai_compat".to_string();
+        config.memory_llm_model = None;
+
+        config.validate_runtime_secrets().unwrap();
+
+        drop(gemini);
+        drop(ollama);
+        drop(openai);
     }
 
     #[test]

@@ -247,6 +247,15 @@ async fn generate_text_with_profile_checked(
                     }
                     attempts.push(llm_attempt);
                     generation.attempts = attempts;
+                    if fallback_index > 0 {
+                        tracing::info!(
+                            route,
+                            fallback_index,
+                            provider = selection.provider_key,
+                            model = selection.model.model,
+                            "LLM profile fallback succeeded"
+                        );
+                    }
                     return Ok(generation);
                 }
                 Err(err) => {
@@ -267,15 +276,6 @@ async fn generate_text_with_profile_checked(
                     break;
                 }
             }
-        }
-        if fallback_index > 0 {
-            tracing::info!(
-                route,
-                fallback_index,
-                provider = selection.provider_key,
-                model = selection.model.model,
-                "LLM profile fallback succeeded"
-            );
         }
     }
 
@@ -340,15 +340,22 @@ async fn generate_profile_once(
                 &api_key,
                 config.llm_proxy_url.as_deref(),
                 config.gemini_thinking_budget,
+                selection.capabilities.thinking,
+                selection.capabilities.structured_output,
                 timeout,
             )
             .generate(request)
             .await?
         }
         LlmDriver::OllamaNative => {
-            OllamaClient::with_profile(&selection.provider.base_url, &api_key, timeout)
-                .generate(request)
-                .await?
+            OllamaClient::with_profile(
+                &selection.provider.base_url,
+                &api_key,
+                timeout,
+                selection.capabilities.structured_output,
+            )
+            .generate(request)
+            .await?
         }
     };
     Ok(GeneratedText {
@@ -585,9 +592,14 @@ mod tests {
     use super::*;
     use crate::config::SearchMcpTools;
     use crate::llm::profiles::LlmProfiles;
-    use axum::{Json, Router, extract::State, routing::post};
+    use axum::{
+        Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+    };
     use serde_json::{Value, json};
-    use tokio::sync::mpsc;
+    use std::sync::LazyLock;
+    use tokio::sync::{Mutex, mpsc};
+
+    static PROFILE_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn config() -> Config {
         Config {
@@ -818,6 +830,187 @@ models = ["test"]
         assert!(request.get("response_format").is_none());
         assert_eq!(request["model"], "profile-model");
         unsafe { std::env::remove_var("PROFILE_PROMPT_ONLY_TEST_KEY") };
+        server.abort();
+    }
+
+    fn switching_profiles(
+        address: std::net::SocketAddr,
+        primary_path: &str,
+        fallback_path: &str,
+        fallback_on_validation_failure: bool,
+    ) -> LlmProfiles {
+        LlmProfiles::from_toml(&format!(
+            r#"
+[providers.primary]
+driver = "openai_compatible"
+base_url = "http://{address}/{primary_path}/v1"
+api_key_env = "PROFILE_SWITCH_PRIMARY_KEY"
+[providers.fallback]
+driver = "openai_compatible"
+base_url = "http://{address}/{fallback_path}/v1"
+api_key_env = "PROFILE_SWITCH_FALLBACK_KEY"
+
+[models.primary]
+provider = "primary"
+model = "primary-model"
+[models.primary.capabilities]
+supports_images = false
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 4096
+max_output_tokens = 256
+request_timeout_sec = 5
+thinking = "none"
+
+[models.fallback]
+provider = "fallback"
+model = "fallback-model"
+[models.fallback.capabilities]
+supports_images = false
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 4096
+max_output_tokens = 256
+request_timeout_sec = 5
+thinking = "none"
+
+[routes.switch]
+models = ["primary", "fallback"]
+fallback_on_validation_failure = {fallback_on_validation_failure}
+"#
+        ))
+        .unwrap()
+    }
+
+    fn profile_options<'a>(validator: Option<&'a OutputValidator>) -> GenerateTextOptions<'a> {
+        GenerateTextOptions {
+            route: Some("switch"),
+            provider_override: None,
+            model_override: None,
+            system_prompt: Some("system"),
+            prompt: "prompt",
+            image_base64: None,
+            temperature: 0.0,
+            num_predict: 64,
+            output_validator: validator,
+            structured_output: None,
+        }
+    }
+
+    fn completion(content: &str) -> Value {
+        json!({
+            "id": "switch-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "profile-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn profile_transport_failure_falls_back_and_records_attempts() {
+        let _env_lock = PROFILE_ENV_LOCK.lock().await;
+        async fn primary() -> impl IntoResponse {
+            (StatusCode::INTERNAL_SERVER_ERROR, "unavailable")
+        }
+        async fn fallback() -> Json<Value> {
+            Json(completion("fallback response"))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/primary/v1/chat/completions", post(primary))
+                    .route("/fallback/v1/chat/completions", post(fallback)),
+            )
+            .await
+            .unwrap();
+        });
+        unsafe {
+            std::env::set_var("PROFILE_SWITCH_PRIMARY_KEY", "test-key");
+            std::env::set_var("PROFILE_SWITCH_FALLBACK_KEY", "test-key");
+        }
+        let mut config = config();
+        config.llm_profiles = Some(switching_profiles(address, "primary", "fallback", false));
+
+        let generated = generate_text_with_provider_checked(&config, profile_options(None))
+            .await
+            .unwrap();
+
+        assert_eq!(generated.content, "fallback response");
+        assert_eq!(generated.attempts.len(), 2);
+        assert_eq!(generated.attempts[0].provider, "primary");
+        assert_eq!(generated.attempts[0].outcome, "http_5xx");
+        assert_eq!(generated.attempts[1].provider, "fallback");
+        assert_eq!(generated.attempts[1].outcome, "success");
+        unsafe {
+            std::env::remove_var("PROFILE_SWITCH_PRIMARY_KEY");
+            std::env::remove_var("PROFILE_SWITCH_FALLBACK_KEY");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn profile_validation_fallback_obeys_route_flag() {
+        let _env_lock = PROFILE_ENV_LOCK.lock().await;
+        async fn invalid() -> Json<Value> {
+            Json(completion("invalid"))
+        }
+        async fn valid() -> Json<Value> {
+            Json(completion("valid"))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/invalid/v1/chat/completions", post(invalid))
+                    .route("/valid/v1/chat/completions", post(valid)),
+            )
+            .await
+            .unwrap();
+        });
+        unsafe {
+            std::env::set_var("PROFILE_SWITCH_PRIMARY_KEY", "test-key");
+            std::env::set_var("PROFILE_SWITCH_FALLBACK_KEY", "test-key");
+        }
+        let validator = |content: &str| -> anyhow::Result<()> {
+            anyhow::ensure!(content == "valid", "invalid output");
+            Ok(())
+        };
+        let mut config = config();
+        config.llm_profiles = Some(switching_profiles(address, "invalid", "valid", false));
+        assert!(
+            generate_text_with_provider_checked(&config, profile_options(Some(&validator)))
+                .await
+                .is_err()
+        );
+
+        config.llm_profiles = Some(switching_profiles(address, "invalid", "valid", true));
+        let generated =
+            generate_text_with_provider_checked(&config, profile_options(Some(&validator)))
+                .await
+                .unwrap();
+        assert_eq!(generated.content, "valid");
+        assert_eq!(generated.attempts.len(), 3);
+        assert_eq!(generated.attempts[0].outcome, "validation_failed");
+        assert_eq!(generated.attempts[1].outcome, "validation_failed");
+        assert_eq!(generated.attempts[2].provider, "fallback");
+        unsafe {
+            std::env::remove_var("PROFILE_SWITCH_PRIMARY_KEY");
+            std::env::remove_var("PROFILE_SWITCH_FALLBACK_KEY");
+        }
         server.abort();
     }
 

@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::http;
+use crate::llm::profiles::StructuredOutputMode;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 pub struct OllamaClient<'a> {
     base_url: &'a str,
     api_key: &'a str,
     timeout: Duration,
+    structured_output_mode: StructuredOutputMode,
 }
 
 impl<'a> OllamaClient<'a> {
@@ -18,14 +20,21 @@ impl<'a> OllamaClient<'a> {
             &config.ollama_base_url,
             &config.ollama_api_key,
             Duration::from_secs(60),
+            StructuredOutputMode::JsonObject,
         )
     }
 
-    pub fn with_profile(base_url: &'a str, api_key: &'a str, timeout: Duration) -> Self {
+    pub fn with_profile(
+        base_url: &'a str,
+        api_key: &'a str,
+        timeout: Duration,
+        structured_output_mode: StructuredOutputMode,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/'),
             api_key: api_key.trim(),
             timeout,
+            structured_output_mode,
         }
     }
 }
@@ -59,7 +68,10 @@ impl LlmClient for OllamaClient<'_> {
             // Ollama Cloud currently honors JSON mode for Gemma, but can ignore a
             // schema object and return fenced/incomplete JSON. The typed validator
             // still enforces the requested schema after generation.
-            format: request.structured_output.map(|_| "json"),
+            format: output_format(
+                request.structured_output.is_some(),
+                self.structured_output_mode,
+            ),
         };
 
         let response = http::client(self.timeout)?
@@ -88,6 +100,14 @@ impl LlmClient for OllamaClient<'_> {
 
         Ok(LlmResponse { content })
     }
+}
+
+fn output_format(
+    has_structured_output: bool,
+    structured_output_mode: StructuredOutputMode,
+) -> Option<&'static str> {
+    (has_structured_output && structured_output_mode != StructuredOutputMode::PromptOnly)
+        .then_some("json")
 }
 
 #[derive(Serialize)]
@@ -142,5 +162,14 @@ mod tests {
         };
 
         assert_eq!(serde_json::to_value(request).unwrap()["format"], "json");
+    }
+
+    #[test]
+    fn prompt_only_profile_omits_ollama_json_mode() {
+        assert_eq!(output_format(true, StructuredOutputMode::PromptOnly), None);
+        assert_eq!(
+            output_format(true, StructuredOutputMode::JsonSchema),
+            Some("json")
+        );
     }
 }
