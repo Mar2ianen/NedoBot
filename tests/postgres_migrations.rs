@@ -51,6 +51,134 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_comment_job_lifecycle(&pool).await;
     assert_avatar_job_finalization_requires_current_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
+    assert_post_history_entry_lease_lifecycle(&pool).await;
+}
+
+async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
+    const STAGED_JOB: i32 = 9_500_001;
+    const STALE_JOB: i32 = 9_500_002;
+    const SUCCESS_JOB: i32 = 9_500_003;
+    const RETRY_JOB: i32 = 9_500_004;
+    const FAILED_JOB: i32 = 9_500_005;
+
+    let staged_id = create_job(pool, STAGED_JOB).await;
+    let stale_id = create_job(pool, STALE_JOB).await;
+    let success_id = create_job(pool, SUCCESS_JOB).await;
+    let retry_id = create_job(pool, RETRY_JOB).await;
+    let failed_id = create_job(pool, FAILED_JOB).await;
+    let stale_started_at = Utc::now() - Duration::minutes(10);
+    let current_started_at = Utc::now();
+    for (job_id, source_message_id, started_at) in [
+        (staged_id, STAGED_JOB, stale_started_at),
+        (stale_id, STALE_JOB, stale_started_at),
+        (success_id, SUCCESS_JOB, current_started_at),
+        (retry_id, RETRY_JOB, current_started_at),
+        (failed_id, FAILED_JOB, current_started_at),
+    ] {
+        query(
+            "insert into post_history_entries (post_comment_job_id, source_channel_id, source_message_id, post_text, bot_comment, status, attempts, processing_started_at, lease_expires_at) values ($1, -1001575496091, $2, 'lease lifecycle post', 'lease lifecycle comment', 'processing', 1, $3, null)",
+        )
+        .bind(job_id)
+        .bind(source_message_id)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .expect("post history lease fixture must be inserted");
+    }
+
+    query("drop index if exists public.post_history_entries_processing_lease_idx")
+        .execute(pool)
+        .await
+        .expect("processing lease index must be removable for staged upgrade");
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260729111000_post_history_entry_leases.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("post history lease migration must upgrade staged processing rows");
+
+    let staged_lease_expired: bool = query_scalar(
+        "select lease_expires_at < now() from post_history_entries where post_comment_job_id = $1",
+    )
+    .bind(staged_id)
+    .fetch_one(pool)
+    .await
+    .expect("legacy processing row must receive an expired lease");
+    assert!(staged_lease_expired);
+    let current_lease_is_derived_from_started_at: bool = query_scalar(
+        "select lease_expires_at >= processing_started_at + interval '5 minutes' from post_history_entries where post_comment_job_id = $1",
+    )
+    .bind(success_id)
+    .fetch_one(pool)
+    .await
+    .expect("legacy processing lease must derive from its start timestamp");
+    assert!(current_lease_is_derived_from_started_at);
+    let lease_index: Option<String> = query_scalar(
+        "select indexname from pg_indexes where schemaname = 'public' and tablename = 'post_history_entries' and indexname = 'post_history_entries_processing_lease_idx'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("processing lease index lookup must succeed");
+    assert_eq!(
+        lease_index.as_deref(),
+        Some("post_history_entries_processing_lease_idx")
+    );
+
+    let reclaimed_attempts: i32 = query_scalar(
+        r#"
+        with candidate as (
+            select id from post_history_entries
+            where post_comment_job_id = $1
+              and status = 'processing'
+              and (lease_expires_at is null or lease_expires_at <= now())
+            for update skip locked
+        )
+        update post_history_entries entry
+        set status = 'processing', attempts = entry.attempts + 1,
+            processing_started_at = now(), lease_expires_at = now() + interval '5 minutes'
+        from candidate where entry.id = candidate.id
+        returning entry.attempts
+        "#,
+    )
+    .bind(stale_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired history claim must be reclaimed");
+    assert_eq!(reclaimed_attempts, 2);
+    let stale_finalizer_rows = query(
+        "update post_history_entries set status = 'ready' where post_comment_job_id = $1 and status = 'processing' and attempts = 1 and lease_expires_at > now()",
+    )
+    .bind(stale_id)
+    .execute(pool)
+    .await
+    .expect("stale history finalizer must execute")
+    .rows_affected();
+    assert_eq!(stale_finalizer_rows, 0, "stale claim must lose CAS");
+
+    for (job_id, final_status) in [
+        (success_id, "ignored"),
+        (retry_id, "retry"),
+        (failed_id, "failed"),
+    ] {
+        let rows = query(
+            "update post_history_entries set status = $2, processing_started_at = null, lease_expires_at = null where post_comment_job_id = $1 and status = 'processing' and attempts = 1 and lease_expires_at > now()",
+        )
+        .bind(job_id)
+        .bind(final_status)
+        .execute(pool)
+        .await
+        .expect("current history finalizer must execute")
+        .rows_affected();
+        assert_eq!(rows, 1);
+        let state: (String, bool, bool) = query_as(
+            "select status, processing_started_at is not null, lease_expires_at is not null from post_history_entries where post_comment_job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("finalized history row must remain queryable");
+        assert_eq!(state, (final_status.to_string(), false, false));
+    }
 }
 
 async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool) {

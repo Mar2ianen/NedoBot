@@ -5,8 +5,14 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::config::Config;
-use crate::features::memory::embedding::{embed_text, pgvector_literal};
 use crate::features::search::types::SearchResult;
+use crate::features::{
+    jobs::{
+        claim::CasResult,
+        policy::{POST_HISTORY_LEASE, POST_HISTORY_RETRY},
+    },
+    memory::embedding::{embed_text, pgvector_literal},
+};
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
@@ -18,8 +24,6 @@ const MAX_SKIP_REASON_CHARS: usize = 240;
 const MAX_ENTITIES: usize = 12;
 const MAX_ENTITY_CHARS: usize = 80;
 const MAX_HISTORY_ATTEMPTS: i32 = 10;
-const INITIAL_HISTORY_RETRY_DELAY_SECONDS: i64 = 15;
-const MAX_HISTORY_RETRY_DELAY_SECONDS: i64 = 3_600;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MemoryNote {
@@ -231,7 +235,7 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
                 embedding,
             )
             .await?;
-            if !saved {
+            if saved == CasResult::LeaseLost {
                 tracing::info!(
                     history_entry_id = entry.id,
                     attempts = entry.attempts,
@@ -251,7 +255,7 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
                     mark_history_failed(pool, entry.id, entry.attempts, error_kind).await?
                 }
             };
-            if updated {
+            if updated == CasResult::Applied {
                 match history_retry_action(entry.attempts) {
                     HistoryRetryAction::Retry { delay_seconds } => tracing::warn!(
                         %err,
@@ -282,50 +286,50 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
 }
 
 async fn claim_history_entry(pool: &PgPool) -> anyhow::Result<Option<PendingHistoryEntry>> {
-    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, (i64, i32, String, String, Option<Value>, i32)>(
         r#"
-        select id, source_message_id, post_text, bot_comment, used_search_result, attempts + 1
-        from post_history_entries
-        where (status in ('pending', 'retry') and next_attempt_at <= now())
-           or (status = 'processing' and processing_started_at < now() - interval '5 minutes')
-        order by next_attempt_at, created_at
-        for update skip locked
-        limit 1
-        "#,
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some((id, source_message_id, post_text, bot_comment, used_search_result, attempts)) = row
-    else {
-        tx.commit().await?;
-        return Ok(None);
-    };
-    sqlx::query(
-        r#"
-        update post_history_entries
+        with candidate as (
+            select id
+            from post_history_entries
+            where (status in ('pending', 'retry') and next_attempt_at <= now())
+               or (status = 'processing'
+                   and (lease_expires_at is null or lease_expires_at <= now()))
+            order by next_attempt_at, created_at
+            for update skip locked
+            limit 1
+        )
+        update post_history_entries entry
         set status = 'processing',
-            attempts = $2,
+            attempts = entry.attempts + 1,
             processing_started_at = now(),
+            lease_expires_at = now() + make_interval(secs => $1::double precision),
             updated_at = now()
-        where id = $1
+        from candidate
+        where entry.id = candidate.id
+        returning entry.id,
+                  entry.source_message_id,
+                  entry.post_text,
+                  entry.bot_comment,
+                  entry.used_search_result,
+                  entry.attempts
         "#,
     )
-    .bind(id)
-    .bind(attempts)
-    .execute(&mut *tx)
+    .bind(POST_HISTORY_LEASE.seconds() as f64)
+    .fetch_optional(pool)
     .await?;
-    tx.commit().await?;
 
-    Ok(Some(PendingHistoryEntry {
-        id,
-        source_message_id,
-        post_text,
-        bot_comment,
-        used_search_result,
-        attempts,
-    }))
+    Ok(row.map(
+        |(id, source_message_id, post_text, bot_comment, used_search_result, attempts)| {
+            PendingHistoryEntry {
+                id,
+                source_message_id,
+                post_text,
+                bot_comment,
+                used_search_result,
+                attempts,
+            }
+        },
+    ))
 }
 
 async fn build_history_entry(
@@ -376,14 +380,14 @@ async fn save_history_entry(
     generation: &crate::llm::types::GeneratedText,
     summary: MemorySummaryOutput,
     embedding: Option<Vec<f32>>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<CasResult> {
     let status = if summary.summary.is_some() {
         "ready"
     } else {
         "ignored"
     };
     let embedding = embedding.as_deref().map(pgvector_literal).transpose()?;
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         update post_history_entries
         set summary = $2,
@@ -402,6 +406,7 @@ async fn save_history_entry(
             embedding_model = case when $10::text is null then null else $11 end,
             error_kind = null,
             processing_started_at = null,
+            lease_expires_at = null,
             updated_at = now()
         where id = $1
           and status = 'processing'
@@ -421,9 +426,8 @@ async fn save_history_entry(
     .bind(&config.rag_embedding_model)
     .bind(attempts)
     .execute(pool)
-    .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(Into::into)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
 }
 
 async fn mark_history_retry(
@@ -432,13 +436,14 @@ async fn mark_history_retry(
     attempts: i32,
     delay_seconds: i64,
     error_kind: &str,
-) -> anyhow::Result<bool> {
-    sqlx::query(
+) -> anyhow::Result<CasResult> {
+    let result = sqlx::query(
         r#"
         update post_history_entries
         set status = 'retry',
             next_attempt_at = now() + make_interval(secs => $2::double precision),
             processing_started_at = null,
+            lease_expires_at = null,
             error_kind = $3,
             updated_at = now()
         where id = $1
@@ -451,9 +456,8 @@ async fn mark_history_retry(
     .bind(error_kind)
     .bind(attempts)
     .execute(pool)
-    .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(Into::into)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
 }
 
 async fn mark_history_failed(
@@ -461,12 +465,13 @@ async fn mark_history_failed(
     id: i64,
     attempts: i32,
     error_kind: &str,
-) -> anyhow::Result<bool> {
-    sqlx::query(
+) -> anyhow::Result<CasResult> {
+    let result = sqlx::query(
         r#"
         update post_history_entries
         set status = 'failed',
             processing_started_at = null,
+            lease_expires_at = null,
             error_kind = $2,
             updated_at = now()
         where id = $1
@@ -478,9 +483,8 @@ async fn mark_history_failed(
     .bind(error_kind)
     .bind(attempts)
     .execute(pool)
-    .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(Into::into)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
 }
 
 fn history_retry_action(attempts: i32) -> HistoryRetryAction {
@@ -488,10 +492,9 @@ fn history_retry_action(attempts: i32) -> HistoryRetryAction {
         return HistoryRetryAction::Fail;
     }
 
-    let exponent = u32::try_from(attempts.saturating_sub(1)).unwrap_or(0);
-    let delay_seconds = INITIAL_HISTORY_RETRY_DELAY_SECONDS
-        .saturating_mul(2_i64.saturating_pow(exponent))
-        .min(MAX_HISTORY_RETRY_DELAY_SECONDS);
+    let delay_seconds = POST_HISTORY_RETRY
+        .delay_seconds(attempts, None)
+        .expect("history retry policy must cover every non-terminal attempt");
     HistoryRetryAction::Retry { delay_seconds }
 }
 

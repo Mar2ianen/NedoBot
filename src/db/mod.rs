@@ -16,7 +16,7 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes.
     // Touched with each migration addition because SQLx embeds this directory at compile time.
-    // The latest reviewed MCP projection migration is embedded with this directory.
+    // The post-history lease migration is embedded with this directory.
     sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())
 }
