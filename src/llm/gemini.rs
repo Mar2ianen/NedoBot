@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::http;
+use crate::llm::profiles::{StructuredOutputMode, ThinkingMode};
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -14,6 +15,8 @@ pub struct GeminiClient<'a> {
     api_key: &'a str,
     proxy_url: Option<&'a str>,
     thinking_budget: u32,
+    profile_thinking: Option<ThinkingMode>,
+    profile_structured_output: Option<StructuredOutputMode>,
     timeout: Duration,
 }
 
@@ -24,6 +27,8 @@ impl<'a> GeminiClient<'a> {
             api_key: config.gemini_api_key.trim(),
             proxy_url: config.llm_proxy_url.as_deref().map(str::trim),
             thinking_budget: config.gemini_thinking_budget,
+            profile_thinking: None,
+            profile_structured_output: None,
             timeout: Duration::from_secs(45),
         }
     }
@@ -33,6 +38,8 @@ impl<'a> GeminiClient<'a> {
         api_key: &'a str,
         proxy_url: Option<&'a str>,
         thinking_budget: u32,
+        thinking: ThinkingMode,
+        structured_output: StructuredOutputMode,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -40,6 +47,8 @@ impl<'a> GeminiClient<'a> {
             api_key: api_key.trim(),
             proxy_url: proxy_url.map(str::trim),
             thinking_budget,
+            profile_thinking: Some(thinking),
+            profile_structured_output: Some(structured_output),
             timeout,
         }
     }
@@ -63,7 +72,12 @@ impl LlmClient for GeminiClient<'_> {
                 role: "user",
                 parts: request_parts(request.prompt, request.image_base64),
             }],
-            generation_config: generation_config(&request, self.thinking_budget),
+            generation_config: generation_config(
+                &request,
+                self.thinking_budget,
+                self.profile_thinking,
+                self.profile_structured_output,
+            ),
         };
 
         let response = http::client_with_proxy(self.timeout, self.proxy_url)?
@@ -191,31 +205,56 @@ struct GeminiResponsePart {
     thought: bool,
 }
 
-fn generation_config<'a>(request: &LlmRequest<'a>, thinking_budget: u32) -> GenerationConfig<'a> {
-    let is_gemini_3 = request.model.trim().starts_with("gemini-3.");
-    let thinking_config = if is_gemini_3 {
-        // Gemini 3.x использует thinkingLevel, а temperature для него уже deprecated.
-        Some(ThinkingConfig {
-            thinking_budget: None,
-            thinking_level: Some("low"),
-        })
+fn generation_config<'a>(
+    request: &LlmRequest<'a>,
+    thinking_budget: u32,
+    profile_thinking: Option<ThinkingMode>,
+    profile_structured_output: Option<StructuredOutputMode>,
+) -> GenerationConfig<'a> {
+    let legacy_gemini_3 = request.model.trim().starts_with("gemini-3.");
+    let legacy_thinking = if legacy_gemini_3 {
+        ThinkingMode::LevelLow
+    } else if thinking_budget > 0 {
+        ThinkingMode::Budget
     } else {
-        (thinking_budget > 0).then_some(ThinkingConfig {
+        ThinkingMode::None
+    };
+    let thinking = profile_thinking.unwrap_or(legacy_thinking);
+    let thinking_config = match thinking {
+        ThinkingMode::None => None,
+        ThinkingMode::Budget => Some(ThinkingConfig {
             thinking_budget: Some(thinking_budget),
             thinking_level: None,
-        })
+        }),
+        ThinkingMode::LevelLow => Some(ThinkingConfig {
+            thinking_budget: None,
+            thinking_level: Some("low"),
+        }),
     };
 
+    let adds_thinking_budget = thinking == ThinkingMode::Budget;
+    let structured_mode = profile_structured_output.unwrap_or(StructuredOutputMode::JsonSchema);
+    let has_structured_output = request.structured_output.is_some();
+
     GenerationConfig {
-        temperature: (!is_gemini_3).then_some(request.temperature),
-        max_output_tokens: if is_gemini_3 {
-            request.num_predict
-        } else {
+        temperature: (thinking != ThinkingMode::LevelLow).then_some(request.temperature),
+        max_output_tokens: if adds_thinking_budget {
             request.num_predict.saturating_add(thinking_budget)
+        } else {
+            request.num_predict
         },
         thinking_config,
-        response_mime_type: request.structured_output.map(|_| "application/json"),
-        response_json_schema: request.structured_output.map(|output| output.schema),
+        response_mime_type: (has_structured_output
+            && structured_mode != StructuredOutputMode::PromptOnly)
+            .then_some("application/json"),
+        response_json_schema: (has_structured_output
+            && structured_mode == StructuredOutputMode::JsonSchema)
+            .then(|| {
+                request
+                    .structured_output
+                    .expect("structured output exists")
+                    .schema
+            }),
     }
 }
 
@@ -263,11 +302,45 @@ mod tests {
             num_predict: output_budget,
             structured_output: None,
         };
-        let config = generation_config(&request, thinking_budget);
+        let config = generation_config(&request, thinking_budget, None, None);
 
         let value = serde_json::to_value(config).unwrap();
         assert_eq!(value["maxOutputTokens"], json!(346));
         assert_eq!(value["thinkingConfig"]["thinkingBudget"], json!(256));
+        assert!(
+            value["temperature"]
+                .as_f64()
+                .is_some_and(|value| (value - 0.35).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn profile_generation_config_honors_declared_thinking_and_structured_modes() {
+        let schema = json!({"type": "object"});
+        let request = LlmRequest {
+            model: "arbitrary-profile-model",
+            system_prompt: None,
+            prompt: "hello",
+            image_base64: None,
+            temperature: 0.35,
+            num_predict: 180,
+            structured_output: Some(crate::llm::types::StructuredOutput {
+                name: "result",
+                schema: &schema,
+            }),
+        };
+        let config = generation_config(
+            &request,
+            1024,
+            Some(ThinkingMode::None),
+            Some(StructuredOutputMode::PromptOnly),
+        );
+
+        let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["maxOutputTokens"], json!(180));
+        assert!(value.get("thinkingConfig").is_none());
+        assert!(value.get("responseMimeType").is_none());
+        assert!(value.get("responseJsonSchema").is_none());
         assert!(
             value["temperature"]
                 .as_f64()
@@ -290,7 +363,7 @@ mod tests {
                 schema: &schema,
             }),
         };
-        let config = generation_config(&request, 1024);
+        let config = generation_config(&request, 1024, None, None);
 
         let value = serde_json::to_value(config).unwrap();
         assert_eq!(value["maxOutputTokens"], json!(180));
