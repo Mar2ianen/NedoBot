@@ -161,7 +161,7 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 
 **Метрики/операционные данные:**
 
-- возраст старейшей ready job;
+- возраст старейшей due initial/retry job (expired processing leases не входят в age);
 - ready/processing/retry/failed/delivery_unknown counts;
 - attempts и terminal failures по безопасному `error_kind`;
 - lease reclaim count;
@@ -175,7 +175,7 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 
 **JOB-4a — выполнено:** `reconcile_comment_delivery` не запускает миграции. `list` и `inspect` только читают БД; `mark-delivered` и `mark-failed` делают только fenced DB-переход из `delivery_unknown` и пишут append-only audit. `retry` требует `--acknowledge-duplicate-risk`, atomically claim-ит ровно указанную ambiguous row с `operator_retry_only`, и только затем создаёт `Config`/`Bot` и запускает реальный pipeline. Обычный worker и `retry_pending_comments` никогда не claim-ят `delivery_unknown`; они могут reclaim-ить только истёкшую pre-send `processing` row с `operator_retry_only`. Ошибка operator retry до send или подтверждённый Telegram rejection становится terminal `failed` и очищает флаг; `sent` также очищает его. Транспортная неоднозначность снова становится `delivery_unknown`, сохраняет флаг и требует нового решения оператора. Каждое terminal/ambiguous outcome добавляет audit в той же транзакции; committed CHECK action enum ограничивает запись существующим `retry`, поэтому сам outcome указывается в `reason`.
 
-**JOB-4b — выполнено:** `job_lifecycle_report` требует только `DATABASE_URL`, не запускает миграции и читает метрики в `SET TRANSACTION READ ONLY`. Он выводит fixed projection для first-comments, embeddings, post-history и reviews: counts/attempts по статусам, возраст старейшей claimable job, суммарные lease reclaim, безопасно нормализованные `error_kind` с attempts и terminal failures. Неизвестный persisted error kind отображается только как `other`. Для embeddings отдельно выводится число строк с `embedding_batch_cardinality`. `lease_reclaim_count` увеличивается исключительно при claim уже истёкшей строки в `processing`; обычные pending/retry claims его не меняют.
+**JOB-4b — выполнено:** `job_lifecycle_report` требует только `DATABASE_URL`, не запускает миграции и читает метрики в `SET TRANSACTION READ ONLY`. Он выводит fixed projection для first-comments, embeddings, post-history и reviews: counts/attempts по статусам, `oldest_ready_age` для старейшей due initial/retry job, суммарные lease reclaim, безопасно нормализованные `error_kind` с attempts и terminal failures. Для reviews ready-age использует тот же ready predicate, что и claim: `status = pending`, `risk_score >= 70`, notification `pending/retry_wait` и due time; expired processing lease в эту age-метрику не входит. Неизвестный persisted error kind отображается только как `other`. Для embeddings отдельно выводится число строк с `embedding_batch_cardinality`. `lease_reclaim_count` увеличивается исключительно при claim уже истёкшей строки в `processing`; обычные pending/retry claims его не меняют.
 
 ## Task JOB-5 — Остаточные regression tests и индексы
 
@@ -193,8 +193,8 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 1. JOB-1: first-comment delivery fencing и `delivery_unknown` — выполнено, ожидает deploy после проверки production-дублей generation.
 2. JOB-2: embedding attempt-CAS и batch cardinality — выполнено, ожидает deploy.
 3. JOB-3: post-history explicit lease — выполнено, ожидает deploy.
-4. JOB-4a: reconciliation — выполнено; JOB-4b: observability — pending.
-5. JOB-5: остаточные regression/performance задачи.
+4. JOB-4a: reconciliation и JOB-4b: observability — выполнены.
+5. JOB-5: остаточные regression/performance задачи — следующий актуальный этап.
 
 JOB-1 и JOB-2 имеют непересекающиеся domain write sets и могут разрабатываться параллельно, но migration и итоговую документацию следует коммитить отдельными логическими единицами.
 

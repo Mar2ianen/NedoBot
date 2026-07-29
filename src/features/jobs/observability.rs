@@ -21,7 +21,7 @@ pub struct JobErrorMetrics {
 pub struct JobQueueMetrics {
     pub queue: &'static str,
     pub statuses: Vec<JobStatusMetrics>,
-    /// Seconds since the earliest retry time among jobs claimable right now.
+    /// Seconds since the earliest due initial/retry delivery, excluding expired leases.
     pub oldest_ready_age_seconds: Option<f64>,
     pub lease_reclaim_count: i64,
     pub errors: Vec<JobErrorMetrics>,
@@ -115,6 +115,7 @@ const REVIEW_READY_AGE_SQL: &str = r#"
     select extract(epoch from now() - min(notification_next_attempt_at))::double precision
     from spam_review_requests
     where status = 'pending'
+      and risk_score >= 70
       and notification_status in ('pending', 'retry_wait')
       and notification_next_attempt_at <= now()
 "#;
@@ -260,6 +261,7 @@ const SAFE_ERROR_KINDS: &[&str] = &[
     "telegram_send_failed",
     "telegram_retry_exhausted",
     "telegram_message_missing",
+    "operator_marked_failed",
 ];
 
 fn safe_error_kind(error_kind: &str) -> &'static str {
