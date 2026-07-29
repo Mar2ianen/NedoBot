@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn ensure_no_arguments() -> anyhow::Result<()> {
-    if std::env::args().skip(1).next().is_some() {
+    if std::env::args().nth(1).is_some() {
         anyhow::bail!("Usage: llm_profile_smoke");
     }
     Ok(())
