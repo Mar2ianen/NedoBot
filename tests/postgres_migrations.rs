@@ -23,7 +23,7 @@ use tg_ai_bot_teloxide::features::{
         mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
-    jobs::claim::CasResult,
+    jobs::{claim::CasResult, observability::load_job_lifecycle_report},
     memory::service::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
@@ -60,6 +60,48 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_avatar_job_finalization_requires_current_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
+    assert_job_lifecycle_observability(&pool).await;
+}
+
+async fn assert_job_lifecycle_observability(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const MESSAGE_ID: i32 = 9_300_003;
+    query(
+        "update telegram_message_embeddings set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .execute(pool)
+    .await
+    .expect("embedding cardinality fixture must be recorded");
+
+    let report = load_job_lifecycle_report(pool)
+        .await
+        .expect("read-only lifecycle report query must succeed");
+    assert_eq!(
+        report.iter().map(|queue| queue.queue).collect::<Vec<_>>(),
+        vec!["first-comments", "embeddings", "post-history", "reviews"]
+    );
+    let embeddings = report
+        .iter()
+        .find(|queue| queue.queue == "embeddings")
+        .expect("embeddings queue must be reported");
+    assert_eq!(embeddings.embedding_batch_cardinality_failures, Some(1));
+    assert!(embeddings.errors.iter().any(|metric| {
+        metric.error_kind == "embedding_batch_cardinality"
+            && metric.jobs == 1
+            && metric.terminal_failures == 1
+    }));
+    let first_comments = report
+        .iter()
+        .find(|queue| queue.queue == "first-comments")
+        .expect("first-comments queue must be reported");
+    assert!(first_comments.lease_reclaim_count >= 1);
+    let history = report
+        .iter()
+        .find(|queue| queue.queue == "post-history")
+        .expect("post-history queue must be reported");
+    assert!(history.lease_reclaim_count >= 1);
 }
 
 async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
@@ -163,6 +205,13 @@ async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
         CasResult::Applied
     );
     assert_history_state(pool, reclaim_id, "ready", false).await;
+    let reclaim_count: i32 =
+        query_scalar("select lease_reclaim_count from post_history_entries where id = $1")
+            .bind(reclaim_id)
+            .fetch_one(pool)
+            .await
+            .expect("reclaimed history row must expose its reclaim count");
+    assert_eq!(reclaim_count, 1);
 }
 
 async fn create_history_fixture(pool: &PgPool, sequence: i32) -> i64 {
@@ -1264,6 +1313,13 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         .expect("reclaim must succeed")
         .expect("expired processing job must be reclaimed");
     assert_eq!(current_job.id, stale_job.id);
+    let reclaim_count: i32 =
+        query_scalar("select lease_reclaim_count from post_comment_jobs where id = $1")
+            .bind(current_job.id)
+            .fetch_one(pool)
+            .await
+            .expect("reclaimed comment job must expose its reclaim count");
+    assert_eq!(reclaim_count, 1);
     assert_eq!(
         begin_post_comment_delivery(pool, &stale_job)
             .await
@@ -1469,13 +1525,88 @@ async fn assert_comment_reconciliation_requires_operator_claim(pool: &PgPool) {
         CasResult::Applied
     );
     assert_job_state(pool, retry_id, "failed", Some("transient"), false).await;
-    let retry_audit: (String, String, i64) = query_as(
-        "select previous_status, resulting_status, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'retry'",
-    ).bind(retry_id).fetch_one(pool).await.expect("retry audit must persist");
+    let retry_failure: (bool, i64) = query_as(
+        "select operator_retry_only, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'retry' and resulting_status = 'failed') from post_comment_jobs where id = $1",
+    )
+    .bind(retry_id)
+    .fetch_one(pool)
+    .await
+    .expect("operator retry failure must clear its flag and persist an outcome audit");
+    assert_eq!(retry_failure, (false, 1));
+
+    let sent_id = create_job(pool, 9_400_304).await;
+    query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")
+        .bind(sent_id)
+        .execute(pool)
+        .await
+        .expect("sent retry fixture must be ambiguous");
+    let sent_retry = claim_delivery_unknown_post_comment_for_operator_retry(
+        pool,
+        sent_id,
+        OperatorAuditParams {
+            actor: "postgres-test",
+            reason: "manual retry expected to send",
+        },
+    )
+    .await
+    .expect("operator sent retry claim must execute")
+    .expect("ambiguous sent retry must be claimed");
     assert_eq!(
-        retry_audit,
-        ("delivery_unknown".to_string(), "processing".to_string(), 1)
+        begin_post_comment_delivery(pool, &sent_retry)
+            .await
+            .unwrap(),
+        CasResult::Applied
     );
+    assert_eq!(
+        finalize_test_comment(pool, &sent_retry, 9_400_404).await,
+        CasResult::Applied
+    );
+    let retry_success: (String, bool, i64) = query_as(
+        "select status, operator_retry_only, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'retry' and resulting_status = 'sent') from post_comment_jobs where id = $1",
+    )
+    .bind(sent_id)
+    .fetch_one(pool)
+    .await
+    .expect("operator retry success must clear its flag and persist an outcome audit");
+    assert_eq!(retry_success, ("sent".to_string(), false, 1));
+
+    let unknown_retry_id = create_job(pool, 9_400_305).await;
+    query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")
+        .bind(unknown_retry_id)
+        .execute(pool)
+        .await
+        .expect("unknown retry fixture must be ambiguous");
+    let unknown_retry = claim_delivery_unknown_post_comment_for_operator_retry(
+        pool,
+        unknown_retry_id,
+        OperatorAuditParams {
+            actor: "postgres-test",
+            reason: "manual retry may remain ambiguous",
+        },
+    )
+    .await
+    .expect("operator unknown retry claim must execute")
+    .expect("ambiguous unknown retry must be claimed");
+    assert_eq!(
+        begin_post_comment_delivery(pool, &unknown_retry)
+            .await
+            .unwrap(),
+        CasResult::Applied
+    );
+    assert_eq!(
+        mark_post_comment_delivery_unknown(pool, &unknown_retry)
+            .await
+            .expect("operator retry ambiguity finalizer must execute"),
+        CasResult::Applied
+    );
+    let retry_unknown: (String, bool, i64) = query_as(
+        "select status, operator_retry_only, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'retry' and resulting_status = 'delivery_unknown') from post_comment_jobs where id = $1",
+    )
+    .bind(unknown_retry_id)
+    .fetch_one(pool)
+    .await
+    .expect("operator retry ambiguity must retain its flag and persist an outcome audit");
+    assert_eq!(retry_unknown, ("delivery_unknown".to_string(), true, 1));
 
     let failed_id = create_job(pool, 9_400_303).await;
     query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")

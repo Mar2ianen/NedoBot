@@ -317,6 +317,8 @@ pub async fn claim_next_history_entry(pool: &PgPool) -> anyhow::Result<Option<Hi
         update post_history_entries entry
         set status = 'processing',
             attempts = entry.attempts + 1,
+            lease_reclaim_count = entry.lease_reclaim_count
+                + case when entry.status = 'processing' then 1 else 0 end,
             processing_started_at = now(),
             lease_expires_at = now() + make_interval(secs => $1::double precision),
             updated_at = now()

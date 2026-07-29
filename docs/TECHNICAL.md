@@ -602,7 +602,7 @@ cargo run --bin reconcile_comment_delivery -- mark-failed --job-id 123 --actor a
 cargo run --bin reconcile_comment_delivery -- retry --job-id 123 --actor alice --reason "verified no reply" --acknowledge-duplicate-risk
 ```
 
-Все operator actions пишутся в `post_comment_job_operator_audit` с bounded `actor` (1–128 символов), `reason` (1–1000), исходным и итоговым status. Повторно claimed job получает `operator_retry_only`; normal worker и `retry_pending_comments` её не берут. Pre-send/confirmed rejection при такой попытке terminally fail без `retry_wait`; network ambiguity снова остаётся `delivery_unknown` и требует нового решения оператора.
+Все operator actions пишутся в `post_comment_job_operator_audit` с bounded `actor` (1–128 символов), `reason` (1–1000), исходным и итоговым status. `delivery_unknown` не claim-ят ни normal worker, ни `retry_pending_comments`; они могут reclaim-ить только просроченную pre-send `processing` задачу с `operator_retry_only`. Pre-send/confirmed rejection при такой попытке terminally fail без `retry_wait` и очищают `operator_retry_only`; подтверждённый `sent` также очищает флаг. Network ambiguity снова становится `delivery_unknown`, сохраняет `operator_retry_only` и требует нового решения оператора. После каждого operator retry outcome (`sent`, `failed`, `delivery_unknown`) добавляется append-only audit: из-за уже применённого CHECK action записывается существующее разрешённое значение `retry`, а outcome указан в reason.
 
 Реакция людей за 30 минут после комментария:
 
@@ -663,6 +663,20 @@ cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.
 ssh vps-153 "podman exec tg-ai-bot-postgres pg_dump -U tg_ai_bot -d tg_ai_bot -Fc -f /tmp/tg_ai_bot_before_export_import.dump"
 ssh vps-153 "podman cp tg-ai-bot-postgres:/tmp/tg_ai_bot_before_export_import.dump /opt/tg-ai-bot-teloxide/tg_ai_bot_before_export_import.dump"
 ```
+
+## Наблюдаемость lifecycle jobs
+
+`job_lifecycle_report` — локальный read-only отчёт для operational state очередей:
+
+```bash
+cargo run --bin job_lifecycle_report
+```
+
+Команде требуется только `DATABASE_URL`; она не создаёт `Config`, не проверяет LLM/Telegram secrets и не запускает миграции. Все запросы определены в typed read-model `features::jobs::observability` и выполняются внутри `SET TRANSACTION READ ONLY`.
+
+Отчёт охватывает `first-comments`, `embeddings`, `post-history` и `reviews`: число jobs и суммарные attempts по статусу, возраст старейшей job, доступной для claim прямо сейчас, безопасные группы `error_kind` с attempts и terminal failures, а также суммарный `lease_reclaim_count`. Неизвестный persisted error kind не выводится: он агрегируется как `other`. Для embeddings отдельно показан текущий счётчик rows с `embedding_batch_cardinality`.
+
+`lease_reclaim_count` сохраняется в доменной таблице и увеличивается только когда worker действительно забирает просроченную `processing` lease. Обычный claim из `pending`/`retry` и повторная попытка после явной failure-finalization его не увеличивают. Для reviews используется аналогичное поле `notification_lease_reclaim_count` её delivery lifecycle.
 
 ## Custom Emoji
 
