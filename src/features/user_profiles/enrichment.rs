@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use teloxide::prelude::*;
 use tokio::sync::mpsc;
@@ -13,7 +14,11 @@ use crate::{
     features::{
         avatar_analysis::service::enqueue_current_avatar_analysis,
         first_message_spam::enqueue_first_message_spam_analysis,
-        new_user_analysis::analyze_new_user_profile,
+        new_user_analysis::{analyze_new_user_profile, load_unified_user_audit_snapshot},
+        new_user_audit::{
+            prompt::PROMPT_VERSION,
+            repo::{NewUserAuditJobParams, enqueue_new_user_audit_job},
+        },
         spam_review::{create_review, send_review},
         user_profiles::service::refresh_profile,
     },
@@ -149,6 +154,11 @@ async fn process_refreshed_profile(
     config: &Config,
     job: ProfileRefreshJob,
 ) {
+    if config.new_user_audit_enabled {
+        enqueue_unified_new_user_audit(pool, job).await;
+        return;
+    }
+
     if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
         tracing::warn!(%err, user_id = job.user_id, "failed to analyze new user profile");
     } else {
@@ -172,6 +182,42 @@ async fn process_refreshed_profile(
         && let Err(err) = enqueue_current_avatar_analysis(pool, job.user_id).await
     {
         tracing::warn!(%err, user_id = job.user_id, "failed to enqueue avatar analysis");
+    }
+}
+
+async fn enqueue_unified_new_user_audit(pool: &PgPool, job: ProfileRefreshJob) {
+    if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
+        tracing::warn!(%err, user_id = job.user_id, "failed to analyze new user profile");
+        return;
+    }
+
+    let snapshot = match load_unified_user_audit_snapshot(pool, job.chat_id, job.user_id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(%err, user_id = job.user_id, "failed to load unified new user audit snapshot");
+            return;
+        }
+    };
+    let snapshot_hash = match serde_json::to_vec(&snapshot) {
+        Ok(bytes) => format!("{:x}", Sha256::digest(bytes)),
+        Err(err) => {
+            tracing::warn!(%err, user_id = job.user_id, "failed to serialize unified new user audit snapshot");
+            return;
+        }
+    };
+
+    let params = NewUserAuditJobParams {
+        chat_id: job.chat_id,
+        telegram_user_id: job.user_id,
+        snapshot_hash: &snapshot_hash,
+        prompt_version: PROMPT_VERSION,
+        input_json: &snapshot,
+        avatar_file_id: None,
+        avatar_file_unique_id: None,
+    };
+    if let Err(err) = enqueue_new_user_audit_job(pool, params).await {
+        tracing::warn!(%err, user_id = job.user_id, "failed to enqueue unified new user audit");
     }
 }
 
