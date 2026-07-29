@@ -181,6 +181,9 @@ models = ["groq_cleanup", "ollama_memory"]
 [routes.first_message_spam]
 models = ["cerebras_spam", "ollama_memory"]
 
+[routes.new_user_audit]
+models = ["gemini_comment"]
+
 [routes.search_extract]
 models = ["ollama_memory"]
 

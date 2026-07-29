@@ -10,6 +10,7 @@ const ROUTES: &[&str] = &[
     "search_extract",
     "avatar_analysis",
     "first_message_spam",
+    "new_user_audit",
     "ask",
     "legacy_default",
 ];
@@ -25,6 +26,14 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("LLM_PROFILES_PATH must be configured for profile smoke testing");
     }
 
+    let validator = |content: &str| {
+        if content.trim().eq_ignore_ascii_case("ok") {
+            Ok(())
+        } else {
+            anyhow::bail!("smoke response must normalize exactly to `ok`");
+        }
+    };
+
     for route in ROUTES {
         let generation = generate_text_with_provider_checked(
             &config,
@@ -37,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
                 image_base64: None,
                 temperature: 0.0,
                 num_predict: 32,
-                output_validator: None,
+                output_validator: Some(&validator),
                 structured_output: None,
             },
         )

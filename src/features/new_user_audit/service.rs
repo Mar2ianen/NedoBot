@@ -5,7 +5,7 @@ use crate::features::jobs::claim::CasResult;
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
-    finalize_new_user_audit_job, mark_new_user_audit_retry,
+    finalize_new_user_audit_job, mark_new_user_audit_failed, mark_new_user_audit_retry,
 };
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
@@ -31,15 +31,29 @@ async fn process_job(pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
     let result = generate_and_finalize(pool, config, job).await;
     let Err(error) = result else { return };
 
-    let error_kind = audit_error_kind(&error);
-    match mark_new_user_audit_retry(pool, job, error_kind, None).await {
-        Ok(CasResult::Applied) => {
-            tracing::warn!(
+    let failure = classify_audit_failure(&error);
+    let result = match failure {
+        AuditFailure::Retry { error_kind } => {
+            mark_new_user_audit_retry(pool, job, error_kind, None).await
+        }
+        AuditFailure::Terminal { error_kind } => {
+            mark_new_user_audit_failed(pool, job, error_kind).await
+        }
+    };
+
+    match result {
+        Ok(CasResult::Applied) => match failure {
+            AuditFailure::Retry { error_kind } => tracing::warn!(
                 job_id = job.id,
                 error_kind,
                 "new user audit job failed and was scheduled for retry"
-            );
-        }
+            ),
+            AuditFailure::Terminal { error_kind } => tracing::warn!(
+                job_id = job.id,
+                error_kind,
+                "new user audit job failed permanently"
+            ),
+        },
         Ok(CasResult::LeaseLost) => {
             tracing::warn!(
                 job_id = job.id,
@@ -50,7 +64,7 @@ async fn process_job(pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
         Err(_) => {
             tracing::warn!(
                 job_id = job.id,
-                "failed to persist new user audit retry state"
+                "failed to persist new user audit failure state"
             );
         }
     }
@@ -62,6 +76,10 @@ async fn generate_and_finalize(
     job: &NewUserAuditJob,
 ) -> anyhow::Result<()> {
     let prompt = build_input(&job.input_json)?;
+    let has_avatar_input = job.avatar_file_id.is_some();
+    let output_validator = move |output: &str| {
+        NewUserAuditAssessment::parse_for_input(output, has_avatar_input).map(|_| ())
+    };
     let generation = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
@@ -76,7 +94,7 @@ async fn generate_and_finalize(
             image_base64: None,
             temperature: 0.0,
             num_predict: config.llm_max_tokens,
-            output_validator: None,
+            output_validator: Some(&output_validator),
             structured_output: Some(StructuredOutput {
                 name: "new_user_audit_assessment",
                 schema: output_schema(),
@@ -85,7 +103,7 @@ async fn generate_and_finalize(
     )
     .await?;
 
-    NewUserAuditAssessment::parse(&generation.content)?;
+    NewUserAuditAssessment::parse_for_input(&generation.content, has_avatar_input)?;
     let assessment_json = serde_json::from_str(&generation.content)?;
     let finalized = finalize_new_user_audit_job(
         pool,
@@ -107,19 +125,63 @@ async fn generate_and_finalize(
     Ok(())
 }
 
-fn audit_error_kind(error: &anyhow::Error) -> &'static str {
+#[derive(Clone, Copy)]
+enum AuditFailure {
+    Retry { error_kind: &'static str },
+    Terminal { error_kind: &'static str },
+}
+
+fn classify_audit_failure(error: &anyhow::Error) -> AuditFailure {
     match error.downcast_ref::<LlmTransportError>() {
-        Some(LlmTransportError::HttpStatus(429)) => "http_429",
-        Some(LlmTransportError::HttpStatus(_)) | Some(LlmTransportError::EmptyResponse) => {
-            "transient"
+        Some(LlmTransportError::HttpStatus(400)) => AuditFailure::Terminal {
+            error_kind: "http_400",
+        },
+        Some(LlmTransportError::HttpStatus(401)) => AuditFailure::Terminal {
+            error_kind: "http_401",
+        },
+        Some(LlmTransportError::HttpStatus(403)) => AuditFailure::Terminal {
+            error_kind: "http_403",
+        },
+        Some(LlmTransportError::HttpStatus(404)) => AuditFailure::Terminal {
+            error_kind: "http_404",
+        },
+        Some(LlmTransportError::HttpStatus(408)) => AuditFailure::Retry {
+            error_kind: "http_408",
+        },
+        Some(LlmTransportError::HttpStatus(422)) => AuditFailure::Terminal {
+            error_kind: "http_422",
+        },
+        Some(LlmTransportError::HttpStatus(429)) => AuditFailure::Retry {
+            error_kind: "http_429",
+        },
+        Some(LlmTransportError::HttpStatus(status)) if (500..=599).contains(status) => {
+            AuditFailure::Retry {
+                error_kind: "http_5xx",
+            }
         }
-        Some(LlmTransportError::Configuration) => "error",
+        Some(LlmTransportError::HttpStatus(status)) if (400..=499).contains(status) => {
+            AuditFailure::Terminal {
+                error_kind: "http_4xx",
+            }
+        }
+        Some(LlmTransportError::HttpStatus(_)) | Some(LlmTransportError::EmptyResponse) => {
+            AuditFailure::Retry {
+                error_kind: "transient",
+            }
+        }
+        Some(LlmTransportError::Configuration) => AuditFailure::Terminal {
+            error_kind: "configuration",
+        },
         None if error
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout) =>
         {
-            "timeout"
+            AuditFailure::Retry {
+                error_kind: "timeout",
+            }
         }
-        None => "validation_failed",
+        None => AuditFailure::Terminal {
+            error_kind: "validation_failed",
+        },
     }
 }
