@@ -21,6 +21,10 @@ use tg_ai_bot_teloxide::features::{
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
     jobs::claim::CasResult,
+    memory::service::{
+        HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
+        finalize_history_failed, finalize_history_retry,
+    },
     spam_review::{claim_next_review_delivery, create_review, mark_review_delivery_succeeded},
     stats::{
         render_html, render_rich, repo as stats_repo,
@@ -56,36 +60,20 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
 
 async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
     const STAGED_JOB: i32 = 9_500_001;
-    const STALE_JOB: i32 = 9_500_002;
-    const SUCCESS_JOB: i32 = 9_500_003;
-    const RETRY_JOB: i32 = 9_500_004;
-    const FAILED_JOB: i32 = 9_500_005;
+    const SUCCESS_JOB: i32 = 9_500_002;
+    const RETRY_JOB: i32 = 9_500_003;
+    const FAILED_JOB: i32 = 9_500_004;
+    const RECLAIM_JOB: i32 = 9_500_005;
 
     let staged_id = create_job(pool, STAGED_JOB).await;
-    let stale_id = create_job(pool, STALE_JOB).await;
-    let success_id = create_job(pool, SUCCESS_JOB).await;
-    let retry_id = create_job(pool, RETRY_JOB).await;
-    let failed_id = create_job(pool, FAILED_JOB).await;
-    let stale_started_at = Utc::now() - Duration::minutes(10);
-    let current_started_at = Utc::now();
-    for (job_id, source_message_id, started_at) in [
-        (staged_id, STAGED_JOB, stale_started_at),
-        (stale_id, STALE_JOB, stale_started_at),
-        (success_id, SUCCESS_JOB, current_started_at),
-        (retry_id, RETRY_JOB, current_started_at),
-        (failed_id, FAILED_JOB, current_started_at),
-    ] {
-        query(
-            "insert into post_history_entries (post_comment_job_id, source_channel_id, source_message_id, post_text, bot_comment, status, attempts, processing_started_at, lease_expires_at) values ($1, -1001575496091, $2, 'lease lifecycle post', 'lease lifecycle comment', 'processing', 1, $3, null)",
-        )
-        .bind(job_id)
-        .bind(source_message_id)
-        .bind(started_at)
-        .execute(pool)
-        .await
-        .expect("post history lease fixture must be inserted");
-    }
-
+    query(
+        "insert into post_history_entries (post_comment_job_id, source_channel_id, source_message_id, post_text, bot_comment, status, attempts, processing_started_at, lease_expires_at) values ($1, -1001575496091, $2, 'lease lifecycle post', 'lease lifecycle comment', 'processing', 1, null, null)",
+    )
+    .bind(staged_id)
+    .bind(STAGED_JOB)
+    .execute(pool)
+    .await
+    .expect("staged processing history row must be inserted");
     query("drop index if exists public.post_history_entries_processing_lease_idx")
         .execute(pool)
         .await
@@ -96,23 +84,14 @@ async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("post history lease migration must upgrade staged processing rows");
-
     let staged_lease_expired: bool = query_scalar(
-        "select lease_expires_at < now() from post_history_entries where post_comment_job_id = $1",
+        "select lease_expires_at < now() from post_history_entries where post_comment_job_id = $1 and processing_started_at is null",
     )
     .bind(staged_id)
     .fetch_one(pool)
     .await
-    .expect("legacy processing row must receive an expired lease");
+    .expect("legacy row without processing start must receive an expired lease");
     assert!(staged_lease_expired);
-    let current_lease_is_derived_from_started_at: bool = query_scalar(
-        "select lease_expires_at >= processing_started_at + interval '5 minutes' from post_history_entries where post_comment_job_id = $1",
-    )
-    .bind(success_id)
-    .fetch_one(pool)
-    .await
-    .expect("legacy processing lease must derive from its start timestamp");
-    assert!(current_lease_is_derived_from_started_at);
     let lease_index: Option<String> = query_scalar(
         "select indexname from pg_indexes where schemaname = 'public' and tablename = 'post_history_entries' and indexname = 'post_history_entries_processing_lease_idx'",
     )
@@ -123,62 +102,123 @@ async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
         lease_index.as_deref(),
         Some("post_history_entries_processing_lease_idx")
     );
-
-    let reclaimed_attempts: i32 = query_scalar(
-        r#"
-        with candidate as (
-            select id from post_history_entries
-            where post_comment_job_id = $1
-              and status = 'processing'
-              and (lease_expires_at is null or lease_expires_at <= now())
-            for update skip locked
-        )
-        update post_history_entries entry
-        set status = 'processing', attempts = entry.attempts + 1,
-            processing_started_at = now(), lease_expires_at = now() + interval '5 minutes'
-        from candidate where entry.id = candidate.id
-        returning entry.attempts
-        "#,
-    )
-    .bind(stale_id)
-    .fetch_one(pool)
-    .await
-    .expect("expired history claim must be reclaimed");
-    assert_eq!(reclaimed_attempts, 2);
-    let stale_finalizer_rows = query(
-        "update post_history_entries set status = 'ready' where post_comment_job_id = $1 and status = 'processing' and attempts = 1 and lease_expires_at > now()",
-    )
-    .bind(stale_id)
-    .execute(pool)
-    .await
-    .expect("stale history finalizer must execute")
-    .rows_affected();
-    assert_eq!(stale_finalizer_rows, 0, "stale claim must lose CAS");
-
-    for (job_id, final_status) in [
-        (success_id, "ignored"),
-        (retry_id, "retry"),
-        (failed_id, "failed"),
-    ] {
-        let rows = query(
-            "update post_history_entries set status = $2, processing_started_at = null, lease_expires_at = null where post_comment_job_id = $1 and status = 'processing' and attempts = 1 and lease_expires_at > now()",
-        )
-        .bind(job_id)
-        .bind(final_status)
+    query("update post_history_entries set status = 'failed' where id = $1")
+        .bind(staged_id)
         .execute(pool)
         .await
-        .expect("current history finalizer must execute")
-        .rows_affected();
-        assert_eq!(rows, 1);
-        let state: (String, bool, bool) = query_as(
-            "select status, processing_started_at is not null, lease_expires_at is not null from post_history_entries where post_comment_job_id = $1",
-        )
-        .bind(job_id)
-        .fetch_one(pool)
+        .expect("staged migration fixture must be closed");
+
+    let success_id = create_history_fixture(pool, SUCCESS_JOB).await;
+    let success_claim = claim_history_entry(pool, success_id, 1).await;
+    expire_history_lease(pool, success_id).await;
+    assert_eq!(
+        finalize_history_entry(pool, &success_claim, ready_history_completion())
+            .await
+            .expect("expired, unreclaimed success finalizer must execute"),
+        CasResult::Applied
+    );
+    assert_history_state(pool, success_id, "ready", false).await;
+
+    let retry_id = create_history_fixture(pool, RETRY_JOB).await;
+    let retry_claim = claim_history_entry(pool, retry_id, 1).await;
+    expire_history_lease(pool, retry_id).await;
+    assert_eq!(
+        finalize_history_retry(pool, &retry_claim, "test_retry")
+            .await
+            .expect("expired, unreclaimed retry finalizer must execute"),
+        CasResult::Applied
+    );
+    assert_history_state(pool, retry_id, "retry", true).await;
+
+    let failed_id = create_history_fixture(pool, FAILED_JOB).await;
+    let failed_claim = claim_history_entry(pool, failed_id, 1).await;
+    expire_history_lease(pool, failed_id).await;
+    assert_eq!(
+        finalize_history_failed(pool, &failed_claim, "test_failure")
+            .await
+            .expect("expired, unreclaimed failed finalizer must execute"),
+        CasResult::Applied
+    );
+    assert_history_state(pool, failed_id, "failed", false).await;
+
+    let reclaim_id = create_history_fixture(pool, RECLAIM_JOB).await;
+    let first_claim = claim_history_entry(pool, reclaim_id, 1).await;
+    expire_history_lease(pool, reclaim_id).await;
+    let second_claim = claim_history_entry(pool, reclaim_id, 2).await;
+    assert_eq!(second_claim.id, first_claim.id);
+    assert_eq!(
+        finalize_history_entry(pool, &first_claim, ready_history_completion())
+            .await
+            .expect("stale history finalizer must execute"),
+        CasResult::LeaseLost
+    );
+    assert_eq!(
+        finalize_history_entry(pool, &second_claim, ready_history_completion())
+            .await
+            .expect("current reclaimed history finalizer must execute"),
+        CasResult::Applied
+    );
+    assert_history_state(pool, reclaim_id, "ready", false).await;
+}
+
+async fn create_history_fixture(pool: &PgPool, sequence: i32) -> i64 {
+    let post_comment_job_id = create_job(pool, sequence).await;
+    let id: i64 = query_scalar(
+        "insert into post_history_entries (post_comment_job_id, source_channel_id, source_message_id, post_text, bot_comment, next_attempt_at) values ($1, -1001575496091, $2, 'lease lifecycle post', 'lease lifecycle comment', now() - interval '1 day') returning id",
+    )
+    .bind(post_comment_job_id)
+    .bind(sequence)
+    .fetch_one(pool)
+    .await
+    .expect("post history lifecycle fixture must be inserted");
+    id
+}
+
+async fn claim_history_entry(
+    pool: &PgPool,
+    expected_id: i64,
+    expected_attempts: i32,
+) -> tg_ai_bot_teloxide::features::memory::service::HistoryEntryClaim {
+    let claim = claim_next_history_entry(pool)
         .await
-        .expect("finalized history row must remain queryable");
-        assert_eq!(state, (final_status.to_string(), false, false));
+        .expect("history claim must execute")
+        .expect("history fixture must be claimable");
+    assert_eq!(claim.id, expected_id);
+    assert_eq!(claim.attempts, expected_attempts);
+    claim
+}
+
+async fn expire_history_lease(pool: &PgPool, id: i64) {
+    query("update post_history_entries set lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("history lease must expire for lifecycle test");
+}
+
+fn ready_history_completion() -> HistoryEntryCompletion {
+    HistoryEntryCompletion {
+        summary: Some("A reusable post history summary for lifecycle tests.".to_string()),
+        entities: vec!["fixture".to_string()],
+        used_angle: Some("lifecycle".to_string()),
+        external_fact: None,
+        skip_reason: None,
+        provider: "test".to_string(),
+        model: "test".to_string(),
+        embedding: Some(vec![0.0; 312]),
+        embedding_model: "test".to_string(),
     }
+}
+
+async fn assert_history_state(pool: &PgPool, id: i64, expected_status: &str, retry: bool) {
+    let state: (String, bool, bool, bool) = query_as(
+        "select status, processing_started_at is not null, lease_expires_at is not null, next_attempt_at > now() from post_history_entries where id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("finalized history row must remain queryable");
+    assert_eq!(state, (expected_status.to_string(), false, false, retry));
 }
 
 async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool) {
