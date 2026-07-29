@@ -8,7 +8,7 @@ const SYSTEM_PROMPT: &str = include_str!("../../../prompts/new_user_audit.md");
 
 // Версия сохраняется вместе с job до подключения worker-а.
 #[allow(dead_code)]
-pub const PROMPT_VERSION: &str = "new-user-audit-v1";
+pub const PROMPT_VERSION: &str = "new-user-audit-v2";
 
 // Схема передаётся LLM-провайдеру после подключения worker-а.
 #[allow(dead_code)]
@@ -33,7 +33,7 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                             "personal_photo_probability": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
                             "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                         },
-                        "required": ["primary_class", "secondary_classes", "face_visibility", "adult_level", "visual_motifs", "description", "confidence"]
+                        "required": ["primary_class", "personal_photo_probability", "secondary_classes", "face_visibility", "adult_level", "visual_motifs", "description", "confidence"]
                     }
                 ]
             },
@@ -128,6 +128,28 @@ mod tests {
             schema["properties"]["profile_assessment"]["properties"]["evidence"]["items"]["additionalProperties"],
             false
         );
+        assert_strict_objects_require_all_properties(schema);
+    }
+
+    fn assert_strict_objects_require_all_properties(value: &Value) {
+        if let Some(object) = value.as_object() {
+            if object.get("type") == Some(&json!("object")) {
+                assert_eq!(object.get("additionalProperties"), Some(&json!(false)));
+                let properties = object["properties"].as_object().unwrap();
+                let required = object["required"].as_array().unwrap();
+                assert_eq!(properties.len(), required.len());
+                for key in properties.keys() {
+                    assert!(required.iter().any(|value| value == key));
+                }
+            }
+            for nested in object.values() {
+                assert_strict_objects_require_all_properties(nested);
+            }
+        } else if let Some(values) = value.as_array() {
+            for nested in values {
+                assert_strict_objects_require_all_properties(nested);
+            }
+        }
     }
 
     #[test]
