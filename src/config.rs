@@ -26,7 +26,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
     "paperpaper.ru",
 ];
 
-use crate::llm::profiles::LlmProfiles;
+use crate::llm::profiles::{LlmProfiles, RouteRequirements};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -325,20 +325,36 @@ impl Config {
     pub fn validate_runtime_secrets(&self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
 
-        validate_llm_provider_secret(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
-        validate_llm_provider_model(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
+        if self.llm_profiles.is_some() {
+            self.validate_profile_routes(&mut errors);
+        } else {
+            validate_llm_provider_secret(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
+            validate_llm_provider_model(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
 
-        if self.voice_transcription_enabled && self.voice_auto_transcribe {
-            validate_voice_asr_secret(&mut errors, self);
-            if let Some(provider) = self.voice_cleanup_provider.as_deref() {
-                validate_llm_provider_secret(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
-                validate_llm_provider_model(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
+            if self.voice_transcription_enabled && self.voice_auto_transcribe {
+                validate_voice_asr_secret(&mut errors, self);
+                if let Some(provider) = self.voice_cleanup_provider.as_deref() {
+                    validate_llm_provider_secret(
+                        &mut errors,
+                        self,
+                        provider,
+                        "VOICE_CLEANUP_PROVIDER",
+                    );
+                    validate_llm_provider_model(
+                        &mut errors,
+                        self,
+                        provider,
+                        "VOICE_CLEANUP_PROVIDER",
+                    );
+                }
             }
         }
 
         if self.search_enabled {
             validate_search_config(&mut errors, self);
-            if let Some(provider) = self.search_extract_provider.as_deref() {
+            if self.llm_profiles.is_none()
+                && let Some(provider) = self.search_extract_provider.as_deref()
+            {
                 validate_llm_provider_secret(
                     &mut errors,
                     self,
@@ -365,16 +381,19 @@ impl Config {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
         if self.avatar_classifier_enabled {
-            require_secret(
-                &mut errors,
-                "CEREBRAS_API_KEY",
-                &self.cerebras_api_key,
-                "AVATAR_CLASSIFIER_ENABLED=true",
-            );
-            if self.avatar_classifier_model.is_none() {
-                errors.push(
-                    "AVATAR_CLASSIFIER_ENABLED=true requires AVATAR_CLASSIFIER_MODEL".to_string(),
+            if self.llm_profiles.is_none() {
+                require_secret(
+                    &mut errors,
+                    "CEREBRAS_API_KEY",
+                    &self.cerebras_api_key,
+                    "AVATAR_CLASSIFIER_ENABLED=true",
                 );
+                if self.avatar_classifier_model.is_none() {
+                    errors.push(
+                        "AVATAR_CLASSIFIER_ENABLED=true requires AVATAR_CLASSIFIER_MODEL"
+                            .to_string(),
+                    );
+                }
             }
             if self.avatar_classifier_concurrency == 0 {
                 errors.push("AVATAR_CLASSIFIER_CONCURRENCY must be greater than 0".to_string());
@@ -382,16 +401,19 @@ impl Config {
         }
 
         if self.first_message_spam_enabled {
-            validate_llm_provider_secret(
-                &mut errors,
-                self,
-                &self.first_message_spam_provider,
-                "FIRST_MESSAGE_SPAM_PROVIDER",
-            );
-            if self.first_message_spam_model.is_none() {
-                errors.push(
-                    "FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL".to_string(),
+            if self.llm_profiles.is_none() {
+                validate_llm_provider_secret(
+                    &mut errors,
+                    self,
+                    &self.first_message_spam_provider,
+                    "FIRST_MESSAGE_SPAM_PROVIDER",
                 );
+                if self.first_message_spam_model.is_none() {
+                    errors.push(
+                        "FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL"
+                            .to_string(),
+                    );
+                }
             }
             self.validate_embedding_config(&mut errors);
         }
@@ -400,20 +422,22 @@ impl Config {
             if self.owner_telegram_id.is_none() {
                 errors.push("ASK_ENABLED=true requires OWNER_TELEGRAM_ID".to_string());
             }
-            validate_llm_provider_secret(
-                &mut errors,
-                self,
-                &self.ask_llm_provider,
-                "ASK_LLM_PROVIDER",
-            );
-            validate_llm_provider_model_with_model(
-                &mut errors,
-                self,
-                &self.ask_llm_provider,
-                "ASK_LLM_PROVIDER",
-                self.ask_llm_model.as_deref(),
-                "ASK_LLM_MODEL",
-            );
+            if self.llm_profiles.is_none() {
+                validate_llm_provider_secret(
+                    &mut errors,
+                    self,
+                    &self.ask_llm_provider,
+                    "ASK_LLM_PROVIDER",
+                );
+                validate_llm_provider_model_with_model(
+                    &mut errors,
+                    self,
+                    &self.ask_llm_provider,
+                    "ASK_LLM_PROVIDER",
+                    self.ask_llm_model.as_deref(),
+                    "ASK_LLM_MODEL",
+                );
+            }
             if self.ask_max_steps == 0 {
                 errors.push("ASK_MAX_STEPS must be greater than 0".to_string());
             }
@@ -441,6 +465,103 @@ impl Config {
                 "invalid runtime secret configuration:\n- {}",
                 errors.join("\n- ")
             )
+        }
+    }
+
+    fn validate_profile_routes(&self, errors: &mut Vec<String>) {
+        let Some(profiles) = self.llm_profiles.as_ref() else {
+            return;
+        };
+        let mut routes = vec![(
+            "first_comment",
+            RouteRequirements {
+                requires_images: true,
+                requires_system_prompt: true,
+                num_predict: Some(self.llm_max_tokens),
+                ..RouteRequirements::default()
+            },
+        )];
+        if self.rag_enabled {
+            routes.push((
+                "memory",
+                RouteRequirements {
+                    requires_system_prompt: true,
+                    num_predict: Some(self.memory_llm_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ));
+        }
+        if self.voice_transcription_enabled && self.voice_auto_transcribe {
+            routes.push((
+                "voice_cleanup",
+                RouteRequirements {
+                    requires_system_prompt: true,
+                    num_predict: Some(self.voice_cleanup_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ));
+        }
+        if self.search_enabled {
+            routes.push((
+                "search_extract",
+                RouteRequirements {
+                    requires_system_prompt: true,
+                    num_predict: Some(self.search_extract_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ));
+        }
+        if self.avatar_classifier_enabled {
+            routes.push((
+                "avatar_analysis",
+                RouteRequirements {
+                    requires_images: true,
+                    requires_system_prompt: true,
+                    num_predict: Some(self.avatar_classifier_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ));
+        }
+        if self.first_message_spam_enabled {
+            routes.push((
+                "first_message_spam",
+                RouteRequirements {
+                    requires_system_prompt: true,
+                    num_predict: Some(450),
+                    ..RouteRequirements::default()
+                },
+            ));
+        }
+        if self.ask_enabled {
+            routes.push((
+                "ask",
+                RouteRequirements {
+                    requires_images: true,
+                    requires_system_prompt: true,
+                    num_predict: Some(self.ask_llm_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            ));
+        }
+
+        for (route, requirements) in routes {
+            match profiles.resolve_route(route, &requirements) {
+                Ok(resolved) => {
+                    for selection in resolved.selections {
+                        let configured = std::env::var(&selection.provider.api_key_env)
+                            .is_ok_and(|value| !value.trim().is_empty());
+                        if !configured {
+                            errors.push(format!(
+                                "LLM profile route {route:?} requires non-empty {} for provider {:?}",
+                                selection.provider.api_key_env, selection.provider_key
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!("LLM profile route {route:?} is invalid: {error}"))
+                }
+            }
         }
     }
 
@@ -1047,6 +1168,65 @@ mod tests {
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 
         assert!(err.contains("LLM_PROVIDER requires non-empty GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn profile_mode_validates_route_fallback_secret_environment_names() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let primary = EnvVarGuard::unset("PROFILE_PRIMARY_TEST_KEY");
+        let fallback = EnvVarGuard::unset("PROFILE_FALLBACK_TEST_KEY");
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(
+                r#"
+[providers.primary]
+driver = "openai_compatible"
+base_url = "https://primary.example/v1"
+api_key_env = "PROFILE_PRIMARY_TEST_KEY"
+[providers.fallback]
+driver = "openai_compatible"
+base_url = "https://fallback.example/v1"
+api_key_env = "PROFILE_FALLBACK_TEST_KEY"
+
+[models.primary]
+provider = "primary"
+model = "primary-model"
+[models.primary.capabilities]
+supports_images = true
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 4096
+max_output_tokens = 256
+request_timeout_sec = 5
+thinking = "none"
+
+[models.fallback]
+provider = "fallback"
+model = "fallback-model"
+[models.fallback.capabilities]
+supports_images = true
+supports_tools = false
+supports_system_prompt = true
+structured_output = "prompt_only"
+context_window_tokens = 4096
+max_output_tokens = 256
+request_timeout_sec = 5
+thinking = "none"
+
+[routes.first_comment]
+models = ["primary", "fallback"]
+"#,
+            )
+            .unwrap(),
+        );
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("PROFILE_PRIMARY_TEST_KEY"));
+        assert!(error.contains("PROFILE_FALLBACK_TEST_KEY"));
+        drop(primary);
+        drop(fallback);
     }
 
     #[test]

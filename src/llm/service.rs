@@ -2,6 +2,7 @@ use crate::config::{Config, normalize_llm_provider};
 use crate::llm::gemini::GeminiClient;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai_compat::OpenAiCompatClient;
+use crate::llm::profiles::{LlmDriver, RouteRequirements, RouteSelection};
 use crate::llm::types::{
     GeneratedText, LlmAttempt, LlmClient, LlmRequest, LlmTransportError, StructuredOutput,
 };
@@ -9,6 +10,8 @@ use crate::llm::types::{
 pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
 pub struct GenerateTextOptions<'a> {
+    /// Явное имя task route в `LLM_PROFILES_PATH`; legacy mode его игнорирует.
+    pub route: Option<&'a str>,
     pub provider_override: Option<&'a str>,
     pub model_override: Option<&'a str>,
     pub system_prompt: Option<&'a str>,
@@ -29,6 +32,10 @@ pub async fn generate_text_with_provider_checked(
     config: &Config,
     options: GenerateTextOptions<'_>,
 ) -> anyhow::Result<GeneratedText> {
+    if let Some(profiles) = config.llm_profiles.as_ref() {
+        return generate_text_with_profile_checked(config, profiles, options).await;
+    }
+
     let provider =
         normalize_llm_provider(options.provider_override.unwrap_or(&config.llm_provider))?;
     let model = match options.model_override {
@@ -176,6 +183,185 @@ pub async fn generate_text_with_provider_checked(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no LLM generation attempts were configured")))
+}
+
+async fn generate_text_with_profile_checked(
+    config: &Config,
+    profiles: &crate::llm::profiles::LlmProfiles,
+    options: GenerateTextOptions<'_>,
+) -> anyhow::Result<GeneratedText> {
+    let route = options.route.unwrap_or("legacy_default");
+    let requirements = RouteRequirements {
+        requires_images: options.image_base64.is_some(),
+        requires_system_prompt: options.system_prompt.is_some(),
+        num_predict: Some(options.num_predict),
+        // Любой из режимов профиля задаёт transport contract. PromptOnly намеренно
+        // допустим: JSON-контракт остаётся в prompt и проверяется validator-ом.
+        structured_output: None,
+        ..RouteRequirements::default()
+    };
+    let resolved = profiles.resolve_route(route, &requirements)?;
+    let mut last_error = None;
+    let mut attempts = Vec::new();
+
+    for (fallback_index, selection) in resolved.selections.iter().enumerate() {
+        let mut attempt_prompt = options.prompt.to_string();
+        for attempt in 0..=VALIDATION_RETRY_ATTEMPTS {
+            let generation = generate_profile_once(
+                config,
+                selection,
+                GenerateOnceRequest {
+                    provider: selection.provider_key,
+                    model: &selection.model.model,
+                    system_prompt: options.system_prompt,
+                    prompt: &attempt_prompt,
+                    image_base64: options.image_base64,
+                    temperature: options.temperature,
+                    num_predict: options.num_predict,
+                    structured_output: options.structured_output,
+                },
+            )
+            .await;
+            match generation {
+                Ok(mut generation) => {
+                    let llm_attempt = generation.attempts.pop().expect("generation has attempt");
+                    if let Some(validate) = options.output_validator
+                        && let Err(err) = validate(&generation.content)
+                    {
+                        attempts.push(LlmAttempt {
+                            outcome: "validation_failed".to_string(),
+                            ..llm_attempt
+                        });
+                        last_error = Some(err);
+                        if attempt < VALIDATION_RETRY_ATTEMPTS {
+                            attempt_prompt = validation_retry_prompt(
+                                options.prompt,
+                                &format!("{:#}", last_error.as_ref().expect("validation error")),
+                            );
+                            continue;
+                        }
+                        if !resolved.fallback_on_validation_failure {
+                            return Err(last_error.expect("validation error"));
+                        }
+                        break;
+                    }
+                    attempts.push(llm_attempt);
+                    generation.attempts = attempts;
+                    return Ok(generation);
+                }
+                Err(err) => {
+                    let empty_response = is_empty_response(&err);
+                    attempts.push(LlmAttempt {
+                        provider: selection.provider_key.to_string(),
+                        model: selection.model.model.clone(),
+                        outcome: classify_attempt_error(&err),
+                    });
+                    last_error = Some(err);
+                    if empty_response && attempt < VALIDATION_RETRY_ATTEMPTS {
+                        attempt_prompt = validation_retry_prompt(
+                            options.prompt,
+                            "модель вернула пустой ответ; верни полный ответ по исходному контракту",
+                        );
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        if fallback_index > 0 {
+            tracing::info!(
+                route,
+                fallback_index,
+                provider = selection.provider_key,
+                model = selection.model.model,
+                "LLM profile fallback succeeded"
+            );
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("no compatible LLM profile generation attempts were configured")
+    }))
+}
+
+async fn generate_profile_once(
+    config: &Config,
+    selection: &RouteSelection<'_>,
+    request: GenerateOnceRequest<'_>,
+) -> anyhow::Result<GeneratedText> {
+    let GenerateOnceRequest {
+        system_prompt,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+        structured_output,
+        ..
+    } = request;
+    let api_key = std::env::var(&selection.provider.api_key_env).map_err(|_| {
+        anyhow::anyhow!(
+            "LLM profile provider {:?} requires configured secret {}",
+            selection.provider_key,
+            selection.provider.api_key_env
+        )
+    })?;
+    if api_key.trim().is_empty() {
+        anyhow::bail!(
+            "LLM profile provider {:?} requires configured secret {}",
+            selection.provider_key,
+            selection.provider.api_key_env
+        );
+    }
+    let image_base64 = image_base64.filter(|_| selection.capabilities.supports_images);
+    let request = LlmRequest {
+        model: &selection.model.model,
+        system_prompt,
+        prompt,
+        image_base64,
+        temperature,
+        num_predict,
+        structured_output,
+    };
+    let timeout = std::time::Duration::from_secs(selection.capabilities.request_timeout_sec);
+    let response = match selection.provider.driver {
+        LlmDriver::OpenaiCompatible => {
+            OpenAiCompatClient::new_with_structured_output_mode(
+                &selection.provider.base_url,
+                &api_key,
+                timeout,
+                selection.capabilities.structured_output,
+            )?
+            .generate(request)
+            .await?
+        }
+        LlmDriver::Gemini => {
+            GeminiClient::with_profile(
+                &selection.provider.base_url,
+                &api_key,
+                config.llm_proxy_url.as_deref(),
+                config.gemini_thinking_budget,
+                timeout,
+            )
+            .generate(request)
+            .await?
+        }
+        LlmDriver::OllamaNative => {
+            OllamaClient::with_profile(&selection.provider.base_url, &api_key, timeout)
+                .generate(request)
+                .await?
+        }
+    };
+    Ok(GeneratedText {
+        provider: selection.provider_key.to_string(),
+        model: selection.model.model.clone(),
+        content: response.content,
+        image_used: image_base64.is_some(),
+        attempts: vec![LlmAttempt {
+            provider: selection.provider_key.to_string(),
+            model: selection.model.model.clone(),
+            outcome: "success".to_string(),
+        }],
+    })
 }
 
 fn classify_attempt_error(error: &anyhow::Error) -> String {
@@ -398,6 +584,10 @@ fn supports_images(config: &Config, provider: &str, model: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::SearchMcpTools;
+    use crate::llm::profiles::LlmProfiles;
+    use axum::{Json, Router, extract::State, routing::post};
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
 
     fn config() -> Config {
         Config {
@@ -529,6 +719,106 @@ mod tests {
             public_base_url: None,
             static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn profile_prompt_only_omits_response_format_and_validator_accepts_json_contract() {
+        async fn capture(
+            State(sender): State<mpsc::UnboundedSender<Value>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            sender.send(body).unwrap();
+            Json(json!({
+                "id": "profile-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "profile-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "{\"ok\":true}"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(capture))
+                    .with_state(sender),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(&format!(
+                r#"
+[providers.test]
+driver = "openai_compatible"
+base_url = "http://{address}/v1"
+api_key_env = "PROFILE_PROMPT_ONLY_TEST_KEY"
+
+[models.test]
+provider = "test"
+model = "profile-model"
+[models.test.capabilities]
+supports_images = false
+supports_tools = false
+supports_system_prompt = true
+structured_output = "prompt_only"
+context_window_tokens = 4096
+max_output_tokens = 256
+request_timeout_sec = 5
+thinking = "none"
+
+[routes.profile_test]
+models = ["test"]
+"#
+            ))
+            .unwrap(),
+        );
+        unsafe { std::env::set_var("PROFILE_PROMPT_ONLY_TEST_KEY", "test-key") };
+        let schema = json!({"type": "object"});
+        let validator = |content: &str| -> anyhow::Result<()> {
+            let value: Value = serde_json::from_str(content)?;
+            anyhow::ensure!(value["ok"] == true, "JSON contract is invalid");
+            Ok(())
+        };
+
+        let generated = generate_text_with_provider_checked(
+            &config,
+            GenerateTextOptions {
+                route: Some("profile_test"),
+                provider_override: Some("ignored-legacy-provider"),
+                model_override: Some("ignored-legacy-model"),
+                system_prompt: Some("return a JSON object"),
+                prompt: "{\"contract\":\"JSON only\"}",
+                image_base64: None,
+                temperature: 0.0,
+                num_predict: 64,
+                output_validator: Some(&validator),
+                structured_output: Some(StructuredOutput {
+                    name: "test_contract",
+                    schema: &schema,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(generated.provider, "test");
+        assert_eq!(generated.model, "profile-model");
+        assert_eq!(generated.content, "{\"ok\":true}");
+        let request = receiver.recv().await.unwrap();
+        assert!(request.get("response_format").is_none());
+        assert_eq!(request["model"], "profile-model");
+        unsafe { std::env::remove_var("PROFILE_PROMPT_ONLY_TEST_KEY") };
+        server.abort();
     }
 
     #[test]

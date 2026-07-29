@@ -10,17 +10,37 @@ use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 pub struct GeminiClient<'a> {
+    api_base_url: &'a str,
     api_key: &'a str,
     proxy_url: Option<&'a str>,
     thinking_budget: u32,
+    timeout: Duration,
 }
 
 impl<'a> GeminiClient<'a> {
     pub fn new(config: &'a Config) -> Self {
         Self {
+            api_base_url: GEMINI_API_BASE_URL,
             api_key: config.gemini_api_key.trim(),
             proxy_url: config.llm_proxy_url.as_deref().map(str::trim),
             thinking_budget: config.gemini_thinking_budget,
+            timeout: Duration::from_secs(45),
+        }
+    }
+
+    pub fn with_profile(
+        api_base_url: &'a str,
+        api_key: &'a str,
+        proxy_url: Option<&'a str>,
+        thinking_budget: u32,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            api_base_url: api_base_url.trim_end_matches('/'),
+            api_key: api_key.trim(),
+            proxy_url: proxy_url.map(str::trim),
+            thinking_budget,
+            timeout,
         }
     }
 }
@@ -46,10 +66,10 @@ impl LlmClient for GeminiClient<'_> {
             generation_config: generation_config(&request, self.thinking_budget),
         };
 
-        let response = http::client_with_proxy(Duration::from_secs(45), self.proxy_url)?
+        let response = http::client_with_proxy(self.timeout, self.proxy_url)?
             .post(format!(
                 "{}/models/{}:generateContent",
-                GEMINI_API_BASE_URL,
+                self.api_base_url,
                 request.model.trim()
             ))
             .header(USER_AGENT, "tg-ai-bot-teloxide/0.1")

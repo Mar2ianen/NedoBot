@@ -77,6 +77,7 @@ async fn generate_cleanup_with_provider(
     generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
+            route: Some("voice_cleanup"),
             provider_override: provider,
             model_override: model,
             system_prompt: Some(CLEANUP_PROMPT),

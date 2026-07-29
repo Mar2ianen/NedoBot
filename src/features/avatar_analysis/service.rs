@@ -125,6 +125,7 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: AvatarAnaly
         let generation = generate_text_with_provider_checked(
             config,
             GenerateTextOptions {
+                route: Some("avatar_analysis"),
                 provider_override: Some("cerebras"),
                 model_override: config.avatar_classifier_model.as_deref(),
                 system_prompt: Some(system_prompt()),

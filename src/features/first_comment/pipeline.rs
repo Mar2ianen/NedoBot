@@ -306,6 +306,7 @@ async fn process_post_comment_job(
     let generation = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
+            route: Some("first_comment"),
             provider_override: None,
             model_override: None,
             system_prompt: Some(&prompt.system),
