@@ -95,6 +95,15 @@ pub struct RouteSelection<'a> {
     pub capabilities: &'a ModelCapabilities,
 }
 
+/// Разрешённый маршрут с совместимыми моделями в порядке fallback-цепочки.
+// LP2 вернёт этот результат при подключении profile routes к runtime-генерации.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute<'a> {
+    pub selections: Vec<RouteSelection<'a>>,
+    pub fallback_on_validation_failure: bool,
+}
+
 impl LlmProfiles {
     pub fn from_path(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -166,12 +175,14 @@ impl LlmProfiles {
         &'a self,
         route_name: &str,
         requirements: &RouteRequirements,
-    ) -> anyhow::Result<Vec<RouteSelection<'a>>> {
+    ) -> anyhow::Result<ResolvedRoute<'a>> {
         let route = self
             .routes
             .get(route_name)
             .ok_or_else(|| anyhow::anyhow!("unknown LLM route {route_name:?}"))?;
         let mut selections = Vec::with_capacity(route.models.len());
+        let mut unmet_requirement = None;
+
         for model_key in &route.models {
             let model = self.models.get(model_key).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -184,7 +195,12 @@ impl LlmProfiles {
                     "route profile {route_name:?} model {model_key:?} references unknown provider {provider_key:?}"
                 )
             })?;
-            ensure_capabilities(route_name, model_key, &model.capabilities, requirements)?;
+            if let Err(error) =
+                ensure_capabilities(route_name, model_key, &model.capabilities, requirements)
+            {
+                unmet_requirement.get_or_insert(error);
+                continue;
+            }
             selections.push(RouteSelection {
                 model_key,
                 model,
@@ -193,7 +209,19 @@ impl LlmProfiles {
                 capabilities: &model.capabilities,
             });
         }
-        Ok(selections)
+
+        if selections.is_empty() {
+            let unmet_requirement =
+                unmet_requirement.expect("routes must contain at least one model");
+            anyhow::bail!(
+                "route {route_name:?} has no compatible models for the requested requirements: {unmet_requirement}"
+            );
+        }
+
+        Ok(ResolvedRoute {
+            selections,
+            fallback_on_validation_failure: route.fallback_on_validation_failure,
+        })
     }
 }
 
@@ -346,17 +374,79 @@ models = ["ollama_memory"]
             .resolve_route("voice_cleanup", &RouteRequirements::default())
             .unwrap();
 
-        assert_eq!(selections.len(), 2);
-        assert_eq!(selections[0].model_key, "groq_cleanup");
-        assert_eq!(selections[0].model.model, "llama-3.3-70b-versatile");
-        assert_eq!(selections[0].provider_key, "groq");
-        assert_eq!(selections[0].provider.driver, LlmDriver::OpenaiCompatible);
+        assert_eq!(selections.selections.len(), 2);
+        assert_eq!(selections.selections[0].model_key, "groq_cleanup");
         assert_eq!(
-            selections[0].capabilities.structured_output,
+            selections.selections[0].model.model,
+            "llama-3.3-70b-versatile"
+        );
+        assert_eq!(selections.selections[0].provider_key, "groq");
+        assert_eq!(
+            selections.selections[0].provider.driver,
+            LlmDriver::OpenaiCompatible
+        );
+        assert_eq!(
+            selections.selections[0].capabilities.structured_output,
             StructuredOutputMode::JsonSchema
         );
-        assert_eq!(selections[1].model_key, "ollama_memory");
-        assert_eq!(selections[1].provider_key, "ollama_cloud");
+        assert_eq!(selections.selections[1].model_key, "ollama_memory");
+        assert_eq!(selections.selections[1].provider_key, "ollama_cloud");
+        assert!(!selections.fallback_on_validation_failure);
+    }
+
+    #[test]
+    fn route_resolution_skips_incompatible_models_and_preserves_text_fallbacks() {
+        let profiles = LlmProfiles::from_toml(&EXAMPLE_PROFILES.replace(
+            "fallback_on_validation_failure = false",
+            "fallback_on_validation_failure = true",
+        ))
+        .unwrap();
+
+        let image_route = profiles
+            .resolve_route(
+                "first_comment",
+                &RouteRequirements {
+                    requires_images: true,
+                    ..RouteRequirements::default()
+                },
+            )
+            .unwrap();
+        let image_models: Vec<_> = image_route
+            .selections
+            .iter()
+            .map(|selection| selection.model_key)
+            .collect();
+
+        assert_eq!(
+            image_models,
+            [
+                "gemini_comment",
+                "gemini_flash_comment",
+                "gemini_flash_lite_comment",
+                "gemini_legacy_flash_lite_comment",
+            ]
+        );
+        assert!(image_route.fallback_on_validation_failure);
+
+        let text_route = profiles
+            .resolve_route("first_comment", &RouteRequirements::default())
+            .unwrap();
+        let text_models: Vec<_> = text_route
+            .selections
+            .iter()
+            .map(|selection| selection.model_key)
+            .collect();
+
+        assert_eq!(
+            text_models,
+            [
+                "gemini_comment",
+                "gemini_flash_comment",
+                "gemini_flash_lite_comment",
+                "gemini_legacy_flash_lite_comment",
+                "ollama_memory",
+            ]
+        );
     }
 
     #[test]

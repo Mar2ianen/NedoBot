@@ -18,10 +18,12 @@ use reqwest::header::USER_AGENT;
 
 use crate::config::Config;
 use crate::http;
+use crate::llm::profiles::StructuredOutputMode;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 pub struct OpenAiCompatClient {
     client: Client<OpenAIConfig>,
+    structured_output_mode: StructuredOutputMode,
 }
 
 impl OpenAiCompatClient {
@@ -40,7 +42,14 @@ impl OpenAiCompatClient {
         let http_client = http::client(timeout)?;
         Ok(Self {
             client: Client::with_config(config).with_http_client(http_client),
+            structured_output_mode: StructuredOutputMode::JsonSchema,
         })
+    }
+
+    #[cfg(test)]
+    fn with_structured_output_mode(mut self, structured_output_mode: StructuredOutputMode) -> Self {
+        self.structured_output_mode = structured_output_mode;
+        self
     }
 
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
@@ -58,7 +67,10 @@ impl LlmClient for OpenAiCompatClient {
         let response = self
             .client
             .chat()
-            .create(build_request(request)?)
+            .create(build_request_for_structured_output_mode(
+                request,
+                self.structured_output_mode,
+            )?)
             .await
             .map_err(map_openai_error)?;
         let content = response
@@ -86,7 +98,10 @@ fn map_openai_error(error: OpenAIError) -> anyhow::Error {
     }
 }
 
-fn build_request(request: LlmRequest<'_>) -> anyhow::Result<CreateChatCompletionRequest> {
+fn build_request_for_structured_output_mode(
+    request: LlmRequest<'_>,
+    structured_output_mode: StructuredOutputMode,
+) -> anyhow::Result<CreateChatCompletionRequest> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = request.system_prompt {
         messages.push(ChatCompletionRequestMessage::System(
@@ -109,20 +124,30 @@ fn build_request(request: LlmRequest<'_>) -> anyhow::Result<CreateChatCompletion
         .messages(messages)
         .temperature(request.temperature)
         .max_completion_tokens(request.num_predict);
-    if let Some(output) = request.structured_output {
-        builder.response_format(response_format(output));
+    if let Some(response_format) = request
+        .structured_output
+        .and_then(|output| response_format(structured_output_mode, output))
+    {
+        builder.response_format(response_format);
     }
     builder.build().map_err(Into::into)
 }
 
-fn response_format(output: crate::llm::types::StructuredOutput<'_>) -> ResponseFormat {
-    ResponseFormat::JsonSchema {
-        json_schema: ResponseFormatJsonSchema {
-            description: None,
-            name: output.name.to_string(),
-            schema: output.schema.clone(),
-            strict: Some(true),
-        },
+fn response_format(
+    mode: StructuredOutputMode,
+    output: crate::llm::types::StructuredOutput<'_>,
+) -> Option<ResponseFormat> {
+    match mode {
+        StructuredOutputMode::JsonSchema => Some(ResponseFormat::JsonSchema {
+            json_schema: ResponseFormatJsonSchema {
+                description: None,
+                name: output.name.to_string(),
+                schema: output.schema.clone(),
+                strict: Some(true),
+            },
+        }),
+        StructuredOutputMode::JsonObject => Some(ResponseFormat::JsonObject),
+        StructuredOutputMode::PromptOnly => None,
     }
 }
 
@@ -204,7 +229,14 @@ mod tests {
 
     #[test]
     fn text_request_omits_response_format() {
-        let body = serde_json::to_value(build_request(llm_request(None)).unwrap()).unwrap();
+        let body = serde_json::to_value(
+            build_request_for_structured_output_mode(
+                llm_request(None),
+                StructuredOutputMode::JsonSchema,
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         assert!(body.get("response_format").is_none());
         assert_eq!(body["max_completion_tokens"], 256);
@@ -216,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_emits_authorization_user_agent_image_and_schema_over_http() {
+    async fn client_serializes_every_structured_output_mode_over_http() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -230,44 +262,60 @@ mod tests {
             name: "wire_schema",
             schema: &schema,
         }));
-        let client = OpenAiCompatClient::new(
-            &format!("http://{address}/v1"),
-            "test-compatible-key",
-            Duration::from_secs(5),
-        )
-        .unwrap();
+        let modes = [
+            (StructuredOutputMode::JsonSchema, Some("json_schema")),
+            (StructuredOutputMode::JsonObject, Some("json_object")),
+            (StructuredOutputMode::PromptOnly, None),
+        ];
 
-        assert_eq!(client.generate(request).await.unwrap().content, "OK");
-        let captured = receiver.recv().await.unwrap();
+        for (mode, expected_type) in modes {
+            let client = OpenAiCompatClient::new(
+                &format!("http://{address}/v1"),
+                "test-compatible-key",
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .with_structured_output_mode(mode);
+
+            assert_eq!(client.generate(request).await.unwrap().content, "OK");
+            let captured = receiver.recv().await.unwrap();
+
+            assert_eq!(
+                captured.headers.get(header::AUTHORIZATION).unwrap(),
+                "Bearer test-compatible-key"
+            );
+            assert_eq!(
+                captured.headers.get(header::USER_AGENT).unwrap(),
+                "tg-ai-bot-teloxide/0.1"
+            );
+            assert_eq!(captured.body["max_completion_tokens"], 256);
+            assert_eq!(
+                captured.body["messages"][1]["content"][1]["type"],
+                "image_url"
+            );
+            match expected_type {
+                Some(expected_type) => {
+                    assert_eq!(captured.body["response_format"]["type"], expected_type)
+                }
+                None => assert!(captured.body.get("response_format").is_none()),
+            }
+        }
+
         server.abort();
-
-        assert_eq!(
-            captured.headers.get(header::AUTHORIZATION).unwrap(),
-            "Bearer test-compatible-key"
-        );
-        assert_eq!(
-            captured.headers.get(header::USER_AGENT).unwrap(),
-            "tg-ai-bot-teloxide/0.1"
-        );
-        assert_eq!(captured.body["max_completion_tokens"], 256);
-        assert_eq!(
-            captured.body["messages"][1]["content"][1]["type"],
-            "image_url"
-        );
-        assert_eq!(
-            captured.body["response_format"]["json_schema"]["name"],
-            "wire_schema"
-        );
     }
 
     #[test]
-    fn structured_request_uses_strict_json_schema() {
+    fn json_schema_mode_uses_strict_schema() {
         let schema = json!({"type": "object", "additionalProperties": false});
         let request = llm_request(Some(crate::llm::types::StructuredOutput {
             name: "avatar_profile_assessment",
             schema: &schema,
         }));
-        let body = serde_json::to_value(build_request(request).unwrap()).unwrap();
+        let body = serde_json::to_value(
+            build_request_for_structured_output_mode(request, StructuredOutputMode::JsonSchema)
+                .unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(
@@ -276,5 +324,41 @@ mod tests {
         );
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
+
+    #[test]
+    fn json_object_mode_uses_async_openai_json_object_format() {
+        let schema = json!({"type": "object"});
+        let body = serde_json::to_value(
+            build_request_for_structured_output_mode(
+                llm_request(Some(crate::llm::types::StructuredOutput {
+                    name: "ignored_by_json_object",
+                    schema: &schema,
+                })),
+                StructuredOutputMode::JsonObject,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(body["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[test]
+    fn prompt_only_mode_omits_response_format() {
+        let schema = json!({"type": "object"});
+        let body = serde_json::to_value(
+            build_request_for_structured_output_mode(
+                llm_request(Some(crate::llm::types::StructuredOutput {
+                    name: "ignored_by_prompt_only",
+                    schema: &schema,
+                })),
+                StructuredOutputMode::PromptOnly,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(body.get("response_format").is_none());
     }
 }
