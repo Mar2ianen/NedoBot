@@ -39,6 +39,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
 
     assert_clean_database_migrations(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
+    assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
@@ -238,6 +239,105 @@ async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
     .await
     .expect("post-lifecycle review fixture must remain queryable");
     assert_eq!(current, ("pending".into(), None));
+}
+
+async fn assert_post_comment_delivery_lifecycle_upgrade(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const SOURCE_CHANNEL_ID: i64 = -1001575496091;
+    const PROCESSING_MESSAGE_ID: i32 = 9_400_001;
+    const PENDING_MESSAGE_ID: i32 = 9_400_002;
+    const RETRY_WAIT_MESSAGE_ID: i32 = 9_400_003;
+    const SENT_MESSAGE_ID: i32 = 9_400_004;
+    const FAILED_MESSAGE_ID: i32 = 9_400_005;
+
+    for (message_id, status) in [
+        (PROCESSING_MESSAGE_ID, "processing"),
+        (PENDING_MESSAGE_ID, "pending"),
+        (RETRY_WAIT_MESSAGE_ID, "retry_wait"),
+        (SENT_MESSAGE_ID, "sent"),
+        (FAILED_MESSAGE_ID, "failed"),
+    ] {
+        query(
+            r#"
+            insert into post_comment_jobs
+                (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
+                 cleaned_post_text, status, sent_at)
+            values ($1, $2, $3, $2, 'delivery lifecycle upgrade fixture', $4,
+                    case when $4 = 'sent' then now() else null end)
+            "#,
+        )
+        .bind(CHAT_ID)
+        .bind(message_id)
+        .bind(SOURCE_CHANNEL_ID)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("staged delivery lifecycle fixture must be inserted");
+    }
+
+    query("drop index if exists public.post_comment_jobs_sending_lease_idx")
+        .execute(pool)
+        .await
+        .expect("sending lease index must be removable for staged upgrade");
+    query("drop index if exists public.post_comment_jobs_delivery_unknown_idx")
+        .execute(pool)
+        .await
+        .expect("delivery unknown index must be removable for staged upgrade");
+    query("drop index if exists public.llm_generations_post_comment_job_id_unique")
+        .execute(pool)
+        .await
+        .expect("generation idempotency index must be removable for staged upgrade");
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260729110000_post_comment_delivery_lifecycle.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("delivery lifecycle migration must upgrade staged legacy rows");
+
+    let statuses: Vec<(i32, String)> = query_as(
+        r#"
+        select discussion_message_id, status
+        from post_comment_jobs
+        where discussion_chat_id = $1
+          and discussion_message_id = any($2)
+        order by discussion_message_id
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind([
+        PROCESSING_MESSAGE_ID,
+        PENDING_MESSAGE_ID,
+        RETRY_WAIT_MESSAGE_ID,
+        SENT_MESSAGE_ID,
+        FAILED_MESSAGE_ID,
+    ])
+    .fetch_all(pool)
+    .await
+    .expect("upgraded delivery lifecycle fixtures must remain queryable");
+    assert_eq!(
+        statuses,
+        vec![
+            (PROCESSING_MESSAGE_ID, "delivery_unknown".to_string()),
+            (PENDING_MESSAGE_ID, "pending".to_string()),
+            (RETRY_WAIT_MESSAGE_ID, "retry_wait".to_string()),
+            (SENT_MESSAGE_ID, "sent".to_string()),
+            (FAILED_MESSAGE_ID, "failed".to_string()),
+        ]
+    );
+    query(
+        "delete from post_comment_jobs where discussion_chat_id = $1 and discussion_message_id = any($2)",
+    )
+    .bind(CHAT_ID)
+    .bind([
+        PROCESSING_MESSAGE_ID,
+        PENDING_MESSAGE_ID,
+        RETRY_WAIT_MESSAGE_ID,
+        SENT_MESSAGE_ID,
+        FAILED_MESSAGE_ID,
+    ])
+    .execute(pool)
+    .await
+    .expect("staged delivery lifecycle fixtures must be cleaned up");
 }
 
 async fn assert_avatar_job_finalization_requires_current_claim(pool: &PgPool) {
@@ -1096,6 +1196,9 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
     )
     .await;
 
+    assert_comment_finalization_rolls_back_on_database_error(pool).await;
+    assert_comment_finalization_is_idempotent_when_audit_rows_exist(pool).await;
+
     let sent_job = claim_created_job(pool, 5).await;
     assert_eq!(
         begin_post_comment_delivery(pool, &sent_job).await.unwrap(),
@@ -1118,6 +1221,150 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         CasResult::LeaseLost,
         "a completed send cannot be finalized twice"
     );
+}
+
+async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool) {
+    let job = claim_created_job(pool, 9_400_101).await;
+    assert_eq!(
+        begin_post_comment_delivery(pool, &job)
+            .await
+            .expect("delivery transition must execute"),
+        CasResult::Applied
+    );
+
+    query("drop trigger if exists post_comment_history_failure_trigger on post_history_entries")
+        .execute(pool)
+        .await
+        .expect("previous test trigger must be removable");
+    query("drop function if exists post_comment_history_failure()")
+        .execute(pool)
+        .await
+        .expect("previous test trigger function must be removable");
+    query(
+        r#"
+        create function post_comment_history_failure()
+        returns trigger
+        language plpgsql
+        as $$
+        begin
+            raise exception 'forced post history persistence failure';
+        end;
+        $$
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("failure trigger function must be created");
+    query(
+        r#"
+        create trigger post_comment_history_failure_trigger
+        before insert on post_history_entries
+        for each row execute function post_comment_history_failure()
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("failure trigger must be created");
+
+    let attempts = serde_json::json!([]);
+    let result = finalize_post_comment_sent(
+        pool,
+        &job,
+        FinalizePostCommentSent {
+            bot_comment_message_id: 9_400_201,
+            generation: LlmGenerationInsert {
+                job_id: job.id,
+                provider: "test",
+                model: "test",
+                prompt: "test prompt",
+                image_used: false,
+                response: "test comment",
+                final_html: "test comment",
+                attempts: &attempts,
+                used_search_result_id: None,
+                used_chat_message_ids: &[],
+            },
+            history_used_search_result: None,
+            source_channel_id: job.source_channel_id,
+            source_message_id: job.source_message_id,
+            cleaned_post_text: &job.cleaned_post_text,
+            bot_comment: "test comment",
+        },
+    )
+    .await;
+
+    query("drop trigger post_comment_history_failure_trigger on post_history_entries")
+        .execute(pool)
+        .await
+        .expect("failure trigger must be cleaned up");
+    query("drop function post_comment_history_failure()")
+        .execute(pool)
+        .await
+        .expect("failure trigger function must be cleaned up");
+
+    assert!(
+        result.is_err(),
+        "a true database persistence failure must fail finalization"
+    );
+    let status: String = query_scalar("select status from post_comment_jobs where id = $1")
+        .bind(job.id)
+        .fetch_one(pool)
+        .await
+        .expect("sending job must remain queryable after rollback");
+    assert_eq!(status, "sending");
+}
+
+async fn assert_comment_finalization_is_idempotent_when_audit_rows_exist(pool: &PgPool) {
+    let job = claim_created_job(pool, 9_400_102).await;
+    assert_eq!(
+        begin_post_comment_delivery(pool, &job)
+            .await
+            .expect("delivery transition must execute"),
+        CasResult::Applied
+    );
+    query(
+        r#"
+        insert into llm_generations
+            (post_comment_job_id, provider, model, prompt, image_used, response, final_html)
+        values ($1, 'preexisting', 'test', 'test prompt', false, 'test comment', 'test comment')
+        "#,
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .expect("matching preexisting generation must be inserted");
+    query(
+        r#"
+        insert into post_history_entries
+            (post_comment_job_id, source_channel_id, source_message_id, post_text, bot_comment)
+        values ($1, $2, $3, 'Тестовый пост', 'test comment')
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.source_channel_id)
+    .bind(job.source_message_id)
+    .execute(pool)
+    .await
+    .expect("matching preexisting history row must be inserted");
+
+    assert_eq!(
+        finalize_test_comment(pool, &job, 9_400_202).await,
+        CasResult::Applied
+    );
+    let state: (String, i64, i64) = query_as(
+        r#"
+        select j.status,
+               (select count(*) from llm_generations where post_comment_job_id = j.id),
+               (select count(*) from post_history_entries where post_comment_job_id = j.id)
+        from post_comment_jobs j
+        where j.id = $1
+        "#,
+    )
+    .bind(job.id)
+    .fetch_one(pool)
+    .await
+    .expect("idempotently finalized job must be queryable");
+    assert_eq!(state, ("sent".to_string(), 1, 1));
 }
 
 async fn claim_created_job(

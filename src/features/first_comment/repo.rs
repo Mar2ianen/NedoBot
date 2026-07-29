@@ -486,7 +486,7 @@ fn normalize_comment_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommentErrorKind, retry_delay_seconds};
+    use super::{CommentErrorKind, SendFailure, classify_send_error, retry_delay_seconds};
 
     #[test]
     fn comment_job_retries_are_bounded() {
@@ -506,6 +506,35 @@ mod tests {
         assert!(!CommentErrorKind::Configuration.is_retryable());
         assert!(!CommentErrorKind::InvalidInput.is_retryable());
         assert!(CommentErrorKind::Transient.is_retryable());
+    }
+
+    #[test]
+    fn telegram_retry_after_and_api_errors_are_confirmed() {
+        let retry_after =
+            teloxide::RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(75));
+        let api_error = teloxide::RequestError::Api(teloxide::ApiError::InvalidToken);
+
+        assert_eq!(
+            classify_send_error(&retry_after),
+            SendFailure::Confirmed {
+                error_kind: CommentErrorKind::RateLimited,
+                retry_after_seconds: Some(75),
+            }
+        );
+        assert_eq!(
+            classify_send_error(&api_error),
+            SendFailure::Confirmed {
+                error_kind: CommentErrorKind::Configuration,
+                retry_after_seconds: None,
+            }
+        );
+    }
+
+    #[test]
+    fn telegram_io_error_leaves_delivery_unknown() {
+        let error = teloxide::RequestError::Io(std::io::Error::other("test transport failure"));
+
+        assert_eq!(classify_send_error(&error), SendFailure::DeliveryUnknown);
     }
 
     #[test]

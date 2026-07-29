@@ -21,9 +21,9 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 
 Это at-most-once политика для неоднозначного crash window, а не обещание exactly-once доставки.
 
-## Task JOB-1 — Durable first-comment delivery phase
+## Task JOB-1 — Durable first-comment delivery phase — выполнено, ожидает deploy
 
-**Приоритет:** P0, следующий implementation task.
+**Приоритет:** P0 закрыт в коде; deployment требует отдельной production-проверки дублей `llm_generations.post_comment_job_id`.
 
 **Файлы:**
 
@@ -86,9 +86,9 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 8. реальная DB-ошибка откатывает transaction: job не становится `sent` и не вызывает повторный Telegram send;
 9. migration сохраняет поведение legacy `pending/retry_wait/sent/failed`.
 
-## Task JOB-2 — Fence embedding batch finalization
+## Task JOB-2 — Fence embedding batch finalization — выполнено, ожидает deploy
 
-**Приоритет:** P0, можно выполнять независимо от JOB-1.
+**Приоритет:** P0 закрыт в коде; выполнен независимо от JOB-1.
 
 **Файлы:**
 
@@ -183,9 +183,9 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 
 ## Порядок реализации
 
-1. JOB-1: first-comment delivery fencing и `delivery_unknown`.
-2. JOB-2: embedding attempt-CAS и batch cardinality.
-3. JOB-3: post-history explicit lease.
+1. JOB-1: first-comment delivery fencing и `delivery_unknown` — выполнено, ожидает deploy после проверки production-дублей generation.
+2. JOB-2: embedding attempt-CAS и batch cardinality — выполнено, ожидает deploy.
+3. JOB-3: post-history explicit lease — следующий implementation task.
 4. JOB-4: observability/reconciliation.
 5. JOB-5: остаточные regression/performance задачи.
 
