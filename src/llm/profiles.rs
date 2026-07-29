@@ -77,6 +77,22 @@ pub struct RouteRequirements {
     pub requires_tools: bool,
     pub requires_system_prompt: bool,
     pub structured_output: Option<StructuredOutputMode>,
+    pub num_predict: Option<u32>,
+}
+
+/// Валидированная упорядоченная цель маршрута, готовая к созданию транспорта.
+///
+/// Ссылки заимствованы из `LlmProfiles`; разрешение маршрута не читает секреты и не обращается
+/// к runtime-конфигурации.
+// LP2 использует выборки при подключении маршрутов профилей к созданию runtime-транспорта.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct RouteSelection<'a> {
+    pub model_key: &'a str,
+    pub model: &'a ModelProfile,
+    pub provider_key: &'a str,
+    pub provider: &'a ProviderProfile,
+    pub capabilities: &'a ModelCapabilities,
 }
 
 impl LlmProfiles {
@@ -150,22 +166,34 @@ impl LlmProfiles {
         &'a self,
         route_name: &str,
         requirements: &RouteRequirements,
-    ) -> anyhow::Result<Vec<&'a ModelProfile>> {
+    ) -> anyhow::Result<Vec<RouteSelection<'a>>> {
         let route = self
             .routes
             .get(route_name)
             .ok_or_else(|| anyhow::anyhow!("unknown LLM route {route_name:?}"))?;
-        let mut models = Vec::with_capacity(route.models.len());
-        for model_name in &route.models {
-            let model = self.models.get(model_name).ok_or_else(|| {
+        let mut selections = Vec::with_capacity(route.models.len());
+        for model_key in &route.models {
+            let model = self.models.get(model_key).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "route profile {route_name:?} references unknown model {model_name:?}"
+                    "route profile {route_name:?} references unknown model {model_key:?}"
                 )
             })?;
-            ensure_capabilities(route_name, model_name, &model.capabilities, requirements)?;
-            models.push(model);
+            let provider_key = model.provider.as_str();
+            let provider = self.providers.get(provider_key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "route profile {route_name:?} model {model_key:?} references unknown provider {provider_key:?}"
+                )
+            })?;
+            ensure_capabilities(route_name, model_key, &model.capabilities, requirements)?;
+            selections.push(RouteSelection {
+                model_key,
+                model,
+                provider_key,
+                provider,
+                capabilities: &model.capabilities,
+            });
         }
-        Ok(models)
+        Ok(selections)
     }
 }
 
@@ -194,8 +222,16 @@ fn ensure_capabilities(
         && capabilities.structured_output != structured_output
     {
         anyhow::bail!(
-            "route {route_name:?} requires {structured_output:?} but model {model_name:?} uses {:?}",
+            "route {route_name:?} requires structured output mode {structured_output:?} but model {model_name:?} declares {:?}",
             capabilities.structured_output
+        );
+    }
+    if let Some(num_predict) = requirements.num_predict
+        && num_predict > capabilities.max_output_tokens
+    {
+        anyhow::bail!(
+            "route {route_name:?} requires num_predict {num_predict} but model {model_name:?} allows at most {} output tokens",
+            capabilities.max_output_tokens
         );
     }
     Ok(())
@@ -300,6 +336,87 @@ models = ["ollama_memory"]
         assert_eq!(profiles.models.len(), 1);
         assert_eq!(profiles.routes["memory"].models, ["ollama_memory"]);
         assert!(profiles.models["ollama_memory"].capabilities.supports_tools);
+    }
+
+    #[test]
+    fn route_resolution_returns_ordered_runtime_ready_selections() {
+        let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
+
+        let selections = profiles
+            .resolve_route("voice_cleanup", &RouteRequirements::default())
+            .unwrap();
+
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].model_key, "groq_cleanup");
+        assert_eq!(selections[0].model.model, "llama-3.3-70b-versatile");
+        assert_eq!(selections[0].provider_key, "groq");
+        assert_eq!(selections[0].provider.driver, LlmDriver::OpenaiCompatible);
+        assert_eq!(
+            selections[0].capabilities.structured_output,
+            StructuredOutputMode::JsonSchema
+        );
+        assert_eq!(selections[1].model_key, "ollama_memory");
+        assert_eq!(selections[1].provider_key, "ollama_cloud");
+    }
+
+    #[test]
+    fn route_resolution_rejects_unsupported_structured_output_mode() {
+        let profiles = LlmProfiles::from_toml(VALID_PROFILES).unwrap();
+        let requirements = RouteRequirements {
+            requires_system_prompt: true,
+            structured_output: Some(StructuredOutputMode::JsonSchema),
+            ..RouteRequirements::default()
+        };
+
+        let error = profiles
+            .resolve_route("memory", &requirements)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("route \"memory\""));
+        assert!(error.contains("model \"ollama_memory\""));
+        assert!(error.contains("structured output mode JsonSchema"));
+    }
+
+    #[test]
+    fn route_resolution_rejects_unsupported_system_prompt() {
+        let profiles = LlmProfiles::from_toml(&VALID_PROFILES.replace(
+            "supports_system_prompt = true",
+            "supports_system_prompt = false",
+        ))
+        .unwrap();
+        let requirements = RouteRequirements {
+            requires_system_prompt: true,
+            ..RouteRequirements::default()
+        };
+
+        let error = profiles
+            .resolve_route("memory", &requirements)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("route \"memory\""));
+        assert!(error.contains("model \"ollama_memory\""));
+        assert!(error.contains("requires a system prompt"));
+    }
+
+    #[test]
+    fn route_resolution_rejects_num_predict_above_model_output_limit() {
+        let profiles = LlmProfiles::from_toml(VALID_PROFILES).unwrap();
+        let requirements = RouteRequirements {
+            num_predict: Some(4097),
+            ..RouteRequirements::default()
+        };
+
+        let error = profiles
+            .resolve_route("memory", &requirements)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("route \"memory\""));
+        assert!(error.contains("model \"ollama_memory\""));
+        assert!(error.contains("num_predict 4097"));
+        assert!(error.contains("at most 4096 output tokens"));
     }
 
     #[test]

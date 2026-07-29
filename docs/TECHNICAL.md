@@ -716,6 +716,22 @@ order by notification_lease_expires_at, id
 limit 1;
 ```
 
+И обязательно снять план полного candidate query из production claim: `OR` между due и expired ветками вместе с общим `ORDER BY` может выбрать другой план, чем isolated reclaim predicate.
+
+```sql
+explain (analyze, buffers)
+select id
+from spam_review_requests
+where status = 'pending'
+  and risk_score >= 70
+  and (
+    (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
+    or (notification_status = 'processing' and notification_lease_expires_at <= now())
+  )
+order by notification_next_attempt_at, id
+limit 1;
+```
+
 Migration на второй partial index допустима только если одновременно наблюдаются ненулевая/растущая очередь expired `processing` rows, план выполняет дорогое scan/sort без подходящего index и claim latency становится измеримой operational проблемой. При нулевой или эпизодической очереди, либо если текущий plan остаётся дешёвым, migration не создавать. Любое решение добавить индекс требует сохранить эти результаты (queue counts, `EXPLAIN ANALYZE` и latency) в review migration.
 
 ## Custom Emoji
