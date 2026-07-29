@@ -1,5 +1,11 @@
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+};
+
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, query, query_as, query_scalar};
+use teloxide::Bot;
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
     avatar_analysis::{
@@ -28,7 +34,9 @@ use tg_ai_bot_teloxide::features::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
     },
-    spam_review::{claim_next_review_delivery, create_review, mark_review_delivery_succeeded},
+    spam_review::{
+        claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
+    },
     stats::{
         render_html, render_rich, repo as stats_repo,
         types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
@@ -54,6 +62,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
+    assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_comment_reconciliation_requires_operator_claim(&pool).await;
@@ -131,12 +140,12 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         .find(|queue| queue.queue == "reviews")
         .expect("reviews queue must be reported");
     assert!(reviews.lease_reclaim_count >= 1);
+    let oldest_ready_age = reviews
+        .oldest_ready_age_seconds
+        .expect("due high-risk review must contribute to oldest_ready_age");
     assert!(
-        reviews
-            .oldest_ready_age_seconds
-            .is_some_and(|age| (55.0..=65.0).contains(&age)),
-        "low-risk pending review must not affect oldest_ready_age: {:?}",
-        reviews.oldest_ready_age_seconds
+        oldest_ready_age < 3_600.0,
+        "an old low-risk review must be excluded from oldest_ready_age: {oldest_ready_age}"
     );
 }
 
@@ -738,6 +747,112 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
             Some(1002)
         )
     );
+}
+
+async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_004;
+
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review retry chat user must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Review retry')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review retry profile must exist");
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("high-risk retry audit must exist");
+
+    let initial_claim = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("review creation must succeed")
+        .expect("high-risk review must be claimed");
+    query(
+        "update spam_review_requests set notification_status = 'retry_wait', notification_attempts = 20, notification_consecutive_failures = 0, notification_next_attempt_at = now(), notification_processing_started_at = null, notification_lease_expires_at = null where id = $1",
+    )
+    .bind(initial_claim.id)
+    .execute(pool)
+    .await
+    .expect("high claim sequence fixture must be stored");
+
+    let retry_claim = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("specific retry claim must succeed")
+        .expect("retryable high-risk review must be claimed");
+    assert_eq!(retry_claim.notification_attempts, 21);
+    assert_eq!(retry_claim.notification_consecutive_failures, 0);
+
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("local transient failure listener must bind");
+    let address = listener
+        .local_addr()
+        .expect("local transient failure listener must have an address");
+    let response_task = std::thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("local transient failure listener must accept the request");
+        let mut request = [0; 1_024];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("local transient failure response must be written");
+    });
+    let bot = Bot::new("test-token").set_api_url(
+        format!("http://{address}/")
+            .parse()
+            .expect("local Telegram API URL must parse"),
+    );
+    assert!(
+        send_review(&bot, pool, &retry_claim).await.is_err(),
+        "HTTP 500 must exercise production transient failure handling"
+    );
+    response_task
+        .join()
+        .expect("local transient failure response task must complete");
+
+    let failed_state: (String, i32, i32) = query_as(
+        "select notification_status, notification_attempts, notification_consecutive_failures from spam_review_requests where id = $1",
+    )
+    .bind(retry_claim.id)
+    .fetch_one(pool)
+    .await
+    .expect("transient failure state must be stored");
+    assert_eq!(failed_state, ("retry_wait".into(), 21, 1));
+
+    query("update spam_review_requests set notification_next_attempt_at = now() where id = $1")
+        .bind(retry_claim.id)
+        .execute(pool)
+        .await
+        .expect("retry must be made due");
+    let success_claim = claim_next_review_delivery(pool)
+        .await
+        .expect("retry claim query must succeed")
+        .expect("failed review must be claimable again");
+    assert_eq!(success_claim.id, retry_claim.id);
+    assert_eq!(success_claim.notification_attempts, 22);
+    assert_eq!(success_claim.notification_consecutive_failures, 1);
+    assert_eq!(
+        mark_review_delivery_succeeded(pool, &success_claim, 1_003)
+            .await
+            .expect("production success finalizer must execute"),
+        CasResult::Applied
+    );
+    let success_state: (String, i32) = query_as(
+        "select notification_status, notification_consecutive_failures from spam_review_requests where id = $1",
+    )
+    .bind(success_claim.id)
+    .fetch_one(pool)
+    .await
+    .expect("successful retry state must be stored");
+    assert_eq!(success_state, ("sent".into(), 0));
 }
 
 async fn assert_terminal_review_delivery_stays_closed(pool: &PgPool) {

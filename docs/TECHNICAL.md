@@ -678,6 +678,46 @@ cargo run --bin job_lifecycle_report
 
 `lease_reclaim_count` сохраняется в доменной таблице и увеличивается только когда worker действительно забирает просроченную `processing` lease. Обычный claim из `pending`/`retry` и повторная попытка после явной failure-finalization его не увеличивают. Для reviews используется аналогичное поле `notification_lease_reclaim_count` её delivery lifecycle.
 
+### Preflight optional index для просроченных spam-review leases
+
+Существующий partial index `spam_review_requests_notification_ready_idx` обслуживает due `pending`/`retry_wait` reviews. Отдельного индекса для reclaim ветки `notification_status = 'processing' AND notification_lease_expires_at <= now()` сейчас нет намеренно: добавлять migration следует только после production evidence, а не заранее.
+
+На production сначала снять размер очереди и число реально reclaimable leases (в read-only сессии):
+
+```sql
+select
+    count(*) as total_reviews,
+    count(*) filter (
+        where status = 'pending'
+          and risk_score >= 70
+          and notification_status = 'processing'
+          and notification_lease_expires_at <= now()
+    ) as expired_processing_ready,
+    count(*) filter (
+        where status = 'pending'
+          and risk_score >= 70
+          and notification_status in ('pending', 'retry_wait')
+          and notification_next_attempt_at <= now()
+    ) as due_initial_or_retry
+from spam_review_requests;
+```
+
+Затем на репрезентативной production нагрузке проверить reclaim predicate отдельным планом:
+
+```sql
+explain (analyze, buffers)
+select id
+from spam_review_requests
+where status = 'pending'
+  and risk_score >= 70
+  and notification_status = 'processing'
+  and notification_lease_expires_at <= now()
+order by notification_lease_expires_at, id
+limit 1;
+```
+
+Migration на второй partial index допустима только если одновременно наблюдаются ненулевая/растущая очередь expired `processing` rows, план выполняет дорогое scan/sort без подходящего index и claim latency становится измеримой operational проблемой. При нулевой или эпизодической очереди, либо если текущий plan остаётся дешёвым, migration не создавать. Любое решение добавить индекс требует сохранить эти результаты (queue counts, `EXPLAIN ANALYZE` и latency) в review migration.
+
 ## Custom Emoji
 
 Список считанных premium/custom emoji:
