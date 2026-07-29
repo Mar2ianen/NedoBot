@@ -114,9 +114,9 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 - partial provider response переводит все ещё принадлежащие worker jobs в bounded retry;
 - eligibility re-check для edited/deleted/spam/bot/automatic-forward сообщений остаётся intact.
 
-## Task JOB-3 — Explicit lease для post history
+## Task JOB-3 — Explicit lease для post history — выполнено, ожидает deploy
 
-**Приоритет:** P1, после JOB-1/JOB-2.
+**Приоритет:** P1 закрыт в коде; additive migration безопасно backfill-ит legacy processing lease.
 
 **Файлы:**
 
@@ -185,8 +185,8 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 
 1. JOB-1: first-comment delivery fencing и `delivery_unknown` — выполнено, ожидает deploy после проверки production-дублей generation.
 2. JOB-2: embedding attempt-CAS и batch cardinality — выполнено, ожидает deploy.
-3. JOB-3: post-history explicit lease — следующий implementation task.
-4. JOB-4: observability/reconciliation.
+3. JOB-3: post-history explicit lease — выполнено, ожидает deploy.
+4. JOB-4: observability/reconciliation — следующий implementation task.
 5. JOB-5: остаточные regression/performance задачи.
 
 JOB-1 и JOB-2 имеют непересекающиеся domain write sets и могут разрабатываться параллельно, но migration и итоговую документацию следует коммитить отдельными логическими единицами.

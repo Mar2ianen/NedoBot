@@ -26,7 +26,7 @@ use features::avatar_analysis::service::process_next_avatar_analysis_job;
 use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
 use features::first_message_spam::process_next_first_message_spam_analysis_job;
-use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
+use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL};
 use features::memory::service::process_next_history_entry;
 use features::spam_review::{apply_callback, parse_callback};
 use features::user_profiles::enrichment::{
@@ -121,10 +121,18 @@ fn spawn_post_history_worker(state: AppState) {
         loop {
             match process_next_history_entry(&state.pool, &state.config).await {
                 Ok(true) => continue,
-                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        POST_HISTORY_POLL.idle_seconds(),
+                    ))
+                    .await
+                }
                 Err(err) => {
                     tracing::warn!(%err, "post history worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        POST_HISTORY_POLL.error_seconds(),
+                    ))
+                    .await;
                 }
             }
         }
