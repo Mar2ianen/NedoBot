@@ -364,6 +364,7 @@ async fn build_history_entry(
     let generation = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
+            route: Some("memory"),
             provider_override: Some(&config.memory_llm_provider),
             model_override: config.memory_llm_model.as_deref(),
             system_prompt: Some(MEMORY_SYSTEM_PROMPT),

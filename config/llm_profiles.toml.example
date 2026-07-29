@@ -1,6 +1,8 @@
 # LLM topology: provider transport -> model profile -> task route.
 # This file contains no API keys. api_key_env names the required environment variable.
-# It is an example only until LP2 connects it to startup loading.
+# Set LLM_PROFILES_PATH to this file to enable strict profile-authoritative routing.
+# In that mode task routes select provider/model/capabilities; legacy provider/model
+# environment variables are ignored for generation.
 
 [providers.gemini]
 driver = "gemini"

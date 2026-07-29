@@ -333,6 +333,7 @@ async fn classify_text(
     let generation = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
+            route: Some("first_message_spam"),
             provider_override: Some(&config.first_message_spam_provider),
             model_override: config.first_message_spam_model.as_deref(),
             system_prompt: Some(SYSTEM_PROMPT),

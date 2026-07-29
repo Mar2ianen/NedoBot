@@ -7,12 +7,26 @@ use crate::http;
 use crate::llm::types::{LlmClient, LlmRequest, LlmResponse, LlmTransportError};
 
 pub struct OllamaClient<'a> {
-    config: &'a Config,
+    base_url: &'a str,
+    api_key: &'a str,
+    timeout: Duration,
 }
 
 impl<'a> OllamaClient<'a> {
     pub fn new(config: &'a Config) -> Self {
-        Self { config }
+        Self::with_profile(
+            &config.ollama_base_url,
+            &config.ollama_api_key,
+            Duration::from_secs(60),
+        )
+    }
+
+    pub fn with_profile(base_url: &'a str, api_key: &'a str, timeout: Duration) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/'),
+            api_key: api_key.trim(),
+            timeout,
+        }
     }
 }
 
@@ -48,12 +62,9 @@ impl LlmClient for OllamaClient<'_> {
             format: request.structured_output.map(|_| "json"),
         };
 
-        let response = http::client(Duration::from_secs(60))?
-            .post(format!(
-                "{}/api/chat",
-                self.config.ollama_base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.config.ollama_api_key)
+        let response = http::client(self.timeout)?
+            .post(format!("{}/api/chat", self.base_url))
+            .bearer_auth(self.api_key)
             .json(&body)
             .send()
             .await?;

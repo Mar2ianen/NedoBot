@@ -66,6 +66,7 @@ pub async fn extract_research_plan(
     let response = generate_text_with_provider_checked(
         config,
         GenerateTextOptions {
+            route: Some("search_extract"),
             provider_override: config.search_extract_provider.as_deref(),
             model_override: config.search_extract_model.as_deref(),
             system_prompt: Some(SEARCH_EXTRACT_PROMPT),

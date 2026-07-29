@@ -413,6 +413,7 @@ async fn generate_action(
         generate_text_with_provider_checked(
             config,
             GenerateTextOptions {
+                route: Some("ask"),
                 provider_override: Some(&config.ask_llm_provider),
                 model_override: config.ask_llm_model.as_deref(),
                 system_prompt: Some(SYSTEM_PROMPT),

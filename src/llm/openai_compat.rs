@@ -28,6 +28,20 @@ pub struct OpenAiCompatClient {
 
 impl OpenAiCompatClient {
     pub fn new(api_base: &str, api_key: &str, timeout: Duration) -> anyhow::Result<Self> {
+        Self::new_with_structured_output_mode(
+            api_base,
+            api_key,
+            timeout,
+            StructuredOutputMode::JsonSchema,
+        )
+    }
+
+    pub fn new_with_structured_output_mode(
+        api_base: &str,
+        api_key: &str,
+        timeout: Duration,
+        structured_output_mode: StructuredOutputMode,
+    ) -> anyhow::Result<Self> {
         if api_key.trim().is_empty() {
             return Err(LlmTransportError::configuration().into());
         }
@@ -42,14 +56,8 @@ impl OpenAiCompatClient {
         let http_client = http::client(timeout)?;
         Ok(Self {
             client: Client::with_config(config).with_http_client(http_client),
-            structured_output_mode: StructuredOutputMode::JsonSchema,
+            structured_output_mode,
         })
-    }
-
-    #[cfg(test)]
-    fn with_structured_output_mode(mut self, structured_output_mode: StructuredOutputMode) -> Self {
-        self.structured_output_mode = structured_output_mode;
-        self
     }
 
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
@@ -269,13 +277,13 @@ mod tests {
         ];
 
         for (mode, expected_type) in modes {
-            let client = OpenAiCompatClient::new(
+            let client = OpenAiCompatClient::new_with_structured_output_mode(
                 &format!("http://{address}/v1"),
                 "test-compatible-key",
                 Duration::from_secs(5),
+                mode,
             )
-            .unwrap()
-            .with_structured_output_mode(mode);
+            .unwrap();
 
             assert_eq!(client.generate(request).await.unwrap().content, "OK");
             let captured = receiver.recv().await.unwrap();
