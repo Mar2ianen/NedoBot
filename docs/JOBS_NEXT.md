@@ -177,16 +177,17 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 
 **JOB-4b — выполнено:** `job_lifecycle_report` требует только `DATABASE_URL`, не запускает миграции и читает метрики в `SET TRANSACTION READ ONLY`. Он выводит fixed projection для first-comments, embeddings, post-history и reviews: counts/attempts по статусам, `oldest_ready_age` для старейшей due initial/retry job, суммарные lease reclaim, безопасно нормализованные `error_kind` с attempts и terminal failures. Для reviews ready-age использует тот же ready predicate, что и claim: `status = pending`, `risk_score >= 70`, notification `pending/retry_wait` и due time; expired processing lease в эту age-метрику не входит. Неизвестный persisted error kind отображается только как `other`. Для embeddings отдельно выводится число строк с `embedding_batch_cardinality`. `lease_reclaim_count` увеличивается исключительно при claim уже истёкшей строки в `processing`; обычные pending/retry claims его не меняют.
 
-## Task JOB-5 — Остаточные regression tests и индексы
+## Task JOB-5 — Остаточные regression tests и индексы — частично выполнено
 
-**Приоритет:** P2, выполнять вместе с соответствующими domain tasks.
+**Приоритет:** P2. Завершены только regression tests и production preflight; optional index намеренно отложен.
 
-- прямой DB-test разделения `claim sequence` и retry ordinal для review delivery;
-- success после нескольких review failures сбрасывает consecutive failures;
-- migration fixture для legacy first-comment `processing -> delivery_unknown`;
-- второй partial index spam-review по expired processing leases добавить только при подтверждённом росте таблицы/slow query;
-- EXPLAIN/queue-size check перед добавлением индекса;
-- test fixtures для upgrade-path каждой новой lifecycle migration.
+- [x] прямой PostgreSQL DB-test разделяет `notification_attempts` (claim sequence) и `notification_consecutive_failures`: искусственные `attempts = 20` при `consecutive_failures = 0` не исчерпывают retry после реальной transient HTTP 500 ошибки production `send_review`;
+- [x] success после review failure через production success finalizer сбрасывает `notification_consecutive_failures` в `0`;
+- [x] flaky узкая проверка возраста oldest-ready review заменена на детерминированную: старая low-risk row исключена, а due high-risk row остаётся в метрике;
+- [x] production preflight для optional partial index documented: queue-size SQL и `EXPLAIN (ANALYZE, BUFFERS)` criteria приведены в `TECHNICAL.md`;
+- [x] migration fixture для legacy first-comment `processing -> delivery_unknown` уже покрыта в существующем lifecycle upgrade test;
+- [ ] второй partial index spam-review по expired processing leases **не добавлять без наблюдаемой необходимости**: migration отсутствует намеренно. Нужны production evidence роста таблицы/expired leases, plan без подходящего index и измеримое slow claim; точные команды и критерии — в `TECHNICAL.md`.
+- [ ] test fixtures для upgrade-path каждой будущей lifecycle migration добавлять вместе с соответствующей migration, а не заранее.
 
 ## Порядок реализации
 
@@ -194,7 +195,7 @@ Telegram `sendMessage` не принимает idempotency key. Если про�
 2. JOB-2: embedding attempt-CAS и batch cardinality — выполнено, ожидает deploy.
 3. JOB-3: post-history explicit lease — выполнено, ожидает deploy.
 4. JOB-4a: reconciliation и JOB-4b: observability — выполнены.
-5. JOB-5: остаточные regression/performance задачи — следующий актуальный этап.
+5. JOB-5: regression tests и index preflight выполнены; optional expired-processing index намеренно deferred до production evidence.
 
 JOB-1 и JOB-2 имеют непересекающиеся domain write sets и могут разрабатываться параллельно, но migration и итоговую документацию следует коммитить отдельными логическими единицами.
 
