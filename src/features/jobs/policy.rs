@@ -46,9 +46,14 @@ impl RetryPolicy {
         Self { delays_seconds }
     }
 
-    /// `attempts` is the attempt count returned by a successful claim.
-    pub fn delay_seconds(self, attempts: i32, retry_after_seconds: Option<i64>) -> Option<i64> {
-        let attempt_index = usize::try_from(attempts.checked_sub(1)?).ok()?;
+    /// `retry_ordinal` starts at one for the first consecutive retryable failure.
+    /// It is independent from a job's monotonic claim sequence used for CAS.
+    pub fn delay_seconds(
+        self,
+        retry_ordinal: i32,
+        retry_after_seconds: Option<i64>,
+    ) -> Option<i64> {
+        let attempt_index = usize::try_from(retry_ordinal.checked_sub(1)?).ok()?;
         let scheduled_delay = *self.delays_seconds.get(attempt_index)?;
         Some(scheduled_delay.max(retry_after_seconds.unwrap_or_default().max(0)))
     }
