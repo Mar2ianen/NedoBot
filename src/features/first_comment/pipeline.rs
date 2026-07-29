@@ -20,11 +20,14 @@ use crate::features::first_comment::prompt::{
     build_llm_prompt_parts_with_chat_evidence,
 };
 use crate::features::first_comment::repo::{
-    CommentErrorKind, CreatePostCommentJobParams, LlmGenerationInsert, PostCommentJob,
-    claim_next_post_comment_job, create_post_comment_job, insert_llm_generation,
-    load_recent_bot_comments, mark_post_comment_failed, mark_post_comment_sent,
+    CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
+    PostCommentJob, SendFailure, begin_post_comment_delivery, claim_next_post_comment_job,
+    classify_send_error, create_post_comment_job, finalize_post_comment_sent,
+    load_recent_bot_comments, mark_post_comment_delivery_unknown,
+    mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
 };
-use crate::features::memory::service::{enqueue_post_history, load_relevant_memory_notes};
+use crate::features::jobs::claim::CasResult;
+use crate::features::memory::service::load_relevant_memory_notes;
 use crate::features::search::repo::{
     insert_search_run, save_chat_evidence_outcome, save_chat_retrieval_candidates,
     save_expanded_chat_contexts,
@@ -99,7 +102,6 @@ enum JobOutcome {
 }
 
 struct CompletedComment {
-    bot_comment_message_id: i32,
     generation: crate::llm::types::GeneratedText,
     draft: FirstCommentDraft,
     prompt_for_log: String,
@@ -122,24 +124,31 @@ pub async fn process_next_post_comment_job(
     };
     match outcome {
         JobOutcome::Prepared(completed) => {
-            if matches!(
-                finalize_completed_post_comment_job(bot, state, &job, completed).await?,
-                JobOutcome::LeaseLost
-            ) {
-                tracing::info!(
+            match deliver_prepared_post_comment(bot, state, &job, completed).await? {
+                JobOutcome::LeaseLost => tracing::info!(
                     job_id = job.id,
-                    "post comment worker lost processing lease after Telegram send"
-                );
+                    "post comment worker lost its current delivery attempt"
+                ),
+                JobOutcome::Failed(error_kind) => tracing::warn!(
+                    job_id = job.id,
+                    attempts = job.attempts,
+                    ?error_kind,
+                    "post comment delivery was rejected"
+                ),
+                JobOutcome::Completed => {}
+                JobOutcome::Prepared(_) => unreachable!("delivery cannot prepare another comment"),
             }
         }
         JobOutcome::Completed => {}
         JobOutcome::Failed(error_kind) => {
-            if mark_post_comment_failed(&state.pool, &job, error_kind).await? {
+            if mark_post_comment_pre_send_failed(&state.pool, &job, error_kind).await?
+                == CasResult::Applied
+            {
                 tracing::warn!(
                     job_id = job.id,
                     attempts = job.attempts,
                     ?error_kind,
-                    "post comment job failed"
+                    "post comment job failed before Telegram delivery"
                 );
             } else {
                 tracing::info!(job_id = job.id, "post comment worker lost processing lease");
@@ -343,17 +352,7 @@ async fn process_post_comment_job(
     );
     ensure_comment_html(&final_html, &draft.comment).map_err(|_| CommentErrorKind::InvalidInput)?;
 
-    let sent = send_html_reply(
-        bot,
-        ChatId(job.discussion_chat_id),
-        MessageId(job.discussion_message_id),
-        final_html.clone(),
-    )
-    .await
-    .map_err(|error| CommentErrorKind::from_telegram_error(&error))?;
-
     Ok(JobOutcome::Prepared(Box::new(CompletedComment {
-        bot_comment_message_id: sent.id.0,
         generation,
         draft,
         prompt_for_log,
@@ -363,33 +362,104 @@ async fn process_post_comment_job(
     })))
 }
 
-async fn finalize_completed_post_comment_job(
+async fn deliver_prepared_post_comment(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     state: &AppState,
     job: &PostCommentJob,
     completed: Box<CompletedComment>,
 ) -> anyhow::Result<JobOutcome> {
-    if !mark_post_comment_sent(&state.pool, job, completed.bot_comment_message_id).await? {
+    if begin_post_comment_delivery(&state.pool, job).await? == CasResult::LeaseLost {
         return Ok(JobOutcome::LeaseLost);
     }
 
+    let sent = match send_html_reply(
+        bot,
+        ChatId(job.discussion_chat_id),
+        MessageId(job.discussion_message_id),
+        completed.final_html.clone(),
+    )
+    .await
+    {
+        Ok(sent) => sent,
+        Err(error) => return handle_post_comment_send_error(state, job, &error).await,
+    };
+
+    finalize_completed_post_comment_job(bot, state, job, completed, sent.id.0).await
+}
+
+async fn handle_post_comment_send_error(
+    state: &AppState,
+    job: &PostCommentJob,
+    error: &teloxide::RequestError,
+) -> anyhow::Result<JobOutcome> {
+    match classify_send_error(error) {
+        SendFailure::Confirmed {
+            error_kind,
+            retry_after_seconds,
+        } => {
+            let result =
+                mark_post_comment_send_rejected(&state.pool, job, error_kind, retry_after_seconds)
+                    .await?;
+            if result == CasResult::Applied {
+                Ok(JobOutcome::Failed(error_kind))
+            } else {
+                Ok(JobOutcome::LeaseLost)
+            }
+        }
+        SendFailure::DeliveryUnknown => {
+            let result = mark_post_comment_delivery_unknown(&state.pool, job).await?;
+            if result == CasResult::Applied {
+                tracing::warn!(job_id = job.id, "post comment delivery outcome is unknown");
+                Ok(JobOutcome::Completed)
+            } else {
+                Ok(JobOutcome::LeaseLost)
+            }
+        }
+    }
+}
+
+async fn finalize_completed_post_comment_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+    job: &PostCommentJob,
+    completed: Box<CompletedComment>,
+    bot_comment_message_id: i32,
+) -> anyhow::Result<JobOutcome> {
     let attempts = serde_json::to_value(&completed.generation.attempts)?;
-    insert_llm_generation(
+    let history_used_search_result = completed
+        .draft
+        .used_search_result_id
+        .and_then(|id| completed.search_context.results.get(id.saturating_sub(1)))
+        .map(serde_json::to_value)
+        .transpose()?;
+    let result = finalize_post_comment_sent(
         &state.pool,
-        LlmGenerationInsert {
-            job_id: job.id,
-            provider: &completed.generation.provider,
-            model: &completed.generation.model,
-            prompt: &completed.prompt_for_log,
-            image_used: completed.generation.image_used,
-            response: &completed.draft.comment,
-            final_html: &completed.final_html,
-            attempts: &attempts,
-            used_search_result_id: completed.used_search_result_id,
-            used_chat_message_ids: &completed.draft.used_chat_message_ids,
+        job,
+        FinalizePostCommentSent {
+            bot_comment_message_id,
+            generation: LlmGenerationInsert {
+                job_id: job.id,
+                provider: &completed.generation.provider,
+                model: &completed.generation.model,
+                prompt: &completed.prompt_for_log,
+                image_used: completed.generation.image_used,
+                response: &completed.draft.comment,
+                final_html: &completed.final_html,
+                attempts: &attempts,
+                used_search_result_id: completed.used_search_result_id,
+                used_chat_message_ids: &completed.draft.used_chat_message_ids,
+            },
+            history_used_search_result: history_used_search_result.as_ref(),
+            source_channel_id: job.source_channel_id,
+            source_message_id: job.source_message_id,
+            cleaned_post_text: &job.cleaned_post_text,
+            bot_comment: &completed.draft.comment,
         },
     )
     .await?;
+    if result == CasResult::LeaseLost {
+        return Ok(JobOutcome::LeaseLost);
+    }
 
     if let Some(owner_id) = owner_preview_chat(&state.config) {
         send_owner_preview(
@@ -401,23 +471,6 @@ async fn finalize_completed_post_comment_job(
             completed.used_search_result_id,
         )
         .await;
-    }
-
-    if let Err(err) = enqueue_post_history(
-        &state.pool,
-        job.id,
-        job.source_channel_id,
-        job.source_message_id,
-        &job.cleaned_post_text,
-        &completed.draft.comment,
-        completed
-            .draft
-            .used_search_result_id
-            .and_then(|id| completed.search_context.results.get(id.saturating_sub(1))),
-    )
-    .await
-    {
-        tracing::warn!(%err, "failed to enqueue post history entry");
     }
 
     Ok(JobOutcome::Completed)
