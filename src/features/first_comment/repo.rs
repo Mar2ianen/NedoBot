@@ -196,6 +196,18 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
                 lease_expires_at = null,
                 updated_at = now()
             where status = 'sending' and lease_expires_at <= now()
+            returning id, operator_retry_only
+        ), expired_operator_retry_audits as (
+            insert into post_comment_job_operator_audit
+                (post_comment_job_id, action, actor, reason, previous_status, resulting_status)
+            select id,
+                   'retry',
+                   'operator-retry',
+                   'operator retry outcome: delivery_unknown (expired sending lease)',
+                   'sending',
+                   'delivery_unknown'
+            from expired_sends
+            where operator_retry_only
         ), candidate as (
             select id
             from post_comment_jobs

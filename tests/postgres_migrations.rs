@@ -10,8 +10,8 @@ use tg_ai_bot_teloxide::features::{
         service::apply_avatar_risk_signal,
     },
     chat_retrieval::{
-        EmbeddingJob, enqueue_message_embedding_if_enabled, mark_embedding_failed,
-        mark_embedding_ready,
+        EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
+        mark_embedding_failed, mark_embedding_ready,
     },
     first_comment::repo::{
         CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
@@ -66,6 +66,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
 async fn assert_job_lifecycle_observability(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const MESSAGE_ID: i32 = 9_300_003;
+    const HIGH_RISK_USER_ID: i64 = 9_000_101;
+    const LOW_RISK_USER_ID: i64 = 9_000_102;
     query(
         "update telegram_message_embeddings set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
     )
@@ -74,6 +76,21 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("embedding cardinality fixture must be recorded");
+    query(
+        r#"
+        insert into spam_review_requests
+            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at)
+        values
+            ($1, $2, 80, 'pending', now() - interval '1 minute'),
+            ($1, $3, 65, 'pending', now() - interval '1 day')
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(HIGH_RISK_USER_ID)
+    .bind(LOW_RISK_USER_ID)
+    .execute(pool)
+    .await
+    .expect("high- and low-risk ready review fixtures must be inserted");
 
     let report = load_job_lifecycle_report(pool)
         .await
@@ -87,6 +104,7 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         .find(|queue| queue.queue == "embeddings")
         .expect("embeddings queue must be reported");
     assert_eq!(embeddings.embedding_batch_cardinality_failures, Some(1));
+    assert!(embeddings.lease_reclaim_count >= 1);
     assert!(embeddings.errors.iter().any(|metric| {
         metric.error_kind == "embedding_batch_cardinality"
             && metric.jobs == 1
@@ -97,11 +115,29 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         .find(|queue| queue.queue == "first-comments")
         .expect("first-comments queue must be reported");
     assert!(first_comments.lease_reclaim_count >= 1);
+    assert!(first_comments.errors.iter().any(|metric| {
+        metric.error_kind == "operator_marked_failed"
+            && metric.jobs == 1
+            && metric.terminal_failures == 1
+    }));
     let history = report
         .iter()
         .find(|queue| queue.queue == "post-history")
         .expect("post-history queue must be reported");
     assert!(history.lease_reclaim_count >= 1);
+
+    let reviews = report
+        .iter()
+        .find(|queue| queue.queue == "reviews")
+        .expect("reviews queue must be reported");
+    assert!(reviews.lease_reclaim_count >= 1);
+    assert!(
+        reviews
+            .oldest_ready_age_seconds
+            .is_some_and(|age| (55.0..=65.0).contains(&age)),
+        "low-risk pending review must not affect oldest_ready_age: {:?}",
+        reviews.oldest_ready_age_seconds
+    );
 }
 
 async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {
@@ -280,18 +316,25 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
     const RETRY_MESSAGE_ID: i32 = 9_300_002;
     const FAILED_MESSAGE_ID: i32 = 9_300_003;
     const TEXT: &str = "embedding finalization CAS";
+    const USER_ID: i64 = 9_300_000;
 
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Embedding CAS')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("embedding source profile must be inserted");
     for message_id in [STALE_MESSAGE_ID, RETRY_MESSAGE_ID, FAILED_MESSAGE_ID] {
-        query("insert into telegram_messages (chat_id, message_id, text) values ($1, $2, $3)")
+        query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, $4)")
             .bind(CHAT_ID)
             .bind(message_id)
+            .bind(USER_ID)
             .bind(TEXT)
             .execute(pool)
             .await
             .expect("embedding source message must be inserted");
     }
     query(
-        "insert into telegram_message_embeddings (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', 2, now(), now() + interval '10 minutes')",
+        "insert into telegram_message_embeddings (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', 1, now(), now() - interval '1 second')",
     )
     .bind(CHAT_ID)
     .bind(STALE_MESSAGE_ID)
@@ -305,6 +348,22 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
         text: TEXT.to_string(),
         attempts: 1,
     };
+    query(
+        "update telegram_message_embeddings set status = 'ignored' where status in ('pending', 'retry_wait') and (chat_id, message_id) <> ($1, $2)",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_MESSAGE_ID)
+    .execute(pool)
+    .await
+    .expect("unrelated pending embedding fixtures must not affect the reclaim regression");
+    let reclaimed_jobs = claim_embedding_jobs(pool, 1)
+        .await
+        .expect("expired embedding claim must execute");
+    assert_eq!(reclaimed_jobs.len(), 1);
+    let current_claim = &reclaimed_jobs[0];
+    assert_eq!(current_claim.chat_id, CHAT_ID);
+    assert_eq!(current_claim.message_id, STALE_MESSAGE_ID);
+    assert_eq!(current_claim.attempts, 2);
     assert_eq!(
         mark_embedding_ready(pool, &stale_claim, &vec![0.0; 312], "test-model")
             .await
@@ -327,12 +386,8 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
     .expect("reclaimed embedding job must remain stored");
     assert_eq!(reclaimed_state, ("processing".to_string(), 2, true, true));
 
-    let current_claim = EmbeddingJob {
-        attempts: 2,
-        ..stale_claim
-    };
     assert_eq!(
-        mark_embedding_ready(pool, &current_claim, &vec![0.0; 312], "test-model")
+        mark_embedding_ready(pool, current_claim, &vec![0.0; 312], "test-model")
             .await
             .expect("current ready finalization must execute"),
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
@@ -1607,6 +1662,60 @@ async fn assert_comment_reconciliation_requires_operator_claim(pool: &PgPool) {
     .await
     .expect("operator retry ambiguity must retain its flag and persist an outcome audit");
     assert_eq!(retry_unknown, ("delivery_unknown".to_string(), true, 1));
+
+    let expired_send_id = create_job(pool, 9_400_306).await;
+    query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")
+        .bind(expired_send_id)
+        .execute(pool)
+        .await
+        .expect("expired send retry fixture must be ambiguous");
+    let expired_send_retry = claim_delivery_unknown_post_comment_for_operator_retry(
+        pool,
+        expired_send_id,
+        OperatorAuditParams {
+            actor: "postgres-test",
+            reason: "manual retry whose send lease expires",
+        },
+    )
+    .await
+    .expect("operator expired-send retry claim must execute")
+    .expect("ambiguous expired-send retry must be claimed");
+    assert_eq!(
+        begin_post_comment_delivery(pool, &expired_send_retry)
+            .await
+            .expect("operator retry must enter sending"),
+        CasResult::Applied
+    );
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(expired_send_id)
+    .execute(pool)
+    .await
+    .expect("operator retry sending lease must expire");
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("normal claim must expire sending operator retry")
+            .is_none(),
+        "expired sending operator retry must become delivery_unknown rather than be reclaimed"
+    );
+    let expired_send_outcome: (String, Option<String>, bool, i64) = query_as(
+        "select status, error_kind, operator_retry_only, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'retry' and previous_status = 'sending' and resulting_status = 'delivery_unknown') from post_comment_jobs where id = $1",
+    )
+    .bind(expired_send_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired sending operator retry must persist one outcome audit");
+    assert_eq!(
+        expired_send_outcome,
+        (
+            "delivery_unknown".to_string(),
+            Some("delivery_unknown".to_string()),
+            true,
+            1
+        )
+    );
 
     let failed_id = create_job(pool, 9_400_303).await;
     query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")

@@ -469,7 +469,7 @@ pub async fn process_next_embedding_batch(pool: &PgPool, config: &Config) -> any
     Ok(true)
 }
 
-async fn claim_embedding_jobs(
+pub async fn claim_embedding_jobs(
     pool: &PgPool,
     batch_size: usize,
 ) -> anyhow::Result<Vec<EmbeddingJob>> {
