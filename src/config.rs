@@ -87,6 +87,7 @@ pub struct Config {
     pub groq_model: Option<String>,
     pub cerebras_api_key: String,
     pub cerebras_model: Option<String>,
+    pub new_user_audit_enabled: bool,
     pub avatar_classifier_enabled: bool,
     pub avatar_classifier_model: Option<String>,
     pub avatar_classifier_max_tokens: u32,
@@ -240,6 +241,7 @@ impl Config {
             groq_model: env_optional("GROQ_MODEL"),
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
+            new_user_audit_enabled: env_bool("NEW_USER_AUDIT_ENABLED", false)?,
             avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true)?,
             avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
                 .or_else(|| Some("gemma-4-31b".to_string())),
@@ -376,6 +378,18 @@ impl Config {
 
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
+        }
+        if self.new_user_audit_enabled && self.avatar_classifier_enabled {
+            errors.push(
+                "NEW_USER_AUDIT_ENABLED=true cannot coexist with AVATAR_CLASSIFIER_ENABLED=true"
+                    .to_string(),
+            );
+        }
+        if self.new_user_audit_enabled && self.first_message_spam_enabled {
+            errors.push(
+                "NEW_USER_AUDIT_ENABLED=true cannot coexist with FIRST_MESSAGE_SPAM_ENABLED=true"
+                    .to_string(),
+            );
         }
         if self.avatar_classifier_enabled {
             if self.llm_profiles.is_none() {
@@ -1066,6 +1080,7 @@ mod tests {
             groq_model: None,
             cerebras_api_key: String::new(),
             cerebras_model: None,
+            new_user_audit_enabled: false,
             avatar_classifier_enabled: false,
             avatar_classifier_model: None,
             avatar_classifier_max_tokens: 900,
@@ -1143,6 +1158,24 @@ mod tests {
             Config::from_env().expect("configuration must parse with default MCP environment");
 
         assert_eq!(config.ask_db_mcp_env, ["ASK_DATABASE_URL", "MCP_MANIFEST"]);
+    }
+
+    #[test]
+    fn new_user_audit_flag_defaults_to_disabled_and_rejects_invalid_values() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .expect("environment test lock must not be poisoned");
+        let _new_user_audit_enabled = EnvVarGuard::unset("NEW_USER_AUDIT_ENABLED");
+
+        let config = Config::from_env().expect("configuration must parse without audit flag");
+        assert!(!config.new_user_audit_enabled);
+
+        unsafe { std::env::set_var("NEW_USER_AUDIT_ENABLED", "enabled") };
+        let error = match Config::from_env() {
+            Ok(_) => panic!("invalid audit flag must fail configuration parsing"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("NEW_USER_AUDIT_ENABLED"));
     }
 
     #[test]
@@ -1351,6 +1384,23 @@ models = ["primary", "fallback"]
         assert!(error.contains("RAG_TOP_K"));
         assert!(error.contains("RAG_MIN_SIMILARITY"));
         assert!(error.contains("RAG_TEMPORAL_HALF_LIFE_DAYS"));
+    }
+
+    #[test]
+    fn new_user_audit_cannot_run_with_parallel_audit_pipelines() {
+        let mut config = config();
+        config.new_user_audit_enabled = true;
+        config.avatar_classifier_enabled = true;
+        config.first_message_spam_enabled = true;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains(
+            "NEW_USER_AUDIT_ENABLED=true cannot coexist with AVATAR_CLASSIFIER_ENABLED=true"
+        ));
+        assert!(error.contains(
+            "NEW_USER_AUDIT_ENABLED=true cannot coexist with FIRST_MESSAGE_SPAM_ENABLED=true"
+        ));
     }
 
     #[test]

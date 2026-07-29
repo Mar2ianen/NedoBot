@@ -667,6 +667,7 @@ mod tests {
             groq_model: None,
             cerebras_api_key: String::new(),
             cerebras_model: None,
+            new_user_audit_enabled: false,
             avatar_classifier_enabled: false,
             avatar_classifier_model: None,
             avatar_classifier_max_tokens: 900,
