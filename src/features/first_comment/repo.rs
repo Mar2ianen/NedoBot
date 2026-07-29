@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use teloxide::RequestError;
 
@@ -99,6 +100,30 @@ pub struct PostCommentJob {
     pub cleaned_post_text: String,
     pub image_file_id: Option<String>,
     pub attempts: i32,
+    pub operator_retry_only: bool,
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PostCommentJobReconciliationView {
+    pub id: i64,
+    pub discussion_message_id: i32,
+    pub source_message_id: i32,
+    pub status: String,
+    pub error_kind: Option<String>,
+    pub attempts: i32,
+    pub operator_retry_only: bool,
+    pub bot_comment_message_id: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+pub struct OperatorAuditParams<'a> {
+    pub actor: &'a str,
+    pub reason: &'a str,
 }
 
 pub struct LlmGenerationInsert<'a> {
@@ -162,7 +187,7 @@ pub async fn create_post_comment_job(
 }
 
 pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option<PostCommentJob>> {
-    let row = sqlx::query_as::<_, (i64, i64, i32, i64, i32, String, Option<String>, i32)>(
+    let row = sqlx::query_as::<_, (i64, i64, i32, i64, i32, String, Option<String>, i32, bool)>(
         r#"
         with expired_sends as (
             update post_comment_jobs
@@ -174,8 +199,17 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
         ), candidate as (
             select id
             from post_comment_jobs
-            where (status in ('pending', 'retry_wait') and next_attempt_at <= now())
-               or (status = 'processing' and lease_expires_at <= now())
+            where (
+                not operator_retry_only
+                and (
+                    (status in ('pending', 'retry_wait') and next_attempt_at <= now())
+                    or (status = 'processing' and lease_expires_at <= now())
+                )
+            ) or (
+                operator_retry_only
+                and status = 'processing'
+                and lease_expires_at <= now()
+            )
             order by next_attempt_at, id
             for update skip locked
             limit 1
@@ -191,7 +225,7 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
         where job.id = candidate.id
         returning job.id, job.discussion_chat_id, job.discussion_message_id,
                   job.source_channel_id, job.source_message_id, job.cleaned_post_text,
-                  job.image_file_id, job.attempts
+                  job.image_file_id, job.attempts, job.operator_retry_only
         "#,
     )
     .bind(POST_COMMENT_PROCESSING_LEASE_SECONDS)
@@ -208,6 +242,7 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
             cleaned_post_text,
             image_file_id,
             attempts,
+            operator_retry_only,
         )| PostCommentJob {
             id,
             discussion_chat_id,
@@ -217,8 +252,286 @@ pub async fn claim_next_post_comment_job(pool: &PgPool) -> anyhow::Result<Option
             cleaned_post_text,
             image_file_id,
             attempts,
+            operator_retry_only,
         },
     ))
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+pub async fn list_delivery_unknown_post_comment_jobs(
+    pool: &PgPool,
+    limit: i64,
+) -> anyhow::Result<Vec<PostCommentJobReconciliationView>> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i32,
+            i32,
+            String,
+            Option<String>,
+            i32,
+            bool,
+            Option<i32>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ),
+    >(
+        r#"
+        select id, discussion_message_id, source_message_id, status, error_kind, attempts,
+               operator_retry_only, bot_comment_message_id, created_at, updated_at
+        from post_comment_jobs
+        where status = 'delivery_unknown'
+        order by updated_at, id
+        limit $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| PostCommentJobReconciliationView {
+            id: row.0,
+            discussion_message_id: row.1,
+            source_message_id: row.2,
+            status: row.3,
+            error_kind: row.4,
+            attempts: row.5,
+            operator_retry_only: row.6,
+            bot_comment_message_id: row.7,
+            created_at: row.8,
+            updated_at: row.9,
+        })
+        .collect())
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+pub async fn inspect_post_comment_job(
+    pool: &PgPool,
+    job_id: i64,
+) -> anyhow::Result<Option<PostCommentJobReconciliationView>> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i32,
+            i32,
+            String,
+            Option<String>,
+            i32,
+            bool,
+            Option<i32>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        ),
+    >(
+        r#"
+        select id, discussion_message_id, source_message_id, status, error_kind, attempts,
+               operator_retry_only, bot_comment_message_id, created_at, updated_at
+        from post_comment_jobs where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| PostCommentJobReconciliationView {
+        id: row.0,
+        discussion_message_id: row.1,
+        source_message_id: row.2,
+        status: row.3,
+        error_kind: row.4,
+        attempts: row.5,
+        operator_retry_only: row.6,
+        bot_comment_message_id: row.7,
+        created_at: row.8,
+        updated_at: row.9,
+    }))
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+pub async fn mark_delivery_unknown_post_comment_delivered(
+    pool: &PgPool,
+    job_id: i64,
+    bot_comment_message_id: i32,
+    audit: OperatorAuditParams<'_>,
+) -> anyhow::Result<CasResult> {
+    operator_transition(
+        pool,
+        job_id,
+        "mark_delivered",
+        "sent",
+        audit,
+        Some(bot_comment_message_id),
+    )
+    .await
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+pub async fn mark_delivery_unknown_post_comment_failed(
+    pool: &PgPool,
+    job_id: i64,
+    audit: OperatorAuditParams<'_>,
+) -> anyhow::Result<CasResult> {
+    operator_transition(pool, job_id, "mark_failed", "failed", audit, None).await
+}
+
+// Reached through the reconciliation-only public transitions above.
+#[allow(dead_code)]
+async fn operator_transition(
+    pool: &PgPool,
+    job_id: i64,
+    action: &str,
+    resulting_status: &str,
+    audit: OperatorAuditParams<'_>,
+    bot_comment_message_id: Option<i32>,
+) -> anyhow::Result<CasResult> {
+    validate_operator_audit(&audit)?;
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        r#"
+        update post_comment_jobs
+        set status = $2,
+            bot_comment_message_id = coalesce($3, bot_comment_message_id),
+            sent_at = case when $2 = 'sent' then now() else sent_at end,
+            error_kind = case when $2 = 'failed' then 'operator_marked_failed' else null end,
+            processing_started_at = null,
+            sending_started_at = null,
+            lease_expires_at = null,
+            operator_retry_only = false,
+            updated_at = now()
+        where id = $1 and status = 'delivery_unknown'
+        "#,
+    )
+    .bind(job_id)
+    .bind(resulting_status)
+    .bind(bot_comment_message_id)
+    .execute(&mut *transaction)
+    .await?;
+    if result.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(CasResult::LeaseLost);
+    }
+    insert_operator_audit(
+        &mut transaction,
+        job_id,
+        action,
+        "delivery_unknown",
+        resulting_status,
+        &audit,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(CasResult::Applied)
+}
+
+// Used by the dedicated reconciliation binary; main.rs compiles a separate module tree.
+#[allow(dead_code)]
+pub async fn claim_delivery_unknown_post_comment_for_operator_retry(
+    pool: &PgPool,
+    job_id: i64,
+    audit: OperatorAuditParams<'_>,
+) -> anyhow::Result<Option<PostCommentJob>> {
+    validate_operator_audit(&audit)?;
+    let mut transaction = pool.begin().await?;
+    let row = sqlx::query_as::<_, (i64, i64, i32, i64, i32, String, Option<String>, i32, bool)>(
+        r#"
+        update post_comment_jobs
+        set status = 'processing', attempts = attempts + 1, processing_started_at = now(),
+            sending_started_at = null,
+            lease_expires_at = now() + ($2 * interval '1 second'),
+            operator_retry_only = true, updated_at = now()
+        where id = $1 and status = 'delivery_unknown'
+        returning id, discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
+                  cleaned_post_text, image_file_id, attempts, operator_retry_only
+        "#,
+    )
+    .bind(job_id)
+    .bind(POST_COMMENT_PROCESSING_LEASE_SECONDS)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(row) = row else {
+        transaction.rollback().await?;
+        return Ok(None);
+    };
+    insert_operator_audit(
+        &mut transaction,
+        job_id,
+        "retry",
+        "delivery_unknown",
+        "processing",
+        &audit,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Some(PostCommentJob {
+        id: row.0,
+        discussion_chat_id: row.1,
+        discussion_message_id: row.2,
+        source_channel_id: row.3,
+        source_message_id: row.4,
+        cleaned_post_text: row.5,
+        image_file_id: row.6,
+        attempts: row.7,
+        operator_retry_only: row.8,
+    }))
+}
+
+pub async fn mark_operator_retry_post_comment_terminal_failed(
+    pool: &PgPool,
+    job: &PostCommentJob,
+    error_kind: CommentErrorKind,
+) -> anyhow::Result<CasResult> {
+    let result = sqlx::query(
+        r#"
+        update post_comment_jobs
+        set status = 'failed', error_kind = $3, processing_started_at = null,
+            sending_started_at = null, lease_expires_at = null, updated_at = now()
+        where id = $1 and status in ('processing', 'sending') and attempts = $2
+          and operator_retry_only
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.attempts)
+    .bind(error_kind.as_str())
+    .execute(pool)
+    .await?;
+    CasResult::from_rows_affected(result.rows_affected())
+}
+
+// Reached through the reconciliation-only public transitions above.
+#[allow(dead_code)]
+async fn insert_operator_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+    action: &str,
+    previous_status: &str,
+    resulting_status: &str,
+    audit: &OperatorAuditParams<'_>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "insert into post_comment_job_operator_audit (post_comment_job_id, action, actor, reason, previous_status, resulting_status) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(job_id).bind(action).bind(audit.actor).bind(audit.reason)
+    .bind(previous_status).bind(resulting_status)
+    .execute(&mut **transaction).await?;
+    Ok(())
+}
+
+// Reached through the reconciliation-only public transitions above.
+#[allow(dead_code)]
+fn validate_operator_audit(audit: &OperatorAuditParams<'_>) -> anyhow::Result<()> {
+    if audit.actor.is_empty() || audit.actor.chars().count() > 128 {
+        anyhow::bail!("--actor must contain 1..=128 characters");
+    }
+    if audit.reason.is_empty() || audit.reason.chars().count() > 1000 {
+        anyhow::bail!("--reason must contain 1..=1000 characters");
+    }
+    Ok(())
 }
 
 pub async fn begin_post_comment_delivery(

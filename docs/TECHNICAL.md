@@ -585,6 +585,25 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pager=off -c \"select source_message_id, round(extract(epoch from updated_at - created_at)::numeric, 2) as send_pipeline_sec, status, bot_comment_message_id from post_comment_jobs order by source_message_id desc limit 20;\""
 ```
 
+### Reconciliation ambiguous first-comment delivery
+
+`delivery_unknown` означает, что Telegram transport не подтвердил результат fenced send. Такая задача **никогда не переотправляется автоматически**. Для оператора есть отдельный CLI; он не применяет миграции:
+
+```bash
+# Только чтение ambiguous задач / одной задачи.
+cargo run --bin reconcile_comment_delivery -- list --limit 20
+cargo run --bin reconcile_comment_delivery -- inspect --job-id 123
+
+# Подтверждённый факт доставки или отсутствия доставки: только DB-переход + audit.
+cargo run --bin reconcile_comment_delivery -- mark-delivered --job-id 123 --bot-comment-message-id 456 --actor alice --reason "reply verified in discussion"
+cargo run --bin reconcile_comment_delivery -- mark-failed --job-id 123 --actor alice --reason "no bot reply after manual inspection"
+
+# Риск дубля принят оператором явно. Только после точного claim создаются Config/Bot и запускается настоящий pipeline.
+cargo run --bin reconcile_comment_delivery -- retry --job-id 123 --actor alice --reason "verified no reply" --acknowledge-duplicate-risk
+```
+
+Все operator actions пишутся в `post_comment_job_operator_audit` с bounded `actor` (1–128 символов), `reason` (1–1000), исходным и итоговым status. Повторно claimed job получает `operator_retry_only`; normal worker и `retry_pending_comments` её не берут. Pre-send/confirmed rejection при такой попытке terminally fail без `retry_wait`; network ambiguity снова остаётся `delivery_unknown` и требует нового решения оператора.
+
 Реакция людей за 30 минут после комментария:
 
 ```bash

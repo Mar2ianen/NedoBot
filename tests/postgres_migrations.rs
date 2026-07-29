@@ -15,8 +15,11 @@ use tg_ai_bot_teloxide::features::{
     },
     first_comment::repo::{
         CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
-        begin_post_comment_delivery, claim_next_post_comment_job, create_post_comment_job,
-        finalize_post_comment_sent, mark_post_comment_delivery_unknown,
+        OperatorAuditParams, begin_post_comment_delivery,
+        claim_delivery_unknown_post_comment_for_operator_retry, claim_next_post_comment_job,
+        create_post_comment_job, finalize_post_comment_sent,
+        mark_delivery_unknown_post_comment_delivered, mark_delivery_unknown_post_comment_failed,
+        mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
         mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
@@ -53,6 +56,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
+    assert_comment_reconciliation_requires_operator_claim(&pool).await;
     assert_avatar_job_finalization_requires_current_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
@@ -1389,6 +1393,114 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         CasResult::LeaseLost,
         "a completed send cannot be finalized twice"
     );
+}
+
+async fn assert_comment_reconciliation_requires_operator_claim(pool: &PgPool) {
+    let unknown_id = create_job(pool, 9_400_301).await;
+    query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")
+        .bind(unknown_id)
+        .execute(pool).await.expect("ambiguous fixture must be created");
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("normal claim must execute")
+            .is_none(),
+        "normal worker must never automatically claim delivery_unknown"
+    );
+
+    let audit = OperatorAuditParams {
+        actor: "postgres-test",
+        reason: "confirmed delivery reconciliation",
+    };
+    assert_eq!(
+        mark_delivery_unknown_post_comment_delivered(pool, unknown_id, 9_400_401, audit)
+            .await
+            .expect("operator delivered transition must execute"),
+        CasResult::Applied
+    );
+    let delivered: (String, Option<i32>, i64) = query_as(
+        "select status, bot_comment_message_id, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'mark_delivered') from post_comment_jobs where id = $1",
+    ).bind(unknown_id).fetch_one(pool).await.expect("delivered reconciliation must persist");
+    assert_eq!(delivered, ("sent".to_string(), Some(9_400_401), 1));
+
+    let retry_id = create_job(pool, 9_400_302).await;
+    query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")
+        .bind(retry_id).execute(pool).await.expect("retry fixture must be ambiguous");
+    let retry = claim_delivery_unknown_post_comment_for_operator_retry(
+        pool,
+        retry_id,
+        OperatorAuditParams {
+            actor: "postgres-test",
+            reason: "manual duplicate-risk retry",
+        },
+    )
+    .await
+    .expect("operator retry claim must execute")
+    .expect("exact ambiguous job must be claimed");
+    assert!(retry.operator_retry_only);
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("normal claim after operator claim must execute")
+            .is_none(),
+        "operator retry processing lease must remain outside automatic worker"
+    );
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(retry.id)
+    .execute(pool)
+    .await
+    .expect("operator retry processing lease must be expirable");
+    let recovered_retry = claim_next_post_comment_job(pool)
+        .await
+        .expect("expired operator retry must be safely recoverable before send")
+        .expect("operator retry must be reclaimed after expiry");
+    assert!(recovered_retry.operator_retry_only);
+    assert!(recovered_retry.attempts > retry.attempts);
+    assert_eq!(
+        mark_operator_retry_post_comment_terminal_failed(
+            pool,
+            &recovered_retry,
+            CommentErrorKind::Transient,
+        )
+        .await
+        .expect("operator retry failure must execute"),
+        CasResult::Applied
+    );
+    assert_job_state(pool, retry_id, "failed", Some("transient"), false).await;
+    let retry_audit: (String, String, i64) = query_as(
+        "select previous_status, resulting_status, (select count(*) from post_comment_job_operator_audit where post_comment_job_id = $1) from post_comment_job_operator_audit where post_comment_job_id = $1 and action = 'retry'",
+    ).bind(retry_id).fetch_one(pool).await.expect("retry audit must persist");
+    assert_eq!(
+        retry_audit,
+        ("delivery_unknown".to_string(), "processing".to_string(), 1)
+    );
+
+    let failed_id = create_job(pool, 9_400_303).await;
+    query("update post_comment_jobs set status = 'delivery_unknown', error_kind = 'delivery_unknown' where id = $1")
+        .bind(failed_id).execute(pool).await.expect("failed fixture must be ambiguous");
+    assert_eq!(
+        mark_delivery_unknown_post_comment_failed(
+            pool,
+            failed_id,
+            OperatorAuditParams {
+                actor: "postgres-test",
+                reason: "confirmed not delivered"
+            }
+        )
+        .await
+        .expect("operator failed transition must execute"),
+        CasResult::Applied
+    );
+    assert_job_state(
+        pool,
+        failed_id,
+        "failed",
+        Some("operator_marked_failed"),
+        false,
+    )
+    .await;
 }
 
 async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool) {
