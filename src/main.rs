@@ -28,6 +28,7 @@ use features::first_comment::pipeline::{maybe_comment_post, process_next_post_co
 use features::first_message_spam::process_next_first_message_spam_analysis_job;
 use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL};
 use features::memory::service::process_next_history_entry;
+use features::new_user_audit::service::process_next_new_user_audit_job;
 use features::spam_review::{apply_callback, parse_callback};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
@@ -64,7 +65,12 @@ async fn main() -> anyhow::Result<()> {
         state.pool.clone(),
         state.config.clone(),
     );
-    spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
+    if state.config.new_user_audit_enabled {
+        spawn_new_user_audit_worker(state.clone());
+    } else {
+        spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
+    }
+    // Delivery review-карточек не зависит от optional first-message analysis.
     spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
     spawn_post_comment_worker(bot.clone(), state.clone());
     spawn_post_history_worker(state.clone());
@@ -263,6 +269,29 @@ async fn handle_callback_query(
         }
     }
     Ok(())
+}
+
+fn spawn_new_user_audit_worker(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match process_next_new_user_audit_job(&state.pool, &state.config).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
+                    ))
+                    .await
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "unified new user audit worker failed to claim a job");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
