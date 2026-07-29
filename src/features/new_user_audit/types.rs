@@ -189,6 +189,11 @@ impl NewUserAuditAssessment {
     /// Десериализует ответ модели и отвергает формально допустимые, но опасные
     /// для хранения или модерации значения.
     pub fn parse(value: &str) -> anyhow::Result<Self> {
+        Self::parse_for_input(value, true)
+    }
+
+    /// Проверяет ответ с учётом того, был ли в снимке доступный для анализа аватар.
+    pub fn parse_for_input(value: &str, has_avatar_input: bool) -> anyhow::Result<Self> {
         let value: Value =
             serde_json::from_str(value).context("LLM audit output is not valid JSON")?;
         let object = value
@@ -206,11 +211,18 @@ impl NewUserAuditAssessment {
 
         let assessment: Self = serde_json::from_value(value)
             .context("LLM audit output does not match the assessment contract")?;
-        assessment.validate()?;
+        assessment.validate_for_input(has_avatar_input)?;
         Ok(assessment)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_for_input(true)
+    }
+
+    pub fn validate_for_input(&self, has_avatar_input: bool) -> anyhow::Result<()> {
+        if !has_avatar_input && self.avatar_observation.is_some() {
+            bail!("avatar_observation must be null when the audit input has no avatar");
+        }
         validate_avatar(self.avatar_observation.as_ref())?;
         validate_first_message(self.first_message_assessment.as_ref())?;
         validate_profile(&self.profile_assessment)
@@ -225,6 +237,9 @@ fn validate_avatar(avatar: Option<&AvatarObservation>) -> anyhow::Result<()> {
     )?;
     validate_text_list("avatar_observation.visual_motifs", &avatar.visual_motifs)?;
     validate_text("avatar_observation.description", &avatar.description)?;
+    if let Some(probability) = avatar.personal_photo_probability {
+        validate_probability("avatar_observation.personal_photo_probability", probability)?;
+    }
     validate_probability("avatar_observation.confidence", avatar.confidence)
 }
 

@@ -26,7 +26,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
     "paperpaper.ru",
 ];
 
-use crate::llm::profiles::{LlmProfiles, RouteRequirements};
+use crate::llm::profiles::{LlmProfiles, RouteRequirements, StructuredOutputMode};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -552,6 +552,20 @@ impl Config {
                     ..RouteRequirements::default()
                 },
             ));
+        }
+        if self.new_user_audit_enabled {
+            for requires_images in [false, true] {
+                routes.push((
+                    "new_user_audit",
+                    RouteRequirements {
+                        requires_images,
+                        requires_system_prompt: true,
+                        structured_output: Some(StructuredOutputMode::JsonSchema),
+                        num_predict: Some(self.llm_max_tokens),
+                        ..RouteRequirements::default()
+                    },
+                ));
+            }
         }
         if self.ask_enabled {
             for requires_images in [false, true] {
@@ -1401,6 +1415,51 @@ models = ["primary", "fallback"]
         assert!(error.contains(
             "NEW_USER_AUDIT_ENABLED=true cannot coexist with FIRST_MESSAGE_SPAM_ENABLED=true"
         ));
+    }
+
+    #[test]
+    fn enabled_new_user_audit_requires_image_capable_json_schema_profile_route() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
+        unsafe { std::env::set_var("GEMINI_API_KEY", "test-key") };
+
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(
+                r#"
+[providers.test]
+driver = "openai_compatible"
+base_url = "https://test.example/v1"
+api_key_env = "GEMINI_API_KEY"
+
+[models.text_only]
+provider = "test"
+model = "test-model"
+[models.text_only.capabilities]
+supports_images = false
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 4096
+max_output_tokens = 256
+request_timeout_sec = 5
+thinking = "none"
+
+[routes.first_comment]
+models = ["text_only"]
+[routes.new_user_audit]
+models = ["text_only"]
+"#,
+            )
+            .unwrap(),
+        );
+        config.new_user_audit_enabled = true;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("LLM profile route \"new_user_audit\" is invalid"));
+        assert!(error.contains("requires images"));
+        drop(gemini);
     }
 
     #[test]
