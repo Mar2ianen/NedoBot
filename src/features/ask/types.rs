@@ -50,7 +50,7 @@ impl AskFailureKind {
 
     pub fn from_error(error: &anyhow::Error) -> Self {
         let error = error.to_string().to_lowercase();
-        if error.contains("timed out") {
+        if error.contains("timed out") || error.contains("deadline exceeded") {
             Self::Timeout
         } else if error.contains("mcp") || error.contains("database") {
             Self::ToolError

@@ -169,7 +169,7 @@ pub async fn search_messages_batch(
     api: &ChatReadApi,
     input: SearchMessagesBatchInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
-    validate_batch_queries(&input.queries)?;
+    let queries = normalize_batch_queries(input.queries)?;
     let date_from = parse_timestamp(input.date_from)?;
     let date_to = parse_timestamp(input.date_to)?;
     let limit = input
@@ -177,7 +177,7 @@ pub async fn search_messages_batch(
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_BATCH_LIMIT);
     let mut results = Vec::new();
-    for query in input.queries {
+    for query in queries {
         let messages = api
             .search_messages(&MessageSearchRequest {
                 query: query.clone(),
@@ -206,14 +206,26 @@ pub async fn search_messages_batch(
     Ok(serde_json::json!({"results": results}))
 }
 
-fn validate_batch_queries(queries: &[String]) -> Result<(), rmcp::ErrorData> {
+fn normalize_batch_queries(queries: Vec<String>) -> Result<Vec<String>, rmcp::ErrorData> {
     if queries.is_empty() {
         return Err(invalid_arguments("queries must not be empty"));
     }
     if queries.len() > MAX_BATCH_QUERIES {
         return Err(invalid_arguments("queries must contain at most six items"));
     }
-    Ok(())
+
+    let mut normalized = Vec::with_capacity(queries.len());
+    for query in queries {
+        let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if query.is_empty() {
+            return Err(invalid_arguments("queries must not contain empty items"));
+        }
+        if normalized.contains(&query) {
+            return Err(invalid_arguments("queries must not contain duplicates"));
+        }
+        normalized.push(query);
+    }
+    Ok(normalized)
 }
 
 pub async fn recent_messages(
@@ -362,8 +374,28 @@ mod tests {
         let queries = (0..=MAX_BATCH_QUERIES)
             .map(|index| format!("query-{index}"))
             .collect::<Vec<_>>();
-        let error = validate_batch_queries(&queries).unwrap_err();
+        let error = normalize_batch_queries(queries).unwrap_err();
         assert_eq!(error.message, "queries must contain at most six items");
+    }
+
+    #[test]
+    fn batch_search_normalizes_and_rejects_empty_or_duplicate_queries() {
+        assert_eq!(
+            normalize_batch_queries(vec!["  один   запрос ".into(), "другой".into()]).unwrap(),
+            vec!["один запрос", "другой"]
+        );
+        assert_eq!(
+            normalize_batch_queries(vec![" ".into()])
+                .unwrap_err()
+                .message,
+            "queries must not contain empty items"
+        );
+        assert_eq!(
+            normalize_batch_queries(vec!["один запрос".into(), " один   запрос ".into()])
+                .unwrap_err()
+                .message,
+            "queries must not contain duplicates"
+        );
     }
 
     #[test]

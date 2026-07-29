@@ -5,7 +5,10 @@ use teloxide::{
     types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReplyParameters},
 };
 
-use crate::telegram::html;
+use crate::{
+    features::jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
+    telegram::html,
+};
 
 const OWNER_USERNAME: &str = "Chechulinm";
 const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
@@ -15,6 +18,7 @@ pub struct SpamReview {
     pub chat_id: i64,
     pub first_message_id: Option<i32>,
     pub notification_message_id: Option<i32>,
+    pub notification_attempts: i32,
     pub risk_score: i32,
     pub risk_signals: Value,
     pub text: String,
@@ -104,7 +108,8 @@ async fn claim_review_delivery(
         from candidate
         where request.id = candidate.id
         returning request.id, request.chat_id, request.telegram_user_id,
-                  request.risk_score, request.risk_signals, request.notification_message_id
+                  request.risk_score, request.risk_signals, request.notification_message_id,
+                  request.notification_attempts
         "#,
     )
     .bind(request_id)
@@ -122,6 +127,7 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
     let score: i32 = row.get("risk_score");
     let signals: Value = row.get("risk_signals");
     let notification_message_id: Option<i32> = row.get("notification_message_id");
+    let notification_attempts: i32 = row.get("notification_attempts");
     let profile = sqlx::query(r#"
         select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
@@ -147,6 +153,7 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
         chat_id,
         first_message_id: profile.get("first_message_id"),
         notification_message_id,
+        notification_attempts,
         risk_score: score,
         risk_signals: signals,
         text,
@@ -182,13 +189,49 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
     };
 
     match result {
-        Ok(message_id) => mark_review_delivery_succeeded(pool, review, message_id).await,
-        Err(err) => {
-            if let Err(save_err) = mark_review_delivery_failed(pool, review.id).await {
-                tracing::warn!(%save_err, request_id = review.id, "failed to persist spam review delivery failure");
+        Ok(message_id) => match mark_review_delivery_succeeded(pool, review, message_id).await? {
+            CasResult::Applied => Ok(()),
+            CasResult::LeaseLost => {
+                tracing::warn!(
+                    request_id = review.id,
+                    attempts = review.notification_attempts,
+                    "spam review delivery completion lost its lease"
+                );
+                Ok(())
             }
-            Err(err.into())
-        }
+        },
+        Err(err) => match classify_delivery_error(&err) {
+            DeliveryFailure::AlreadyApplied => {
+                match mark_review_delivery_succeeded(
+                    pool,
+                    review,
+                    review.notification_message_id.unwrap_or_default(),
+                )
+                .await?
+                {
+                    CasResult::Applied => Ok(()),
+                    CasResult::LeaseLost => {
+                        tracing::warn!(
+                            request_id = review.id,
+                            attempts = review.notification_attempts,
+                            "stale spam review edit completion lost its lease"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            failure => {
+                let saved = mark_review_delivery_failed(pool, review, failure).await?;
+                if saved == CasResult::LeaseLost {
+                    tracing::warn!(
+                        request_id = review.id,
+                        attempts = review.notification_attempts,
+                        "spam review delivery failure lost its lease"
+                    );
+                }
+                Err(err.into())
+            }
+        },
     }
 }
 
@@ -202,12 +245,12 @@ fn review_keyboard(request_id: i64) -> InlineKeyboardMarkup {
     ]])
 }
 
-async fn mark_review_delivery_succeeded(
+pub async fn mark_review_delivery_succeeded(
     pool: &PgPool,
     review: &SpamReview,
     message_id: i32,
-) -> anyhow::Result<()> {
-    sqlx::query(
+) -> anyhow::Result<CasResult> {
+    let rows = sqlx::query(
         r#"
         update spam_review_requests
         set notification_status = case
@@ -224,42 +267,99 @@ async fn mark_review_delivery_succeeded(
             notification_processing_started_at = null,
             notification_lease_expires_at = null,
             notification_error_kind = null
-        where id = $1 and status = 'pending' and notification_status = 'processing'
+        where id = $1
+          and notification_attempts = $5
+          and status = 'pending'
+          and notification_status = 'processing'
         "#,
     )
     .bind(review.id)
     .bind(message_id)
     .bind(review.risk_score)
     .bind(&review.risk_signals)
+    .bind(review.notification_attempts)
     .execute(pool)
     .await?;
-    Ok(())
+    CasResult::from_rows_affected(rows.rows_affected())
 }
 
-async fn mark_review_delivery_failed(pool: &PgPool, request_id: i64) -> anyhow::Result<()> {
-    sqlx::query(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryFailure {
+    Retryable,
+    ReplaceMessage,
+    Terminal(&'static str),
+    AlreadyApplied,
+}
+
+fn classify_delivery_error(error: &teloxide::RequestError) -> DeliveryFailure {
+    if matches!(error, teloxide::RequestError::RetryAfter(_)) {
+        return DeliveryFailure::Retryable;
+    }
+    if matches!(
+        error,
+        teloxide::RequestError::Api(teloxide::ApiError::InvalidToken)
+    ) {
+        return DeliveryFailure::Terminal("telegram_invalid_token");
+    }
+
+    let message = error.to_string().to_lowercase();
+    if message.contains("message is not modified") {
+        DeliveryFailure::AlreadyApplied
+    } else if message.contains("message to edit not found")
+        || message.contains("message can't be edited")
+    {
+        DeliveryFailure::ReplaceMessage
+    } else if message.contains("forbidden") || message.contains("chat not found") {
+        DeliveryFailure::Terminal("telegram_forbidden")
+    } else {
+        DeliveryFailure::Retryable
+    }
+}
+
+async fn mark_review_delivery_failed(
+    pool: &PgPool,
+    review: &SpamReview,
+    failure: DeliveryFailure,
+) -> anyhow::Result<CasResult> {
+    let (status, error_kind, clear_message_id, delay_seconds) = match failure {
+        DeliveryFailure::Retryable => {
+            match ANALYSIS_RETRY.delay_seconds(review.notification_attempts, None) {
+                Some(delay) => ("retry_wait", "telegram_send_failed", false, Some(delay)),
+                None => ("failed", "telegram_retry_exhausted", false, None),
+            }
+        }
+        DeliveryFailure::ReplaceMessage => {
+            ("retry_wait", "telegram_message_missing", true, Some(0))
+        }
+        DeliveryFailure::Terminal(kind) => ("failed", kind, false, None),
+        DeliveryFailure::AlreadyApplied => {
+            anyhow::bail!("already-applied delivery must be finalized as success")
+        }
+    };
+    let rows = sqlx::query(
         r#"
         update spam_review_requests
-        set notification_status = 'retry_wait',
-            notification_next_attempt_at = now() + (
-                case notification_attempts
-                    when 1 then 15
-                    when 2 then 30
-                    when 3 then 60
-                    when 4 then 300
-                    else 86400
-                end * interval '1 second'
-            ),
+        set notification_status = $2,
+            notification_next_attempt_at = now() + (coalesce($3, 0) * interval '1 second'),
+            notification_message_id = case when $4 then null else notification_message_id end,
             notification_processing_started_at = null,
             notification_lease_expires_at = null,
-            notification_error_kind = 'telegram_send_failed'
-        where id = $1 and status = 'pending' and notification_status = 'processing'
+            notification_error_kind = $5
+        where id = $1
+          and notification_attempts = $6
+          and status = 'pending'
+          and notification_status = 'processing'
         "#,
     )
-    .bind(request_id)
+    .bind(review.id)
+    .bind(status)
+    .bind(delay_seconds)
+    .bind(clear_message_id)
+    .bind(error_kind)
+    .bind(review.notification_attempts)
     .execute(pool)
     .await?;
-    Ok(())
+    CasResult::from_rows_affected(rows.rows_affected())
 }
 
 pub async fn apply_callback(

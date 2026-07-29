@@ -15,7 +15,7 @@ use tg_ai_bot_teloxide::features::{
         create_post_comment_job, mark_post_comment_failed, mark_post_comment_sent,
     },
     first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
-    spam_review::create_review,
+    spam_review::{claim_next_review_delivery, create_review, mark_review_delivery_succeeded},
     stats::{
         render_html, render_rich, repo as stats_repo,
         types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
@@ -38,6 +38,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
+    assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_avatar_job_finalization_requires_current_claim(&pool).await;
 }
@@ -100,6 +101,69 @@ async fn assert_avatar_job_finalization_requires_current_claim(pool: &PgPool) {
     assert_eq!(
         current_result,
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
+    );
+}
+
+async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_002;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review CAS chat user must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Review CAS')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review CAS profile must exist");
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("high-risk audit must exist");
+    let first_claim = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("review creation must succeed")
+        .expect("high-risk review must be claimed");
+    query("update spam_review_requests set notification_lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(first_claim.id)
+        .execute(pool)
+        .await
+        .expect("review lease must expire");
+    let second_claim = claim_next_review_delivery(pool)
+        .await
+        .expect("reclaimed review must be claimable")
+        .expect("review must be reclaimed");
+    assert!(second_claim.notification_attempts > first_claim.notification_attempts);
+    assert_eq!(
+        mark_review_delivery_succeeded(pool, &first_claim, 1001)
+            .await
+            .expect("stale review finalization must execute"),
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
+    );
+    assert_eq!(
+        mark_review_delivery_succeeded(pool, &second_claim, 1002)
+            .await
+            .expect("current review finalization must execute"),
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
+    );
+    let state: (String, i32, Option<i32>) = query_as(
+        "select notification_status, notification_attempts, notification_message_id from spam_review_requests where id = $1",
+    )
+    .bind(second_claim.id)
+    .fetch_one(pool)
+    .await
+    .expect("finalized review must be stored");
+    assert_eq!(
+        state,
+        (
+            "sent".into(),
+            second_claim.notification_attempts,
+            Some(1002)
+        )
     );
 }
 
