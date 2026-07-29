@@ -154,11 +154,6 @@ async fn process_refreshed_profile(
     config: &Config,
     job: ProfileRefreshJob,
 ) {
-    if config.new_user_audit_enabled {
-        enqueue_unified_new_user_audit(pool, job).await;
-        return;
-    }
-
     if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
         tracing::warn!(%err, user_id = job.user_id, "failed to analyze new user profile");
     } else {
@@ -178,6 +173,12 @@ async fn process_refreshed_profile(
         }
     }
 
+    // Пока unified audit не materialize-ит score и review в одной транзакции,
+    // он работает только в shadow-режиме и не заменяет legacy источник истины.
+    if config.new_user_audit_enabled {
+        enqueue_unified_new_user_audit(pool, job).await;
+    }
+
     if config.avatar_classifier_enabled
         && let Err(err) = enqueue_current_avatar_analysis(pool, job.user_id).await
     {
@@ -186,11 +187,6 @@ async fn process_refreshed_profile(
 }
 
 async fn enqueue_unified_new_user_audit(pool: &PgPool, job: ProfileRefreshJob) {
-    if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
-        tracing::warn!(%err, user_id = job.user_id, "failed to analyze new user profile");
-        return;
-    }
-
     let snapshot = match load_unified_user_audit_snapshot(pool, job.chat_id, job.user_id).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return,
