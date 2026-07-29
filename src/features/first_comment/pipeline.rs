@@ -23,8 +23,9 @@ use crate::features::first_comment::repo::{
     CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
     PostCommentJob, SendFailure, begin_post_comment_delivery, claim_next_post_comment_job,
     classify_send_error, create_post_comment_job, finalize_post_comment_sent,
-    load_recent_bot_comments, mark_post_comment_delivery_unknown,
-    mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
+    load_recent_bot_comments, mark_operator_retry_post_comment_terminal_failed,
+    mark_post_comment_delivery_unknown, mark_post_comment_pre_send_failed,
+    mark_post_comment_send_rejected,
 };
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::service::load_relevant_memory_notes;
@@ -118,13 +119,23 @@ pub async fn process_next_post_comment_job(
         return Ok(false);
     };
 
-    let outcome = match process_post_comment_job(bot, state, &job).await {
+    process_claimed_post_comment_job(bot, state, &job).await?;
+
+    Ok(true)
+}
+
+pub async fn process_claimed_post_comment_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+    job: &PostCommentJob,
+) -> anyhow::Result<()> {
+    let outcome = match process_post_comment_job(bot, state, job).await {
         Ok(outcome) => outcome,
         Err(error_kind) => JobOutcome::Failed(error_kind),
     };
     match outcome {
         JobOutcome::Prepared(completed) => {
-            match deliver_prepared_post_comment(bot, state, &job, completed).await? {
+            match deliver_prepared_post_comment(bot, state, job, completed).await? {
                 JobOutcome::LeaseLost => tracing::info!(
                     job_id = job.id,
                     "post comment worker lost its current delivery attempt"
@@ -141,9 +152,13 @@ pub async fn process_next_post_comment_job(
         }
         JobOutcome::Completed => {}
         JobOutcome::Failed(error_kind) => {
-            if mark_post_comment_pre_send_failed(&state.pool, &job, error_kind).await?
-                == CasResult::Applied
-            {
+            let result = if job.operator_retry_only {
+                mark_operator_retry_post_comment_terminal_failed(&state.pool, job, error_kind)
+                    .await?
+            } else {
+                mark_post_comment_pre_send_failed(&state.pool, job, error_kind).await?
+            };
+            if result == CasResult::Applied {
                 tracing::warn!(
                     job_id = job.id,
                     attempts = job.attempts,
@@ -159,7 +174,7 @@ pub async fn process_next_post_comment_job(
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 async fn process_post_comment_job(
@@ -397,9 +412,13 @@ async fn handle_post_comment_send_error(
             error_kind,
             retry_after_seconds,
         } => {
-            let result =
+            let result = if job.operator_retry_only {
+                mark_operator_retry_post_comment_terminal_failed(&state.pool, job, error_kind)
+                    .await?
+            } else {
                 mark_post_comment_send_rejected(&state.pool, job, error_kind, retry_after_seconds)
-                    .await?;
+                    .await?
+            };
             if result == CasResult::Applied {
                 Ok(JobOutcome::Failed(error_kind))
             } else {
