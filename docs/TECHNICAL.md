@@ -178,6 +178,7 @@ deploy hook перезагружает контейнерный Nginx после
 - `LLM_PROVIDER=ollama` секрета не требует.
 - Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
+- `NEW_USER_AUDIT_ENABLED=true` использует существующий LLM provider/profile и не добавляет отдельных secret/model переменных. Он взаимоисключающий с `AVATAR_CLASSIFIER_ENABLED=true` и `FIRST_MESSAGE_SPAM_ENABLED=true`: параллельные audit pipelines запрещены.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
@@ -566,6 +567,8 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 ## New User Audit
 
 `src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
+
+`NEW_USER_AUDIT_ENABLED=false` по умолчанию. Если включить unified audit (`true`), одновременно отключите `AVATAR_CLASSIFIER_ENABLED` и `FIRST_MESSAGE_SPAM_ENABLED`: startup validation отклоняет их совместное включение, чтобы не запускать параллельные audit pipelines.
 
 Для ручного пересчёта истории:
 

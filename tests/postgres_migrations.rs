@@ -35,8 +35,8 @@ use tg_ai_bot_teloxide::features::{
         finalize_history_failed, finalize_history_retry,
     },
     new_user_audit::repo::{
-        claim_next_new_user_audit_job, enqueue_new_user_audit_job, mark_new_user_audit_failed,
-        mark_new_user_audit_retry, mark_new_user_audit_succeeded,
+        NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
+        mark_new_user_audit_failed, mark_new_user_audit_retry,
     },
     spam_review::{
         claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
@@ -725,12 +725,32 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
     const USER_ID: i64 = 9_000_098;
     let input = serde_json::json!({"schema_version": "fixture-v1"});
 
-    enqueue_new_user_audit_job(pool, CHAT_ID, USER_ID, "snapshot-a", "prompt-v1", &input)
+    let params = NewUserAuditJobParams {
+        chat_id: CHAT_ID,
+        telegram_user_id: USER_ID,
+        snapshot_hash: "snapshot-a",
+        prompt_version: "prompt-v1",
+        input_json: &input,
+        avatar_file_id: None,
+        avatar_file_unique_id: None,
+    };
+    enqueue_new_user_audit_job(pool, params)
         .await
         .expect("new audit job enqueue must succeed");
-    enqueue_new_user_audit_job(pool, CHAT_ID, USER_ID, "snapshot-a", "prompt-v1", &input)
-        .await
-        .expect("identical audit job enqueue must be idempotent");
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "snapshot-a",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("identical audit job enqueue must be idempotent");
 
     let count: i64 = query_scalar(
         "select count(*) from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
@@ -758,7 +778,7 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
         .expect("expired audit job must be reclaimed");
     assert!(second_claim.attempts > first_claim.attempts);
     assert_eq!(
-        mark_new_user_audit_succeeded(pool, &first_claim)
+        mark_new_user_audit_failed(pool, &first_claim, "fixture_stale")
             .await
             .expect("stale audit finalizer must execute"),
         CasResult::LeaseLost
