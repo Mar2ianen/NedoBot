@@ -60,12 +60,17 @@ impl RetryPolicy {
 }
 
 pub const EXTERNAL_REQUEST_LEASE: LeasePolicy = LeasePolicy::new(10 * 60);
+pub const CHAT_EMBEDDING_LEASE: LeasePolicy = LeasePolicy::new(10 * 60);
+pub const CHAT_EMBEDDING_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 120]);
 pub const ANALYSIS_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 5 * 60, 24 * 60 * 60]);
 pub const EXTERNAL_ANALYSIS_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 
 #[cfg(test)]
 mod tests {
-    use super::{ANALYSIS_RETRY, EXTERNAL_ANALYSIS_POLL, EXTERNAL_REQUEST_LEASE};
+    use super::{
+        ANALYSIS_RETRY, CHAT_EMBEDDING_LEASE, CHAT_EMBEDDING_RETRY, EXTERNAL_ANALYSIS_POLL,
+        EXTERNAL_REQUEST_LEASE,
+    };
 
     #[test]
     fn analysis_retry_has_bounded_schedule() {
@@ -82,8 +87,12 @@ mod tests {
     }
 
     #[test]
-    fn external_requests_share_named_lease_and_poll() {
+    fn named_leases_and_polls_preserve_existing_timing() {
         assert_eq!(EXTERNAL_REQUEST_LEASE.seconds(), 600);
+        assert_eq!(CHAT_EMBEDDING_LEASE.seconds(), 600);
+        assert_eq!(CHAT_EMBEDDING_RETRY.delay_seconds(1, None), Some(15));
+        assert_eq!(CHAT_EMBEDDING_RETRY.delay_seconds(4, None), Some(120));
+        assert_eq!(CHAT_EMBEDDING_RETRY.delay_seconds(5, None), None);
         assert_eq!(EXTERNAL_ANALYSIS_POLL.idle_seconds(), 5);
         assert_eq!(EXTERNAL_ANALYSIS_POLL.error_seconds(), 5);
     }

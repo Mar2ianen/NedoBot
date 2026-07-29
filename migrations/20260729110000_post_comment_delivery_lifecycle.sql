@@ -11,6 +11,9 @@ set status = 'delivery_unknown',
 where status = 'processing';
 
 alter table public.post_comment_jobs
+    drop constraint if exists post_comment_jobs_status_check;
+
+alter table public.post_comment_jobs
     add constraint post_comment_jobs_status_check
         check (status in (
             'pending', 'retry_wait', 'processing', 'sending', 'sent', 'failed',

@@ -4,12 +4,13 @@ use serde::Serialize;
 use sqlx::{PgPool, Row};
 
 use crate::config::Config;
-use crate::features::jobs::claim::CasResult;
+use crate::features::jobs::{
+    claim::CasResult,
+    policy::{CHAT_EMBEDDING_LEASE, CHAT_EMBEDDING_RETRY},
+};
 use crate::features::memory::embedding::{embed_text_batch, pgvector_literal};
 use crate::features::search::types::ResearchPlan;
 
-const LEASE_SECONDS: i64 = 10 * 60;
-const MAX_RETRY_ATTEMPTS: i32 = 5;
 const SHADOW_CANDIDATE_LIMIT: i64 = 12;
 const MAX_CANDIDATES_PER_SIGNAL: usize = 4;
 const PRECISE_LITERAL_SCORE: f64 = 1.0;
@@ -565,7 +566,7 @@ async fn claim_embedding_jobs_matching(
     );
     let rows = sqlx::query(&sql)
         .bind(batch_size.clamp(1, 64) as i64)
-        .bind(LEASE_SECONDS)
+        .bind(CHAT_EMBEDDING_LEASE.seconds())
         .fetch_all(pool)
         .await?;
     Ok(rows
@@ -641,7 +642,8 @@ pub async fn mark_embedding_failed(
     job: &EmbeddingJob,
     error_kind: &str,
 ) -> anyhow::Result<CasResult> {
-    let (status, delay) = retry_after(job.attempts)
+    let (status, delay) = CHAT_EMBEDDING_RETRY
+        .delay_seconds(job.attempts, None)
         .map(|delay| ("retry_wait", delay))
         .unwrap_or(("failed", 0));
     let update = sqlx::query(
@@ -665,16 +667,12 @@ pub async fn mark_embedding_failed(
     CasResult::from_rows_affected(update.rows_affected())
 }
 
-fn retry_after(attempts: i32) -> Option<i64> {
-    (attempts < MAX_RETRY_ATTEMPTS).then(|| 15 * 2_i64.pow(attempts.saturating_sub(1) as u32))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         BROAD_LITERAL_SCORE, EmbeddingJob, PRECISE_LITERAL_SCORE,
         embedding_batch_matches_claimed_jobs, geometric_freshness, literal_match_score,
-        literal_variants, retry_after, select_diverse_candidates,
+        literal_variants, select_diverse_candidates,
     };
     use crate::features::chat_retrieval::RetrievalCandidate;
 
@@ -704,15 +702,6 @@ mod tests {
             &jobs,
             &[vec![0.0], vec![0.0], vec![0.0]]
         ));
-    }
-
-    #[test]
-    fn retries_are_bounded_and_increase_geometrically() {
-        assert_eq!(retry_after(1), Some(15));
-        assert_eq!(retry_after(2), Some(30));
-        assert_eq!(retry_after(3), Some(60));
-        assert_eq!(retry_after(4), Some(120));
-        assert_eq!(retry_after(5), None);
     }
 
     #[test]
