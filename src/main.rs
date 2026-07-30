@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         state.config.clone(),
     );
     if state.config.new_user_audit_enabled {
-        // До финального cutover unified worker только собирает shadow assessments.
+        // В shadow-режиме worker сохраняет assessment; authoritative режим materialize-ит score/review.
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
     // Legacy avatar worker остаётся authoritative в shadow-режиме unified audit.

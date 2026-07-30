@@ -120,6 +120,12 @@ GROQ_API_KEY=
 GROQ_MODEL=
 CEREBRAS_API_KEY=
 CEREBRAS_MODEL=
+# Unified audit rollout: shadow first, then authoritative cutover.
+NEW_USER_AUDIT_ENABLED=false
+NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=false
+NEW_USER_AUDIT_MAX_TOKENS=900
+AVATAR_CLASSIFIER_ENABLED=true
+FIRST_MESSAGE_SPAM_ENABLED=false
 OPENROUTER_API_KEY=
 OPENROUTER_MODEL=
 GEMINI_API_KEY=
@@ -162,7 +168,7 @@ deploy hook перезагружает контейнерный Nginx после
 
 ### Строгие LLM profiles
 
-`LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют legacy-поведение `LLM_PROVIDER`/моделей. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `avatar_analysis`, `first_message_spam` или `ask`) и игнорирует legacy provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
+`LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют legacy-поведение `LLM_PROVIDER`/моделей. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `avatar_analysis`, `first_message_spam`, `new_user_audit` или `ask`) и игнорирует legacy provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
 
@@ -178,7 +184,7 @@ deploy hook перезагружает контейнерный Nginx после
 - `LLM_PROVIDER=ollama` секрета не требует.
 - Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
-- `NEW_USER_AUDIT_ENABLED=true` использует существующий LLM provider/profile и не добавляет отдельных secret/model переменных. Он взаимоисключающий с `AVATAR_CLASSIFIER_ENABLED=true` и `FIRST_MESSAGE_SPAM_ENABLED=true`: параллельные audit pipelines запрещены. Пока unified worker находится в shadow implementation slice без final score/review transaction, этот flag нельзя включать в production.
+- `NEW_USER_AUDIT_ENABLED=true` запускает unified worker и использует существующий LLM provider/profile без отдельных secret/model переменных. `NEW_USER_AUDIT_MAX_TOKENS` ограничивает его output и по умолчанию равен `900`. При `NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=false` worker сохраняет shadow assessments, а legacy pipelines остаются источником истины. Authoritative cutover требует одновременно `NEW_USER_AUDIT_ENABLED=true`, `AVATAR_CLASSIFIER_ENABLED=false` и `FIRST_MESSAGE_SPAM_ENABLED=false`; он также требует корректные `RAG_EMBEDDING_URL`, `RAG_EMBEDDING_MODEL` и `RAG_EMBEDDING_TIMEOUT_SEC`, поскольку материализация оценивает embedding первого сообщения.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
@@ -568,7 +574,7 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 
 `src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
 
-`NEW_USER_AUDIT_ENABLED=false` по умолчанию. Пока unified worker не получил final score/review transaction, flag остаётся shadow-only и его нельзя включать в production. После завершения cutover он будет взаимоисключающим с `AVATAR_CLASSIFIER_ENABLED` и `FIRST_MESSAGE_SPAM_ENABLED`: startup validation отклонит их совместное включение, чтобы не запускать параллельные audit pipelines.
+`NEW_USER_AUDIT_ENABLED=false` по умолчанию. При `NEW_USER_AUDIT_ENABLED=true` и `NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=false` unified worker выполняет shadow-анализ и сохраняет assessment без изменения authoritative score/review. Для cutover включите оба флага: authoritative flow атомарно сохраняет baseline и job, затем materialize-ит итоговый score/review. Startup validation требует выключить `AVATAR_CLASSIFIER_ENABLED` и `FIRST_MESSAGE_SPAM_ENABLED`, а также проверяет embedding-конфиг, поэтому параллельные источники риска и неполная materialization-конфигурация не попадут в production.
 
 Для ручного пересчёта истории:
 

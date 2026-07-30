@@ -195,7 +195,7 @@ async fn generate_and_finalize(
             prompt: &prompt,
             image_base64: image_base64.as_deref(),
             temperature: 0.0,
-            num_predict: config.llm_max_tokens,
+            num_predict: config.new_user_audit_max_tokens,
             output_validator: Some(&output_validator),
             structured_output: Some(StructuredOutput {
                 name: "new_user_audit_assessment",

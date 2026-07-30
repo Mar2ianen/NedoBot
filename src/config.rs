@@ -90,6 +90,7 @@ pub struct Config {
     pub new_user_audit_enabled: bool,
     /// Включает authoritative unified cutover после завершения shadow-сверки.
     pub new_user_audit_authoritative_enabled: bool,
+    pub new_user_audit_max_tokens: u32,
     pub avatar_classifier_enabled: bool,
     pub avatar_classifier_model: Option<String>,
     pub avatar_classifier_max_tokens: u32,
@@ -248,6 +249,7 @@ impl Config {
                 "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED",
                 false,
             )?,
+            new_user_audit_max_tokens: env_u32("NEW_USER_AUDIT_MAX_TOKENS", 900)?,
             avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true)?,
             avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
                 .or_else(|| Some("gemma-4-31b".to_string())),
@@ -397,6 +399,9 @@ impl Config {
             errors.push(
                 "authoritative unified audit requires FIRST_MESSAGE_SPAM_ENABLED=false".to_string(),
             );
+        }
+        if self.new_user_audit_authoritative_enabled {
+            self.validate_embedding_config(&mut errors);
         }
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
@@ -572,7 +577,7 @@ impl Config {
                         requires_images,
                         requires_system_prompt: true,
                         structured_output: Some(StructuredOutputMode::JsonSchema),
-                        num_predict: Some(self.llm_max_tokens),
+                        num_predict: Some(self.new_user_audit_max_tokens),
                         ..RouteRequirements::default()
                     },
                 ));
@@ -1107,6 +1112,7 @@ mod tests {
             cerebras_model: None,
             new_user_audit_enabled: false,
             new_user_audit_authoritative_enabled: false,
+            new_user_audit_max_tokens: 900,
             avatar_classifier_enabled: false,
             avatar_classifier_model: None,
             avatar_classifier_max_tokens: 900,
@@ -1192,9 +1198,11 @@ mod tests {
             .lock()
             .expect("environment test lock must not be poisoned");
         let _new_user_audit_enabled = EnvVarGuard::unset("NEW_USER_AUDIT_ENABLED");
+        let _new_user_audit_max_tokens = EnvVarGuard::unset("NEW_USER_AUDIT_MAX_TOKENS");
 
         let config = Config::from_env().expect("configuration must parse without audit flag");
         assert!(!config.new_user_audit_enabled);
+        assert_eq!(config.new_user_audit_max_tokens, 900);
 
         unsafe { std::env::set_var("NEW_USER_AUDIT_ENABLED", "enabled") };
         let error = match Config::from_env() {
@@ -1202,6 +1210,14 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("NEW_USER_AUDIT_ENABLED"));
+
+        unsafe { std::env::set_var("NEW_USER_AUDIT_ENABLED", "false") };
+        unsafe { std::env::set_var("NEW_USER_AUDIT_MAX_TOKENS", "many") };
+        let error = match Config::from_env() {
+            Ok(_) => panic!("invalid audit token limit must fail configuration parsing"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("NEW_USER_AUDIT_MAX_TOKENS"));
     }
 
     #[test]
@@ -1465,6 +1481,18 @@ models = ["text_only"]
         assert!(error.contains("LLM profile route \"new_user_audit\" is invalid"));
         assert!(error.contains("requires images"));
         drop(gemini);
+    }
+
+    #[test]
+    fn authoritative_new_user_audit_requires_embedding_config() {
+        let mut config = config();
+        config.new_user_audit_enabled = true;
+        config.new_user_audit_authoritative_enabled = true;
+        config.rag_embedding_url.clear();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
     }
 
     #[test]
