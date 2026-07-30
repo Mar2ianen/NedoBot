@@ -190,10 +190,7 @@ where
                         })
                     }
                     Err(error) => {
-                        return Err(OpenAIError::JSONDeserialize(
-                            error,
-                            String::from_utf8_lossy(&bytes).into_owned(),
-                        ));
+                        return Err(OpenAIError::JSONDeserialize(error));
                     }
                 };
 
