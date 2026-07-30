@@ -162,15 +162,6 @@ fn validate_cleanup_text(raw: &str, cleaned: &str) -> anyhow::Result<()> {
         anyhow::bail!("cleanup introduced numbers not present in ASR: {added_numbers:?}");
     }
 
-    let raw_tokens = normalized_tokens(raw);
-    let added_tokens = normalized_tokens(cleaned)
-        .difference(&raw_tokens)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !added_tokens.is_empty() {
-        anyhow::bail!("cleanup introduced words not present in ASR: {added_tokens:?}");
-    }
-
     Ok(())
 }
 
@@ -183,24 +174,6 @@ fn number_tokens(text: &str) -> BTreeSet<String> {
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn normalized_tokens(text: &str) -> BTreeSet<String> {
-    text.split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(normalize_token)
-        .collect()
-}
-
-fn normalize_token(token: &str) -> String {
-    match token.to_lowercase().as_str() {
-        "грок" | "groq" => "groq".to_string(),
-        "оллама" | "ollama" => "ollama".to_string(),
-        "гемма" | "gemma" => "gemma".to_string(),
-        "церебрас" | "cerebras" => "cerebras".to_string(),
-        "клинап" | "cleanup" => "cleanup".to_string(),
-        _ => token.to_lowercase(),
-    }
 }
 
 fn parse_cleanup_json(value: &str) -> anyhow::Result<CleanTranscript> {
@@ -486,11 +459,11 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_rejects_guessed_term_without_new_number() {
+    fn cleanup_allows_word_corrections_without_new_numbers() {
         let transcript = transcript_with_text("Модель Fable 5 пока не вышла.");
         let clean = plain_cleanup("Модель Claude 5 пока не вышла.");
 
-        assert!(validate_cleanup_against_asr(&clean, &transcript).is_err());
+        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
     }
 
     #[test]
