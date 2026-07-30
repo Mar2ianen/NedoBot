@@ -39,8 +39,9 @@ use tg_ai_bot_teloxide::features::{
         repo::{
             NewUserAuditJobParams, claim_next_new_user_audit_job,
             claim_next_new_user_audit_job_with_materialization, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, mark_new_user_audit_failed, mark_new_user_audit_retry,
-            materialize_authoritative_new_user_audit_job,
+            finalize_new_user_audit_job, mark_new_user_audit_failed,
+            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+            mark_new_user_audit_retry, materialize_authoritative_new_user_audit_job,
         },
         scoring::ScoreComponents,
     },
@@ -74,6 +75,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
     assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
+    assert_new_user_audit_materialization_lifecycle(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
@@ -899,7 +901,7 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
     );
 
     query(
-        "update new_user_audit_jobs set status = 'retry_wait', next_attempt_at = now() - interval '1 second' where id = $1",
+        "update new_user_audit_jobs set materialization_status = 'retry_wait', materialization_next_attempt_at = now() - interval '1 second' where id = $1",
     )
     .bind(shadow_claim.id)
     .execute(pool)
@@ -914,7 +916,7 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
     );
 
     query(
-        "update new_user_audit_jobs set status = 'processing', lease_expires_at = now() - interval '1 second' where id = $1",
+        "update new_user_audit_jobs set materialization_status = 'processing', materialization_lease_expires_at = now() - interval '1 second' where id = $1",
     )
     .bind(shadow_claim.id)
     .execute(pool)
@@ -929,7 +931,7 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
     );
 
     query(
-        "update new_user_audit_jobs set status = 'succeeded', lease_expires_at = null where id = $1",
+        "update new_user_audit_jobs set materialization_status = 'pending', materialization_lease_expires_at = null where id = $1",
     )
     .bind(shadow_claim.id)
     .execute(pool)
@@ -971,6 +973,176 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
             .expect("completed replay claim must execute")
             .is_none(),
         "materialized shadow assessment must be closed"
+    );
+}
+
+async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_096;
+    let input = serde_json::json!({"schema_version": "fixture-v1"});
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("materialization lifecycle baseline must be inserted");
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "materialization-lifecycle-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("materialization lifecycle job must be enqueued");
+    let generation_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("generation claim must execute")
+        .expect("generation job must be claimable");
+    let assessment = serde_json::json!({
+        "avatar_observation": null,
+        "first_message_assessment": null,
+        "profile_assessment": {
+            "risk_patterns": ["no_material_risk_pattern"],
+            "evidence": [], "contradictions": ["Нет признаков."],
+            "review_priority": "low", "confidence": 0.5, "summary": "Нейтрально."
+        }
+    });
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &generation_claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment,
+                provider: "fixture",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("generation must succeed before replay"),
+        CasResult::Applied
+    );
+
+    let first_replay = claim_next_new_user_audit_job_with_materialization(pool, true)
+        .await
+        .expect("first replay claim must execute")
+        .expect("successful generation must be replayable");
+    assert!(first_replay.is_materialization_replay);
+    assert_eq!(first_replay.attempts, generation_claim.attempts);
+    assert_eq!(first_replay.materialization_attempts, 1);
+    assert_eq!(
+        mark_new_user_audit_materialization_retry(pool, &first_replay, "sql_transient")
+            .await
+            .expect("replay retry finalizer must execute"),
+        CasResult::Applied
+    );
+    let retry_state: (String, String, i32, bool, bool) = query_as(
+        "select status, materialization_status, materialization_attempts, materialization_processing_started_at is null, materialization_lease_expires_at is null from new_user_audit_jobs where id = $1",
+    )
+    .bind(first_replay.id)
+    .fetch_one(pool)
+    .await
+    .expect("replay retry state must be stored");
+    assert_eq!(
+        retry_state,
+        ("succeeded".into(), "retry_wait".into(), 1, true, true)
+    );
+
+    query("update new_user_audit_jobs set materialization_next_attempt_at = now() - interval '1 second' where id = $1")
+        .bind(first_replay.id)
+        .execute(pool)
+        .await
+        .expect("replay retry must be made due");
+    let stale_replay = claim_next_new_user_audit_job_with_materialization(pool, true)
+        .await
+        .expect("retry replay claim must execute")
+        .expect("retry replay must be claimable");
+    query("update new_user_audit_jobs set materialization_lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(stale_replay.id)
+        .execute(pool)
+        .await
+        .expect("replay lease must expire");
+    let current_replay = claim_next_new_user_audit_job_with_materialization(pool, true)
+        .await
+        .expect("expired replay claim must execute")
+        .expect("expired replay must be reclaimed");
+    assert_eq!(
+        current_replay.materialization_attempts,
+        stale_replay.materialization_attempts + 1
+    );
+    assert_eq!(
+        mark_new_user_audit_materialization_stale(pool, &stale_replay, "malformed_assessment")
+            .await
+            .expect("stale replay finalizer must execute"),
+        CasResult::LeaseLost
+    );
+    assert_eq!(
+        mark_new_user_audit_materialization_stale(pool, &current_replay, "malformed_assessment")
+            .await
+            .expect("current replay stale finalizer must execute"),
+        CasResult::Applied
+    );
+    let terminal_state: (String, String, String) = query_as(
+        "select status, materialization_status, materialization_error_kind from new_user_audit_jobs where id = $1",
+    )
+    .bind(current_replay.id)
+    .fetch_one(pool)
+    .await
+    .expect("stale replay state must be stored");
+    assert_eq!(
+        terminal_state,
+        (
+            "succeeded".into(),
+            "stale".into(),
+            "malformed_assessment".into()
+        )
+    );
+
+    query("update new_user_audit_jobs set materialization_status = 'processing', materialization_attempts = 6, materialization_lease_expires_at = now() + interval '10 minutes' where id = $1")
+        .bind(current_replay.id)
+        .execute(pool)
+        .await
+        .expect("materialization exhaustion fixture must be stored");
+    let exhausted_replay = tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditJob {
+        materialization_attempts: 6,
+        ..current_replay.clone()
+    };
+    assert_eq!(
+        mark_new_user_audit_materialization_retry(pool, &exhausted_replay, "sql_transient")
+            .await
+            .expect("exhausted replay finalizer must execute"),
+        CasResult::Applied
+    );
+    let exhaustion_state: (String, String, String) = query_as(
+        "select status, materialization_status, materialization_error_kind from new_user_audit_jobs where id = $1",
+    )
+    .bind(current_replay.id)
+    .fetch_one(pool)
+    .await
+    .expect("exhausted replay state must be stored");
+    assert_eq!(
+        exhaustion_state,
+        ("succeeded".into(), "stale".into(), "retry_exhausted".into())
+    );
+
+    query("update new_user_audit_jobs set materialization_status = 'pending', materialization_version = 'obsolete-version' where id = $1")
+        .bind(current_replay.id)
+        .execute(pool)
+        .await
+        .expect("obsolete replay version fixture must be stored");
+    assert!(
+        claim_next_new_user_audit_job_with_materialization(pool, true)
+            .await
+            .expect("version-gated replay claim must execute")
+            .is_none(),
+        "authoritative replay must require the current materialization version"
     );
 }
 
