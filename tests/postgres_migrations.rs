@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::TcpListener,
 };
 
@@ -68,6 +68,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
+    assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
@@ -885,6 +886,87 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
             second_claim.notification_attempts,
             Some(1002)
         )
+    );
+}
+
+async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_006;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review payload CAS chat user must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Payload CAS')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review payload CAS profile must exist");
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[{\"label\": \"single_message_account\"}]'::jsonb)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("high-risk payload CAS audit must exist");
+
+    let replaced_claim = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("payload CAS review creation must succeed")
+        .expect("high-risk payload CAS review must be claimed");
+    query("update spam_review_requests set risk_signals = '[{\"label\": \"personal_channel_attached\"}]'::jsonb where id = $1")
+        .bind(replaced_claim.id)
+        .execute(pool)
+        .await
+        .expect("review payload must be replaceable while claimed");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Telegram stub listener must bind");
+    listener
+        .set_nonblocking(true)
+        .expect("Telegram stub listener must be nonblocking");
+    let bot = Bot::new("test-token").set_api_url(
+        format!(
+            "http://{}/",
+            listener
+                .local_addr()
+                .expect("Telegram stub address must exist")
+        )
+        .parse()
+        .expect("Telegram stub API URL must parse"),
+    );
+    send_review(&bot, pool, &replaced_claim)
+        .await
+        .expect("replaced payload must be skipped before Telegram delivery");
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("replaced payload must not open a Telegram connection")
+            .kind(),
+        ErrorKind::WouldBlock
+    );
+
+    query("update spam_review_requests set notification_status = 'pending', notification_lease_expires_at = null where id = $1")
+        .bind(replaced_claim.id)
+        .execute(pool)
+        .await
+        .expect("replaced payload fixture must be returned to pending");
+    let lowered_claim = claim_next_review_delivery(pool)
+        .await
+        .expect("replaced high-risk review must be reclaimable")
+        .expect("replaced high-risk review must be claimed again");
+    query("update spam_review_requests set risk_score = 69 where id = $1")
+        .bind(lowered_claim.id)
+        .execute(pool)
+        .await
+        .expect("review risk must be lowerable while claimed");
+    send_review(&bot, pool, &lowered_claim)
+        .await
+        .expect("lowered-risk payload must be skipped before Telegram delivery");
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("lowered-risk payload must not open a Telegram connection")
+            .kind(),
+        ErrorKind::WouldBlock
     );
 }
 
