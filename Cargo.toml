@@ -25,7 +25,6 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Temporary NedoBot fork patch. PR #578 contains only the Groq on_demand
-# compatibility fix; this branch additionally redacts raw API response bodies.
+# Temporary upstream PR #578 compatibility patch for Groq service_tier="on_demand".
 [patch.crates-io]
-async-openai = { git = "https://github.com/Mar2ianen/async-openai", branch = "bot/nedobot-safe-openai-errors" }
+async-openai = { git = "https://github.com/Mar2ianen/async-openai", branch = "fix/groq-on-demand-service-tier" }

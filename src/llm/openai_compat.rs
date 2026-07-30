@@ -98,6 +98,11 @@ fn map_openai_error(error: OpenAIError) -> anyhow::Error {
         OpenAIError::ApiError(response) => {
             LlmTransportError::http_status(response.status_code.as_u16()).into()
         }
+        // async-openai includes the complete provider body in this error's Display.
+        // Keep provider output out of bot logs and surface only serde diagnostics.
+        OpenAIError::JSONDeserialize(error, _) => {
+            anyhow::anyhow!("OpenAI-compatible response deserialization failed: {error}")
+        }
         OpenAIError::Reqwest(error) => match error.status() {
             Some(status) => LlmTransportError::http_status(status.as_u16()).into(),
             None => error.into(),
