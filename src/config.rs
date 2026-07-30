@@ -88,6 +88,8 @@ pub struct Config {
     pub cerebras_api_key: String,
     pub cerebras_model: Option<String>,
     pub new_user_audit_enabled: bool,
+    /// Включает authoritative unified cutover после завершения shadow-сверки.
+    pub new_user_audit_authoritative_enabled: bool,
     pub avatar_classifier_enabled: bool,
     pub avatar_classifier_model: Option<String>,
     pub avatar_classifier_max_tokens: u32,
@@ -242,6 +244,10 @@ impl Config {
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
             new_user_audit_enabled: env_bool("NEW_USER_AUDIT_ENABLED", false)?,
+            new_user_audit_authoritative_enabled: env_bool(
+                "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED",
+                false,
+            )?,
             avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true)?,
             avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
                 .or_else(|| Some("gemma-4-31b".to_string())),
@@ -376,6 +382,22 @@ impl Config {
         }
         self.validate_chat_retrieval_config(&mut errors);
 
+        if self.new_user_audit_authoritative_enabled && !self.new_user_audit_enabled {
+            errors.push(
+                "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=true requires NEW_USER_AUDIT_ENABLED=true"
+                    .to_string(),
+            );
+        }
+        if self.new_user_audit_authoritative_enabled && self.avatar_classifier_enabled {
+            errors.push(
+                "authoritative unified audit requires AVATAR_CLASSIFIER_ENABLED=false".to_string(),
+            );
+        }
+        if self.new_user_audit_authoritative_enabled && self.first_message_spam_enabled {
+            errors.push(
+                "authoritative unified audit requires FIRST_MESSAGE_SPAM_ENABLED=false".to_string(),
+            );
+        }
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
@@ -1084,6 +1106,7 @@ mod tests {
             cerebras_api_key: String::new(),
             cerebras_model: None,
             new_user_audit_enabled: false,
+            new_user_audit_authoritative_enabled: false,
             avatar_classifier_enabled: false,
             avatar_classifier_model: None,
             avatar_classifier_max_tokens: 900,

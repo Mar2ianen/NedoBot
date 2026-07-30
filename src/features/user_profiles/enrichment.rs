@@ -154,6 +154,15 @@ async fn process_refreshed_profile(
     config: &Config,
     job: ProfileRefreshJob,
 ) {
+    if config.new_user_audit_authoritative_enabled {
+        if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
+            tracing::warn!(%err, user_id = job.user_id, "failed to analyze authoritative unified audit baseline");
+        } else {
+            enqueue_unified_new_user_audit(pool, job).await;
+        }
+        return;
+    }
+
     if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
         tracing::warn!(%err, user_id = job.user_id, "failed to analyze new user profile");
     } else {
