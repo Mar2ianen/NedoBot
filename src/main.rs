@@ -40,7 +40,14 @@ use telegram::commands::Command;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    let explicit_env_file = std::env::var("ENV_FILE").ok();
+    let env_file = explicit_env_file.as_deref().unwrap_or(".env");
+    if explicit_env_file.is_some() {
+        dotenvy::from_filename(env_file)
+            .map_err(|error| anyhow::anyhow!("failed to load {env_file}: {error}"))?;
+    } else {
+        dotenvy::dotenv().ok();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
