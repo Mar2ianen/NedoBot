@@ -1502,6 +1502,68 @@ models = ["text_only"]
     }
 
     #[test]
+    fn new_user_audit_profile_validation_requires_prompt_only_fallback_secret() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let primary = EnvVarGuard::unset("TEST_AUDIT_PRIMARY_KEY");
+        let fallback = EnvVarGuard::unset("TEST_AUDIT_FALLBACK_KEY");
+        unsafe { std::env::set_var("TEST_AUDIT_PRIMARY_KEY", "test-key") };
+
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(
+                r#"
+[providers.primary]
+driver = "openai_compatible"
+base_url = "https://primary.example/v1"
+api_key_env = "TEST_AUDIT_PRIMARY_KEY"
+[providers.fallback]
+driver = "openai_compatible"
+base_url = "https://fallback.example/v1"
+api_key_env = "TEST_AUDIT_FALLBACK_KEY"
+
+[models.primary]
+provider = "primary"
+model = "primary-model"
+[models.primary.capabilities]
+supports_images = true
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 4096
+max_output_tokens = 1024
+request_timeout_sec = 5
+thinking = "none"
+
+[models.fallback]
+provider = "fallback"
+model = "fallback-model"
+[models.fallback.capabilities]
+supports_images = true
+supports_tools = false
+supports_system_prompt = true
+structured_output = "prompt_only"
+context_window_tokens = 4096
+max_output_tokens = 1024
+request_timeout_sec = 5
+thinking = "none"
+
+[routes.first_comment]
+models = ["primary"]
+[routes.new_user_audit]
+models = ["primary", "fallback"]
+"#,
+            )
+            .unwrap(),
+        );
+        config.new_user_audit_enabled = true;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+        assert!(error.contains("TEST_AUDIT_FALLBACK_KEY"));
+        drop(primary);
+        drop(fallback);
+    }
+
+    #[test]
     fn authoritative_new_user_audit_requires_embedding_config() {
         let mut config = config();
         config.new_user_audit_enabled = true;
