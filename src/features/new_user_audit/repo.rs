@@ -36,6 +36,15 @@ pub async fn enqueue_new_user_audit_job(
     pool: &PgPool,
     params: NewUserAuditJobParams<'_>,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = $3, unified_audit_generation = unified_audit_generation + 1 where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(params.chat_id)
+    .bind(params.telegram_user_id)
+    .bind(params.snapshot_hash)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         r#"
         insert into new_user_audit_jobs
@@ -59,8 +68,9 @@ pub async fn enqueue_new_user_audit_job(
     .bind(params.input_json)
     .bind(params.avatar_file_id)
     .bind(params.avatar_file_unique_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -182,6 +192,7 @@ pub async fn finalize_authoritative_new_user_audit_job(
             risk_avatar_score = $7, risk_avatar_signals = $8,
             risk_score = $9, risk_level = $10, risk_signal_breakdown = $11
         where chat_id = $1 and telegram_user_id = $2
+          and unified_audit_snapshot_hash = $12
         "#,
     )
     .bind(job.chat_id)
@@ -195,8 +206,17 @@ pub async fn finalize_authoritative_new_user_audit_job(
     .bind(final_score)
     .bind(components.final_level())
     .bind(&final_signals)
+    .bind(&job.snapshot_hash)
     .execute(&mut *tx)
     .await?;
+    if update.rows_affected() == 0 {
+        sqlx::query("update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = 'snapshot_stale' where id = $1")
+            .bind(job.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(result);
+    }
 
     sqlx::query(
         r#"
