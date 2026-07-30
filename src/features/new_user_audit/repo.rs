@@ -112,8 +112,13 @@ pub async fn claim_next_new_user_audit_job_with_materialization(
         with candidate as (
             select id, assessment_json is not null as is_materialization_replay
             from new_user_audit_jobs
-            where (status in ('pending', 'retry_wait') and next_attempt_at <= now())
-               or (status = 'processing' and lease_expires_at <= now())
+            where (
+                    $2 or assessment_json is null
+                  )
+              and (
+                    (status in ('pending', 'retry_wait') and next_attempt_at <= now())
+                    or (status = 'processing' and lease_expires_at <= now())
+                  )
                or (
                     $2
                     and status = 'succeeded'

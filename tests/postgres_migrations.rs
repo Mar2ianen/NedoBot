@@ -898,6 +898,44 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
         "successful shadow assessments must not be repeatedly claimed"
     );
 
+    query(
+        "update new_user_audit_jobs set status = 'retry_wait', next_attempt_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(shadow_claim.id)
+    .execute(pool)
+    .await
+    .expect("stored replay retry fixture must be created");
+    assert!(
+        claim_next_new_user_audit_job_with_materialization(pool, false)
+            .await
+            .expect("non-authoritative retry claim must execute")
+            .is_none(),
+        "non-authoritative worker must not reprocess a stored replay in retry_wait"
+    );
+
+    query(
+        "update new_user_audit_jobs set status = 'processing', lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(shadow_claim.id)
+    .execute(pool)
+    .await
+    .expect("expired stored replay fixture must be created");
+    assert!(
+        claim_next_new_user_audit_job_with_materialization(pool, false)
+            .await
+            .expect("non-authoritative expired claim must execute")
+            .is_none(),
+        "non-authoritative worker must not reclaim an expired stored replay"
+    );
+
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', lease_expires_at = null where id = $1",
+    )
+    .bind(shadow_claim.id)
+    .execute(pool)
+    .await
+    .expect("stored replay fixture must be restored for authoritative materialization");
+
     let replay_claim = claim_next_new_user_audit_job_with_materialization(pool, true)
         .await
         .expect("authoritative replay claim must execute")
