@@ -184,7 +184,7 @@ pub async fn finalize_authoritative_new_user_audit_job(
 
     let final_score = components.final_score();
     let final_signals = components.final_signals();
-    sqlx::query(
+    let audit_update = sqlx::query(
         r#"
         update telegram_new_user_profile_audits
         set risk_baseline_score = $3, risk_baseline_signals = $4,
@@ -209,7 +209,7 @@ pub async fn finalize_authoritative_new_user_audit_job(
     .bind(&job.snapshot_hash)
     .execute(&mut *tx)
     .await?;
-    if update.rows_affected() == 0 {
+    if audit_update.rows_affected() == 0 {
         sqlx::query("update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = 'snapshot_stale' where id = $1")
             .bind(job.id)
             .execute(&mut *tx)
@@ -240,6 +240,12 @@ pub async fn finalize_authoritative_new_user_audit_job(
     .bind(job.telegram_user_id)
     .bind(final_score)
     .bind(&final_signals)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null where id = $1",
+    )
+    .bind(job.id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
