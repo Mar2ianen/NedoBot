@@ -205,7 +205,7 @@ async fn generate_and_finalize(
     )
     .await?;
 
-    let assessment = NewUserAuditAssessment::parse_for_modalities(
+    NewUserAuditAssessment::parse_for_modalities(
         &generation.content,
         has_avatar_input,
         has_first_message_input,
@@ -217,16 +217,7 @@ async fn generate_and_finalize(
         model: &generation.model,
     };
     let finalized = if config.new_user_audit_authoritative_enabled {
-        let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
-        let first_message_context =
-            load_first_message_score_context(pool, config, job, &assessment).await?;
-        let components = score_assessment(
-            baseline_score,
-            baseline_signals,
-            &assessment,
-            first_message_context,
-        );
-        finalize_authoritative_new_user_audit_job(pool, job, outcome, &components).await?
+        finalize_authoritative_new_user_audit_job(pool, job, outcome).await?
     } else {
         finalize_new_user_audit_job(pool, job, outcome).await?
     };
