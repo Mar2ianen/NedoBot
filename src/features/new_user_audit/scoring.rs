@@ -5,9 +5,14 @@ use super::types::{
     ProfileNameGrammarRelation, SelfReferenceGrammar,
 };
 
+// Подключается authoritative unified finalizer в следующем шаге cutover.
+#[allow(dead_code)]
 pub const REVIEW_RISK_THRESHOLD: i32 = 70;
+#[allow(dead_code)]
 const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
 
+// Контекст извлекается из той же snapshot/embedding базы, что legacy analysis.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FirstMessageScoreContext {
     pub template_matches: i32,
@@ -15,6 +20,7 @@ pub struct FirstMessageScoreContext {
     pub feminine_profile_name: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoreComponents {
     pub baseline_score: i32,
@@ -25,6 +31,7 @@ pub struct ScoreComponents {
     pub avatar_signals: Value,
 }
 
+#[allow(dead_code)]
 impl ScoreComponents {
     pub fn final_score(&self) -> i32 {
         (self.baseline_score + self.first_message_score + self.avatar_score).clamp(0, 100)
@@ -53,6 +60,7 @@ impl ScoreComponents {
     }
 }
 
+#[allow(dead_code)]
 pub fn score_assessment(
     baseline_score: i32,
     baseline_signals: Value,
@@ -90,9 +98,7 @@ fn score_first_message(
             assessment,
             FirstMessageRiskMarker::PerformativeFemininePersona,
         );
-    let llm_score = if paid_easy_task {
-        30
-    } else if assessment.direct_dm_offer && assessment.offtopic_promo {
+    let llm_score = if paid_easy_task || (assessment.direct_dm_offer && assessment.offtopic_promo) {
         30
     } else if assessment.direct_dm_offer && assessment.template_campaign {
         24

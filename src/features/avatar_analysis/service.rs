@@ -243,10 +243,13 @@ pub async fn apply_avatar_risk_signal(
     let rows = sqlx::query(
         r#"
         update telegram_new_user_profile_audits audit
-        set risk_score = least(100, audit.risk_score + $3),
-            risk_level = case when least(100, audit.risk_score + $3) >= 70 then 'high'
-                              when least(100, audit.risk_score + $3) >= 40 then 'medium' else 'low' end,
-            risk_signal_breakdown = coalesce(audit.risk_signal_breakdown, '[]'::jsonb)
+        set risk_avatar_score = $3,
+            risk_avatar_signals = jsonb_build_array($4::jsonb),
+            risk_score = least(100, audit.risk_baseline_score + audit.risk_first_message_score + $3),
+            risk_level = case when least(100, audit.risk_baseline_score + audit.risk_first_message_score + $3) >= 70 then 'high'
+                              when least(100, audit.risk_baseline_score + audit.risk_first_message_score + $3) >= 40 then 'medium' else 'low' end,
+            risk_signal_breakdown = audit.risk_baseline_signals
+                || audit.risk_first_message_signals
                 || jsonb_build_array($4::jsonb)
         from telegram_user_profiles profile
         where audit.telegram_user_id = $1
