@@ -466,8 +466,9 @@ fn human_signals(signals: &Value) -> String {
                 .collect::<Vec<_>>();
             if signal.get("label").and_then(Value::as_str) == Some("first_message_spam_analysis") {
                 labels.extend(
-                    signal["assessment"]["markers"]
+                    signal["assessment"]["risk_markers"]
                         .as_array()
+                        .or_else(|| signal["assessment"]["markers"].as_array())
                         .into_iter()
                         .flatten()
                         .filter_map(Value::as_str)

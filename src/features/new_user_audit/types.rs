@@ -194,6 +194,14 @@ impl NewUserAuditAssessment {
 
     /// Проверяет ответ с учётом того, был ли в снимке доступный для анализа аватар.
     pub fn parse_for_input(value: &str, has_avatar_input: bool) -> anyhow::Result<Self> {
+        Self::parse_for_modalities(value, has_avatar_input, false)
+    }
+
+    pub fn parse_for_modalities(
+        value: &str,
+        has_avatar_input: bool,
+        has_first_message_input: bool,
+    ) -> anyhow::Result<Self> {
         let value: Value =
             serde_json::from_str(value).context("LLM audit output is not valid JSON")?;
         let object = value
@@ -211,7 +219,7 @@ impl NewUserAuditAssessment {
 
         let assessment: Self = serde_json::from_value(value)
             .context("LLM audit output does not match the assessment contract")?;
-        assessment.validate_for_input(has_avatar_input)?;
+        assessment.validate_for_modalities(has_avatar_input, has_first_message_input)?;
         Ok(assessment)
     }
 
@@ -220,8 +228,21 @@ impl NewUserAuditAssessment {
     }
 
     pub fn validate_for_input(&self, has_avatar_input: bool) -> anyhow::Result<()> {
+        self.validate_for_modalities(has_avatar_input, false)
+    }
+
+    pub fn validate_for_modalities(
+        &self,
+        has_avatar_input: bool,
+        has_first_message_input: bool,
+    ) -> anyhow::Result<()> {
         if !has_avatar_input && self.avatar_observation.is_some() {
             bail!("avatar_observation must be null when the audit input has no avatar");
+        }
+        if has_first_message_input && self.first_message_assessment.is_none() {
+            bail!(
+                "first_message_assessment must be present when the audit input has a first message"
+            );
         }
         validate_avatar(self.avatar_observation.as_ref())?;
         validate_first_message(self.first_message_assessment.as_ref())?;
