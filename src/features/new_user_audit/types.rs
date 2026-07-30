@@ -364,6 +364,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_requires_first_message_assessment_when_input_has_text() {
+        let error = NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("first_message_assessment must be present"));
+
+        NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, false).unwrap();
+    }
+
+    #[test]
     fn parse_rejects_unknown_fields_and_unknown_enum_values() {
         let unknown_field = VALID_ASSESSMENT.replace(
             "\"confidence\": 0.75,",

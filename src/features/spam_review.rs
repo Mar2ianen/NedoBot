@@ -557,6 +557,21 @@ mod tests {
     }
 
     #[test]
+    fn human_signals_renders_unified_and_legacy_first_message_markers() {
+        let unified = serde_json::json!([{
+            "label": "first_message_spam_analysis",
+            "assessment": { "risk_markers": ["direct_messages"] }
+        }]);
+        let legacy = serde_json::json!([{
+            "label": "first_message_spam_analysis",
+            "assessment": { "markers": ["paid_easy_task_offer"] }
+        }]);
+
+        assert!(human_signals(&unified).contains("перевод разговора в личные сообщения"));
+        assert!(human_signals(&legacy).contains("обещание лёгкой оплачиваемой работы"));
+    }
+
+    #[test]
     fn renders_human_signal() {
         assert_eq!(
             human_label("recent_high_telegram_id"),
