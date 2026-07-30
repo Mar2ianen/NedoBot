@@ -1,6 +1,10 @@
-# Voice transcription follow-up
+# Следующая инженерная цель: миграция на fork teloxide
 
-Актуальное состояние после реализации voice pipeline. Старый план внедрения выполнен: вертикальный срез `voice/audio/video_note -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit` уже есть в коде.
+Unified audit и voice follow-up закрыты и развёрнуты в `v0.12.0` (`deploy-2026-07-31-v0.12.0`). Следующая крупная задача — отдельная миграция проекта на поддерживаемый fork `teloxide` с проверкой совместимости Bot API, `teloxide` types и production transport paths. Пока это только зафиксированная цель: implementation scope, dependency source/version, migration steps и rollout plan нужно согласовать отдельным планом до начала кода.
+
+## Закрытый voice follow-up
+
+Старый план внедрения выполнен: вертикальный срез `voice/audio/video_note -> Groq ASR -> LLM cleanup -> Telegram reply/file -> DB audit` уже есть в коде.
 
 ## Уже реализовано
 
