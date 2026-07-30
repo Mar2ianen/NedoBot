@@ -116,6 +116,8 @@ async fn claim_review_delivery(
                 + case when request.notification_status = 'processing' then 1 else 0 end,
             notification_processing_started_at = now(),
             notification_lease_expires_at = now() + ($2 * interval '1 second'),
+            notification_delivery_risk_score = request.risk_score,
+            notification_delivery_risk_signals = request.risk_signals,
             notification_error_kind = null
         from candidate
         where request.id = candidate.id
@@ -183,16 +185,13 @@ fn is_valid_telegram_username(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn can_deliver_review(risk_score: i32) -> bool {
-    risk_score >= REVIEW_DELIVERY_RISK_THRESHOLD
-}
-
 pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyhow::Result<()> {
-    if !can_deliver_review(review.risk_score) {
-        tracing::error!(
+    if confirm_review_delivery_payload(pool, review).await? == CasResult::LeaseLost {
+        release_stale_review_delivery(pool, review).await?;
+        tracing::warn!(
             request_id = review.id,
-            risk_score = review.risk_score,
-            "refusing Telegram spam-review delivery below the risk threshold"
+            attempts = review.notification_attempts,
+            "spam review payload changed or delivery claim is no longer current; skipping Telegram delivery"
         );
         return Ok(());
     }
@@ -261,6 +260,67 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
             }
         },
     }
+}
+
+async fn confirm_review_delivery_payload(
+    pool: &PgPool,
+    review: &SpamReview,
+) -> anyhow::Result<CasResult> {
+    let rows = sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_lease_expires_at = now() + ($5 * interval '1 second')
+        where id = $1
+          and notification_attempts = $2
+          and status = 'pending'
+          and notification_status = 'processing'
+          and notification_lease_expires_at > now()
+          and risk_score >= $6
+          and (risk_score, risk_signals) is not distinct from ($3, $4::jsonb)
+          and (notification_delivery_risk_score, notification_delivery_risk_signals)
+              is not distinct from ($3, $4::jsonb)
+        "#,
+    )
+    .bind(review.id)
+    .bind(review.notification_attempts)
+    .bind(review.risk_score)
+    .bind(&review.risk_signals)
+    .bind(DELIVERY_LEASE_SECONDS)
+    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .execute(pool)
+    .await?;
+    CasResult::from_rows_affected(rows.rows_affected())
+}
+
+async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_status = case
+                when risk_score >= $5 then 'retry_wait'
+                else 'pending'
+            end,
+            notification_next_attempt_at = now(),
+            notification_processing_started_at = null,
+            notification_lease_expires_at = null,
+            notification_error_kind = null
+        where id = $1
+          and notification_attempts = $2
+          and status = 'pending'
+          and notification_status = 'processing'
+          and (notification_delivery_risk_score, notification_delivery_risk_signals)
+              is not distinct from ($3, $4::jsonb)
+          and (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
+        "#,
+    )
+    .bind(review.id)
+    .bind(review.notification_attempts)
+    .bind(review.risk_score)
+    .bind(&review.risk_signals)
+    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn review_keyboard(request_id: i64) -> InlineKeyboardMarkup {
@@ -535,12 +595,6 @@ mod tests {
     fn parses_callback() {
         assert_eq!(parse_callback("spam_review:42:spam"), Some((42, "spam")));
         assert_eq!(parse_callback("spam_review:42:spam:x"), None);
-    }
-    #[test]
-    fn blocks_telegram_delivery_below_risk_threshold() {
-        assert!(!can_deliver_review(0));
-        assert!(!can_deliver_review(69));
-        assert!(can_deliver_review(70));
     }
 
     #[test]
