@@ -35,9 +35,14 @@ use tg_ai_bot_teloxide::features::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
     },
-    new_user_audit::repo::{
-        NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-        mark_new_user_audit_failed, mark_new_user_audit_retry,
+    new_user_audit::{
+        repo::{
+            NewUserAuditJobParams, claim_next_new_user_audit_job,
+            claim_next_new_user_audit_job_with_materialization, enqueue_new_user_audit_job,
+            finalize_new_user_audit_job, mark_new_user_audit_failed, mark_new_user_audit_retry,
+            materialize_authoritative_new_user_audit_job,
+        },
+        scoring::ScoreComponents,
     },
     spam_review::{
         claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
@@ -68,6 +73,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_deduplication(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
+    assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
@@ -826,6 +832,108 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
             .await
             .expect("terminal audit status must be stored");
     assert_eq!(terminal_status, "failed");
+}
+
+async fn assert_successful_shadow_audit_replays_only_for_authoritative_materialization(
+    pool: &PgPool,
+) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_097;
+    let input = serde_json::json!({"schema_version": "fixture-v1"});
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("shadow replay audit baseline must be inserted");
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "shadow-replay-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("shadow replay audit job must be enqueued");
+
+    let shadow_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("shadow audit claim must execute")
+        .expect("shadow audit job must be claimable");
+    let assessment = serde_json::json!({
+        "avatar_observation": null,
+        "first_message_assessment": null,
+        "profile_assessment": {
+            "risk_patterns": ["no_material_risk_pattern"],
+            "evidence": [], "contradictions": ["Нет признаков."],
+            "review_priority": "low", "confidence": 0.5, "summary": "Нейтрально."
+        }
+    });
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &shadow_claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment,
+                provider: "fixture",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("shadow audit success must finalize"),
+        CasResult::Applied
+    );
+    assert!(
+        claim_next_new_user_audit_job(pool)
+            .await
+            .expect("normal shadow claim must execute")
+            .is_none(),
+        "successful shadow assessments must not be repeatedly claimed"
+    );
+
+    let replay_claim = claim_next_new_user_audit_job_with_materialization(pool, true)
+        .await
+        .expect("authoritative replay claim must execute")
+        .expect("successful shadow assessment must be replayable after cutover");
+    assert!(replay_claim.is_materialization_replay);
+    assert_eq!(
+        materialize_authoritative_new_user_audit_job(
+            pool,
+            &replay_claim,
+            &ScoreComponents {
+                baseline_score: 0,
+                baseline_signals: serde_json::json!([]),
+                first_message_score: 0,
+                first_message_signals: serde_json::json!([]),
+                avatar_score: 0,
+                avatar_signals: serde_json::json!([]),
+            },
+        )
+        .await
+        .expect("stored assessment materialization must finalize"),
+        CasResult::Applied
+    );
+    let state: (String, String) =
+        query_as("select status, materialization_status from new_user_audit_jobs where id = $1")
+            .bind(replay_claim.id)
+            .fetch_one(pool)
+            .await
+            .expect("materialized replay state must be stored");
+    assert_eq!(state, ("succeeded".to_string(), "succeeded".to_string()));
+    assert!(
+        claim_next_new_user_audit_job_with_materialization(pool, true)
+            .await
+            .expect("completed replay claim must execute")
+            .is_none(),
+        "materialized shadow assessment must be closed"
+    );
 }
 
 async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {

@@ -5,6 +5,10 @@ use crate::features::jobs::claim::CasResult;
 use crate::features::jobs::policy::{ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE};
 use crate::features::new_user_audit::scoring::ScoreComponents;
 
+/// Версия правил записи unified score. Меняется только при несовместимом изменении
+/// materializer-а, чтобы старые shadow assessments не применялись молча.
+pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v1";
+
 // В следующем slice job будет подключена к worker; пока API вызывается PostgreSQL integration test.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -17,7 +21,9 @@ pub struct NewUserAuditJob {
     pub input_json: Value,
     pub avatar_file_id: Option<String>,
     pub avatar_file_unique_id: Option<String>,
+    pub assessment_json: Option<Value>,
     pub attempts: i32,
+    pub is_materialization_replay: bool,
 }
 
 pub struct NewUserAuditJobParams<'a> {
@@ -63,9 +69,9 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
         insert into new_user_audit_jobs
             (
                 chat_id, telegram_user_id, snapshot_hash, prompt_version, input_json,
-                avatar_file_id, avatar_file_unique_id
+                avatar_file_id, avatar_file_unique_id, materialization_version
             )
-        values ($1, $2, $3, $4, $5, $6, $7)
+        values ($1, $2, $3, $4, $5, $6, $7, $8)
         on conflict (chat_id, telegram_user_id, snapshot_hash, prompt_version)
         do update set
             input_json = excluded.input_json,
@@ -81,6 +87,7 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
     .bind(params.input_json)
     .bind(params.avatar_file_id)
     .bind(params.avatar_file_unique_id)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -91,13 +98,29 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
 pub async fn claim_next_new_user_audit_job(
     pool: &PgPool,
 ) -> anyhow::Result<Option<NewUserAuditJob>> {
+    claim_next_new_user_audit_job_with_materialization(pool, false).await
+}
+
+/// В authoritative режиме успешные shadow jobs текущей версии могут быть
+/// повторно leased исключительно для materialization, без генерации.
+pub async fn claim_next_new_user_audit_job_with_materialization(
+    pool: &PgPool,
+    materialization_enabled: bool,
+) -> anyhow::Result<Option<NewUserAuditJob>> {
     let row = sqlx::query(
         r#"
         with candidate as (
-            select id
+            select id, assessment_json is not null as is_materialization_replay
             from new_user_audit_jobs
             where (status in ('pending', 'retry_wait') and next_attempt_at <= now())
                or (status = 'processing' and lease_expires_at <= now())
+               or (
+                    $2
+                    and status = 'succeeded'
+                    and assessment_json is not null
+                    and materialization_status = 'pending'
+                    and materialization_version = $3
+               )
             order by next_attempt_at, id
             for update skip locked
             limit 1
@@ -112,10 +135,13 @@ pub async fn claim_next_new_user_audit_job(
         where job.id = candidate.id
         returning job.id, job.chat_id, job.telegram_user_id, job.snapshot_hash,
                   job.prompt_version, job.input_json, job.avatar_file_id,
-                  job.avatar_file_unique_id, job.attempts
+                  job.avatar_file_unique_id, job.assessment_json, job.attempts,
+                  candidate.is_materialization_replay
         "#,
     )
     .bind(EXTERNAL_REQUEST_LEASE.seconds())
+    .bind(materialization_enabled)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
     .fetch_optional(pool)
     .await?;
 
@@ -128,7 +154,9 @@ pub async fn claim_next_new_user_audit_job(
         input_json: row.get("input_json"),
         avatar_file_id: row.get("avatar_file_id"),
         avatar_file_unique_id: row.get("avatar_file_unique_id"),
+        assessment_json: row.get("assessment_json"),
         attempts: row.get("attempts"),
+        is_materialization_replay: row.get("is_materialization_replay"),
     }))
 }
 
@@ -194,6 +222,17 @@ pub async fn finalize_authoritative_new_user_audit_job(
         return Ok(result);
     }
 
+    materialize_authoritative_in_transaction(&mut tx, job, components).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Применяет current-score к baseline только пока canonical snapshot не изменился.
+async fn materialize_authoritative_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &NewUserAuditJob,
+    components: &ScoreComponents,
+) -> anyhow::Result<()> {
     let final_score = components.final_score();
     let final_signals = components.final_signals();
     let audit_update = sqlx::query(
@@ -219,15 +258,14 @@ pub async fn finalize_authoritative_new_user_audit_job(
     .bind(components.final_level())
     .bind(&final_signals)
     .bind(&job.snapshot_hash)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if audit_update.rows_affected() == 0 {
         sqlx::query("update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = 'snapshot_stale' where id = $1")
             .bind(job.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-        tx.commit().await?;
-        return Ok(result);
+        return Ok(());
     }
 
     sqlx::query(
@@ -252,16 +290,58 @@ pub async fn finalize_authoritative_new_user_audit_job(
     .bind(job.telegram_user_id)
     .bind(final_score)
     .bind(&final_signals)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null where id = $1",
     )
     .bind(job.id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Завершает lease успешной shadow job и materializes уже сохранённый assessment.
+/// Assessment не перезаписывается, поэтому этот путь никогда не инициирует LLM generation.
+pub async fn materialize_authoritative_new_user_audit_job(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    components: &ScoreComponents,
+) -> anyhow::Result<CasResult> {
+    let mut tx = pool.begin().await?;
+    let update = sqlx::query(
+        "update new_user_audit_jobs set status = 'succeeded', error_kind = null, lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing' and assessment_json is not null and materialization_status = 'pending' and materialization_version = $3",
+    )
+    .bind(job.id)
+    .bind(job.attempts)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
     .execute(&mut *tx)
     .await?;
+    let result = CasResult::from_rows_affected(update.rows_affected())?;
+    if result == CasResult::LeaseLost {
+        tx.rollback().await?;
+        return Ok(result);
+    }
+    materialize_authoritative_in_transaction(&mut tx, job, components).await?;
     tx.commit().await?;
     Ok(result)
+}
+
+/// Stops a malformed stored assessment from being retried as a generation job.
+pub async fn mark_new_user_audit_materialization_stale(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    error_kind: &str,
+) -> anyhow::Result<CasResult> {
+    let update = sqlx::query(
+        "update new_user_audit_jobs set status = 'succeeded', materialization_status = 'stale', materialized_at = now(), materialization_error_kind = $3, lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing' and assessment_json is not null",
+    )
+    .bind(job.id)
+    .bind(job.attempts)
+    .bind(error_kind)
+    .execute(pool)
+    .await?;
+    CasResult::from_rows_affected(update.rows_affected())
 }
 
 // В следующем slice retry finalizer вызывается unified audit service.
