@@ -291,7 +291,7 @@ async fn replied_post_context(
     Ok(context.map(|text| first_text_chars(&text, POST_CONTEXT_LIMIT)))
 }
 
-async fn template_match_count(
+pub(crate) async fn template_match_count(
     pool: &PgPool,
     chat_id: i64,
     user_id: i64,
@@ -310,7 +310,7 @@ async fn template_match_count(
         .min(10) as i32)
 }
 
-async fn spam_similarity(pool: &PgPool, embedding: &str) -> anyhow::Result<Option<f64>> {
+pub(crate) async fn spam_similarity(pool: &PgPool, embedding: &str) -> anyhow::Result<Option<f64>> {
     let value = sqlx::query_scalar::<_, Option<f64>>(r#"
         select max(1.0 - (a.first_message_embedding <=> $1::vector))
         from telegram_new_user_profile_audits a

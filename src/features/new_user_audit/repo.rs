@@ -3,6 +3,7 @@ use sqlx::{PgPool, Row};
 
 use crate::features::jobs::claim::CasResult;
 use crate::features::jobs::policy::{ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE};
+use crate::features::new_user_audit::scoring::ScoreComponents;
 
 // В следующем slice job будет подключена к worker; пока API вызывается PostgreSQL integration test.
 #[allow(dead_code)]
@@ -139,6 +140,90 @@ pub async fn finalize_new_user_audit_job(
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())
+}
+
+/// Завершает unified audit и материализует score/review в одной транзакции.
+/// Telegram delivery намеренно не claim'ится здесь: её выполняет отдельный worker.
+pub async fn finalize_authoritative_new_user_audit_job(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    outcome: NewUserAuditOutcome<'_>,
+    components: &ScoreComponents,
+) -> anyhow::Result<CasResult> {
+    let mut tx = pool.begin().await?;
+    let update = sqlx::query(
+        r#"
+        update new_user_audit_jobs
+        set status = 'succeeded', assessment_json = $3, provider = $4, model = $5,
+            completed_at = now(), error_kind = null, lease_expires_at = null, updated_at = now()
+        where id = $1 and attempts = $2 and status = 'processing'
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.attempts)
+    .bind(outcome.assessment_json)
+    .bind(outcome.provider)
+    .bind(outcome.model)
+    .execute(&mut *tx)
+    .await?;
+    let result = CasResult::from_rows_affected(update.rows_affected())?;
+    if result == CasResult::LeaseLost {
+        tx.rollback().await?;
+        return Ok(result);
+    }
+
+    let final_score = components.final_score();
+    let final_signals = components.final_signals();
+    sqlx::query(
+        r#"
+        update telegram_new_user_profile_audits
+        set risk_baseline_score = $3, risk_baseline_signals = $4,
+            risk_first_message_score = $5, risk_first_message_signals = $6,
+            risk_avatar_score = $7, risk_avatar_signals = $8,
+            risk_score = $9, risk_level = $10, risk_signal_breakdown = $11
+        where chat_id = $1 and telegram_user_id = $2
+        "#,
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .bind(components.baseline_score)
+    .bind(&components.baseline_signals)
+    .bind(components.first_message_score)
+    .bind(&components.first_message_signals)
+    .bind(components.avatar_score)
+    .bind(&components.avatar_signals)
+    .bind(final_score)
+    .bind(components.final_level())
+    .bind(&final_signals)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals)
+        values ($1, $2, $3, $4)
+        on conflict (chat_id, telegram_user_id) do update
+        set risk_score = excluded.risk_score, risk_signals = excluded.risk_signals,
+            notification_status = case when spam_review_requests.status = 'pending'
+                and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
+                and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                    is distinct from (excluded.risk_score, excluded.risk_signals)
+                then 'retry_wait' else spam_review_requests.notification_status end,
+            notification_next_attempt_at = case when spam_review_requests.status = 'pending'
+                and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
+                and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                    is distinct from (excluded.risk_score, excluded.risk_signals)
+                then now() else spam_review_requests.notification_next_attempt_at end
+        "#,
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .bind(final_score)
+    .bind(&final_signals)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(result)
 }
 
 // В следующем slice retry finalizer вызывается unified audit service.

@@ -1,5 +1,5 @@
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use teloxide::prelude::Bot;
 
 use crate::config::Config;
@@ -7,8 +7,10 @@ use crate::features::jobs::claim::CasResult;
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
-    finalize_new_user_audit_job, mark_new_user_audit_failed, mark_new_user_audit_retry,
+    finalize_authoritative_new_user_audit_job, finalize_new_user_audit_job,
+    mark_new_user_audit_failed, mark_new_user_audit_retry,
 };
+use crate::features::new_user_audit::scoring::{FirstMessageScoreContext, score_assessment};
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
@@ -115,18 +117,26 @@ async fn generate_and_finalize(
     )
     .await?;
 
-    NewUserAuditAssessment::parse_for_input(&generation.content, has_avatar_input)?;
+    let assessment =
+        NewUserAuditAssessment::parse_for_input(&generation.content, has_avatar_input)?;
     let assessment_json = serde_json::from_str(&generation.content)?;
-    let finalized = finalize_new_user_audit_job(
-        pool,
-        job,
-        NewUserAuditOutcome {
-            assessment_json: &assessment_json,
-            provider: &generation.provider,
-            model: &generation.model,
-        },
-    )
-    .await?;
+    let outcome = NewUserAuditOutcome {
+        assessment_json: &assessment_json,
+        provider: &generation.provider,
+        model: &generation.model,
+    };
+    let finalized = if config.new_user_audit_authoritative_enabled {
+        let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
+        let components = score_assessment(
+            baseline_score,
+            baseline_signals,
+            &assessment,
+            FirstMessageScoreContext::default(),
+        );
+        finalize_authoritative_new_user_audit_job(pool, job, outcome, &components).await?
+    } else {
+        finalize_new_user_audit_job(pool, job, outcome).await?
+    };
     if finalized == CasResult::LeaseLost {
         tracing::warn!(
             job_id = job.id,
@@ -135,6 +145,23 @@ async fn generate_and_finalize(
         );
     }
     Ok(())
+}
+
+async fn load_baseline_component(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<(i32, Value)> {
+    let row = sqlx::query(
+        "select risk_baseline_score, risk_baseline_signals from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        row.get("risk_baseline_score"),
+        row.get("risk_baseline_signals"),
+    ))
 }
 
 async fn load_avatar_input(
