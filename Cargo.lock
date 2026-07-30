@@ -49,7 +49,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.41.1"
-source = "git+https://github.com/Mar2ianen/async-openai?branch=bot%2Fnedobot-safe-openai-errors#1545d35a2cfbafcd9c2d4883704da63cc2455b8a"
+source = "git+https://github.com/Mar2ianen/async-openai?branch=fix%2Fgroq-on-demand-service-tier#b1b41e8d304342468d4d17db832d0e17c7b7a25c"
 dependencies = [
  "async-openai-macros",
  "base64 0.22.1",
@@ -76,7 +76,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.3.0"
-source = "git+https://github.com/Mar2ianen/async-openai?branch=bot%2Fnedobot-safe-openai-errors#1545d35a2cfbafcd9c2d4883704da63cc2455b8a"
+source = "git+https://github.com/Mar2ianen/async-openai?branch=fix%2Fgroq-on-demand-service-tier#b1b41e8d304342468d4d17db832d0e17c7b7a25c"
 dependencies = [
  "proc-macro2",
  "quote",
