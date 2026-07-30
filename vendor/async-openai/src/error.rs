@@ -13,8 +13,8 @@ pub enum OpenAIError {
     #[error("{0}")]
     ApiError(ApiErrorResponse),
     /// Error when a response cannot be deserialized into a Rust type
-    #[error("failed to deserialize api response: error:{0} content:{1}")]
-    JSONDeserialize(serde_json::Error, String),
+    #[error("failed to deserialize api response: error:{0}")]
+    JSONDeserialize(serde_json::Error),
     #[cfg(all(feature = "_api", not(target_family = "wasm")))]
     /// Error on the client side when saving file to file system
     #[error("failed to save file: {0}")]
@@ -137,9 +137,7 @@ pub struct WrappedError {
 }
 
 #[cfg(feature = "_api")]
-pub(crate) fn map_deserialization_error(e: serde_json::Error, bytes: &[u8]) -> OpenAIError {
-    let json_content = String::from_utf8_lossy(bytes);
-    tracing::error!("failed deserialization of: {}", json_content);
-
-    OpenAIError::JSONDeserialize(e, json_content.to_string())
+pub(crate) fn map_deserialization_error(e: serde_json::Error, _bytes: &[u8]) -> OpenAIError {
+    tracing::error!(error = %e, "failed to deserialize API response");
+    OpenAIError::JSONDeserialize(e)
 }
