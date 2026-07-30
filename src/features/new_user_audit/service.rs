@@ -11,8 +11,9 @@ use crate::features::new_user_audit::prompt::{build_input, output_schema, system
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job_with_materialization,
     finalize_authoritative_new_user_audit_job, finalize_new_user_audit_job,
-    mark_new_user_audit_failed, mark_new_user_audit_materialization_stale,
-    mark_new_user_audit_retry, materialize_authoritative_new_user_audit_job,
+    mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
+    mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
+    materialize_authoritative_new_user_audit_job,
 };
 use crate::features::new_user_audit::scoring::{FirstMessageScoreContext, score_assessment};
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
@@ -50,18 +51,23 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAud
     };
     let Err(error) = result else { return };
 
-    let failure = classify_audit_failure(&error);
-    if job.is_materialization_replay && matches!(failure, AuditFailure::Terminal { .. }) {
-        let AuditFailure::Terminal { error_kind } = failure else {
-            unreachable!("terminal failure was matched above")
+    if job.is_materialization_replay {
+        let failure = classify_materialization_failure(&error);
+        let (result, error_kind) = match failure {
+            MaterializationFailure::Retry { error_kind } => (
+                mark_new_user_audit_materialization_retry(pool, job, error_kind).await,
+                error_kind,
+            ),
+            MaterializationFailure::Stale { error_kind } => (
+                mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
+                error_kind,
+            ),
         };
-        log_materialization_failure(
-            mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
-            job,
-            error_kind,
-        );
+        log_materialization_failure(result, job, error_kind);
         return;
     }
+
+    let failure = classify_audit_failure(&error);
     let result = match failure {
         AuditFailure::Retry { error_kind } => {
             mark_new_user_audit_retry(pool, job, error_kind, None).await
@@ -109,7 +115,8 @@ async fn materialize_stored_assessment(
         .assessment_json
         .as_ref()
         .context("materialization replay requires stored assessment")?;
-    let assessment = parse_stored_assessment(job, assessment_json)?;
+    let assessment = parse_stored_assessment(job, assessment_json)
+        .map_err(|error| MalformedStoredAssessment(error.to_string()))?;
     let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
     let first_message_context =
         load_first_message_score_context(pool, config, job, &assessment).await?;
@@ -340,6 +347,44 @@ async fn load_avatar_input(
     Ok(Some(cached.base64().await?))
 }
 
+#[derive(Debug)]
+struct MalformedStoredAssessment(String);
+
+impl std::fmt::Display for MalformedStoredAssessment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "malformed stored assessment: {}", self.0)
+    }
+}
+
+impl std::error::Error for MalformedStoredAssessment {}
+
+#[derive(Clone, Copy)]
+enum MaterializationFailure {
+    Retry { error_kind: &'static str },
+    Stale { error_kind: &'static str },
+}
+
+fn classify_materialization_failure(error: &anyhow::Error) -> MaterializationFailure {
+    if error.downcast_ref::<MalformedStoredAssessment>().is_some() {
+        return MaterializationFailure::Stale {
+            error_kind: "malformed_assessment",
+        };
+    }
+    if error.downcast_ref::<sqlx::Error>().is_some() {
+        return MaterializationFailure::Retry {
+            error_kind: "sql_transient",
+        };
+    }
+    if error.downcast_ref::<reqwest::Error>().is_some() {
+        return MaterializationFailure::Retry {
+            error_kind: "embedding_transient",
+        };
+    }
+    MaterializationFailure::Retry {
+        error_kind: "materialization_transient",
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AuditFailure {
     Retry { error_kind: &'static str },
@@ -419,6 +464,7 @@ mod tests {
             avatar_file_unique_id: None,
             assessment_json: None,
             attempts: 1,
+            materialization_attempts: 1,
             is_materialization_replay: true,
         }
     }

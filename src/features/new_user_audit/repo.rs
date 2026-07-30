@@ -2,7 +2,9 @@ use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::features::jobs::claim::CasResult;
-use crate::features::jobs::policy::{ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE};
+use crate::features::jobs::policy::{
+    ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE, MATERIALIZATION_RETRY,
+};
 use crate::features::new_user_audit::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется только при несовместимом изменении
@@ -22,7 +24,10 @@ pub struct NewUserAuditJob {
     pub avatar_file_id: Option<String>,
     pub avatar_file_unique_id: Option<String>,
     pub assessment_json: Option<Value>,
+    /// Monotonic generation claim sequence, used only by generation finalizers.
     pub attempts: i32,
+    /// Independent replay claim sequence, used only by materialization finalizers.
+    pub materialization_attempts: i32,
     pub is_materialization_replay: bool,
 }
 
@@ -110,38 +115,50 @@ pub async fn claim_next_new_user_audit_job_with_materialization(
     let row = sqlx::query(
         r#"
         with candidate as (
-            select id, assessment_json is not null as is_materialization_replay
+            select id,
+                   assessment_json is not null as is_materialization_replay,
+                   case when assessment_json is not null
+                        then materialization_next_attempt_at else next_attempt_at end as ready_at
             from new_user_audit_jobs
             where (
-                    $2 or assessment_json is null
-                  )
-              and (
-                    (status in ('pending', 'retry_wait') and next_attempt_at <= now())
-                    or (status = 'processing' and lease_expires_at <= now())
+                    assessment_json is null
+                    and (
+                        (status in ('pending', 'retry_wait') and next_attempt_at <= now())
+                        or (status = 'processing' and lease_expires_at <= now())
+                    )
                   )
                or (
                     $2
                     and status = 'succeeded'
                     and assessment_json is not null
-                    and materialization_status = 'pending'
                     and materialization_version = $3
-               )
-            order by next_attempt_at, id
+                    and (
+                        (materialization_status in ('pending', 'retry_wait')
+                         and materialization_next_attempt_at <= now())
+                        or (materialization_status = 'processing'
+                            and materialization_lease_expires_at <= now())
+                    )
+                  )
+            order by ready_at, id
             for update skip locked
             limit 1
         )
         update new_user_audit_jobs job
-        set status = 'processing',
-            attempts = job.attempts + 1,
-            processing_started_at = now(),
-            lease_expires_at = now() + ($1 * interval '1 second'),
+        set status = case when candidate.is_materialization_replay then job.status else 'processing' end,
+            attempts = case when candidate.is_materialization_replay then job.attempts else job.attempts + 1 end,
+            processing_started_at = case when candidate.is_materialization_replay then job.processing_started_at else now() end,
+            lease_expires_at = case when candidate.is_materialization_replay then job.lease_expires_at else now() + ($1 * interval '1 second') end,
+            materialization_status = case when candidate.is_materialization_replay then 'processing' else job.materialization_status end,
+            materialization_attempts = case when candidate.is_materialization_replay then job.materialization_attempts + 1 else job.materialization_attempts end,
+            materialization_processing_started_at = case when candidate.is_materialization_replay then now() else job.materialization_processing_started_at end,
+            materialization_lease_expires_at = case when candidate.is_materialization_replay then now() + ($1 * interval '1 second') else job.materialization_lease_expires_at end,
             updated_at = now()
         from candidate
         where job.id = candidate.id
         returning job.id, job.chat_id, job.telegram_user_id, job.snapshot_hash,
                   job.prompt_version, job.input_json, job.avatar_file_id,
                   job.avatar_file_unique_id, job.assessment_json, job.attempts,
-                  candidate.is_materialization_replay
+                  job.materialization_attempts, candidate.is_materialization_replay
         "#,
     )
     .bind(EXTERNAL_REQUEST_LEASE.seconds())
@@ -161,6 +178,7 @@ pub async fn claim_next_new_user_audit_job_with_materialization(
         avatar_file_unique_id: row.get("avatar_file_unique_id"),
         assessment_json: row.get("assessment_json"),
         attempts: row.get("attempts"),
+        materialization_attempts: row.get("materialization_attempts"),
         is_materialization_replay: row.get("is_materialization_replay"),
     }))
 }
@@ -266,10 +284,16 @@ async fn materialize_authoritative_in_transaction(
     .execute(&mut **tx)
     .await?;
     if audit_update.rows_affected() == 0 {
-        sqlx::query("update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = 'snapshot_stale' where id = $1")
-            .bind(job.id)
-            .execute(&mut **tx)
-            .await?;
+        let stale = sqlx::query(
+            "update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = 'snapshot_stale', materialization_processing_started_at = null, materialization_lease_expires_at = null where id = $1 and (not $4 or (status = 'succeeded' and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3))",
+        )
+        .bind(job.id)
+        .bind(job.materialization_attempts)
+        .bind(CURRENT_MATERIALIZATION_VERSION)
+        .bind(job.is_materialization_replay)
+        .execute(&mut **tx)
+        .await?;
+        CasResult::from_rows_affected(stale.rows_affected())?;
         return Ok(());
     }
 
@@ -297,12 +321,16 @@ async fn materialize_authoritative_in_transaction(
     .bind(&final_signals)
     .execute(&mut **tx)
     .await?;
-    sqlx::query(
-        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null where id = $1",
+    let finalized = sqlx::query(
+        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null, materialization_processing_started_at = null, materialization_lease_expires_at = null where id = $1 and (not $4 or (status = 'succeeded' and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3))",
     )
     .bind(job.id)
+    .bind(job.materialization_attempts)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
+    .bind(job.is_materialization_replay)
     .execute(&mut **tx)
     .await?;
+    CasResult::from_rows_affected(finalized.rows_affected())?;
     Ok(())
 }
 
@@ -315,10 +343,10 @@ pub async fn materialize_authoritative_new_user_audit_job(
 ) -> anyhow::Result<CasResult> {
     let mut tx = pool.begin().await?;
     let update = sqlx::query(
-        "update new_user_audit_jobs set status = 'succeeded', error_kind = null, lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing' and assessment_json is not null and materialization_status = 'pending' and materialization_version = $3",
+        "update new_user_audit_jobs set updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3",
     )
     .bind(job.id)
-    .bind(job.attempts)
+    .bind(job.materialization_attempts)
     .bind(CURRENT_MATERIALIZATION_VERSION)
     .execute(&mut *tx)
     .await?;
@@ -339,11 +367,36 @@ pub async fn mark_new_user_audit_materialization_stale(
     error_kind: &str,
 ) -> anyhow::Result<CasResult> {
     let update = sqlx::query(
-        "update new_user_audit_jobs set status = 'succeeded', materialization_status = 'stale', materialized_at = now(), materialization_error_kind = $3, lease_expires_at = null, updated_at = now() where id = $1 and attempts = $2 and status = 'processing' and assessment_json is not null",
+        "update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = $3, materialization_processing_started_at = null, materialization_lease_expires_at = null, updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $4",
     )
     .bind(job.id)
-    .bind(job.attempts)
+    .bind(job.materialization_attempts)
     .bind(error_kind)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
+    .execute(pool)
+    .await?;
+    CasResult::from_rows_affected(update.rows_affected())
+}
+
+/// Schedules a replay retry without reopening or altering the successful generation.
+pub async fn mark_new_user_audit_materialization_retry(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    error_kind: &str,
+) -> anyhow::Result<CasResult> {
+    let Some(delay_seconds) =
+        MATERIALIZATION_RETRY.delay_seconds(job.materialization_attempts, None)
+    else {
+        return mark_new_user_audit_materialization_stale(pool, job, "retry_exhausted").await;
+    };
+    let update = sqlx::query(
+        "update new_user_audit_jobs set materialization_status = 'retry_wait', materialization_error_kind = $3, materialization_next_attempt_at = now() + ($4 * interval '1 second'), materialization_processing_started_at = null, materialization_lease_expires_at = null, updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $5",
+    )
+    .bind(job.id)
+    .bind(job.materialization_attempts)
+    .bind(error_kind)
+    .bind(delay_seconds)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())

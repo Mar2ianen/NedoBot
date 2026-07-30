@@ -66,6 +66,9 @@ pub const CHAT_EMBEDDING_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 120
 pub const POST_HISTORY_RETRY: RetryPolicy =
     RetryPolicy::new(&[15, 30, 60, 120, 240, 480, 960, 1_920, 3_600]);
 pub const ANALYSIS_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 5 * 60, 24 * 60 * 60]);
+/// Replay has an independent retry budget from the LLM generation that produced it.
+pub const MATERIALIZATION_RETRY: RetryPolicy =
+    RetryPolicy::new(&[15, 30, 60, 5 * 60, 24 * 60 * 60]);
 pub const EXTERNAL_ANALYSIS_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 pub const POST_HISTORY_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 
@@ -73,7 +76,8 @@ pub const POST_HISTORY_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 mod tests {
     use super::{
         ANALYSIS_RETRY, CHAT_EMBEDDING_LEASE, CHAT_EMBEDDING_RETRY, EXTERNAL_ANALYSIS_POLL,
-        EXTERNAL_REQUEST_LEASE, POST_HISTORY_LEASE, POST_HISTORY_POLL, POST_HISTORY_RETRY,
+        EXTERNAL_REQUEST_LEASE, MATERIALIZATION_RETRY, POST_HISTORY_LEASE, POST_HISTORY_POLL,
+        POST_HISTORY_RETRY,
     };
 
     #[test]
@@ -82,6 +86,8 @@ mod tests {
         assert_eq!(ANALYSIS_RETRY.delay_seconds(5, None), Some(86_400));
         assert_eq!(ANALYSIS_RETRY.delay_seconds(6, None), None);
         assert_eq!(ANALYSIS_RETRY.delay_seconds(0, None), None);
+        assert_eq!(MATERIALIZATION_RETRY.delay_seconds(5, None), Some(86_400));
+        assert_eq!(MATERIALIZATION_RETRY.delay_seconds(6, None), None);
     }
 
     #[test]
