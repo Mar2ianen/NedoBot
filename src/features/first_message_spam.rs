@@ -87,10 +87,12 @@ pub async fn analyze_first_message(
             first_message_spam_similarity = $6,
             first_message_template_matches = $7,
             first_message_analysis_at = now(),
-            risk_score = least(100, risk_score + $8),
-            risk_level = case when least(100, risk_score + $8) >= 70 then 'high'
-                              when least(100, risk_score + $8) >= 40 then 'medium' else 'low' end,
-            risk_signal_breakdown = coalesce(risk_signal_breakdown, '[]'::jsonb) || jsonb_build_array($9::jsonb)
+            risk_first_message_score = $8,
+            risk_first_message_signals = jsonb_build_array($9::jsonb),
+            risk_score = least(100, risk_baseline_score + $8 + risk_avatar_score),
+            risk_level = case when least(100, risk_baseline_score + $8 + risk_avatar_score) >= 70 then 'high'
+                              when least(100, risk_baseline_score + $8 + risk_avatar_score) >= 40 then 'medium' else 'low' end,
+            risk_signal_breakdown = risk_baseline_signals || jsonb_build_array($9::jsonb) || risk_avatar_signals
         where chat_id = $1 and telegram_user_id = $2 and first_message_analysis_at is null
         returning risk_level
         "#,

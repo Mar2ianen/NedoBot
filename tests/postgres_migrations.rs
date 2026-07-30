@@ -1412,8 +1412,11 @@ async fn assert_review_deduplication(pool: &PgPool) {
     query(
         r#"
         insert into telegram_new_user_profile_audits
-            (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown)
-        values ($1, $2, 65, 'medium', '[]'::jsonb)
+            (
+                chat_id, telegram_user_id, risk_baseline_score,
+                risk_baseline_signals, risk_score, risk_level, risk_signal_breakdown
+            )
+        values ($1, $2, 65, '[]'::jsonb, 65, 'medium', '[]'::jsonb)
         "#,
     )
     .bind(CHAT_ID)

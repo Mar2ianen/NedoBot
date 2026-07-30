@@ -1533,6 +1533,12 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "join_event_seen",
         "invite_link",
         "via_chat_folder_invite_link",
+        "risk_baseline_score",
+        "risk_baseline_signals",
+        "risk_first_message_score",
+        "risk_first_message_signals",
+        "risk_avatar_score",
+        "risk_avatar_signals",
         "risk_score",
         "risk_level",
         "primary_risk_class",
@@ -1719,6 +1725,12 @@ async fn save_audit(
         values.push_bind(&features.invite_link);
         values.push_bind(features.via_chat_folder_invite_link);
         values.push_bind(risk.score);
+        values.push_bind(&risk.signals);
+        values.push_bind(0_i32);
+        values.push_bind(json!([]));
+        values.push_bind(0_i32);
+        values.push_bind(json!([]));
+        values.push_bind(risk.score);
         values.push_bind(&risk.level);
         values.push_bind(&risk.primary_class);
         values.push_bind(&risk.class_scores);
@@ -1731,13 +1743,29 @@ async fn save_audit(
     query.push(") on conflict (chat_id, telegram_user_id) do update set analyzed_at = now(), ");
     {
         let mut updates = query.separated(", ");
-        for column in columns
-            .iter()
-            .copied()
-            .filter(|column| !matches!(*column, "chat_id" | "telegram_user_id"))
-        {
+        for column in columns.iter().copied().filter(|column| {
+            !matches!(
+                *column,
+                "chat_id"
+                    | "telegram_user_id"
+                    | "risk_baseline_score"
+                    | "risk_baseline_signals"
+                    | "risk_first_message_score"
+                    | "risk_first_message_signals"
+                    | "risk_avatar_score"
+                    | "risk_avatar_signals"
+                    | "risk_score"
+                    | "risk_level"
+                    | "risk_signal_breakdown"
+            )
+        }) {
             updates.push(format_args!("{column} = excluded.{column}"));
         }
+        updates.push("risk_baseline_score = excluded.risk_baseline_score");
+        updates.push("risk_baseline_signals = excluded.risk_baseline_signals");
+        updates.push("risk_score = least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score)");
+        updates.push("risk_level = case when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score) >= 70 then 'high' when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score) >= 40 then 'medium' else 'low' end");
+        updates.push("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || telegram_new_user_profile_audits.risk_avatar_signals");
     }
 
     query.build().execute(pool).await?;
