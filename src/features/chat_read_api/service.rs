@@ -8,6 +8,7 @@ use super::types::{
 const MAX_QUERY_CHARS: usize = 240;
 const MAX_RESULT_LIMIT: i64 = 20;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
+const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
 
 #[derive(FromRow)]
 struct MessageRow {
@@ -289,7 +290,7 @@ pub async fn user_interactions(
                 user_id: row.user_id,
                 author: row.author,
                 author_url: author_url(row.author_username.as_deref()),
-                text: first_chars(&row.text, 700),
+                text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
                 reply_to_message_id: row.reply_to_message_id,
                 created_at: row.created_at.to_rfc3339(),
             };
@@ -307,7 +308,7 @@ pub async fn user_interactions(
                     row.replied_to_text
                         .as_deref()
                         .unwrap_or("[медиа без текста]"),
-                    700,
+                    MAX_MESSAGE_PREVIEW_CHARS,
                 ),
                 reply_to_message_id: None,
                 created_at: row
@@ -376,7 +377,7 @@ fn map_rows(chat_id: i64, rows: Vec<MessageRow>) -> Vec<ChatMessage> {
             user_id: row.user_id,
             author: row.author,
             author_url: author_url(row.author_username.as_deref()),
-            text: first_chars(&row.text, 700),
+            text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
             reply_to_message_id: row.reply_to_message_id,
             created_at: row.created_at.to_rfc3339(),
         })
