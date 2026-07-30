@@ -456,6 +456,9 @@ async fn mark_review_delivery_failed(
           and notification_attempts = $7
           and status = 'pending'
           and notification_status = 'processing'
+          and (risk_score, risk_signals) is not distinct from ($8, $9::jsonb)
+          and (notification_delivery_risk_score, notification_delivery_risk_signals)
+              is not distinct from ($8, $9::jsonb)
         "#,
     )
     .bind(review.id)
@@ -465,6 +468,8 @@ async fn mark_review_delivery_failed(
     .bind(error_kind)
     .bind(increment_failures)
     .bind(review.notification_attempts)
+    .bind(review.risk_score)
+    .bind(&review.risk_signals)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
