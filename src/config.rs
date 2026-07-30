@@ -26,7 +26,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
     "paperpaper.ru",
 ];
 
-use crate::llm::profiles::{LlmProfiles, RouteRequirements, StructuredOutputMode};
+use crate::llm::profiles::{LlmProfiles, RouteRequirements};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -384,6 +384,13 @@ impl Config {
         }
         self.validate_chat_retrieval_config(&mut errors);
 
+        if self.new_user_audit_enabled {
+            require_positive(
+                &mut errors,
+                "NEW_USER_AUDIT_MAX_TOKENS",
+                self.new_user_audit_max_tokens,
+            );
+        }
         if self.new_user_audit_authoritative_enabled && !self.new_user_audit_enabled {
             errors.push(
                 "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=true requires NEW_USER_AUDIT_ENABLED=true"
@@ -576,7 +583,8 @@ impl Config {
                     RouteRequirements {
                         requires_images,
                         requires_system_prompt: true,
-                        structured_output: Some(StructuredOutputMode::JsonSchema),
+                        // Runtime допускает json_schema, json_object и prompt_only:
+                        // окончательный контракт контролирует Rust validator.
                         num_predict: Some(self.new_user_audit_max_tokens),
                         ..RouteRequirements::default()
                     },
@@ -1218,6 +1226,16 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("NEW_USER_AUDIT_MAX_TOKENS"));
+    }
+
+    #[test]
+    fn enabled_new_user_audit_rejects_zero_output_budget() {
+        let mut config = config();
+        config.new_user_audit_enabled = true;
+        config.new_user_audit_max_tokens = 0;
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+        assert!(error.contains("NEW_USER_AUDIT_MAX_TOKENS must be greater than 0"));
     }
 
     #[test]
