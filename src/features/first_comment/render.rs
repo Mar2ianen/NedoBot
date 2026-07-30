@@ -326,6 +326,7 @@ mod tests {
             cerebras_model: None,
             new_user_audit_enabled: false,
             new_user_audit_authoritative_enabled: false,
+            new_user_audit_max_tokens: 900,
             avatar_classifier_enabled: false,
             avatar_classifier_model: None,
             avatar_classifier_max_tokens: 900,

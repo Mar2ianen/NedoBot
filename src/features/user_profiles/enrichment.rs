@@ -185,8 +185,7 @@ async fn process_refreshed_profile(
         }
     }
 
-    // Пока unified audit не materialize-ит score и review в одной транзакции,
-    // он работает только в shadow-режиме и не заменяет legacy источник истины.
+    // При выключенном authoritative flag unified audit сохраняет только shadow assessment.
     if config.new_user_audit_enabled {
         enqueue_unified_new_user_audit(pool, job).await;
     }
