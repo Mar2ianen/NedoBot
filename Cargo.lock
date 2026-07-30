@@ -49,6 +49,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.41.1"
+source = "git+https://github.com/Mar2ianen/async-openai?branch=fix%2Fgroq-on-demand-service-tier#1545d35a2cfbafcd9c2d4883704da63cc2455b8a"
 dependencies = [
  "async-openai-macros",
  "base64 0.22.1",
@@ -75,8 +76,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "492a944774207eed3acf425214eadbd6ce84a2b89331164ff1c11bae92b26302"
+source = "git+https://github.com/Mar2ianen/async-openai?branch=fix%2Fgroq-on-demand-service-tier#1545d35a2cfbafcd9c2d4883704da63cc2455b8a"
 dependencies = [
  "proc-macro2",
  "quote",
