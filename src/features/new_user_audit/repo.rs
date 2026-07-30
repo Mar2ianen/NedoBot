@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -10,6 +12,11 @@ use crate::features::new_user_audit::scoring::ScoreComponents;
 /// Версия правил записи unified score. Меняется только при несовместимом изменении
 /// materializer-а, чтобы старые shadow assessments не применялись молча.
 pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v1";
+
+/// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
+/// generation boundary. Job остаётся под исходным generation lease.
+const GENERATION_FINALIZATION_SQL_RETRIES: u32 = 3;
+const GENERATION_FINALIZATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 // В следующем slice job будет подключена к worker; пока API вызывается PostgreSQL integration test.
 #[allow(dead_code)]
@@ -76,6 +83,7 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
             input_json = excluded.input_json,
             avatar_file_id = excluded.avatar_file_id,
             avatar_file_unique_id = excluded.avatar_file_unique_id,
+            materialization_version = $8,
             updated_at = now()
         "#,
     )
@@ -227,27 +235,56 @@ async fn finalize_new_user_audit_generation(
     job: &NewUserAuditJob,
     outcome: NewUserAuditOutcome<'_>,
 ) -> anyhow::Result<CasResult> {
-    let update = sqlx::query(
-        r#"
-        update new_user_audit_jobs
-        set status = 'succeeded', assessment_json = $3, provider = $4, model = $5,
-            completed_at = now(), error_kind = null, processing_started_at = null,
-            lease_expires_at = null, materialization_status = 'pending',
-            materialization_attempts = 0, materialization_next_attempt_at = now(),
-            materialization_processing_started_at = null,
-            materialization_lease_expires_at = null, materialization_error_kind = null,
-            materialized_at = null, updated_at = now()
-        where id = $1 and attempts = $2 and status = 'processing'
-        "#,
-    )
-    .bind(job.id)
-    .bind(job.attempts)
-    .bind(outcome.assessment_json)
-    .bind(outcome.provider)
-    .bind(outcome.model)
-    .execute(pool)
-    .await?;
-    CasResult::from_rows_affected(update.rows_affected())
+    for retry in 0..=GENERATION_FINALIZATION_SQL_RETRIES {
+        let update = sqlx::query(
+            r#"
+            update new_user_audit_jobs
+            set status = 'succeeded', assessment_json = $3, provider = $4, model = $5,
+                materialization_version = $6, completed_at = now(), error_kind = null,
+                processing_started_at = null, lease_expires_at = null,
+                materialization_status = 'pending', materialization_attempts = 0,
+                materialization_next_attempt_at = now(),
+                materialization_processing_started_at = null,
+                materialization_lease_expires_at = null, materialization_error_kind = null,
+                materialized_at = null, updated_at = now()
+            where id = $1 and attempts = $2 and status = 'processing'
+              and lease_expires_at > now()
+            "#,
+        )
+        .bind(job.id)
+        .bind(job.attempts)
+        .bind(outcome.assessment_json)
+        .bind(outcome.provider)
+        .bind(outcome.model)
+        .bind(CURRENT_MATERIALIZATION_VERSION)
+        .execute(pool)
+        .await;
+
+        match update {
+            Ok(update) => return CasResult::from_rows_affected(update.rows_affected()),
+            Err(error)
+                if should_retry_generation_finalization(
+                    retry,
+                    is_transient_generation_finalization_error(&error),
+                ) =>
+            {
+                tokio::time::sleep(GENERATION_FINALIZATION_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("generation finalization retry loop always returns")
+}
+
+fn should_retry_generation_finalization(retry: u32, is_transient_sql_error: bool) -> bool {
+    retry < GENERATION_FINALIZATION_SQL_RETRIES && is_transient_sql_error
+}
+
+fn is_transient_generation_finalization_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| matches!(code.as_ref(), "40001" | "40P01" | "55P03" | "57014"))
 }
 
 /// Применяет current-score к baseline только пока canonical snapshot не изменился.
@@ -454,4 +491,23 @@ pub async fn mark_new_user_audit_failed(
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_generation_finalization_retries_stay_local_and_bounded() {
+        assert!(should_retry_generation_finalization(0, true));
+        assert!(should_retry_generation_finalization(
+            GENERATION_FINALIZATION_SQL_RETRIES - 1,
+            true
+        ));
+        assert!(!should_retry_generation_finalization(
+            GENERATION_FINALIZATION_SQL_RETRIES,
+            true
+        ));
+        assert!(!should_retry_generation_finalization(0, false));
+    }
 }
