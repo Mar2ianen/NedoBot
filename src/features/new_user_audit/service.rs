@@ -94,8 +94,16 @@ async fn generate_and_finalize(
         );
     }
     let prompt = build_input(&input_json)?;
+    let has_first_message_input = input_json["text"]["first_message_preview"]
+        .as_str()
+        .is_some_and(|text| !text.trim().is_empty());
     let output_validator = move |output: &str| {
-        NewUserAuditAssessment::parse_for_input(output, has_avatar_input).map(|_| ())
+        NewUserAuditAssessment::parse_for_modalities(
+            output,
+            has_avatar_input,
+            has_first_message_input,
+        )
+        .map(|_| ())
     };
     let generation = generate_text_with_provider_checked(
         config,
@@ -119,8 +127,11 @@ async fn generate_and_finalize(
     )
     .await?;
 
-    let assessment =
-        NewUserAuditAssessment::parse_for_input(&generation.content, has_avatar_input)?;
+    let assessment = NewUserAuditAssessment::parse_for_modalities(
+        &generation.content,
+        has_avatar_input,
+        has_first_message_input,
+    )?;
     let assessment_json = serde_json::from_str(&generation.content)?;
     let outcome = NewUserAuditOutcome {
         assessment_json: &assessment_json,
