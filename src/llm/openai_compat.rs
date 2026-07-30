@@ -217,7 +217,8 @@ mod tests {
                 "message": {"role": "assistant", "content": "OK"},
                 "finish_reason": "stop"
             }],
-            "usage": null
+            "usage": null,
+            "service_tier": "on_demand"
         }))
     }
 

@@ -24,3 +24,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-std"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Groq returns the valid OpenAI-compatible service_tier="on_demand", which
+# async-openai 0.41.1 does not deserialize yet. Remove once upstream supports it.
+[patch.crates-io]
+async-openai = { path = "vendor/async-openai" }
