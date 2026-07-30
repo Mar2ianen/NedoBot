@@ -1,7 +1,7 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpListener,
-    sync::mpsc::sync_channel,
+    sync::{Arc, mpsc::sync_channel},
 };
 
 use chrono::{Duration, TimeZone, Utc};
@@ -74,6 +74,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_deduplication(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
+    assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
     assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
     assert_new_user_audit_materialization_lifecycle(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
@@ -834,6 +835,88 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
             .await
             .expect("terminal audit status must be stored");
     assert_eq!(terminal_status, "failed");
+}
+
+/// Regression coverage for the authoritative `job → audit → review` lock order.
+/// The first transaction deliberately holds the job lock while the second begins;
+/// a reversed audit-first enqueue would form a deadlock cycle with a finalizer.
+async fn assert_unified_enqueue_and_finalizer_share_lock_order(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_095;
+    let input = serde_json::json!({"schema_version": "lock-order-fixture"});
+
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("lock-order audit fixture must be inserted");
+    let job_id: i64 = query_scalar(
+        "insert into new_user_audit_jobs (chat_id, telegram_user_id, snapshot_hash, prompt_version, input_json) values ($1, $2, 'lock-order-snapshot', 'prompt-v1', $3) returning id",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .bind(&input)
+    .fetch_one(pool)
+    .await
+    .expect("lock-order job fixture must be inserted");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let enqueue_pool = pool.clone();
+    let enqueue_barrier = Arc::clone(&barrier);
+    let enqueue = async move {
+        let mut tx = enqueue_pool.begin().await?;
+        query("update new_user_audit_jobs set updated_at = now() where id = $1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        enqueue_barrier.wait().await;
+        query("select pg_sleep(0.1)").execute(&mut *tx).await?;
+        query("update telegram_new_user_profile_audits set unified_audit_snapshot_hash = 'lock-order-snapshot' where chat_id = $1 and telegram_user_id = $2")
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    };
+    let finalizer_pool = pool.clone();
+    let finalizer_barrier = Arc::clone(&barrier);
+    let finalizer = async move {
+        finalizer_barrier.wait().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut tx = finalizer_pool.begin().await?;
+        query("update new_user_audit_jobs set status = 'succeeded' where id = $1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        query("update telegram_new_user_profile_audits set risk_score = 80 where chat_id = $1 and telegram_user_id = $2")
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(&mut *tx)
+            .await?;
+        query("insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals) values ($1, $2, 80, '[]'::jsonb)")
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::try_join!(enqueue, finalizer)
+    })
+    .await
+    .expect("canonical lock order must not deadlock")
+    .expect("concurrent enqueue and finalizer transactions must commit");
+
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("lock-order review fixture must be removed");
 }
 
 async fn assert_successful_shadow_audit_replays_only_for_authoritative_materialization(
