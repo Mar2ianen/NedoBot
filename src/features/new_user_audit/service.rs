@@ -3,7 +3,9 @@ use sqlx::{PgPool, Row};
 use teloxide::prelude::Bot;
 
 use crate::config::Config;
+use crate::features::first_message_spam::{spam_similarity, template_match_count};
 use crate::features::jobs::claim::CasResult;
+use crate::features::memory::embedding::{embed_text, pgvector_literal};
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
@@ -127,11 +129,13 @@ async fn generate_and_finalize(
     };
     let finalized = if config.new_user_audit_authoritative_enabled {
         let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
+        let first_message_context =
+            load_first_message_score_context(pool, config, job, &assessment).await?;
         let components = score_assessment(
             baseline_score,
             baseline_signals,
             &assessment,
-            FirstMessageScoreContext::default(),
+            first_message_context,
         );
         finalize_authoritative_new_user_audit_job(pool, job, outcome, &components).await?
     } else {
@@ -145,6 +149,38 @@ async fn generate_and_finalize(
         );
     }
     Ok(())
+}
+
+async fn load_first_message_score_context(
+    pool: &PgPool,
+    config: &Config,
+    job: &NewUserAuditJob,
+    assessment: &NewUserAuditAssessment,
+) -> anyhow::Result<FirstMessageScoreContext> {
+    if assessment.first_message_assessment.is_none() {
+        return Ok(FirstMessageScoreContext::default());
+    }
+    let row = sqlx::query(
+        "select first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .fetch_one(pool)
+    .await?;
+    let Some(text) = row.get::<Option<String>, _>("first_message_text") else {
+        return Ok(FirstMessageScoreContext::default());
+    };
+    if text.trim().is_empty() {
+        return Ok(FirstMessageScoreContext::default());
+    }
+    let embedding = embed_text(config, &text).await?;
+    let embedding = pgvector_literal(&embedding)?;
+    Ok(FirstMessageScoreContext {
+        template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
+            .await?,
+        spam_similarity: spam_similarity(pool, &embedding).await?,
+        feminine_profile_name: row.get("first_name_feminine_pattern"),
+    })
 }
 
 async fn load_baseline_component(
