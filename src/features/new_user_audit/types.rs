@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // Лимиты применит worker после подключения в следующем slice.
@@ -15,7 +15,7 @@ const MAX_EVIDENCE_ITEMS: usize = 10;
 /// Поля с наблюдениями за аватаром и первым сообщением всегда присутствуют в
 /// JSON, но равны `null`, если соответствующих входных данных не было.
 #[allow(dead_code)] // Typed-контракт ожидает будущий worker аудита.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NewUserAuditAssessment {
     pub avatar_observation: Option<AvatarObservation>,
@@ -23,7 +23,7 @@ pub struct NewUserAuditAssessment {
     pub profile_assessment: ProfileAssessment,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AvatarObservation {
     pub primary_class: AvatarClass,
@@ -36,7 +36,7 @@ pub struct AvatarObservation {
     pub confidence: f64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AvatarClass {
     OrdinaryPersonal,
@@ -49,7 +49,7 @@ pub enum AvatarClass {
     Unclear,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FaceVisibility {
     Clear,
@@ -58,7 +58,7 @@ pub enum FaceVisibility {
     Unclear,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdultLevel {
     None,
@@ -67,7 +67,7 @@ pub enum AdultLevel {
     Unclear,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FirstMessageAssessment {
     pub relation_to_chat: MessageRelation,
@@ -82,7 +82,7 @@ pub struct FirstMessageAssessment {
     pub confidence: f64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRelation {
     OnTopic,
@@ -91,7 +91,7 @@ pub enum MessageRelation {
     NoMessageContext,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SelfReferenceGrammar {
     Masculine,
@@ -99,7 +99,7 @@ pub enum SelfReferenceGrammar {
     NoneOrUnclear,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileNameGrammarRelation {
     Consistent,
@@ -107,7 +107,7 @@ pub enum ProfileNameGrammarRelation {
     NotApplicable,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FirstMessageRiskMarker {
     SendOrShareOffer,
@@ -121,14 +121,14 @@ pub enum FirstMessageRiskMarker {
     PerformativeFemininePersona,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FirstMessageEvidence {
     pub marker: FirstMessageRiskMarker,
     pub quote: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileAssessment {
     pub risk_patterns: Vec<ProfileRiskPattern>,
@@ -139,7 +139,7 @@ pub struct ProfileAssessment {
     pub summary: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileRiskPattern {
     BioOrUsernamePromotion,
@@ -150,7 +150,7 @@ pub enum ProfileRiskPattern {
     NoMaterialRiskPattern,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEvidence {
     pub source: EvidenceSource,
@@ -158,7 +158,7 @@ pub struct AuditEvidence {
     pub strength: EvidenceStrength,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSource {
     Avatar,
@@ -168,7 +168,7 @@ pub enum EvidenceSource {
     ChatHistory,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceStrength {
     Weak,
@@ -176,7 +176,7 @@ pub enum EvidenceStrength {
     Strong,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewPriority {
     Low,
