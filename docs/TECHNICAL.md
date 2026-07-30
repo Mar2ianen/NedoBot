@@ -327,7 +327,7 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий deploy `v0.11.0` сделан на `vps-153`. Release binary соответствует merge commit [`bf59fd9`](https://github.com/Mar2ianen/NedoBot/commit/bf59fd9); immutable tag [`deploy-2026-07-31-v0.11.0`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-v0.11.0) фиксирует этот boundary. Предыдущий voice flow release отмечен [`deploy-2026-07-31-voice-flow`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-voice-flow), unified audit — [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit). Последующие commits разрабатываются в `dev` и не считаются deployed до отдельного merge/review.
+Текущий deploy `v0.12.0` сделан на `vps-153`. Release binary соответствует merge commit [`b643ba8`](https://github.com/Mar2ianen/NedoBot/commit/b643ba8); immutable tag [`deploy-2026-07-31-v0.12.0`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-v0.12.0) фиксирует этот boundary. Предыдущий release `v0.11.0` отмечен [`deploy-2026-07-31-v0.11.0`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-v0.11.0), voice flow — [`deploy-2026-07-31-voice-flow`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-voice-flow), unified audit — [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit). Последующие commits разрабатываются в `dev` и не считаются deployed до отдельного merge/review.
 
 
 - код: `/opt/tg-ai-bot-teloxide`
