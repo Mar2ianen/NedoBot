@@ -206,12 +206,37 @@ pub async fn finalize_new_user_audit_job(
     job: &NewUserAuditJob,
     outcome: NewUserAuditOutcome<'_>,
 ) -> anyhow::Result<CasResult> {
+    finalize_new_user_audit_generation(pool, job, outcome).await
+}
+
+/// Durable boundary between authoritative LLM generation and materialization.
+///
+/// Once this CAS succeeds, the worker must only use the stored assessment through
+/// the materialization replay lifecycle. In particular, SQL or embedding failures
+/// after this point must never reopen LLM generation.
+pub async fn finalize_authoritative_new_user_audit_job(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    outcome: NewUserAuditOutcome<'_>,
+) -> anyhow::Result<CasResult> {
+    finalize_new_user_audit_generation(pool, job, outcome).await
+}
+
+async fn finalize_new_user_audit_generation(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    outcome: NewUserAuditOutcome<'_>,
+) -> anyhow::Result<CasResult> {
     let update = sqlx::query(
         r#"
         update new_user_audit_jobs
         set status = 'succeeded', assessment_json = $3, provider = $4, model = $5,
-            completed_at = now(), error_kind = null, lease_expires_at = null,
-            updated_at = now()
+            completed_at = now(), error_kind = null, processing_started_at = null,
+            lease_expires_at = null, materialization_status = 'pending',
+            materialization_attempts = 0, materialization_next_attempt_at = now(),
+            materialization_processing_started_at = null,
+            materialization_lease_expires_at = null, materialization_error_kind = null,
+            materialized_at = null, updated_at = now()
         where id = $1 and attempts = $2 and status = 'processing'
         "#,
     )
@@ -223,41 +248,6 @@ pub async fn finalize_new_user_audit_job(
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())
-}
-
-/// Завершает unified audit и материализует score/review в одной транзакции.
-/// Telegram delivery намеренно не claim'ится здесь: её выполняет отдельный worker.
-pub async fn finalize_authoritative_new_user_audit_job(
-    pool: &PgPool,
-    job: &NewUserAuditJob,
-    outcome: NewUserAuditOutcome<'_>,
-    components: &ScoreComponents,
-) -> anyhow::Result<CasResult> {
-    let mut tx = pool.begin().await?;
-    let update = sqlx::query(
-        r#"
-        update new_user_audit_jobs
-        set status = 'succeeded', assessment_json = $3, provider = $4, model = $5,
-            completed_at = now(), error_kind = null, lease_expires_at = null, updated_at = now()
-        where id = $1 and attempts = $2 and status = 'processing'
-        "#,
-    )
-    .bind(job.id)
-    .bind(job.attempts)
-    .bind(outcome.assessment_json)
-    .bind(outcome.provider)
-    .bind(outcome.model)
-    .execute(&mut *tx)
-    .await?;
-    let result = CasResult::from_rows_affected(update.rows_affected())?;
-    if result == CasResult::LeaseLost {
-        tx.rollback().await?;
-        return Ok(result);
-    }
-
-    materialize_authoritative_in_transaction(&mut tx, job, components).await?;
-    tx.commit().await?;
-    Ok(result)
 }
 
 /// Применяет current-score к baseline только пока canonical snapshot не изменился.

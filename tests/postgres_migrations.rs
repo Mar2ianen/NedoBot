@@ -39,9 +39,10 @@ use tg_ai_bot_teloxide::features::{
         repo::{
             NewUserAuditJobParams, claim_next_new_user_audit_job,
             claim_next_new_user_audit_job_with_materialization, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_authoritative_new_user_audit_job,
+            finalize_authoritative_new_user_audit_job, finalize_new_user_audit_job,
+            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
+            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
+            materialize_authoritative_new_user_audit_job,
         },
         scoring::ScoreComponents,
     },
@@ -76,7 +77,9 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_new_user_audit_job_lifecycle(&pool).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
     assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
+    assert_authoritative_generation_is_durable_before_materialization(&pool).await;
     assert_new_user_audit_materialization_lifecycle(&pool).await;
+    assert_new_user_audit_generation_materialization_upgrade(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
@@ -1056,6 +1059,149 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
             .expect("completed replay claim must execute")
             .is_none(),
         "materialized shadow assessment must be closed"
+    );
+}
+
+async fn assert_authoritative_generation_is_durable_before_materialization(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_094;
+    let input = serde_json::json!({"schema_version": "authoritative-boundary-fixture"});
+    let assessment = serde_json::json!({
+        "avatar_observation": null,
+        "first_message_assessment": null,
+        "profile_assessment": {
+            "risk_patterns": ["no_material_risk_pattern"],
+            "evidence": [], "contradictions": ["Нет признаков."],
+            "review_priority": "low", "confidence": 0.5, "summary": "Нейтрально."
+        }
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "authoritative-boundary-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("authoritative boundary job must be enqueued");
+    let generation_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("authoritative generation claim must execute")
+        .expect("authoritative generation job must be claimable");
+    assert_eq!(
+        finalize_authoritative_new_user_audit_job(
+            pool,
+            &generation_claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment,
+                provider: "fixture",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("authoritative generation must persist before materialization"),
+        CasResult::Applied
+    );
+    let generation_state: (String, serde_json::Value, String, i32, bool) = query_as(
+        "select status, assessment_json, materialization_status, materialization_attempts, lease_expires_at is null from new_user_audit_jobs where id = $1",
+    )
+    .bind(generation_claim.id)
+    .fetch_one(pool)
+    .await
+    .expect("durable authoritative generation state must be stored");
+    assert_eq!(
+        generation_state,
+        (
+            "succeeded".into(),
+            assessment.clone(),
+            "pending".into(),
+            0,
+            true
+        )
+    );
+
+    let materialization_claim = claim_next_new_user_audit_job_with_materialization(pool, true)
+        .await
+        .expect("materialization replay claim must execute")
+        .expect("stored authoritative assessment must be replayable");
+    assert_eq!(materialization_claim.id, generation_claim.id);
+    assert!(materialization_claim.is_materialization_replay);
+    assert_eq!(materialization_claim.attempts, generation_claim.attempts);
+    assert_eq!(
+        mark_new_user_audit_materialization_retry(pool, &materialization_claim, "sql_transient",)
+            .await
+            .expect("transient materialization failure must schedule replay"),
+        CasResult::Applied
+    );
+    assert!(
+        claim_next_new_user_audit_job(pool)
+            .await
+            .expect("generation queue check must execute")
+            .is_none(),
+        "a materialization retry must never reopen authoritative LLM generation"
+    );
+}
+
+async fn assert_new_user_audit_generation_materialization_upgrade(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const PROCESSING_USER_ID: i64 = 9_000_092;
+    const RETRY_USER_ID: i64 = 9_000_093;
+    let assessment = serde_json::json!({"legacy": "assessment"});
+    for (user_id, status) in [
+        (PROCESSING_USER_ID, "processing"),
+        (RETRY_USER_ID, "retry_wait"),
+    ] {
+        query(
+            "insert into new_user_audit_jobs (chat_id, telegram_user_id, snapshot_hash, prompt_version, input_json, status, attempts, next_attempt_at, assessment_json, error_kind) values ($1, $2, $3, 'prompt-v1', '{}'::jsonb, $4, 1, now() + interval '10 minutes', $5, 'legacy_error')",
+        )
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .bind(format!("generation-materialization-upgrade-{user_id}"))
+        .bind(status)
+        .bind(&assessment)
+        .execute(pool)
+        .await
+        .expect("legacy assessment fixture must be inserted");
+    }
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260730122000_new_user_audit_generation_materialization_boundary.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("generation/materialization boundary migration must normalize legacy rows");
+
+    let rows: Vec<(i64, String, String, bool, Option<String>)> = query_as(
+        "select telegram_user_id, status, materialization_status, materialization_next_attempt_at > now(), materialization_error_kind from new_user_audit_jobs where chat_id = $1 and telegram_user_id = any($2) order by telegram_user_id",
+    )
+    .bind(CHAT_ID)
+    .bind([PROCESSING_USER_ID, RETRY_USER_ID])
+    .fetch_all(pool)
+    .await
+    .expect("normalized legacy assessment rows must be queryable");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                PROCESSING_USER_ID,
+                "succeeded".into(),
+                "pending".into(),
+                false,
+                None
+            ),
+            (
+                RETRY_USER_ID,
+                "succeeded".into(),
+                "retry_wait".into(),
+                true,
+                Some("legacy_error".into())
+            ),
+        ]
     );
 }
 
