@@ -95,81 +95,27 @@ limit 20;
 
 ## Ближайшие фиксы
 
-### 1. Сохранять cleanup provider/model в БД
+### Закрыто: provider/model, recoverable ошибки и ручной режим
 
-Миграция уже содержит поля:
+`CleanupResult` сохраняет фактически использованные `cleanup_provider` и `cleanup_model` в `voice_transcription_jobs`, включая `raw_asr_fallback`.
 
-```text
-cleanup_provider
-cleanup_model
-```
+Для recoverable download/ASR/cleanup failures job получает безопасный error kind (`download_failed`, `asr_failed`, `cleanup_failed`), а пользователь — короткий ответ без деталей Telegram, Groq, response body или внутреннего stack trace. Пустой ASR transcript получает отдельный понятный ответ.
 
-Но `save_voice_result` сейчас их не пишет. Для отладки fallback chain надо знать, какая модель реально чистила текст.
-
-Вариант:
-
-```rust
-pub struct CleanupResult {
-    pub provider: String,
-    pub model: String,
-    pub transcript: CleanTranscript,
-}
-```
-
-Или минимально расширить `CleanTranscript`, если не хочется отдельный тип.
-
-### 2. User-facing ошибки для ASR/cleanup/download
-
-Сейчас validate errors отвечают пользователю, а ошибки download/ASR/cleanup в основном уходят в logs + `voice_transcription_jobs.error`.
-
-Нужно решить policy:
-
-- transient Groq/Telegram error: тихо логировать или отвечать `Не смог расшифровать, API отвалился`;
-- empty ASR transcript: лучше коротко ответить пользователю;
-- cleanup failed but ASR ok: можно отправлять raw ASR с пометкой не надо, если бот только для себя.
-
-Практичный MVP: отвечать пользователю только на понятные recoverable ошибки, внутренние stack details не показывать.
-
-### 3. Manual `/transcribe` reply command
-
-Auto mode уже есть, но ручной режим полезен, если auto-transcribe начнёт шуметь.
-
-Правило:
-
-```text
-/transcribe reply на voice/audio -> расшифровать reply message
-```
-
-Не нужно делать свободный аргумент с message id на первом проходе.
+`/transcribe` работает reply-командой для `voice`, `audio` и `video_note`. Она доступна при `VOICE_TRANSCRIPTION_ENABLED=true`, даже когда `VOICE_AUTO_TRANSCRIBE=false`; свободный аргумент с ID сообщения не поддерживается. Повторный вызов не создаёт второй job благодаря существующему dedup по `(chat_id, message_id)`.
 
 ### 4. `video_note` без `ffmpeg` — выполнено
 
 Groq ASR принимает MP4 напрямую, поэтому кружок скачивается во временный файл и отправляется в существующий multipart ASR request с MIME `video/mp4`. `TempPath` удаляется после ASR, исходник на сервере не хранится, а в `voice_transcription_jobs` сохраняется только audit-результат с `media_kind=video_note`.
 
-### 5. Тесты, которых не хватает
+### Закрыто: ключевые unit-тесты voice
 
-Уже есть тесты для:
+Покрыты HTML/expandable escaping, short transcript, fallback без глав и нормализация терминов, а также:
 
-- HTML escaping;
-- expandable blockquote escaping;
-- short transcript render;
-- cleanup fallback на отсутствие глав;
-- normalize terms.
-
-Добавить:
-
-```text
-voice::render chapter title has no timestamp
-voice::render long chapters produce MessageAndFile when over SAFE_TEXT_LIMIT
-voice::cleanup parses valid chapter JSON
-voice::cleanup invalid JSON falls back to plain text
-voice::types video_note has mp4 MIME type for ASR upload
-voice::download accepts video_note as mp4 media
-voice::download keeps duration and size limits for video_note
-voice::download rejects too long voice
-voice::download rejects too large voice
-voice::asr parses Groq verbose_json with segments
-```
+- JSON cleanup с главами и fallback при невалидном JSON;
+- отсутствие timestamp в заголовках глав;
+- длинные главы с `MessageAndFile` fallback;
+- `video_note` с MIME `video/mp4` и лимитами duration/file size;
+- Groq `verbose_json` и multipart request с segments.
 
 ## Остаточные риски
 

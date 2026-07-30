@@ -342,7 +342,6 @@ impl Config {
             validate_llm_provider_model(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
 
             if self.voice_transcription_enabled
-                && self.voice_auto_transcribe
                 && let Some(provider) = self.voice_cleanup_provider.as_deref()
             {
                 validate_llm_provider_secret(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
@@ -372,7 +371,7 @@ impl Config {
             }
         }
 
-        if self.voice_transcription_enabled && self.voice_auto_transcribe {
+        if self.voice_transcription_enabled {
             validate_voice_asr_secret(&mut errors, self);
         }
 
@@ -535,7 +534,7 @@ impl Config {
                 },
             ));
         }
-        if self.voice_transcription_enabled && self.voice_auto_transcribe {
+        if self.voice_transcription_enabled {
             routes.push((
                 "voice_cleanup",
                 RouteRequirements {
