@@ -1,5 +1,5 @@
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::features::jobs::claim::CasResult;
 use crate::features::jobs::policy::{ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE};
@@ -37,13 +37,26 @@ pub async fn enqueue_new_user_audit_job(
     params: NewUserAuditJobParams<'_>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
+    enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Обновляет ревизию снимка и upsert-ит job в уже открытой транзакции.
+///
+/// Авторитетный baseline вызывает это вместе с сохранением аудита, поэтому
+/// materializer не может увидеть новый baseline без соответствующего job.
+pub async fn enqueue_new_user_audit_job_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    params: NewUserAuditJobParams<'_>,
+) -> anyhow::Result<()> {
     sqlx::query(
         "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = $3, unified_audit_generation = unified_audit_generation + 1 where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(params.chat_id)
     .bind(params.telegram_user_id)
     .bind(params.snapshot_hash)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         r#"
@@ -68,9 +81,8 @@ pub async fn enqueue_new_user_audit_job(
     .bind(params.input_json)
     .bind(params.avatar_file_id)
     .bind(params.avatar_file_unique_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 

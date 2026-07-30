@@ -1,9 +1,16 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value, json};
-use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
-use crate::text::{has_mixed_script_homoglyphs, normalize_cyrillic_homoglyphs};
+use crate::{
+    features::new_user_audit::{
+        prompt::PROMPT_VERSION,
+        repo::{NewUserAuditJobParams, enqueue_new_user_audit_job_in_transaction},
+    },
+    text::{has_mixed_script_homoglyphs, normalize_cyrillic_homoglyphs},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct NewUserAnalysisConfig {
@@ -318,6 +325,54 @@ pub async fn analyze_new_user_profile_with_config(
         "new user spam risk analyzed"
     );
     save_audit(pool, &features, &risk, &config).await
+}
+
+/// Сохраняет authoritative baseline, ревизию снимка и unified-audit job одной
+/// транзакцией. В отличие от shadow-пути, между baseline и job нет окна, в
+/// котором материализатор может увидеть несогласованное состояние.
+pub(crate) async fn analyze_new_user_profile_and_enqueue_authoritative(
+    pool: &PgPool,
+    chat_id: i64,
+    telegram_user_id: i64,
+) -> anyhow::Result<()> {
+    let Some(features) = load_features(pool, chat_id, telegram_user_id).await? else {
+        return Ok(());
+    };
+    let config = NewUserAnalysisConfig::default();
+    let is_old_active_user = features.message_count >= config.old_user_message_threshold;
+    let risk = analyze_risk(&features, &config, is_old_active_user);
+    let input_json = project_unified_user_audit_snapshot(&features, &risk);
+    let material_revision = project_unified_user_audit_material_revision(&features);
+    let snapshot_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&material_revision)?)
+    );
+
+    let mut tx = pool.begin().await?;
+    save_audit_in_transaction(&mut tx, &features, &risk, &config).await?;
+    enqueue_new_user_audit_job_in_transaction(
+        &mut tx,
+        NewUserAuditJobParams {
+            chat_id,
+            telegram_user_id,
+            snapshot_hash: &snapshot_hash,
+            prompt_version: PROMPT_VERSION,
+            input_json: &input_json,
+            avatar_file_id: features.profile_photo_file_id.as_deref(),
+            avatar_file_unique_id: features.profile_photo_file_unique_id.as_deref(),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        chat_id,
+        telegram_user_id,
+        risk_score = risk.score,
+        risk_level = %risk.level,
+        "authoritative new user audit baseline and job saved"
+    );
+    Ok(())
 }
 
 /// Возвращает канонический безопасный снимок для unified audit.
@@ -1556,6 +1611,18 @@ async fn save_audit(
     risk: &RiskAnalysis,
     config: &NewUserAnalysisConfig,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    save_audit_in_transaction(&mut tx, features, risk, config).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn save_audit_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    features: &NewUserFeatures,
+    risk: &RiskAnalysis,
+    config: &NewUserAnalysisConfig,
+) -> anyhow::Result<()> {
     let username_stats = username_stats(features.username.as_deref());
     let profile_photo_dc = best_effort_profile_photo_dc(features.profile_photo_file_id.as_deref());
     let first_message_len = features.first_message_text.as_deref().map(char_count_i32);
@@ -1768,7 +1835,7 @@ async fn save_audit(
         updates.push("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || telegram_new_user_profile_audits.risk_avatar_signals");
     }
 
-    query.build().execute(pool).await?;
+    query.build().execute(&mut **tx).await?;
 
     Ok(())
 }

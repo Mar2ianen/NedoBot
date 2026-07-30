@@ -14,7 +14,10 @@ use crate::{
     features::{
         avatar_analysis::service::enqueue_current_avatar_analysis,
         first_message_spam::enqueue_first_message_spam_analysis,
-        new_user_analysis::{analyze_new_user_profile, load_unified_user_audit_snapshot},
+        new_user_analysis::{
+            analyze_new_user_profile, analyze_new_user_profile_and_enqueue_authoritative,
+            load_unified_user_audit_snapshot,
+        },
         new_user_audit::{
             prompt::PROMPT_VERSION,
             repo::{NewUserAuditJobParams, enqueue_new_user_audit_job},
@@ -155,10 +158,10 @@ async fn process_refreshed_profile(
     job: ProfileRefreshJob,
 ) {
     if config.new_user_audit_authoritative_enabled {
-        if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
-            tracing::warn!(%err, user_id = job.user_id, "failed to analyze authoritative unified audit baseline");
-        } else {
-            enqueue_unified_new_user_audit(pool, job).await;
+        if let Err(err) =
+            analyze_new_user_profile_and_enqueue_authoritative(pool, job.chat_id, job.user_id).await
+        {
+            tracing::warn!(%err, user_id = job.user_id, "failed to save authoritative unified audit baseline and job");
         }
         return;
     }
