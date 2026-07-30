@@ -109,7 +109,7 @@ async fn materialize_stored_assessment(
         .assessment_json
         .as_ref()
         .context("materialization replay requires stored assessment")?;
-    let assessment = NewUserAuditAssessment::parse(&serde_json::to_string(assessment_json)?)?;
+    let assessment = parse_stored_assessment(job, assessment_json)?;
     let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
     let first_message_context =
         load_first_message_score_context(pool, config, job, &assessment).await?;
@@ -167,9 +167,7 @@ async fn generate_and_finalize(
         );
     }
     let prompt = build_input(&input_json)?;
-    let has_first_message_input = input_json["text"]["first_message_preview"]
-        .as_str()
-        .is_some_and(|text| !text.trim().is_empty());
+    let has_first_message_input = has_first_message_input(&input_json);
     let output_validator = move |output: &str| {
         NewUserAuditAssessment::parse_for_modalities(
             output,
@@ -233,6 +231,28 @@ async fn generate_and_finalize(
         );
     }
     Ok(())
+}
+
+/// Валидирует сохранённый результат в контексте канонического снимка job.
+///
+/// Аватар считаем доступным консервативно: после успешной генерации Telegram
+/// может удалить file reference, но это не должно делать ранее сохранённое
+/// наблюдение невалидным при replay.
+fn parse_stored_assessment(
+    job: &NewUserAuditJob,
+    assessment_json: &Value,
+) -> anyhow::Result<NewUserAuditAssessment> {
+    NewUserAuditAssessment::parse_for_modalities(
+        &serde_json::to_string(assessment_json)?,
+        true,
+        has_first_message_input(&job.input_json),
+    )
+}
+
+fn has_first_message_input(input_json: &Value) -> bool {
+    input_json["text"]["first_message_preview"]
+        .as_str()
+        .is_some_and(|text| !text.trim().is_empty())
 }
 
 async fn load_first_message_score_context(
@@ -378,5 +398,74 @@ fn classify_audit_failure(error: &anyhow::Error) -> AuditFailure {
         None => AuditFailure::Terminal {
             error_kind: "validation_failed",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn job_with_input(input_json: Value) -> NewUserAuditJob {
+        NewUserAuditJob {
+            id: 1,
+            chat_id: 1,
+            telegram_user_id: 1,
+            snapshot_hash: "snapshot".to_string(),
+            prompt_version: "prompt".to_string(),
+            input_json,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            assessment_json: None,
+            attempts: 1,
+            is_materialization_replay: true,
+        }
+    }
+
+    fn assessment_without_first_message() -> Value {
+        json!({
+            "avatar_observation": null,
+            "first_message_assessment": null,
+            "profile_assessment": {
+                "risk_patterns": ["no_material_risk_pattern"],
+                "evidence": [],
+                "contradictions": ["Нет независимых признаков."],
+                "review_priority": "low",
+                "confidence": 0.5,
+                "summary": "Оснований для проверки нет."
+            }
+        })
+    }
+
+    #[test]
+    fn stored_replay_requires_first_message_assessment_when_job_input_has_first_message() {
+        let job = job_with_input(json!({
+            "text": { "first_message_preview": "Здравствуйте, предлагаю заработок" }
+        }));
+        let error = parse_stored_assessment(&job, &assessment_without_first_message())
+            .expect_err("stored replay must honor first-message input")
+            .to_string();
+
+        assert!(error.contains("first_message_assessment must be present"));
+    }
+
+    #[test]
+    fn stored_replay_keeps_avatar_validation_conservative() {
+        let job = job_with_input(json!({ "text": { "first_message_preview": null } }));
+        let mut assessment = assessment_without_first_message();
+        assessment["avatar_observation"] = json!({
+            "primary_class": "ordinary_personal",
+            "personal_photo_probability": 0.9,
+            "secondary_classes": [],
+            "face_visibility": "clear",
+            "adult_level": "none",
+            "visual_motifs": ["лицо"],
+            "description": "Фотография человека.",
+            "confidence": 0.8
+        });
+
+        parse_stored_assessment(&job, &assessment)
+            .expect("stored avatar observation must remain valid during replay");
     }
 }
