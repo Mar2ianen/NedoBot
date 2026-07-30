@@ -31,6 +31,7 @@ pub struct NewUserAuditJob {
     pub is_materialization_replay: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct NewUserAuditJobParams<'a> {
     pub chat_id: i64,
     pub telegram_user_id: i64,
@@ -49,26 +50,19 @@ pub async fn enqueue_new_user_audit_job(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
+    record_new_user_audit_snapshot_in_transaction(&mut tx, params).await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Обновляет ревизию снимка и upsert-ит job в уже открытой транзакции.
+/// Upsert-ит job в уже открытой транзакции.
 ///
-/// Авторитетный baseline вызывает это вместе с сохранением аудита, поэтому
-/// materializer не может увидеть новый baseline без соответствующего job.
+/// Любой authoritative путь берёт строки в одном порядке: `job → audit → review`.
+/// Ревизия снимка записывается отдельным шагом после сохранения audit baseline.
 pub async fn enqueue_new_user_audit_job_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     params: NewUserAuditJobParams<'_>,
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = $3, unified_audit_generation = unified_audit_generation + 1 where chat_id = $1 and telegram_user_id = $2",
-    )
-    .bind(params.chat_id)
-    .bind(params.telegram_user_id)
-    .bind(params.snapshot_hash)
-    .execute(&mut **tx)
-    .await?;
     sqlx::query(
         r#"
         insert into new_user_audit_jobs
@@ -93,6 +87,22 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
     .bind(params.avatar_file_id)
     .bind(params.avatar_file_unique_id)
     .bind(CURRENT_MATERIALIZATION_VERSION)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Фиксирует ревизию после job upsert-а и audit baseline, не меняя порядок блокировок.
+pub async fn record_new_user_audit_snapshot_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    params: NewUserAuditJobParams<'_>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = $3, unified_audit_generation = unified_audit_generation + 1 where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(params.chat_id)
+    .bind(params.telegram_user_id)
+    .bind(params.snapshot_hash)
     .execute(&mut **tx)
     .await?;
     Ok(())

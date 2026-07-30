@@ -7,7 +7,10 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use crate::{
     features::new_user_audit::{
         prompt::PROMPT_VERSION,
-        repo::{NewUserAuditJobParams, enqueue_new_user_audit_job_in_transaction},
+        repo::{
+            NewUserAuditJobParams, enqueue_new_user_audit_job_in_transaction,
+            record_new_user_audit_snapshot_in_transaction,
+        },
     },
     text::{has_mixed_script_homoglyphs, normalize_cyrillic_homoglyphs},
 };
@@ -348,21 +351,20 @@ pub(crate) async fn analyze_new_user_profile_and_enqueue_authoritative(
         Sha256::digest(serde_json::to_vec(&material_revision)?)
     );
 
+    let params = NewUserAuditJobParams {
+        chat_id,
+        telegram_user_id,
+        snapshot_hash: &snapshot_hash,
+        prompt_version: PROMPT_VERSION,
+        input_json: &input_json,
+        avatar_file_id: features.profile_photo_file_id.as_deref(),
+        avatar_file_unique_id: features.profile_photo_file_unique_id.as_deref(),
+    };
     let mut tx = pool.begin().await?;
+    // Authoritative transactions consistently lock job, then audit, then review.
+    enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
     save_audit_in_transaction(&mut tx, &features, &risk, &config).await?;
-    enqueue_new_user_audit_job_in_transaction(
-        &mut tx,
-        NewUserAuditJobParams {
-            chat_id,
-            telegram_user_id,
-            snapshot_hash: &snapshot_hash,
-            prompt_version: PROMPT_VERSION,
-            input_json: &input_json,
-            avatar_file_id: features.profile_photo_file_id.as_deref(),
-            avatar_file_unique_id: features.profile_photo_file_unique_id.as_deref(),
-        },
-    )
-    .await?;
+    record_new_user_audit_snapshot_in_transaction(&mut tx, params).await?;
     tx.commit().await?;
 
     tracing::info!(
