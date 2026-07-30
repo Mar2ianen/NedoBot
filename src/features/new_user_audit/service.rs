@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use teloxide::prelude::Bot;
@@ -8,9 +9,10 @@ use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
-    NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
+    NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job_with_materialization,
     finalize_authoritative_new_user_audit_job, finalize_new_user_audit_job,
-    mark_new_user_audit_failed, mark_new_user_audit_retry,
+    mark_new_user_audit_failed, mark_new_user_audit_materialization_stale,
+    mark_new_user_audit_retry, materialize_authoritative_new_user_audit_job,
 };
 use crate::features::new_user_audit::scoring::{FirstMessageScoreContext, score_assessment};
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
@@ -27,7 +29,12 @@ pub async fn process_next_new_user_audit_job(
     pool: &PgPool,
     config: &Config,
 ) -> anyhow::Result<bool> {
-    let Some(job) = claim_next_new_user_audit_job(pool).await? else {
+    let Some(job) = claim_next_new_user_audit_job_with_materialization(
+        pool,
+        config.new_user_audit_authoritative_enabled,
+    )
+    .await?
+    else {
         return Ok(false);
     };
 
@@ -36,10 +43,25 @@ pub async fn process_next_new_user_audit_job(
 }
 
 async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
-    let result = generate_and_finalize(bot, pool, config, job).await;
+    let result = if job.is_materialization_replay {
+        materialize_stored_assessment(pool, config, job).await
+    } else {
+        generate_and_finalize(bot, pool, config, job).await
+    };
     let Err(error) = result else { return };
 
     let failure = classify_audit_failure(&error);
+    if job.is_materialization_replay && matches!(failure, AuditFailure::Terminal { .. }) {
+        let AuditFailure::Terminal { error_kind } = failure else {
+            unreachable!("terminal failure was matched above")
+        };
+        log_materialization_failure(
+            mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
+            job,
+            error_kind,
+        );
+        return;
+    }
     let result = match failure {
         AuditFailure::Retry { error_kind } => {
             mark_new_user_audit_retry(pool, job, error_kind, None).await
@@ -75,6 +97,57 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAud
                 "failed to persist new user audit failure state"
             );
         }
+    }
+}
+
+async fn materialize_stored_assessment(
+    pool: &PgPool,
+    config: &Config,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<()> {
+    let assessment_json = job
+        .assessment_json
+        .as_ref()
+        .context("materialization replay requires stored assessment")?;
+    let assessment = NewUserAuditAssessment::parse(&serde_json::to_string(assessment_json)?)?;
+    let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
+    let first_message_context =
+        load_first_message_score_context(pool, config, job, &assessment).await?;
+    let components = score_assessment(
+        baseline_score,
+        baseline_signals,
+        &assessment,
+        first_message_context,
+    );
+    let finalized = materialize_authoritative_new_user_audit_job(pool, job, &components).await?;
+    if finalized == CasResult::LeaseLost {
+        tracing::warn!(
+            job_id = job.id,
+            attempts = job.attempts,
+            "new user audit materialization lease was reclaimed"
+        );
+    }
+    Ok(())
+}
+
+fn log_materialization_failure(
+    result: anyhow::Result<CasResult>,
+    job: &NewUserAuditJob,
+    error_kind: &str,
+) {
+    match result {
+        Ok(CasResult::Applied) => tracing::warn!(
+            job_id = job.id,
+            error_kind,
+            "stored audit assessment was not materialized"
+        ),
+        Ok(CasResult::LeaseLost) => {
+            tracing::warn!(job_id = job.id, "stale materialization failure ignored")
+        }
+        Err(_) => tracing::warn!(
+            job_id = job.id,
+            "failed to persist materialization failure state"
+        ),
     }
 }
 
