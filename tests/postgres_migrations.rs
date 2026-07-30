@@ -1,6 +1,7 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpListener,
+    sync::mpsc::sync_channel,
 };
 
 use chrono::{Duration, TimeZone, Utc};
@@ -69,6 +70,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_new_user_audit_job_lifecycle(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
+    assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
@@ -967,6 +969,104 @@ async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(poo
             .expect_err("lowered-risk payload must not open a Telegram connection")
             .kind(),
         ErrorKind::WouldBlock
+    );
+}
+
+async fn assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_007;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale failure chat user must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Stale failure')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale failure profile must exist");
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[{\"label\": \"single_message_account\"}]'::jsonb)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale failure audit must exist");
+    let review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("stale failure review creation must succeed")
+        .expect("stale failure review must be claimed");
+    let review_id = review.id;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("stale failure listener must bind");
+    let address = listener
+        .local_addr()
+        .expect("stale failure listener must have an address");
+    let (request_received, request_received_wait) = sync_channel(1);
+    let (send_response, send_response_wait) = sync_channel(1);
+    let response_task = std::thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("stale failure listener must accept the request");
+        let mut request = [0; 1_024];
+        let _ = stream.read(&mut request);
+        request_received
+            .send(())
+            .expect("stale failure request receipt must be reported");
+        send_response_wait
+            .recv()
+            .expect("stale failure response must be released");
+        stream
+            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("stale failure response must be written");
+    });
+    let bot = Bot::new("test-token").set_api_url(
+        format!("http://{address}/")
+            .parse()
+            .expect("stale failure Telegram API URL must parse"),
+    );
+    let delivery_pool = pool.clone();
+    let delivery = tokio::spawn(async move { send_review(&bot, &delivery_pool, &review).await });
+    tokio::task::spawn_blocking(move || {
+        request_received_wait
+            .recv()
+            .expect("stale failure request must reach Telegram")
+    })
+    .await
+    .expect("stale failure request wait must not panic");
+
+    query("update spam_review_requests set risk_signals = '[{\"label\": \"personal_channel_attached\"}]'::jsonb where id = $1")
+        .bind(review_id)
+        .execute(pool)
+        .await
+        .expect("review payload must change while the HTTP request is in flight");
+    send_response
+        .send(())
+        .expect("stale failure response must be released");
+    assert!(
+        delivery
+            .await
+            .expect("stale failure delivery task must not panic")
+            .is_err(),
+        "HTTP 500 must reach the failure finalizer"
+    );
+    response_task
+        .join()
+        .expect("stale failure response task must complete");
+
+    let state: (String, i32, Option<String>, serde_json::Value) = query_as(
+        "select notification_status, notification_consecutive_failures, notification_error_kind, risk_signals from spam_review_requests where id = $1",
+    )
+    .bind(review_id)
+    .fetch_one(pool)
+    .await
+    .expect("stale failure state must be readable");
+    assert_eq!(state.0, "processing");
+    assert_eq!(state.1, 0);
+    assert_eq!(state.2, None);
+    assert_eq!(
+        state.3,
+        serde_json::json!([{"label": "personal_channel_attached"}])
     );
 }
 
