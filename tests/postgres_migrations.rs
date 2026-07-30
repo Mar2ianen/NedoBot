@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{Duration, TimeZone, Utc};
-use sqlx::{PgPool, query, query_as, query_scalar};
+use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
@@ -76,6 +76,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
     assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
+    assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
+    assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(&database_url).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
     assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
     assert_authoritative_generation_is_durable_before_materialization(&pool).await;
@@ -952,6 +954,167 @@ async fn assert_new_user_audit_generation_cas_requires_live_lease_and_current_ve
         finalized_version,
         tg_ai_bot_teloxide::features::new_user_audit::repo::CURRENT_MATERIALIZATION_VERSION
     );
+}
+
+async fn assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(
+    pool: &PgPool,
+) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_110;
+    let input = serde_json::json!({"schema_version": "version-bump-fixture"});
+    let params = NewUserAuditJobParams {
+        chat_id: CHAT_ID,
+        telegram_user_id: USER_ID,
+        snapshot_hash: "version-bump-snapshot",
+        prompt_version: "prompt-v1",
+        input_json: &input,
+        avatar_file_id: None,
+        avatar_file_unique_id: None,
+    };
+
+    enqueue_new_user_audit_job(pool, params)
+        .await
+        .expect("version bump fixture must be enqueued");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"fixture\": \"assessment\"}'::jsonb, materialization_version = 'obsolete-version', materialization_status = 'succeeded', materialization_attempts = 5, materialization_next_attempt_at = now() + interval '1 day', materialization_processing_started_at = now(), materialization_lease_expires_at = now() + interval '1 hour', materialization_error_kind = 'obsolete_failure', materialized_at = now() where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("completed obsolete materialization fixture must be stored");
+
+    enqueue_new_user_audit_job(pool, params)
+        .await
+        .expect("conflicting enqueue must reopen obsolete materialization");
+    let state: (String, i32, bool, bool, bool, Option<String>, bool) = query_as(
+        "select materialization_status, materialization_attempts, materialization_next_attempt_at <= now(), materialization_processing_started_at is null, materialization_lease_expires_at is null, materialization_error_kind, materialized_at is null from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("reopened materialization state must be queryable");
+    assert_eq!(
+        state,
+        ("pending".into(), 0, true, true, true, None, true),
+        "a materialization version bump must reset the completed replay lifecycle"
+    );
+}
+
+async fn assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(
+    database_url: &str,
+) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_111;
+
+    let retry_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .expect("retry test database pool must connect");
+    let input = serde_json::json!({"schema_version": "generation-retry-fixture"});
+    let assessment = serde_json::json!({"fixture": "retry-assessment"});
+
+    enqueue_new_user_audit_job(
+        &retry_pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "generation-retry-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("generation retry fixture must be enqueued");
+    let claim = claim_next_new_user_audit_job(&retry_pool)
+        .await
+        .expect("generation retry claim must execute")
+        .expect("generation retry job must be claimable");
+
+    query("drop trigger if exists new_user_audit_generation_retry_timeout on new_user_audit_jobs")
+        .execute(&retry_pool)
+        .await
+        .expect("previous retry trigger must be removable");
+    query("drop function if exists new_user_audit_generation_retry_timeout()")
+        .execute(&retry_pool)
+        .await
+        .expect("previous retry trigger function must be removable");
+    query("drop sequence if exists new_user_audit_generation_retry_calls")
+        .execute(&retry_pool)
+        .await
+        .expect("previous retry sequence must be removable");
+    query("create sequence new_user_audit_generation_retry_calls")
+        .execute(&retry_pool)
+        .await
+        .expect("retry sequence must be created");
+    query(
+        "create function new_user_audit_generation_retry_timeout() returns trigger language plpgsql as $$ begin perform nextval('new_user_audit_generation_retry_calls'); perform pg_sleep(0.2); return new; end; $$",
+    )
+    .execute(&retry_pool)
+    .await
+    .expect("retry trigger function must be created");
+    query(
+        "create trigger new_user_audit_generation_retry_timeout before update on new_user_audit_jobs for each row execute function new_user_audit_generation_retry_timeout()",
+    )
+    .execute(&retry_pool)
+    .await
+    .expect("retry trigger must be created");
+
+    let mut connection = retry_pool
+        .acquire()
+        .await
+        .expect("retry pool connection must be acquired");
+    query("set statement_timeout = '50ms'")
+        .execute(&mut *connection)
+        .await
+        .expect("retry connection timeout must be configured");
+    drop(connection);
+
+    let error = finalize_new_user_audit_job(
+        &retry_pool,
+        &claim,
+        tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+            assessment_json: &assessment,
+            provider: "fixture",
+            model: "fixture",
+        },
+    )
+    .await
+    .expect_err("cancelled finalization must exhaust its local transient retries");
+    assert!(
+        error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|error| error.as_database_error())
+            .and_then(|error| error.code())
+            .is_some_and(|code| code.as_ref() == "57014"),
+        "expected PostgreSQL query-cancel SQLSTATE after transient retries: {error:#}"
+    );
+    let retry_attempts: i64 =
+        query_scalar("select last_value from new_user_audit_generation_retry_calls")
+            .fetch_one(&retry_pool)
+            .await
+            .expect("retry sequence must be readable");
+    assert_eq!(
+        retry_attempts, 4,
+        "initial attempt plus three local retries"
+    );
+
+    query("drop trigger new_user_audit_generation_retry_timeout on new_user_audit_jobs")
+        .execute(&retry_pool)
+        .await
+        .expect("retry trigger must be removed");
+    query("drop function new_user_audit_generation_retry_timeout()")
+        .execute(&retry_pool)
+        .await
+        .expect("retry trigger function must be removed");
+    query("drop sequence new_user_audit_generation_retry_calls")
+        .execute(&retry_pool)
+        .await
+        .expect("retry sequence must be removed");
 }
 
 async fn assert_unified_enqueue_and_finalizer_share_lock_order(pool: &PgPool) {

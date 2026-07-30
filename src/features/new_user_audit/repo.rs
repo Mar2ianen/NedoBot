@@ -84,6 +84,34 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
             avatar_file_id = excluded.avatar_file_id,
             avatar_file_unique_id = excluded.avatar_file_unique_id,
             materialization_version = $8,
+            materialization_status = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then 'pending'
+                else new_user_audit_jobs.materialization_status
+            end,
+            materialization_attempts = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then 0
+                else new_user_audit_jobs.materialization_attempts
+            end,
+            materialization_next_attempt_at = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then now()
+                else new_user_audit_jobs.materialization_next_attempt_at
+            end,
+            materialization_processing_started_at = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                else new_user_audit_jobs.materialization_processing_started_at
+            end,
+            materialization_lease_expires_at = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                else new_user_audit_jobs.materialization_lease_expires_at
+            end,
+            materialization_error_kind = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                else new_user_audit_jobs.materialization_error_kind
+            end,
+            materialized_at = case
+                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                else new_user_audit_jobs.materialized_at
+            end,
             updated_at = now()
         "#,
     )
@@ -281,10 +309,25 @@ fn should_retry_generation_finalization(retry: u32, is_transient_sql_error: bool
 }
 
 fn is_transient_generation_finalization_error(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|database_error| database_error.code())
-        .is_some_and(|code| matches!(code.as_ref(), "40001" | "40P01" | "55P03" | "57014"))
+    match error {
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(database_error) => database_error
+            .code()
+            .is_some_and(|code| is_transient_postgres_sqlstate(code.as_ref())),
+        _ => false,
+    }
+}
+
+fn is_transient_postgres_sqlstate(code: &str) -> bool {
+    matches!(
+        code,
+        // Transaction conflicts and explicitly cancelled/locked statements.
+        "40001" | "40P01" | "55P03" | "57014"
+            // Connection failures while PostgreSQL is unavailable or restarting.
+            | "08000" | "08001" | "08003" | "08004" | "08006" | "08007"
+            // PostgreSQL shutdown/restart and temporary connection-capacity pressure.
+            | "57P01" | "57P02" | "57P03" | "53300"
+    )
 }
 
 /// Применяет current-score к baseline только пока canonical snapshot не изменился.
@@ -509,5 +552,35 @@ mod tests {
             true
         ));
         assert!(!should_retry_generation_finalization(0, false));
+    }
+
+    #[test]
+    fn transient_generation_finalization_recognizes_sqlx_transport_errors() {
+        assert!(is_transient_generation_finalization_error(
+            &sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset),)
+        ));
+        assert!(is_transient_generation_finalization_error(
+            &sqlx::Error::Tls(Box::new(std::io::Error::from(
+                std::io::ErrorKind::ConnectionAborted,
+            )),)
+        ));
+        assert!(is_transient_generation_finalization_error(
+            &sqlx::Error::PoolTimedOut
+        ));
+        assert!(!is_transient_generation_finalization_error(
+            &sqlx::Error::PoolClosed
+        ));
+    }
+
+    #[test]
+    fn transient_postgres_sqlstates_are_limited_to_retryable_conditions() {
+        for code in [
+            "40001", "40P01", "55P03", "57014", "08006", "57P01", "53300",
+        ] {
+            assert!(is_transient_postgres_sqlstate(code), "{code}");
+        }
+        for code in ["23505", "42501", "42601", "08P01"] {
+            assert!(!is_transient_postgres_sqlstate(code), "{code}");
+        }
     }
 }
