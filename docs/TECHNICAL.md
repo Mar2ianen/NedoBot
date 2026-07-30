@@ -327,7 +327,8 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий тестовый деплой сделан на `vps-153`:
+Текущий deploy unified authoritative audit сделан на `vps-153`. Release binary соответствует commit [`849b632`](https://github.com/Mar2ianen/NedoBot/commit/849b632); immutable tag [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit) фиксирует этот boundary. Последующие commits разрабатываются в `dev` и не считаются deployed до отдельного merge/review.
+
 
 - код: `/opt/tg-ai-bot-teloxide`
 - Postgres: Podman container `tg-ai-bot-postgres`
