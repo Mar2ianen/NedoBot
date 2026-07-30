@@ -15,6 +15,8 @@ pub enum Command {
     FormatTest(String),
     #[command(description = "показать последние заметки памяти")]
     Memory,
+    #[command(description = "расшифровать voice, audio или кружок в reply")]
+    Transcribe,
     #[command(description = "спросить помощника по истории чата; /ask <вопрос>")]
     Ask(String),
     #[command(description = "добавить общую заметку чата; /chat_note <текст>")]

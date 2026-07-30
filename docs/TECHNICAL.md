@@ -276,8 +276,8 @@ FIRST_COMMENT_MAX_IMAGE_MB=10
 
 Правила voice-конфига:
 
-- `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline.
-- `VOICE_AUTO_TRANSCRIBE=false` оставляет контур выключенным для обычных сообщений; ручной `/transcribe` пока не реализован.
+- `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline, включая `/transcribe`.
+- `VOICE_AUTO_TRANSCRIBE=false` выключает обработку обычных сообщений, но оставляет доступной ручную `/transcribe` reply-команду.
 - `VOICE_ASR_PROVIDER=groq` - сейчас единственный поддержанный ASR provider.
 - `VOICE_ASR_MODEL=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
 - `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
@@ -327,7 +327,8 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий тестовый деплой сделан на `vps-153`:
+Текущий deploy unified authoritative audit сделан на `vps-153`. Release binary соответствует commit [`849b632`](https://github.com/Mar2ianen/NedoBot/commit/849b632); immutable tag [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit) фиксирует этот boundary. Последующие commits разрабатываются в `dev` и не считаются deployed до отдельного merge/review.
+
 
 - код: `/opt/tg-ai-bot-teloxide`
 - Postgres: Podman container `tg-ai-bot-postgres`
@@ -523,7 +524,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 
 Порядок обработки:
 
-1. Проверить `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
+1. Проверить `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE` для автоматического режима; `/transcribe` требует только `VOICE_TRANSCRIPTION_ENABLED`.
 2. Отфильтровать чужие чаты, ботов, команды и automatic forwards.
 3. Определить `VoiceMedia` из `voice`, `audio` или `video_note`.
 4. Сохранить исходное Telegram message в `telegram_messages`.
@@ -531,7 +532,8 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 6. Проверить duration/file size до скачивания.
 7. Скачать файл через Telegram `getFile` во временный файл.
 8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
-9. Сохранить raw ASR text, segments и raw JSON.
+9. Сразу после preflight отправить reply `Расшифровка…`; для обычного результата заменить его через `editMessageText`, а для Rich/file варианта обновить его статусом и отправить полный payload отдельным сообщением.
+10. Сохранить raw ASR text, segments и raw JSON.
 10. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
 11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
 12. Собрать Telegram HTML через `telegram::html`.

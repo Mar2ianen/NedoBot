@@ -420,6 +420,43 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_parses_valid_chapter_json() {
+        let clean = parse_cleanup_json(
+            r#"{
+                "mode": "chapters",
+                "text": "Сначала обсудили драйверы, затем игры.",
+                "chapters": [{
+                    "title": "Драйверы",
+                    "start": "0:05",
+                    "end": "1:10",
+                    "text": "Обсудили новый драйвер."
+                }],
+                "short_summary": "Разговор о драйверах."
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(clean.mode, TranscriptRenderMode::Chapters);
+        assert_eq!(clean.chapters.len(), 1);
+        assert_eq!(clean.chapters[0].start_sec, 5.0);
+        assert_eq!(clean.chapters[0].end_sec, Some(70.0));
+        assert_eq!(
+            clean.short_summary.as_deref(),
+            Some("Разговор о драйверах.")
+        );
+    }
+
+    #[test]
+    fn invalid_cleanup_json_falls_back_to_plain_asr_text() {
+        assert!(parse_cleanup_json("не JSON").is_err());
+
+        let fallback = plain_cleanup("  Исходная расшифровка.  ");
+        assert_eq!(fallback.mode, TranscriptRenderMode::Short);
+        assert_eq!(fallback.text, "Исходная расшифровка.");
+        assert!(fallback.chapters.is_empty());
+    }
+
+    #[test]
     fn cleanup_rejects_new_numbers_and_excessive_rewrite() {
         let raw = "Gemma 4 31B ".repeat(40);
         let transcript = transcript_with_text(&raw);

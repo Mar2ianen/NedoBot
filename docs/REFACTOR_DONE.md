@@ -166,7 +166,7 @@ having count(*) > 1;
 
 ### Pending comment jobs
 
-Основной pipeline создаёт `post_comment_jobs` до LLM/send. Если LLM, HTML render или Telegram send упали, job может остаться `pending`. Для этого есть `retry_pending_comments`, но на будущее лучше вынести общий `mark_post_comment_failed` в `features/first_comment/repo.rs` и использовать его и в live pipeline, и в retry tool.
+Закрыто unified audit: live pipeline использует общий lifecycle в `features/first_comment/repo.rs`. Ошибки до отправки и подтверждённые Telegram-ошибки переводят job в `retry_wait` с bounded backoff либо в terminal `failed`; lease-safe CAS не даёт воркеру перезаписать более новое состояние. Неопределённый результат отправки переводится в `delivery_unknown` и требует явной reconciliation, чтобы автоматический retry не создал дубликат комментария.
 
 ### Reaction metrics
 

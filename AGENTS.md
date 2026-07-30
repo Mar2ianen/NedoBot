@@ -187,6 +187,13 @@ Test fixtures: каждая тестовая модуль определяет `
 
 VPS `vps-153`, systemd service `tg-ai-bot-teloxide`, Postgres в Podman `tg-ai-bot-postgres`. Проверенные общие команды и ограничения деплоя описаны в `docs/TECHNICAL.md`; `docs/LOCAL_WORKFLOW.md` остаётся локальным, некоммитящимся файлом для machine-specific заметок.
 
+### Ветки между deploy
+
+- `main` — release line. Каждый фактический deploy отмечается immutable annotated tag `deploy-YYYY-MM-DD-<scope>` на точном commit release binary.
+- После deploy вся дальнейшая разработка идёт в `dev`; новый deploy готовится отдельным review/merge из `dev` в `main`.
+- Не считать `HEAD` автоматически задеплоенным: ориентироваться на deployment tag и запись в `docs/TECHNICAL.md`.
+- Первый такой tag: `deploy-2026-07-30-unified-audit` указывает на `849b632`.
+
 ## Стиль кода
 
 ### Контроль потока
