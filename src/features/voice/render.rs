@@ -389,12 +389,41 @@ mod tests {
         };
 
         let rendered = render_transcript(&clean, &config());
-        let RenderedTranscript::RichMessage { html, .. } = rendered else {
+        let RenderedTranscript::RichMessage { html, fallback } = rendered else {
             panic!("long chapters must use a rich message");
         };
 
         assert_eq!(html.matches("<details>").count(), 2);
         assert!(html.contains("Первая &lt;тема&gt;"));
         assert!(!html.contains("<details open>"));
+        assert!(matches!(
+            *fallback,
+            RenderedTranscript::MessageAndFile { .. }
+        ));
+    }
+
+    #[test]
+    fn chapter_title_has_no_timestamp() {
+        let clean = CleanTranscript {
+            mode: TranscriptRenderMode::Chapters,
+            text: "Текст расшифровки длиннее short лимита.".to_string(),
+            chapters: vec![TranscriptChapter {
+                title: "Обсуждение драйверов".to_string(),
+                start_sec: 65.0,
+                end_sec: Some(120.0),
+                text: "Содержимое главы.".to_string(),
+            }],
+            short_summary: None,
+        };
+        let mut config = config();
+        config.voice_short_text_max_chars = 1;
+
+        let RenderedTranscript::Message { html } = render_transcript(&clean, &config) else {
+            panic!("short chapter transcript must fit into a regular message");
+        };
+
+        assert!(html.contains("<b>Обсуждение драйверов</b>"));
+        assert!(!html.contains("1:05"));
+        assert!(!html.contains("2:00"));
     }
 }

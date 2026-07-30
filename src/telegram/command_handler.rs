@@ -14,6 +14,7 @@ use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
 use crate::features::stats::types::{StatsPeriod, StatsRender};
+use crate::features::voice::pipeline::transcribe_reply;
 use crate::state::AppState;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
@@ -75,6 +76,14 @@ pub async fn handle_command(
         }
         Command::Memory => {
             send_memory_notes(&bot, msg.chat.id, pool).await?;
+        }
+        Command::Transcribe => {
+            transcribe_reply(&bot, &msg, &state).await.map_err(|err| {
+                tracing::error!(%err, "manual voice transcription command failed");
+                teloxide::RequestError::Io(std::io::Error::other(
+                    "manual voice transcription failed",
+                ))
+            })?;
         }
         Command::Ask(question) => {
             handle_ask_command(&bot, &msg, &state, &question).await?;
