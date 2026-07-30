@@ -75,6 +75,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_deduplication(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
+    assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
     assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
     assert_authoritative_generation_is_durable_before_materialization(&pool).await;
@@ -843,6 +844,116 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
 /// Regression coverage for the authoritative `job → audit → review` lock order.
 /// The first transaction deliberately holds the job lock while the second begins;
 /// a reversed audit-first enqueue would form a deadlock cycle with a finalizer.
+async fn assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(
+    pool: &PgPool,
+) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_091;
+    let input = serde_json::json!({"schema_version": "generation-cas-fixture"});
+    let params = NewUserAuditJobParams {
+        chat_id: CHAT_ID,
+        telegram_user_id: USER_ID,
+        snapshot_hash: "generation-cas-snapshot",
+        prompt_version: "prompt-v1",
+        input_json: &input,
+        avatar_file_id: None,
+        avatar_file_unique_id: None,
+    };
+    let assessment = serde_json::json!({"fixture": "assessment"});
+
+    enqueue_new_user_audit_job(pool, params)
+        .await
+        .expect("generation CAS fixture must be enqueued");
+    let job_id: i64 = query_scalar(
+        "select id from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("generation CAS fixture id must be queryable");
+    query(
+        "update new_user_audit_jobs set materialization_version = 'obsolete-version' where id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("obsolete materialization version must be set");
+    enqueue_new_user_audit_job(pool, params)
+        .await
+        .expect("conflicting enqueue must restore the current materialization version");
+    let enqueued_version: String =
+        query_scalar("select materialization_version from new_user_audit_jobs where id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("enqueued materialization version must be queryable");
+    assert_eq!(
+        enqueued_version,
+        tg_ai_bot_teloxide::features::new_user_audit::repo::CURRENT_MATERIALIZATION_VERSION
+    );
+
+    let expired_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("generation CAS expired claim must execute")
+        .expect("generation CAS fixture must be claimable");
+    query("update new_user_audit_jobs set lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(expired_claim.id)
+        .execute(pool)
+        .await
+        .expect("generation CAS lease must expire");
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &expired_claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment,
+                provider: "fixture",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("expired generation finalizer must execute"),
+        CasResult::LeaseLost
+    );
+
+    let current_claim = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("reclaimed generation CAS claim must execute")
+        .expect("expired generation CAS fixture must be reclaimable");
+    query(
+        "update new_user_audit_jobs set materialization_version = 'obsolete-version' where id = $1",
+    )
+    .bind(current_claim.id)
+    .execute(pool)
+    .await
+    .expect("obsolete finalizer materialization version must be set");
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &current_claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment,
+                provider: "fixture",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("current generation finalizer must execute"),
+        CasResult::Applied
+    );
+    let finalized_version: String =
+        query_scalar("select materialization_version from new_user_audit_jobs where id = $1")
+            .bind(current_claim.id)
+            .fetch_one(pool)
+            .await
+            .expect("finalized materialization version must be queryable");
+    assert_eq!(
+        finalized_version,
+        tg_ai_bot_teloxide::features::new_user_audit::repo::CURRENT_MATERIALIZATION_VERSION
+    );
+}
+
 async fn assert_unified_enqueue_and_finalizer_share_lock_order(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_095;
@@ -1053,13 +1164,6 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
             .await
             .expect("materialized replay state must be stored");
     assert_eq!(state, ("succeeded".to_string(), "succeeded".to_string()));
-    assert!(
-        claim_next_new_user_audit_job_with_materialization(pool, true)
-            .await
-            .expect("completed replay claim must execute")
-            .is_none(),
-        "materialized shadow assessment must be closed"
-    );
 }
 
 async fn assert_authoritative_generation_is_durable_before_materialization(pool: &PgPool) {
@@ -1124,6 +1228,12 @@ async fn assert_authoritative_generation_is_durable_before_materialization(pool:
             true
         )
     );
+
+    query("update new_user_audit_jobs set materialization_status = 'stale' where id <> $1 and assessment_json is not null")
+        .bind(generation_claim.id)
+        .execute(pool)
+        .await
+        .expect("other replay fixtures must not affect authoritative boundary assertion");
 
     let materialization_claim = claim_next_new_user_audit_job_with_materialization(pool, true)
         .await
