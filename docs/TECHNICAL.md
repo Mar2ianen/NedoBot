@@ -176,6 +176,8 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 `LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют legacy-поведение `LLM_PROVIDER`/моделей. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `avatar_analysis`, `first_message_spam`, `new_user_audit` или `ask`) и игнорирует legacy provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
 
+Целевая топология без Gemini вне комментариев: `/ask` и `new_user_audit` используют Ollama Cloud `minimax-m3`; Gemini-модели остаются только в цепочке `first_comment`. Legacy `.env` также задаёт `ASK_LLM_PROVIDER=ollama` и `ASK_LLM_MODEL=minimax-m3`.
+
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
 
 Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.

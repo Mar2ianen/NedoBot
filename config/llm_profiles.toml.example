@@ -116,6 +116,20 @@ max_output_tokens = 4096
 request_timeout_sec = 120
 thinking = "none"
 
+[models.ollama_minimax]
+provider = "ollama_cloud"
+model = "minimax-m3"
+
+[models.ollama_minimax.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 8192
+request_timeout_sec = 120
+thinking = "none"
+
 [models.groq_cleanup]
 provider = "groq"
 model = "llama-3.3-70b-versatile"
@@ -194,13 +208,13 @@ models = ["groq_cleanup", "ollama_memory"]
 models = ["cerebras_spam", "ollama_memory"]
 
 [routes.new_user_audit]
-models = ["gemini_comment"]
+models = ["ollama_minimax"]
 
 [routes.search_extract]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["gemini_comment", "groq_cleanup"]
+models = ["ollama_minimax", "ollama_memory"]
 
 [routes.legacy_default]
 models = ["ollama_memory"]
