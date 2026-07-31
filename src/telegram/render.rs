@@ -277,7 +277,7 @@ fn telegram_token() -> ResponseResult<String> {
 }
 
 fn io_request_error(error: impl std::fmt::Display) -> teloxide::RequestError {
-    teloxide::RequestError::Io(std::io::Error::other(error.to_string()))
+    teloxide::RequestError::Io(std::io::Error::other(error.to_string()).into())
 }
 
 fn disabled_link_preview() -> LinkPreviewOptions {

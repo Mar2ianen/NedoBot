@@ -397,7 +397,7 @@ async fn send_regular_transcript(
                 .await?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
-                file_id: sent.document().map(|document| document.file.id.clone()),
+                file_id: sent.document().map(|document| document.file.id.to_string()),
             })
         }
         RenderedTranscript::RichMessage { .. } => {

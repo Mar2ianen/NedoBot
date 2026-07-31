@@ -229,7 +229,7 @@ fn member_status(kind: &ChatMemberKind) -> (&'static str, bool, bool) {
     match kind {
         ChatMemberKind::Owner(_) => ("creator", true, true),
         ChatMemberKind::Administrator(_) => ("administrator", true, true),
-        ChatMemberKind::Member => ("member", false, true),
+        ChatMemberKind::Member(_) => ("member", false, true),
         ChatMemberKind::Restricted(restricted) => ("restricted", false, restricted.is_member),
         ChatMemberKind::Left => ("left", false, false),
         ChatMemberKind::Banned(_) => ("banned", false, false),

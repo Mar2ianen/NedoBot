@@ -4,7 +4,11 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use teloxide::{net::Download, prelude::*, types::MessageId};
+use teloxide::{
+    net::Download,
+    prelude::*,
+    types::{FileId, MessageId},
+};
 use tokio::io::AsyncWrite;
 
 use crate::config::Config;
@@ -73,8 +77,8 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
             source_channel_id: candidate.source_channel_id,
             source_message_id: candidate.source_message_id.0,
             cleaned_post_text: &clean_post,
-            image_file_id: image.map(|photo| photo.file.id.as_str()),
-            image_file_unique_id: image.map(|photo| photo.file.unique_id.as_str()),
+            image_file_id: image.map(|photo| photo.file.id.0.as_str()),
+            image_file_unique_id: image.map(|photo| photo.file.unique_id.0.as_str()),
         },
     )
     .await?;
@@ -553,7 +557,7 @@ pub(crate) async fn download_largest_photo_base64(
     let image_file_id = msg
         .photo()
         .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height))
-        .map(|photo| photo.file.id.as_str());
+        .map(|photo| photo.file.id.0.as_str());
     download_photo_base64(bot, image_file_id, config).await
 }
 
@@ -566,7 +570,7 @@ async fn download_photo_base64(
         return Ok(None);
     };
 
-    let file = bot.get_file(image_file_id.to_owned()).await?;
+    let file = bot.get_file(FileId(image_file_id.to_owned())).await?;
     let max_bytes = u64::from(config.first_comment_max_image_mb) * 1024 * 1024;
     if u64::from(file.size) > max_bytes {
         anyhow::bail!(
