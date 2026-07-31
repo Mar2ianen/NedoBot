@@ -325,6 +325,8 @@ mod tests {
             cerebras_api_key: String::new(),
             cerebras_model: None,
             new_user_audit_enabled: false,
+            new_user_audit_provider: "cerebras".to_string(),
+            new_user_audit_model: Some("gemma-4-31b".to_string()),
             new_user_audit_authoritative_enabled: false,
             new_user_audit_max_tokens: 900,
             avatar_classifier_enabled: false,

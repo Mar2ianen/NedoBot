@@ -88,6 +88,8 @@ pub struct Config {
     pub cerebras_api_key: String,
     pub cerebras_model: Option<String>,
     pub new_user_audit_enabled: bool,
+    pub new_user_audit_provider: String,
+    pub new_user_audit_model: Option<String>,
     /// Включает authoritative unified cutover после завершения shadow-сверки.
     pub new_user_audit_authoritative_enabled: bool,
     pub new_user_audit_max_tokens: u32,
@@ -245,6 +247,8 @@ impl Config {
             cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
             cerebras_model: env_optional("CEREBRAS_MODEL"),
             new_user_audit_enabled: env_bool("NEW_USER_AUDIT_ENABLED", false)?,
+            new_user_audit_provider: env_or("NEW_USER_AUDIT_PROVIDER", "cerebras"),
+            new_user_audit_model: env_optional("NEW_USER_AUDIT_MODEL"),
             new_user_audit_authoritative_enabled: env_bool(
                 "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED",
                 false,
@@ -389,6 +393,22 @@ impl Config {
                 "NEW_USER_AUDIT_MAX_TOKENS",
                 self.new_user_audit_max_tokens,
             );
+            if self.llm_profiles.is_none() {
+                validate_llm_provider_secret(
+                    &mut errors,
+                    self,
+                    &self.new_user_audit_provider,
+                    "NEW_USER_AUDIT_PROVIDER",
+                );
+                validate_llm_provider_model_with_model(
+                    &mut errors,
+                    self,
+                    &self.new_user_audit_provider,
+                    "NEW_USER_AUDIT_PROVIDER",
+                    self.new_user_audit_model.as_deref(),
+                    "NEW_USER_AUDIT_MODEL",
+                );
+            }
         }
         if self.new_user_audit_authoritative_enabled && !self.new_user_audit_enabled {
             errors.push(
@@ -1136,6 +1156,8 @@ mod tests {
             cerebras_api_key: String::new(),
             cerebras_model: None,
             new_user_audit_enabled: false,
+            new_user_audit_provider: "cerebras".to_string(),
+            new_user_audit_model: Some("gemma-4-31b".to_string()),
             new_user_audit_authoritative_enabled: false,
             new_user_audit_max_tokens: 900,
             avatar_classifier_enabled: false,
@@ -1467,6 +1489,7 @@ models = ["primary", "fallback"]
     fn new_user_audit_shadow_mode_allows_legacy_authoritative_pipelines() {
         let mut config = config();
         config.new_user_audit_enabled = true;
+        config.cerebras_api_key = "cerebras-key".to_string();
         config.avatar_classifier_enabled = false;
         config.first_message_spam_enabled = false;
 

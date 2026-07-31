@@ -187,10 +187,10 @@ async fn generate_and_finalize(
         config,
         GenerateTextOptions {
             route: Some("new_user_audit"),
-            // Profile mode resolves the route above. Legacy mode needs explicit main
-            // LLM settings because this feature intentionally has no separate config.
-            provider_override: Some(&config.llm_provider),
-            model_override: config.llm_model.as_deref(),
+            // Profile mode resolves the route above. Legacy mode keeps this audit
+            // independent from the ordinary generation provider.
+            provider_override: Some(&config.new_user_audit_provider),
+            model_override: config.new_user_audit_model.as_deref(),
             system_prompt: Some(system_prompt()),
             prompt: &prompt,
             image_base64: image_base64.as_deref(),

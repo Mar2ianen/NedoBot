@@ -158,6 +158,34 @@ max_output_tokens = 8192
 request_timeout_sec = 45
 thinking = "none"
 
+[models.cerebras_audit]
+provider = "cerebras"
+model = "gemma-4-31b"
+
+[models.cerebras_audit.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 131072
+max_output_tokens = 8192
+request_timeout_sec = 45
+thinking = "none"
+
+[models.cerebras_avatar]
+provider = "cerebras"
+model = "gemma-4-31b"
+
+[models.cerebras_avatar.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 131072
+max_output_tokens = 8192
+request_timeout_sec = 45
+thinking = "none"
+
 # Replace these IDs with the models selected for the existing GROQ_MODEL,
 # OPENROUTER_MODEL and OPENAI_COMPAT_MODEL settings during compatibility migration.
 [models.openrouter_general]
@@ -208,7 +236,7 @@ models = ["groq_cleanup", "ollama_memory"]
 models = ["cerebras_spam", "ollama_memory"]
 
 [routes.new_user_audit]
-models = ["ollama_minimax"]
+models = ["cerebras_audit"]
 
 [routes.search_extract]
 models = ["ollama_memory"]
@@ -220,4 +248,4 @@ models = ["ollama_minimax", "ollama_memory"]
 models = ["ollama_memory"]
 
 [routes.avatar_analysis]
-models = ["cerebras_spam"]
+models = ["cerebras_avatar"]
