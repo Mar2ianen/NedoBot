@@ -18,7 +18,7 @@ use crate::features::new_user_audit::scoring::{
 };
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::features::user_profiles::avatar::cache_profile_avatar;
-use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
+use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::{LlmTransportError, StructuredOutput};
 
 /// Обрабатывает одну готовую unified-audit job.
@@ -178,14 +178,10 @@ async fn generate_and_finalize(
         )
         .map(|_| ())
     };
-    let generation = generate_text_with_provider_checked(
+    let generation = generate_text_checked(
         config,
         GenerateTextOptions {
-            route: Some("new_user_audit"),
-            // Profile mode resolves the route above. Without profiles the
-            // dedicated audit provider keeps this flow independent from ordinary generation.
-            provider_override: Some(&config.new_user_audit_provider),
-            model_override: config.new_user_audit_model.as_deref(),
+            route: "new_user_audit",
             system_prompt: Some(system_prompt()),
             prompt: &prompt,
             image_base64: image_base64.as_deref(),

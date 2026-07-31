@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::config::Config;
-use crate::features::search::types::SearchResult;
 use crate::features::{
     jobs::{
         claim::CasResult,
@@ -13,7 +12,7 @@ use crate::features::{
     },
     memory::embedding::{embed_text, pgvector_literal},
 };
-use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
+use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::StructuredOutput;
 use crate::text::first_text_chars;
 
@@ -195,36 +194,6 @@ pub async fn load_relevant_memory_notes(
     Ok(notes)
 }
 
-pub async fn enqueue_post_history(
-    pool: &PgPool,
-    post_comment_job_id: i64,
-    source_channel_id: i64,
-    source_message_id: i32,
-    post_text: &str,
-    bot_comment: &str,
-    used_search_result: Option<&SearchResult>,
-) -> anyhow::Result<()> {
-    let used_search_result = used_search_result.map(serde_json::to_value).transpose()?;
-    sqlx::query(
-        r#"
-        insert into post_history_entries
-            (post_comment_job_id, source_channel_id, source_message_id, post_text,
-             bot_comment, used_search_result)
-        values ($1, $2, $3, $4, $5, $6)
-        on conflict (source_channel_id, source_message_id) do nothing
-        "#,
-    )
-    .bind(post_comment_job_id)
-    .bind(source_channel_id)
-    .bind(source_message_id)
-    .bind(post_text)
-    .bind(bot_comment)
-    .bind(used_search_result)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyhow::Result<bool> {
     if !config.rag_enabled {
         return Ok(false);
@@ -361,12 +330,10 @@ async fn build_history_entry(
     let prompt = build_memory_prompt(entry);
     let schema = memory_summary_schema();
     let validator = |value: &str| parse_memory_summary(value).map(|_| ());
-    let generation = generate_text_with_provider_checked(
+    let generation = generate_text_checked(
         config,
         GenerateTextOptions {
-            route: Some("memory"),
-            provider_override: Some(&config.memory_llm_provider),
-            model_override: config.memory_llm_model.as_deref(),
+            route: "memory",
             system_prompt: Some(MEMORY_SYSTEM_PROMPT),
             prompt: &prompt,
             image_base64: None,

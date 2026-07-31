@@ -116,11 +116,8 @@ pub struct RouteRequirements {
 ///
 /// Ссылки заимствованы из `LlmProfiles`; разрешение маршрута не читает секреты и не обращается
 /// к runtime-конфигурации.
-// LP2 использует выборки при подключении маршрутов профилей к созданию runtime-транспорта.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct RouteSelection<'a> {
-    pub model_key: &'a str,
     pub model: &'a ModelProfile,
     pub provider_key: &'a str,
     pub provider: &'a ProviderProfile,
@@ -128,8 +125,6 @@ pub struct RouteSelection<'a> {
 }
 
 /// Разрешённый маршрут с совместимыми моделями в порядке fallback-цепочки.
-// LP2 вернёт этот результат при подключении profile routes к runtime-генерации.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute<'a> {
     pub selections: Vec<RouteSelection<'a>>,
@@ -234,7 +229,6 @@ impl LlmProfiles {
                 continue;
             }
             selections.push(RouteSelection {
-                model_key,
                 model,
                 provider_key,
                 provider,
@@ -407,12 +401,13 @@ models = ["ollama_memory"]
             .unwrap();
 
         assert_eq!(selections.selections.len(), 2);
-        assert_eq!(selections.selections[0].model_key, "groq_cleanup");
         assert_eq!(
-            selections.selections[0].model.model,
-            "llama-3.3-70b-versatile"
+            (
+                selections.selections[0].provider_key,
+                selections.selections[0].model.model.as_str()
+            ),
+            ("groq", "llama-3.3-70b-versatile")
         );
-        assert_eq!(selections.selections[0].provider_key, "groq");
         assert_eq!(
             selections.selections[0].provider.driver,
             LlmDriver::OpenaiCompatible
@@ -421,8 +416,13 @@ models = ["ollama_memory"]
             selections.selections[0].capabilities.structured_output,
             StructuredOutputMode::JsonSchema
         );
-        assert_eq!(selections.selections[1].model_key, "ollama_memory");
-        assert_eq!(selections.selections[1].provider_key, "ollama_cloud");
+        assert_eq!(
+            (
+                selections.selections[1].provider_key,
+                selections.selections[1].model.model.as_str()
+            ),
+            ("ollama_cloud", "gemma4:31b")
+        );
         assert!(!selections.fallback_on_validation_failure);
     }
 
@@ -446,16 +446,15 @@ models = ["ollama_memory"]
         let image_models: Vec<_> = image_route
             .selections
             .iter()
-            .map(|selection| selection.model_key)
+            .map(|selection| (selection.provider_key, selection.model.model.as_str()))
             .collect();
 
         assert_eq!(
             image_models,
             [
-                "gemini_comment",
-                "gemini_flash_comment",
-                "gemini_flash_lite_comment",
-                "gemini_legacy_flash_lite_comment",
+                ("gemini", "gemini-3.6-flash"),
+                ("gemini", "gemini-3.5-flash"),
+                ("gemini", "gemini-3.5-flash-lite"),
             ]
         );
         assert!(image_route.fallback_on_validation_failure);
@@ -466,17 +465,16 @@ models = ["ollama_memory"]
         let text_models: Vec<_> = text_route
             .selections
             .iter()
-            .map(|selection| selection.model_key)
+            .map(|selection| (selection.provider_key, selection.model.model.as_str()))
             .collect();
 
         assert_eq!(
             text_models,
             [
-                "gemini_comment",
-                "gemini_flash_comment",
-                "gemini_flash_lite_comment",
-                "gemini_legacy_flash_lite_comment",
-                "ollama_memory",
+                ("gemini", "gemini-3.6-flash"),
+                ("gemini", "gemini-3.5-flash"),
+                ("gemini", "gemini-3.5-flash-lite"),
+                ("ollama_cloud", "gemma4:31b"),
             ]
         );
     }

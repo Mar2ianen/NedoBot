@@ -56,7 +56,7 @@ VOICE_AUTO_TRANSCRIBE=true
 
 Fallback:
 
-- если `VOICE_CLEANUP_PROVIDER` задан и падает, код пробует обычный `LLM_PROVIDER`;
+- cleanup использует явный profile route `voice_cleanup` и его fallback chain;
 - если все cleanup providers падают, используется raw ASR text;
 - если cleanup JSON не парсится, используется plain LLM text;
 - если после normalize нет глав, режим принудительно становится `short`.
@@ -124,7 +124,7 @@ Groq ASR принимает MP4 напрямую, поэтому кружок с
 ## Остаточные риски
 
 - `VOICE_ASR_PROVIDER` сейчас фактически поддерживает только `groq`; unknown provider падает ошибкой.
-- `VOICE_CLEANUP_PROVIDER` использует общий LLM provider router; если ошибиться в имени, будет `unknown LLM_PROVIDER`, хотя речь про cleanup provider.
+- provider/model voice cleanup задаются в `voice_cleanup` profile route; отдельного env-router больше нет.
 - Для `audio` Telegram metadata обычно есть, но если duration/file_size внезапно отсутствуют, файл может дойти до API и упасть там.
 - `render_mode=file` парсится как enum value, но renderer не имеет отдельной ветки для file-only режима; сейчас это не проблема, потому что prompt просит только `short | chapters`.
 - В `render_preview` считается длина по уже HTML-escaped строкам плюс chunk; это достаточно для MVP, но не полноценный entity-aware splitter.

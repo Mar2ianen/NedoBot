@@ -8,7 +8,7 @@ use crate::features::memory::service::MemoryNote;
 use crate::features::search::types::{
     MAX_QUERY_CHARS, MAX_SEARCH_QUERIES, ResearchPlan, SearchQuery, SearchSource,
 };
-use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
+use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::StructuredOutput;
 
 const SEARCH_EXTRACT_PROMPT: &str = include_str!("../../../prompts/search_extract.md");
@@ -63,12 +63,10 @@ pub async fn extract_research_plan(
     );
     let schema = research_plan_schema();
     let validator = |value: &str| parse_research_plan(value, "").map(|_| ());
-    let response = generate_text_with_provider_checked(
+    let response = generate_text_checked(
         config,
         GenerateTextOptions {
-            route: Some("search_extract"),
-            provider_override: config.search_extract_provider.as_deref(),
-            model_override: config.search_extract_model.as_deref(),
+            route: "search_extract",
             system_prompt: Some(SEARCH_EXTRACT_PROMPT),
             prompt: &prompt,
             image_base64: None,

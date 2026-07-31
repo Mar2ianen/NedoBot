@@ -58,7 +58,7 @@ Ask command handler
       |
       v
 Ask agent loop -----------------------> LLM provider
-      |                                  |  action JSON
+      |                                  |  native tool calls
       |                                  |  or final Rich Markdown
       v                                  |
 Tool registry <-------------------------+
@@ -107,40 +107,11 @@ LLM не получает адрес базы, DB credentials, команды з
 
 Последние сообщения чата автоматически в prompt не добавляются. Если они нужны, модель должна запросить их инструментом. Это уменьшает стоимость, шум и риск утечки лишнего контекста.
 
-### 4.2 Универсальный протокол действий
+### 4.2 Native tool-call protocol
 
-Для совместимости с Gemini, Cerebras, OpenAI-compatible и Ollama используется уже поддерживаемый строгий structured output, а не provider-specific native tool calling.
+`genai` передаёт модели каталог инструментов с JSON Schema. Модель либо возвращает native tool calls, либо обычный финальный Rich Markdown-ответ. Для каждого вызова бот проверяет имя и JSON-аргументы по allowlist, выполняет bounded dispatch и возвращает результат как matching tool response в историю диалога. Application code не сериализует самописный `kind/tool_calls/final` envelope; provider wire format остаётся внутри `genai` transport.
 
-Модель на каждом шаге возвращает один из вариантов:
-
-```json
-{
-  "kind": "tool_calls",
-  "reason": "Нужно найти обсуждение и затем прочитать контекст",
-  "calls": [
-    {
-      "id": "call_1",
-      "tool": "chat.search_messages",
-      "arguments": {
-        "query": "переход на Rust",
-        "limit": 10
-      }
-    }
-  ]
-}
-```
-
-или:
-
-```json
-{
-  "kind": "final",
-  "markdown": "## Ответ\n\n...",
-  "used_sources": ["chat:12345", "web:https://example.com"]
-}
-```
-
-Бот валидирует JSON Schema, сверяет инструменты с allowlist и только затем выполняет вызовы. Независимые read-only вызовы одного шага можно выполнять параллельно.
+Независимые read-only вызовы одного шага можно выполнять параллельно, сохраняя native assistant/tool message history, call IDs и reasoning signatures.
 
 ### 4.3 Ограничения цикла
 
@@ -566,8 +537,8 @@ migrations/<timestamp>_user_notes.sql
 
 ### Шаг 4. Реализовать read-only агентный цикл
 
-- action JSON Schema;
-- parser и semantic validation;
+- native tool catalog и scoped JSON Schema;
+- проверка аргументов и semantic validation;
 - tool registry;
 - bounded loop;
 - параллельные read-only calls;
@@ -651,7 +622,7 @@ migrations/<timestamp>_user_notes.sql
 ## 16. Решения, которые нужно подтвердить перед кодом
 
 1. Первая аудитория: только владелец или сразу администраторы.
-2. Отдельные `ASK_LLM_PROVIDER`/`ASK_LLM_MODEL` либо использование общего LLM routing.
+2. Отдельный `ask` route в authoritative LLM profiles.
 3. Включать `notes.add` в первый rollout или начать полностью read-only.
 4. Разрешать ли поиск удалённых ботом/spam-сообщений владельцу; обычным пользователям их лучше скрывать.
 5. Разрешать ли private GitHub repositories в будущем; MVP предполагает только разрешённый read-only scope.
@@ -660,7 +631,7 @@ migrations/<timestamp>_user_notes.sql
 ## 17. Рекомендуемые решения по умолчанию
 
 - rollout владельцу и текущим администраторам чата;
-- отдельная конфигурация модели `/ask`;
+- отдельный `ask` route с моделью и fallback в authoritative profiles;
 - read-only DB, web и GitHub сначала, заметки следующим изолированным шагом;
 - основной поиск — FTS + `simple`, trigram после проверки extension;
 - embeddings отложить до появления измеримых miss-запросов;

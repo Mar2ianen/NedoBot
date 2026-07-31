@@ -30,8 +30,8 @@
 - [x] Stats partially переведён на безопасный HTML.
 - [x] First-comment prompt/repo/pipeline вынесены из `main.rs`.
 - [x] Telegram persistence вынесен из `main.rs`.
-- [x] LLM routing вынесен и нормализует provider/model/image_used.
-- [x] Unknown `LLM_PROVIDER` больше не падает молча в Ollama.
+- [x] LLM routing вынесен в authoritative profiles и сохраняет provider/model/image_used.
+- [x] Неизвестные provider profiles отклоняются на startup, без silent fallback в Ollama.
 - [x] Best-effort image download не ломает text-only генерацию.
 - [x] `ChatStatsSummary` заменён с tuple на struct.
 - [x] Telegram export importer добавлен.

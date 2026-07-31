@@ -1,8 +1,7 @@
 # LLM topology: provider transport -> model profile -> task route.
 # This file contains no API keys. api_key_env names the required environment variable.
-# Set LLM_PROFILES_PATH to this file to enable strict profile-authoritative routing.
-# In that mode task routes select provider/model/capabilities; legacy provider/model
-# environment variables are ignored for generation.
+# Set LLM_PROFILES_PATH to this file. Task routes are the only source of
+# provider/model/capabilities for runtime generation.
 
 [providers.gemini]
 driver = "gemini"
@@ -88,20 +87,6 @@ max_output_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_low"
 
-[models.gemini_legacy_flash_lite_comment]
-provider = "gemini"
-model = "gemini-3.1-flash-lite"
-
-[models.gemini_legacy_flash_lite_comment.capabilities]
-supports_images = true
-supports_tools = true
-supports_system_prompt = true
-structured_output = "json_schema"
-context_window_tokens = 1000000
-max_output_tokens = 8192
-request_timeout_sec = 60
-thinking = "level_low"
-
 [models.ollama_memory]
 provider = "ollama_cloud"
 model = "gemma4:31b"
@@ -158,8 +143,7 @@ max_output_tokens = 8192
 request_timeout_sec = 45
 thinking = "none"
 
-# Replace these IDs with the models selected for the existing GROQ_MODEL,
-# OPENROUTER_MODEL and OPENAI_COMPAT_MODEL settings during compatibility migration.
+# Optional provider profiles for future routes.
 [models.openrouter_general]
 provider = "openrouter"
 model = "openai/gpt-4.1-mini"
@@ -193,7 +177,6 @@ models = [
   "gemini_comment",
   "gemini_flash_comment",
   "gemini_flash_lite_comment",
-  "gemini_legacy_flash_lite_comment",
   "ollama_memory",
 ]
 fallback_on_validation_failure = false
@@ -212,6 +195,3 @@ models = ["ollama_memory"]
 
 [routes.ask]
 models = ["ollama_minimax", "ollama_memory"]
-
-[routes.legacy_default]
-models = ["ollama_memory"]

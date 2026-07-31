@@ -36,18 +36,13 @@ pub struct Config {
     pub chat_invite_url: String,
     pub chat_invite_label: String,
     pub post_signature_marker: String,
-    pub llm_provider: String,
-    pub llm_model: Option<String>,
     pub llm_profiles_path: Option<String>,
     pub llm_profiles: Option<LlmProfiles>,
-    pub llm_supports_images: Option<bool>,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
     pub llm_proxy_url: Option<String>,
     pub memory_llm_temperature: f32,
     pub memory_llm_max_tokens: u32,
-    pub memory_llm_provider: String,
-    pub memory_llm_model: Option<String>,
     pub rag_enabled: bool,
     pub rag_embedding_url: String,
     pub rag_embedding_model: String,
@@ -64,8 +59,6 @@ pub struct Config {
     pub chat_retrieval_window_days: i64,
     pub chat_retrieval_half_life_days: f64,
     pub search_enabled: bool,
-    pub search_extract_provider: Option<String>,
-    pub search_extract_model: Option<String>,
     pub search_extract_temperature: f32,
     pub search_extract_max_tokens: u32,
     pub search_mcp_command: Option<String>,
@@ -84,35 +77,14 @@ pub struct Config {
     pub search_github_mcp_env: Vec<String>,
     pub search_github_mcp_tools: Vec<String>,
     pub groq_api_key: String,
-    pub groq_model: Option<String>,
-    pub cerebras_api_key: String,
-    pub cerebras_model: Option<String>,
     pub new_user_audit_enabled: bool,
-    pub new_user_audit_provider: String,
-    pub new_user_audit_model: Option<String>,
     pub new_user_audit_max_tokens: u32,
-    pub openrouter_api_key: String,
-    pub openrouter_model: Option<String>,
-    pub gemini_api_key: String,
-    pub gemini_text_model: String,
-    pub gemini_flash_model: String,
-    pub gemini_flash_lite_model: String,
-    pub gemini_legacy_flash_lite_model: String,
-    pub gemini_tts_model: String,
     pub gemini_thinking_budget: u32,
-    pub ollama_base_url: String,
-    pub ollama_api_key: String,
-    pub openai_compat_base_url: String,
-    pub openai_compat_api_key: String,
-    pub openai_compat_model: Option<String>,
-    pub vision_model: String,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
     pub ask_enabled: bool,
     pub ask_allow_chat_admins: bool,
     pub ask_private_user_ids: Vec<i64>,
-    pub ask_llm_provider: String,
-    pub ask_llm_model: Option<String>,
     pub ask_llm_temperature: f32,
     pub ask_llm_max_tokens: u32,
     pub ask_max_steps: usize,
@@ -139,8 +111,6 @@ pub struct Config {
     pub voice_asr_provider: String,
     pub voice_asr_model: String,
     pub voice_asr_temperature: f32,
-    pub voice_cleanup_provider: Option<String>,
-    pub voice_cleanup_model: Option<String>,
     pub voice_cleanup_temperature: f32,
     pub voice_cleanup_max_tokens: u32,
     pub voice_render_expandable_chapters: bool,
@@ -163,19 +133,13 @@ impl Config {
             chat_invite_url: env_or("CHAT_INVITE_URL", "https://t.me/+RxmPtw7Bs-IxNzEy"),
             chat_invite_label: env_or("CHAT_INVITE_LABEL", "Присоединяйтесь к чату"),
             post_signature_marker: env_or("POST_SIGNATURE_MARKER", "Не теряем связь"),
-            llm_provider: env_or("LLM_PROVIDER", "ollama"),
-            llm_model: env_optional("LLM_MODEL"),
             llm_profiles_path,
             llm_profiles,
-            llm_supports_images: env_optional_bool("LLM_SUPPORTS_IMAGES")?,
             llm_temperature: env_f32("LLM_TEMPERATURE", 0.45)?,
             llm_max_tokens: env_u32("LLM_MAX_TOKENS", 180)?,
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
             memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2)?,
             memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220)?,
-            memory_llm_provider: env_or("MEMORY_LLM_PROVIDER", "ollama"),
-            memory_llm_model: env_optional("MEMORY_LLM_MODEL")
-                .or_else(|| Some("gemma4:31b".to_string())),
             rag_enabled: env_bool("RAG_ENABLED", false)?,
             rag_embedding_url: env_or("RAG_EMBEDDING_URL", "http://127.0.0.1:8788"),
             rag_embedding_model: env_or("RAG_EMBEDDING_MODEL", "cointegrated/rubert-tiny2"),
@@ -198,10 +162,6 @@ impl Config {
             chat_retrieval_window_days: env_i64("CHAT_RETRIEVAL_WINDOW_DAYS", 30)?,
             chat_retrieval_half_life_days: env_f64("CHAT_RETRIEVAL_HALF_LIFE_DAYS", 7.0)?,
             search_enabled: env_bool("SEARCH_ENABLED", false)?,
-            search_extract_provider: env_optional("SEARCH_EXTRACT_PROVIDER")
-                .or_else(|| Some("ollama".to_string())),
-            search_extract_model: env_optional("SEARCH_EXTRACT_MODEL")
-                .or_else(|| Some("gemma4:31b".to_string())),
             search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1)?,
             search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 900)?,
             search_mcp_command: env_optional("SEARCH_MCP_COMMAND"),
@@ -234,51 +194,18 @@ impl Config {
                 &["search_issues", "search_code"],
             ),
             groq_api_key: env_or("GROQ_API_KEY", ""),
-            groq_model: env_optional("GROQ_MODEL"),
-            cerebras_api_key: env_or("CEREBRAS_API_KEY", ""),
-            cerebras_model: env_optional("CEREBRAS_MODEL"),
             new_user_audit_enabled: env_bool("NEW_USER_AUDIT_ENABLED", false)?,
-            new_user_audit_provider: env_or("NEW_USER_AUDIT_PROVIDER", "cerebras"),
-            new_user_audit_model: env_optional("NEW_USER_AUDIT_MODEL"),
             new_user_audit_max_tokens: env_u32("NEW_USER_AUDIT_MAX_TOKENS", 900)?,
-            openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
-            openrouter_model: env_optional("OPENROUTER_MODEL"),
-            gemini_api_key: env_optional("GEMINI_API_KEY")
-                .or_else(|| env_optional("GOOGLE_AI_STUDIO_API_KEY"))
-                .unwrap_or_default(),
-            gemini_text_model: env_or("GEMINI_TEXT_MODEL", "gemini-3.6-flash"),
-            gemini_flash_model: env_or("GEMINI_FLASH_MODEL", "gemini-3.5-flash"),
-            gemini_flash_lite_model: env_or("GEMINI_FLASH_LITE_MODEL", "gemini-3.5-flash-lite"),
-            gemini_legacy_flash_lite_model: env_or(
-                "GEMINI_LEGACY_FLASH_LITE_MODEL",
-                "gemini-3.1-flash-lite",
-            ),
-            gemini_tts_model: env_or("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
             gemini_thinking_budget: env_u32("GEMINI_THINKING_BUDGET", 1024)?,
-            ollama_base_url: env_or("OLLAMA_BASE_URL", "https://ollama.com"),
-            ollama_api_key: env_or("OLLAMA_API_KEY", ""),
-            openai_compat_base_url: env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
-            openai_compat_api_key: env_or("OPENAI_COMPAT_API_KEY", ""),
-            openai_compat_model: env_optional("OPENAI_COMPAT_MODEL"),
-            vision_model: env_optional("VISION_MODEL")
-                .or_else(|| env_optional("OLLAMA_MODEL"))
-                .unwrap_or_else(|| "gemma4:31b".to_string()),
             owner_telegram_id: env_optional_i64("OWNER_TELEGRAM_ID")?,
             send_owner_preview: env_bool("SEND_OWNER_PREVIEW", true)?,
             ask_enabled: env_bool("ASK_ENABLED", false)?,
             ask_allow_chat_admins: env_bool("ASK_ALLOW_CHAT_ADMINS", true)?,
             ask_private_user_ids: env_i64_list_csv("ASK_PRIVATE_USER_IDS")?,
-            ask_llm_provider: env_optional("ASK_LLM_PROVIDER")
-                .unwrap_or_else(|| env_or("LLM_PROVIDER", "ollama")),
-            ask_llm_model: env_optional("ASK_LLM_MODEL").or_else(|| env_optional("LLM_MODEL")),
             ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2)?,
             ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800)?,
             ask_max_steps: env_usize("ASK_MAX_STEPS", 7)?,
-            ask_action_timeout_sec: env_u64_with_legacy(
-                "ASK_ACTION_TIMEOUT_SEC",
-                "ASK_TIMEOUT_SEC",
-                45,
-            )?,
+            ask_action_timeout_sec: env_u64("ASK_ACTION_TIMEOUT_SEC", 45)?,
             ask_total_timeout_sec: env_u64("ASK_TOTAL_TIMEOUT_SEC", 180)?,
             ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1)?,
             ask_db_mcp_command: env_optional("ASK_DB_MCP_COMMAND"),
@@ -304,8 +231,6 @@ impl Config {
             voice_asr_provider: env_or("VOICE_ASR_PROVIDER", "groq"),
             voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3"),
             voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0)?,
-            voice_cleanup_provider: env_optional("VOICE_CLEANUP_PROVIDER"),
-            voice_cleanup_model: env_optional("VOICE_CLEANUP_MODEL"),
             voice_cleanup_temperature: env_f32("VOICE_CLEANUP_TEMPERATURE", 0.2)?,
             voice_cleanup_max_tokens: env_u32("VOICE_CLEANUP_MAX_TOKENS", 1800)?,
             voice_render_expandable_chapters: env_bool("VOICE_RENDER_EXPANDABLE_CHAPTERS", true)?,
@@ -321,37 +246,11 @@ impl Config {
         if self.llm_profiles.is_some() {
             self.validate_profile_routes(&mut errors);
         } else {
-            validate_llm_provider_secret(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
-            validate_llm_provider_model(&mut errors, self, &self.llm_provider, "LLM_PROVIDER");
-
-            if self.voice_transcription_enabled
-                && let Some(provider) = self.voice_cleanup_provider.as_deref()
-            {
-                validate_llm_provider_secret(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
-                validate_llm_provider_model(&mut errors, self, provider, "VOICE_CLEANUP_PROVIDER");
-            }
+            errors.push("LLM_PROFILES_PATH must configure authoritative LLM routes".to_string());
         }
 
         if self.search_enabled {
             validate_search_config(&mut errors, self);
-            if self.llm_profiles.is_none()
-                && let Some(provider) = self.search_extract_provider.as_deref()
-            {
-                validate_llm_provider_secret(
-                    &mut errors,
-                    self,
-                    provider,
-                    "SEARCH_EXTRACT_PROVIDER",
-                );
-                validate_llm_provider_model_with_model(
-                    &mut errors,
-                    self,
-                    provider,
-                    "SEARCH_EXTRACT_PROVIDER",
-                    self.search_extract_model.as_deref(),
-                    "SEARCH_EXTRACT_MODEL",
-                );
-            }
         }
 
         if self.voice_transcription_enabled {
@@ -360,9 +259,6 @@ impl Config {
 
         if self.rag_enabled {
             self.validate_rag_retrieval_config(&mut errors);
-            if self.llm_profiles.is_none() {
-                self.validate_legacy_memory_llm(&mut errors);
-            }
         }
         self.validate_chat_retrieval_config(&mut errors);
 
@@ -373,22 +269,6 @@ impl Config {
                 self.new_user_audit_max_tokens,
             );
             self.validate_embedding_config(&mut errors);
-            if self.llm_profiles.is_none() {
-                validate_llm_provider_secret(
-                    &mut errors,
-                    self,
-                    &self.new_user_audit_provider,
-                    "NEW_USER_AUDIT_PROVIDER",
-                );
-                validate_llm_provider_model_with_model(
-                    &mut errors,
-                    self,
-                    &self.new_user_audit_provider,
-                    "NEW_USER_AUDIT_PROVIDER",
-                    self.new_user_audit_model.as_deref(),
-                    "NEW_USER_AUDIT_MODEL",
-                );
-            }
         }
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
@@ -397,22 +277,6 @@ impl Config {
         if self.ask_enabled {
             if self.owner_telegram_id.is_none() {
                 errors.push("ASK_ENABLED=true requires OWNER_TELEGRAM_ID".to_string());
-            }
-            if self.llm_profiles.is_none() {
-                validate_llm_provider_secret(
-                    &mut errors,
-                    self,
-                    &self.ask_llm_provider,
-                    "ASK_LLM_PROVIDER",
-                );
-                validate_llm_provider_model_with_model(
-                    &mut errors,
-                    self,
-                    &self.ask_llm_provider,
-                    "ASK_LLM_PROVIDER",
-                    self.ask_llm_model.as_deref(),
-                    "ASK_LLM_MODEL",
-                );
             }
             if self.ask_max_steps == 0 {
                 errors.push("ASK_MAX_STEPS must be greater than 0".to_string());
@@ -569,23 +433,6 @@ impl Config {
         }
     }
 
-    fn validate_legacy_memory_llm(&self, errors: &mut Vec<String>) {
-        validate_llm_provider_secret(
-            errors,
-            self,
-            &self.memory_llm_provider,
-            "MEMORY_LLM_PROVIDER",
-        );
-        validate_llm_provider_model_with_model(
-            errors,
-            self,
-            &self.memory_llm_provider,
-            "MEMORY_LLM_PROVIDER",
-            self.memory_llm_model.as_deref(),
-            "MEMORY_LLM_MODEL",
-        );
-    }
-
     fn validate_rag_retrieval_config(&self, errors: &mut Vec<String>) {
         self.validate_embedding_config(errors);
         require_positive(errors, "RAG_TOP_K", self.rag_top_k);
@@ -681,48 +528,6 @@ fn require_in_unit_interval(errors: &mut Vec<String>, key: &str, value: f32) {
     }
 }
 
-fn validate_llm_provider_model(
-    errors: &mut Vec<String>,
-    config: &Config,
-    provider: &str,
-    context: &str,
-) {
-    validate_llm_provider_model_with_model(
-        errors,
-        config,
-        provider,
-        context,
-        config.llm_model.as_deref(),
-        "LLM_MODEL",
-    );
-}
-
-fn validate_llm_provider_model_with_model(
-    errors: &mut Vec<String>,
-    config: &Config,
-    provider: &str,
-    context: &str,
-    model: Option<&str>,
-    model_key: &str,
-) {
-    match normalize_llm_provider(provider) {
-        Ok("groq") if model.is_none() && config.groq_model.is_none() => errors.push(format!(
-            "{context}=groq requires {model_key} or GROQ_MODEL; refusing to fallback to VISION_MODEL"
-        )),
-        Ok("cerebras") if model.is_none() && config.cerebras_model.is_none() => {
-            errors.push(format!(
-                "{context}=cerebras requires {model_key} or CEREBRAS_MODEL; refusing to fallback to VISION_MODEL"
-            ));
-        }
-        Ok("openrouter") if model.is_none() && config.openrouter_model.is_none() => {
-            errors.push(format!(
-                "{context}=openrouter requires {model_key} or OPENROUTER_MODEL; refusing to fallback to VISION_MODEL"
-            ));
-        }
-        Ok(_) | Err(_) => {}
-    }
-}
-
 fn validate_search_config(errors: &mut Vec<String>, config: &Config) {
     if config.search_mcp_command.is_none() {
         errors.push("SEARCH_ENABLED=true requires non-empty SEARCH_MCP_COMMAND".to_string());
@@ -752,58 +557,6 @@ fn validate_voice_asr_secret(errors: &mut Vec<String>, config: &Config) {
         provider => errors.push(format!(
             "VOICE_ASR_PROVIDER={provider} is unsupported; supported provider: groq"
         )),
-    }
-}
-
-fn validate_llm_provider_secret(
-    errors: &mut Vec<String>,
-    config: &Config,
-    provider: &str,
-    context: &str,
-) {
-    match normalize_llm_provider(provider) {
-        Ok("ollama") => {}
-        Ok("groq") => require_secret(errors, "GROQ_API_KEY", &config.groq_api_key, context),
-        Ok("cerebras") => require_secret(
-            errors,
-            "CEREBRAS_API_KEY",
-            &config.cerebras_api_key,
-            context,
-        ),
-        Ok("openrouter") => require_secret(
-            errors,
-            "OPENROUTER_API_KEY",
-            &config.openrouter_api_key,
-            context,
-        ),
-        Ok("gemini") => require_secret(
-            errors,
-            "GEMINI_API_KEY or GOOGLE_AI_STUDIO_API_KEY",
-            &config.gemini_api_key,
-            context,
-        ),
-        Ok("openai_compat") => require_secret(
-            errors,
-            "OPENAI_COMPAT_API_KEY",
-            &config.openai_compat_api_key,
-            context,
-        ),
-        Ok(_) => unreachable!("all normalized providers are matched"),
-        Err(err) => errors.push(format!(
-            "{context} has unsupported provider {provider:?}: {err}"
-        )),
-    }
-}
-
-pub(crate) fn normalize_llm_provider(provider: &str) -> anyhow::Result<&'static str> {
-    match provider.trim().to_lowercase().as_str() {
-        "" | "ollama" => Ok("ollama"),
-        "groq" => Ok("groq"),
-        "cerebras" => Ok("cerebras"),
-        "openrouter" => Ok("openrouter"),
-        "gemini" | "google" | "google_ai_studio" => Ok("gemini"),
-        "openai_compat" => Ok("openai_compat"),
-        other => anyhow::bail!("unknown provider: {other}"),
     }
 }
 
@@ -840,18 +593,6 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     env_parse(key, default, "a non-negative 64-bit integer")
 }
 
-/// `ASK_TIMEOUT_SEC` is accepted only as a parsed compatibility alias while
-/// deployments migrate to the explicit action/total deadline split.
-fn env_u64_with_legacy(key: &str, legacy_key: &str, default: u64) -> anyhow::Result<u64> {
-    if let Some(value) = env_value(key) {
-        return parse_env_value(key, &value, "a non-negative 64-bit integer");
-    }
-    if let Some(value) = env_value(legacy_key) {
-        return parse_env_value(legacy_key, &value, "a non-negative 64-bit integer");
-    }
-    Ok(default)
-}
-
 fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {
     env_parse(key, default, "a non-negative integer")
 }
@@ -881,12 +622,6 @@ where
     value
         .parse()
         .map_err(|_| anyhow::anyhow!("{key} must be {expected}"))
-}
-
-fn env_optional_bool(key: &str) -> anyhow::Result<Option<bool>> {
-    env_optional(key)
-        .map(|value| parse_bool(key, &value))
-        .transpose()
 }
 
 fn env_optional_i64(key: &str) -> anyhow::Result<Option<i64>> {
@@ -998,18 +733,13 @@ mod tests {
             chat_invite_url: "https://t.me/example".to_string(),
             chat_invite_label: "чат".to_string(),
             post_signature_marker: "marker".to_string(),
-            llm_provider: "ollama".to_string(),
-            llm_model: Some("gemma4:31b".to_string()),
             llm_profiles_path: None,
             llm_profiles: None,
-            llm_supports_images: Some(true),
             llm_temperature: 0.35,
             llm_max_tokens: 90,
             llm_proxy_url: None,
             memory_llm_temperature: 0.2,
             memory_llm_max_tokens: 220,
-            memory_llm_provider: "ollama".to_string(),
-            memory_llm_model: Some("gemma4:31b".to_string()),
             rag_enabled: false,
             rag_embedding_url: "http://127.0.0.1:8788".to_string(),
             rag_embedding_model: "cointegrated/rubert-tiny2".to_string(),
@@ -1026,8 +756,6 @@ mod tests {
             chat_retrieval_window_days: 30,
             chat_retrieval_half_life_days: 7.0,
             search_enabled: false,
-            search_extract_provider: Some("ollama".to_string()),
-            search_extract_model: Some("gemma4:31b".to_string()),
             search_extract_temperature: 0.1,
             search_extract_max_tokens: 700,
             search_mcp_command: None,
@@ -1054,35 +782,14 @@ mod tests {
             ],
             search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             groq_api_key: String::new(),
-            groq_model: None,
-            cerebras_api_key: String::new(),
-            cerebras_model: None,
             new_user_audit_enabled: false,
-            new_user_audit_provider: "cerebras".to_string(),
-            new_user_audit_model: Some("gemma-4-31b".to_string()),
             new_user_audit_max_tokens: 900,
-            openrouter_api_key: String::new(),
-            openrouter_model: None,
-            gemini_api_key: String::new(),
-            gemini_text_model: "gemini-3.6-flash".to_string(),
-            gemini_flash_model: "gemini-3.5-flash".to_string(),
-            gemini_flash_lite_model: "gemini-3.5-flash-lite".to_string(),
-            gemini_legacy_flash_lite_model: "gemini-3.1-flash-lite".to_string(),
-            gemini_tts_model: "gemini-3.1-flash-tts-preview".to_string(),
             gemini_thinking_budget: 1024,
-            ollama_base_url: "https://ollama.com".to_string(),
-            ollama_api_key: String::new(),
-            openai_compat_base_url: "https://api.openai.com/v1".to_string(),
-            openai_compat_api_key: String::new(),
-            openai_compat_model: None,
-            vision_model: "gemma4:31b".to_string(),
             owner_telegram_id: None,
             send_owner_preview: false,
             ask_enabled: false,
             ask_allow_chat_admins: true,
             ask_private_user_ids: Vec::new(),
-            ask_llm_provider: "ollama".to_string(),
-            ask_llm_model: Some("gemma4:31b".to_string()),
             ask_llm_temperature: 0.2,
             ask_llm_max_tokens: 1800,
             ask_max_steps: 5,
@@ -1109,8 +816,6 @@ mod tests {
             voice_asr_provider: "groq".to_string(),
             voice_asr_model: "whisper-large-v3-turbo".to_string(),
             voice_asr_temperature: 0.0,
-            voice_cleanup_provider: None,
-            voice_cleanup_model: None,
             voice_cleanup_temperature: 0.2,
             voice_cleanup_max_tokens: 1800,
             voice_render_expandable_chapters: true,
@@ -1201,17 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_provider_requires_gemini_key_at_startup() {
-        let mut config = config();
-        config.llm_provider = "gemini".to_string();
-        config.llm_model = Some("gemini-3.5-flash".to_string());
-
-        let err = config.validate_runtime_secrets().unwrap_err().to_string();
-
-        assert!(err.contains("LLM_PROVIDER requires non-empty GEMINI_API_KEY"));
-    }
-
-    #[test]
     fn profile_mode_validates_route_fallback_secret_environment_names() {
         let _lock = ENV_LOCK.lock().unwrap();
         let primary = EnvVarGuard::unset("PROFILE_PRIMARY_TEST_KEY");
@@ -1296,11 +990,10 @@ models = ["primary", "fallback"]
     }
 
     #[test]
-    fn profile_mode_does_not_validate_ignored_legacy_memory_llm() {
+    fn profile_mode_uses_route_profiles_for_memory() {
         let _lock = ENV_LOCK.lock().unwrap();
         let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
         let ollama = EnvVarGuard::unset("OLLAMA_API_KEY");
-        let openai = EnvVarGuard::unset("OPENAI_COMPAT_API_KEY");
         unsafe {
             std::env::set_var("GEMINI_API_KEY", "test-key");
             std::env::set_var("OLLAMA_API_KEY", "test-key");
@@ -1310,27 +1003,11 @@ models = ["primary", "fallback"]
             LlmProfiles::from_toml(include_str!("../config/llm_profiles.toml.example")).unwrap(),
         );
         config.rag_enabled = true;
-        config.memory_llm_provider = "openai_compat".to_string();
-        config.memory_llm_model = None;
 
         config.validate_runtime_secrets().unwrap();
 
         drop(gemini);
         drop(ollama);
-        drop(openai);
-    }
-
-    #[test]
-    fn groq_provider_requires_explicit_model_at_startup() {
-        let mut config = config();
-        config.llm_provider = "groq".to_string();
-        config.llm_model = None;
-        config.groq_model = None;
-        config.groq_api_key = "secret".to_string();
-
-        let err = config.validate_runtime_secrets().unwrap_err().to_string();
-
-        assert!(err.contains("LLM_PROVIDER=groq requires LLM_MODEL or GROQ_MODEL"));
     }
 
     #[test]
@@ -1345,23 +1022,12 @@ models = ["primary", "fallback"]
     }
 
     #[test]
-    fn configured_voice_cleanup_provider_requires_its_key() {
-        let mut config = config();
-        config.voice_transcription_enabled = true;
-        config.voice_auto_transcribe = true;
-        config.groq_api_key = "groq-key".to_string();
-        config.voice_cleanup_provider = Some("openrouter".to_string());
-
-        let err = config.validate_runtime_secrets().unwrap_err().to_string();
-
-        assert!(err.contains("VOICE_CLEANUP_PROVIDER requires non-empty OPENROUTER_API_KEY"));
-    }
-
-    #[test]
-    fn ollama_without_secrets_is_valid_when_voice_is_disabled() {
+    fn missing_profiles_are_rejected_before_runtime() {
         let config = config();
 
-        config.validate_runtime_secrets().unwrap();
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("LLM_PROFILES_PATH must configure authoritative LLM routes"));
     }
 
     #[test]
@@ -1383,7 +1049,6 @@ models = ["primary", "fallback"]
     fn enabled_new_user_audit_requires_its_embedding_config() {
         let mut config = config();
         config.new_user_audit_enabled = true;
-        config.cerebras_api_key = "cerebras-key".to_string();
         config.rag_embedding_url.clear();
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
@@ -1546,7 +1211,10 @@ models = ["primary", "fallback"]
         config.search_mcp_command = None;
         config.search_mcp_timeout_sec = 0;
 
-        config.validate_runtime_secrets().unwrap();
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("LLM_PROFILES_PATH"));
+        assert!(!error.contains("SEARCH_ENABLED=true requires"));
     }
 
     #[test]
@@ -1566,15 +1234,12 @@ models = ["primary", "fallback"]
     fn enabled_ask_requires_owner_model_and_mcp_command() {
         let mut config = config();
         config.ask_enabled = true;
-        config.ask_llm_provider = "cerebras".to_string();
-        config.ask_llm_model = None;
         config.ask_db_mcp_command = None;
 
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 
         assert!(err.contains("ASK_ENABLED=true requires OWNER_TELEGRAM_ID"));
-        assert!(err.contains("ASK_LLM_PROVIDER requires non-empty CEREBRAS_API_KEY"));
-        assert!(err.contains("ASK_LLM_PROVIDER=cerebras requires ASK_LLM_MODEL or CEREBRAS_MODEL"));
+        assert!(err.contains("LLM_PROFILES_PATH must configure authoritative LLM routes"));
         assert!(err.contains("ASK_ENABLED=true requires ASK_DB_MCP_COMMAND"));
     }
 }
