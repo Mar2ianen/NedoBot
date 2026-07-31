@@ -661,7 +661,7 @@ pub async fn save_message_reaction(
 ) -> anyhow::Result<()> {
     // Telegram only sends these updates when bot permissions and allowed
     // updates line up; old reactions cannot be backfilled through Bot API.
-    if let Some(user) = reaction.user.as_ref() {
+    if let Some(user) = reaction.user() {
         upsert_user_profile(pool, user).await?;
     }
 
@@ -679,8 +679,8 @@ pub async fn save_message_reaction(
     )
     .bind(reaction.chat.id.0)
     .bind(reaction.message_id.0)
-    .bind(reaction.user.as_ref().map(|user| user.id.0 as i64))
-    .bind(reaction.actor_chat.as_ref().map(|chat| chat.id.0))
+    .bind(reaction.user().map(|user| user.id.0 as i64))
+    .bind(reaction.chat().map(|chat| chat.id.0))
     .bind(old_reactions)
     .bind(new_reactions)
     .bind(raw_json)
@@ -1001,7 +1001,7 @@ fn chat_member_status(kind: &ChatMemberKind) -> String {
     match kind {
         ChatMemberKind::Owner(_) => "creator",
         ChatMemberKind::Administrator(_) => "administrator",
-        ChatMemberKind::Member => "member",
+        ChatMemberKind::Member(_) => "member",
         ChatMemberKind::Restricted(_) => "restricted",
         ChatMemberKind::Left => "left",
         ChatMemberKind::Banned(_) => "banned",

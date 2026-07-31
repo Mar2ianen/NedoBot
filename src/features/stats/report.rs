@@ -120,7 +120,7 @@ async fn send_stats_report(
 fn stats_error(message: &'static str) -> impl FnOnce(anyhow::Error) -> teloxide::RequestError {
     move |err| {
         tracing::error!(%err, "{message}");
-        teloxide::RequestError::Io(std::io::Error::other("stats failed"))
+        teloxide::RequestError::Io(std::io::Error::other("stats failed").into())
     }
 }
 

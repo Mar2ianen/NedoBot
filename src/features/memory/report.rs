@@ -21,7 +21,7 @@ pub async fn send_memory_notes(
     .await
     .map_err(|err| {
         tracing::error!(%err, "failed to load memory notes");
-        teloxide::RequestError::Io(std::io::Error::other("memory check failed"))
+        teloxide::RequestError::Io(std::io::Error::other("memory check failed").into())
     })?;
 
     if notes.is_empty() {

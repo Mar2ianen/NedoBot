@@ -8,7 +8,7 @@ use sqlx::types::chrono::Utc;
 use teloxide::{
     payloads::GetUserProfilePhotosSetters,
     prelude::*,
-    types::{Chat, ChatKind, PhotoSize, UserId, UserProfilePhotos},
+    types::{ChatFullInfo, PhotoSize, UserId, UserProfilePhotos},
 };
 use tokio::time::sleep;
 
@@ -143,15 +143,11 @@ pub async fn refresh_profile(bot: &Bot, pool: &PgPool, user_id: i64) -> anyhow::
 
 fn build_details(
     telegram_user_id: i64,
-    chat: Option<&Chat>,
+    chat: Option<&ChatFullInfo>,
     photos: Option<&UserProfilePhotos>,
     personal_channel: Option<&PersonalChannelData>,
     personal_channel_error: Option<String>,
 ) -> UserProfileDetails {
-    let private = chat.and_then(|chat| match &chat.kind {
-        ChatKind::Private(private) => Some(private),
-        ChatKind::Public(_) => None,
-    });
     let chat_photo = chat.and_then(|chat| chat.photo.as_ref());
     let profile_photo = photos
         .and_then(|photos| photos.photos.first())
@@ -168,23 +164,23 @@ fn build_details(
 
     UserProfileDetails {
         telegram_user_id,
-        username: private.and_then(|private| private.username.clone()),
-        first_name: private.and_then(|private| private.first_name.clone()),
-        last_name: private.and_then(|private| private.last_name.clone()),
-        bio: private.and_then(|private| private.bio.clone()),
-        small_photo_file_id: chat_photo.map(|photo| photo.small_file_id.clone()),
-        small_photo_file_unique_id: chat_photo.map(|photo| photo.small_file_unique_id.clone()),
-        big_photo_file_id: chat_photo.map(|photo| photo.big_file_id.clone()),
-        big_photo_file_unique_id: chat_photo.map(|photo| photo.big_file_unique_id.clone()),
-        profile_photo_file_id: profile_photo.map(|photo| photo.file.id.clone()),
-        profile_photo_file_unique_id: profile_photo.map(|photo| photo.file.unique_id.clone()),
+        username: chat.and_then(|chat| chat.username().map(str::to_owned)),
+        first_name: chat.and_then(|chat| chat.first_name().map(str::to_owned)),
+        last_name: chat.and_then(|chat| chat.last_name().map(str::to_owned)),
+        bio: chat.and_then(|chat| chat.bio().map(str::to_owned)),
+        small_photo_file_id: chat_photo.map(|photo| photo.small_file_id.to_string()),
+        small_photo_file_unique_id: chat_photo.map(|photo| photo.small_file_unique_id.to_string()),
+        big_photo_file_id: chat_photo.map(|photo| photo.big_file_id.to_string()),
+        big_photo_file_unique_id: chat_photo.map(|photo| photo.big_file_unique_id.to_string()),
+        profile_photo_file_id: profile_photo.map(|photo| photo.file.id.to_string()),
+        profile_photo_file_unique_id: profile_photo.map(|photo| photo.file.unique_id.to_string()),
         profile_photo_width: profile_photo.map(photo_width),
         profile_photo_height: profile_photo.map(photo_height),
         profile_photo_count: photos.map(|photos| photos.total_count as i32),
         emoji_status_custom_emoji_id: chat
-            .and_then(|chat| chat.chat_full_info.emoji_status_custom_emoji_id.clone()),
-        profile_accent_color_id: chat
-            .and_then(|chat| chat.chat_full_info.profile_accent_color_id.map(i16::from)),
+            .and_then(|chat| chat.emoji_status_custom_emoji_id.as_ref())
+            .map(ToString::to_string),
+        profile_accent_color_id: chat.and_then(|chat| chat.profile_accent_color_id.map(i16::from)),
         personal_channel_chat_id: personal_channel.and_then(|channel| channel.chat_id),
         personal_channel_title: personal_channel.and_then(|channel| channel.title.clone()),
         personal_channel_username: personal_channel.and_then(|channel| channel.username.clone()),

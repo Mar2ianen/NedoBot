@@ -83,7 +83,9 @@ pub async fn download_media_file(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     media: &VoiceMedia,
 ) -> anyhow::Result<DownloadedMedia> {
-    let file = bot.get_file(media.file_id.clone()).await?;
+    let file = bot
+        .get_file(teloxide::types::FileId(media.file_id.clone()))
+        .await?;
     let suffix = file_suffix(media);
     let named = tempfile::Builder::new()
         .prefix("tg-media-")
