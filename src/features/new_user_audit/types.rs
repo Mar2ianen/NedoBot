@@ -248,6 +248,11 @@ impl NewUserAuditAssessment {
                 "first_message_assessment must be present when the audit input has a first message"
             );
         }
+        if !has_first_message_input && self.first_message_assessment.is_some() {
+            bail!(
+                "first_message_assessment must be null when the audit input has no first message"
+            );
+        }
         validate_avatar(self.avatar_observation.as_ref())?;
         validate_first_message(self.first_message_assessment.as_ref())?;
         validate_profile(&self.profile_assessment)
@@ -385,6 +390,30 @@ mod tests {
         assert!(error.contains("first_message_assessment must be present"));
 
         NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, false).unwrap();
+    }
+
+    #[test]
+    fn parse_rejects_first_message_assessment_without_input_text() {
+        let value = VALID_ASSESSMENT.replace(
+            "\"first_message_assessment\": null,",
+            r#""first_message_assessment": {
+                "relation_to_chat": "on_topic",
+                "direct_dm_offer": false,
+                "offtopic_promo": false,
+                "template_campaign": false,
+                "self_reference_grammar": "none_or_unclear",
+                "profile_name_grammar_relation": "not_applicable",
+                "risk_markers": [],
+                "evidence": [],
+                "summary": "Контекста первого сообщения нет.",
+                "confidence": 0.8
+            },"#,
+        );
+        let error = NewUserAuditAssessment::parse_for_modalities(&value, false, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("first_message_assessment must be null"));
     }
 
     #[test]
