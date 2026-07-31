@@ -57,7 +57,7 @@ curl "https://api.telegram.org/bot$TELOXIDE_TOKEN/getMe"
 
 ## Конфиг
 
-Локальный `.env` не коммитится и содержит только секреты либо чувствительные URL. Несекретный runtime-конфиг хранится в секции `[runtime]` существующего файла [`config/llm_profiles.toml.example`](../config/llm_profiles.toml.example). Для production рекомендуется скопировать этот файл в `/etc/tg-ai-bot/llm_profiles.toml` и задать `LLM_PROFILES_PATH` в unit/process environment; если переменная не задана, используется репозиторный `config/llm_profiles.toml.example`.
+Локальный `.env` не коммитится и содержит только секреты либо чувствительные URL. Несекретный runtime-конфиг хранится в обязательной секции `[runtime]` существующего файла [`config/llm_profiles.toml.example`](../config/llm_profiles.toml.example). Если секция отсутствует, startup завершается ошибкой — runtime defaults не подставляются. Для production рекомендуется скопировать этот файл в `/etc/tg-ai-bot/llm_profiles.toml` и задать `LLM_PROFILES_PATH` в unit/process environment; если переменная не задана, используется репозиторный `config/llm_profiles.toml.example` только для локального запуска.
 
 В окружении процесса остаются только секреты и чувствительные адреса:
 
@@ -75,6 +75,15 @@ OPENROUTER_API_KEY=
 ASK_DATABASE_URL=
 GITHUB_PERSONAL_ACCESS_TOKEN=
 ```
+
+Для systemd production unit путь задаётся явно и абсолютно:
+
+```ini
+[Service]
+Environment=LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml
+```
+
+Не использовать под systemd относительный `config/llm_profiles.toml.example` и не заменять production profile простым копированием example: provider topology и значения `[runtime]` должны быть перенесены из фактического deployment-конфига.
 
 `config/llm_profiles.toml.example` содержит provider/model profiles, task routes и все статические лимиты, флаги, идентификаторы чатов, пути и tool allowlists. API keys, DSN, invite URL и proxy URL туда не переносятся.
 
@@ -100,7 +109,7 @@ deploy hook перезагружает контейнерный Nginx после
 
 GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy". Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
 
-`LLM_PROFILES_PATH` необязателен: без него загружается `config/llm_profiles.toml.example`. Для production отдельный путь задаётся в environment самого процесса или systemd unit, но не в secrets `.env`. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
+`LLM_PROFILES_PATH` необязателен только для локального запуска: без него загружается `config/llm_profiles.toml.example`. Для production unit обязан задавать абсолютный `LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml`; на относительный путь под systemd рассчитывать нельзя. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
 
 Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 

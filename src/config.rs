@@ -132,7 +132,7 @@ impl Config {
         let runtime = llm_profiles
             .as_ref()
             .map(|profiles| profiles.runtime.clone())
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("LLM profile runtime settings are not configured"))?;
 
         Ok(Self {
             source_channel_id: runtime.source_channel_id,
@@ -871,6 +871,8 @@ thinking = "none"
 
 [routes.first_comment]
 models = ["primary", "fallback"]
+
+[runtime]
 "#,
             )
             .unwrap(),
@@ -1008,6 +1010,8 @@ thinking = "none"
 models = ["text_only"]
 [routes.new_user_audit]
 models = ["text_only"]
+
+[runtime]
 "#,
             )
             .unwrap(),
@@ -1071,6 +1075,8 @@ thinking = "none"
 models = ["primary"]
 [routes.new_user_audit]
 models = ["primary", "fallback"]
+
+[runtime]
 "#,
             )
             .unwrap(),

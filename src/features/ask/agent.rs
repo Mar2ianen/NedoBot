@@ -181,6 +181,7 @@ async fn answer_within_deadline(
             &messages,
             Some(agent_tools.clone()),
             continuation_id.as_deref(),
+            image_base64.is_some(),
         )
         .await
         .map_err(|AgentGenerationError::Request(error)| error)?;
@@ -385,9 +386,15 @@ async fn answer_within_deadline(
         "{}\n\nSYSTEM: лимит исследования исчерпан. Сейчас верни лучший честный Rich Markdown-ответ по уже полученным данным. Не вызывай новый инструмент.",
         continuation_prompt(&observations, 0)
     )));
-    let response = generate_turn(config, &messages, None, continuation_id.as_deref())
-        .await
-        .map_err(|AgentGenerationError::Request(error)| error)?;
+    let response = generate_turn(
+        config,
+        &messages,
+        None,
+        continuation_id.as_deref(),
+        image_base64.is_some(),
+    )
+    .await
+    .map_err(|AgentGenerationError::Request(error)| error)?;
     if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
         return finish_answer(
             mcp,
@@ -442,6 +449,7 @@ async fn generate_turn(
     messages: &[ChatMessage],
     tools: Option<Vec<Tool>>,
     previous_response_id: Option<&str>,
+    requires_images: bool,
 ) -> Result<ChatResponse, AgentGenerationError> {
     retry_once_on_timeout(Duration::from_secs(config.ask_action_timeout_sec), || {
         generate_chat_checked(
@@ -451,6 +459,7 @@ async fn generate_turn(
                 system_prompt: Some(SYSTEM_PROMPT),
                 messages: messages.to_vec(),
                 tools: tools.clone(),
+                requires_images,
                 requires_tools: true,
                 previous_response_id: previous_response_id.map(str::to_owned),
                 temperature: config.ask_llm_temperature,

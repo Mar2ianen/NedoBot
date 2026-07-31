@@ -2,7 +2,8 @@
 # This file contains no API keys. api_key_env names the required environment variable.
 # By default the bot loads this file. Set LLM_PROFILES_PATH in the process
 # environment when deployment needs a separate copy. Task routes are the only
-# source of provider/model/capabilities for runtime generation.
+# source of provider/model/capabilities for runtime generation. The [runtime]
+# section is required; missing it is a startup error.
 
 [providers.gemini]
 driver = "gemini"

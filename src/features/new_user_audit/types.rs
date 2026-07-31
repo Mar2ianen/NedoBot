@@ -184,7 +184,11 @@ impl NewUserAuditAssessment {
     /// для хранения или модерации значения.
     #[cfg(test)]
     pub fn parse(value: &str) -> anyhow::Result<Self> {
-        Self::parse_for_modalities(value, true, false)
+        let assessment = Self::parse_value(value)?;
+        validate_avatar(assessment.avatar_observation.as_ref())?;
+        validate_first_message(assessment.first_message_assessment.as_ref())?;
+        validate_profile(&assessment.profile_assessment)?;
+        Ok(assessment)
     }
 
     pub fn parse_for_modalities(
@@ -192,6 +196,12 @@ impl NewUserAuditAssessment {
         has_avatar_input: bool,
         has_first_message_input: bool,
     ) -> anyhow::Result<Self> {
+        let assessment = Self::parse_value(value)?;
+        assessment.validate_for_modalities(has_avatar_input, has_first_message_input)?;
+        Ok(assessment)
+    }
+
+    fn parse_value(value: &str) -> anyhow::Result<Self> {
         let value: Value =
             serde_json::from_str(value).context("LLM audit output is not valid JSON")?;
         let object = value
@@ -209,7 +219,6 @@ impl NewUserAuditAssessment {
 
         let assessment: Self = serde_json::from_value(value)
             .context("LLM audit output does not match the assessment contract")?;
-        assessment.validate_for_modalities(has_avatar_input, has_first_message_input)?;
         Ok(assessment)
     }
 
@@ -220,6 +229,9 @@ impl NewUserAuditAssessment {
     ) -> anyhow::Result<()> {
         if !has_avatar_input && self.avatar_observation.is_some() {
             bail!("avatar_observation must be null when the audit input has no avatar");
+        }
+        if has_avatar_input && self.avatar_observation.is_none() {
+            bail!("avatar_observation must be present when the audit input has an avatar");
         }
         if has_first_message_input && self.first_message_assessment.is_none() {
             bail!(
@@ -250,6 +262,16 @@ fn validate_first_message(assessment: Option<&FirstMessageAssessment>) -> anyhow
     let Some(assessment) = assessment else {
         return Ok(());
     };
+    if assessment.offtopic_promo
+        && !matches!(
+            assessment.relation_to_chat,
+            MessageRelation::LooselyRelated | MessageRelation::OffTopic
+        )
+    {
+        bail!(
+            "first_message_assessment.offtopic_promo requires loosely_related or off_topic relation"
+        );
+    }
     validate_list(
         "first_message_assessment.risk_markers",
         &assessment.risk_markers,
@@ -353,6 +375,39 @@ mod tests {
         assert!(error.contains("first_message_assessment must be present"));
 
         NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, false).unwrap();
+    }
+
+    #[test]
+    fn parse_requires_avatar_observation_when_input_has_avatar() {
+        let error = NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, true, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("avatar_observation must be present"));
+    }
+
+    #[test]
+    fn parse_rejects_offtopic_promo_for_on_topic_message() {
+        let value = VALID_ASSESSMENT.replace(
+            "\"first_message_assessment\": null,",
+            r#""first_message_assessment": {
+                "relation_to_chat": "on_topic",
+                "direct_dm_offer": true,
+                "offtopic_promo": true,
+                "template_campaign": false,
+                "self_reference_grammar": "none_or_unclear",
+                "profile_name_grammar_relation": "not_applicable",
+                "risk_markers": [],
+                "evidence": [],
+                "summary": "Предложение выглядит тематическим.",
+                "confidence": 0.8
+            },"#,
+        );
+        let error = NewUserAuditAssessment::parse_for_modalities(&value, false, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("offtopic_promo requires"));
     }
 
     #[test]

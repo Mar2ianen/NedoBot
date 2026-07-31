@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 use super::types::{
-    AvatarClass, FirstMessageAssessment, FirstMessageRiskMarker, NewUserAuditAssessment,
-    ProfileNameGrammarRelation, SelfReferenceGrammar,
+    AvatarClass, FirstMessageAssessment, FirstMessageRiskMarker, MessageRelation,
+    NewUserAuditAssessment, ProfileNameGrammarRelation, SelfReferenceGrammar,
 };
 
 #[allow(dead_code)]
@@ -99,7 +99,12 @@ fn score_first_message(
             assessment,
             FirstMessageRiskMarker::PerformativeFemininePersona,
         );
-    let llm_score = if paid_easy_task || (assessment.direct_dm_offer && assessment.offtopic_promo) {
+    let off_topic_promo = assessment.offtopic_promo
+        && matches!(
+            assessment.relation_to_chat,
+            MessageRelation::LooselyRelated | MessageRelation::OffTopic
+        );
+    let llm_score = if paid_easy_task || (assessment.direct_dm_offer && off_topic_promo) {
         30
     } else if assessment.direct_dm_offer && assessment.template_campaign {
         24
@@ -288,6 +293,30 @@ mod tests {
         );
         assert_eq!(components.first_message_score, 45);
         assert_eq!(components.final_score(), 65);
+    }
+
+    #[test]
+    fn on_topic_offtopic_promo_does_not_add_direct_message_score() {
+        let mut assessment = assessment(
+            r#"{
+                "relation_to_chat":"on_topic", "direct_dm_offer":true,
+                "offtopic_promo":false, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":[], "evidence":[],
+                "summary":"Тематическое сообщение.", "confidence":0.9
+            }"#,
+            "null",
+        );
+        assessment
+            .first_message_assessment
+            .as_mut()
+            .expect("test assessment must contain first message")
+            .offtopic_promo = true;
+
+        let components = score_assessment(0, json!([]), &assessment, Default::default());
+
+        assert_eq!(components.first_message_score, 0);
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub struct GenerateChatOptions<'a> {
     pub system_prompt: Option<&'a str>,
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Tool>>,
+    pub requires_images: bool,
     pub requires_tools: bool,
     pub previous_response_id: Option<String>,
     pub temperature: f32,
@@ -169,12 +170,7 @@ async fn generate_chat_with_profile_checked(
     options: GenerateChatOptions<'_>,
 ) -> anyhow::Result<ChatResponse> {
     let route = options.route;
-    let requirements = RouteRequirements {
-        requires_tools: options.requires_tools || options.tools.is_some(),
-        requires_system_prompt: options.system_prompt.is_some(),
-        num_predict: Some(options.num_predict),
-        ..RouteRequirements::default()
-    };
+    let requirements = chat_route_requirements(&options);
     let resolved = profiles.resolve_route(route, &requirements)?;
     let mut last_error = None;
 
@@ -209,6 +205,16 @@ async fn generate_chat_with_profile_checked(
     Err(last_error.unwrap_or_else(|| {
         anyhow::anyhow!("no compatible LLM profile chat attempts were configured")
     }))
+}
+
+fn chat_route_requirements(options: &GenerateChatOptions<'_>) -> RouteRequirements {
+    RouteRequirements {
+        requires_images: options.requires_images,
+        requires_tools: options.requires_tools || options.tools.is_some(),
+        requires_system_prompt: options.system_prompt.is_some(),
+        num_predict: Some(options.num_predict),
+        ..RouteRequirements::default()
+    }
 }
 
 async fn generate_chat_profile_once(
@@ -475,6 +481,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_route_requirements_preserve_image_requirement_for_fallback_resolution() {
+        let options = GenerateChatOptions {
+            route: "ask",
+            system_prompt: Some("system"),
+            messages: Vec::new(),
+            tools: None,
+            requires_images: true,
+            requires_tools: true,
+            previous_response_id: None,
+            temperature: 0.0,
+            num_predict: 128,
+        };
+        let profiles =
+            LlmProfiles::from_toml(include_str!("../../config/llm_profiles.toml.example")).unwrap();
+
+        let resolved = profiles
+            .resolve_route("ask", &chat_route_requirements(&options))
+            .unwrap();
+
+        assert_eq!(resolved.selections.len(), 1);
+        assert_eq!(resolved.selections[0].model.model, "minimax-m3");
+    }
+
     #[tokio::test]
     async fn profile_prompt_only_omits_response_format_and_validator_accepts_json_contract() {
         async fn capture(
@@ -532,6 +562,8 @@ thinking = "none"
 
 [routes.profile_test]
 models = ["test"]
+
+[runtime]
 "#
             ))
             .unwrap(),
@@ -619,6 +651,8 @@ thinking = "none"
 [routes.switch]
 models = ["primary", "fallback"]
 fallback_on_validation_failure = {fallback_on_validation_failure}
+
+[runtime]
 "#
         ))
         .unwrap()
