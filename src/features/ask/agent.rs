@@ -12,7 +12,9 @@ use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
 use crate::features::ask::chat_search::message_url;
-use crate::features::ask::mcp_client::{LOCAL_AGENT_TOOLS, McpClient, structured_preview};
+use crate::features::ask::mcp_client::{
+    LOCAL_AGENT_TOOLS, McpClient, structured_preview, wire_tool_name,
+};
 use crate::features::ask::notes::add_user_note_from_search;
 use crate::features::ask::repo;
 use crate::features::ask::types::{AskProgress, PendingToolCallAudit};
@@ -221,7 +223,9 @@ async fn answer_within_deadline(
         messages.push(assistant_message(&response));
         let mut tool_responses = Vec::with_capacity(tool_calls.len());
         for call in tool_calls {
-            let tool = call.fn_name.as_str();
+            let wire_tool = call.fn_name.as_str();
+            let canonical_tool = canonical_native_tool(&mcp, &agent_tools, wire_tool);
+            let tool = canonical_tool.as_deref().unwrap_or(wire_tool);
             let arguments = &call.fn_arguments;
             let signature = format!(
                 "{tool}:{}",
@@ -249,7 +253,7 @@ async fn answer_within_deadline(
                 ));
                 continue;
             }
-            if !allowed_native_tool(&mcp, &agent_tools, tool) {
+            if canonical_tool.is_none() {
                 audit_tool_call(
                     pool,
                     ask_run_id,
@@ -518,7 +522,7 @@ fn ask_user_message(prompt: String, image_base64: Option<&str>) -> ChatMessage {
 
 fn local_agent_tools() -> Vec<Tool> {
     vec![
-        Tool::new("notes.add_user")
+        Tool::new(wire_tool_name("notes.add_user"))
             .with_description("Сохранить короткий подтверждённый факт о пользователе.")
             .with_schema(json!({
                 "type": "object",
@@ -530,7 +534,7 @@ fn local_agent_tools() -> Vec<Tool> {
                 }
             }))
             .with_strict(true),
-        Tool::new("web.search")
+        Tool::new(wire_tool_name("web.search"))
             .with_description("Найти актуальные внешние факты и прочитать результаты поиска.")
             .with_schema(json!({
                 "type": "object",
@@ -539,7 +543,7 @@ fn local_agent_tools() -> Vec<Tool> {
                 "properties": {"query": {"type": "string"}}
             }))
             .with_strict(true),
-        Tool::new("github.search")
+        Tool::new(wire_tool_name("github.search"))
             .with_description("Найти публичный код, issue или репозиторий на GitHub.")
             .with_schema(json!({
                 "type": "object",
@@ -551,11 +555,21 @@ fn local_agent_tools() -> Vec<Tool> {
     ]
 }
 
-fn allowed_native_tool(mcp: &McpClient, tools: &[Tool], tool: &str) -> bool {
-    tools
+fn canonical_native_tool(mcp: &McpClient, tools: &[Tool], wire_tool: &str) -> Option<String> {
+    if !tools
         .iter()
-        .any(|candidate| candidate.name.to_string() == tool)
-        && (mcp.has_tool(tool) || LOCAL_AGENT_TOOLS.contains(&tool))
+        .any(|candidate| candidate.name.to_string() == wire_tool)
+    {
+        return None;
+    }
+    mcp.canonical_tool_name(wire_tool)
+        .map(str::to_owned)
+        .or_else(|| {
+            LOCAL_AGENT_TOOLS
+                .iter()
+                .find(|canonical| wire_tool_name(canonical) == wire_tool)
+                .map(|canonical| (*canonical).to_string())
+        })
 }
 
 async fn audit_tool_call(

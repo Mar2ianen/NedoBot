@@ -196,6 +196,8 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 `/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены. Старый `ASK_TIMEOUT_SEC` временно поддерживается только как совместимый alias для turn timeout, пока production environment files переезжают на явное имя.
 
+MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
+
 ### Поиск фактов для первого комментария
 
 SEARCH-контур добавляет вспомогательный свежий контекст перед генерацией первого комментария:
