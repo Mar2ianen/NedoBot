@@ -120,12 +120,9 @@ GROQ_API_KEY=
 GROQ_MODEL=
 CEREBRAS_API_KEY=
 CEREBRAS_MODEL=
-# Unified audit rollout: shadow first, then authoritative cutover.
+# Unified audit: one canonical generation and materialization flow.
 NEW_USER_AUDIT_ENABLED=false
-NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=false
 NEW_USER_AUDIT_MAX_TOKENS=900
-AVATAR_CLASSIFIER_ENABLED=true
-FIRST_MESSAGE_SPAM_ENABLED=false
 OPENROUTER_API_KEY=
 OPENROUTER_MODEL=
 GEMINI_API_KEY=
@@ -174,9 +171,9 @@ deploy hook перезагружает контейнерный Nginx после
 
 GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy"; legacy Gemini использует proxy при заданном LLM_PROXY_URL, остальные legacy providers идут напрямую. Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
 
-`LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют legacy-поведение `LLM_PROVIDER`/моделей. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `avatar_analysis`, `first_message_spam`, `new_user_audit` или `ask`) и игнорирует legacy provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
+`LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют совместимость с `LLM_PROVIDER`/моделями. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`) и игнорирует обычные provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
 
-Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, а `new_user_audit`, `avatar_analysis` и `first_message_spam` остаются отдельными Cerebras-маршрутами на `gemma-4-31b`; у first-message сохраняется Ollama fallback. Gemini-модели остаются только в цепочке `first_comment`. Legacy `.env` задаёт `ASK_LLM_PROVIDER=ollama`, `ASK_LLM_MODEL=minimax-m3`, `NEW_USER_AUDIT_PROVIDER=cerebras` и `NEW_USER_AUDIT_MODEL=gemma-4-31b`.
+Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет. При отключённых profiles `.env` задаёт `ASK_LLM_PROVIDER=ollama`, `ASK_LLM_MODEL=minimax-m3`, `NEW_USER_AUDIT_PROVIDER=cerebras` и `NEW_USER_AUDIT_MODEL=gemma-4-31b`.
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
 
@@ -192,7 +189,7 @@ GenAiTransport создаёт два долгоживущих клиента: di
 - `LLM_PROVIDER=ollama` секрета не требует.
 - Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
 - Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
-- `NEW_USER_AUDIT_ENABLED=true` запускает unified worker. В legacy mode он использует отдельные `NEW_USER_AUDIT_PROVIDER`/`NEW_USER_AUDIT_MODEL`, а в profile mode — route `new_user_audit` из TOML. `NEW_USER_AUDIT_MAX_TOKENS` ограничивает его output и по умолчанию равен `900`. При `NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=false` worker сохраняет shadow assessments, а legacy pipelines остаются источником истины. Authoritative cutover требует одновременно `NEW_USER_AUDIT_ENABLED=true`, `AVATAR_CLASSIFIER_ENABLED=false` и `FIRST_MESSAGE_SPAM_ENABLED=false`; он также требует корректные `RAG_EMBEDDING_URL`, `RAG_EMBEDDING_MODEL` и `RAG_EMBEDDING_TIMEOUT_SEC`, поскольку материализация оценивает embedding первого сообщения.
+- `NEW_USER_AUDIT_ENABLED=true` запускает единственный unified worker. При отключённых profiles он использует отдельные `NEW_USER_AUDIT_PROVIDER`/`NEW_USER_AUDIT_MODEL`, а в profile mode — route `new_user_audit` из TOML. `NEW_USER_AUDIT_MAX_TOKENS` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `RAG_EMBEDDING_URL`, `RAG_EMBEDDING_MODEL` и `RAG_EMBEDDING_TIMEOUT_SEC`.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
@@ -586,13 +583,7 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 
 `src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
 
-`NEW_USER_AUDIT_ENABLED=false` по умолчанию. При `NEW_USER_AUDIT_ENABLED=true` и `NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=false` unified worker выполняет shadow-анализ и сохраняет assessment без изменения authoritative score/review. Для cutover включите оба флага: authoritative flow атомарно сохраняет baseline и job, затем materialize-ит итоговый score/review. Startup validation требует выключить `AVATAR_CLASSIFIER_ENABLED` и `FIRST_MESSAGE_SPAM_ENABLED`, а также проверяет embedding-конфиг, поэтому параллельные источники риска и неполная materialization-конфигурация не попадут в production.
-
-Для ручного пересчёта истории:
-
-```bash
-cargo run --release --bin analyze_new_users -- --limit 4000 --max-messages 1000000 --include-analyzed
-```
+`NEW_USER_AUDIT_ENABLED=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. Startup validation проверяет provider/model, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
 
 Ключевая таблица: `telegram_new_user_profile_audits`. В ней сохраняются классы риска, labels/reasons, возраст в чате, reply/comment context, текстовая повторяемость, профиль/персональный канал, наличие/метрики фото. `profile_photo_reuse_count` сейчас метрика only и не добавляет risk score.
 

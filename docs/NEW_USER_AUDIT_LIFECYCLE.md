@@ -1,92 +1,62 @@
 # Единый lifecycle аудита нового пользователя
 
-## Цель
-
-Проверка нового пользователя — один доменный процесс на пару `(chat_id, telegram_user_id)`:
+Проверка нового пользователя — один доменный процесс на пару
+`(chat_id, telegram_user_id)`:
 
 1. refresh профиля;
-2. сбор bounded snapshot профиля, поведения, первого сообщения и аватара;
-3. единый audit/score;
-4. создание review request;
-5. отдельная Telegram delivery только при `risk_score >= 70`.
+2. bounded snapshot профиля, поведения, первого сообщения и аватара;
+3. один LLM audit на route `new_user_audit`;
+4. атомарная materialization score/signals и review request;
+5. отдельная bounded Telegram delivery только при `risk_score >= 70`.
 
-`avatar_analysis_jobs` и `first_message_spam_analysis_jobs` не должны независимо менять risk score, создавать review или отправлять Telegram-карточки.
+Avatar и first-message являются секциями единого assessment. Отдельных
+очередей, LLM routes и workers для них нет. Старые таблицы и миграции остаются
+в БД для backward compatibility, но runtime их больше не enqueue-ит и не
+обрабатывает.
 
-## Текущая проблема
-
-Сейчас `user_profiles::enrichment::process_refreshed_profile` синхронно сохраняет baseline audit, отдельно ставит first-message и avatar jobs, а каждый из трёх путей может вызывать `create_review` и `send_review`.
-
-Это создаёт три независимых lifecycle, несколько LLM requests и гонку score: повторный baseline upsert способен затереть ранее применённые async contributions.
-
-## Целевая state machine
+## State machine
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending: upsert chat/user job
+    [*] --> pending: upsert canonical snapshot
     pending --> processing: claim + lease + attempts
     retry_wait --> processing: due claim
-    processing --> retry_wait: retryable failure
+    processing --> retry_wait: retryable generation failure
     processing --> failed: retry budget exhausted
-    processing --> succeeded: audit persisted and review synced
-    succeeded --> pending: material snapshot changed
+    processing --> succeeded: assessment persisted
+    succeeded --> materializing: materialization claim
+    materializing --> retry_wait_materialization: transient SQL/embedding failure
+    materializing --> stale: malformed or stale snapshot
+    materializing --> materialized: score and review persisted
+    materialized --> pending: snapshot changed
 ```
 
-Внутри `processing` stages выполняются в одном orchestration worker:
-
-```text
-baseline profile/behavior
-  -> first-message evidence, если доступно и включено
-  -> avatar evidence, если доступно и включено
-  -> transaction: materialize final score/signals and upsert review request
-```
-
-Telegram transport не является stage audit worker-а. Единственный review delivery worker отдельно claim-ит `spam_review_requests`; DB constraint и `send_review` не допускают delivery ниже 70.
+Generation and materialization have independent leases. A successful LLM
+response is persisted before materialization starts, so SQL or embedding
+failures never reopen LLM generation. A stale snapshot cannot overwrite a
+newer baseline.
 
 ## Score ownership
 
-Risk score нельзя дальше хранить как смесь полного baseline upsert и async `risk_score = risk_score + delta`.
-
-Authoritative итог строится из idempotent contributions:
+The final score is rebuilt from idempotent components:
 
 ```text
 final_score = clamp(baseline_score + first_message_delta + avatar_delta, 0, 100)
 ```
 
-Каждый contribution хранит input/snapshot version и применяется один раз. Повторный profile refresh пересчитывает baseline, но не затирает действующие contributions.
+The materializer writes the audit row and upserts one review request in the
+same transaction. Telegram delivery is a separate worker and never changes the
+score.
 
-## Rollout без потери jobs
+## Guarantees
 
-1. Добавить additive `new_user_audit_jobs` с `chat_id`, `telegram_user_id`, state, attempts, lease, snapshot hash и typed stage states.
-2. Добавить worker и integration tests, но оставить его в shadow mode: он не меняет authoritative score и не создаёт review. Producer enqueue'ит unified job параллельно с legacy pipeline; legacy остаётся authoritative.
-3. Сверить shadow results со score и решениями legacy pipeline.
-4. Реализовать final transaction unified pipeline: materialize score/signals и upsert review request без Telegram delivery.
-5. Только после этого переключить producer после profile refresh на один unified enqueue и отдельно убрать старые workers/call sites.
+- one claim owner: `FOR UPDATE SKIP LOCKED`, lease and CAS;
+- bounded generation and materialization retries with terminal states;
+- missing avatar is a valid text-only assessment, not an endless retry;
+- one audit job and one review request per canonical snapshot/user;
+- score `69` has no delivery attempt, score `70` is claimable;
+- stale workers cannot change score, signals or review state.
 
-Пока не выполнен пункт 4, `NEW_USER_AUDIT_ENABLED=true` означает именно shadow mode и не отключает `FIRST_MESSAGE_SPAM_ENABLED` или `AVATAR_CLASSIFIER_ENABLED`.
-
-Legacy `processing` rows не reclaim-ятся новым worker-ом до истечения старой lease или controlled drain.
-
-## Обязательные гарантии
-
-- один claim owner: `FOR UPDATE SKIP LOCKED`, lease и CAS по `(id, attempts, status)`;
-- bounded retry: `15s → 30s → 60s → 5m → 24h → terminal failed`;
-- missing/unavailable avatar — нейтральный evidence state, не бесконечный retry;
-- first message/avatar disabled — stage `not_required`, без backlog/external request;
-- один review request на `(chat_id, user)`;
-- no Telegram send из unified audit worker;
-- score `69` никогда не имеет delivery attempt/message id; score `70` становится claimable;
-- stale worker не меняет score, signals или review.
-
-## Acceptance tests
-
-PostgreSQL integration tests должны покрыть:
-
-- dedup и scope по `(chat_id, user)`;
-- lease reclaim/CAS stale finalizer;
-- migration pending/retry/expired-processing rows без dual claim;
-- idempotent contributions и сохранение их при refresh baseline;
-- avatar change rejects stale snapshot;
-- disabled stages не создают job/backlog;
-- retry exhaustion;
-- review threshold и отсутствие Telegram send ниже 70;
-- два concurrent stage completion создают один review request.
+Historical migration files and tables are intentionally not dropped: they may
+already be applied to production databases. They are no longer part of the
+application flow or reviewed MCP catalog.

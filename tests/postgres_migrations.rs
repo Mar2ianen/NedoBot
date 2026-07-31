@@ -9,13 +9,6 @@ use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
-    avatar_analysis::{
-        repo::{
-            claim_next_avatar_analysis_job, enqueue_avatar_analysis_job,
-            mark_avatar_analysis_failed,
-        },
-        service::apply_avatar_risk_signal,
-    },
     chat_retrieval::{
         EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
         mark_embedding_failed, mark_embedding_ready,
@@ -29,7 +22,6 @@ use tg_ai_bot_teloxide::features::{
         mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
         mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
-    first_message_spam::enqueue_first_message_spam_analysis_if_enabled,
     jobs::{claim::CasResult, observability::load_job_lifecycle_report},
     memory::service::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
@@ -37,12 +29,10 @@ use tg_ai_bot_teloxide::features::{
     },
     new_user_audit::{
         repo::{
-            NewUserAuditJobParams, claim_next_new_user_audit_job,
-            claim_next_new_user_audit_job_with_materialization, enqueue_new_user_audit_job,
-            finalize_authoritative_new_user_audit_job, finalize_new_user_audit_job,
-            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
-            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
-            materialize_authoritative_new_user_audit_job,
+            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
+            finalize_new_user_audit_job, mark_new_user_audit_failed,
+            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+            mark_new_user_audit_retry, materialize_new_user_audit_job,
         },
         scoring::ScoreComponents,
     },
@@ -79,8 +69,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
     assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(&database_url).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
-    assert_successful_shadow_audit_replays_only_for_authoritative_materialization(&pool).await;
-    assert_authoritative_generation_is_durable_before_materialization(&pool).await;
+    assert_successful_audit_replays_for_materialization(&pool).await;
+    assert_audit_generation_is_durable_before_materialization(&pool).await;
     assert_new_user_audit_materialization_lifecycle(&pool).await;
     assert_new_user_audit_generation_materialization_upgrade(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
@@ -90,7 +80,6 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_comment_reconciliation_requires_operator_claim(&pool).await;
-    assert_avatar_job_finalization_requires_current_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
     assert_job_lifecycle_observability(&pool).await;
@@ -649,67 +638,6 @@ async fn assert_post_comment_delivery_lifecycle_upgrade(pool: &PgPool) {
     .expect("staged delivery lifecycle fixtures must be cleaned up");
 }
 
-async fn assert_avatar_job_finalization_requires_current_claim(pool: &PgPool) {
-    let user_id = 9_000_001_i64;
-    let unique_id = "avatar-cas-regression";
-    let features = serde_json::json!({ "test": true });
-    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Avatar CAS')")
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("avatar job user profile must exist");
-    enqueue_avatar_analysis_job(
-        pool,
-        user_id,
-        "avatar-file-id",
-        unique_id,
-        "avatar-snapshot",
-        &features,
-        "test-prompt",
-    )
-    .await
-    .expect("avatar job must be enqueued");
-
-    let first_claim = claim_next_avatar_analysis_job(pool)
-        .await
-        .expect("first avatar claim must succeed")
-        .expect("avatar job must be claimed");
-    query("update avatar_analysis_jobs set lease_expires_at = now() - interval '1 second' where id = $1")
-        .bind(first_claim.id)
-        .execute(pool)
-        .await
-        .expect("avatar lease must be expired for regression test");
-    let second_claim = claim_next_avatar_analysis_job(pool)
-        .await
-        .expect("reclaimed avatar job must be claimable")
-        .expect("avatar job must be reclaimed");
-    assert!(second_claim.attempts > first_claim.attempts);
-
-    let stale_result = mark_avatar_analysis_failed(pool, &first_claim, "test_failure", None)
-        .await
-        .expect("stale avatar finalization query must execute");
-    assert_eq!(
-        stale_result,
-        tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
-    );
-
-    let status: (String, i32) =
-        query_as("select status, attempts from avatar_analysis_jobs where id = $1")
-            .bind(second_claim.id)
-            .fetch_one(pool)
-            .await
-            .expect("reclaimed avatar job must remain present");
-    assert_eq!(status, ("processing".to_string(), second_claim.attempts));
-
-    let current_result = mark_avatar_analysis_failed(pool, &second_claim, "test_failure", None)
-        .await
-        .expect("current avatar finalization query must execute");
-    assert_eq!(
-        current_result,
-        tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
-    );
-}
-
 async fn assert_low_risk_review_delivery_is_blocked_by_database(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_099;
@@ -954,6 +882,13 @@ async fn assert_new_user_audit_generation_cas_requires_live_lease_and_current_ve
         finalized_version,
         tg_ai_bot_teloxide::features::new_user_audit::repo::CURRENT_MATERIALIZATION_VERSION
     );
+    query(
+        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_next_attempt_at = now() + interval '1 day' where id = $1",
+    )
+    .bind(current_claim.id)
+    .execute(pool)
+    .await
+    .expect("generation CAS replay fixture must be closed");
 }
 
 async fn assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(
@@ -1000,6 +935,21 @@ async fn assert_new_user_audit_enqueue_version_bump_reopens_completed_materializ
         ("pending".into(), 0, true, true, true, None, true),
         "a materialization version bump must reset the completed replay lifecycle"
     );
+    let job_id: i64 = query_scalar(
+        "select id from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("version bump fixture id must be queryable");
+    query(
+        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_next_attempt_at = now() + interval '1 day' where id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("version bump replay fixture must be closed");
 }
 
 async fn assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(
@@ -1196,9 +1146,7 @@ async fn assert_unified_enqueue_and_finalizer_share_lock_order(pool: &PgPool) {
         .expect("lock-order review fixture must be removed");
 }
 
-async fn assert_successful_shadow_audit_replays_only_for_authoritative_materialization(
-    pool: &PgPool,
-) {
+async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_097;
     let input = serde_json::json!({"schema_version": "fixture-v1"});
@@ -1252,59 +1200,21 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
         .expect("shadow audit success must finalize"),
         CasResult::Applied
     );
-    assert!(
-        claim_next_new_user_audit_job(pool)
-            .await
-            .expect("normal shadow claim must execute")
-            .is_none(),
-        "successful shadow assessments must not be repeatedly claimed"
-    );
-
-    query(
-        "update new_user_audit_jobs set materialization_status = 'retry_wait', materialization_next_attempt_at = now() - interval '1 second' where id = $1",
-    )
-    .bind(shadow_claim.id)
-    .execute(pool)
-    .await
-    .expect("stored replay retry fixture must be created");
-    assert!(
-        claim_next_new_user_audit_job_with_materialization(pool, false)
-            .await
-            .expect("non-authoritative retry claim must execute")
-            .is_none(),
-        "non-authoritative worker must not reprocess a stored replay in retry_wait"
-    );
-
-    query(
-        "update new_user_audit_jobs set materialization_status = 'processing', materialization_lease_expires_at = now() - interval '1 second' where id = $1",
-    )
-    .bind(shadow_claim.id)
-    .execute(pool)
-    .await
-    .expect("expired stored replay fixture must be created");
-    assert!(
-        claim_next_new_user_audit_job_with_materialization(pool, false)
-            .await
-            .expect("non-authoritative expired claim must execute")
-            .is_none(),
-        "non-authoritative worker must not reclaim an expired stored replay"
-    );
-
     query(
         "update new_user_audit_jobs set materialization_status = 'pending', materialization_lease_expires_at = null where id = $1",
     )
     .bind(shadow_claim.id)
     .execute(pool)
     .await
-    .expect("stored replay fixture must be restored for authoritative materialization");
+    .expect("stored replay fixture must be restored for materialization");
 
-    let replay_claim = claim_next_new_user_audit_job_with_materialization(pool, true)
+    let replay_claim = claim_next_new_user_audit_job(pool)
         .await
-        .expect("authoritative replay claim must execute")
-        .expect("successful shadow assessment must be replayable after cutover");
+        .expect("replay claim must execute")
+        .expect("successful assessment must be replayable");
     assert!(replay_claim.is_materialization_replay);
     assert_eq!(
-        materialize_authoritative_new_user_audit_job(
+        materialize_new_user_audit_job(
             pool,
             &replay_claim,
             &ScoreComponents {
@@ -1329,7 +1239,7 @@ async fn assert_successful_shadow_audit_replays_only_for_authoritative_materiali
     assert_eq!(state, ("succeeded".to_string(), "succeeded".to_string()));
 }
 
-async fn assert_authoritative_generation_is_durable_before_materialization(pool: &PgPool) {
+async fn assert_audit_generation_is_durable_before_materialization(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_094;
     let input = serde_json::json!({"schema_version": "authoritative-boundary-fixture"});
@@ -1361,7 +1271,7 @@ async fn assert_authoritative_generation_is_durable_before_materialization(pool:
         .expect("authoritative generation claim must execute")
         .expect("authoritative generation job must be claimable");
     assert_eq!(
-        finalize_authoritative_new_user_audit_job(
+        finalize_new_user_audit_job(
             pool,
             &generation_claim,
             tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
@@ -1398,7 +1308,7 @@ async fn assert_authoritative_generation_is_durable_before_materialization(pool:
         .await
         .expect("other replay fixtures must not affect authoritative boundary assertion");
 
-    let materialization_claim = claim_next_new_user_audit_job_with_materialization(pool, true)
+    let materialization_claim = claim_next_new_user_audit_job(pool)
         .await
         .expect("materialization replay claim must execute")
         .expect("stored authoritative assessment must be replayable");
@@ -1532,7 +1442,7 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
         CasResult::Applied
     );
 
-    let first_replay = claim_next_new_user_audit_job_with_materialization(pool, true)
+    let first_replay = claim_next_new_user_audit_job(pool)
         .await
         .expect("first replay claim must execute")
         .expect("successful generation must be replayable");
@@ -1562,7 +1472,7 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("replay retry must be made due");
-    let stale_replay = claim_next_new_user_audit_job_with_materialization(pool, true)
+    let stale_replay = claim_next_new_user_audit_job(pool)
         .await
         .expect("retry replay claim must execute")
         .expect("retry replay must be claimable");
@@ -1571,7 +1481,7 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("replay lease must expire");
-    let current_replay = claim_next_new_user_audit_job_with_materialization(pool, true)
+    let current_replay = claim_next_new_user_audit_job(pool)
         .await
         .expect("expired replay claim must execute")
         .expect("expired replay must be reclaimed");
@@ -1640,7 +1550,7 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
         .await
         .expect("obsolete replay version fixture must be stored");
     assert!(
-        claim_next_new_user_audit_job_with_materialization(pool, true)
+        claim_next_new_user_audit_job(pool)
             .await
             .expect("version-gated replay claim must execute")
             .is_none(),
@@ -2307,32 +2217,6 @@ async fn assert_feature_gated_jobs(pool: &PgPool) {
     .await
     .expect("enabled embedding job count query must succeed");
     assert_eq!(embedding_jobs, 1);
-
-    enqueue_first_message_spam_analysis_if_enabled(pool, false, CHAT_ID, USER_ID)
-        .await
-        .expect("disabled first-message spam gate must succeed");
-    let spam_jobs: i64 = query_scalar(
-        "select count(*) from first_message_spam_analysis_jobs where chat_id = $1 and telegram_user_id = $2",
-    )
-    .bind(CHAT_ID)
-    .bind(USER_ID)
-    .fetch_one(pool)
-    .await
-    .expect("spam job count query must succeed");
-    assert_eq!(spam_jobs, 0);
-
-    enqueue_first_message_spam_analysis_if_enabled(pool, true, CHAT_ID, USER_ID)
-        .await
-        .expect("enabled first-message spam gate must succeed");
-    let spam_jobs: i64 = query_scalar(
-        "select count(*) from first_message_spam_analysis_jobs where chat_id = $1 and telegram_user_id = $2",
-    )
-    .bind(CHAT_ID)
-    .bind(USER_ID)
-    .fetch_one(pool)
-    .await
-    .expect("enabled spam job count query must succeed");
-    assert_eq!(spam_jobs, 1);
 }
 
 async fn assert_agent_note_contract(pool: &PgPool) {
@@ -2444,21 +2328,17 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .expect("medium-risk review record must be queryable");
     assert_eq!(review_count, 1);
 
-    let affected_chat_ids = apply_avatar_risk_signal(
-        pool,
-        USER_ID,
-        "photo-42",
-        &serde_json::json!({
-            "primary_class": "suggestive_bait",
-            "personal_photo_probability": 0.0,
-        }),
+    query(
+        "update telegram_new_user_profile_audits set risk_score = 73, risk_level = 'high', risk_signal_breakdown = '[{\"label\": \"unified_signal\"}]'::jsonb where chat_id = $1 and telegram_user_id = $2",
     )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
     .await
-    .expect("avatar risk signal must be applied");
-    assert_eq!(affected_chat_ids, vec![CHAT_ID]);
+    .expect("unified risk snapshot must be applied");
     let updated_review = create_review(pool, CHAT_ID, USER_ID)
         .await
-        .expect("avatar risk must refresh review delivery")
+        .expect("unified risk must refresh review delivery")
         .expect("high-risk review must be claimed for its first delivery");
     assert_eq!(updated_review.notification_message_id, None);
 
@@ -2469,7 +2349,7 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .bind(USER_ID)
     .fetch_one(pool)
     .await
-    .expect("updated risk audit must exist");
+        .expect("updated unified risk audit must exist");
     assert_eq!(risk_score, 73);
     assert_eq!(risk_level, "high");
 
@@ -2480,16 +2360,15 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .bind(USER_ID)
     .fetch_one(pool)
     .await
-    .expect("review snapshot must be refreshed after an avatar risk signal");
+        .expect("review snapshot must be refreshed after a unified risk signal");
     assert_eq!(review_score, 73);
     assert!(
         review_signals
             .as_array()
             .is_some_and(|signals| signals.iter().any(|signal| {
-                signal.get("label").and_then(serde_json::Value::as_str)
-                    == Some("suggestive_avatar_bait")
+                signal.get("label").and_then(serde_json::Value::as_str) == Some("unified_signal")
             })),
-        "review snapshot must include the later avatar signal: {review_signals}"
+        "review snapshot must include the later unified signal: {review_signals}"
     );
 
     let (notification_status, notification_attempts, notification_message_id): (String, i32, Option<i32>) = query_as(

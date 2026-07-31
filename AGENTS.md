@@ -54,9 +54,8 @@ src/features/voice/types.rs             — VoiceMedia, AsrTranscript, CleanTran
 src/features/voice/repo.rs              — voice_transcription_jobs CRUD
 src/features/user_profiles/service.rs   — refresh_profile: get_chat, get_user_profile_photos, get_user_personal_chat_messages
 src/features/user_profiles/enrichment.rs — bounded queue: profile refresh → audit → spam/review/avatar jobs
-src/features/new_user_analysis.rs       — new user audit: features, risk scoring, spam classification
-src/features/first_message_spam.rs      — optional LLM-анализ первого сообщения нового пользователя
-src/features/avatar_analysis/           — очередь и классификация аватаров
+src/features/new_user_analysis.rs       — unified new-user audit snapshot and baseline risk scoring
+src/features/new_user_audit/             — unified profile, avatar and first-message assessment
 src/features/spam_review.rs             — idempotent review-карточки для новых пользователей
 src/features/ask/                       — /ask agent, audit и RMCP child client
 src/features/chat_read_api/             — transport-agnostic public read-model и manifest catalog
@@ -65,7 +64,6 @@ src/bin/import_telegram_export.rs       — CLI: импорт Telegram Desktop e
 src/bin/refresh_chat_members.rs         — CLI: refresh member snapshots
 src/bin/refresh_user_profiles.rs        — CLI: batch profile refresh
 src/bin/retry_pending_comments.rs      — CLI: retry failed comment jobs
-src/bin/analyze_new_users.rs            — CLI: batch new user analysis
 src/bin/chat_db_mcp.rs                  — internal RMCP stdio server для /ask
 src/bin/nedonews_mcp_http.rs             — public RMCP Streamable HTTP server
 prompts/first_comment.md                — system prompt для первого комментария

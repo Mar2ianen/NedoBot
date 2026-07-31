@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use teloxide::prelude::*;
 use tokio::sync::mpsc;
@@ -12,17 +11,7 @@ use crate::{
     config::Config,
     db::telegram::{mark_user_profile_refresh_error, user_profile_needs_refresh},
     features::{
-        avatar_analysis::service::enqueue_current_avatar_analysis,
-        first_message_spam::enqueue_first_message_spam_analysis,
-        new_user_analysis::{
-            analyze_new_user_profile, analyze_new_user_profile_and_enqueue_authoritative,
-            load_unified_user_audit_snapshot,
-        },
-        new_user_audit::{
-            prompt::PROMPT_VERSION,
-            repo::{NewUserAuditJobParams, enqueue_new_user_audit_job},
-        },
-        spam_review::{create_review, send_review},
+        new_user_analysis::enqueue_new_user_audit_for_profile_refresh,
         user_profiles::service::refresh_profile,
     },
 };
@@ -137,7 +126,7 @@ async fn process_profile_refresh_job(
 
     match refresh_profile(bot, pool, job.user_id).await {
         Ok(()) => {
-            process_refreshed_profile(bot, pool, config, job).await;
+            process_refreshed_profile(pool, config, job).await;
         }
         Err(err) => {
             let message = err.to_string();
@@ -151,80 +140,12 @@ async fn process_profile_refresh_job(
     }
 }
 
-async fn process_refreshed_profile(
-    bot: &Bot,
-    pool: &PgPool,
-    config: &Config,
-    job: ProfileRefreshJob,
-) {
-    if config.new_user_audit_authoritative_enabled {
-        if let Err(err) =
-            analyze_new_user_profile_and_enqueue_authoritative(pool, job.chat_id, job.user_id).await
-        {
-            tracing::warn!(%err, user_id = job.user_id, "failed to save authoritative unified audit baseline and job");
-        }
-        return;
-    }
-
-    if let Err(err) = analyze_new_user_profile(pool, job.chat_id, job.user_id).await {
-        tracing::warn!(%err, user_id = job.user_id, "failed to analyze new user profile");
-    } else {
-        if let Err(err) =
-            enqueue_first_message_spam_analysis(pool, config, job.chat_id, job.user_id).await
-        {
-            tracing::warn!(%err, user_id = job.user_id, "failed to enqueue first-message spam analysis");
-        }
-        match create_review(pool, job.chat_id, job.user_id).await {
-            Ok(Some(review)) => {
-                if let Err(err) = send_review(bot, pool, &review).await {
-                    tracing::warn!(%err, user_id = job.user_id, "failed to send spam review");
-                }
-            }
-            Ok(None) => {}
-            Err(err) => tracing::warn!(%err, user_id = job.user_id, "failed to create spam review"),
-        }
-    }
-
-    // При выключенном authoritative flag unified audit сохраняет только shadow assessment.
-    if config.new_user_audit_enabled {
-        enqueue_unified_new_user_audit(pool, job).await;
-    }
-
-    if config.avatar_classifier_enabled
-        && let Err(err) = enqueue_current_avatar_analysis(pool, job.user_id).await
+async fn process_refreshed_profile(pool: &PgPool, config: &Config, job: ProfileRefreshJob) {
+    if config.new_user_audit_enabled
+        && let Err(err) =
+            enqueue_new_user_audit_for_profile_refresh(pool, job.chat_id, job.user_id).await
     {
-        tracing::warn!(%err, user_id = job.user_id, "failed to enqueue avatar analysis");
-    }
-}
-
-async fn enqueue_unified_new_user_audit(pool: &PgPool, job: ProfileRefreshJob) {
-    let snapshot = match load_unified_user_audit_snapshot(pool, job.chat_id, job.user_id).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(%err, user_id = job.user_id, "failed to load unified new user audit snapshot");
-            return;
-        }
-    };
-    let snapshot_hash = match serde_json::to_vec(&snapshot.material_revision) {
-        Ok(bytes) => format!("{:x}", Sha256::digest(bytes)),
-        Err(err) => {
-            tracing::warn!(%err, user_id = job.user_id, "failed to serialize unified new user audit snapshot");
-            return;
-        }
-    };
-
-    let params = NewUserAuditJobParams {
-        chat_id: job.chat_id,
-        telegram_user_id: job.user_id,
-        snapshot_hash: &snapshot_hash,
-        prompt_version: PROMPT_VERSION,
-        input_json: &snapshot.input_json,
-        avatar_file_id: snapshot.avatar_file_id.as_deref(),
-        avatar_file_unique_id: snapshot.avatar_file_unique_id.as_deref(),
-    };
-    if let Err(err) = enqueue_new_user_audit_job(pool, params).await {
-        tracing::warn!(%err, user_id = job.user_id, "failed to enqueue unified new user audit");
+        tracing::warn!(%err, user_id = job.user_id, "failed to save unified new user audit baseline and job");
     }
 }
 

@@ -144,39 +144,11 @@ max_output_tokens = 32768
 request_timeout_sec = 45
 thinking = "none"
 
-[models.cerebras_spam]
-provider = "cerebras"
-model = "gemma-4-31b"
-
-[models.cerebras_spam.capabilities]
-supports_images = false
-supports_tools = true
-supports_system_prompt = true
-structured_output = "json_schema"
-context_window_tokens = 131072
-max_output_tokens = 8192
-request_timeout_sec = 45
-thinking = "none"
-
 [models.cerebras_audit]
 provider = "cerebras"
 model = "gemma-4-31b"
 
 [models.cerebras_audit.capabilities]
-supports_images = true
-supports_tools = true
-supports_system_prompt = true
-structured_output = "json_schema"
-context_window_tokens = 131072
-max_output_tokens = 8192
-request_timeout_sec = 45
-thinking = "none"
-
-[models.cerebras_avatar]
-provider = "cerebras"
-model = "gemma-4-31b"
-
-[models.cerebras_avatar.capabilities]
 supports_images = true
 supports_tools = true
 supports_system_prompt = true
@@ -232,9 +204,6 @@ models = ["ollama_memory"]
 [routes.voice_cleanup]
 models = ["groq_cleanup", "ollama_memory"]
 
-[routes.first_message_spam]
-models = ["cerebras_spam", "ollama_memory"]
-
 [routes.new_user_audit]
 models = ["cerebras_audit"]
 
@@ -246,6 +215,3 @@ models = ["ollama_minimax", "ollama_memory"]
 
 [routes.legacy_default]
 models = ["ollama_memory"]
-
-[routes.avatar_analysis]
-models = ["cerebras_avatar"]

@@ -10,7 +10,7 @@ use crate::features::jobs::policy::{
 use crate::features::new_user_audit::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется только при несовместимом изменении
-/// materializer-а, чтобы старые shadow assessments не применялись молча.
+/// materializer-а, чтобы сохранённые assessments не применялись молча.
 pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v1";
 
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
@@ -49,8 +49,7 @@ pub struct NewUserAuditJobParams<'a> {
     pub avatar_file_unique_id: Option<&'a str>,
 }
 
-// В следующем slice enqueue вызывается из profile enrichment.
-#[allow(dead_code)]
+#[allow(dead_code)] // Используется PostgreSQL migration/integration harness.
 pub async fn enqueue_new_user_audit_job(
     pool: &PgPool,
     params: NewUserAuditJobParams<'_>,
@@ -64,7 +63,7 @@ pub async fn enqueue_new_user_audit_job(
 
 /// Upsert-ит job в уже открытой транзакции.
 ///
-/// Любой authoritative путь берёт строки в одном порядке: `job → audit → review`.
+/// Unified flow берёт строки в одном порядке: `job → audit → review`.
 /// Ревизия снимка записывается отдельным шагом после сохранения audit baseline.
 pub async fn enqueue_new_user_audit_job_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
@@ -144,19 +143,9 @@ pub async fn record_new_user_audit_snapshot_in_transaction(
     Ok(())
 }
 
-// В следующем slice claim вызывается из bounded unified audit worker.
-#[allow(dead_code)]
+/// Claims either a fresh generation or a stored assessment awaiting materialization.
 pub async fn claim_next_new_user_audit_job(
     pool: &PgPool,
-) -> anyhow::Result<Option<NewUserAuditJob>> {
-    claim_next_new_user_audit_job_with_materialization(pool, false).await
-}
-
-/// В authoritative режиме успешные shadow jobs текущей версии могут быть
-/// повторно leased исключительно для materialization, без генерации.
-pub async fn claim_next_new_user_audit_job_with_materialization(
-    pool: &PgPool,
-    materialization_enabled: bool,
 ) -> anyhow::Result<Option<NewUserAuditJob>> {
     let row = sqlx::query(
         r#"
@@ -174,10 +163,9 @@ pub async fn claim_next_new_user_audit_job_with_materialization(
                     )
                   )
                or (
-                    $2
-                    and status = 'succeeded'
+                    status = 'succeeded'
                     and assessment_json is not null
-                    and materialization_version = $3
+                    and materialization_version = $2
                     and (
                         (materialization_status in ('pending', 'retry_wait')
                          and materialization_next_attempt_at <= now())
@@ -185,7 +173,7 @@ pub async fn claim_next_new_user_audit_job_with_materialization(
                             and materialization_lease_expires_at <= now())
                     )
                   )
-            order by ready_at, id
+            order by (assessment_json is not null), ready_at, id
             for update skip locked
             limit 1
         )
@@ -208,7 +196,6 @@ pub async fn claim_next_new_user_audit_job_with_materialization(
         "#,
     )
     .bind(EXTERNAL_REQUEST_LEASE.seconds())
-    .bind(materialization_enabled)
     .bind(CURRENT_MATERIALIZATION_VERSION)
     .fetch_optional(pool)
     .await?;
@@ -235,8 +222,7 @@ pub struct NewUserAuditOutcome<'a> {
     pub model: &'a str,
 }
 
-// В следующем slice finalizer вызывается unified audit service.
-#[allow(dead_code)]
+/// Persists the model assessment and opens the materialization stage.
 pub async fn finalize_new_user_audit_job(
     pool: &PgPool,
     job: &NewUserAuditJob,
@@ -245,19 +231,11 @@ pub async fn finalize_new_user_audit_job(
     finalize_new_user_audit_generation(pool, job, outcome).await
 }
 
-/// Durable boundary between authoritative LLM generation and materialization.
+/// Durable boundary between LLM generation and materialization.
 ///
 /// Once this CAS succeeds, the worker must only use the stored assessment through
 /// the materialization replay lifecycle. In particular, SQL or embedding failures
 /// after this point must never reopen LLM generation.
-pub async fn finalize_authoritative_new_user_audit_job(
-    pool: &PgPool,
-    job: &NewUserAuditJob,
-    outcome: NewUserAuditOutcome<'_>,
-) -> anyhow::Result<CasResult> {
-    finalize_new_user_audit_generation(pool, job, outcome).await
-}
-
 async fn finalize_new_user_audit_generation(
     pool: &PgPool,
     job: &NewUserAuditJob,
@@ -331,7 +309,7 @@ fn is_transient_postgres_sqlstate(code: &str) -> bool {
 }
 
 /// Применяет current-score к baseline только пока canonical snapshot не изменился.
-async fn materialize_authoritative_in_transaction(
+async fn materialize_new_user_audit_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     job: &NewUserAuditJob,
     components: &ScoreComponents,
@@ -414,9 +392,9 @@ async fn materialize_authoritative_in_transaction(
     Ok(())
 }
 
-/// Завершает lease успешной shadow job и materializes уже сохранённый assessment.
+/// Завершает lease успешной job и materializes уже сохранённый assessment.
 /// Assessment не перезаписывается, поэтому этот путь никогда не инициирует LLM generation.
-pub async fn materialize_authoritative_new_user_audit_job(
+pub async fn materialize_new_user_audit_job(
     pool: &PgPool,
     job: &NewUserAuditJob,
     components: &ScoreComponents,
@@ -435,7 +413,7 @@ pub async fn materialize_authoritative_new_user_audit_job(
         tx.rollback().await?;
         return Ok(result);
     }
-    materialize_authoritative_in_transaction(&mut tx, job, components).await?;
+    materialize_new_user_audit_in_transaction(&mut tx, job, components).await?;
     tx.commit().await?;
     Ok(result)
 }
@@ -482,8 +460,6 @@ pub async fn mark_new_user_audit_materialization_retry(
     CasResult::from_rows_affected(update.rows_affected())
 }
 
-// В следующем slice retry finalizer вызывается unified audit service.
-#[allow(dead_code)]
 pub async fn mark_new_user_audit_retry(
     pool: &PgPool,
     job: &NewUserAuditJob,
@@ -513,8 +489,6 @@ pub async fn mark_new_user_audit_retry(
     CasResult::from_rows_affected(update.rows_affected())
 }
 
-// В следующем slice terminal finalizer вызывается unified audit service.
-#[allow(dead_code)]
 pub async fn mark_new_user_audit_failed(
     pool: &PgPool,
     job: &NewUserAuditJob,

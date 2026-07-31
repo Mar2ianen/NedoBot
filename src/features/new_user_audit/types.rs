@@ -2,19 +2,14 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// Лимиты применит worker после подключения в следующем slice.
-#[allow(dead_code)]
 const MAX_LIST_ITEMS: usize = 8;
-#[allow(dead_code)]
 const MAX_TEXT_LENGTH: usize = 600;
-#[allow(dead_code)]
 const MAX_EVIDENCE_ITEMS: usize = 10;
 
 /// Строгий результат единой LLM-оценки нового участника.
 ///
 /// Поля с наблюдениями за аватаром и первым сообщением всегда присутствуют в
 /// JSON, но равны `null`, если соответствующих входных данных не было.
-#[allow(dead_code)] // Typed-контракт ожидает будущий worker аудита.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NewUserAuditAssessment {
@@ -184,17 +179,12 @@ pub enum ReviewPriority {
     High,
 }
 
-#[allow(dead_code)] // Вызов parse/validate появится вместе с worker-ом аудита.
 impl NewUserAuditAssessment {
     /// Десериализует ответ модели и отвергает формально допустимые, но опасные
     /// для хранения или модерации значения.
+    #[cfg(test)]
     pub fn parse(value: &str) -> anyhow::Result<Self> {
-        Self::parse_for_input(value, true)
-    }
-
-    /// Проверяет ответ с учётом того, был ли в снимке доступный для анализа аватар.
-    pub fn parse_for_input(value: &str, has_avatar_input: bool) -> anyhow::Result<Self> {
-        Self::parse_for_modalities(value, has_avatar_input, false)
+        Self::parse_for_modalities(value, true, false)
     }
 
     pub fn parse_for_modalities(
@@ -221,14 +211,6 @@ impl NewUserAuditAssessment {
             .context("LLM audit output does not match the assessment contract")?;
         assessment.validate_for_modalities(has_avatar_input, has_first_message_input)?;
         Ok(assessment)
-    }
-
-    pub fn validate(&self) -> anyhow::Result<()> {
-        self.validate_for_input(true)
-    }
-
-    pub fn validate_for_input(&self, has_avatar_input: bool) -> anyhow::Result<()> {
-        self.validate_for_modalities(has_avatar_input, false)
     }
 
     pub fn validate_for_modalities(

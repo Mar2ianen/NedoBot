@@ -1,17 +1,18 @@
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
+use sqlx::{PgPool, Row};
 
 use super::types::{
     AvatarClass, FirstMessageAssessment, FirstMessageRiskMarker, NewUserAuditAssessment,
     ProfileNameGrammarRelation, SelfReferenceGrammar,
 };
 
-// Подключается authoritative unified finalizer в следующем шаге cutover.
 #[allow(dead_code)]
 pub const REVIEW_RISK_THRESHOLD: i32 = 70;
 #[allow(dead_code)]
 const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
 
-// Контекст извлекается из той же snapshot/embedding базы, что legacy analysis.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FirstMessageScoreContext {
@@ -124,7 +125,7 @@ fn score_first_message(
     let signals = (score > 0).then(|| {
         json!([{
             "class": "first_message_content",
-            "label": "first_message_spam_analysis",
+            "label": "unified_first_message_analysis",
             "coefficient": score,
             "warning_strength": if score >= 30 { "strong" } else { "supporting" },
             "assessment": assessment,
@@ -158,6 +159,90 @@ fn has_marker(assessment: &FirstMessageAssessment, marker: FirstMessageRiskMarke
     assessment.risk_markers.contains(&marker)
 }
 
+pub(crate) async fn template_match_count(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+    text: &str,
+) -> anyhow::Result<i32> {
+    let rows = sqlx::query(
+        r#"
+        select distinct m.text
+        from telegram_messages m
+        where m.chat_id = $1
+          and m.spam_marked_at is not null
+          and m.user_id <> $2
+          and m.text is not null
+        "#,
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let current = token_set(text);
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.get::<Option<String>, _>("text"))
+        .filter(|candidate| jaccard(&current, &token_set(candidate)) >= 0.5)
+        .count()
+        .min(10) as i32)
+}
+
+pub(crate) async fn spam_similarity(pool: &PgPool, embedding: &str) -> anyhow::Result<Option<f64>> {
+    let value = sqlx::query_scalar::<_, Option<f64>>(
+        r#"
+        select max(1.0 - (a.first_message_embedding <=> $1::vector))
+        from telegram_new_user_profile_audits a
+        join telegram_chat_users u
+          on u.chat_id = a.chat_id and u.telegram_user_id = a.telegram_user_id
+        where u.is_spammer and a.first_message_embedding is not null
+        "#,
+    )
+    .bind(embedding)
+    .fetch_one(pool)
+    .await?;
+    Ok(value)
+}
+
+fn token_set(text: &str) -> BTreeSet<String> {
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 4)
+        .map(campaign_token)
+        .collect()
+}
+
+fn campaign_token(word: &str) -> String {
+    match word {
+        "отправить"
+        | "отправлю"
+        | "переслать"
+        | "перешлю"
+        | "скинуть"
+        | "скину"
+        | "поделиться"
+        | "поделюсь"
+        | "закинуть"
+        | "закину" => "send_offer".to_string(),
+        "личку" | "личные" | "сообщения" | "стучитесь" => {
+            "direct_messages".to_string()
+        }
+        "аудиокнигу" | "аудиокнига" | "аудиоверсия" | "текстовая" => {
+            "promoted_material".to_string()
+        }
+        _ => word.to_owned(),
+    }
+}
+
+fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
+    let union = left.union(right).count();
+    if union == 0 {
+        0.0
+    } else {
+        left.intersection(right).count() as f64 / union as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn first_message_preserves_legacy_cap_and_weights() {
+    fn first_message_preserves_unified_cap_and_weights() {
         let assessment = assessment(
             r#"{
                 "relation_to_chat":"off_topic", "direct_dm_offer":true,
@@ -219,5 +304,15 @@ mod tests {
         assert_eq!(components.avatar_score, 3);
         assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
         assert_eq!(components.final_level(), "high");
+    }
+
+    #[test]
+    fn template_similarity_catches_campaign_variants() {
+        assert!(
+            jaccard(
+                &token_set("могу переслать аудиокнигу пишите в личку"),
+                &token_set("есть аудиоверсия могу отправить пишите в личные сообщения")
+            ) >= 0.4
+        );
     }
 }

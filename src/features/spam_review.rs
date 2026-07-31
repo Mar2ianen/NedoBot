@@ -26,6 +26,7 @@ pub struct SpamReview {
     pub text: String,
 }
 
+#[allow(dead_code)] // Остаётся ручным/integration API; runtime materializer пишет review атомарно.
 pub async fn create_review(
     pool: &PgPool,
     chat_id: i64,
@@ -87,6 +88,14 @@ pub async fn create_review(
 
 pub async fn claim_next_review_delivery(pool: &PgPool) -> anyhow::Result<Option<SpamReview>> {
     claim_review_delivery(pool, None).await
+}
+
+pub async fn process_next_review_delivery(bot: &Bot, pool: &PgPool) -> anyhow::Result<bool> {
+    let Some(review) = claim_next_review_delivery(pool).await? else {
+        return Ok(false);
+    };
+    send_review(bot, pool, &review).await?;
+    Ok(true)
 }
 
 async fn claim_review_delivery(
@@ -529,7 +538,8 @@ fn human_signals(signals: &Value) -> String {
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>();
-            if signal.get("label").and_then(Value::as_str) == Some("first_message_spam_analysis") {
+            if signal.get("label").and_then(Value::as_str) == Some("unified_first_message_analysis")
+            {
                 labels.extend(
                     signal["assessment"]["risk_markers"]
                         .as_array()
@@ -588,7 +598,7 @@ fn human_label(label: &str) -> &str {
         "personal_channel_external_link" => "в личном канале есть внешняя ссылка",
         "non_adjacent_emoji_message" => "нетипичный emoji в комментарии",
         "non_adjacent_emoji_message_ending" => "комментарий заканчивается emoji",
-        "first_message_spam_analysis" => "первое сообщение похоже на известную спам-кампанию",
+        "unified_first_message_analysis" => "первое сообщение похоже на известную спам-кампанию",
         _ => label,
     }
 }
@@ -616,18 +626,18 @@ mod tests {
     }
 
     #[test]
-    fn human_signals_renders_unified_and_legacy_first_message_markers() {
+    fn human_signals_renders_unified_first_message_markers() {
         let unified = serde_json::json!([{
-            "label": "first_message_spam_analysis",
+            "label": "unified_first_message_analysis",
             "assessment": { "risk_markers": ["direct_messages"] }
         }]);
-        let legacy = serde_json::json!([{
-            "label": "first_message_spam_analysis",
+        let additional = serde_json::json!([{
+            "label": "unified_first_message_analysis",
             "assessment": { "markers": ["paid_easy_task_offer"] }
         }]);
 
         assert!(human_signals(&unified).contains("перевод разговора в личные сообщения"));
-        assert!(human_signals(&legacy).contains("обещание лёгкой оплачиваемой работы"));
+        assert!(human_signals(&additional).contains("обещание лёгкой оплачиваемой работы"));
     }
 
     #[test]

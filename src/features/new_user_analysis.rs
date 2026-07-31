@@ -76,8 +76,6 @@ struct NewUserFeatures {
     profile_photo_reuse_count: i64,
     profile_photo_width: Option<i32>,
     profile_photo_height: Option<i32>,
-    avatar_primary_class: Option<String>,
-    avatar_personal_photo_probability: Option<f64>,
     emoji_status_custom_emoji_id: Option<String>,
     profile_accent_color_id: Option<i16>,
     personal_channel_chat_id: Option<i64>,
@@ -291,49 +289,10 @@ impl RiskAccumulator {
     }
 }
 
-pub async fn analyze_new_user_profile(
-    pool: &PgPool,
-    chat_id: i64,
-    telegram_user_id: i64,
-) -> anyhow::Result<()> {
-    analyze_new_user_profile_with_config(
-        pool,
-        chat_id,
-        telegram_user_id,
-        NewUserAnalysisConfig::default(),
-    )
-    .await
-}
-
-pub async fn analyze_new_user_profile_with_config(
-    pool: &PgPool,
-    chat_id: i64,
-    telegram_user_id: i64,
-    config: NewUserAnalysisConfig,
-) -> anyhow::Result<()> {
-    let Some(features) = load_features(pool, chat_id, telegram_user_id).await? else {
-        return Ok(());
-    };
-
-    // Старые активные пользователи не цель этой системы: сохраняем low-risk snapshot,
-    // но не накидываем профильные штрафы за нормальное накопленное поведение.
-    let is_old_active_user = features.message_count >= config.old_user_message_threshold;
-    let risk = analyze_risk(&features, &config, is_old_active_user);
-    tracing::info!(
-        chat_id,
-        telegram_user_id,
-        risk_score = risk.score,
-        risk_level = %risk.level,
-        risk_signals = %risk.signals,
-        "new user spam risk analyzed"
-    );
-    save_audit(pool, &features, &risk, &config).await
-}
-
-/// Сохраняет authoritative baseline, ревизию снимка и unified-audit job одной
-/// транзакцией. В отличие от shadow-пути, между baseline и job нет окна, в
-/// котором материализатор может увидеть несогласованное состояние.
-pub(crate) async fn analyze_new_user_profile_and_enqueue_authoritative(
+/// Сохраняет baseline, ревизию снимка и unified-audit job одной транзакцией.
+/// Между baseline и job нет окна, в котором materializer может увидеть
+/// несогласованное состояние.
+pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
     pool: &PgPool,
     chat_id: i64,
     telegram_user_id: i64,
@@ -372,44 +331,9 @@ pub(crate) async fn analyze_new_user_profile_and_enqueue_authoritative(
         telegram_user_id,
         risk_score = risk.score,
         risk_level = %risk.level,
-        "authoritative new user audit baseline and job saved"
+        "unified new user audit baseline and job saved"
     );
     Ok(())
-}
-
-/// Возвращает канонический безопасный снимок для unified audit.
-///
-/// SQL и правила оценки остаются единым источником истины: используются те же
-/// `load_features` и `analyze_risk`, что и у персистентного аудита. Проекция
-/// намеренно не содержит invite URLs, Telegram file IDs и сохранённые raw JSON.
-///
-/// Временно не вызывается до подключения unified-audit consumer в отдельной правке.
-#[allow(dead_code)]
-pub(crate) struct UnifiedUserAuditSnapshot {
-    pub input_json: Value,
-    pub material_revision: Value,
-    pub avatar_file_id: Option<String>,
-    pub avatar_file_unique_id: Option<String>,
-}
-
-pub(crate) async fn load_unified_user_audit_snapshot(
-    pool: &PgPool,
-    chat_id: i64,
-    user_id: i64,
-) -> anyhow::Result<Option<UnifiedUserAuditSnapshot>> {
-    let Some(features) = load_features(pool, chat_id, user_id).await? else {
-        return Ok(None);
-    };
-    let config = NewUserAnalysisConfig::default();
-    let is_old_active_user = features.message_count >= config.old_user_message_threshold;
-    let risk = analyze_risk(&features, &config, is_old_active_user);
-
-    Ok(Some(UnifiedUserAuditSnapshot {
-        input_json: project_unified_user_audit_snapshot(&features, &risk),
-        material_revision: project_unified_user_audit_material_revision(&features),
-        avatar_file_id: features.profile_photo_file_id.clone(),
-        avatar_file_unique_id: features.profile_photo_file_unique_id.clone(),
-    }))
 }
 
 const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
@@ -461,8 +385,6 @@ fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAn
             "has_profile_photo": has_profile_photo(features),
             "avatar_image_available": false,
             "profile_photo_reuse_count": features.profile_photo_reuse_count,
-            "avatar_primary_class": features.avatar_primary_class,
-            "avatar_personal_photo_probability": features.avatar_personal_photo_probability,
         },
         "activity": {
             "first_seen_at": features.first_seen_at.map(|value| value.to_rfc3339()),
@@ -687,8 +609,6 @@ async fn load_features(
             coalesce(pr.reuse_count, 0)::bigint as profile_photo_reuse_count,
             p.profile_photo_width,
             p.profile_photo_height,
-            avatar.observation_json ->> 'primary_class' as avatar_primary_class,
-            (avatar.observation_json ->> 'personal_photo_probability')::double precision as avatar_personal_photo_probability,
             p.emoji_status_custom_emoji_id,
             p.profile_accent_color_id,
             p.personal_channel_chat_id,
@@ -714,13 +634,6 @@ async fn load_features(
         from telegram_chat_users cu
         left join telegram_user_profiles p on p.telegram_user_id = cu.telegram_user_id
         left join telegram_chat_member_snapshots s on s.chat_id = cu.chat_id and s.telegram_user_id = cu.telegram_user_id
-        left join lateral (
-            select observation_json
-            from avatar_image_analyses
-            where profile_photo_file_unique_id = p.profile_photo_file_unique_id
-            order by analyzed_at desc
-            limit 1
-        ) avatar on true
         left join msg_stats ms on true
         left join first_msg fm on true
         left join last_msg lm on true
@@ -833,8 +746,6 @@ async fn load_features(
             profile_photo_reuse_count: row.get("profile_photo_reuse_count"),
             profile_photo_width: row.get("profile_photo_width"),
             profile_photo_height: row.get("profile_photo_height"),
-            avatar_primary_class: row.get("avatar_primary_class"),
-            avatar_personal_photo_probability: row.get("avatar_personal_photo_probability"),
             emoji_status_custom_emoji_id: row.get("emoji_status_custom_emoji_id"),
             profile_accent_color_id: row.get("profile_accent_color_id"),
             personal_channel_chat_id: row.get("personal_channel_chat_id"),
@@ -896,7 +807,6 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(username_signal(features, &username_stats));
     risk.add_optional(display_name_signal(features));
     risk.add_optional(profile_photo_signal(features));
-    risk.add_optional(avatar_visual_signal(features));
     risk.add_optional(feminine_name_signal(features));
     risk.add_optional(homoglyph_profile_signal(features));
     risk.add_optional(message_texture_signal(features));
@@ -1056,27 +966,6 @@ fn profile_photo_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
             reason: "No visible profile photo via Bot API",
         }),
         true => None,
-    }
-}
-
-fn avatar_visual_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
-    match (
-        features.avatar_primary_class.as_deref(),
-        features.avatar_personal_photo_probability,
-    ) {
-        (Some("suggestive_bait"), _) => Some(RiskSignal {
-            class: SpamClass::LlmProfileBait,
-            coefficient: 8,
-            label: "suggestive_avatar_bait",
-            reason: "Avatar analysis found a suggestive bait-style portrait",
-        }),
-        (Some("ordinary_personal"), Some(probability)) if probability >= 0.8 => Some(RiskSignal {
-            class: SpamClass::LlmProfileBait,
-            coefficient: 3,
-            label: "photorealistic_personal_portrait",
-            reason: "Avatar analysis found a photorealistic personal portrait",
-        }),
-        _ => None,
     }
 }
 
@@ -1607,18 +1496,6 @@ fn audit_insert_columns() -> &'static [&'static str] {
     ]
 }
 
-async fn save_audit(
-    pool: &PgPool,
-    features: &NewUserFeatures,
-    risk: &RiskAnalysis,
-    config: &NewUserAnalysisConfig,
-) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
-    save_audit_in_transaction(&mut tx, features, risk, config).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn save_audit_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     features: &NewUserFeatures,
@@ -1652,8 +1529,6 @@ async fn save_audit_in_transaction(
         "profile_photo_file_id_present": features.profile_photo_file_id.is_some(),
         "profile_photo_file_unique_id_present": features.profile_photo_file_unique_id.is_some(),
         "profile_photo_reuse_count": features.profile_photo_reuse_count,
-        "avatar_primary_class": features.avatar_primary_class,
-        "avatar_personal_photo_probability": features.avatar_personal_photo_probability,
         "username_reuse_count": features.username_reuse_count,
         "username_reuse_spammer_count": features.username_reuse_spammer_count,
         "first_name_feminine_pattern": looks_like_feminine_first_name(features.first_name.as_deref()),

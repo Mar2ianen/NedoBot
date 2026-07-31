@@ -8,8 +8,6 @@ const ROUTES: &[&str] = &[
     "memory",
     "voice_cleanup",
     "search_extract",
-    "avatar_analysis",
-    "first_message_spam",
     "new_user_audit",
     "ask",
     "legacy_default",
