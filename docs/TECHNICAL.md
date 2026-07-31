@@ -11,7 +11,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Распознаёт авто-форварды из канала по `forward_origin.channel.id`.
 - Пропускает рекламу/служебные посты без маркера `Не теряем связь`.
 - Скачивает самое большое фото поста и отправляет его в vision-модель, если текущий LLM provider/model поддерживает изображения.
-- Генерирует комментарий через LLM provider router: `ollama`, `groq`, `cerebras`, `openrouter`, `openai_compat`.
+- Генерирует комментарий через единый `genai` transport с явным adapter/profile routing для `ollama`, `groq`, `cerebras`, `openrouter`, `openai_compat` и Gemini.
 - Отправляет HTML-комментарий reply под постом.
 - Отключает link preview.
 - Подставляет premium/custom emoji по тематике, включая канал/AMD/Radeon/Ryzen.
@@ -167,6 +167,12 @@ deploy hook перезагружает контейнерный Nginx после
 Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.6 Flash` как основная модель, затем `Gemini 3.5 Flash`, `Gemini 3.5 Flash Lite`, `Gemini 3.1 Flash Lite` и в конце `ollama`/`gemma4:31b`. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
 
 ### Строгие LLM profiles
+
+В актуальной profile topology provider дополнительно задаёт genai adapter и egress boundary. Route resolver проверяет capabilities для изображений, native tools, system prompt и output limit; proxy-route без LLM_PROXY_URL отклоняется на startup.
+
+### Единый genai transport и egress
+
+GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy"; legacy Gemini использует proxy при заданном LLM_PROXY_URL, остальные legacy providers идут напрямую. Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
 
 `LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют legacy-поведение `LLM_PROVIDER`/моделей. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `avatar_analysis`, `first_message_spam`, `new_user_audit` или `ask`) и игнорирует legacy provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
 

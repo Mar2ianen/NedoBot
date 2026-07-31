@@ -26,7 +26,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
     "paperpaper.ru",
 ];
 
-use crate::llm::profiles::{LlmProfiles, RouteRequirements};
+use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -596,6 +596,7 @@ impl Config {
                     "ask",
                     RouteRequirements {
                         requires_images,
+                        requires_tools: true,
                         requires_system_prompt: true,
                         num_predict: Some(self.ask_llm_max_tokens),
                         ..RouteRequirements::default()
@@ -605,6 +606,7 @@ impl Config {
         }
 
         let mut required_secrets = std::collections::BTreeMap::new();
+        let mut required_proxy_providers = std::collections::BTreeMap::new();
         for (route, requirements) in routes {
             match profiles.resolve_route(route, &requirements) {
                 Ok(resolved) => {
@@ -612,6 +614,11 @@ impl Config {
                         required_secrets
                             .entry(selection.provider.api_key_env.as_str())
                             .or_insert((selection.provider_key, route));
+                        if selection.provider.egress == Egress::Proxy {
+                            required_proxy_providers
+                                .entry(selection.provider_key)
+                                .or_insert(route);
+                        }
                     }
                 }
                 Err(error) => {
@@ -624,6 +631,17 @@ impl Config {
             if !configured {
                 errors.push(format!(
                     "LLM profile route {route:?} requires non-empty {api_key_env} for provider {provider_key:?}"
+                ));
+            }
+        }
+        if self
+            .llm_proxy_url
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            for (provider_key, route) in required_proxy_providers {
+                errors.push(format!(
+                    "LLM profile route {route:?} selects proxy egress for provider {provider_key:?}, but LLM_PROXY_URL is not configured"
                 ));
             }
         }

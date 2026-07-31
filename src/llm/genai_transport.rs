@@ -322,6 +322,14 @@ fn map_web_error(error: &genai::webc::Error, structured_output: bool) -> LlmTran
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::Value;
+
+    type CapturedRequest = std::sync::Arc<std::sync::Mutex<Option<(HeaderMap, Value)>>>;
 
     #[test]
     fn image_request_preserves_mime_and_filename() {
@@ -417,5 +425,145 @@ mod tests {
             map_genai_error(error, false),
             LlmTransportError::EmptyResponse
         );
+    }
+
+    #[tokio::test]
+    async fn openai_http_contract_maps_request_response_and_auth() {
+        async fn completion(
+            State(captured): State<CapturedRequest>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *captured.lock().unwrap() = Some((headers, body));
+            Json(serde_json::json!({
+                "id": "contract-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "contract-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "transport ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let server_captured = std::sync::Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(completion))
+                    .with_state(server_captured),
+            )
+            .await
+            .unwrap();
+        });
+
+        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let endpoint = format!("http://{address}/v1");
+        let response = transport
+            .generate(GenAiRequest {
+                model: ModelTarget {
+                    adapter: GenAiAdapter::OpenAi,
+                    endpoint: &endpoint,
+                    api_key: "contract-key",
+                    model: "contract-model",
+                },
+                system_prompt: Some("system"),
+                prompt: "prompt",
+                image: Some(ImageInput {
+                    mime_type: "image/png",
+                    base64: "encoded-image",
+                    file_name: Some("image.png"),
+                }),
+                temperature: 0.2,
+                max_tokens: 128,
+                timeout: Duration::from_secs(5),
+                reasoning: ThinkingMode::None,
+                reasoning_budget: None,
+                structured_output_mode: StructuredOutputMode::PromptOnly,
+                structured_output: None,
+                extra_body: None,
+                egress: Egress::Direct,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response, "transport ok");
+        let captured = captured.lock().unwrap().take().unwrap();
+        assert_eq!(
+            captured
+                .0
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer contract-key")
+        );
+        assert_eq!(captured.1["model"], "contract-model");
+        assert_eq!(captured.1["messages"][0]["role"], "system");
+        assert_eq!(captured.1["messages"][1]["content"][0]["text"], "prompt");
+        assert_eq!(
+            captured.1["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,encoded-image"
+        );
+        assert_eq!(captured.1["max_tokens"], 128);
+        let temperature = captured.1["temperature"].as_f64().unwrap();
+        assert!((temperature - 0.2).abs() < 1e-6);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_error_body_is_not_exposed_in_structured_output_error() {
+        async fn rejected() -> impl IntoResponse {
+            (StatusCode::BAD_REQUEST, "SECRET_PROVIDER_BODY")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(rejected)),
+            )
+            .await
+            .unwrap();
+        });
+        let schema = serde_json::json!({"type": "object"});
+        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let endpoint = format!("http://{address}/v1");
+        let error = transport
+            .generate(GenAiRequest {
+                model: ModelTarget {
+                    adapter: GenAiAdapter::OpenAi,
+                    endpoint: &endpoint,
+                    api_key: "contract-key",
+                    model: "contract-model",
+                },
+                system_prompt: None,
+                prompt: "prompt",
+                image: None,
+                temperature: 0.2,
+                max_tokens: 128,
+                timeout: Duration::from_secs(5),
+                reasoning: ThinkingMode::None,
+                reasoning_budget: None,
+                structured_output_mode: StructuredOutputMode::JsonSchema,
+                structured_output: Some(StructuredOutput {
+                    name: "result",
+                    schema: &schema,
+                }),
+                extra_body: None,
+                egress: Egress::Direct,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, LlmTransportError::StructuredOutputRejected);
+        assert!(!error.to_string().contains("SECRET_PROVIDER_BODY"));
+        server.abort();
     }
 }
