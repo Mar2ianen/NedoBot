@@ -87,6 +87,10 @@ pub fn classify_send_error(error: &RequestError) -> SendFailure {
         RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_) => {
             SendFailure::DeliveryUnknown
         }
+        RequestError::Validation(_) => SendFailure::Confirmed {
+            error_kind: CommentErrorKind::InvalidInput,
+            retry_after_seconds: None,
+        },
     }
 }
 
@@ -931,7 +935,8 @@ mod tests {
 
     #[test]
     fn telegram_io_error_leaves_delivery_unknown() {
-        let error = teloxide::RequestError::Io(std::io::Error::other("test transport failure"));
+        let error =
+            teloxide::RequestError::Io(std::io::Error::other("test transport failure").into());
 
         assert_eq!(classify_send_error(&error), SendFailure::DeliveryUnknown);
     }
