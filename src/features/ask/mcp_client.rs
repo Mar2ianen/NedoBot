@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 
+use genai::chat::Tool as GenAiTool;
 use rmcp::{
     RoleClient, ServiceExt,
     model::{CallToolRequestParams, ContentBlock, Tool},
@@ -47,7 +48,7 @@ pub struct McpToolResult {
 pub struct McpClient {
     service: RunningService<RoleClient, ()>,
     tool_names: HashSet<String>,
-    tool_catalog: String,
+    genai_tools: Vec<GenAiTool>,
     timeout: Duration,
 }
 
@@ -90,7 +91,7 @@ impl McpClient {
         Ok(Self {
             service,
             tool_names: catalog.tool_names,
-            tool_catalog: catalog.rendered,
+            genai_tools: catalog.genai_tools,
             timeout: timeout_duration,
         })
     }
@@ -103,8 +104,8 @@ impl McpClient {
         self.tool_names.iter().map(String::as_str)
     }
 
-    pub fn tool_catalog(&self) -> &str {
-        &self.tool_catalog
+    pub fn genai_tools(&self) -> &[GenAiTool] {
+        &self.genai_tools
     }
 
     pub async fn shutdown(mut self) {
@@ -132,7 +133,7 @@ impl McpClient {
 
 struct ToolCatalog {
     tool_names: HashSet<String>,
-    rendered: String,
+    genai_tools: Vec<GenAiTool>,
 }
 
 fn reject_local_tool_collisions(tools: &[Tool]) -> anyhow::Result<()> {
@@ -156,18 +157,28 @@ fn format_tool_catalog(tools: &[Tool]) -> anyhow::Result<ToolCatalog> {
     allowed_tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 
     let mut tool_names = HashSet::new();
-    let mut rendered = String::new();
+    let mut genai_tools = Vec::new();
+    let mut rendered_chars = 0;
     for tool in allowed_tools {
         let entry = format_tool_catalog_entry(tool)?;
-        if rendered.chars().count() + entry.chars().count() > MAX_TOOL_CATALOG_CHARS {
+        if rendered_chars + entry.chars().count() > MAX_TOOL_CATALOG_CHARS {
             continue;
         }
         tool_names.insert(tool.name.to_string());
-        rendered.push_str(&entry);
+        rendered_chars += entry.chars().count();
+        let mut genai_tool = GenAiTool::new(tool.name.to_string())
+            .with_description(
+                tool.description
+                    .as_deref()
+                    .unwrap_or("описание отсутствует"),
+            )
+            .with_schema(Value::Object((*tool.input_schema).clone()));
+        genai_tool = genai_tool.with_strict(true);
+        genai_tools.push(genai_tool);
     }
     Ok(ToolCatalog {
         tool_names,
-        rendered,
+        genai_tools,
     })
 }
 
@@ -313,8 +324,10 @@ mod tests {
         let catalog = format_tool_catalog(&tools).unwrap();
         assert!(catalog.tool_names.contains("chat.resolve_user"));
         assert!(!catalog.tool_names.contains("db.select"));
-        assert!(catalog.rendered.contains("chat.resolve_user"));
-        assert!(!catalog.rendered.contains("db.select"));
+        assert_eq!(catalog.genai_tools.len(), 1);
+        assert!(catalog.genai_tools[0].schema.is_some());
+        assert_eq!(catalog.genai_tools[0].name.to_string(), "chat.resolve_user");
+        assert_eq!(catalog.genai_tools[0].strict, Some(true));
     }
 
     #[test]

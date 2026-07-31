@@ -1,5 +1,9 @@
+use genai::chat::{ChatMessage, ChatResponse, Tool};
+
 use crate::config::{Config, normalize_llm_provider};
-use crate::llm::genai_transport::{GenAiRequest, GenAiTransport, ImageInput, ModelTarget};
+use crate::llm::genai_transport::{
+    GenAiChatRequest, GenAiRequest, GenAiTransport, ImageInput, ModelTarget,
+};
 use crate::llm::profiles::{Egress, GenAiAdapter, RouteRequirements, RouteSelection};
 use crate::llm::types::{GeneratedText, LlmAttempt, LlmTransportError, StructuredOutput};
 
@@ -19,7 +23,56 @@ pub struct GenerateTextOptions<'a> {
     pub structured_output: Option<StructuredOutput<'a>>,
 }
 
+pub struct GenerateChatOptions<'a> {
+    /// Явное имя task route в LLM_PROFILES_PATH.
+    pub route: Option<&'a str>,
+    pub provider_override: Option<&'a str>,
+    pub model_override: Option<&'a str>,
+    pub system_prompt: Option<&'a str>,
+    pub messages: Vec<ChatMessage>,
+    pub tools: Option<Vec<Tool>>,
+    pub requires_tools: bool,
+    pub previous_response_id: Option<String>,
+    pub temperature: f32,
+    pub num_predict: u32,
+}
+
 const VALIDATION_RETRY_ATTEMPTS: usize = 1;
+
+pub async fn generate_chat_with_provider_checked(
+    config: &Config,
+    options: GenerateChatOptions<'_>,
+) -> anyhow::Result<ChatResponse> {
+    if let Some(profiles) = config.llm_profiles.as_ref() {
+        return generate_chat_with_profile_checked(config, profiles, options).await;
+    }
+
+    let provider =
+        normalize_llm_provider(options.provider_override.unwrap_or(&config.llm_provider))?;
+    let model = match options.model_override {
+        Some(model) => model,
+        None => model_for_provider(config, provider)?,
+    };
+    let fallbacks = fallback_models(config, provider, options.model_override, model);
+    let mut last_error = None;
+
+    for fallback in fallbacks {
+        match generate_chat_once(config, fallback.provider, fallback.model, &options).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                tracing::warn!(
+                    provider = fallback.provider,
+                    model = fallback.model,
+                    outcome = classify_attempt_error(&error),
+                    "LLM chat generation attempt failed"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no LLM chat attempts were configured")))
+}
 
 pub async fn generate_text_with_provider_checked(
     config: &Config,
@@ -277,6 +330,97 @@ async fn generate_text_with_profile_checked(
     }))
 }
 
+async fn generate_chat_with_profile_checked(
+    config: &Config,
+    profiles: &crate::llm::profiles::LlmProfiles,
+    options: GenerateChatOptions<'_>,
+) -> anyhow::Result<ChatResponse> {
+    let route = options.route.unwrap_or("legacy_default");
+    let requirements = RouteRequirements {
+        requires_tools: options.requires_tools || options.tools.is_some(),
+        requires_system_prompt: options.system_prompt.is_some(),
+        num_predict: Some(options.num_predict),
+        ..RouteRequirements::default()
+    };
+    let resolved = profiles.resolve_route(route, &requirements)?;
+    let mut last_error = None;
+
+    for (fallback_index, selection) in resolved.selections.iter().enumerate() {
+        match generate_chat_profile_once(config, selection, &options).await {
+            Ok(response) => {
+                if fallback_index > 0 {
+                    tracing::info!(
+                        route,
+                        fallback_index,
+                        provider = selection.provider_key,
+                        model = selection.model.model,
+                        "LLM chat profile fallback succeeded"
+                    );
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    route,
+                    fallback_index,
+                    provider = selection.provider_key,
+                    model = selection.model.model,
+                    outcome = classify_attempt_error(&error),
+                    "LLM chat profile attempt failed"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("no compatible LLM profile chat attempts were configured")
+    }))
+}
+
+async fn generate_chat_profile_once(
+    config: &Config,
+    selection: &RouteSelection<'_>,
+    options: &GenerateChatOptions<'_>,
+) -> anyhow::Result<ChatResponse> {
+    let api_key = std::env::var(&selection.provider.api_key_env).map_err(|_| {
+        anyhow::anyhow!(
+            "LLM profile provider {:?} requires configured secret {}",
+            selection.provider_key,
+            selection.provider.api_key_env
+        )
+    })?;
+    if api_key.trim().is_empty() {
+        anyhow::bail!(
+            "LLM profile provider {:?} requires configured secret {}",
+            selection.provider_key,
+            selection.provider.api_key_env
+        );
+    }
+    let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
+    transport
+        .chat(GenAiChatRequest {
+            model: ModelTarget {
+                adapter: selection.provider.genai_adapter(),
+                endpoint: &selection.provider.base_url,
+                api_key: &api_key,
+                model: &selection.model.model,
+            },
+            system_prompt: options.system_prompt.map(str::to_owned),
+            messages: options.messages.clone(),
+            tools: options.tools.clone(),
+            previous_response_id: options.previous_response_id.clone(),
+            temperature: options.temperature,
+            max_tokens: options.num_predict,
+            timeout: std::time::Duration::from_secs(selection.capabilities.request_timeout_sec),
+            reasoning: selection.capabilities.thinking,
+            reasoning_budget: Some(config.gemini_thinking_budget),
+            egress: selection.provider.egress,
+        })
+        .await
+        .map_err(anyhow::Error::new)
+}
+
 async fn generate_profile_once(
     config: &Config,
     selection: &RouteSelection<'_>,
@@ -347,6 +491,36 @@ async fn generate_profile_once(
             outcome: "success".to_string(),
         }],
     })
+}
+
+async fn generate_chat_once(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    options: &GenerateChatOptions<'_>,
+) -> anyhow::Result<ChatResponse> {
+    let (target, egress) = legacy_model_target(config, provider, model)?;
+    let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
+    transport
+        .chat(GenAiChatRequest {
+            model: target,
+            system_prompt: options.system_prompt.map(str::to_owned),
+            messages: options.messages.to_vec(),
+            tools: options.tools.clone(),
+            previous_response_id: options.previous_response_id.clone(),
+            temperature: options.temperature,
+            max_tokens: options.num_predict,
+            timeout: std::time::Duration::from_secs(45),
+            reasoning: if provider == "gemini" {
+                crate::llm::profiles::ThinkingMode::Budget
+            } else {
+                crate::llm::profiles::ThinkingMode::None
+            },
+            reasoning_budget: Some(config.gemini_thinking_budget),
+            egress,
+        })
+        .await
+        .map_err(anyhow::Error::new)
 }
 
 fn classify_attempt_error(error: &anyhow::Error) -> String {

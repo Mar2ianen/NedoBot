@@ -53,12 +53,12 @@ pub struct GenAiRequest<'a> {
     pub egress: Egress,
 }
 
-#[allow(dead_code)] // Используется фазой B для native tool-call history.
 pub struct GenAiChatRequest<'a> {
     pub model: ModelTarget<'a>,
     pub system_prompt: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Tool>>,
+    pub previous_response_id: Option<String>,
     pub temperature: f32,
     pub max_tokens: u32,
     pub timeout: Duration,
@@ -143,7 +143,6 @@ impl GenAiTransport {
             .ok_or_else(LlmTransportError::empty_response)
     }
 
-    #[allow(dead_code)] // Используется фазой B для native tool-call history.
     pub async fn chat(
         &self,
         request: GenAiChatRequest<'_>,
@@ -152,7 +151,7 @@ impl GenAiTransport {
             system: request.system_prompt,
             messages: request.messages,
             tools: request.tools,
-            previous_response_id: None,
+            previous_response_id: request.previous_response_id,
             store: None,
         };
         let options = build_chat_options(
@@ -564,6 +563,85 @@ mod tests {
 
         assert_eq!(error, LlmTransportError::StructuredOutputRejected);
         assert!(!error.to_string().contains("SECRET_PROVIDER_BODY"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_tool_http_contract_roundtrips_tool_call() {
+        async fn tool_call_response() -> Json<Value> {
+            Json(serde_json::json!({
+                "id": "tool-contract",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "contract-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "chat.search_messages",
+                                "arguments": r#"{"query":"тест"}"#
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(tool_call_response)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let endpoint = format!("http://{address}/v1");
+        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let response = transport
+            .chat(GenAiChatRequest {
+                model: ModelTarget {
+                    adapter: GenAiAdapter::OpenAi,
+                    endpoint: &endpoint,
+                    api_key: "contract-key",
+                    model: "contract-model",
+                },
+                system_prompt: Some("system".to_string()),
+                messages: vec![ChatMessage::user("question")],
+                tools: Some(vec![
+                    Tool::new("chat.search_messages")
+                        .with_description("search")
+                        .with_schema(serde_json::json!({
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}}
+                        }))
+                        .with_strict(true),
+                ]),
+                previous_response_id: None,
+                temperature: 0.2,
+                max_tokens: 128,
+                timeout: Duration::from_secs(5),
+                reasoning: ThinkingMode::None,
+                reasoning_budget: None,
+                egress: Egress::Direct,
+            })
+            .await
+            .unwrap();
+
+        let calls = response.into_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "call-1");
+        assert_eq!(calls[0].fn_name, "chat.search_messages");
+        assert_eq!(calls[0].fn_arguments, serde_json::json!({"query": "тест"}));
+
         server.abort();
     }
 }
