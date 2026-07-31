@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use crate::config::Config;
 // Reserve space for the agent's untrusted-result envelope; never raw-truncate JSON there.
 const MAX_TOOL_RESULT_CHARS: usize = 11_000;
 const MAX_TOOL_CATALOG_CHARS: usize = 12_000;
+const PROVIDER_TOOL_NAME_SEPARATOR: &str = "__";
 
 pub const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github.search"];
 pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
@@ -49,6 +50,7 @@ pub struct McpClient {
     service: RunningService<RoleClient, ()>,
     tool_names: HashSet<String>,
     genai_tools: Vec<GenAiTool>,
+    wire_to_canonical: HashMap<String, String>,
     timeout: Duration,
 }
 
@@ -92,6 +94,7 @@ impl McpClient {
             service,
             tool_names: catalog.tool_names,
             genai_tools: catalog.genai_tools,
+            wire_to_canonical: catalog.wire_to_canonical,
             timeout: timeout_duration,
         })
     }
@@ -106,6 +109,10 @@ impl McpClient {
 
     pub fn genai_tools(&self) -> &[GenAiTool] {
         &self.genai_tools
+    }
+
+    pub fn canonical_tool_name(&self, wire_name: &str) -> Option<&str> {
+        self.wire_to_canonical.get(wire_name).map(String::as_str)
     }
 
     pub async fn shutdown(mut self) {
@@ -134,6 +141,13 @@ impl McpClient {
 struct ToolCatalog {
     tool_names: HashSet<String>,
     genai_tools: Vec<GenAiTool>,
+    wire_to_canonical: HashMap<String, String>,
+}
+
+/// OpenAI-compatible function names do not accept the dotted MCP namespace.
+/// Keep canonical names for policy/audit and use a reversible provider-safe wire name.
+pub(crate) fn wire_tool_name(canonical_name: &str) -> String {
+    canonical_name.replace('.', PROVIDER_TOOL_NAME_SEPARATOR)
 }
 
 fn reject_local_tool_collisions(tools: &[Tool]) -> anyhow::Result<()> {
@@ -158,27 +172,41 @@ fn format_tool_catalog(tools: &[Tool]) -> anyhow::Result<ToolCatalog> {
 
     let mut tool_names = HashSet::new();
     let mut genai_tools = Vec::new();
+    let mut wire_to_canonical = HashMap::new();
     let mut rendered_chars = 0;
     for tool in allowed_tools {
         let entry = format_tool_catalog_entry(tool)?;
         if rendered_chars + entry.chars().count() > MAX_TOOL_CATALOG_CHARS {
             continue;
         }
-        tool_names.insert(tool.name.to_string());
+        let canonical_name = tool.name.to_string();
+        let wire_name = wire_tool_name(&canonical_name);
+        if let Some(previous) = wire_to_canonical.insert(wire_name.clone(), canonical_name.clone())
+        {
+            anyhow::bail!(
+                "MCP tools {:?} and {:?} collide after provider tool-name mapping",
+                previous,
+                canonical_name
+            );
+        }
+        tool_names.insert(canonical_name);
         rendered_chars += entry.chars().count();
-        let mut genai_tool = GenAiTool::new(tool.name.to_string())
+        let genai_tool = GenAiTool::new(wire_name)
             .with_description(
                 tool.description
                     .as_deref()
                     .unwrap_or("описание отсутствует"),
             )
             .with_schema(Value::Object((*tool.input_schema).clone()));
-        genai_tool = genai_tool.with_strict(true);
+        // MCP-схемы содержат optional-поля. Strict OpenAI-compatible tool schema
+        // требует объявлять каждое поле обязательным, поэтому policy-проверка
+        // остаётся локальной, а provider strict mode для MCP не включаем.
         genai_tools.push(genai_tool);
     }
     Ok(ToolCatalog {
         tool_names,
         genai_tools,
+        wire_to_canonical,
     })
 }
 
@@ -326,8 +354,15 @@ mod tests {
         assert!(!catalog.tool_names.contains("db.select"));
         assert_eq!(catalog.genai_tools.len(), 1);
         assert!(catalog.genai_tools[0].schema.is_some());
-        assert_eq!(catalog.genai_tools[0].name.to_string(), "chat.resolve_user");
-        assert_eq!(catalog.genai_tools[0].strict, Some(true));
+        assert_eq!(
+            catalog.genai_tools[0].name.to_string(),
+            "chat__resolve_user"
+        );
+        assert_eq!(catalog.genai_tools[0].strict, None);
+        assert_eq!(
+            catalog.wire_to_canonical.get("chat__resolve_user"),
+            Some(&"chat.resolve_user".to_string())
+        );
     }
 
     #[test]
