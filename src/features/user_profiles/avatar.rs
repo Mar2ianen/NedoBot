@@ -65,7 +65,9 @@ async fn download_profile_avatar(
     path: &Path,
 ) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(avatars_dir).await?;
-    let file = bot.get_file(file_id.to_string()).await?;
+    let file = bot
+        .get_file(teloxide::types::FileId(file_id.to_string()))
+        .await?;
     if usize::try_from(file.size).unwrap_or(usize::MAX) > MAX_PROFILE_AVATAR_BYTES {
         anyhow::bail!("profile avatar exceeds byte limit");
     }
