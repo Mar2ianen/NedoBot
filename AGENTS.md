@@ -6,7 +6,7 @@
 
 Rust-бот для Telegram-чата `НедоNews Chat`. Первый комментарий под постом канала, память контекста, статистика, расшифровка голосовых.
 
-- **Стек**: Rust 2024 edition, teloxide 0.13 (параллельно готовится отдельный fork/upgrade для Bot API 10.2), sqlx 0.8 (PostgreSQL), reqwest 0.12
+- **Стек**: Rust 2024 edition, fork teloxide 0.18 / teloxide-core 0.14 (Bot API 10.2), sqlx 0.8 (PostgreSQL), reqwest 0.13
 - **LLM-провайдеры**: Gemini (основной), Groq, Cerebras, OpenRouter, Ollama, OpenAI-compatible
 - **ASR**: Groq Whisper
 - **Бот**: `@nedostraj_bot`, чат `-1001932061163`, канал `-1001575496091`
@@ -52,7 +52,7 @@ src/features/voice/cleanup.rs           — LLM cleanup: prompt → generate →
 src/features/voice/render.rs            — plain text / chapters / preview+file
 src/features/voice/types.rs             — VoiceMedia, AsrTranscript, CleanTranscript, TranscriptChapter
 src/features/voice/repo.rs              — voice_transcription_jobs CRUD
-src/features/user_profiles/service.rs   — refresh_profile: get_chat, get_user_profile_photos, getUserPersonalChatMessages
+src/features/user_profiles/service.rs   — refresh_profile: get_chat, get_user_profile_photos, get_user_personal_chat_messages
 src/features/user_profiles/enrichment.rs — bounded queue: profile refresh → audit → spam/review/avatar jobs
 src/features/new_user_analysis.rs       — new user audit: features, risk scoring, spam classification
 src/features/first_message_spam.rs      — optional LLM-анализ первого сообщения нового пользователя
@@ -132,12 +132,12 @@ migrations/                            — sqlx compile-time миграции
 
 ### Secrets — не утекать
 - API ключи передаются через `bearer_auth()` или `header("x-goog-api-key", ...)`.
-- **Не логировать** response bodies от API при ошибках. `send_rich_message_request` извлекает body только для разбора безопасных `error_code`/`description`; raw body и URL с токеном не должны попадать в ошибки.
-- Токен в URL для raw API calls (`getUserPersonalChatMessages`, `sendRichMessage`) — ок, но не логировать URL при ошибках.
+- **Не логировать** response bodies от внешних API при ошибках. Raw body и URL с секретами не должны попадать в ошибки.
+- Telegram API вызывается через typed методы teloxide fork-а; application code не должен собирать token-bearing URLs или дублировать Telegram payload/response модели.
 
-### Telegram Bot API 10.1
-- `sendRichMessage` / `InputRichMessage` используются в production для rich stats, `/ask` и длинных расшифровок голосовых; при ошибке доступен безопасный HTML/file fallback.
-- `getUserPersonalChatMessages` — используется в profile refresh (Bot API 10.1, June 11, 2026).
+### Telegram Bot API 10.2
+- `Bot::send_rich_message` / `InputRichMessage` используются в production для rich stats, `/ask` и длинных расшифровок голосовых; при ошибке доступен безопасный HTML/file fallback.
+- `Bot::get_user_personal_chat_messages` используется в profile refresh.
 - `chatFullInfo` поля (`emoji_status_custom_emoji_id`, `profile_accent_color_id`) — используются.
 
 ## Потоки данных
@@ -293,55 +293,32 @@ docs: update TECHNICAL.md with voice pipeline details
 - Если меняем Config (новые поля) — обновить struct + from_env + все test fixtures + техническую документацию и tracked config template, если он добавлен в репозиторий.
 - Commit message тело (если нужно): описать контекст, мотивацию, что пробовалось. Не dump diff.
 
-## Bot API 10.1 — локальные изменения
+## Bot API 10.2 — typed fork methods
 
-Бот использует три метода из **Bot API 10.1** (June 11, 2026). Все через raw HTTP, teloxide их не оборачивает.
+Fork teloxide 0.18 / teloxide-core 0.14 предоставляет typed методы для используемых расширений Bot API. Не добавлять для них raw HTTP-обёртки или самодельные wire-модели.
 
-### getUserPersonalChatMessages
-**Где:** `src/features/user_profiles/service.rs:253-281`
-
-```
-POST https://api.telegram.org/bot{token}/getUserPersonalChatMessages
-Body: { "user_id": i64, "limit": 5 }
-```
+### `get_user_personal_chat_messages`
+**Где:** `src/features/user_profiles/service.rs:224-232`
 
 Возвращает последние сообщения из личного канала пользователя. Используется для:
-- Детектирования adult-спама (promo DM bait, personal channel promotion)
-- Анализа текста личного канала нового пользователя
-- Ошибки: `USER_PERSONAL_CHANNEL_MISSING` — канал отсутствует, считается definitive
+- детектирования adult-спама (promo DM bait, personal channel promotion);
+- анализа текста личного канала нового пользователя;
+- обработки `USER_PERSONAL_CHANNEL_MISSING` как definitive-ошибки отсутствия канала.
 
-### sendRichMessage
-**Где:** `src/telegram/render.rs`
+### `send_rich_message`
+**Где:** `src/telegram/render.rs:36-80`
 
-```
-POST https://api.telegram.org/bot{token}/sendRichMessage
-Body: { chat_id, rich_message: { html | markdown, is_rtl?, skip_entity_detection? }, reply_parameters?, ... }
-```
+Используется для rich-отчётов статистики, `/ask` и длинных расшифровок голосовых. Локальный renderer отвечает только за application-level лимит `32_768` символов, reply-параметры и безопасный fallback.
 
-Rich Messages — структурированный текст до 32 KB с вложениями, entity detection, RTL. Реализовано:
-- `InputRichMessage::html()`, `InputRichMessage::markdown()`
-- `send_rich_html()`, `send_rich_html_reply()`
-- `normalize_rich_text()` с лимитом 32 768 символов
-
-Используется в production для rich-отчётов статистики, `/ask` и длинных расшифровок голосовых. Если Rich API недоступен или ответ не проходит его лимит, вызывающий pipeline использует безопасный fallback.
-
-### chatFullInfo поля
-**Где:** `src/features/user_profiles/service.rs:185-187`
+### `ChatFullInfo`
+**Где:** `src/features/user_profiles/service.rs:179-181`
 
 ```rust
-chat.chat_full_info.emoji_status_custom_emoji_id
-chat.chat_full_info.profile_accent_color_id
+chat.emoji_status_custom_emoji_id
+chat.profile_accent_color_id
 ```
 
-teloxide оборачивает эти поля из `ChatFullInfo` (Bot API 10.1). Используются в профиле пользователя для:
-- Custom emoji status пользователя
-- Accent color профиля
-
-### Типы teloxide, затронутые Bot API 10.1
-- `Chat` получил `chat_full_info: ChatFullInfo`
-- `UserProfilePhotos` — без изменений
-- `MessageOrigin::Channel` — без изменений
-- teloxide 0.13 обновлён для 10.1
+Typed-модель teloxide предоставляет эти поля для сохранения custom emoji status и accent color профиля.
 
 ## Правила для AI-ассистента
 
