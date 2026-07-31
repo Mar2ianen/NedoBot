@@ -201,6 +201,16 @@ impl NewUserAuditAssessment {
         Ok(assessment)
     }
 
+    /// Разбирает результат, который уже прошёл modality validation на границе
+    /// generation и был сохранён для materialization replay.
+    pub(crate) fn parse_stored(value: &str) -> anyhow::Result<Self> {
+        let assessment = Self::parse_value(value)?;
+        validate_avatar(assessment.avatar_observation.as_ref())?;
+        validate_first_message(assessment.first_message_assessment.as_ref())?;
+        validate_profile(&assessment.profile_assessment)?;
+        Ok(assessment)
+    }
+
     fn parse_value(value: &str) -> anyhow::Result<Self> {
         let value: Value =
             serde_json::from_str(value).context("LLM audit output is not valid JSON")?;

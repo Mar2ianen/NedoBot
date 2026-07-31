@@ -218,21 +218,31 @@ async fn generate_and_finalize(
     Ok(())
 }
 
-/// Валидирует сохранённый результат в контексте канонического снимка job.
+/// Валидирует сохранённый результат перед materialization replay.
 ///
-/// Аватар считаем доступным консервативно: после успешной генерации Telegram
-/// может удалить file reference, но это не должно делать ранее сохранённое
-/// наблюдение невалидным при replay.
+/// Stored assessment уже прошёл modality validation на generation boundary.
+/// Поэтому исторический Telegram file ID не используется для восстановления
+/// факта реально скачанного изображения: старый ID может остаться в job, даже
+/// если generation продолжила работу в text-only режиме.
 fn parse_stored_assessment(
     job: &NewUserAuditJob,
     assessment_json: &Value,
 ) -> anyhow::Result<NewUserAuditAssessment> {
-    let has_avatar_input = job.avatar_file_id.is_some() || job.avatar_file_unique_id.is_some();
-    NewUserAuditAssessment::parse_for_modalities(
-        &serde_json::to_string(assessment_json)?,
-        has_avatar_input,
-        has_first_message_input(&job.input_json),
-    )
+    let assessment =
+        NewUserAuditAssessment::parse_stored(&serde_json::to_string(assessment_json)?)?;
+
+    if has_first_message_input(&job.input_json) && assessment.first_message_assessment.is_none() {
+        anyhow::bail!(
+            "first_message_assessment must be present when stored input has a first message"
+        );
+    }
+
+    let has_avatar_metadata = job.avatar_file_id.is_some() || job.avatar_file_unique_id.is_some();
+    if !has_avatar_metadata && assessment.avatar_observation.is_some() {
+        anyhow::bail!("stored avatar observation has no corresponding avatar metadata");
+    }
+
+    Ok(assessment)
 }
 
 fn has_first_message_input(input_json: &Value) -> bool {
@@ -501,6 +511,17 @@ mod tests {
             .expect_err("stored avatar observation requires avatar input")
             .to_string();
 
-        assert!(error.contains("avatar_observation must be null"));
+        assert!(error.contains("stored avatar observation has no corresponding avatar metadata"));
+    }
+
+    #[test]
+    fn stored_replay_accepts_text_only_assessment_with_stale_avatar_id() {
+        let mut job = job_with_input(json!({ "text": { "first_message_preview": null } }));
+        job.avatar_file_id = Some("stale-file-id".to_string());
+
+        let assessment = parse_stored_assessment(&job, &assessment_without_first_message())
+            .expect("stored text-only assessment must survive replay");
+
+        assert_eq!(assessment.avatar_observation, None);
     }
 }
