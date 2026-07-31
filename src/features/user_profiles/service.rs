@@ -1,21 +1,19 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
 use teloxide::{
     payloads::GetUserProfilePhotosSetters,
     prelude::*,
-    types::{ChatFullInfo, PhotoSize, UserId, UserProfilePhotos},
+    types::{ChatFullInfo, Message, PhotoSize, UserId, UserProfilePhotos},
 };
 use tokio::time::sleep;
 
 use crate::db::telegram::{
     UserProfileDetails, mark_user_profile_refresh_error, update_user_profile_details,
 };
-use crate::http;
 
 #[allow(dead_code)]
 pub struct RefreshUserProfilesQuery {
@@ -105,7 +103,7 @@ pub async fn refresh_profile(bot: &Bot, pool: &PgPool, user_id: i64) -> anyhow::
     let user_id_u64 = u64::try_from(user_id).context("negative user id")?;
     let user_id = UserId(user_id_u64);
 
-    let personal_channel_future = fetch_personal_channel_messages(user_id.0 as i64);
+    let personal_channel_future = fetch_personal_channel_messages(bot, user_id);
     let (chat_result, photos_result, personal_channel_result) = tokio::join!(
         bot.get_chat(ChatId(user_id.0 as i64)),
         bot.get_user_profile_photos(user_id).limit(1),
@@ -223,78 +221,22 @@ struct PersonalChannelData {
     raw_json: Value,
 }
 
-#[derive(Deserialize)]
-struct TelegramApiResponse<T> {
-    ok: bool,
-    result: Option<T>,
-    description: Option<String>,
+async fn fetch_personal_channel_messages(
+    bot: &Bot,
+    user_id: UserId,
+) -> anyhow::Result<PersonalChannelData> {
+    let messages = bot.get_user_personal_chat_messages(user_id, 5).await?;
+    let result = serde_json::to_value(&messages)?;
+    let raw_json = json!({"ok": true, "result": result});
+
+    Ok(build_personal_channel_data(messages, raw_json))
 }
 
-#[derive(Deserialize)]
-struct PersonalChannelMessage {
-    message_id: i32,
-    date: i64,
-    chat: PersonalChannelChat,
-    text: Option<String>,
-    caption: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PersonalChannelChat {
-    id: i64,
-    title: Option<String>,
-    username: Option<String>,
-}
-
-async fn fetch_personal_channel_messages(user_id: i64) -> anyhow::Result<PersonalChannelData> {
-    let token = std::env::var("TELOXIDE_TOKEN")
-        .or_else(|_| std::env::var("BOT_TOKEN"))
-        .map_err(|_| anyhow::anyhow!("Telegram bot token is not configured"))?;
-    let url = format!("https://api.telegram.org/bot{token}/getUserPersonalChatMessages");
-    let response = http::client(Duration::from_secs(5))?
-        .post(url)
-        .json(&json!({
-            "user_id": user_id,
-            "limit": 5,
-        }))
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("personal channel request failed"))?;
-
-    let raw_json: Value = response
-        .json()
-        .await
-        .map_err(|_| anyhow::anyhow!("personal channel response parsing failed"))?;
-    let api: TelegramApiResponse<Vec<PersonalChannelMessage>> =
-        serde_json::from_value(raw_json.clone())?;
-
-    if !api.ok {
-        anyhow::bail!(
-            "{}",
-            api.description
-                .unwrap_or_else(|| "getUserPersonalChatMessages failed".to_string())
-        );
-    }
-
-    Ok(build_personal_channel_data(
-        api.result.unwrap_or_default(),
-        raw_json,
-    ))
-}
-
-fn build_personal_channel_data(
-    messages: Vec<PersonalChannelMessage>,
-    raw_json: Value,
-) -> PersonalChannelData {
+fn build_personal_channel_data(messages: Vec<Message>, raw_json: Value) -> PersonalChannelData {
     let first = messages.first();
-    let last_text = first.and_then(|message| message.text.clone().or(message.caption.clone()));
+    let last_text = first.and_then(message_text).map(str::to_owned);
     let has_adult_links = messages.iter().any(|message| {
-        let text = message
-            .text
-            .as_deref()
-            .or(message.caption.as_deref())
-            .unwrap_or_default()
-            .to_lowercase();
+        let text = message_text(message).unwrap_or_default().to_lowercase();
         text.contains("t.me/+")
             && (text.contains("хочешь увидеть")
                 || text.contains("заходи")
@@ -304,17 +246,20 @@ fn build_personal_channel_data(
     });
 
     PersonalChannelData {
-        chat_id: first.map(|message| message.chat.id),
-        title: first.and_then(|message| message.chat.title.clone()),
-        username: first.and_then(|message| message.chat.username.clone()),
+        chat_id: first.map(|message| message.chat.id.0),
+        title: first.and_then(|message| message.chat.title().map(str::to_owned)),
+        username: first.and_then(|message| message.chat.username().map(str::to_owned)),
         message_count: i32::try_from(messages.len()).unwrap_or(i32::MAX),
-        last_message_id: first.map(|message| message.message_id),
-        last_message_at: first
-            .and_then(|message| sqlx::types::chrono::DateTime::from_timestamp(message.date, 0)),
+        last_message_id: first.map(|message| message.id.0),
+        last_message_at: first.map(|message| message.date),
         last_text,
         has_adult_links,
         raw_json,
     }
+}
+
+fn message_text(message: &Message) -> Option<&str> {
+    message.text().or_else(|| message.caption())
 }
 
 fn is_definitive_personal_channel_error(error: &str) -> bool {

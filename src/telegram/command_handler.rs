@@ -291,7 +291,7 @@ async fn handle_ask_command(
     }
     match answer {
         Ok(answer) => {
-            if send_rich_markdown_reply(msg.chat.id, msg.id, answer.markdown.clone())
+            if send_rich_markdown_reply(bot, msg.chat.id, msg.id, answer.markdown.clone())
                 .await
                 .is_ok()
             {

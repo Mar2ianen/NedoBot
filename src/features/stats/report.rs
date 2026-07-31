@@ -113,7 +113,7 @@ async fn send_stats_report(
 ) -> ResponseResult<Message> {
     match render {
         StatsRender::Html => send_html(bot, chat_id, report).await,
-        StatsRender::Rich => send_rich_html(chat_id, report).await,
+        StatsRender::Rich => send_rich_html(bot, chat_id, report).await,
     }
 }
 
