@@ -236,6 +236,11 @@ fn parse_stored_assessment(
             "first_message_assessment must be present when stored input has a first message"
         );
     }
+    if !has_first_message_input(&job.input_json) && assessment.first_message_assessment.is_some() {
+        anyhow::bail!(
+            "first_message_assessment must be null when stored input has no first message"
+        );
+    }
 
     let has_avatar_metadata = job.avatar_file_id.is_some() || job.avatar_file_unique_id.is_some();
     if !has_avatar_metadata && assessment.avatar_observation.is_some() {
@@ -490,6 +495,30 @@ mod tests {
             .to_string();
 
         assert!(error.contains("first_message_assessment must be present"));
+    }
+
+    #[test]
+    fn stored_replay_rejects_first_message_assessment_without_job_input() {
+        let job = job_with_input(json!({ "text": { "first_message_preview": null } }));
+        let mut assessment = assessment_without_first_message();
+        assessment["first_message_assessment"] = json!({
+            "relation_to_chat": "on_topic",
+            "direct_dm_offer": false,
+            "offtopic_promo": false,
+            "template_campaign": false,
+            "self_reference_grammar": "none_or_unclear",
+            "profile_name_grammar_relation": "not_applicable",
+            "risk_markers": [],
+            "evidence": [],
+            "summary": "Контекста первого сообщения нет.",
+            "confidence": 0.8
+        });
+
+        let error = parse_stored_assessment(&job, &assessment)
+            .expect_err("stored replay must reject an assessment without first-message input")
+            .to_string();
+
+        assert!(error.contains("first_message_assessment must be null"));
     }
 
     #[test]
