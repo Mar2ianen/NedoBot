@@ -10,7 +10,6 @@ pub struct LlmProfiles {
     pub providers: BTreeMap<String, ProviderProfile>,
     pub models: BTreeMap<String, ModelProfile>,
     pub routes: BTreeMap<String, RouteProfile>,
-    #[serde(default)]
     pub runtime: RuntimeSettings,
 }
 
@@ -376,6 +375,8 @@ thinking = "none"
 
 [routes.memory]
 models = ["ollama_memory"]
+
+[runtime]
 "#;
 
     #[test]
@@ -384,6 +385,16 @@ models = ["ollama_memory"]
 
         assert!(profiles.routes.contains_key("first_comment"));
         assert!(profiles.routes.contains_key("voice_cleanup"));
+    }
+
+    #[test]
+    fn profiles_require_runtime_section() {
+        let without_runtime = VALID_PROFILES.replace("\n[runtime]\n", "\n");
+        let error = LlmProfiles::from_toml(&without_runtime)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("runtime"));
     }
 
     #[test]

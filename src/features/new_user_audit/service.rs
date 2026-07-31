@@ -227,9 +227,10 @@ fn parse_stored_assessment(
     job: &NewUserAuditJob,
     assessment_json: &Value,
 ) -> anyhow::Result<NewUserAuditAssessment> {
+    let has_avatar_input = job.avatar_file_id.is_some() || job.avatar_file_unique_id.is_some();
     NewUserAuditAssessment::parse_for_modalities(
         &serde_json::to_string(assessment_json)?,
-        true,
+        has_avatar_input,
         has_first_message_input(&job.input_json),
     )
 }
@@ -482,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_replay_keeps_avatar_validation_conservative() {
+    fn stored_replay_rejects_avatar_observation_without_avatar_input() {
         let job = job_with_input(json!({ "text": { "first_message_preview": null } }));
         let mut assessment = assessment_without_first_message();
         assessment["avatar_observation"] = json!({
@@ -496,7 +497,10 @@ mod tests {
             "confidence": 0.8
         });
 
-        parse_stored_assessment(&job, &assessment)
-            .expect("stored avatar observation must remain valid during replay");
+        let error = parse_stored_assessment(&job, &assessment)
+            .expect_err("stored avatar observation requires avatar input")
+            .to_string();
+
+        assert!(error.contains("avatar_observation must be null"));
     }
 }

@@ -101,7 +101,7 @@ migrations/                            — sqlx compile-time миграции
 
 ## Конфигурация
 
-Несекретные runtime-настройки хранятся в `[runtime]` существующего `config/llm_profiles.toml.example` (или в deployment-копии, выбранной через `LLM_PROFILES_PATH`). Локальный `.env` не коммитится и содержит только секреты, DSN, invite/proxy URL и другие чувствительные значения; полный контракт приведён в `docs/TECHNICAL.md`. Валидация секретов выполняется на старте в `Config::validate_runtime_secrets`.
+Несекретные runtime-настройки хранятся в обязательной `[runtime]` секции существующего `config/llm_profiles.toml.example` (или в deployment-копии, выбранной через абсолютный `LLM_PROFILES_PATH`). Локальный `.env` не коммитится и содержит только секреты, DSN, invite/proxy URL и другие чувствительные значения; полный контракт приведён в `docs/TECHNICAL.md`. Отсутствующая `[runtime]` секция — startup error, defaults не подставляются. Валидация секретов выполняется на старте в `Config::validate_runtime_secrets`.
 
 **LLM routing**: `LLM_PROFILES_PATH` необязателен и задаёт deployment-копию provider/model/task route topology; без него используется репозиторный example-файл. Каждый runtime-вызов передаёт явный route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`); provider/model env overrides и hard-coded fallback chains удалены.
 
