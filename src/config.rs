@@ -90,16 +90,7 @@ pub struct Config {
     pub new_user_audit_enabled: bool,
     pub new_user_audit_provider: String,
     pub new_user_audit_model: Option<String>,
-    /// Включает authoritative unified cutover после завершения shadow-сверки.
-    pub new_user_audit_authoritative_enabled: bool,
     pub new_user_audit_max_tokens: u32,
-    pub avatar_classifier_enabled: bool,
-    pub avatar_classifier_model: Option<String>,
-    pub avatar_classifier_max_tokens: u32,
-    pub avatar_classifier_concurrency: usize,
-    pub first_message_spam_enabled: bool,
-    pub first_message_spam_provider: String,
-    pub first_message_spam_model: Option<String>,
     pub openrouter_api_key: String,
     pub openrouter_model: Option<String>,
     pub gemini_api_key: String,
@@ -249,19 +240,7 @@ impl Config {
             new_user_audit_enabled: env_bool("NEW_USER_AUDIT_ENABLED", false)?,
             new_user_audit_provider: env_or("NEW_USER_AUDIT_PROVIDER", "cerebras"),
             new_user_audit_model: env_optional("NEW_USER_AUDIT_MODEL"),
-            new_user_audit_authoritative_enabled: env_bool(
-                "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED",
-                false,
-            )?,
             new_user_audit_max_tokens: env_u32("NEW_USER_AUDIT_MAX_TOKENS", 900)?,
-            avatar_classifier_enabled: env_bool("AVATAR_CLASSIFIER_ENABLED", true)?,
-            avatar_classifier_model: env_optional("AVATAR_CLASSIFIER_MODEL")
-                .or_else(|| Some("gemma-4-31b".to_string())),
-            avatar_classifier_max_tokens: env_u32("AVATAR_CLASSIFIER_MAX_TOKENS", 900)?,
-            avatar_classifier_concurrency: env_usize("AVATAR_CLASSIFIER_CONCURRENCY", 1)?,
-            first_message_spam_enabled: env_bool("FIRST_MESSAGE_SPAM_ENABLED", false)?,
-            first_message_spam_provider: env_or("FIRST_MESSAGE_SPAM_PROVIDER", "cerebras"),
-            first_message_spam_model: env_optional("FIRST_MESSAGE_SPAM_MODEL"),
             openrouter_api_key: env_or("OPENROUTER_API_KEY", ""),
             openrouter_model: env_optional("OPENROUTER_MODEL"),
             gemini_api_key: env_optional("GEMINI_API_KEY")
@@ -393,6 +372,7 @@ impl Config {
                 "NEW_USER_AUDIT_MAX_TOKENS",
                 self.new_user_audit_max_tokens,
             );
+            self.validate_embedding_config(&mut errors);
             if self.llm_profiles.is_none() {
                 validate_llm_provider_secret(
                     &mut errors,
@@ -410,65 +390,8 @@ impl Config {
                 );
             }
         }
-        if self.new_user_audit_authoritative_enabled && !self.new_user_audit_enabled {
-            errors.push(
-                "NEW_USER_AUDIT_AUTHORITATIVE_ENABLED=true requires NEW_USER_AUDIT_ENABLED=true"
-                    .to_string(),
-            );
-        }
-        if self.new_user_audit_authoritative_enabled && self.avatar_classifier_enabled {
-            errors.push(
-                "authoritative unified audit requires AVATAR_CLASSIFIER_ENABLED=false".to_string(),
-            );
-        }
-        if self.new_user_audit_authoritative_enabled && self.first_message_spam_enabled {
-            errors.push(
-                "authoritative unified audit requires FIRST_MESSAGE_SPAM_ENABLED=false".to_string(),
-            );
-        }
-        if self.new_user_audit_authoritative_enabled {
-            self.validate_embedding_config(&mut errors);
-        }
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
-        }
-
-        if self.avatar_classifier_enabled {
-            if self.llm_profiles.is_none() {
-                require_secret(
-                    &mut errors,
-                    "CEREBRAS_API_KEY",
-                    &self.cerebras_api_key,
-                    "AVATAR_CLASSIFIER_ENABLED=true",
-                );
-                if self.avatar_classifier_model.is_none() {
-                    errors.push(
-                        "AVATAR_CLASSIFIER_ENABLED=true requires AVATAR_CLASSIFIER_MODEL"
-                            .to_string(),
-                    );
-                }
-            }
-            if self.avatar_classifier_concurrency == 0 {
-                errors.push("AVATAR_CLASSIFIER_CONCURRENCY must be greater than 0".to_string());
-            }
-        }
-
-        if self.first_message_spam_enabled {
-            if self.llm_profiles.is_none() {
-                validate_llm_provider_secret(
-                    &mut errors,
-                    self,
-                    &self.first_message_spam_provider,
-                    "FIRST_MESSAGE_SPAM_PROVIDER",
-                );
-                if self.first_message_spam_model.is_none() {
-                    errors.push(
-                        "FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL"
-                            .to_string(),
-                    );
-                }
-            }
-            self.validate_embedding_config(&mut errors);
         }
 
         if self.ask_enabled {
@@ -570,27 +493,6 @@ impl Config {
                 RouteRequirements {
                     requires_system_prompt: true,
                     num_predict: Some(self.search_extract_max_tokens),
-                    ..RouteRequirements::default()
-                },
-            ));
-        }
-        if self.avatar_classifier_enabled {
-            routes.push((
-                "avatar_analysis",
-                RouteRequirements {
-                    requires_images: true,
-                    requires_system_prompt: true,
-                    num_predict: Some(self.avatar_classifier_max_tokens),
-                    ..RouteRequirements::default()
-                },
-            ));
-        }
-        if self.first_message_spam_enabled {
-            routes.push((
-                "first_message_spam",
-                RouteRequirements {
-                    requires_system_prompt: true,
-                    num_predict: Some(450),
                     ..RouteRequirements::default()
                 },
             ));
@@ -1158,15 +1060,7 @@ mod tests {
             new_user_audit_enabled: false,
             new_user_audit_provider: "cerebras".to_string(),
             new_user_audit_model: Some("gemma-4-31b".to_string()),
-            new_user_audit_authoritative_enabled: false,
             new_user_audit_max_tokens: 900,
-            avatar_classifier_enabled: false,
-            avatar_classifier_model: None,
-            avatar_classifier_max_tokens: 900,
-            avatar_classifier_concurrency: 1,
-            first_message_spam_enabled: false,
-            first_message_spam_provider: "cerebras".to_string(),
-            first_message_spam_model: None,
             openrouter_api_key: String::new(),
             openrouter_model: None,
             gemini_api_key: String::new(),
@@ -1486,14 +1380,15 @@ models = ["primary", "fallback"]
     }
 
     #[test]
-    fn new_user_audit_shadow_mode_allows_legacy_authoritative_pipelines() {
+    fn enabled_new_user_audit_requires_its_embedding_config() {
         let mut config = config();
         config.new_user_audit_enabled = true;
         config.cerebras_api_key = "cerebras-key".to_string();
-        config.avatar_classifier_enabled = false;
-        config.first_message_spam_enabled = false;
+        config.rag_embedding_url.clear();
 
-        config.validate_runtime_secrets().unwrap();
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
     }
 
     #[test]
@@ -1601,33 +1496,6 @@ models = ["primary", "fallback"]
         assert!(error.contains("TEST_AUDIT_FALLBACK_KEY"));
         drop(primary);
         drop(fallback);
-    }
-
-    #[test]
-    fn authoritative_new_user_audit_requires_embedding_config() {
-        let mut config = config();
-        config.new_user_audit_enabled = true;
-        config.new_user_audit_authoritative_enabled = true;
-        config.rag_embedding_url.clear();
-
-        let error = config.validate_runtime_secrets().unwrap_err().to_string();
-
-        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
-    }
-
-    #[test]
-    fn enabled_first_message_spam_requires_its_model_secret_and_embedding_config() {
-        let mut config = config();
-        config.first_message_spam_enabled = true;
-        config.rag_embedding_url.clear();
-
-        let error = config.validate_runtime_secrets().unwrap_err().to_string();
-
-        assert!(error.contains("FIRST_MESSAGE_SPAM_PROVIDER requires non-empty CEREBRAS_API_KEY"));
-        assert!(
-            error.contains("FIRST_MESSAGE_SPAM_ENABLED=true requires FIRST_MESSAGE_SPAM_MODEL")
-        );
-        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
     }
 
     #[test]

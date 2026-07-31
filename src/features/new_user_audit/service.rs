@@ -4,18 +4,18 @@ use sqlx::{PgPool, Row};
 use teloxide::prelude::Bot;
 
 use crate::config::Config;
-use crate::features::first_message_spam::{spam_similarity, template_match_count};
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
-    NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job_with_materialization,
-    finalize_authoritative_new_user_audit_job, finalize_new_user_audit_job,
-    mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
-    mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
-    materialize_authoritative_new_user_audit_job,
+    NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
+    finalize_new_user_audit_job, mark_new_user_audit_failed,
+    mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+    mark_new_user_audit_retry, materialize_new_user_audit_job,
 };
-use crate::features::new_user_audit::scoring::{FirstMessageScoreContext, score_assessment};
+use crate::features::new_user_audit::scoring::{
+    FirstMessageScoreContext, score_assessment, spam_similarity, template_match_count,
+};
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
@@ -30,12 +30,7 @@ pub async fn process_next_new_user_audit_job(
     pool: &PgPool,
     config: &Config,
 ) -> anyhow::Result<bool> {
-    let Some(job) = claim_next_new_user_audit_job_with_materialization(
-        pool,
-        config.new_user_audit_authoritative_enabled,
-    )
-    .await?
-    else {
+    let Some(job) = claim_next_new_user_audit_job(pool).await? else {
         return Ok(false);
     };
 
@@ -126,7 +121,7 @@ async fn materialize_stored_assessment(
         &assessment,
         first_message_context,
     );
-    let finalized = materialize_authoritative_new_user_audit_job(pool, job, &components).await?;
+    let finalized = materialize_new_user_audit_job(pool, job, &components).await?;
     if finalized == CasResult::LeaseLost {
         tracing::warn!(
             job_id = job.id,
@@ -187,8 +182,8 @@ async fn generate_and_finalize(
         config,
         GenerateTextOptions {
             route: Some("new_user_audit"),
-            // Profile mode resolves the route above. Legacy mode keeps this audit
-            // independent from the ordinary generation provider.
+            // Profile mode resolves the route above. Without profiles the
+            // dedicated audit provider keeps this flow independent from ordinary generation.
             provider_override: Some(&config.new_user_audit_provider),
             model_override: config.new_user_audit_model.as_deref(),
             system_prompt: Some(system_prompt()),
@@ -216,11 +211,7 @@ async fn generate_and_finalize(
         provider: &generation.provider,
         model: &generation.model,
     };
-    let finalized = if config.new_user_audit_authoritative_enabled {
-        finalize_authoritative_new_user_audit_job(pool, job, outcome).await?
-    } else {
-        finalize_new_user_audit_job(pool, job, outcome).await?
-    };
+    let finalized = finalize_new_user_audit_job(pool, job, outcome).await?;
     if finalized == CasResult::LeaseLost {
         tracing::warn!(
             job_id = job.id,

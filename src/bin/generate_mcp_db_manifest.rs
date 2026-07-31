@@ -34,6 +34,12 @@ struct Column {
     nullable: bool,
 }
 
+const RETIRED_LEGACY_VIEWS: &[&str] = &[
+    "avatar_analysis_jobs",
+    "avatar_image_analyses",
+    "avatar_profile_assessments",
+];
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -54,6 +60,9 @@ async fn main() -> anyhow::Result<()> {
     let mut tables = BTreeMap::new();
     for row in rows {
         let name: String = row.get("table_name");
+        if RETIRED_LEGACY_VIEWS.contains(&name.as_str()) {
+            continue;
+        }
         let column_rows = sqlx::query("select column_name, data_type, udt_name, is_nullable from information_schema.columns where table_schema = 'mcp_public' and table_name = $1 order by ordinal_position").bind(&name).fetch_all(&pool).await?;
         let columns = column_rows
             .into_iter()
@@ -149,7 +158,6 @@ fn primary_key(name: &str) -> Vec<String> {
         | "telegram_user_notes"
         | "telegram_chat_notes"
         | "voice_transcription_jobs"
-        | "avatar_analysis_jobs"
         | "admin_events" => vec!["id"],
         "telegram_user_profiles" => vec!["telegram_user_id"],
         "telegram_chat_users"
@@ -158,13 +166,6 @@ fn primary_key(name: &str) -> Vec<String> {
         "telegram_chat_member_events" => vec!["id"],
         "telegram_message_reaction_counts" => vec!["chat_id", "message_id"],
         "telegram_profile_identity_observations" => vec!["telegram_user_id", "snapshot_key"],
-        "avatar_profile_assessments" => vec![
-            "telegram_user_id",
-            "profile_photo_file_unique_id",
-            "features_snapshot_hash",
-            "prompt_version",
-        ],
-        "avatar_image_analyses" => vec!["profile_photo_file_unique_id", "prompt_version"],
         _ => vec!["id"],
     }
     .into_iter()

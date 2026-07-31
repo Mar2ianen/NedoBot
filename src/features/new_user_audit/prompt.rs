@@ -2,16 +2,10 @@ use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 
-// Контракт будет использован worker-ом в следующем slice аудита.
-#[allow(dead_code)]
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/new_user_audit.md");
 
-// Версия сохраняется вместе с job до подключения worker-а.
-#[allow(dead_code)]
 pub const PROMPT_VERSION: &str = "new-user-audit-v2";
 
-// Схема передаётся LLM-провайдеру после подключения worker-а.
-#[allow(dead_code)]
 static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
@@ -77,19 +71,16 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-#[allow(dead_code)] // Будущий worker получает system prompt через этот API.
 pub fn system_prompt() -> &'static str {
     SYSTEM_PROMPT
 }
 
-#[allow(dead_code)] // Будущий worker передаст схему как StructuredOutput.
 pub fn output_schema() -> &'static Value {
     &OUTPUT_SCHEMA
 }
 
 /// Сериализует канонический снимок без интерполяции строк: все его поля
 /// остаются данными, а не инструкциями для модели.
-#[allow(dead_code)] // Будущий worker сериализует снимок только через этот API.
 pub fn build_input(canonical_snapshot: &Value) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&json!({
         "untrusted_canonical_snapshot": canonical_snapshot,

@@ -22,14 +22,12 @@ use db::telegram::{
     save_message_reaction, save_message_reaction_count,
 };
 use db::{build_pool, migrate};
-use features::avatar_analysis::service::process_next_avatar_analysis_job;
 use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
-use features::first_message_spam::process_next_first_message_spam_analysis_job;
 use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL};
 use features::memory::service::process_next_history_entry;
 use features::new_user_audit::service::process_next_new_user_audit_job;
-use features::spam_review::{apply_callback, parse_callback};
+use features::spam_review::{apply_callback, parse_callback, process_next_review_delivery};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
@@ -75,13 +73,9 @@ async fn main() -> anyhow::Result<()> {
         state.config.clone(),
     );
     if state.config.new_user_audit_enabled {
-        // В shadow-режиме worker сохраняет assessment; authoritative режим materialize-ит score/review.
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
-    // Legacy avatar worker остаётся authoritative в shadow-режиме unified audit.
-    spawn_avatar_analysis_worker(bot.inner().clone(), state.clone());
-    // Delivery review-карточек не зависит от optional first-message analysis.
-    spawn_first_message_spam_analysis_worker(bot.inner().clone(), state.clone());
+    spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
     spawn_post_comment_worker(bot.clone(), state.clone());
     spawn_post_history_worker(state.clone());
     spawn_chat_retrieval_embedding_worker(state.clone());
@@ -304,20 +298,10 @@ fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
     });
 }
 
-fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
-    if !state.config.avatar_classifier_enabled {
-        return;
-    }
+fn spawn_spam_review_delivery_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
-            let permit = match state.avatar_classifier_slots.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => return,
-            };
-            let processed =
-                process_next_avatar_analysis_job(&bot, &state.pool, &state.config).await;
-            drop(permit);
-            match processed {
+            match process_next_review_delivery(&bot, &state.pool).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     tokio::time::sleep(std::time::Duration::from_secs(
@@ -326,34 +310,7 @@ fn spawn_avatar_analysis_worker(bot: Bot, state: AppState) {
                     .await
                 }
                 Err(err) => {
-                    tracing::warn!(%err, "avatar analysis worker failed to claim a job");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
-                    ))
-                    .await;
-                }
-            }
-        }
-    });
-}
-
-fn spawn_first_message_spam_analysis_worker(bot: Bot, state: AppState) {
-    // Review-card delivery is independent from optional LLM first-message analysis.
-    // The worker therefore remains active to retry pending Telegram notifications.
-    tokio::spawn(async move {
-        loop {
-            match process_next_first_message_spam_analysis_job(&bot, &state.pool, &state.config)
-                .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
-                    ))
-                    .await
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "spam review or first-message analysis worker failed");
+                    tracing::warn!(%err, "spam review delivery worker failed");
                     tokio::time::sleep(std::time::Duration::from_secs(
                         EXTERNAL_ANALYSIS_POLL.error_seconds(),
                     ))
