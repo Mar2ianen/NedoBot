@@ -1,5 +1,5 @@
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, MessageId, ReplyParameters};
+use teloxide::types::{InputFile, InputRichMessage, MessageId, ReplyParameters};
 
 use crate::db::telegram::save_telegram_message;
 use crate::features::voice::asr::transcribe_audio;
@@ -12,7 +12,7 @@ use crate::features::voice::repo::{
 };
 use crate::features::voice::types::{AsrTranscript, VoiceMedia};
 use crate::state::AppState;
-use crate::telegram::render::{InputRichMessage, send_html_reply, send_rich_message_reply};
+use crate::telegram::render::{send_html_reply, send_rich_message_reply};
 
 const NO_SPEECH_MESSAGE: &str = "В записи не нашёл распознаваемой речи — не буду додумывать текст.";
 
@@ -345,8 +345,8 @@ async fn send_rendered_transcript(
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
             .await?;
-            let rich = InputRichMessage::html(html.clone())?.skip_entity_detection(true);
-            match send_rich_message_reply(msg.chat.id, msg.id, rich).await {
+            let rich = InputRichMessage::html(html.clone()).skip_entity_detection(true);
+            match send_rich_message_reply(bot, msg.chat.id, msg.id, rich).await {
                 Ok(_) => Ok(SentRenderedTranscript {
                     html: html.clone(),
                     file_id: None,
@@ -397,7 +397,7 @@ async fn send_regular_transcript(
                 .await?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
-                file_id: sent.document().map(|document| document.file.id.clone()),
+                file_id: sent.document().map(|document| document.file.id.to_string()),
             })
         }
         RenderedTranscript::RichMessage { .. } => {
