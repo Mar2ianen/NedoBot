@@ -19,7 +19,7 @@ pub fn custom_emoji_ids(msg: &Message) -> Vec<String> {
         .flatten()
         .chain(msg.caption_entities().into_iter().flatten())
         .filter_map(|entity| match &entity.kind {
-            MessageEntityKind::CustomEmoji { custom_emoji_id } => Some(custom_emoji_id.clone()),
+            MessageEntityKind::CustomEmoji { custom_emoji_id } => Some(custom_emoji_id.to_string()),
             _ => None,
         })
         .collect()

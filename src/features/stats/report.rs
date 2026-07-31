@@ -113,14 +113,14 @@ async fn send_stats_report(
 ) -> ResponseResult<Message> {
     match render {
         StatsRender::Html => send_html(bot, chat_id, report).await,
-        StatsRender::Rich => send_rich_html(chat_id, report).await,
+        StatsRender::Rich => send_rich_html(bot, chat_id, report).await,
     }
 }
 
 fn stats_error(message: &'static str) -> impl FnOnce(anyhow::Error) -> teloxide::RequestError {
     move |err| {
         tracing::error!(%err, "{message}");
-        teloxide::RequestError::Io(std::io::Error::other("stats failed"))
+        teloxide::RequestError::Io(std::io::Error::other("stats failed").into())
     }
 }
 

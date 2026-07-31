@@ -51,7 +51,9 @@ pub async fn handle_command(
                 .await
                 .map_err(|err| {
                     tracing::error!(%err, "database check failed");
-                    teloxide::RequestError::Io(std::io::Error::other("database check failed"))
+                    teloxide::RequestError::Io(
+                        std::io::Error::other("database check failed").into(),
+                    )
                 })?;
 
             bot.send_message(msg.chat.id, format!("db ok: {}", row.0))
@@ -80,9 +82,9 @@ pub async fn handle_command(
         Command::Transcribe => {
             transcribe_reply(&bot, &msg, &state).await.map_err(|err| {
                 tracing::error!(%err, "manual voice transcription command failed");
-                teloxide::RequestError::Io(std::io::Error::other(
-                    "manual voice transcription failed",
-                ))
+                teloxide::RequestError::Io(
+                    std::io::Error::other("manual voice transcription failed").into(),
+                )
             })?;
         }
         Command::Ask(question) => {
@@ -224,10 +226,9 @@ async fn handle_ask_command(
         return Ok(());
     }
 
-    let permit =
-        state.ask_slots.clone().try_acquire_owned().map_err(|_| {
-            teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy"))
-        })?;
+    let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
+        teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy").into())
+    })?;
     let progress_message = bot
         .send_message(msg.chat.id, ask_progress_message(AskProgress::Preparing))
         .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
@@ -290,7 +291,7 @@ async fn handle_ask_command(
     }
     match answer {
         Ok(answer) => {
-            if send_rich_markdown_reply(msg.chat.id, msg.id, answer.markdown.clone())
+            if send_rich_markdown_reply(bot, msg.chat.id, msg.id, answer.markdown.clone())
                 .await
                 .is_ok()
             {
