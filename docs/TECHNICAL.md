@@ -194,7 +194,7 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
-`/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает одну генерацию действия LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Значения `0` запрещены. Старый `ASK_TIMEOUT_SEC` временно поддерживается только как совместимый alias для action timeout, пока production environment files переезжают на явное имя.
+`/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены. Старый `ASK_TIMEOUT_SEC` временно поддерживается только как совместимый alias для turn timeout, пока production environment files переезжают на явное имя.
 
 ### Поиск фактов для первого комментария
 

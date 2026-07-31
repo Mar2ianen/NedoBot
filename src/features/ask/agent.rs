@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Instant;
 
-use serde::Deserialize;
+use genai::chat::{ChatMessage, ChatResponse, ContentPart, MessageContent, Tool, ToolResponse};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
@@ -17,8 +18,7 @@ use crate::features::ask::repo;
 use crate::features::ask::types::{AskProgress, PendingToolCallAudit};
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
-use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
-use crate::llm::types::StructuredOutput;
+use crate::llm::service::{GenerateChatOptions, generate_chat_with_provider_checked};
 
 const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
@@ -62,29 +62,10 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Пиши на языке пользователя в Rich Markdown Telegram: короткие абзацы, списки и заголовки только когда полезны.
 - Отделяй найденные факты от выводов. Честно говори о неопределённости и ограничениях поиска.
 - Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата встраивай ссылку на message_url прямо в фразу: «[Михаил написал](URL)», «[в этом сообщении](URL)». Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
-- На каждом шаге верни ровно один JSON-объект без code fence: {"kind":"tool","tool":"имя","arguments":{...}} либо {"kind":"final","markdown":"ответ"}."#;
+- Используй native tool calls для инструментов. Если инструменты не нужны, верни обычный Rich Markdown-ответ без JSON-envelope и без code fence."#;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum ActionKind {
-    Tool,
-    Final,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentAction {
-    kind: ActionKind,
-    #[serde(default)]
-    tool: Option<String>,
-    #[serde(default)]
-    arguments: Value,
-    #[serde(default)]
-    markdown: Option<String>,
-}
-
-enum ActionGenerationError {
+enum AgentGenerationError {
     Request(anyhow::Error),
-    Invalid,
 }
 
 #[derive(Default)]
@@ -168,8 +149,8 @@ async fn answer_within_deadline(
     } = request;
     report_progress(progress, AskProgress::Preparing);
     let mcp = McpClient::start(config).await?;
-    let agent_tools = agent_tool_names(&mcp);
-    let tool_catalog = tool_catalog(mcp.tool_catalog());
+    let mut agent_tools = mcp.genai_tools().to_vec();
+    agent_tools.extend(local_agent_tools());
     let mut observations = Vec::new();
     let mut evidence = Evidence::default();
     let mut research = ResearchState::for_question(question);
@@ -183,176 +164,227 @@ async fn answer_within_deadline(
     }
 
     let max_attempts = config.ask_max_steps.saturating_add(MAX_CORRECTION_STEPS);
-    for step in 0..max_attempts {
-        let remaining_steps = max_attempts.saturating_sub(step);
-        let prompt = build_prompt(
-            requester_user_id,
-            requester_identity,
-            question,
-            &observations,
-            remaining_steps,
-            &tool_catalog,
-        );
-        let action = match generate_action(config, &prompt, image_base64, &agent_tools).await {
-            Ok(action) => action,
-            Err(ActionGenerationError::Invalid) => {
-                push_observation(
-                    &mut observations,
-                    "SYSTEM: предыдущий ответ модели не был допустимым JSON-действием. Верни один JSON-объект по схеме.".to_string(),
-                );
-                continue;
-            }
-            Err(ActionGenerationError::Request(err)) => return Err(err),
-        };
-        match action.kind {
-            ActionKind::Final => {
-                if let Some(markdown) = non_empty(action.markdown.as_deref()) {
-                    if let Some(instruction) = research.follow_up_instruction(markdown) {
-                        push_observation(
-                            &mut observations,
-                            format!("DRAFT_FINAL_UNTRUSTED:\n{markdown}"),
-                        );
-                        push_observation(&mut observations, instruction);
-                        continue;
-                    }
-                    return finish_answer(mcp, progress, markdown, &evidence, config).await;
-                }
-                push_observation(
-                    &mut observations,
-                    "SYSTEM: final должен содержать непустое поле markdown.".to_string(),
-                );
-            }
-            ActionKind::Tool => {
-                let Some(tool) = non_empty(action.tool.as_deref()) else {
-                    push_observation(
-                        &mut observations,
-                        "SYSTEM: tool-действие должно содержать имя инструмента.".to_string(),
-                    );
-                    continue;
-                };
-                if !allowed_agent_tool(&mcp, tool) {
-                    push_observation(
-                        &mut observations,
-                        format!("SYSTEM: инструмент {tool:?} не разрешён. Выбери его из каталога."),
-                    );
-                    continue;
-                }
-                if !action.arguments.is_object() {
-                    push_observation(
-                        &mut observations,
-                        format!("SYSTEM: arguments для {tool} должны быть JSON-объектом."),
-                    );
-                    continue;
-                }
-                if tool_call_count >= config.ask_max_steps {
-                    push_observation(
-                        &mut observations,
-                        "SYSTEM: лимит вызовов инструментов исчерпан. Сформируй лучший честный final по уже полученным данным.".to_string(),
-                    );
-                    continue;
-                }
-                let signature = format!(
-                    "{tool}:{}",
-                    serde_json::to_string(&action.arguments).unwrap_or_default()
-                );
-                if !tool_signatures.insert(signature) {
-                    audit_tool_call(
-                        pool,
-                        ask_run_id,
-                        PendingToolCallAudit::duplicate(step, tool, &action.arguments),
-                    )
-                    .await;
-                    push_observation(
-                        &mut observations,
-                        format!(
-                            "SYSTEM: точный вызов {tool} с такими аргументами уже выполнялся. Не повторяй его: измени запрос/режим либо используй контекст найденного сообщения."
-                        ),
-                    );
-                    continue;
-                }
-                tool_call_count += 1;
-                let tracking_arguments = action.arguments.clone();
-                let started = Instant::now();
-                report_progress(progress, progress_for_tool(tool));
-                match call_tool(
-                    ToolCallContext {
-                        config,
-                        pool,
-                        requester_user_id,
-                        evidence: &mut evidence,
-                        mcp: &mcp,
-                        allow_mutations,
-                    },
-                    tool,
-                    action.arguments,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        audit_tool_call(
-                            pool,
-                            ask_run_id,
-                            PendingToolCallAudit::completed(
-                                step,
-                                tool,
-                                &tracking_arguments,
-                                tool_result_count(&result.value),
-                                elapsed_millis(started),
-                            ),
-                        )
-                        .await;
-                        research.record(tool, &tracking_arguments, &result.value);
-                        push_observation(
-                            &mut observations,
-                            format!("TOOL_RESULT_UNTRUSTED {tool}:\n{}", result.agent_preview),
-                        );
-                    }
-                    Err(err) => {
-                        audit_tool_call(
-                            pool,
-                            ask_run_id,
-                            PendingToolCallAudit::failed(
-                                step,
-                                tool,
-                                &tracking_arguments,
-                                elapsed_millis(started),
-                                "tool_error",
-                            ),
-                        )
-                        .await;
-                        tracing::warn!(%err, tool, "ask tool call failed");
-                        push_observation(
-                            &mut observations,
-                            format!(
-                                "TOOL_ERROR {tool}: вызов не удался или аргументы некорректны. Исправь аргументы, выбери другой инструмент либо ответь с доступными данными."
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let prompt = build_prompt(
+    let initial_prompt = build_prompt(
         requester_user_id,
         requester_identity,
         question,
         &observations,
-        0,
-        &tool_catalog,
+        max_attempts,
     );
-    let final_prompt = format!(
-        "{prompt}\n\nSYSTEM: лимит инструментов исчерпан. Сейчас верни kind=final с лучшим честным ответом по уже полученным данным. Не вызывай новый инструмент."
-    );
-    let action = generate_action(config, &final_prompt, image_base64, &agent_tools)
+    let mut messages = vec![ask_user_message(initial_prompt, image_base64)];
+    let mut continuation_id = None;
+    for step in 0..max_attempts {
+        let response = generate_turn(
+            config,
+            &messages,
+            Some(agent_tools.clone()),
+            continuation_id.as_deref(),
+        )
         .await
-        .map_err(|error| match error {
-            ActionGenerationError::Request(err) => err,
-            ActionGenerationError::Invalid => anyhow::anyhow!("ask LLM returned an invalid action"),
-        })?;
-    if action.kind == ActionKind::Final
-        && let Some(markdown) = non_empty(action.markdown.as_deref())
-    {
+        .map_err(|AgentGenerationError::Request(error)| error)?;
+        continuation_id = response.response_id.clone();
+        let tool_calls = response
+            .tool_calls()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if tool_calls.is_empty() {
+            if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
+                if let Some(instruction) = research.follow_up_instruction(markdown) {
+                    messages.push(assistant_message(&response));
+                    push_observation(
+                        &mut observations,
+                        format!("DRAFT_FINAL_UNTRUSTED:\n{markdown}"),
+                    );
+                    push_observation(&mut observations, instruction);
+                    messages.push(ChatMessage::user(continuation_prompt(
+                        &observations,
+                        max_attempts.saturating_sub(step + 1),
+                    )));
+                    continue;
+                }
+                return finish_answer(mcp, progress, markdown, &evidence, config).await;
+            }
+            messages.push(assistant_message(&response));
+            push_observation(
+                &mut observations,
+                "SYSTEM: модель не вернула ни tool call, ни непустой финальный текст. Сформируй ответ или вызови нужный native tool.".to_string(),
+            );
+            messages.push(ChatMessage::user(continuation_prompt(
+                &observations,
+                max_attempts.saturating_sub(step + 1),
+            )));
+            continue;
+        }
+
+        messages.push(assistant_message(&response));
+        let mut tool_responses = Vec::with_capacity(tool_calls.len());
+        for call in tool_calls {
+            let tool = call.fn_name.as_str();
+            let arguments = &call.fn_arguments;
+            let signature = format!(
+                "{tool}:{}",
+                serde_json::to_string(arguments).unwrap_or_default()
+            );
+            let tracking_arguments = arguments.clone();
+            let started = Instant::now();
+
+            if tool_call_count >= config.ask_max_steps {
+                audit_tool_call(
+                    pool,
+                    ask_run_id,
+                    PendingToolCallAudit::failed(
+                        step,
+                        tool,
+                        &tracking_arguments,
+                        elapsed_millis(started),
+                        "tool_budget_exhausted",
+                    ),
+                )
+                .await;
+                tool_responses.push(ToolResponse::from_tool_call(
+                    &call,
+                    json!({"error": "лимит вызовов инструментов исчерпан"}).to_string(),
+                ));
+                continue;
+            }
+            if !allowed_native_tool(&mcp, &agent_tools, tool) {
+                audit_tool_call(
+                    pool,
+                    ask_run_id,
+                    PendingToolCallAudit::failed(
+                        step,
+                        tool,
+                        &tracking_arguments,
+                        elapsed_millis(started),
+                        "forbidden_tool",
+                    ),
+                )
+                .await;
+                push_observation(
+                    &mut observations,
+                    format!("SYSTEM: native tool {tool:?} не входит в разрешённый каталог."),
+                );
+                tool_responses.push(ToolResponse::from_tool_call(
+                    &call,
+                    json!({"error": "инструмент не разрешён"}).to_string(),
+                ));
+                continue;
+            }
+            if !arguments.is_object() {
+                audit_tool_call(
+                    pool,
+                    ask_run_id,
+                    PendingToolCallAudit::failed(
+                        step,
+                        tool,
+                        &tracking_arguments,
+                        elapsed_millis(started),
+                        "invalid_arguments",
+                    ),
+                )
+                .await;
+                tool_responses.push(ToolResponse::from_tool_call(
+                    &call,
+                    json!({"error": "arguments должны быть JSON-объектом"}).to_string(),
+                ));
+                continue;
+            }
+            if !tool_signatures.insert(signature) {
+                audit_tool_call(
+                    pool,
+                    ask_run_id,
+                    PendingToolCallAudit::duplicate(step, tool, arguments),
+                )
+                .await;
+                push_observation(
+                    &mut observations,
+                    format!("SYSTEM: точный вызов {tool} с такими аргументами уже выполнялся."),
+                );
+                tool_responses.push(ToolResponse::from_tool_call(
+                    &call,
+                    json!({"error": "точный вызов уже выполнялся"}).to_string(),
+                ));
+                continue;
+            }
+
+            tool_call_count += 1;
+            report_progress(progress, progress_for_tool(tool));
+            match call_tool(
+                ToolCallContext {
+                    config,
+                    pool,
+                    requester_user_id,
+                    evidence: &mut evidence,
+                    mcp: &mcp,
+                    allow_mutations,
+                },
+                tool,
+                arguments.clone(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    audit_tool_call(
+                        pool,
+                        ask_run_id,
+                        PendingToolCallAudit::completed(
+                            step,
+                            tool,
+                            &tracking_arguments,
+                            tool_result_count(&result.value),
+                            elapsed_millis(started),
+                        ),
+                    )
+                    .await;
+                    research.record(tool, &tracking_arguments, &result.value);
+                    push_observation(
+                        &mut observations,
+                        format!("TOOL_RESULT_UNTRUSTED {tool}:\n{}", result.agent_preview),
+                    );
+                    tool_responses.push(ToolResponse::from_tool_call(&call, result.agent_preview));
+                }
+                Err(error) => {
+                    audit_tool_call(
+                        pool,
+                        ask_run_id,
+                        PendingToolCallAudit::failed(
+                            step,
+                            tool,
+                            &tracking_arguments,
+                            elapsed_millis(started),
+                            "tool_error",
+                        ),
+                    )
+                    .await;
+                    tracing::warn!(%error, tool, "ask tool call failed");
+                    push_observation(
+                        &mut observations,
+                        format!("TOOL_ERROR {tool}: вызов не удался или аргументы некорректны."),
+                    );
+                    tool_responses.push(ToolResponse::from_tool_call(
+                        &call,
+                        json!({"error": "вызов инструмента не удался"}).to_string(),
+                    ));
+                }
+            }
+        }
+        messages.push(ChatMessage::from(tool_responses));
+        messages.push(ChatMessage::user(continuation_prompt(
+            &observations,
+            max_attempts.saturating_sub(step + 1),
+        )));
+    }
+
+    messages.push(ChatMessage::user(format!(
+        "{}\n\nSYSTEM: лимит исследования исчерпан. Сейчас верни лучший честный Rich Markdown-ответ по уже полученным данным. Не вызывай новый инструмент.",
+        continuation_prompt(&observations, 0)
+    )));
+    let response = generate_turn(config, &messages, None, continuation_id.as_deref())
+        .await
+        .map_err(|AgentGenerationError::Request(error)| error)?;
+    if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
         return finish_answer(
             mcp,
             progress,
@@ -401,57 +433,43 @@ fn progress_for_tool(tool: &str) -> AskProgress {
     }
 }
 
-async fn generate_action(
+async fn generate_turn(
     config: &Config,
-    prompt: &str,
-    image_base64: Option<&str>,
-    agent_tools: &[String],
-) -> Result<AgentAction, ActionGenerationError> {
-    let action_schema = action_schema(agent_tools);
-    let timeout_secs = config.ask_action_timeout_sec;
-    let generated = retry_once_on_timeout(Duration::from_secs(timeout_secs), || {
-        generate_text_with_provider_checked(
+    messages: &[ChatMessage],
+    tools: Option<Vec<Tool>>,
+    previous_response_id: Option<&str>,
+) -> Result<ChatResponse, AgentGenerationError> {
+    retry_once_on_timeout(Duration::from_secs(config.ask_action_timeout_sec), || {
+        generate_chat_with_provider_checked(
             config,
-            GenerateTextOptions {
+            GenerateChatOptions {
                 route: Some("ask"),
                 provider_override: Some(&config.ask_llm_provider),
                 model_override: config.ask_llm_model.as_deref(),
                 system_prompt: Some(SYSTEM_PROMPT),
-                prompt,
-                image_base64,
+                messages: messages.to_vec(),
+                tools: tools.clone(),
+                requires_tools: true,
+                previous_response_id: previous_response_id.map(str::to_owned),
                 temperature: config.ask_llm_temperature,
                 num_predict: config.ask_llm_max_tokens,
-                // Native JSON mode ограничивает provider. Parse failure обрабатывается
-                // agent loop: он запрашивает исправленное действие с текущим контекстом.
-                output_validator: None,
-                structured_output: Some(StructuredOutput {
-                    name: "ask_action",
-                    schema: &action_schema,
-                }),
             },
         )
     })
-    .await?;
-    parse_agent_action(&generated.content).map_err(|_| {
-        tracing::warn!(
-            shape = invalid_action_shape(&generated.content),
-            "ask LLM returned an invalid action; requesting correction"
-        );
-        ActionGenerationError::Invalid
-    })
+    .await
 }
 
 async fn retry_once_on_timeout<T, F, Fut>(
     timeout_duration: Duration,
     mut generate: F,
-) -> Result<T, ActionGenerationError>
+) -> Result<T, AgentGenerationError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     match timeout(timeout_duration, generate()).await {
         Ok(Ok(generated)) => Ok(generated),
-        Ok(Err(err)) => Err(ActionGenerationError::Request(err)),
+        Ok(Err(err)) => Err(AgentGenerationError::Request(err)),
         Err(_) => {
             tracing::warn!(
                 timeout_secs = timeout_duration.as_secs(),
@@ -459,8 +477,8 @@ where
             );
             match timeout(timeout_duration, generate()).await {
                 Ok(Ok(generated)) => Ok(generated),
-                Ok(Err(err)) => Err(ActionGenerationError::Request(err)),
-                Err(_) => Err(ActionGenerationError::Request(anyhow::anyhow!(
+                Ok(Err(err)) => Err(AgentGenerationError::Request(err)),
+                Err(_) => Err(AgentGenerationError::Request(anyhow::anyhow!(
                     "ask LLM timed out twice"
                 ))),
             }
@@ -468,145 +486,76 @@ where
     }
 }
 
-fn action_schema(agent_tools: &[String]) -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind"],
-        "properties": {
-            "kind": {"type": "string", "enum": ["tool", "final"]},
-            "tool": {"type": "string", "enum": agent_tools},
-            "arguments": {"type": "object"},
-            "markdown": {"type": "string"}
+fn assistant_message(response: &ChatResponse) -> ChatMessage {
+    let mut content = response.content.clone();
+    if content.thought_signatures().is_empty()
+        && let Some(signatures) = response
+            .tool_calls()
+            .first()
+            .and_then(|call| call.thought_signatures.as_ref())
+    {
+        for signature in signatures.iter().rev() {
+            content.prepend(ContentPart::ThoughtSignature(signature.clone()));
         }
-    })
-}
-
-fn parse_agent_action(value: &str) -> Result<AgentAction, ()> {
-    let trimmed = value.trim();
-    let without_fence = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```JSON"))
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)
-        .unwrap_or(trimmed);
-    let extracted_object = extract_json_object(without_fence);
-    let parsed = parse_json_action(without_fence).or_else(|_| {
-        extracted_object
-            .filter(|object| *object != without_fence)
-            .ok_or(())
-            .and_then(parse_json_action)
-    });
-    match parsed {
-        Ok(action) => Ok(action),
-        Err(()) if !without_fence.is_empty() && !looks_like_json(without_fence) => {
-            Ok(AgentAction {
-                kind: ActionKind::Final,
-                tool: None,
-                arguments: Value::Null,
-                markdown: Some(without_fence.to_string()),
-            })
-        }
-        Err(()) => Err(()),
     }
+    ChatMessage::assistant(content).with_reasoning_content(response.reasoning_content.clone())
 }
 
-fn parse_json_action(value: &str) -> Result<AgentAction, ()> {
-    serde_json::from_str(value)
-        .or_else(|_| serde_json::from_str(&escape_json_string_controls(value)))
-        .map_err(|_| ())
-}
-
-fn extract_json_object(value: &str) -> Option<&str> {
-    let start = value.find('{')?;
-    let end = value.rfind('}')?;
-    (start <= end).then_some(&value[start..=end])
-}
-
-fn looks_like_json(value: &str) -> bool {
-    serde_json::from_str::<Value>(value).is_ok()
-        || matches!(value.chars().next(), Some('{' | '[' | '"'))
-        || extract_json_object(value).is_some()
-}
-
-fn invalid_action_shape(value: &str) -> &'static str {
-    let value = value.trim();
-    let value = value
-        .find('{')
-        .zip(value.rfind('}'))
-        .filter(|(start, end)| start <= end)
-        .map(|(start, end)| &value[start..=end])
-        .unwrap_or(value);
-    let Ok(value) = serde_json::from_str::<Value>(value) else {
-        return "not_json";
+fn ask_user_message(prompt: String, image_base64: Option<&str>) -> ChatMessage {
+    let content = match image_base64 {
+        Some(image_base64) => MessageContent::from_parts(vec![
+            ContentPart::from_text(prompt),
+            ContentPart::from_binary_base64(
+                "image/jpeg",
+                Arc::<str>::from(image_base64),
+                Some("ask-image.jpg".to_string()),
+            ),
+        ]),
+        None => MessageContent::from(prompt),
     };
-    let Some(object) = value.as_object() else {
-        return "not_object";
-    };
-    match object.get("kind").and_then(Value::as_str) {
-        None => "missing_kind",
-        Some("tool") if object.get("tool").and_then(Value::as_str).is_none() => "tool_missing_name",
-        Some("tool") if !object.get("arguments").is_none_or(Value::is_object) => {
-            "tool_arguments_not_object"
-        }
-        Some("tool" | "final") => "malformed_fields",
-        Some(_) => "unknown_kind",
-    }
+    ChatMessage::user(content)
 }
 
-#[cfg(test)]
-fn validate_agent_action_output(value: &str) -> anyhow::Result<()> {
-    parse_agent_action(value)
-        .map(|_| ())
-        .map_err(|_| anyhow::anyhow!("ask LLM response is not a valid action"))
-}
-
-fn escape_json_string_controls(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for character in value.chars() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                result.push(character);
-                continue;
-            }
-            match character {
-                '\\' => {
-                    escaped = true;
-                    result.push(character);
+fn local_agent_tools() -> Vec<Tool> {
+    vec![
+        Tool::new("notes.add_user")
+            .with_description("Сохранить короткий подтверждённый факт о пользователе.")
+            .with_schema(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["telegram_user_id", "note"],
+                "properties": {
+                    "telegram_user_id": {"type": "integer"},
+                    "note": {"type": "string"}
                 }
-                '"' => {
-                    in_string = false;
-                    result.push(character);
-                }
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                _ => result.push(character),
-            }
-        } else {
-            if character == '"' {
-                in_string = true;
-            }
-            result.push(character);
-        }
-    }
-    result
+            }))
+            .with_strict(true),
+        Tool::new("web.search")
+            .with_description("Найти актуальные внешние факты и прочитать результаты поиска.")
+            .with_schema(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}}
+            }))
+            .with_strict(true),
+        Tool::new("github.search")
+            .with_description("Найти публичный код, issue или репозиторий на GitHub.")
+            .with_schema(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}}
+            }))
+            .with_strict(true),
+    ]
 }
 
-fn agent_tool_names(mcp: &McpClient) -> Vec<String> {
-    let mut tools = mcp.tool_names().map(str::to_owned).collect::<Vec<_>>();
-    tools.extend(LOCAL_AGENT_TOOLS.iter().map(|tool| (*tool).to_string()));
-    tools.sort_unstable();
-    tools.dedup();
+fn allowed_native_tool(mcp: &McpClient, tools: &[Tool], tool: &str) -> bool {
     tools
-}
-
-fn allowed_agent_tool(mcp: &McpClient, tool: &str) -> bool {
-    mcp.has_tool(tool) || LOCAL_AGENT_TOOLS.contains(&tool)
+        .iter()
+        .any(|candidate| candidate.name.to_string() == tool)
+        && (mcp.has_tool(tool) || LOCAL_AGENT_TOOLS.contains(&tool))
 }
 
 async fn audit_tool_call(
@@ -644,7 +593,6 @@ fn build_prompt(
     question: &str,
     observations: &[String],
     remaining_steps: usize,
-    tool_catalog: &str,
 ) -> String {
     let observations = observations
         .iter()
@@ -652,9 +600,8 @@ fn build_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nАвтор вопроса: {requester_identity} (Telegram ID: {requester_user_id})\nЕсли вопрос называет только имя и оно совпадает с автором вопроса, сначала разреши автора по его Telegram ID; не проси уточнение без необходимости.\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\n\nВопрос пользователя:\n{question}\n\nДоступные инструменты:\n{}\n\nНаблюдения:\n{}",
+        "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nАвтор вопроса: {requester_identity} (Telegram ID: {requester_user_id})\nЕсли вопрос называет только имя и оно совпадает с автором вопроса, сначала разреши автора по его Telegram ID; не проси уточнение без необходимости.\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\nNative tools переданы отдельным каталогом и доступны только в рамках политики /ask.\n\nВопрос пользователя:\n{question}\n\nНаблюдения:\n{}",
         Utc::now().to_rfc3339(),
-        tool_catalog,
         if observations.is_empty() {
             "пока нет"
         } else {
@@ -663,9 +610,19 @@ fn build_prompt(
     )
 }
 
-fn tool_catalog(mcp_catalog: &str) -> String {
+fn continuation_prompt(observations: &[String], remaining_steps: usize) -> String {
+    let observations = observations
+        .iter()
+        .map(|observation| format!("UNTRUSTED_TOOL_DATA:\n{observation}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     format!(
-        "Инструменты MCP (получены через tools/list):\n{mcp_catalog}\n\nЛокальные инструменты:\n- notes.add_user: {{telegram_user_id, note}} — только подтверждённый сообщениями факт\n- web.search: {{query}} — web-поиск с чтением найденных страниц; URL можно включить в query\n- github.search: {{query}} — публичные GitHub code/issues"
+        "Продолжай исследование с полной историей native tool calls. Осталось агентских шагов: {remaining_steps}.\nНаблюдения:\n{}",
+        if observations.is_empty() {
+            "пока нет"
+        } else {
+            &observations
+        }
     )
 }
 
@@ -1140,14 +1097,14 @@ mod tests {
     async fn does_not_retry_request_errors() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let recorded_attempts = std::sync::Arc::clone(&attempts);
-        let result: Result<(), ActionGenerationError> =
+        let result: Result<(), AgentGenerationError> =
             retry_once_on_timeout(Duration::from_secs(1), move || {
                 recorded_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async { Err(anyhow::anyhow!("provider failed")) }
             })
             .await;
 
-        assert!(matches!(result, Err(ActionGenerationError::Request(_))));
+        assert!(matches!(result, Err(AgentGenerationError::Request(_))));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1159,63 +1116,53 @@ mod tests {
             "что обсуждали?",
             &["данные".to_string()],
             3,
-            "- chat.get_recent_messages: последние сообщения",
         );
         assert!(prompt.contains("UNTRUSTED"));
-        assert!(prompt.contains("chat.get_recent_messages"));
+        assert!(prompt.contains("Native tools"));
         assert!(!SYSTEM_PROMPT.contains("5700x3d"));
     }
 
     #[test]
-    fn parses_partial_fenced_and_prefixed_agent_actions() {
-        let final_action =
-            parse_agent_action("```json\n{\"kind\":\"final\",\"markdown\":\"ответ\"}\n```")
-                .unwrap();
-        assert_eq!(final_action.kind, ActionKind::Final);
-        let tool_action = parse_agent_action(
-            "Действие: {\"kind\":\"tool\",\"tool\":\"chat.resolve_user\",\"arguments\":{}}",
-        )
-        .unwrap();
-        assert_eq!(tool_action.kind, ActionKind::Tool);
-        let multiline =
-            parse_agent_action("{\"kind\":\"final\",\"markdown\":\"строка 1\n\nстрока 2\"}")
-                .unwrap();
-        assert_eq!(multiline.markdown.as_deref(), Some("строка 1\n\nстрока 2"));
-        let plain = parse_agent_action("**Короткий ответ:** готово").unwrap();
-        assert_eq!(plain.kind, ActionKind::Final);
-        assert_eq!(
-            plain.markdown.as_deref(),
-            Some("**Короткий ответ:** готово")
-        );
+    fn native_tools_use_strict_scoped_schemas() {
+        let tools = local_agent_tools();
+        assert_eq!(tools.len(), LOCAL_AGENT_TOOLS.len());
+        assert!(tools.iter().all(|tool| tool.strict == Some(true)));
+        assert!(tools.iter().all(|tool| tool.schema.is_some()));
     }
 
     #[test]
-    fn diagnostic_invalid_action_shape_does_not_expose_model_content() {
-        assert_eq!(invalid_action_shape("не JSON"), "not_json");
-        assert_eq!(invalid_action_shape("[]"), "not_object");
-        assert_eq!(
-            invalid_action_shape(r#"{"tool":"chat.search_messages"}"#),
-            "missing_kind"
-        );
-        assert_eq!(
-            invalid_action_shape(r#"{"kind":"unknown"}"#),
-            "unknown_kind"
-        );
-    }
+    fn native_history_preserves_tool_call_signature_reasoning_and_call_id() {
+        let call = genai::chat::ToolCall {
+            call_id: "call-1".to_string(),
+            fn_name: "chat.search_messages".to_string(),
+            fn_arguments: json!({"query": "тест"}),
+            thought_signatures: Some(vec!["thought-signature".to_string()]),
+        };
+        let response = ChatResponse {
+            content: MessageContent::from(vec![call.clone()]),
+            reasoning_content: Some("reasoning".to_string()),
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "test-model"),
+            provider_model_iden: genai::ModelIden::new(
+                genai::adapter::AdapterKind::OpenAI,
+                "test-model",
+            ),
+            stop_reason: None,
+            usage: genai::chat::Usage::default(),
+            captured_raw_body: None,
+            response_id: None,
+        };
 
-    #[test]
-    fn agent_action_validator_rejects_invalid_structured_response() {
-        assert!(validate_agent_action_output(r#"{"kind":"unknown"}"#).is_err());
-        assert!(validate_agent_action_output("Короткий ответ: готово").is_ok());
-    }
+        let assistant = assistant_message(&response);
+        assert_eq!(assistant.content.tool_calls()[0].call_id, "call-1");
+        assert_eq!(
+            assistant.content.thought_signatures(),
+            vec!["thought-signature"]
+        );
+        assert_eq!(assistant.content.reasoning_contents(), vec!["reasoning"]);
 
-    #[test]
-    fn parser_rejects_malformed_or_missing_kind_json_instead_of_plain_text_fallback() {
-        assert!(parse_agent_action(r#"{"markdown":"ответ"}"#).is_err());
-        assert!(parse_agent_action(r#"{"kind":"final","markdown": }"#).is_err());
-        assert!(parse_agent_action("Префикс: {\"markdown\":\"ответ\"}").is_err());
-        assert!(parse_agent_action("{невалидный JSON").is_err());
-        assert!(parse_agent_action("Обычный текст без JSON").is_ok());
+        let tool_message =
+            ChatMessage::from(vec![ToolResponse::from_tool_call(&call, r#"{"ok":true}"#)]);
+        assert_eq!(tool_message.content.tool_responses()[0].call_id, "call-1");
     }
 
     #[test]

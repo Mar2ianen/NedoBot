@@ -36,7 +36,7 @@ provider transport -> model profile -> task route
 - [x] **LP3 — compatibility profiles:** TOML topology задаёт явные genai adapters, endpoints, models, capabilities и egress для Gemini, Ollama Cloud, Groq, Cerebras, OpenRouter и custom OpenAI-compatible endpoint.
 - [x] **LP4 — route resolver:** typed route resolver проверяет primary/fallback chain и requirements против capabilities; Gemini fallback сохранён в legacy mode, а profile mode использует route order.
 - [x] **LP5 — transport profiles:** все LLM generation paths используют единый `genai` transport с direct/proxy clients, явным adapter target и safe error mapping. Policy fallback, validation retry и audit остаются в service/pipeline слоях.
-- [~] **LP6 — task migration:** generation paths уже используют named routes в profile mode; native tool-call history для `ask` завершается отдельной Phase B.
+- [x] **LP6 — task migration:** generation paths используют named routes в profile mode, а `ask` — native tool-call history с bounded execution и сохранённой research FSM.
 - [ ] **LP7 — cleanup:** удалить legacy provider/model env routing, `LLM_SUPPORTS_IMAGES`, model-name эвристики и hard-coded fallback chain после production migration.
 
 ## Правила fallback
