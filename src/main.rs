@@ -8,6 +8,7 @@ use teloxide::{
 };
 
 mod config;
+mod config_file;
 mod db;
 mod features;
 mod http;

@@ -337,7 +337,7 @@ refactor: define shared rmcp tool router
 
 ### RMCP-05 — Перевести internal stdio server — выполнено
 
-Временно добавить `chat_db_mcp_rmcp`, чтобы можно было провести canary через существующий `ASK_DB_MCP_COMMAND`.
+Временно добавить `chat_db_mcp_rmcp`, чтобы можно было провести canary через существующий `runtime.ask_db_mcp_command`.
 
 Binary должен:
 
@@ -385,14 +385,14 @@ refactor: use rmcp client for ask tools
 Production rollout:
 
 1. задеплоить старый и новый stdio binaries;
-2. переключить `ASK_DB_MCP_COMMAND` на `chat_db_mcp_rmcp`;
+2. переключить `runtime.ask_db_mcp_command` на `chat_db_mcp_rmcp` в profile TOML;
 3. проверить search/context/resolve/notes/multi-step `/ask`;
 4. проверить `ask_runs` и `ask_tool_calls`;
 5. проверить отсутствие orphan child processes;
 6. после стабильного canary удалить legacy stdio protocol/client;
 7. вернуть новому binary имя `chat_db_mcp`.
 
-Rollback: вернуть старое значение `ASK_DB_MCP_COMMAND` и рестартовать bot.
+Rollback: вернуть старое значение `runtime.ask_db_mcp_command` и рестартовать bot.
 
 Коммит cleanup:
 

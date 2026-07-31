@@ -1,7 +1,8 @@
 # LLM topology: provider transport -> model profile -> task route.
 # This file contains no API keys. api_key_env names the required environment variable.
-# Set LLM_PROFILES_PATH to this file. Task routes are the only source of
-# provider/model/capabilities for runtime generation.
+# By default the bot loads this file. Set LLM_PROFILES_PATH in the process
+# environment when deployment needs a separate copy. Task routes are the only
+# source of provider/model/capabilities for runtime generation.
 
 [providers.gemini]
 driver = "gemini"
@@ -195,3 +196,101 @@ models = ["ollama_memory"]
 
 [routes.ask]
 models = ["ollama_minimax", "ollama_memory"]
+
+# Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
+# API keys stay in the process environment and are not stored in this file.
+[runtime]
+source_channel_id = -1001575496091
+discussion_chat_id = -1001932061163
+chat_invite_label = "чате"
+post_signature_marker = "Не теряем связь"
+
+llm_temperature = 0.35
+llm_max_tokens = 140
+memory_llm_temperature = 0.2
+memory_llm_max_tokens = 220
+
+rag_enabled = false
+rag_embedding_url = "http://127.0.0.1:8788"
+rag_embedding_model = "cointegrated/rubert-tiny2"
+rag_embedding_timeout_sec = 10
+rag_top_k = 6
+rag_min_similarity = 0.55
+rag_temporal_half_life_days = 180.0
+
+chat_retrieval_embeddings_enabled = false
+chat_retrieval_embedding_batch_size = 16
+chat_retrieval_embedding_poll_sec = 5
+chat_retrieval_shadow_enabled = false
+chat_retrieval_evidence_enabled = false
+chat_retrieval_evidence_min_score = 2.0
+chat_retrieval_window_days = 30
+chat_retrieval_half_life_days = 7.0
+
+search_enabled = false
+search_extract_temperature = 0.1
+search_extract_max_tokens = 900
+search_mcp_args = []
+search_mcp_env = []
+search_mcp_timeout_sec = 8
+search_query_timeout_sec = 20
+search_mcp_tool_web = "web_search"
+search_mcp_tool_github = "github_search"
+search_mcp_tool_reddit = "reddit_search"
+search_mcp_tool_fetch = "web_fetch_exa"
+search_fetch_top_n = 4
+search_fetch_max_chars = 16000
+comment_blocked_source_domains = [
+  "meduza.io", "theins.ru", "tvrain.tv", "novayagazeta.eu",
+  "zona.media", "istories.media", "holod.media", "verstka.media",
+  "proekt.media",
+  "thebell.io", "currenttime.tv", "svoboda.org", "severreal.org",
+  "ridl.io", "doxa.team", "7x7-journal.ru", "paperpaper.ru",
+]
+comment_blocked_terms = []
+search_github_mcp_args = []
+search_github_mcp_env = ["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+search_github_mcp_tools = ["search_issues", "search_code"]
+
+new_user_audit_enabled = false
+new_user_audit_max_tokens = 900
+gemini_thinking_budget = 1024
+owner_telegram_id = 5939287960
+send_owner_preview = true
+
+ask_enabled = false
+ask_allow_chat_admins = true
+ask_private_user_ids = []
+ask_llm_temperature = 0.2
+ask_llm_max_tokens = 1800
+ask_max_steps = 7
+ask_action_timeout_sec = 45
+ask_total_timeout_sec = 180
+ask_max_concurrency = 1
+ask_db_mcp_args = []
+ask_db_mcp_env = ["ASK_DATABASE_URL", "MCP_MANIFEST"]
+ask_db_mcp_timeout_sec = 8
+
+profile_refresh_concurrency = 4
+comment_custom_emoji_id = "5445092965875729965"
+first_comment_max_image_mb = 10
+tech_custom_emoji_id = "5445122339157065472"
+amd_custom_emoji_id = "5442995600201106682"
+radeon_custom_emoji_id = "5442853853395436819"
+ryzen_custom_emoji_id = "5444875271163364561"
+
+voice_transcription_enabled = false
+voice_auto_transcribe = false
+voice_max_duration_sec = 600
+voice_max_file_mb = 20
+voice_short_text_max_chars = 400
+voice_language = "ru"
+voice_asr_provider = "groq"
+voice_asr_model = "whisper-large-v3"
+voice_asr_temperature = 0.0
+voice_cleanup_temperature = 0.2
+voice_cleanup_max_tokens = 1800
+voice_render_expandable_chapters = true
+voice_send_full_file = true
+
+static_files_dir = "/opt/tg-ai-bot-teloxide/static"

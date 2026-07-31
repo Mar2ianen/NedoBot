@@ -41,8 +41,8 @@
 
 После успешного `sendMessage` и до `mark_post_comment_sent` остаётся короткое окно. Если процесс завершится именно в нём, lease истечёт, worker повторно claim'ит job и Telegram может получить второй комментарий. Bot API не предоставляет idempotency key для `sendMessage`, поэтому текущая гарантия — at-least-once delivery. Снижается немедленным finalization после отправки; устранение потребует отдельного reconciliation design по уже отправленным bot replies.
 
-### L3. `.env.example:45` — VOICE_ASR_TEMPERATURE=0 без дробной части
-**Суть:** Везде `0.35`, `0.2`, а тут `0` без точки. Не баг (парсится ок), но неконсистентно.
+### L3. `config/llm_profiles.toml.example` — voice temperature должен быть TOML-числом
+**Статус:** закрыто. Runtime voice settings теперь лежат в `[runtime]`; `voice_asr_temperature = 0.0` явно задан как TOML float.
 
 ### L4. Profile endpoint ownership
 **Статус:** закрыто. Ollama и остальные LLM endpoints больше не задаются env-переменными; единственный источник — `base_url` provider profile.

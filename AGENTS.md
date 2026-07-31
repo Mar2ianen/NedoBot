@@ -15,7 +15,7 @@ Rust-бот для Telegram-чата `НедоNews Chat`. Первый комм�
 
 ```
 src/main.rs                          — dispatcher, handler wiring, startup checks
-src/config.rs                        — Config из .env, validate_runtime_secrets
+src/config.rs                        — Config из profile TOML и secrets env, validate_runtime_secrets
 src/state.rs                         — AppState(pool, config)
 src/http.rs                          — кэшированные reqwest::Client с proxy
 src/text.rs                          — normalize_ai_markers, strip_links, first_text_chars
@@ -101,11 +101,11 @@ migrations/                            — sqlx compile-time миграции
 
 ## Конфигурация
 
-Все через локальный `.env`, он не коммитится. Полный перечень переменных и безопасные примеры приведены в `docs/TECHNICAL.md`; валидация секретов выполняется на старте в `Config::validate_runtime_secrets`.
+Несекретные runtime-настройки хранятся в `[runtime]` существующего `config/llm_profiles.toml.example` (или в deployment-копии, выбранной через `LLM_PROFILES_PATH`). Локальный `.env` не коммитится и содержит только секреты, DSN, invite/proxy URL и другие чувствительные значения; полный контракт приведён в `docs/TECHNICAL.md`. Валидация секретов выполняется на старте в `Config::validate_runtime_secrets`.
 
-**LLM routing**: `LLM_PROFILES_PATH` обязателен и задаёт provider/model/task route topology. Каждый runtime-вызов передаёт явный route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`); provider/model env overrides и hard-coded fallback chains удалены.
+**LLM routing**: `LLM_PROFILES_PATH` необязателен и задаёт deployment-копию provider/model/task route topology; без него используется репозиторный example-файл. Каждый runtime-вызов передаёт явный route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`); provider/model env overrides и hard-coded fallback chains удалены.
 
-**Thinking budget**: для Gemini 3.x бот использует `thinkingLevel=low` и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `GEMINI_THINKING_BUDGET` добавляется к `LLM_MAX_TOKENS` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
+**Thinking budget**: для Gemini 3.x бот использует `thinkingLevel=low` и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `runtime.gemini_thinking_budget` добавляется к `runtime.llm_max_tokens` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
 
 **Proxy**: `LLM_PROXY_URL` — SOCKS5/HTTP proxy только для LLM запросов, не для Telegram polling.
 

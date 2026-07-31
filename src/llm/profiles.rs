@@ -2,12 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+use crate::config_file::RuntimeSettings;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmProfiles {
     pub providers: BTreeMap<String, ProviderProfile>,
     pub models: BTreeMap<String, ModelProfile>,
     pub routes: BTreeMap<String, RouteProfile>,
+    #[serde(default)]
+    pub runtime: RuntimeSettings,
 }
 
 #[derive(Debug, Clone, Deserialize)]
