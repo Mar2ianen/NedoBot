@@ -411,7 +411,7 @@ async fn generate_once(
         num_predict,
         structured_output,
     } = request;
-    let image_base64 = image_base64.filter(|_| legacy_supports_images(config));
+    let image_base64 = image_base64.filter(|_| legacy_supports_images(config, provider));
     let (target, egress) = legacy_model_target(config, provider, model)?;
     let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let response = transport
@@ -539,8 +539,10 @@ fn model_for_provider<'a>(config: &'a Config, provider: &str) -> anyhow::Result<
     }
 }
 
-fn legacy_supports_images(config: &Config) -> bool {
-    config.llm_supports_images.unwrap_or(false)
+fn legacy_supports_images(config: &Config, provider: &str) -> bool {
+    config
+        .llm_supports_images
+        .unwrap_or(matches!(provider, "gemini" | "ollama"))
 }
 
 fn legacy_model_target<'a>(

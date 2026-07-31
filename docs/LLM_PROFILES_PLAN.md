@@ -32,11 +32,11 @@ provider transport -> model profile -> task route
 ## Задачи
 
 - [x] **LP1 — schema и parser:** добавлены `src/llm/profiles.rs`, TOML example и unit tests parsing/validation без изменения live routing.
-- [~] **LP2 — config loading:** добавлен явный `LLM_PROFILES_PATH` и startup loading/schema validation; validation выбранных enabled routes будет добавлена вместе с их migration на resolver. Legacy `.env` пока определяет runtime routing.
-- [ ] **LP3 — compatibility profiles:** собрать встроенные profiles, эквивалентные текущим `GROQ_*`, `CEREBRAS_*`, `OPENROUTER_*`, Gemini и Ollama настройкам; проверить идентичность effective model/fallback chain.
-- [ ] **LP4 — route resolver:** добавить typed `LlmTask`, resolver primary/fallback chain и проверку task requirements против capabilities. Перенести Gemini fallback из `llm/service.rs` в route `first_comment`.
-- [~] **LP5 — transport profiles:** legacy Groq, Cerebras, OpenRouter и custom endpoint переведены на один `async-openai` transport с `OpenAIConfig::with_api_base()` и `with_api_key()`. Profile-driven provider resolution будет добавлен вместе с route migration. Gemini и native Ollama остаются отдельными drivers.
-- [ ] **LP6 — task migration:** последовательно переключить first comment, memory, search extract, voice cleanup, ask, avatar analysis и first-message spam на named routes.
+- [x] **LP2 — config loading:** `LLM_PROFILES_PATH` загружает и валидирует profiles; enabled routes проверяются на startup вместе с secret и explicit proxy-egress requirements.
+- [x] **LP3 — compatibility profiles:** TOML topology задаёт явные genai adapters, endpoints, models, capabilities и egress для Gemini, Ollama Cloud, Groq, Cerebras, OpenRouter и custom OpenAI-compatible endpoint.
+- [x] **LP4 — route resolver:** typed route resolver проверяет primary/fallback chain и requirements против capabilities; Gemini fallback сохранён в legacy mode, а profile mode использует route order.
+- [x] **LP5 — transport profiles:** все LLM generation paths используют единый `genai` transport с direct/proxy clients, явным adapter target и safe error mapping. Policy fallback, validation retry и audit остаются в service/pipeline слоях.
+- [~] **LP6 — task migration:** generation paths уже используют named routes в profile mode; native tool-call history для `ask` завершается отдельной Phase B.
 - [ ] **LP7 — cleanup:** удалить legacy provider/model env routing, `LLM_SUPPORTS_IMAGES`, model-name эвристики и hard-coded fallback chain после production migration.
 
 ## Правила fallback
