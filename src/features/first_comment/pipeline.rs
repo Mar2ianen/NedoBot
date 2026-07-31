@@ -39,7 +39,7 @@ use crate::features::search::repo::{
 };
 use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
-use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
+use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::state::AppState;
 use crate::telegram::render::{send_html, send_html_reply};
 
@@ -307,12 +307,10 @@ async fn process_post_comment_job(
             &allowed_chat_message_ids,
         )
     };
-    let generation = generate_text_with_provider_checked(
+    let generation = generate_text_checked(
         config,
         GenerateTextOptions {
-            route: Some("first_comment"),
-            provider_override: None,
-            model_override: None,
+            route: "first_comment",
             system_prompt: Some(&prompt.system),
             prompt: &prompt.user,
             image_base64: image_base64.as_deref(),

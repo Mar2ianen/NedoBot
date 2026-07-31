@@ -8,6 +8,7 @@ use crate::features::ask::rich_markdown;
 use crate::features::ask::types::{
     AskAnswer, AskCommandInput, AskFailureKind, AskProgress, AskRunStatus,
 };
+use crate::llm::profiles::RouteRequirements;
 
 pub struct AskService<'a> {
     pool: &'a PgPool,
@@ -69,6 +70,33 @@ impl<'a> AskService<'a> {
     }
 
     async fn start_run(&self, input: &AskCommandInput) -> Option<i64> {
+        let (provider, model) = self
+            .config
+            .llm_profiles
+            .as_ref()
+            .and_then(|profiles| {
+                profiles
+                    .resolve_route(
+                        "ask",
+                        &RouteRequirements {
+                            requires_images: input.reply_image_base64.is_some(),
+                            requires_tools: true,
+                            requires_system_prompt: true,
+                            num_predict: Some(self.config.ask_llm_max_tokens),
+                            ..RouteRequirements::default()
+                        },
+                    )
+                    .ok()
+                    .and_then(|route| {
+                        route.selections.first().map(|selection| {
+                            (
+                                selection.provider_key.to_string(),
+                                Some(selection.model.model.clone()),
+                            )
+                        })
+                    })
+            })
+            .unwrap_or_else(|| ("profile_route".to_string(), None));
         match repo::create_run(
             self.pool,
             CreateAskRunParams {
@@ -77,8 +105,8 @@ impl<'a> AskService<'a> {
                 requester_user_id: input.requester_user_id,
                 question: &input.question,
                 reply_to_message_id: input.reply_to_message_id,
-                provider: &self.config.ask_llm_provider,
-                model: self.config.ask_llm_model.as_deref(),
+                provider: &provider,
+                model: model.as_deref(),
             },
         )
         .await

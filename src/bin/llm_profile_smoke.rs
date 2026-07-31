@@ -1,6 +1,6 @@
 use tg_ai_bot_teloxide::{
     config::Config,
-    llm::service::{GenerateTextOptions, generate_text_with_provider_checked},
+    llm::service::{GenerateTextOptions, generate_text_checked},
 };
 
 const ROUTES: &[&str] = &[
@@ -10,7 +10,6 @@ const ROUTES: &[&str] = &[
     "search_extract",
     "new_user_audit",
     "ask",
-    "legacy_default",
 ];
 
 #[tokio::main]
@@ -33,12 +32,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     for route in ROUTES {
-        let generation = generate_text_with_provider_checked(
+        let generation = generate_text_checked(
             &config,
             GenerateTextOptions {
-                route: Some(route),
-                provider_override: None,
-                model_override: None,
+                route,
                 system_prompt: Some("Ответь ровно одним словом: ok"),
                 prompt: "Smoke-проверка profile router. Ответь ровно: ok",
                 image_base64: None,

@@ -103,7 +103,7 @@ migrations/                            — sqlx compile-time миграции
 
 Все через локальный `.env`, он не коммитится. Полный перечень переменных и безопасные примеры приведены в `docs/TECHNICAL.md`; валидация секретов выполняется на старте в `Config::validate_runtime_secrets`.
 
-**LLM routing**: `LLM_PROVIDER` определяет основной провайдер. Модель через `LLM_MODEL` или provider-specific переменную (`GROQ_MODEL`, `CEREBRAS_MODEL`, и т.д.). Для Gemini: fallback chain → flash-lite → ollama. Для других провайдеров — без fallback (fail-fast на старте, если модель не задана).
+**LLM routing**: `LLM_PROFILES_PATH` обязателен и задаёт provider/model/task route topology. Каждый runtime-вызов передаёт явный route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`); provider/model env overrides и hard-coded fallback chains удалены.
 
 **Thinking budget**: для Gemini 3.x бот использует `thinkingLevel=low` и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `GEMINI_THINKING_BUDGET` добавляется к `LLM_MAX_TOKENS` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
 
@@ -145,7 +145,7 @@ migrations/                            — sqlx compile-time миграции
 2. `maybe_comment_post`: check `discussion_chat_id` + `source_channel_id` → check `post_signature_marker` → create job (dedup)
 3. Download largest photo → base64
 4. `build_llm_prompt`: system prompt + tech_rag + memory notes + recent comments + post text
-5. `generate_text_checked`: provider → model → fallback chain → output validator (`validate_comment_output`)
+5. `generate_text_checked`: task route → model fallback chain → output validator (`validate_comment_output`)
 6. `build_comment_html`: strip_links → normalize_ai_markers → escape → CHAT_LINK replacement → custom_emoji
 7. `send_html_reply` → `mark_post_comment_sent` → `insert_llm_generation` → owner preview
 8. `enqueue_post_history`: отдельная job → LLM JSON summary → RuBERT embedding → `post_history_entries`; retry с геометрическим backoff до terminal `failed`
@@ -325,7 +325,7 @@ Typed-модель teloxide предоставляет эти поля для с
 3. **SQL-миграции**: новый файл в `migrations/` с timestamp prefix. После добавления — `touch src/db/mod.rs` для sqlx recompile.
 4. **Новые Config-поля**: добавить в struct, `from_env()`, все test `fn config()`, документацию и tracked config template, если он существует.
 5. **Новые команды**: enum `Command` в `commands.rs` + handler в `command_handler.rs` + обновить README и TECHNICAL.
-6. **Новые LLM-провайдеры**: реализовать `LlmClient` trait, добавить в `generate_once` match + `model_for_provider` + `validate_llm_provider_secret`.
+6. **Новые LLM-провайдеры**: добавить provider/model profile и route selection в `config/llm_profiles.toml.example`; не добавлять provider match в service code.
 7. **Не ломать backward compatibility**: бот работает в проде, старые записи в БД. Миграции только additive.
 8. **Comment density**: код хорошо документирован. Писать комментарии по делу, не_water.
 9. **Russian** — код, комментарии, промпты, документация на русском. Git commit messages на английском (imperative).

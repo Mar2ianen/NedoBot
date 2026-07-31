@@ -20,7 +20,7 @@ use crate::features::ask::repo;
 use crate::features::ask::types::{AskProgress, PendingToolCallAudit};
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
-use crate::llm::service::{GenerateChatOptions, generate_chat_with_provider_checked};
+use crate::llm::service::{GenerateChatOptions, generate_chat_checked};
 
 const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
@@ -444,12 +444,10 @@ async fn generate_turn(
     previous_response_id: Option<&str>,
 ) -> Result<ChatResponse, AgentGenerationError> {
     retry_once_on_timeout(Duration::from_secs(config.ask_action_timeout_sec), || {
-        generate_chat_with_provider_checked(
+        generate_chat_checked(
             config,
             GenerateChatOptions {
-                route: Some("ask"),
-                provider_override: Some(&config.ask_llm_provider),
-                model_override: config.ask_llm_model.as_deref(),
+                route: "ask",
                 system_prompt: Some(SYSTEM_PROMPT),
                 messages: messages.to_vec(),
                 tools: tools.clone(),

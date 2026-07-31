@@ -729,8 +729,6 @@ pub async fn finalize_post_comment_sent(
     completed: FinalizePostCommentSent<'_>,
 ) -> anyhow::Result<CasResult> {
     // History persistence must share this transaction with the delivery CAS.
-    // Keep the established pool-based helper linked for non-transactional callers.
-    let _legacy_enqueue = crate::features::memory::service::enqueue_post_history;
     let mut transaction = pool.begin().await?;
     let result =
         finalize_post_comment_sent_in_transaction(&mut transaction, job, &completed).await?;

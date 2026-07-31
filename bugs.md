@@ -12,14 +12,14 @@
 ## ✅ Исправлено 2026-07-04
 
 - Gemini request parts serialization: `text` и `inlineData` теперь сериализуются в формате Gemini API; добавлен unit-test `request_parts_match_gemini_api_shape`.
-- M1: для `groq`/`cerebras`/`openrouter` больше нет fallback на `VISION_MODEL`. Требуется `LLM_MODEL` или provider-specific `GROQ_MODEL`/`CEREBRAS_MODEL`/`OPENROUTER_MODEL`, иначе startup fail-fast.
+- M1: image features используют capabilities соответствующего route profile; provider/model env больше не читаются.
 - M2: `reqwest::Client` больше не создаётся заново на каждый LLM/ASR/profile request; добавлен общий кэш HTTP-клиентов с учётом timeout/proxy.
 - M3: удалён unreachable `lower.contains("amd")` из вычисления `is_tech`.
 - M4: voice cleanup больше не делает второй LLM-запрос с тем же prompt при падении кастомного cleanup provider; используется raw ASR fallback.
 - L1: `first_text_chars` добавляет `…` при обрезке.
 - L2: `strip_links` удаляет ссылки, обёрнутые пунктуацией/кавычками, например `(https://example.com)`.
 - L5: удалён неиспользуемый параметр `_short_limit` из `plain_cleanup`.
-- AP1: `normalize_provider` больше не дублируется; LLM router использует общий `normalize_llm_provider` из config.
+- AP1: закрыто profile routing: provider normalization и provider match удалены из runtime service.
 
 ---
 
@@ -44,8 +44,8 @@
 ### L3. `.env.example:45` — VOICE_ASR_TEMPERATURE=0 без дробной части
 **Суть:** Везде `0.35`, `0.2`, а тут `0` без точки. Не баг (парсится ок), но неконсистентно.
 
-### L4. `config.rs:80` — OLLAMA_BASE_URL=https://ollama.com (по умолчанию)
-**Суть:** `https://ollama.com` — рабочий эндпоинт Ollama Cloud (см. docs.ollama.com/api/introduction). Не баг, но локальным пользователям нужно переопределять на `http://localhost:11434`. В `.env.example` тоже указан `https://ollama.com`.
+### L4. Profile endpoint ownership
+**Статус:** закрыто. Ollama и остальные LLM endpoints больше не задаются env-переменными; единственный источник — `base_url` provider profile.
 
 ### ~~L6. `first_comment/render.rs:77-95` — непарный `{CHAT_LINK` обрывает HTML~~
 ~~**Статус:** Уже исправлено ранее. При отсутствии `}` код добавляет весь остаток `after_start` как обычный текст и не теряет содержимое.~~

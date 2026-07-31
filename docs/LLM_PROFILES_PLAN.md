@@ -34,10 +34,10 @@ provider transport -> model profile -> task route
 - [x] **LP1 — schema и parser:** добавлены `src/llm/profiles.rs`, TOML example и unit tests parsing/validation без изменения live routing.
 - [x] **LP2 — config loading:** `LLM_PROFILES_PATH` загружает и валидирует profiles; enabled routes проверяются на startup вместе с secret и explicit proxy-egress requirements.
 - [x] **LP3 — compatibility profiles:** TOML topology задаёт явные genai adapters, endpoints, models, capabilities и egress для Gemini, Ollama Cloud, Groq, Cerebras, OpenRouter и custom OpenAI-compatible endpoint.
-- [x] **LP4 — route resolver:** typed route resolver проверяет primary/fallback chain и requirements против capabilities; Gemini fallback сохранён в legacy mode, а profile mode использует route order.
+- [x] **LP4 — route resolver:** typed route resolver проверяет primary/fallback chain и requirements против capabilities; runtime использует только route order.
 - [x] **LP5 — transport profiles:** все LLM generation paths используют единый `genai` transport с direct/proxy clients, явным adapter target и safe error mapping. Policy fallback, validation retry и audit остаются в service/pipeline слоях.
 - [x] **LP6 — task migration:** generation paths используют named routes в profile mode, а `ask` — native tool-call history с bounded execution и сохранённой research FSM.
-- [ ] **LP7 — cleanup:** удалить legacy provider/model env routing, `LLM_SUPPORTS_IMAGES`, model-name эвристики и hard-coded fallback chain после production migration.
+- [x] **LP7 — cleanup:** удалены provider/model env routing, capability env, model-name эвристики и hard-coded fallback chain; profiles стали authoritative runtime topology.
 
 ## Правила fallback
 
@@ -58,4 +58,4 @@ provider transport -> model profile -> task route
 3. invalid HTTP(S) endpoint и non-positive limits;
 4. route без моделей и fallback cycle/duplicate model;
 5. capability mismatch для image, tools, system prompt и structured output;
-6. сохранения текущей Gemini first-comment fallback последовательности при compatibility migration.
+6. сохранения Gemini first-comment fallback последовательности в authoritative route.

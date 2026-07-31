@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::features::voice::types::{
     AsrTranscript, CleanTranscript, TranscriptChapter, TranscriptRenderMode,
 };
-use crate::llm::service::{GenerateTextOptions, generate_text_with_provider_checked};
+use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 
 const CLEANUP_PROMPT: &str = include_str!("../../../prompts/voice_cleanup.md");
 const MIN_CLEANUP_CONTENT_PERCENT: usize = 65;
@@ -59,27 +59,10 @@ async fn generate_cleanup_content(
     config: &Config,
     prompt: &str,
 ) -> anyhow::Result<crate::llm::types::GeneratedText> {
-    generate_cleanup_with_provider(
-        config,
-        config.voice_cleanup_provider.as_deref(),
-        config.voice_cleanup_model.as_deref(),
-        prompt,
-    )
-    .await
-}
-
-async fn generate_cleanup_with_provider(
-    config: &Config,
-    provider: Option<&str>,
-    model: Option<&str>,
-    prompt: &str,
-) -> anyhow::Result<crate::llm::types::GeneratedText> {
-    generate_text_with_provider_checked(
+    generate_text_checked(
         config,
         GenerateTextOptions {
-            route: Some("voice_cleanup"),
-            provider_override: provider,
-            model_override: model,
+            route: "voice_cleanup",
             system_prompt: Some(CLEANUP_PROMPT),
             prompt,
             image_base64: None,

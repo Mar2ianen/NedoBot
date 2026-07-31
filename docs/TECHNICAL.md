@@ -10,7 +10,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Сохраняет входящие сообщения в Postgres.
 - Распознаёт авто-форварды из канала по `forward_origin.channel.id`.
 - Пропускает рекламу/служебные посты без маркера `Не теряем связь`.
-- Скачивает самое большое фото поста и отправляет его в vision-модель, если текущий LLM provider/model поддерживает изображения.
+- Скачивает самое большое фото поста и отправляет его в модель, если текущий task route profile поддерживает изображения.
 - Генерирует комментарий через единый `genai` transport с явным adapter/profile routing для `ollama`, `groq`, `cerebras`, `openrouter`, `openai_compat` и Gemini.
 - Отправляет HTML-комментарий reply под постом.
 - Отключает link preview.
@@ -71,18 +71,13 @@ CHAT_INVITE_URL=https://t.me/+RxmPtw7Bs-IxNzEy
 CHAT_INVITE_LABEL=Присоединяйтесь к чату
 POST_SIGNATURE_MARKER=Не теряем связь
 
-# Optional: enables strict profile-authoritative task routing.
-# LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml
-LLM_PROVIDER=gemini
-LLM_MODEL=gemini-3.5-flash
-LLM_SUPPORTS_IMAGES=true
+# Required authoritative provider/model/task-route profiles.
+LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml
 LLM_TEMPERATURE=0.45
 LLM_MAX_TOKENS=180
 LLM_PROXY_URL=
 MEMORY_LLM_TEMPERATURE=0.2
 MEMORY_LLM_MAX_TOKENS=220
-MEMORY_LLM_PROVIDER=ollama
-MEMORY_LLM_MODEL=gemma4:31b
 RAG_ENABLED=true
 RAG_EMBEDDING_URL=http://127.0.0.1:8788
 RAG_EMBEDDING_MODEL=cointegrated/rubert-tiny2
@@ -92,8 +87,6 @@ RAG_MIN_SIMILARITY=0.55
 RAG_TEMPORAL_HALF_LIFE_DAYS=180
 
 SEARCH_ENABLED=false
-SEARCH_EXTRACT_PROVIDER=ollama
-SEARCH_EXTRACT_MODEL=gemma4:31b
 SEARCH_EXTRACT_TEMPERATURE=0.1
 SEARCH_EXTRACT_MAX_TOKENS=900
 SEARCH_MCP_COMMAND=
@@ -117,32 +110,19 @@ SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
 SEARCH_GITHUB_MCP_TOOLS=search_issues,search_code
 
 GROQ_API_KEY=
-GROQ_MODEL=
 CEREBRAS_API_KEY=
-CEREBRAS_MODEL=
 # Unified audit: one canonical generation and materialization flow.
 NEW_USER_AUDIT_ENABLED=false
 NEW_USER_AUDIT_MAX_TOKENS=900
 OPENROUTER_API_KEY=
-OPENROUTER_MODEL=
 GEMINI_API_KEY=
-GEMINI_TEXT_MODEL=gemini-3.6-flash
-GEMINI_FLASH_MODEL=gemini-3.5-flash
-GEMINI_FLASH_LITE_MODEL=gemini-3.5-flash-lite
-GEMINI_LEGACY_FLASH_LITE_MODEL=gemini-3.1-flash-lite
-GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 GEMINI_THINKING_BUDGET=1024
 
 PUBLIC_BASE_URL=https://nedobot.chickenkiller.com
 STATIC_FILES_DIR=/opt/tg-ai-bot-teloxide/static
 LLM_PROXY_URL=
 OLLAMA_API_KEY=
-OLLAMA_BASE_URL=https://ollama.com
-OLLAMA_MODEL=gemma4:31b
-VISION_MODEL=gemma4:31b
 OPENAI_COMPAT_API_KEY=
-OPENAI_COMPAT_BASE_URL=https://api.openai.com/v1
-OPENAI_COMPAT_MODEL=
 
 OWNER_TELEGRAM_ID=
 SEND_OWNER_PREVIEW=true
@@ -161,7 +141,7 @@ PROFILE_REFRESH_CONCURRENCY=4
 `deploy/vpn-nginx/nginx.conf`; сертификат Let’s Encrypt обновляется Certbot, а
 deploy hook перезагружает контейнерный Nginx после продления.
 
-Для комментариев рекомендуемый основной provider — `gemini`: `Gemini 3.6 Flash` как основная модель, затем `Gemini 3.5 Flash`, `Gemini 3.5 Flash Lite`, `Gemini 3.1 Flash Lite` и в конце `ollama`/`gemma4:31b`. Fallback-цепочка срабатывает только когда модель не переопределена явно на уровне конкретного вызова.
+Для комментариев profile route использует Gemini chain из `config/llm_profiles.toml.example`; fallback-порядок и capability declarations задаются только этим route.
 
 ### Строгие LLM profiles
 
@@ -169,11 +149,11 @@ deploy hook перезагружает контейнерный Nginx после
 
 ### Единый genai transport и egress
 
-GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy"; legacy Gemini использует proxy при заданном LLM_PROXY_URL, остальные legacy providers идут напрямую. Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
+GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy". Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
 
-`LLM_PROFILES_PATH` необязателен. Если он отсутствует, генерация и стартовые проверки сохраняют совместимость с `LLM_PROVIDER`/моделями. Если переменная указывает на TOML-файл profiles, режим строгий: каждая генерация использует свой task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`) и игнорирует обычные provider/model overrides. Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`.
+`LLM_PROFILES_PATH` обязателен: без него startup завершается ошибкой. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
 
-Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет. При отключённых profiles `.env` задаёт `ASK_LLM_PROVIDER=ollama`, `ASK_LLM_MODEL=minimax-m3`, `NEW_USER_AUDIT_PROVIDER=cerebras` и `NEW_USER_AUDIT_MODEL=gemma-4-31b`.
+Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
 
@@ -183,17 +163,14 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 
-- `LLM_PROVIDER=gemini` требует непустой `GEMINI_API_KEY` или `GOOGLE_AI_STUDIO_API_KEY`.
-- `LLM_PROVIDER=groq|cerebras|openrouter|openai_compat` требует соответствующий API key.
-- `LLM_PROVIDER=groq|cerebras|openrouter` требует явную модель через `LLM_MODEL` или provider-specific переменную `GROQ_MODEL`/`CEREBRAS_MODEL`/`OPENROUTER_MODEL`; fallback на `VISION_MODEL` запрещён.
-- `LLM_PROVIDER=ollama` секрета не требует.
+- `LLM_PROFILES_PATH` должен указывать на валидный profile TOML; секреты проверяются по `api_key_env` всех включённых route selections.
 - Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
-- Если для включённого voice pipeline задан `VOICE_CLEANUP_PROVIDER`, для него тоже проверяется соответствующий LLM secret.
-- `NEW_USER_AUDIT_ENABLED=true` запускает единственный unified worker. При отключённых profiles он использует отдельные `NEW_USER_AUDIT_PROVIDER`/`NEW_USER_AUDIT_MODEL`, а в profile mode — route `new_user_audit` из TOML. `NEW_USER_AUDIT_MAX_TOKENS` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `RAG_EMBEDDING_URL`, `RAG_EMBEDDING_MODEL` и `RAG_EMBEDDING_TIMEOUT_SEC`.
+- Voice cleanup использует profile route `voice_cleanup` и его fallback chain.
+- `NEW_USER_AUDIT_ENABLED=true` запускает единственный unified worker через route `new_user_audit`. `NEW_USER_AUDIT_MAX_TOKENS` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `RAG_EMBEDDING_URL`, `RAG_EMBEDDING_MODEL` и `RAG_EMBEDDING_TIMEOUT_SEC`.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
-`/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены. Старый `ASK_TIMEOUT_SEC` временно поддерживается только как совместимый alias для turn timeout, пока production environment files переезжают на явное имя.
+`/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены.
 
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 
@@ -207,8 +184,8 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 
 Поведение gated by config:
 
-- `SEARCH_ENABLED=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт через обычный `LLM_PROVIDER` без внешнего поиска.
-- `SEARCH_EXTRACT_PROVIDER` / `SEARCH_EXTRACT_MODEL` задают LLM, который из очищенного поста возвращает JSON с максимум 4 запросами для `web`, `github` или `reddit`.
+- `SEARCH_ENABLED=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт без внешнего поиска.
+- Profile route `search_extract` задаёт LLM, который из очищенного поста возвращает JSON с максимум 4 запросами для `web`, `github` или `reddit`.
 - `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают основной MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
 - `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
 - `SEARCH_QUERY_TIMEOUT_SEC` — отдельный deadline одного source query. Таймаут GitHub, Reddit или web не отбрасывает результаты остальных источников.
@@ -265,8 +242,6 @@ VOICE_LANGUAGE=ru
 VOICE_ASR_PROVIDER=groq
 VOICE_ASR_MODEL=whisper-large-v3
 VOICE_ASR_TEMPERATURE=0
-VOICE_CLEANUP_PROVIDER=
-VOICE_CLEANUP_MODEL=
 VOICE_CLEANUP_TEMPERATURE=0.2
 VOICE_CLEANUP_MAX_TOKENS=1800
 VOICE_RENDER_EXPANDABLE_CHAPTERS=true
@@ -287,8 +262,7 @@ FIRST_COMMENT_MAX_IMAGE_MB=10
 - `VOICE_AUTO_TRANSCRIBE=false` выключает обработку обычных сообщений, но оставляет доступной ручную `/transcribe` reply-команду.
 - `VOICE_ASR_PROVIDER=groq` - сейчас единственный поддержанный ASR provider.
 - `VOICE_ASR_MODEL=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
-- `VOICE_CLEANUP_PROVIDER` пустой значит использовать обычный `LLM_PROVIDER`.
-- `VOICE_CLEANUP_MODEL` пустой значит использовать модель обычного provider-а.
+- Voice cleanup всегда использует profile route `voice_cleanup` и его fallback chain.
 - `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
 - `VOICE_MAX_FILE_MB=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
 - Если обычный HTML не влезает в безопасный лимит Telegram, бот отправляет Rich Message с закрытым блоком полного текста. `VOICE_SEND_FULL_FILE=true` оставляет `preview + voice-transcript.txt` только как fallback при ошибке Rich API или превышении rich-лимита.
@@ -560,9 +534,8 @@ timestamp_granularities[] = segment
 
 Cleanup request:
 
-- сначала используется `VOICE_CLEANUP_PROVIDER`/`VOICE_CLEANUP_MODEL`, если заданы;
-- если cleanup provider отличается от основного `LLM_PROVIDER` и падает, код пробует основной provider;
-- если все cleanup providers падают, используется raw ASR transcript;
+- сначала используется profile route `voice_cleanup` и его fallback chain;
+- если все cleanup selections падают, используется raw ASR transcript;
 - если JSON от модели не парсится или cleanup меняет объём/числа сверх безопасных границ, используется raw ASR transcript.
 
 Rendering policy:
@@ -583,7 +556,7 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 
 `src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
 
-`NEW_USER_AUDIT_ENABLED=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. Startup validation проверяет provider/model, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
+`NEW_USER_AUDIT_ENABLED=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. Startup validation проверяет profile route, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
 
 Ключевая таблица: `telegram_new_user_profile_audits`. В ней сохраняются классы риска, labels/reasons, возраст в чате, reply/comment context, текстовая повторяемость, профиль/персональный канал, наличие/метрики фото. `profile_photo_reuse_count` сейчас метрика only и не добавляет risk score.
 
