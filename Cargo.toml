@@ -7,11 +7,11 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-async-openai = { version = "0.41", features = ["chat-completion"] }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = "0.4"
 dotenvy = "0.15"
+genai = { version = "=0.6.5", default-features = false, features = ["native-tls"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "socks"] }
 rmcp = { version = "=3.0.0-beta.3", default-features = false, features = ["server", "client", "macros", "schemars", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +24,3 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-std"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Temporary upstream PR #578 compatibility patch for Groq service_tier="on_demand".
-[patch.crates-io]
-async-openai = { git = "https://github.com/Mar2ianen/async-openai", branch = "fix/groq-on-demand-service-tier" }

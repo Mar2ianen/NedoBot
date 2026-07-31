@@ -1,11 +1,7 @@
 use crate::config::{Config, normalize_llm_provider};
-use crate::llm::gemini::GeminiClient;
-use crate::llm::ollama::OllamaClient;
-use crate::llm::openai_compat::OpenAiCompatClient;
-use crate::llm::profiles::{LlmDriver, RouteRequirements, RouteSelection};
-use crate::llm::types::{
-    GeneratedText, LlmAttempt, LlmClient, LlmRequest, LlmTransportError, StructuredOutput,
-};
+use crate::llm::genai_transport::{GenAiRequest, GenAiTransport, ImageInput, ModelTarget};
+use crate::llm::profiles::{Egress, GenAiAdapter, RouteRequirements, RouteSelection};
+use crate::llm::types::{GeneratedText, LlmAttempt, LlmTransportError, StructuredOutput};
 
 pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
@@ -23,9 +19,6 @@ pub struct GenerateTextOptions<'a> {
     pub structured_output: Option<StructuredOutput<'a>>,
 }
 
-const GROQ_OPENAI_BASE_URL: &str = "https://api.groq.com/openai/v1";
-const CEREBRAS_OPENAI_BASE_URL: &str = "https://api.cerebras.ai/v1";
-const OPENROUTER_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const VALIDATION_RETRY_ATTEMPTS: usize = 1;
 
 pub async fn generate_text_with_provider_checked(
@@ -313,55 +306,40 @@ async fn generate_profile_once(
         );
     }
     let image_base64 = image_base64.filter(|_| selection.capabilities.supports_images);
-    let request = LlmRequest {
-        model: &selection.model.model,
-        system_prompt,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-        structured_output,
-    };
     let timeout = std::time::Duration::from_secs(selection.capabilities.request_timeout_sec);
-    let response = match selection.provider.driver {
-        LlmDriver::OpenaiCompatible => {
-            OpenAiCompatClient::new_with_structured_output_mode(
-                &selection.provider.base_url,
-                &api_key,
-                timeout,
-                selection.capabilities.structured_output,
-            )?
-            .generate(request)
-            .await?
-        }
-        LlmDriver::Gemini => {
-            GeminiClient::with_profile(
-                &selection.provider.base_url,
-                &api_key,
-                config.llm_proxy_url.as_deref(),
-                config.gemini_thinking_budget,
-                selection.capabilities.thinking,
-                selection.capabilities.structured_output,
-                timeout,
-            )
-            .generate(request)
-            .await?
-        }
-        LlmDriver::OllamaNative => {
-            OllamaClient::with_profile(
-                &selection.provider.base_url,
-                &api_key,
-                timeout,
-                selection.capabilities.structured_output,
-            )
-            .generate(request)
-            .await?
-        }
-    };
+    let image = image_base64.map(|base64| ImageInput {
+        mime_type: "image/jpeg",
+        base64,
+        file_name: Some("image.jpg"),
+    });
+    let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
+    let response = transport
+        .generate(GenAiRequest {
+            model: ModelTarget {
+                adapter: selection.provider.genai_adapter(),
+                endpoint: &selection.provider.base_url,
+                api_key: &api_key,
+                model: &selection.model.model,
+            },
+            system_prompt,
+            prompt,
+            image,
+            temperature,
+            max_tokens: num_predict,
+            timeout,
+            reasoning: selection.capabilities.thinking,
+            reasoning_budget: Some(config.gemini_thinking_budget),
+            structured_output_mode: selection.capabilities.structured_output,
+            structured_output,
+            extra_body: None,
+            egress: selection.provider.egress,
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
     Ok(GeneratedText {
         provider: selection.provider_key.to_string(),
         model: selection.model.model.clone(),
-        content: response.content,
+        content: response,
         image_used: image_base64.is_some(),
         attempts: vec![LlmAttempt {
             provider: selection.provider_key.to_string(),
@@ -377,7 +355,13 @@ fn classify_attempt_error(error: &anyhow::Error) -> String {
         Some(LlmTransportError::HttpStatus(status)) if *status >= 500 => "http_5xx".to_string(),
         Some(LlmTransportError::HttpStatus(status)) => format!("http_{status}"),
         Some(LlmTransportError::Configuration) => "configuration".to_string(),
+        Some(LlmTransportError::Timeout) => "timeout".to_string(),
         Some(LlmTransportError::EmptyResponse) => "empty_response".to_string(),
+        Some(LlmTransportError::InvalidResponse) => "invalid_response".to_string(),
+        Some(LlmTransportError::UnsupportedFeature) => "unsupported_feature".to_string(),
+        Some(LlmTransportError::StructuredOutputRejected) => {
+            "structured_output_fallback".to_string()
+        }
         None if error
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout) =>
@@ -398,7 +382,7 @@ fn is_empty_response(error: &anyhow::Error) -> bool {
 fn is_structured_output_rejection(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<LlmTransportError>(),
-        Some(LlmTransportError::HttpStatus(400 | 422))
+        Some(LlmTransportError::StructuredOutputRejected)
     )
 }
 
@@ -427,57 +411,40 @@ async fn generate_once(
         num_predict,
         structured_output,
     } = request;
-    let image_base64 = image_base64.filter(|_| supports_images(config, provider, model));
-    let request = LlmRequest {
-        model,
-        system_prompt,
-        prompt,
-        image_base64,
-        temperature,
-        num_predict,
-        structured_output,
-    };
-    let response = match provider {
-        "groq" => {
-            OpenAiCompatClient::new(
-                GROQ_OPENAI_BASE_URL,
-                &config.groq_api_key,
-                std::time::Duration::from_secs(45),
-            )?
-            .generate(request)
-            .await?
-        }
-        "cerebras" => {
-            OpenAiCompatClient::new(
-                CEREBRAS_OPENAI_BASE_URL,
-                &config.cerebras_api_key,
-                std::time::Duration::from_secs(45),
-            )?
-            .generate(request)
-            .await?
-        }
-        "openrouter" => {
-            OpenAiCompatClient::new(
-                OPENROUTER_OPENAI_BASE_URL,
-                &config.openrouter_api_key,
-                std::time::Duration::from_secs(45),
-            )?
-            .generate(request)
-            .await?
-        }
-        "gemini" => GeminiClient::new(config).generate(request).await?,
-        "openai_compat" => {
-            OpenAiCompatClient::from_config(config)?
-                .generate(request)
-                .await?
-        }
-        _ => OllamaClient::new(config).generate(request).await?,
-    };
+    let image_base64 = image_base64.filter(|_| legacy_supports_images(config));
+    let (target, egress) = legacy_model_target(config, provider, model)?;
+    let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
+    let response = transport
+        .generate(GenAiRequest {
+            model: target,
+            system_prompt,
+            prompt,
+            image: image_base64.map(|base64| ImageInput {
+                mime_type: "image/jpeg",
+                base64,
+                file_name: Some("image.jpg"),
+            }),
+            temperature,
+            max_tokens: num_predict,
+            timeout: std::time::Duration::from_secs(45),
+            reasoning: if provider == "gemini" {
+                crate::llm::profiles::ThinkingMode::Budget
+            } else {
+                crate::llm::profiles::ThinkingMode::None
+            },
+            reasoning_budget: Some(config.gemini_thinking_budget),
+            structured_output_mode: crate::llm::profiles::StructuredOutputMode::JsonSchema,
+            structured_output,
+            extra_body: None,
+            egress,
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
 
     Ok(GeneratedText {
         provider: provider.to_string(),
         model: model.to_string(),
-        content: response.content,
+        content: response,
         image_used: image_base64.is_some(),
         attempts: vec![LlmAttempt {
             provider: provider.to_string(),
@@ -572,19 +539,68 @@ fn model_for_provider<'a>(config: &'a Config, provider: &str) -> anyhow::Result<
     }
 }
 
-fn supports_images(config: &Config, provider: &str, model: &str) -> bool {
-    if let Some(supports_images) = config.llm_supports_images {
-        return supports_images;
-    }
+fn legacy_supports_images(config: &Config) -> bool {
+    config.llm_supports_images.unwrap_or(false)
+}
 
-    let model = model.to_lowercase();
-    matches!(provider, "ollama" | "gemini")
-        || model.contains("vision")
-        || model.contains("llama-4")
-        || model.contains("gpt-4o")
-        || model.contains("gemma4")
-        || model.contains("gemini")
-        || model.contains("pixtral")
+fn legacy_model_target<'a>(
+    config: &'a Config,
+    provider: &str,
+    model: &'a str,
+) -> anyhow::Result<(ModelTarget<'a>, Egress)> {
+    let (adapter, endpoint, api_key, egress) = match provider {
+        "gemini" => (
+            GenAiAdapter::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta",
+            config.gemini_api_key.as_str(),
+            config
+                .llm_proxy_url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|_| Egress::Proxy)
+                .unwrap_or(Egress::Direct),
+        ),
+        "groq" => (
+            GenAiAdapter::Groq,
+            "https://api.groq.com/openai/v1",
+            config.groq_api_key.as_str(),
+            Egress::Direct,
+        ),
+        "cerebras" => (
+            GenAiAdapter::OpenAi,
+            "https://api.cerebras.ai/v1",
+            config.cerebras_api_key.as_str(),
+            Egress::Direct,
+        ),
+        "openrouter" => (
+            GenAiAdapter::OpenRouter,
+            "https://openrouter.ai/api/v1",
+            config.openrouter_api_key.as_str(),
+            Egress::Direct,
+        ),
+        "openai_compat" => (
+            GenAiAdapter::OpenAi,
+            config.openai_compat_base_url.as_str(),
+            config.openai_compat_api_key.as_str(),
+            Egress::Direct,
+        ),
+        "ollama" => (
+            GenAiAdapter::OllamaCloud,
+            config.ollama_base_url.as_str(),
+            config.ollama_api_key.as_str(),
+            Egress::Direct,
+        ),
+        other => anyhow::bail!("unsupported legacy LLM provider {other:?}"),
+    };
+    Ok((
+        ModelTarget {
+            adapter,
+            endpoint,
+            api_key,
+            model,
+        },
+        egress,
+    ))
 }
 
 #[cfg(test)]
@@ -1077,8 +1093,8 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
 
     #[test]
     fn detects_typed_structured_output_rejections() {
-        let bad_request = anyhow::Error::new(LlmTransportError::http_status(400));
-        let unprocessable = anyhow::Error::new(LlmTransportError::http_status(422));
+        let bad_request = anyhow::Error::new(LlmTransportError::structured_output_rejected());
+        let unprocessable = anyhow::Error::new(LlmTransportError::structured_output_rejected());
         let unavailable = anyhow::Error::new(LlmTransportError::http_status(503));
 
         assert!(is_structured_output_rejection(&bad_request));

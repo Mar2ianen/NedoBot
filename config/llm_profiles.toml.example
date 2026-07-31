@@ -6,31 +6,43 @@
 
 [providers.gemini]
 driver = "gemini"
+adapter = "gemini"
+egress = "direct"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 api_key_env = "GEMINI_API_KEY"
 
 [providers.ollama_cloud]
 driver = "ollama_native"
+adapter = "ollama_cloud"
+egress = "direct"
 base_url = "https://ollama.com"
 api_key_env = "OLLAMA_API_KEY"
 
 [providers.groq]
 driver = "openai_compatible"
+adapter = "groq"
+egress = "direct"
 base_url = "https://api.groq.com/openai/v1"
 api_key_env = "GROQ_API_KEY"
 
 [providers.cerebras]
 driver = "openai_compatible"
+adapter = "open_ai"
+egress = "direct"
 base_url = "https://api.cerebras.ai/v1"
 api_key_env = "CEREBRAS_API_KEY"
 
 [providers.openrouter]
 driver = "openai_compatible"
+adapter = "open_router"
+egress = "direct"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 
 [providers.custom_openai]
 driver = "openai_compatible"
+adapter = "open_ai"
+egress = "direct"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_COMPAT_API_KEY"
 

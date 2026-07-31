@@ -34,6 +34,7 @@ use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
 use features::voice::pipeline::maybe_transcribe_voice;
+use llm::genai_transport::GenAiTransport;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
 use telegram::commands::Command;
@@ -51,12 +52,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,teloxide=info,async_openai=off".into()),
+                .unwrap_or_else(|_| "info,teloxide=info".into()),
         )
         .init();
 
     let config = Config::from_env()?;
     config.validate_runtime_secrets()?;
+    GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
     let pool = build_pool().await?;
     migrate(&pool).await?;

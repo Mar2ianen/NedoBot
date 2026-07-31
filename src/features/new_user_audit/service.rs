@@ -415,11 +415,18 @@ fn classify_audit_failure(error: &anyhow::Error) -> AuditFailure {
                 error_kind: "http_4xx",
             }
         }
-        Some(LlmTransportError::HttpStatus(_)) | Some(LlmTransportError::EmptyResponse) => {
-            AuditFailure::Retry {
-                error_kind: "transient",
-            }
-        }
+        Some(
+            LlmTransportError::Timeout
+            | LlmTransportError::HttpStatus(_)
+            | LlmTransportError::EmptyResponse
+            | LlmTransportError::InvalidResponse
+            | LlmTransportError::StructuredOutputRejected,
+        ) => AuditFailure::Retry {
+            error_kind: "transient",
+        },
+        Some(LlmTransportError::UnsupportedFeature) => AuditFailure::Terminal {
+            error_kind: "unsupported_feature",
+        },
         Some(LlmTransportError::Configuration) => AuditFailure::Terminal {
             error_kind: "configuration",
         },

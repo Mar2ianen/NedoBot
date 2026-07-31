@@ -16,6 +16,10 @@ pub struct ProviderProfile {
     pub driver: LlmDriver,
     pub base_url: String,
     pub api_key_env: String,
+    #[serde(default)]
+    pub adapter: Option<GenAiAdapter>,
+    #[serde(default)]
+    pub egress: Egress,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -24,6 +28,34 @@ pub enum LlmDriver {
     Gemini,
     OllamaNative,
     OpenaiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenAiAdapter {
+    OpenAi,
+    Gemini,
+    Groq,
+    OpenRouter,
+    OllamaCloud,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Egress {
+    #[default]
+    Direct,
+    Proxy,
+}
+
+impl ProviderProfile {
+    pub fn genai_adapter(&self) -> GenAiAdapter {
+        self.adapter.unwrap_or(match self.driver {
+            LlmDriver::Gemini => GenAiAdapter::Gemini,
+            LlmDriver::OllamaNative => GenAiAdapter::OllamaCloud,
+            LlmDriver::OpenaiCompatible => GenAiAdapter::OpenAi,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
