@@ -19,11 +19,11 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - После комментария асинхронно создаёт атомарную Gemma-карточку полезного поста; рекламу, мемы и повторы помечает `ignored`.
 - Ищет релевантную историю через RuBERT Tiny 2 и pgvector с отдельными similarity, temporal coefficient и итоговым rank score.
 - Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
-- Опционально добавляет свежий web/GitHub/Reddit факт-чек для первого комментария через lazy MCP process, если включён `SEARCH_ENABLED`.
+- Опционально добавляет свежий web/GitHub/Reddit факт-чек для первого комментария через lazy MCP process, если включён `runtime.search_enabled`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
 - Показывает пользователей в отчётах человекочитаемо: имя кликабельно, ID спрятан в `tg://user`, рядом статус/админство.
 - Сохраняет новые reaction updates, reaction count updates и chat member updates, если Telegram отдаёт их боту.
-- Расшифровывает `voice`, `audio` и `video_note`, если включены `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE`.
+- Расшифровывает `voice`, `audio` и `video_note`, если включены `runtime.voice_transcription_enabled` и `runtime.voice_auto_transcribe`.
 - Для аудиозаписей делает Groq ASR, LLM cleanup, safe Telegram HTML render и audit в `voice_transcription_jobs`.
 - Короткие расшифровки отправляет plain text без глав/таймкодов; длинные может отправлять главами с expandable blockquotes или preview + `.txt` файлом.
 - Отвечает на `/ask` как агентный помощник: ищет по истории и reply-веткам, разрешает участников, читает безопасные профили/заметки, использует web/GitHub и передаёт фото из reply vision-модели.
@@ -57,83 +57,32 @@ curl "https://api.telegram.org/bot$TELOXIDE_TOKEN/getMe"
 
 ## Конфиг
 
-Локальный `.env` не коммитится. Безопасные примеры и полный перечень переменных приведены в этом разделе; секреты задаются только в локальном окружении или в защищённом server-side environment file.
+Локальный `.env` не коммитится и содержит только секреты либо чувствительные URL. Несекретный runtime-конфиг хранится в секции `[runtime]` существующего файла [`config/llm_profiles.toml.example`](../config/llm_profiles.toml.example). Для production рекомендуется скопировать этот файл в `/etc/tg-ai-bot/llm_profiles.toml` и задать `LLM_PROFILES_PATH` в unit/process environment; если переменная не задана, используется репозиторный `config/llm_profiles.toml.example`.
 
-Основные переменные:
+В окружении процесса остаются только секреты и чувствительные адреса:
 
 ```env
 TELOXIDE_TOKEN=
 DATABASE_URL=postgres://tg_ai_bot:tg_ai_bot@localhost:5432/tg_ai_bot
-
-SOURCE_CHANNEL_ID=-1001575496091
-DISCUSSION_CHAT_ID=-1001932061163
-CHAT_INVITE_URL=https://t.me/+RxmPtw7Bs-IxNzEy
-CHAT_INVITE_LABEL=Присоединяйтесь к чату
-POST_SIGNATURE_MARKER=Не теряем связь
-
-# Required authoritative provider/model/task-route profiles.
-LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml
-LLM_TEMPERATURE=0.45
-LLM_MAX_TOKENS=180
+CHAT_INVITE_URL=
 LLM_PROXY_URL=
-MEMORY_LLM_TEMPERATURE=0.2
-MEMORY_LLM_MAX_TOKENS=220
-RAG_ENABLED=true
-RAG_EMBEDDING_URL=http://127.0.0.1:8788
-RAG_EMBEDDING_MODEL=cointegrated/rubert-tiny2
-RAG_EMBEDDING_TIMEOUT_SEC=10
-RAG_TOP_K=6
-RAG_MIN_SIMILARITY=0.55
-RAG_TEMPORAL_HALF_LIFE_DAYS=180
-
-SEARCH_ENABLED=false
-SEARCH_EXTRACT_TEMPERATURE=0.1
-SEARCH_EXTRACT_MAX_TOKENS=900
-SEARCH_MCP_COMMAND=
-SEARCH_MCP_ARGS=
-SEARCH_MCP_ENV=
-SEARCH_MCP_TIMEOUT_SEC=8
-SEARCH_QUERY_TIMEOUT_SEC=20
-SEARCH_MCP_TOOL_WEB=web_search
-SEARCH_MCP_TOOL_GITHUB=github_search
-SEARCH_MCP_TOOL_REDDIT=reddit_search
-SEARCH_MCP_TOOL_FETCH=web_fetch_exa
-SEARCH_FETCH_TOP_N=4
-SEARCH_FETCH_MAX_CHARS=16000
-CHAT_RETRIEVAL_EMBEDDINGS_ENABLED=false
-CHAT_RETRIEVAL_SHADOW_ENABLED=false
-CHAT_RETRIEVAL_EVIDENCE_ENABLED=false
-CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE=2.0
-SEARCH_GITHUB_MCP_COMMAND=
-SEARCH_GITHUB_MCP_ARGS=
-SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
-SEARCH_GITHUB_MCP_TOOLS=search_issues,search_code
-
 GROQ_API_KEY=
 CEREBRAS_API_KEY=
-# Unified audit: one canonical generation and materialization flow.
-NEW_USER_AUDIT_ENABLED=false
-NEW_USER_AUDIT_MAX_TOKENS=900
-OPENROUTER_API_KEY=
 GEMINI_API_KEY=
-GEMINI_THINKING_BUDGET=1024
-
-PUBLIC_BASE_URL=https://nedobot.chickenkiller.com
-STATIC_FILES_DIR=/opt/tg-ai-bot-teloxide/static
-LLM_PROXY_URL=
 OLLAMA_API_KEY=
 OPENAI_COMPAT_API_KEY=
-
-OWNER_TELEGRAM_ID=
-SEND_OWNER_PREVIEW=true
-ASK_ENABLED=false
-ASK_MAX_STEPS=7
-ASK_ACTION_TIMEOUT_SEC=45
-ASK_TOTAL_TIMEOUT_SEC=180
-ASK_MAX_CONCURRENCY=1
-ASK_DB_MCP_TIMEOUT_SEC=8
-PROFILE_REFRESH_CONCURRENCY=4
+OPENROUTER_API_KEY=
+ASK_DATABASE_URL=
+GITHUB_PERSONAL_ACCESS_TOKEN=
 ```
+
+`config/llm_profiles.toml.example` содержит provider/model profiles, task routes и все статические лимиты, флаги, идентификаторы чатов, пути и tool allowlists. API keys, DSN, invite URL и proxy URL туда не переносятся.
+
+### Кандидаты для динамической конфигурации в БД
+
+В БД имеет смысл вынести только policy, которую нужно менять без перезапуска: `comment_blocked_source_domains`, `comment_blocked_terms`, feature flags/moderation thresholds и access policy для `/ask` (`ask_private_user_ids`, список администраторов). Для этого сначала нужны additive migration, typed read-model, явный приоритет `DB > TOML`, version/audit записи и безопасный cache/reload протокол. В этой миграции DB override не включён, поэтому единственным runtime source остаётся `[runtime]` TOML.
+
+Provider credentials, DSN, invite/proxy URLs, transport topology, model routes, timeouts и resource limits в БД переносить не следует: это deployment-контракт и startup validation.
 
 `nedobot.chickenkiller.com` — публичный HTTPS-домен проекта. Он отдаёт только
 кэшированные аватарки Telegram по пути `/tg-ai-bot-static/avatars/`; бот строит
@@ -151,7 +100,7 @@ deploy hook перезагружает контейнерный Nginx после
 
 GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy". Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
 
-`LLM_PROFILES_PATH` обязателен: без него startup завершается ошибкой. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
+`LLM_PROFILES_PATH` необязателен: без него загружается `config/llm_profiles.toml.example`. Для production отдельный путь задаётся в environment самого процесса или systemd unit, но не в secrets `.env`. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
 
 Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
@@ -159,18 +108,18 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
 
-Для Gemini 3.x бот использует актуальный `thinkingLevel=low` и не передаёт устаревшие `temperature` и числовой `thinkingBudget`. `LLM_MAX_TOKENS` задаёт полный лимит вывода; для JSON-комментария нужен запас, поэтому значение по умолчанию — 180. Для старых Gemini-моделей сохраняется `GEMINI_THINKING_BUDGET`: бот отправляет `maxOutputTokens = LLM_MAX_TOKENS + GEMINI_THINKING_BUDGET`.
+Для Gemini 3.x бот использует актуальный `thinkingLevel=low` и не передаёт устаревшие `temperature` и числовой `thinkingBudget`. `runtime.llm_max_tokens` задаёт полный лимит вывода; для JSON-комментария нужен запас, поэтому значение по умолчанию — 180. Для старых Gemini-моделей сохраняется `runtime.gemini_thinking_budget`: бот отправляет `maxOutputTokens = runtime.llm_max_tokens + runtime.gemini_thinking_budget`.
 
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 
-- `LLM_PROFILES_PATH` должен указывать на валидный profile TOML; секреты проверяются по `api_key_env` всех включённых route selections.
-- Если включены `VOICE_TRANSCRIPTION_ENABLED=true` и `VOICE_AUTO_TRANSCRIBE=true`, `VOICE_ASR_PROVIDER=groq` требует `GROQ_API_KEY`.
+- Загруженный profile TOML должен быть валидным; секреты проверяются по `api_key_env` всех включённых route selections.
+- Если включены `runtime.voice_transcription_enabled=true` и `runtime.voice_auto_transcribe=true`, `runtime.voice_asr_provider=groq` требует `GROQ_API_KEY`.
 - Voice cleanup использует profile route `voice_cleanup` и его fallback chain.
-- `NEW_USER_AUDIT_ENABLED=true` запускает единственный unified worker через route `new_user_audit`. `NEW_USER_AUDIT_MAX_TOKENS` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `RAG_EMBEDDING_URL`, `RAG_EMBEDDING_MODEL` и `RAG_EMBEDDING_TIMEOUT_SEC`.
+- `runtime.new_user_audit_enabled=true` запускает единственный unified worker через route `new_user_audit`. `runtime.new_user_audit_max_tokens` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `runtime.rag_embedding_url`, `runtime.rag_embedding_model` и `runtime.rag_embedding_timeout_sec`.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
-`/ask` использует два независимых deadline: `ASK_ACTION_TIMEOUT_SEC` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `ASK_TOTAL_TIMEOUT_SEC` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены.
+`/ask` использует два независимых deadline: `runtime.ask_action_timeout_sec` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `runtime.ask_total_timeout_sec` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены.
 
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 
@@ -184,88 +133,95 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 
 Поведение gated by config:
 
-- `SEARCH_ENABLED=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт без внешнего поиска.
+- `runtime.search_enabled=false` сохраняет старое поведение: search-блок не добавляется в prompt, а генерация идёт без внешнего поиска.
 - Profile route `search_extract` задаёт LLM, который из очищенного поста возвращает JSON с максимум 4 запросами для `web`, `github` или `reddit`.
-- `SEARCH_MCP_COMMAND` и `SEARCH_MCP_ARGS` запускают основной MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
-- `SEARCH_MCP_ENV` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
-- `SEARCH_QUERY_TIMEOUT_SEC` — отдельный deadline одного source query. Таймаут GitHub, Reddit или web не отбрасывает результаты остальных источников.
-- `SEARCH_MCP_TOOL_WEB`, `SEARCH_MCP_TOOL_GITHUB`, `SEARCH_MCP_TOOL_REDDIT` задают имена MCP tools для основного MCP server.
-- `SEARCH_MCP_TOOL_FETCH` включает дополнительный fetch top URL после search. Для Exa это `web_fetch_exa`.
-- `SEARCH_GITHUB_MCP_COMMAND` / `SEARCH_GITHUB_MCP_ARGS` включают отдельный GitHub MCP server для запросов `source=github`; если они не заданы, GitHub-запросы идут через основной `SEARCH_MCP_TOOL_GITHUB`.
-- `SEARCH_GITHUB_MCP_ENV` по умолчанию пропускает только `PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN`; значения не логируются.
-- `SEARCH_GITHUB_MCP_TOOLS` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
+- `runtime.search_mcp_command` и `runtime.search_mcp_args` запускают основной MCP server лениво на один search-run. Long-lived MCP client в `AppState`, lifecycle restart/shutdown и постоянный child process не используются в первой итерации.
+- `runtime.search_mcp_env` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
+- `runtime.search_query_timeout_sec` — отдельный deadline одного source query. Таймаут GitHub, Reddit или web не отбрасывает результаты остальных источников.
+- `runtime.search_mcp_tool_web`, `runtime.search_mcp_tool_github`, `runtime.search_mcp_tool_reddit` задают имена MCP tools для основного MCP server.
+- `runtime.search_mcp_tool_fetch` включает дополнительный fetch top URL после search. Для Exa это `web_fetch_exa`.
+- `runtime.search_github_mcp_command` / `runtime.search_github_mcp_args` включают отдельный GitHub MCP server для запросов `source=github`; если они не заданы, GitHub-запросы идут через основной `runtime.search_mcp_tool_github`.
+- `runtime.search_github_mcp_env` по умолчанию пропускает только `PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN`; значения не логируются.
+- `runtime.search_github_mcp_tools` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
 - Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
 - Ошибка extract превращается в skipped `SearchContext`; ошибка или таймаут отдельного MCP source оставляет успешные результаты других источников доступными для комментария.
 - Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. В промпт помещается до 24 результатов, до 16 000 символов на результат и до 160 000 символов суммарно; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
-- Chat retrieval работает отдельно: `CHAT_RETRIEVAL_SHADOW_ENABLED` сохраняет гибридные кандидаты и раскрытый контекст только для аудита. `CHAT_RETRIEVAL_EVIDENCE_ENABLED` по умолчанию выключен; включать его можно лишь после ручной оценки shadow-выборки. Даже при включении в prompt попадают только кандидаты не ниже `CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE`.
+- Chat retrieval работает отдельно: `runtime.chat_retrieval_shadow_enabled` сохраняет гибридные кандидаты и раскрытый контекст только для аудита. `runtime.chat_retrieval_evidence_enabled` по умолчанию выключен; включать его можно лишь после ручной оценки shadow-выборки. Даже при включении в prompt попадают только кандидаты не ниже `runtime.chat_retrieval_evidence_min_score`.
 
 Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
 
-```env
-SEARCH_ENABLED=true
-SEARCH_MCP_COMMAND=npx
-SEARCH_MCP_ARGS="-y mcp-remote https://mcp.exa.ai/mcp"
-SEARCH_MCP_ENV=PATH,HOME
-SEARCH_MCP_TIMEOUT_SEC=30
-SEARCH_QUERY_TIMEOUT_SEC=20
-SEARCH_MCP_TOOL_WEB=web_search_exa
-SEARCH_MCP_TOOL_GITHUB=web_search_exa
-SEARCH_MCP_TOOL_REDDIT=web_search_exa
-SEARCH_MCP_TOOL_FETCH=web_fetch_exa
-SEARCH_FETCH_TOP_N=4
-SEARCH_FETCH_MAX_CHARS=16000
+```toml
+[runtime]
+search_enabled = true
+search_mcp_command = "npx"
+search_mcp_args = ["-y", "mcp-remote", "https://mcp.exa.ai/mcp"]
+search_mcp_env = ["PATH", "HOME"]
+search_mcp_timeout_sec = 30
+search_query_timeout_sec = 20
+search_mcp_tool_web = "web_search_exa"
+search_mcp_tool_github = "web_search_exa"
+search_mcp_tool_reddit = "web_search_exa"
+search_mcp_tool_fetch = "web_fetch_exa"
+search_fetch_top_n = 4
+search_fetch_max_chars = 16000
 ```
 
 Для новостей об утилитах можно добавить GitHub MCP поверх Exa, чтобы `source=github` ходил в GitHub issues/code отдельно:
 
 ```env
 GITHUB_PERSONAL_ACCESS_TOKEN=
-SEARCH_GITHUB_MCP_COMMAND=npx
-SEARCH_GITHUB_MCP_ARGS="-y @modelcontextprotocol/server-github"
-SEARCH_GITHUB_MCP_ENV=PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN
-SEARCH_GITHUB_MCP_TOOLS=search_issues,search_code
+```
+
+```toml
+[runtime]
+search_github_mcp_command = "npx"
+search_github_mcp_args = ["-y", "@modelcontextprotocol/server-github"]
+search_github_mcp_env = ["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+search_github_mcp_tools = ["search_issues", "search_code"]
 ```
 
 `PATH,HOME` нужны не Exa, а `npx`/`mcp-remote` после `env_clear()`. Значения не логируются.
 
-Voice transcription:
+Voice transcription (`[runtime]` в profile TOML):
 
-```env
-VOICE_TRANSCRIPTION_ENABLED=false
-VOICE_AUTO_TRANSCRIBE=false
-VOICE_MAX_DURATION_SEC=600
-VOICE_MAX_FILE_MB=20
-VOICE_SHORT_TEXT_MAX_CHARS=400
-VOICE_LANGUAGE=ru
-VOICE_ASR_PROVIDER=groq
-VOICE_ASR_MODEL=whisper-large-v3
-VOICE_ASR_TEMPERATURE=0
-VOICE_CLEANUP_TEMPERATURE=0.2
-VOICE_CLEANUP_MAX_TOKENS=1800
-VOICE_RENDER_EXPANDABLE_CHAPTERS=true
-VOICE_SEND_FULL_FILE=true
+```toml
+[runtime]
+voice_transcription_enabled = false
+voice_auto_transcribe = false
+voice_max_duration_sec = 600
+voice_max_file_mb = 20
+voice_short_text_max_chars = 400
+voice_language = "ru"
+voice_asr_provider = "groq"
+voice_asr_model = "whisper-large-v3"
+voice_asr_temperature = 0.0
+voice_cleanup_temperature = 0.2
+voice_cleanup_max_tokens = 1800
+voice_render_expandable_chapters = true
+voice_send_full_file = true
 ```
 
 Для изображений в постах первого комментария используется отдельный лимит:
 
-```env
-FIRST_COMMENT_MAX_IMAGE_MB=10
+```toml
+[runtime]
+first_comment_max_image_mb = 10
 ```
 
 Если Telegram сообщает размер файла выше лимита, бот не скачивает изображение и продолжает генерацию текстового комментария.
 
 Правила voice-конфига:
 
-- `VOICE_TRANSCRIPTION_ENABLED=false` полностью выключает voice pipeline, включая `/transcribe`.
-- `VOICE_AUTO_TRANSCRIBE=false` выключает обработку обычных сообщений, но оставляет доступной ручную `/transcribe` reply-команду.
-- `VOICE_ASR_PROVIDER=groq` - сейчас единственный поддержанный ASR provider.
-- `VOICE_ASR_MODEL=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
+- `runtime.voice_transcription_enabled=false` полностью выключает voice pipeline, включая `/transcribe`.
+- `runtime.voice_auto_transcribe=false` выключает обработку обычных сообщений, но оставляет доступной ручную `/transcribe` reply-команду.
+- `runtime.voice_asr_provider=groq` - сейчас единственный поддержанный ASR provider.
+- `runtime.voice_asr_model=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
 - Voice cleanup всегда использует profile route `voice_cleanup` и его fallback chain.
-- `VOICE_SHORT_TEXT_MAX_CHARS=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
-- `VOICE_MAX_FILE_MB=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
-- Если обычный HTML не влезает в безопасный лимит Telegram, бот отправляет Rich Message с закрытым блоком полного текста. `VOICE_SEND_FULL_FILE=true` оставляет `preview + voice-transcript.txt` только как fallback при ошибке Rich API или превышении rich-лимита.
+- `runtime.voice_short_text_max_chars=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
+- `runtime.voice_max_file_mb=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
+- Если обычный HTML не влезает в безопасный лимит Telegram, бот отправляет Rich Message с закрытым блоком полного текста. `runtime.voice_send_full_file=true` оставляет `preview + voice-transcript.txt` только как fallback при ошибке Rich API или превышении rich-лимита.
 
 ## Локальный Запуск
 
@@ -400,8 +356,8 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 Пользователь с меньшим score не может получить карточку даже при ошибочном caller-е.
 Поздние сигналы аватара или первого сообщения могут сделать уже сохранённый audit
 доставляемым. Кнопки «Верно: спамер» и «Неверно: не спамер» доступны только
-`OWNER_TELEGRAM_ID`; первое решение атомарно закрывает запрос и убирает
-клавиатуру. Технические labels риска в карточке переводятся в понятные причины.
+`runtime.owner_telegram_id`; первое решение атомарно закрывает запрос и убирает
+клавиатуру. Технические labels риска в карточке переводятся в понятные причины. Кнопки доступны только владельцу, заданному через `runtime.owner_telegram_id`.
 
 Посмотреть последние сообщения:
 
@@ -480,7 +436,7 @@ RAG не предназначен для пересказа новости: по
 - `summary: null` разрешён для рекламы, мемов, служебных публикаций, повторов и постов без устойчивого полезного факта; запись становится `ignored` и не участвует в retrieval;
 - полезная запись получает 312-мерный embedding `cointegrated/rubert-tiny2` и становится `ready`;
 - перед внешним поиском бот строит embedding нового поста и выбирает до шести карточек по cosine similarity;
-- рейтинг считается как `similarity * temporal_coefficient`, где коэффициент свежести плавно снижается от `1.0` к `0.70`, а период полураспада настраивается через `RAG_TEMPORAL_HALF_LIFE_DAYS`;
+- рейтинг считается как `similarity * temporal_coefficient`, где коэффициент свежести плавно снижается от `1.0` к `0.70`, а период полураспада настраивается через `runtime.rag_temporal_half_life_days`;
 - Gemma-поисковик видит `already_known` и `already_used_angles`, поэтому ищет развитие истории, последствия, альтернативы, changelog или свежую реакцию, а при отсутствии нового направления может вернуть `need_search=false`;
 - модель комментария получает одновременно найденную историю и свежие результаты внешнего поиска;
 - старые объединённые заметки удаляются миграцией и не переносятся в новую историю.
@@ -505,7 +461,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 
 Порядок обработки:
 
-1. Проверить `VOICE_TRANSCRIPTION_ENABLED` и `VOICE_AUTO_TRANSCRIBE` для автоматического режима; `/transcribe` требует только `VOICE_TRANSCRIPTION_ENABLED`.
+1. Проверить `runtime.voice_transcription_enabled` и `runtime.voice_auto_transcribe` для автоматического режима; `/transcribe` требует только `runtime.voice_transcription_enabled`.
 2. Отфильтровать чужие чаты, ботов, команды и automatic forwards.
 3. Определить `VoiceMedia` из `voice`, `audio` или `video_note`.
 4. Сохранить исходное Telegram message в `telegram_messages`.
@@ -525,10 +481,10 @@ ASR request:
 
 ```text
 POST https://api.groq.com/openai/v1/audio/transcriptions
-model = VOICE_ASR_MODEL
+model = runtime.voice_asr_model
 response_format = verbose_json
-language = VOICE_LANGUAGE
-temperature = VOICE_ASR_TEMPERATURE
+language = runtime.voice_language
+temperature = runtime.voice_asr_temperature
 timestamp_granularities[] = segment
 ```
 
@@ -540,11 +496,11 @@ Cleanup request:
 
 Rendering policy:
 
-- `clean.text.chars().count() <= VOICE_SHORT_TEXT_MAX_CHARS` -> только исправленный текст;
+- `clean.text.chars().count() <= runtime.voice_short_text_max_chars` -> только исправленный текст;
 - `mode=chapters` + непустые chapters -> заголовок `Расшифровка голосового` и главы;
-- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true` и обычное сообщение влезает;
+- тело главы идёт в `<blockquote expandable>`, если `runtime.voice_render_expandable_chapters=true` и обычное сообщение влезает;
 - если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет Rich Message с закрытым `<details>`; rich-формат поддерживает до 32 768 символов;
-- если Rich API отклоняет сообщение или rich-лимит превышен, `VOICE_SEND_FULL_FILE=true` включает fallback `preview + voice-transcript.txt`.
+- если Rich API отклоняет сообщение или rich-лимит превышен, `runtime.voice_send_full_file=true` включает fallback `preview + voice-transcript.txt`.
 
 Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
 
@@ -556,7 +512,7 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 
 `src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
 
-`NEW_USER_AUDIT_ENABLED=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. Startup validation проверяет profile route, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
+`runtime.new_user_audit_enabled=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. Startup validation проверяет profile route, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
 
 Ключевая таблица: `telegram_new_user_profile_audits`. В ней сохраняются классы риска, labels/reasons, возраст в чате, reply/comment context, текстовая повторяемость, профиль/персональный канал, наличие/метрики фото. `profile_photo_reuse_count` сейчас метрика only и не добавляет risk score.
 
@@ -738,12 +694,13 @@ Migration на второй partial index допустима только есл
 
 Текущие ID:
 
-```env
-COMMENT_CUSTOM_EMOJI_ID=5445092965875729965
-TECH_CUSTOM_EMOJI_ID=
-AMD_CUSTOM_EMOJI_ID=5442995600201106682
-RADEON_CUSTOM_EMOJI_ID=5442853853395436819
-RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
+```toml
+[runtime]
+comment_custom_emoji_id = "5445092965875729965"
+tech_custom_emoji_id = ""
+amd_custom_emoji_id = "5442995600201106682"
+radeon_custom_emoji_id = "5442853853395436819"
+ryzen_custom_emoji_id = "5444875271163364561"
 ```
 
 ## Ограничения MVP
@@ -756,4 +713,4 @@ RYZEN_CUSTOM_EMOJI_ID=5444875271163364561
 - Voice ASR сейчас только через Groq; local Whisper/Ollama audio не подключены.
 - Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
-- Админки пока нет; настройки меняются через `.env` и рестарт сервиса.
+- Админки пока нет; статические настройки меняются в `[runtime]` profile TOML и требуют рестарта сервиса. DB-backed dynamic policy — отдельный следующий этап.

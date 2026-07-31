@@ -28,6 +28,8 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
 
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
 
+const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct Config {
@@ -121,122 +123,115 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let llm_profiles_path = env_optional("LLM_PROFILES_PATH");
+        let llm_profiles_path = env_optional("LLM_PROFILES_PATH")
+            .or_else(|| Some(DEFAULT_LLM_PROFILES_PATH.to_string()));
         let llm_profiles = llm_profiles_path
             .as_deref()
             .map(LlmProfiles::from_path)
             .transpose()?;
+        let runtime = llm_profiles
+            .as_ref()
+            .map(|profiles| profiles.runtime.clone())
+            .unwrap_or_default();
 
         Ok(Self {
-            source_channel_id: env_i64("SOURCE_CHANNEL_ID", -1001575496091)?,
-            discussion_chat_id: env_i64("DISCUSSION_CHAT_ID", -1001932061163)?,
+            source_channel_id: runtime.source_channel_id,
+            discussion_chat_id: runtime.discussion_chat_id,
             chat_invite_url: env_or("CHAT_INVITE_URL", "https://t.me/+RxmPtw7Bs-IxNzEy"),
-            chat_invite_label: env_or("CHAT_INVITE_LABEL", "Присоединяйтесь к чату"),
-            post_signature_marker: env_or("POST_SIGNATURE_MARKER", "Не теряем связь"),
+            chat_invite_label: runtime.chat_invite_label,
+            post_signature_marker: runtime.post_signature_marker,
             llm_profiles_path,
             llm_profiles,
-            llm_temperature: env_f32("LLM_TEMPERATURE", 0.45)?,
-            llm_max_tokens: env_u32("LLM_MAX_TOKENS", 180)?,
+            llm_temperature: runtime.llm_temperature,
+            llm_max_tokens: runtime.llm_max_tokens,
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
-            memory_llm_temperature: env_f32("MEMORY_LLM_TEMPERATURE", 0.2)?,
-            memory_llm_max_tokens: env_u32("MEMORY_LLM_MAX_TOKENS", 220)?,
-            rag_enabled: env_bool("RAG_ENABLED", false)?,
-            rag_embedding_url: env_or("RAG_EMBEDDING_URL", "http://127.0.0.1:8788"),
-            rag_embedding_model: env_or("RAG_EMBEDDING_MODEL", "cointegrated/rubert-tiny2"),
-            rag_embedding_timeout_sec: env_u64("RAG_EMBEDDING_TIMEOUT_SEC", 10)?,
-            rag_top_k: env_usize("RAG_TOP_K", 6)?,
-            rag_min_similarity: env_f32("RAG_MIN_SIMILARITY", 0.55)?,
-            rag_temporal_half_life_days: env_f32("RAG_TEMPORAL_HALF_LIFE_DAYS", 180.0)?,
-            chat_retrieval_embeddings_enabled: env_bool(
-                "CHAT_RETRIEVAL_EMBEDDINGS_ENABLED",
-                false,
-            )?,
-            chat_retrieval_embedding_batch_size: env_usize(
-                "CHAT_RETRIEVAL_EMBEDDING_BATCH_SIZE",
-                16,
-            )?,
-            chat_retrieval_embedding_poll_sec: env_u64("CHAT_RETRIEVAL_EMBEDDING_POLL_SEC", 5)?,
-            chat_retrieval_shadow_enabled: env_bool("CHAT_RETRIEVAL_SHADOW_ENABLED", false)?,
-            chat_retrieval_evidence_enabled: env_bool("CHAT_RETRIEVAL_EVIDENCE_ENABLED", false)?,
-            chat_retrieval_evidence_min_score: env_f64("CHAT_RETRIEVAL_EVIDENCE_MIN_SCORE", 2.0)?,
-            chat_retrieval_window_days: env_i64("CHAT_RETRIEVAL_WINDOW_DAYS", 30)?,
-            chat_retrieval_half_life_days: env_f64("CHAT_RETRIEVAL_HALF_LIFE_DAYS", 7.0)?,
-            search_enabled: env_bool("SEARCH_ENABLED", false)?,
-            search_extract_temperature: env_f32("SEARCH_EXTRACT_TEMPERATURE", 0.1)?,
-            search_extract_max_tokens: env_u32("SEARCH_EXTRACT_MAX_TOKENS", 900)?,
-            search_mcp_command: env_optional("SEARCH_MCP_COMMAND"),
-            search_mcp_args: env_args("SEARCH_MCP_ARGS"),
-            search_mcp_env: env_list_csv("SEARCH_MCP_ENV"),
-            search_mcp_timeout_sec: env_u64("SEARCH_MCP_TIMEOUT_SEC", 8)?,
-            search_query_timeout_sec: env_u64("SEARCH_QUERY_TIMEOUT_SEC", 20)?,
+            memory_llm_temperature: runtime.memory_llm_temperature,
+            memory_llm_max_tokens: runtime.memory_llm_max_tokens,
+            rag_enabled: runtime.rag_enabled,
+            rag_embedding_url: runtime.rag_embedding_url,
+            rag_embedding_model: runtime.rag_embedding_model,
+            rag_embedding_timeout_sec: runtime.rag_embedding_timeout_sec,
+            rag_top_k: runtime.rag_top_k,
+            rag_min_similarity: runtime.rag_min_similarity,
+            rag_temporal_half_life_days: runtime.rag_temporal_half_life_days,
+            chat_retrieval_embeddings_enabled: runtime.chat_retrieval_embeddings_enabled,
+            chat_retrieval_embedding_batch_size: runtime.chat_retrieval_embedding_batch_size,
+            chat_retrieval_embedding_poll_sec: runtime.chat_retrieval_embedding_poll_sec,
+            chat_retrieval_shadow_enabled: runtime.chat_retrieval_shadow_enabled,
+            chat_retrieval_evidence_enabled: runtime.chat_retrieval_evidence_enabled,
+            chat_retrieval_evidence_min_score: runtime.chat_retrieval_evidence_min_score,
+            chat_retrieval_window_days: runtime.chat_retrieval_window_days,
+            chat_retrieval_half_life_days: runtime.chat_retrieval_half_life_days,
+            search_enabled: runtime.search_enabled,
+            search_extract_temperature: runtime.search_extract_temperature,
+            search_extract_max_tokens: runtime.search_extract_max_tokens,
+            search_mcp_command: runtime.search_mcp_command,
+            search_mcp_args: runtime.search_mcp_args,
+            search_mcp_env: runtime.search_mcp_env,
+            search_mcp_timeout_sec: runtime.search_mcp_timeout_sec,
+            search_query_timeout_sec: runtime.search_query_timeout_sec,
             search_mcp_tools: SearchMcpTools {
-                web: env_or("SEARCH_MCP_TOOL_WEB", "web_search"),
-                github: env_or("SEARCH_MCP_TOOL_GITHUB", "github_search"),
-                reddit: env_or("SEARCH_MCP_TOOL_REDDIT", "reddit_search"),
+                web: runtime.search_mcp_tool_web,
+                github: runtime.search_mcp_tool_github,
+                reddit: runtime.search_mcp_tool_reddit,
             },
-            search_mcp_fetch_tool: env_optional("SEARCH_MCP_TOOL_FETCH")
-                .or_else(|| Some("web_fetch_exa".to_string())),
-            search_fetch_top_n: env_usize("SEARCH_FETCH_TOP_N", 4)?,
-            search_fetch_max_chars: env_usize("SEARCH_FETCH_MAX_CHARS", 16_000)?,
-            comment_blocked_source_domains: env_list_csv_or(
-                "COMMENT_BLOCKED_SOURCE_DOMAINS",
-                DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS,
-            ),
-            comment_blocked_terms: env_list_csv("COMMENT_BLOCKED_TERMS"),
-            search_github_mcp_command: env_optional("SEARCH_GITHUB_MCP_COMMAND"),
-            search_github_mcp_args: env_args("SEARCH_GITHUB_MCP_ARGS"),
-            search_github_mcp_env: env_list_csv_or(
-                "SEARCH_GITHUB_MCP_ENV",
-                &["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"],
-            ),
-            search_github_mcp_tools: env_list_csv_or(
-                "SEARCH_GITHUB_MCP_TOOLS",
-                &["search_issues", "search_code"],
-            ),
+            search_mcp_fetch_tool: runtime.search_mcp_tool_fetch,
+            search_fetch_top_n: runtime.search_fetch_top_n,
+            search_fetch_max_chars: runtime.search_fetch_max_chars,
+            comment_blocked_source_domains: if runtime.comment_blocked_source_domains.is_empty() {
+                DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            } else {
+                runtime.comment_blocked_source_domains
+            },
+            comment_blocked_terms: runtime.comment_blocked_terms,
+            search_github_mcp_command: runtime.search_github_mcp_command,
+            search_github_mcp_args: runtime.search_github_mcp_args,
+            search_github_mcp_env: runtime.search_github_mcp_env,
+            search_github_mcp_tools: runtime.search_github_mcp_tools,
             groq_api_key: env_or("GROQ_API_KEY", ""),
-            new_user_audit_enabled: env_bool("NEW_USER_AUDIT_ENABLED", false)?,
-            new_user_audit_max_tokens: env_u32("NEW_USER_AUDIT_MAX_TOKENS", 900)?,
-            gemini_thinking_budget: env_u32("GEMINI_THINKING_BUDGET", 1024)?,
-            owner_telegram_id: env_optional_i64("OWNER_TELEGRAM_ID")?,
-            send_owner_preview: env_bool("SEND_OWNER_PREVIEW", true)?,
-            ask_enabled: env_bool("ASK_ENABLED", false)?,
-            ask_allow_chat_admins: env_bool("ASK_ALLOW_CHAT_ADMINS", true)?,
-            ask_private_user_ids: env_i64_list_csv("ASK_PRIVATE_USER_IDS")?,
-            ask_llm_temperature: env_f32("ASK_LLM_TEMPERATURE", 0.2)?,
-            ask_llm_max_tokens: env_u32("ASK_LLM_MAX_TOKENS", 1800)?,
-            ask_max_steps: env_usize("ASK_MAX_STEPS", 7)?,
-            ask_action_timeout_sec: env_u64("ASK_ACTION_TIMEOUT_SEC", 45)?,
-            ask_total_timeout_sec: env_u64("ASK_TOTAL_TIMEOUT_SEC", 180)?,
-            ask_max_concurrency: env_usize("ASK_MAX_CONCURRENCY", 1)?,
-            ask_db_mcp_command: env_optional("ASK_DB_MCP_COMMAND"),
-            ask_db_mcp_args: env_args("ASK_DB_MCP_ARGS"),
-            ask_db_mcp_env: env_list_csv_or(
-                "ASK_DB_MCP_ENV",
-                &["ASK_DATABASE_URL", "MCP_MANIFEST"],
-            ),
-            ask_db_mcp_timeout_sec: env_u64("ASK_DB_MCP_TIMEOUT_SEC", 8)?,
-            profile_refresh_concurrency: env_usize("PROFILE_REFRESH_CONCURRENCY", 4)?,
-            comment_custom_emoji_id: env_optional("COMMENT_CUSTOM_EMOJI_ID"),
-            first_comment_max_image_mb: env_u32("FIRST_COMMENT_MAX_IMAGE_MB", 10)?,
-            tech_custom_emoji_id: env_optional("TECH_CUSTOM_EMOJI_ID"),
-            amd_custom_emoji_id: env_optional("AMD_CUSTOM_EMOJI_ID"),
-            radeon_custom_emoji_id: env_optional("RADEON_CUSTOM_EMOJI_ID"),
-            ryzen_custom_emoji_id: env_optional("RYZEN_CUSTOM_EMOJI_ID"),
-            voice_transcription_enabled: env_bool("VOICE_TRANSCRIPTION_ENABLED", false)?,
-            voice_auto_transcribe: env_bool("VOICE_AUTO_TRANSCRIBE", false)?,
-            voice_max_duration_sec: env_u32("VOICE_MAX_DURATION_SEC", 600)?,
-            voice_max_file_mb: env_u32("VOICE_MAX_FILE_MB", 20)?,
-            voice_short_text_max_chars: env_usize("VOICE_SHORT_TEXT_MAX_CHARS", 400)?,
-            voice_language: env_or("VOICE_LANGUAGE", "ru"),
-            voice_asr_provider: env_or("VOICE_ASR_PROVIDER", "groq"),
-            voice_asr_model: env_or("VOICE_ASR_MODEL", "whisper-large-v3"),
-            voice_asr_temperature: env_f32("VOICE_ASR_TEMPERATURE", 0.0)?,
-            voice_cleanup_temperature: env_f32("VOICE_CLEANUP_TEMPERATURE", 0.2)?,
-            voice_cleanup_max_tokens: env_u32("VOICE_CLEANUP_MAX_TOKENS", 1800)?,
-            voice_render_expandable_chapters: env_bool("VOICE_RENDER_EXPANDABLE_CHAPTERS", true)?,
-            voice_send_full_file: env_bool("VOICE_SEND_FULL_FILE", true)?,
-            public_base_url: env_optional("PUBLIC_BASE_URL"),
-            static_files_dir: env_or("STATIC_FILES_DIR", "/opt/tg-ai-bot-teloxide/static"),
+            new_user_audit_enabled: runtime.new_user_audit_enabled,
+            new_user_audit_max_tokens: runtime.new_user_audit_max_tokens,
+            gemini_thinking_budget: runtime.gemini_thinking_budget,
+            owner_telegram_id: runtime.owner_telegram_id,
+            send_owner_preview: runtime.send_owner_preview,
+            ask_enabled: runtime.ask_enabled,
+            ask_allow_chat_admins: runtime.ask_allow_chat_admins,
+            ask_private_user_ids: runtime.ask_private_user_ids,
+            ask_llm_temperature: runtime.ask_llm_temperature,
+            ask_llm_max_tokens: runtime.ask_llm_max_tokens,
+            ask_max_steps: runtime.ask_max_steps,
+            ask_action_timeout_sec: runtime.ask_action_timeout_sec,
+            ask_total_timeout_sec: runtime.ask_total_timeout_sec,
+            ask_max_concurrency: runtime.ask_max_concurrency,
+            ask_db_mcp_command: runtime.ask_db_mcp_command,
+            ask_db_mcp_args: runtime.ask_db_mcp_args,
+            ask_db_mcp_env: runtime.ask_db_mcp_env,
+            ask_db_mcp_timeout_sec: runtime.ask_db_mcp_timeout_sec,
+            profile_refresh_concurrency: runtime.profile_refresh_concurrency,
+            comment_custom_emoji_id: runtime.comment_custom_emoji_id,
+            first_comment_max_image_mb: runtime.first_comment_max_image_mb,
+            tech_custom_emoji_id: runtime.tech_custom_emoji_id,
+            amd_custom_emoji_id: runtime.amd_custom_emoji_id,
+            radeon_custom_emoji_id: runtime.radeon_custom_emoji_id,
+            ryzen_custom_emoji_id: runtime.ryzen_custom_emoji_id,
+            voice_transcription_enabled: runtime.voice_transcription_enabled,
+            voice_auto_transcribe: runtime.voice_auto_transcribe,
+            voice_max_duration_sec: runtime.voice_max_duration_sec,
+            voice_max_file_mb: runtime.voice_max_file_mb,
+            voice_short_text_max_chars: runtime.voice_short_text_max_chars,
+            voice_language: runtime.voice_language,
+            voice_asr_provider: runtime.voice_asr_provider,
+            voice_asr_model: runtime.voice_asr_model,
+            voice_asr_temperature: runtime.voice_asr_temperature,
+            voice_cleanup_temperature: runtime.voice_cleanup_temperature,
+            voice_cleanup_max_tokens: runtime.voice_cleanup_max_tokens,
+            voice_render_expandable_chapters: runtime.voice_render_expandable_chapters,
+            voice_send_full_file: runtime.voice_send_full_file,
+            public_base_url: runtime.public_base_url,
+            static_files_dir: runtime.static_files_dir,
         })
     }
 
@@ -566,13 +561,7 @@ fn require_secret(errors: &mut Vec<String>, key: &str, value: &str, context: &st
     }
 }
 
-fn env_bool(key: &str, default: bool) -> anyhow::Result<bool> {
-    Ok(env_value(key)
-        .map(|value| parse_bool(key, &value))
-        .transpose()?
-        .unwrap_or(default))
-}
-
+#[cfg(test)]
 fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
     match value {
         "true" | "1" => Ok(true),
@@ -581,30 +570,7 @@ fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
     }
 }
 
-fn env_i64(key: &str, default: i64) -> anyhow::Result<i64> {
-    env_parse(key, default, "a signed 64-bit integer")
-}
-
-fn env_u32(key: &str, default: u32) -> anyhow::Result<u32> {
-    env_parse(key, default, "a non-negative 32-bit integer")
-}
-
-fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
-    env_parse(key, default, "a non-negative 64-bit integer")
-}
-
-fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {
-    env_parse(key, default, "a non-negative integer")
-}
-
-fn env_f32(key: &str, default: f32) -> anyhow::Result<f32> {
-    env_parse(key, default, "a number")
-}
-
-fn env_f64(key: &str, default: f64) -> anyhow::Result<f64> {
-    env_parse(key, default, "a number")
-}
-
+#[cfg(test)]
 fn env_parse<T>(key: &str, default: T, expected: &str) -> anyhow::Result<T>
 where
     T: std::str::FromStr,
@@ -615,6 +581,14 @@ where
     parse_env_value(key, &value, expected)
 }
 
+#[cfg(test)]
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+#[cfg(test)]
 fn parse_env_value<T>(key: &str, value: &str, expected: &str) -> anyhow::Result<T>
 where
     T: std::str::FromStr,
@@ -624,35 +598,8 @@ where
         .map_err(|_| anyhow::anyhow!("{key} must be {expected}"))
 }
 
-fn env_optional_i64(key: &str) -> anyhow::Result<Option<i64>> {
-    let Some(value) = env_optional(key) else {
-        return Ok(None);
-    };
-    value
-        .parse()
-        .map(Some)
-        .map_err(|_| anyhow::anyhow!("{key} must be a signed 64-bit integer"))
-}
-
-fn env_i64_list_csv(key: &str) -> anyhow::Result<Vec<i64>> {
-    env_list_csv(key)
-        .into_iter()
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| anyhow::anyhow!("{key} must contain only signed 64-bit integers"))
-        })
-        .collect()
-}
-
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn env_value(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
 }
 
 fn env_optional(key: &str) -> Option<String> {
@@ -660,32 +607,6 @@ fn env_optional(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn env_list_csv(name: &str) -> Vec<String> {
-    parse_csv_env(name).unwrap_or_default()
-}
-
-fn env_list_csv_or(name: &str, default: &[&str]) -> Vec<String> {
-    parse_csv_env(name).unwrap_or_else(|| default.iter().map(ToString::to_string).collect())
-}
-
-fn parse_csv_env(name: &str) -> Option<Vec<String>> {
-    std::env::var(name).ok().map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(ToString::to_string)
-            .collect()
-    })
-}
-
-fn env_args(name: &str) -> Vec<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.split_whitespace().map(ToString::to_string).collect())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -836,34 +757,33 @@ mod tests {
             Config::from_env().expect("configuration must parse with default MCP environment");
 
         assert_eq!(config.ask_db_mcp_env, ["ASK_DATABASE_URL", "MCP_MANIFEST"]);
+        assert_eq!(config.source_channel_id, -1001575496091);
+        assert_eq!(config.discussion_chat_id, -1001932061163);
+        assert_eq!(config.chat_invite_label, "чате");
+        assert_eq!(config.llm_temperature, 0.35);
+        assert_eq!(config.llm_max_tokens, 140);
+        assert_eq!(config.owner_telegram_id, Some(5939287960));
     }
 
     #[test]
-    fn new_user_audit_flag_defaults_to_disabled_and_rejects_invalid_values() {
-        let _env_lock = ENV_LOCK
-            .lock()
-            .expect("environment test lock must not be poisoned");
-        let _new_user_audit_enabled = EnvVarGuard::unset("NEW_USER_AUDIT_ENABLED");
-        let _new_user_audit_max_tokens = EnvVarGuard::unset("NEW_USER_AUDIT_MAX_TOKENS");
-
+    fn runtime_settings_defaults_to_disabled_audit_and_reject_invalid_values() {
         let config = Config::from_env().expect("configuration must parse without audit flag");
         assert!(!config.new_user_audit_enabled);
         assert_eq!(config.new_user_audit_max_tokens, 900);
 
-        unsafe { std::env::set_var("NEW_USER_AUDIT_ENABLED", "enabled") };
-        let error = match Config::from_env() {
-            Ok(_) => panic!("invalid audit flag must fail configuration parsing"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("NEW_USER_AUDIT_ENABLED"));
+        let error = toml::from_str::<crate::config_file::RuntimeSettings>(
+            "new_user_audit_enabled = 'enabled'",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid type"));
 
-        unsafe { std::env::set_var("NEW_USER_AUDIT_ENABLED", "false") };
-        unsafe { std::env::set_var("NEW_USER_AUDIT_MAX_TOKENS", "many") };
-        let error = match Config::from_env() {
-            Ok(_) => panic!("invalid audit token limit must fail configuration parsing"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("NEW_USER_AUDIT_MAX_TOKENS"));
+        let error = toml::from_str::<crate::config_file::RuntimeSettings>(
+            "new_user_audit_max_tokens = 'many'",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid type"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 Проект уже не выглядит как один большой `main.rs`. Сейчас это нормальный MVP-монолит с понятными контурами:
 
 - `main.rs` отвечает за init, migrations, dispatcher wiring и маленькие update handlers.
-- `config.rs` читает `.env` и держит runtime-настройки.
+- `config.rs` читает `[runtime]` из profile TOML, а секреты и чувствительные URL — из окружения.
 - `state.rs` прокидывает `PgPool` и `Config` в handlers.
 - `db/telegram.rs` сохраняет live Telegram updates, профили, реакции, member snapshots и activity counters.
 - `telegram/html.rs` отвечает за безопасную сборку Telegram HTML.

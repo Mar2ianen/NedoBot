@@ -1,4 +1,5 @@
 pub mod config;
+pub(crate) mod config_file;
 pub mod db;
 pub mod features;
 pub mod http;

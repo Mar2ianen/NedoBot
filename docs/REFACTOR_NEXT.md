@@ -25,9 +25,10 @@ Unified audit, voice follow-up и миграция на fork `teloxide 0.18` з�
 
 Voice pipeline включается только при двух флагах:
 
-```env
-VOICE_TRANSCRIPTION_ENABLED=true
-VOICE_AUTO_TRANSCRIBE=true
+```toml
+[runtime]
+voice_transcription_enabled = true
+voice_auto_transcribe = true
 ```
 
 Фильтры в `maybe_transcribe_voice`:
@@ -41,7 +42,7 @@ VOICE_AUTO_TRANSCRIBE=true
 
 Короткие расшифровки:
 
-- если итоговый clean text `<= VOICE_SHORT_TEXT_MAX_CHARS`, renderer отправляет только текст;
+- если итоговый clean text `<= runtime.voice_short_text_max_chars`, renderer отправляет только текст;
 - без заголовка;
 - без глав;
 - без timestamp;
@@ -50,9 +51,9 @@ VOICE_AUTO_TRANSCRIBE=true
 Длинные расшифровки:
 
 - если cleanup вернул главы и текст длиннее short limit, renderer собирает `Расшифровка голосового` + главы;
-- тело главы идёт в `<blockquote expandable>`, если `VOICE_RENDER_EXPANDABLE_CHAPTERS=true`;
+- тело главы идёт в `<blockquote expandable>`, если `runtime.voice_render_expandable_chapters=true`;
 - если HTML влезает в `SAFE_TEXT_LIMIT`, отправляется одним сообщением;
-- если не влезает, отправляется preview и полный `voice-transcript.txt`, если `VOICE_SEND_FULL_FILE=true`.
+- если не влезает, отправляется preview и полный `voice-transcript.txt`, если `runtime.voice_send_full_file=true`.
 
 Fallback:
 
@@ -65,8 +66,8 @@ Fallback:
 
 Минимальный smoke в живом чате:
 
-1. `VOICE_TRANSCRIPTION_ENABLED=true`, `VOICE_AUTO_TRANSCRIBE=true`.
-2. `VOICE_ASR_PROVIDER=groq`, `VOICE_ASR_MODEL=whisper-large-v3-turbo`.
+1. `runtime.voice_transcription_enabled=true`, `runtime.voice_auto_transcribe=true`.
+2. `runtime.voice_asr_provider=groq`, `runtime.voice_asr_model=whisper-large-v3-turbo`.
 3. `GROQ_API_KEY` заполнен.
 4. Отправить короткое voice до 10 секунд.
 5. Проверить, что ответ plain text без заголовка и timestamp.
@@ -105,7 +106,7 @@ limit 20;
 
 Для recoverable download/ASR/cleanup failures job получает безопасный error kind (`download_failed`, `asr_failed`, `cleanup_failed`), а пользователь — короткий ответ без деталей Telegram, Groq, response body или внутреннего stack trace. Пустой ASR transcript получает отдельный понятный ответ.
 
-`/transcribe` работает reply-командой для `voice`, `audio` и `video_note`. Она доступна при `VOICE_TRANSCRIPTION_ENABLED=true`, даже когда `VOICE_AUTO_TRANSCRIBE=false`; свободный аргумент с ID сообщения не поддерживается. Повторный вызов не создаёт второй job благодаря существующему dedup по `(chat_id, message_id)`.
+`/transcribe` работает reply-командой для `voice`, `audio` и `video_note`. Она доступна при `runtime.voice_transcription_enabled=true`, даже когда `runtime.voice_auto_transcribe=false`; свободный аргумент с ID сообщения не поддерживается. Повторный вызов не создаёт второй job благодаря существующему dedup по `(chat_id, message_id)`.
 
 ### 4. `video_note` без `ffmpeg` — выполнено
 
@@ -123,7 +124,7 @@ Groq ASR принимает MP4 напрямую, поэтому кружок с
 
 ## Остаточные риски
 
-- `VOICE_ASR_PROVIDER` сейчас фактически поддерживает только `groq`; unknown provider падает ошибкой.
+- `runtime.voice_asr_provider` сейчас фактически поддерживает только `groq`; unknown provider падает ошибкой.
 - provider/model voice cleanup задаются в `voice_cleanup` profile route; отдельного env-router больше нет.
 - Для `audio` Telegram metadata обычно есть, но если duration/file_size внезапно отсутствуют, файл может дойти до API и упасть там.
 - `render_mode=file` парсится как enum value, но renderer не имеет отдельной ветки для file-only режима; сейчас это не проблема, потому что prompt просит только `short | chapters`.
