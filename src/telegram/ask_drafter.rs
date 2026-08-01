@@ -3,7 +3,7 @@ use teloxide::{
     adaptors::DefaultParseMode,
     drafter::{
         CleanupFailure, DraftId, DrafterBackend, DrafterCapabilities, DrafterErrorClass,
-        DrafterOperation, DrafterRateLimitKey, NativeRichBackend, PreviewAck,
+        DrafterOperation, DrafterRateLimitKey, EditAbortPolicy, NativeRichBackend, PreviewAck,
         RichEditInPlaceBackend,
     },
     prelude::{Bot, ChatId, UserId},
@@ -37,7 +37,8 @@ impl AskDrafterBackend {
         } else {
             Self::Edit(Box::new(
                 RichEditInPlaceBackend::new(bot.inner().clone(), chat_id)
-                    .reply_parameters(reply_parameters),
+                    .reply_parameters(reply_parameters)
+                    .abort_policy(EditAbortPolicy::DeletePreviewBestEffort),
             ))
         }
     }

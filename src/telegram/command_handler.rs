@@ -2,7 +2,7 @@ use teloxide::{
     drafter::{DraftConfig, Drafter},
     prelude::*,
     types::{
-        InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
+        InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
         InputRichBlockThinking, InputRichMessage, ReplyParameters, RichText,
     },
     utils::command::BotCommands,
@@ -27,6 +27,7 @@ use crate::state::AppState;
 use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
+use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
 
 pub async fn handle_command(
@@ -313,35 +314,59 @@ async fn handle_ask_command(
     drop(permit);
     match answer {
         Ok(answer) => {
-            let final_payload = match input_rich_markdown(answer.markdown) {
+            let markdown = answer.markdown;
+            let final_payload = match input_rich_markdown(markdown.clone()) {
                 Ok(payload) => payload,
                 Err(err) => {
                     if let Err(cleanup_err) = drafter.abort().await {
                         tracing::debug!(%cleanup_err, "failed to clean up invalid /ask preview");
                     }
-                    return Err(err);
+                    tracing::warn!(%err, "rich /ask answer is not deliverable; falling back");
+                    return send_ask_fallback(bot, msg.chat.id, &markdown).await;
                 }
             };
             match drafter.finish(final_payload).await {
                 Ok(_) => Ok(()),
                 Err(err) => {
-                    tracing::error!(%err, "failed to deliver final /ask answer");
-                    Err(teloxide::RequestError::Io(
-                        std::io::Error::other("failed to deliver final ask answer").into(),
-                    ))
+                    tracing::warn!(%err, "failed to deliver final rich /ask answer; falling back");
+                    send_ask_fallback(bot, msg.chat.id, &markdown).await
                 }
             }
         }
         Err(err) => {
-            if let Err(cleanup_err) = drafter.abort().await {
-                tracing::debug!(%cleanup_err, "failed to clean up /ask progress preview");
-            }
             tracing::warn!(%err, error_kind = err.kind.as_str(), "ask assistant failed");
-            send_html(bot, msg.chat.id, ask_failure_message(err.kind))
+            let failure_message = ask_failure_message(err.kind);
+            match drafter
+                .finish(InputRichMessage::markdown(failure_message))
                 .await
-                .map(|_| ())
+            {
+                Ok(_) => Ok(()),
+                Err(finish_err) => {
+                    tracing::warn!(%finish_err, "failed to deliver rich /ask failure; falling back");
+                    send_ask_fallback(bot, msg.chat.id, failure_message).await
+                }
+            }
         }
     }
+}
+
+async fn send_ask_fallback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    markdown: &str,
+) -> ResponseResult<()> {
+    if markdown.chars().count() <= TELEGRAM_TEXT_LIMIT {
+        return send_html(bot, chat_id, escape_html(markdown))
+            .await
+            .map(|_| ());
+    }
+
+    bot.send_document(
+        chat_id,
+        InputFile::memory(markdown.as_bytes().to_vec()).file_name("ask-answer.md"),
+    )
+    .await
+    .map(|_| ())
 }
 
 fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<String> {
