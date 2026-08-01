@@ -136,7 +136,7 @@
 | `/memory` | Показывает последние атомарные карточки истории и статус их обработки. |
 | `/transcribe` | Reply на voice, audio или кружок: запускает расшифровку. Работает при включённом voice-контуре, даже если автоматическая расшифровка выключена. |
 | `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет статус поиска, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Доступен всем участникам основного чата; в личке — только private allowlist. |
-| `/drafter_smoke` | Временный dev-only smoke test Drafter: native rich/thinking в личке и status/edit backend с rich final в основном чате; проверяет coalescing, flush, segment rotation, accumulator и abort. |
+| `/drafter_smoke` | Временный dev-only smoke test Drafter: native rich/thinking в личке и один rich message с edit-in-place в основном чате; проверяет coalescing, flush и финальное редактирование. |
 | `/stats_day [-r\|-p]` | Статистика за текущий день чата, где день начинается в 05:00 по Москве. |
 | `/stats_week [-r\|-p]` | Статистика за текущую неделю с понедельника 05:00 по Москве. |
 | `/stats_month [-r\|-p]` | Статистика за текущий месяц с 1 числа 05:00 по Москве. |

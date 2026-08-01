@@ -5,7 +5,7 @@ use teloxide::{
     adaptors::DefaultParseMode,
     drafter::{
         DraftAccumulator, DraftConfig, Drafter, DrafterMetricsCollector, NativeRichBackend,
-        StatusThenRichBackend,
+        RichEditInPlaceBackend,
     },
     prelude::{Bot, Message, UserId},
     types::{
@@ -45,35 +45,13 @@ impl DraftAccumulator for SmokeAccumulator {
     }
 }
 
-#[derive(Default)]
-struct StatusAccumulator {
-    text: String,
-}
-
-impl DraftAccumulator for StatusAccumulator {
-    type Update = String;
-    type Preview = String;
-
-    fn apply(&mut self, update: Self::Update) {
-        self.text.push_str(&update);
-    }
-
-    fn snapshot(&self) -> Option<Self::Preview> {
-        (!self.text.is_empty()).then(|| format!("Accumulator status: {}", self.text))
-    }
-
-    fn reset_segment(&mut self) {
-        self.text.clear();
-    }
-}
-
 /// Runs the live Drafter smoke test in a private or configured discussion chat.
 ///
 /// The command is intentionally available only from debug builds and the
 /// configured private allowlist. Private chats use Telegram-native rich
-/// drafts; the discussion chat uses the status-message backend. Both modes
-/// leave successful final messages in the chat so Telegram rendering can be
-/// inspected manually.
+/// drafts; the discussion chat edits one rich message in place. The private
+/// path exercises the full lifecycle, while the chat path stays deliberately
+/// compact so the smoke command does not flood the conversation.
 pub async fn run(bot: &DefaultParseMode<Bot>, msg: &Message, state: &AppState) -> Result<String> {
     let Some(user) = msg.from.as_ref() else {
         bail!("drafter smoke requires a user sender");
@@ -95,24 +73,15 @@ pub async fn run(bot: &DefaultParseMode<Bot>, msg: &Message, state: &AppState) -
     }
 
     let config = smoke_config();
-    let (snapshot_metrics, accumulator_metrics) = if is_private {
+    if is_private {
         let snapshot_metrics = run_snapshot_lifecycle(bot, msg, state, &config).await?;
         let accumulator_metrics = run_accumulator_lifecycle(bot, msg, state, &config).await?;
         run_abort_lifecycle(bot, msg, state, &config).await?;
-        (snapshot_metrics, accumulator_metrics)
+        Ok(format_metrics(snapshot_metrics, accumulator_metrics))
     } else {
-        let snapshot_metrics = run_status_snapshot_lifecycle(bot, msg, state, &config).await?;
-        let accumulator_metrics =
-            run_status_accumulator_lifecycle(bot, msg, state, &config).await?;
-        run_status_abort_lifecycle(bot, msg, state, &config).await?;
-        (snapshot_metrics, accumulator_metrics)
-    };
-
-    Ok(format_metrics(
-        snapshot_metrics,
-        accumulator_metrics,
-        is_private,
-    ))
+        let metrics = run_edit_in_place_lifecycle(bot, msg, state, &config).await?;
+        Ok(format_edit_metrics(metrics))
+    }
 }
 
 async fn run_snapshot_lifecycle(
@@ -257,153 +226,53 @@ async fn run_abort_lifecycle(
     Ok(())
 }
 
-async fn run_status_snapshot_lifecycle(
+async fn run_edit_in_place_lifecycle(
     bot: &DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
     config: &DraftConfig,
 ) -> Result<DrafterMetricsCollector> {
     let metrics = DrafterMetricsCollector::default();
-    let backend = status_backend(bot, msg);
-    let (mut drafter, sink) = Drafter::snapshots_with_observer(
+    let backend = edit_backend(bot, msg);
+    let (drafter, sink) = Drafter::snapshots_with_observer(
         backend,
         state.drafter_limiter.clone(),
         config.clone(),
         std::sync::Arc::new(metrics.clone()),
     )
-    .context("failed to create status snapshot smoke drafter")?;
+    .context("failed to create rich edit smoke drafter")?;
 
-    sink.update("status revision 1".to_owned())
-        .context("failed to queue first status snapshot")?;
-    sink.update("status revision 2 (latest wins)".to_owned())
-        .context("failed to queue second status snapshot")?;
-    drafter
-        .flush()
-        .await
-        .context("status snapshot flush failed")?;
+    sink.update(edit_preview("rich preview revision 1"))
+        .context("failed to queue first rich preview")?;
+    sink.update(edit_preview("rich preview revision 2 (latest wins)"))
+        .context("failed to queue second rich preview")?;
+    drafter.flush().await.context("rich preview flush failed")?;
 
     tokio::time::sleep(config.min_update_interval + Duration::from_millis(100)).await;
-    sink.update("status revision 3 (edited in place)".to_owned())
-        .context("failed to queue edited status snapshot")?;
+    sink.update(edit_preview("rich preview edited in place"))
+        .context("failed to queue edited rich preview")?;
     drafter
         .flush()
         .await
-        .context("edited status snapshot flush failed")?;
-
-    drafter
-        .commit_segment(rich_final(
-            "status segment 1 committed",
-            "the temporary status was replaced by a permanent rich message",
-        ))
-        .await
-        .context("status segment commit failed")?;
-
-    sink.update("status segment 2".to_owned())
-        .context("failed to queue second status segment")?;
-    drafter
-        .flush()
-        .await
-        .context("second status segment flush failed")?;
+        .context("edited rich preview flush failed")?;
 
     let preview_metrics = metrics.snapshot();
     drafter
         .finish(rich_final(
-            "status lifecycle complete",
+            "one rich message complete",
             &format!(
-                "previews={} segments={}",
-                preview_metrics.sent_previews, preview_metrics.segment_count
+                "the same message was sent and edited in place; previews={} refreshes={}",
+                preview_metrics.sent_previews, preview_metrics.refresh_requests
             ),
         ))
         .await
-        .context("status finish failed")?;
+        .context("rich edit finish failed")?;
 
     Ok(metrics)
 }
 
-async fn run_status_accumulator_lifecycle(
-    bot: &DefaultParseMode<Bot>,
-    msg: &Message,
-    state: &AppState,
-    config: &DraftConfig,
-) -> Result<DrafterMetricsCollector> {
-    let metrics = DrafterMetricsCollector::default();
-    let backend = status_backend(bot, msg);
-    let (mut drafter, sink) = Drafter::accumulating_with_observer(
-        StatusAccumulator::default(),
-        backend,
-        state.drafter_limiter.clone(),
-        config.clone(),
-        std::sync::Arc::new(metrics.clone()),
-    )
-    .context("failed to create status accumulator smoke drafter")?;
-
-    sink.push("status accumulator segment 1: ".to_owned())
-        .context("failed to push first status accumulator chunk")?;
-    sink.push("old text must not leak".to_owned())
-        .context("failed to push second status accumulator chunk")?;
-    drafter
-        .flush()
-        .await
-        .context("status accumulator flush failed")?;
-
-    drafter
-        .commit_segment(rich_final(
-            "status accumulator segment 1 committed",
-            "the next status preview must start from an empty accumulator",
-        ))
-        .await
-        .context("status accumulator segment commit failed")?;
-
-    sink.push("status accumulator segment 2 only".to_owned())
-        .context("failed to push new status accumulator segment")?;
-    drafter
-        .flush()
-        .await
-        .context("new status accumulator flush failed")?;
-
-    let preview_metrics = metrics.snapshot();
-    drafter
-        .finish(rich_final(
-            "status accumulator lifecycle complete",
-            &format!(
-                "previews={} segments={}",
-                preview_metrics.sent_previews, preview_metrics.segment_count
-            ),
-        ))
-        .await
-        .context("status accumulator finish failed")?;
-
-    Ok(metrics)
-}
-
-async fn run_status_abort_lifecycle(
-    bot: &DefaultParseMode<Bot>,
-    msg: &Message,
-    state: &AppState,
-    config: &DraftConfig,
-) -> Result<()> {
-    let backend = status_backend(bot, msg);
-    let (drafter, sink) =
-        Drafter::snapshots(backend, state.drafter_limiter.clone(), config.clone())
-            .context("failed to create status abort smoke drafter")?;
-    sink.update("this temporary status should be deleted by abort".to_owned())
-        .context("failed to queue status abort preview")?;
-    drafter
-        .flush()
-        .await
-        .context("status abort preview flush failed")?;
-    drafter
-        .abort()
-        .await
-        .context("status abort lifecycle failed")?;
-    Ok(())
-}
-
-fn status_backend(
-    bot: &DefaultParseMode<Bot>,
-    msg: &Message,
-) -> StatusThenRichBackend<DefaultParseMode<Bot>> {
-    StatusThenRichBackend::new(bot.clone(), msg.chat.id)
+fn edit_backend(bot: &DefaultParseMode<Bot>, msg: &Message) -> RichEditInPlaceBackend {
+    RichEditInPlaceBackend::new(bot.inner().clone(), msg.chat.id)
         .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
 }
 
@@ -465,6 +334,39 @@ fn rich_preview(thinking: &str, text: &str) -> InputRichMessage {
     ])
 }
 
+fn edit_preview(text: &str) -> InputRichMessage {
+    InputRichMessage::blocks([
+        InputRichBlock::Heading(InputRichBlockSectionHeading {
+            text: RichText::from("Drafter smoke rich preview"),
+            size: 2,
+        }),
+        InputRichBlock::Paragraph(InputRichBlockParagraph { text: text.into() }),
+        InputRichBlock::Pre(InputRichBlockPreformatted {
+            text: "send once / edit in place / rich final".into(),
+            language: Some("text".to_owned()),
+        }),
+        InputRichBlock::List(InputRichBlockList {
+            items: vec![InputRichBlockListItem {
+                blocks: vec![InputRichBlock::Paragraph(InputRichBlockParagraph {
+                    text: "rich blocks are active".into(),
+                })],
+                has_checkbox: Some(true),
+                is_checked: Some(true),
+                value: Some(1),
+                type_field: Some("1".to_owned()),
+            }],
+        }),
+        InputRichBlock::Divider(InputRichBlockDivider {}),
+        InputRichBlock::Details(InputRichBlockDetails {
+            summary: "nested rich block".into(),
+            blocks: vec![InputRichBlock::Paragraph(InputRichBlockParagraph {
+                text: "this preview is valid for send and edit".into(),
+            })],
+            is_open: Some(true),
+        }),
+    ])
+}
+
 fn rich_final(title: &str, body: &str) -> InputRichMessage {
     InputRichMessage::blocks([
         InputRichBlock::Heading(InputRichBlockSectionHeading {
@@ -492,22 +394,11 @@ fn accumulator_preview(text: &str) -> InputRichMessage {
 fn format_metrics(
     snapshot: DrafterMetricsCollector,
     accumulator: DrafterMetricsCollector,
-    is_private: bool,
 ) -> String {
     let snapshot = snapshot.snapshot();
     let accumulator = accumulator.snapshot();
-    let mode = if is_private {
-        "native rich draft в личке"
-    } else {
-        "status/edit rich backend в обычном чате"
-    };
-    let checks = if is_private {
-        "native rich draft, thinking block, rich blocks, latest-wins, flush, watchdog refresh, segment rotation, accumulator reset, finish и abort"
-    } else {
-        "status send/edit, latest-wins, flush, segment rotation, accumulator reset, rich final, cleanup и abort"
-    };
     format!(
-        "✅ Drafter smoke passed ({mode})\n\nSnapshot: previews={}, refreshes={}, segments={}, updates={}\nAccumulator: previews={}, segments={}, updates={}\nAbort: ok\n\nПроверены {checks}.",
+        "✅ Drafter smoke passed (native rich draft в личке)\n\nSnapshot: previews={}, refreshes={}, segments={}, updates={}\nAccumulator: previews={}, segments={}, updates={}\nAbort: ok\n\nПроверены native rich draft, thinking block, rich blocks, latest-wins, flush, watchdog refresh, segment rotation, accumulator reset, finish и abort.",
         snapshot.sent_previews,
         snapshot.refresh_requests,
         snapshot.segment_count,
@@ -515,5 +406,13 @@ fn format_metrics(
         accumulator.sent_previews,
         accumulator.segment_count,
         accumulator.received_updates,
+    )
+}
+
+fn format_edit_metrics(metrics: DrafterMetricsCollector) -> String {
+    let metrics = metrics.snapshot();
+    format!(
+        "✅ Drafter smoke passed (one rich message в обычном чате)\n\nRich edit: previews={}, refreshes={}, updates={}\nFinal: то же сообщение превращено в permanent rich message.\n\nПроверены send rich once, latest-wins, flush, edit-in-place, rich blocks и final edit.",
+        metrics.sent_previews, metrics.refresh_requests, metrics.received_updates,
     )
 }
