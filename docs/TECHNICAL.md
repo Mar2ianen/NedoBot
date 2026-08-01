@@ -424,7 +424,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 `/userstats` принимает числовой Telegram ID, уже виденный ботом username или reply на сообщение пользователя. Без аргумента команда показывает отправителя. `UserStatsArgs` один раз нормализует command arguments: render-флаги `-r`/`--rich` и `-p`/`--plain` можно поставить до или после target, они не считаются частью username, а команда только с флагом сохраняет reply/sender fallback. Нормализованный target используется и для refresh профиля, и для построения отчёта. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
 
-`/drafter_smoke` доступна только debug-сборке и пользователю из `ask_private_user_ids`, строго в личном чате. Она оставляет успешные rich-финалы в чате для визуальной проверки; Thinking-блоки отправляются только в native draft и намеренно не попадают в финальные сообщения.
+`/drafter_smoke` доступна только debug-сборке и пользователю из `ask_private_user_ids`. В личке она проверяет native rich draft с Thinking-блоком; в `discussion_chat_id` — второй backend со временным status-сообщением, edit-in-place и постоянным rich final. Команда оставляет успешные финалы в чате для визуальной проверки; Thinking-блоки отправляются только в native draft и намеренно не попадают в финальные сообщения.
 
 ## Prompt
 
