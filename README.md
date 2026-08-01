@@ -174,7 +174,7 @@ certainty — без тел ответов инструментов и секр�
 
 Rust, teloxide, PostgreSQL, LLM/Vision/ASR, prompt-файлы, память, RAG, импорт Telegram export и деплой на VPS.
 
-README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode, импорт истории и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md). Контракт и приёмочные сценарии `/ask` собраны в [`docs/ASK_MVP_PLAN.md`](docs/ASK_MVP_PLAN.md). Активный инженерный план лежит в [`docs/REFACTOR_NEXT.md`](docs/REFACTOR_NEXT.md), а уже закрытый рефактор заархивирован в [`docs/REFACTOR_DONE.md`](docs/REFACTOR_DONE.md).
+README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode, импорт истории и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md). Пошаговый production runbook находится в [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). Контракт и приёмочные сценарии `/ask` собраны в [`docs/ASK_MVP_PLAN.md`](docs/ASK_MVP_PLAN.md). Активный инженерный план лежит в [`docs/REFACTOR_NEXT.md`](docs/REFACTOR_NEXT.md), а уже закрытый рефактор заархивирован в [`docs/REFACTOR_DONE.md`](docs/REFACTOR_DONE.md).
 
 ## Лицензия
 

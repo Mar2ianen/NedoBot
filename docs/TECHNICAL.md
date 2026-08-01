@@ -281,7 +281,7 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий deploy на `vps-153` включает миграцию на teloxide fork 0.18 и typed Telegram API methods. Immutable tag [`deploy-2026-07-31-teloxide-fork`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-teloxide-fork) фиксирует commit с фактически собранным и проверенным release binary. Предыдущий release `v0.12.0` отмечен [`deploy-2026-07-31-v0.12.0`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-v0.12.0), voice flow — [`deploy-2026-07-31-voice-flow`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-voice-flow), unified audit — [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit). Последующие commits разрабатываются в `dev` и не считаются deployed до отдельного merge/review.
+Текущий production release на `vps-153` фиксируется immutable tag [`deploy-2026-08-02-drafter-time-rendering`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-02-drafter-time-rendering) после успешной сборки и post-deploy smoke. В него входят merged `main`, shared Drafter, explicit time rendering, delivery certainty и production LLM profile. Предыдущие releases: [`deploy-2026-07-31-teloxide-fork`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-teloxide-fork), [`deploy-2026-07-31-v0.12.0`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-v0.12.0), [`deploy-2026-07-31-voice-flow`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-voice-flow) и [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit). Полный порядок dry-run, выкладки, проверки, rollback и фиксации tag описан в [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
 
 
 - код: `/opt/tg-ai-bot-teloxide`
@@ -330,11 +330,15 @@ podman exec -i tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot \
 
 Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; туда не передаются Telegram или LLM secrets и ему не нужен writable checkout. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
 
-Ручной redeploy из локальной папки:
+Ручной redeploy из локальной папки выполняется только после dry-run и проверки production profile; не использовать старую сокращённую команду без exclusions:
 
 ```bash
-rsync -az --delete --exclude target --exclude .git --exclude .env ./ vps-153:/opt/tg-ai-bot-teloxide/
-ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release && systemctl restart tg-ai-bot-teloxide && systemctl is-active tg-ai-bot-teloxide && systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
+rsync -azn --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' ./ vps-153:/opt/tg-ai-bot-teloxide/
+rsync -az --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' ./ vps-153:/opt/tg-ai-bot-teloxide/
+rsync -az config/llm_profiles.toml.production.example vps-153:/etc/tg-ai-bot/llm_profiles.toml
+ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release'
+ssh vps-153 'systemctl restart tg-ai-bot-teloxide && systemctl is-active tg-ai-bot-teloxide'
+ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 ```
 
 ## База
