@@ -4,7 +4,7 @@ use teloxide::{
     drafter::{
         CleanupFailure, DraftId, DrafterBackend, DrafterCapabilities, DrafterErrorClass,
         DrafterOperation, DrafterRateLimitKey, NativeRichBackend, PreviewAck,
-        StatusThenRichBackend,
+        RichEditInPlaceBackend,
     },
     prelude::{Bot, ChatId, UserId},
     types::{InputRichMessage, MessageId, ReplyParameters},
@@ -12,13 +12,13 @@ use teloxide::{
 
 /// Rich `/ask` delivery with a Telegram-native draft in private chats.
 ///
-/// Telegram does not support native drafts in group chats, so groups use a
-/// temporary status message that is edited in place and removed after the
-/// permanent answer is delivered. Keeping both modes behind one backend keeps
-/// the scheduler and the `/ask` lifecycle identical.
+/// Telegram does not support native drafts in group chats, so groups use one
+/// rich message that is sent once, edited in place, and turned into the final
+/// answer. Keeping both modes behind one backend keeps the scheduler and the
+/// `/ask` lifecycle identical.
 pub enum AskDrafterBackend {
     Native(Box<NativeRichBackend<DefaultParseMode<Bot>>>),
-    Status(Box<StatusThenRichBackend<DefaultParseMode<Bot>>>),
+    Edit(Box<RichEditInPlaceBackend>),
 }
 
 impl AskDrafterBackend {
@@ -35,8 +35,9 @@ impl AskDrafterBackend {
                 NativeRichBackend::new(bot, user_id).reply_parameters(reply_parameters),
             ))
         } else {
-            Self::Status(Box::new(
-                StatusThenRichBackend::new(bot, chat_id).reply_parameters(reply_parameters),
+            Self::Edit(Box::new(
+                RichEditInPlaceBackend::new(bot.inner().clone(), chat_id)
+                    .reply_parameters(reply_parameters),
             ))
         }
     }
@@ -52,35 +53,35 @@ impl DrafterBackend for AskDrafterBackend {
     fn capabilities(&self) -> DrafterCapabilities {
         match self {
             Self::Native(backend) => backend.capabilities(),
-            Self::Status(backend) => backend.capabilities(),
+            Self::Edit(backend) => backend.capabilities(),
         }
     }
 
     fn rate_limit_key(&self) -> DrafterRateLimitKey {
         match self {
             Self::Native(backend) => backend.rate_limit_key(),
-            Self::Status(backend) => backend.rate_limit_key(),
+            Self::Edit(backend) => backend.rate_limit_key(),
         }
     }
 
     fn draft_id(&self) -> Option<DraftId> {
         match self {
             Self::Native(backend) => backend.draft_id(),
-            Self::Status(backend) => backend.draft_id(),
+            Self::Edit(backend) => backend.draft_id(),
         }
     }
 
     fn preview_message_id(&self) -> Option<MessageId> {
         match self {
             Self::Native(backend) => backend.preview_message_id(),
-            Self::Status(backend) => backend.preview_message_id(),
+            Self::Edit(backend) => backend.preview_message_id(),
         }
     }
 
     async fn update(&mut self, preview: Self::Preview) -> Result<PreviewAck, Self::Error> {
         match self {
             Self::Native(backend) => backend.update(preview).await,
-            Self::Status(backend) => backend.update(status_preview_text(&preview)).await,
+            Self::Edit(backend) => backend.update(preview).await,
         }
     }
 
@@ -90,21 +91,21 @@ impl DrafterBackend for AskDrafterBackend {
     ) -> Result<Self::SegmentOutput, Self::Error> {
         match self {
             Self::Native(backend) => backend.commit_segment(final_payload).await,
-            Self::Status(backend) => backend.commit_segment(final_payload).await,
+            Self::Edit(backend) => backend.commit_segment(final_payload).await,
         }
     }
 
     async fn finish(&mut self, final_payload: &Self::Final) -> Result<Self::Output, Self::Error> {
         match self {
             Self::Native(backend) => backend.finish(final_payload).await,
-            Self::Status(backend) => backend.finish(final_payload).await,
+            Self::Edit(backend) => backend.finish(final_payload).await,
         }
     }
 
     async fn abort(&mut self) -> Result<(), Self::Error> {
         match self {
             Self::Native(backend) => backend.abort().await,
-            Self::Status(backend) => backend.abort().await,
+            Self::Edit(backend) => backend.abort().await,
         }
     }
 
@@ -115,22 +116,14 @@ impl DrafterBackend for AskDrafterBackend {
     ) -> DrafterErrorClass {
         match self {
             Self::Native(backend) => backend.classify_error(operation, error),
-            Self::Status(backend) => backend.classify_error(operation, error),
+            Self::Edit(backend) => backend.classify_error(operation, error),
         }
     }
 
     fn take_cleanup_failure(&mut self) -> Option<CleanupFailure<Self::Error>> {
         match self {
             Self::Native(backend) => backend.take_cleanup_failure(),
-            Self::Status(backend) => backend.take_cleanup_failure(),
+            Self::Edit(backend) => backend.take_cleanup_failure(),
         }
     }
-}
-
-fn status_preview_text(preview: &InputRichMessage) -> String {
-    preview
-        .markdown_ref()
-        .or_else(|| preview.html_ref())
-        .unwrap_or_default()
-        .to_owned()
 }
