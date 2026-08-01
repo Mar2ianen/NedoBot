@@ -19,8 +19,6 @@ pub enum Command {
     Transcribe,
     #[command(description = "спросить помощника по истории чата; /ask <вопрос>")]
     Ask(String),
-    #[command(description = "dev-only smoke test Drafter: native в личке, rich edit в чате")]
-    DrafterSmoke,
     #[command(description = "добавить общую заметку чата; /chat_note <текст>")]
     ChatNote(String),
     #[command(description = "добавить заметку о пользователе reply; /user_note <текст>")]

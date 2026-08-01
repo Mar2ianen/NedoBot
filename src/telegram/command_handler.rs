@@ -1,7 +1,10 @@
 use teloxide::{
     drafter::{DraftConfig, Drafter},
     prelude::*,
-    types::{InputRichMessage, ReplyParameters},
+    types::{
+        InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
+        InputRichBlockThinking, InputRichMessage, ReplyParameters, RichText,
+    },
     utils::command::BotCommands,
 };
 use tokio::sync::mpsc;
@@ -24,7 +27,6 @@ use crate::state::AppState;
 use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
-use crate::telegram::drafter_smoke::run as run_drafter_smoke;
 use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
 
 pub async fn handle_command(
@@ -96,44 +98,6 @@ pub async fn handle_command(
         }
         Command::Ask(question) => {
             handle_ask_command(&bot, &msg, &state, &question).await?;
-        }
-        Command::DrafterSmoke => {
-            if !cfg!(debug_assertions) {
-                return Ok(());
-            }
-            let Some(user) = msg.from.as_ref() else {
-                return Ok(());
-            };
-            if !state
-                .config
-                .ask_private_user_ids
-                .contains(&(user.id.0 as i64))
-            {
-                return Ok(());
-            }
-            if !msg.chat.is_private() && msg.chat.id.0 != config.discussion_chat_id {
-                send_html(
-                    &bot,
-                    msg.chat.id,
-                    "Drafter smoke доступен в личном чате dev-бота или в основном dev-чате.",
-                )
-                .await?;
-                return Ok(());
-            }
-            match run_drafter_smoke(&bot, &msg, &state).await {
-                Ok(report) => {
-                    send_html(&bot, msg.chat.id, escape_html(&report)).await?;
-                }
-                Err(err) => {
-                    tracing::error!(error = ?err, "drafter smoke test failed");
-                    send_html(
-                        &bot,
-                        msg.chat.id,
-                        "❌ Drafter smoke упал. Подробности записаны в dev-лог.",
-                    )
-                    .await?;
-                }
-            }
         }
         Command::ChatNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, None).await?;
@@ -271,6 +235,7 @@ async fn handle_ask_command(
         return Ok(());
     }
 
+    let use_native_draft = msg.chat.is_private();
     let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
         teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy").into())
     })?;
@@ -278,7 +243,7 @@ async fn handle_ask_command(
         bot.clone(),
         msg.chat.id,
         user.id,
-        msg.chat.is_private(),
+        use_native_draft,
         ReplyParameters::new(msg.id).allow_sending_without_reply(),
     );
     let (drafter, draft_sink) = Drafter::snapshots(
@@ -290,7 +255,10 @@ async fn handle_ask_command(
         tracing::error!(%err, "failed to initialize /ask drafter");
         teloxide::RequestError::Io(std::io::Error::other("failed to initialize ask drafter").into())
     })?;
-    if let Err(err) = draft_sink.update(ask_progress_preview(AskProgress::Preparing)) {
+    if let Err(err) = draft_sink.update(ask_progress_preview(
+        AskProgress::Preparing,
+        use_native_draft,
+    )) {
         tracing::debug!(%err, "failed to queue initial /ask progress preview");
     }
     if let Err(err) = drafter.flush().await {
@@ -330,8 +298,11 @@ async fn handle_ask_command(
             update = progress_rx.recv(), if progress_open => match update {
                 Some(update) if update != last_progress => {
                     last_progress = update;
-                    if let Err(err) = draft_sink.update(ask_progress_preview(update)) {
-                        tracing::debug!(%err, "failed to update ask progress message");
+                    if let Err(err) = draft_sink.update(ask_progress_preview(
+                        update,
+                        use_native_draft,
+                    )) {
+                        tracing::debug!(%err, "failed to update ask progress preview");
                     }
                 }
                 Some(_) => {}
@@ -435,8 +406,26 @@ fn ask_progress_message(progress: AskProgress) -> &'static str {
     }
 }
 
-fn ask_progress_preview(progress: AskProgress) -> InputRichMessage {
-    InputRichMessage::markdown(ask_progress_message(progress))
+fn ask_progress_preview(progress: AskProgress, use_native_draft: bool) -> InputRichMessage {
+    let message = ask_progress_message(progress);
+    if !use_native_draft {
+        return InputRichMessage::markdown(message);
+    }
+
+    InputRichMessage::blocks([
+        InputRichBlock::Heading(InputRichBlockSectionHeading {
+            text: RichText::from("NedoBot /ask"),
+            size: 2,
+        }),
+        InputRichBlock::Thinking(InputRichBlockThinking {
+            text: message.into(),
+        }),
+        InputRichBlock::Paragraph(InputRichBlockParagraph {
+            text: "Исследование продолжается; финальный ответ появится в этом draft."
+                .to_owned()
+                .into(),
+        }),
+    ])
 }
 
 fn requester_identity(user: &teloxide::types::User) -> String {
@@ -660,5 +649,22 @@ mod tests {
             status_period_from_args("месяц"),
             Some(StatsPeriod::Month)
         ));
+    }
+
+    #[test]
+    fn ask_progress_uses_thinking_only_for_native_drafts() {
+        let native = serde_json::to_value(ask_progress_preview(AskProgress::Preparing, true))
+            .expect("native progress should serialize");
+        let native_blocks = native["blocks"].as_array().expect("native blocks");
+        assert!(
+            native_blocks
+                .iter()
+                .any(|block| { block["type"].as_str() == Some("thinking") })
+        );
+
+        let edit = serde_json::to_value(ask_progress_preview(AskProgress::Preparing, false))
+            .expect("edit progress should serialize");
+        assert!(edit["markdown"].is_string());
+        assert!(edit["blocks"].is_null());
     }
 }
