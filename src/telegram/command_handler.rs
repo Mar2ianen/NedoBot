@@ -1,7 +1,7 @@
 use teloxide::{
-    drafter::{DraftConfig, Drafter, StatusThenRichBackend},
+    drafter::{DraftConfig, Drafter},
     prelude::*,
-    types::ReplyParameters,
+    types::{InputRichMessage, ReplyParameters},
     utils::command::BotCommands,
 };
 use tokio::sync::mpsc;
@@ -21,6 +21,7 @@ use crate::features::stats::report::{
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::features::voice::pipeline::transcribe_reply;
 use crate::state::AppState;
+use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
@@ -234,8 +235,13 @@ async fn handle_ask_command(
     let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
         teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy").into())
     })?;
-    let backend = StatusThenRichBackend::new(bot.clone(), msg.chat.id)
-        .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply());
+    let backend = AskDrafterBackend::new(
+        bot.clone(),
+        msg.chat.id,
+        user.id,
+        msg.chat.is_private(),
+        ReplyParameters::new(msg.id).allow_sending_without_reply(),
+    );
     let (drafter, draft_sink) = Drafter::snapshots(
         backend,
         state.drafter_limiter.clone(),
@@ -245,7 +251,7 @@ async fn handle_ask_command(
         tracing::error!(%err, "failed to initialize /ask drafter");
         teloxide::RequestError::Io(std::io::Error::other("failed to initialize ask drafter").into())
     })?;
-    if let Err(err) = draft_sink.update(ask_progress_message(AskProgress::Preparing).to_owned()) {
+    if let Err(err) = draft_sink.update(ask_progress_preview(AskProgress::Preparing)) {
         tracing::debug!(%err, "failed to queue initial /ask progress preview");
     }
     if let Err(err) = drafter.flush().await {
@@ -285,7 +291,7 @@ async fn handle_ask_command(
             update = progress_rx.recv(), if progress_open => match update {
                 Some(update) if update != last_progress => {
                     last_progress = update;
-                    if let Err(err) = draft_sink.update(ask_progress_message(update).to_owned()) {
+                    if let Err(err) = draft_sink.update(ask_progress_preview(update)) {
                         tracing::debug!(%err, "failed to update ask progress message");
                     }
                 }
@@ -388,6 +394,10 @@ fn ask_progress_message(progress: AskProgress) -> &'static str {
         AskProgress::CheckingNotes => "📝 Проверяю сохранённые заметки…",
         AskProgress::FormingAnswer => "✍️ Формирую ответ…",
     }
+}
+
+fn ask_progress_preview(progress: AskProgress) -> InputRichMessage {
+    InputRichMessage::markdown(ask_progress_message(progress))
 }
 
 fn requester_identity(user: &teloxide::types::User) -> String {
