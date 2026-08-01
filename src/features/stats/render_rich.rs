@@ -4,14 +4,23 @@ use crate::features::stats::types::{
 };
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
+use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
-pub fn chat_stats(data: &ChatStatsReportData, discussion_chat_id: i64) -> String {
+pub fn chat_stats(
+    data: &ChatStatsReportData,
+    discussion_chat_id: i64,
+    time: &TimeContext,
+) -> String {
     let summary = &data.summary;
+    let period_start = DateTimeToken::instant_in_unix(
+        time,
+        summary.start_at.timestamp(),
+        DateTimeFormat::DateTime,
+    )
+    .expect("Postgres timestamptz must fit into a Telegram timestamp")
+    .to_html();
     let summary_table = table_no_header(&[
-        vec![
-            "Период с".into(),
-            escape_html(&format!("{} МСК", summary.start_label)),
-        ],
+        vec!["Период с".into(), period_start],
         vec!["Сообщения".into(), bold_num(summary.messages)],
         vec![
             "Активные пользователи".into(),

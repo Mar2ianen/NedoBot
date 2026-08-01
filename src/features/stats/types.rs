@@ -33,7 +33,7 @@ impl ReportWindow {
 
 #[derive(Clone)]
 pub struct ChatStatsSummary {
-    pub start_label: String,
+    pub start_at: DateTime<Utc>,
     pub messages: i64,
     pub active_users: i64,
     pub replies: i64,

@@ -46,8 +46,8 @@ pub async fn send_rich_html(
     .await
 }
 
-pub fn input_rich_markdown(markdown: impl Into<String>) -> ResponseResult<InputRichMessage> {
-    Ok(InputRichMessage::markdown(normalize_rich_text(markdown)?))
+pub fn validate_rich_markdown(markdown: &str) -> ResponseResult<()> {
+    normalize_rich_text(markdown.to_owned()).map(|_| ())
 }
 
 pub async fn send_rich_message(
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn rich_markdown_input_keeps_telegram_limit() {
-        assert!(input_rich_markdown("## Ответ").is_ok());
-        assert!(input_rich_markdown("x".repeat(TELEGRAM_RICH_TEXT_LIMIT + 1)).is_err());
+        assert!(validate_rich_markdown("## Ответ").is_ok());
+        assert!(validate_rich_markdown(&"x".repeat(TELEGRAM_RICH_TEXT_LIMIT + 1)).is_err());
     }
 }

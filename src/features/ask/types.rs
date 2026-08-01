@@ -1,4 +1,5 @@
 use serde_json::Value;
+use teloxide::utils::time::RenderedMessage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskProgress {
@@ -25,6 +26,7 @@ pub struct AskCommandInput {
 
 pub struct AskAnswer {
     pub markdown: String,
+    pub rendered: RenderedMessage,
     pub ask_run_id: Option<i64>,
 }
 
