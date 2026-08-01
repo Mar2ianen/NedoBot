@@ -1,5 +1,6 @@
 use sqlx::PgPool;
 use std::sync::Arc;
+use teloxide::drafter::InProcessRateLimiter;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
@@ -9,6 +10,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Config,
     pub ask_slots: Arc<Semaphore>,
+    pub drafter_limiter: InProcessRateLimiter,
 }
 
 impl AppState {
@@ -18,6 +20,7 @@ impl AppState {
             pool,
             config,
             ask_slots: Arc::new(Semaphore::new(ask_concurrency)),
+            drafter_limiter: InProcessRateLimiter::default(),
         }
     }
 }

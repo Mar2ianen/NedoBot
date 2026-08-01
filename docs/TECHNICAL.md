@@ -132,6 +132,8 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 
+Telegram lifecycle `/ask` использует shared Drafter: во время исследования редактируется временный status preview, а после успешного ответа отправляется отдельное rich-сообщение с reply на исходную команду. При ошибке агентского шага Drafter best-effort удаляет status; limiter общий для всех `/ask`-драфтеров процесса.
+
 ### Поиск фактов для первого комментария
 
 SEARCH-контур добавляет вспомогательный свежий контекст перед генерацией первого комментария:
