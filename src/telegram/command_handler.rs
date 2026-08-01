@@ -111,11 +111,11 @@ pub async fn handle_command(
             {
                 return Ok(());
             }
-            if !msg.chat.is_private() {
+            if !msg.chat.is_private() && msg.chat.id.0 != config.discussion_chat_id {
                 send_html(
                     &bot,
                     msg.chat.id,
-                    "Native Drafter smoke нужно запускать в личном чате dev-бота: Telegram не поддерживает native draft в группах.",
+                    "Drafter smoke доступен в личном чате dev-бота или в основном dev-чате.",
                 )
                 .await?;
                 return Ok(());
