@@ -24,6 +24,7 @@ use crate::state::AppState;
 use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
+use crate::telegram::drafter_smoke::run as run_drafter_smoke;
 use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
 
 pub async fn handle_command(
@@ -95,6 +96,35 @@ pub async fn handle_command(
         }
         Command::Ask(question) => {
             handle_ask_command(&bot, &msg, &state, &question).await?;
+        }
+        Command::DrafterSmoke => {
+            if !cfg!(debug_assertions) {
+                return Ok(());
+            }
+            let Some(user) = msg.from.as_ref() else {
+                return Ok(());
+            };
+            if !state
+                .config
+                .ask_private_user_ids
+                .contains(&(user.id.0 as i64))
+            {
+                return Ok(());
+            }
+            match run_drafter_smoke(&bot, &msg, &state).await {
+                Ok(report) => {
+                    send_html(&bot, msg.chat.id, escape_html(&report)).await?;
+                }
+                Err(err) => {
+                    tracing::error!(%err, "drafter smoke test failed");
+                    send_html(
+                        &bot,
+                        msg.chat.id,
+                        "❌ Drafter smoke упал. Подробности записаны в dev-лог.",
+                    )
+                    .await?;
+                }
+            }
         }
         Command::ChatNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, None).await?;
