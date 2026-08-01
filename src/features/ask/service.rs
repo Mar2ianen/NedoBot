@@ -1,23 +1,36 @@
+use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use sqlx::PgPool;
+use teloxide::utils::time::{LLM_DIALECT_VERSION, LlmMarkdownFormatter, TIME_RENDERER_VERSION};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
 use crate::features::ask::agent::{self, AskRequest};
-use crate::features::ask::repo::{self, CreateAskRunParams};
+use crate::features::ask::repo::{self, CreateAskRunParams, RenderAudit};
 use crate::features::ask::rich_markdown;
 use crate::features::ask::types::{
     AskAnswer, AskCommandInput, AskFailureKind, AskProgress, AskRunStatus,
 };
 use crate::llm::profiles::RouteRequirements;
+use crate::telegram::render::validate_rich_markdown;
 
 pub struct AskService<'a> {
     pool: &'a PgPool,
     config: &'a Config,
+    llm_formatter: &'a LlmMarkdownFormatter,
 }
 
 impl<'a> AskService<'a> {
-    pub fn new(pool: &'a PgPool, config: &'a Config) -> Self {
-        Self { pool, config }
+    pub fn new(
+        pool: &'a PgPool,
+        config: &'a Config,
+        llm_formatter: &'a LlmMarkdownFormatter,
+    ) -> Self {
+        Self {
+            pool,
+            config,
+            llm_formatter,
+        }
     }
 
     pub async fn execute(
@@ -45,26 +58,86 @@ impl<'a> AskService<'a> {
         match answer {
             Ok(answer) => match rich_markdown::validate(&answer) {
                 Ok(markdown) => {
-                    self.finish_run(ask_run_id, AskRunStatus::Completed, Some(&markdown), None)
-                        .await;
-                    Ok(AskAnswer {
-                        markdown,
-                        ask_run_id,
-                    })
+                    let captured_now = Timestamp::now();
+                    match self.llm_formatter.render_at(&markdown, captured_now) {
+                        Ok(rendered) => {
+                            let render = self.render_audit(captured_now, Some(&rendered.markdown));
+                            if let Err(err) = validate_rich_markdown(&rendered.markdown) {
+                                tracing::warn!(%err, "compiled ask rich markdown is not deliverable");
+                                let kind = AskFailureKind::InvalidOutput;
+                                self.finish_run(
+                                    ask_run_id,
+                                    AskRunStatus::Failed,
+                                    Some(&markdown),
+                                    render,
+                                    Some(kind),
+                                )
+                                .await;
+                                Err(AskServiceError::new(
+                                    kind,
+                                    anyhow::Error::new(err),
+                                    ask_run_id,
+                                ))
+                            } else {
+                                self.finish_run(
+                                    ask_run_id,
+                                    AskRunStatus::DeliveryPending,
+                                    Some(&markdown),
+                                    render,
+                                    None,
+                                )
+                                .await;
+                                Ok(AskAnswer {
+                                    markdown,
+                                    rendered,
+                                    ask_run_id,
+                                })
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "ask assistant returned invalid time markup");
+                            let kind = AskFailureKind::InvalidOutput;
+                            self.finish_run(
+                                ask_run_id,
+                                AskRunStatus::Failed,
+                                Some(&markdown),
+                                self.render_audit(captured_now, None),
+                                Some(kind),
+                            )
+                            .await;
+                            Err(AskServiceError::new(
+                                kind,
+                                anyhow::Error::new(err),
+                                ask_run_id,
+                            ))
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(%err, "ask assistant returned unsafe markdown");
                     let kind = AskFailureKind::InvalidOutput;
-                    self.finish_run(ask_run_id, AskRunStatus::Failed, None, Some(kind))
-                        .await;
-                    Err(AskServiceError::new(kind, err))
+                    self.finish_run(
+                        ask_run_id,
+                        AskRunStatus::Failed,
+                        None,
+                        RenderAudit::default(),
+                        Some(kind),
+                    )
+                    .await;
+                    Err(AskServiceError::new(kind, err, ask_run_id))
                 }
             },
             Err(err) => {
                 let kind = AskFailureKind::from_error(&err);
-                self.finish_run(ask_run_id, AskRunStatus::Failed, None, Some(kind))
-                    .await;
-                Err(AskServiceError::new(kind, err))
+                self.finish_run(
+                    ask_run_id,
+                    AskRunStatus::Failed,
+                    None,
+                    RenderAudit::default(),
+                    Some(kind),
+                )
+                .await;
+                Err(AskServiceError::new(kind, err, ask_run_id))
             }
         }
     }
@@ -124,6 +197,7 @@ impl<'a> AskService<'a> {
         ask_run_id: Option<i64>,
         status: AskRunStatus,
         answer_markdown: Option<&str>,
+        render: RenderAudit,
         failure_kind: Option<AskFailureKind>,
     ) {
         let Some(ask_run_id) = ask_run_id else {
@@ -134,6 +208,7 @@ impl<'a> AskService<'a> {
             ask_run_id,
             status,
             answer_markdown,
+            render,
             failure_kind.map(AskFailureKind::as_str),
         )
         .await
@@ -141,17 +216,42 @@ impl<'a> AskService<'a> {
             tracing::warn!(%err, ask_run_id, "failed to finish ask audit run");
         }
     }
+
+    fn render_audit(
+        &self,
+        captured_now: Timestamp,
+        rendered_markdown: Option<&str>,
+    ) -> RenderAudit {
+        RenderAudit {
+            captured_now: timestamp_to_chrono(captured_now),
+            dialect: Some(LLM_DIALECT_VERSION.to_owned()),
+            timezone: Some(self.config.render_timezone.clone()),
+            renderer_revision: Some(TIME_RENDERER_VERSION.to_owned()),
+            rendered_markdown: rendered_markdown.map(str::to_owned),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            ..RenderAudit::default()
+        }
+    }
+}
+
+fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(timestamp.as_second(), timestamp.subsec_nanosecond() as u32)
 }
 
 #[derive(Debug)]
 pub struct AskServiceError {
     pub kind: AskFailureKind,
+    pub ask_run_id: Option<i64>,
     source: anyhow::Error,
 }
 
 impl AskServiceError {
-    fn new(kind: AskFailureKind, source: anyhow::Error) -> Self {
-        Self { kind, source }
+    fn new(kind: AskFailureKind, source: anyhow::Error, ask_run_id: Option<i64>) -> Self {
+        Self {
+            kind,
+            ask_run_id,
+            source,
+        }
     }
 }
 

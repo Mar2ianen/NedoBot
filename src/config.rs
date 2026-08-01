@@ -35,6 +35,7 @@ const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
 pub struct Config {
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
+    pub render_timezone: String,
     pub chat_invite_url: String,
     pub chat_invite_label: String,
     pub post_signature_marker: String,
@@ -137,6 +138,7 @@ impl Config {
         Ok(Self {
             source_channel_id: runtime.source_channel_id,
             discussion_chat_id: runtime.discussion_chat_id,
+            render_timezone: runtime.render_timezone,
             chat_invite_url: env_or("CHAT_INVITE_URL", "https://t.me/+RxmPtw7Bs-IxNzEy"),
             chat_invite_label: runtime.chat_invite_label,
             post_signature_marker: runtime.post_signature_marker,
@@ -237,6 +239,10 @@ impl Config {
 
     pub fn validate_runtime_secrets(&self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
+
+        if let Err(error) = teloxide::utils::time::TimeContext::from_name(&self.render_timezone) {
+            errors.push(format!("invalid RENDER_TIMEZONE: {error}"));
+        }
 
         if self.llm_profiles.is_some() {
             self.validate_profile_routes(&mut errors);
@@ -651,6 +657,7 @@ mod tests {
         Config {
             source_channel_id: -1001,
             discussion_chat_id: -1002,
+            render_timezone: "Europe/Moscow".to_string(),
             chat_invite_url: "https://t.me/example".to_string(),
             chat_invite_label: "чат".to_string(),
             post_signature_marker: "marker".to_string(),
@@ -784,6 +791,15 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("invalid type"));
+    }
+
+    #[test]
+    fn invalid_render_timezone_is_rejected_at_startup_validation() {
+        let mut config = config();
+        config.render_timezone = "Not/A_TimeZone".to_string();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+        assert!(error.contains("invalid RENDER_TIMEZONE"));
     }
 
     #[test]
