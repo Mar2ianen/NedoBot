@@ -1,3 +1,4 @@
+use std::future::Future;
 use teloxide::{
     drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter},
     prelude::*,
@@ -421,7 +422,7 @@ fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
     )
 }
 
-fn finish_error_certainty(error: &DraftFinishError<teloxide::RequestError>) -> DeliveryCertainty {
+fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     match error {
         DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
         DraftFinishError::WorkerStoppedAfterCommand { delivery }
@@ -439,16 +440,41 @@ async fn fallback_after_finish_error(
     error: DraftFinishError<teloxide::RequestError>,
 ) -> ResponseResult<()> {
     let certainty = finish_error_certainty(&error);
+    if may_send_fallback(certainty) {
+        tracing::warn!(?certainty, %error, "rich /ask delivery rejected; sending fallback");
+    }
+    apply_finish_error_policy(
+        certainty,
+        fallback_status,
+        || send_ask_fallback(bot, chat_id, fallback_text),
+        || state.ask_delivery_metrics.record_unknown_delivery_failure(),
+        |status, outcome, certainty| {
+            record_ask_delivery(state, ask_run_id, status, outcome, certainty)
+        },
+    )
+    .await
+}
+
+async fn apply_finish_error_policy<SendFallback, SendFuture, RecordDelivery, RecordFuture>(
+    certainty: DeliveryCertainty,
+    fallback_status: AskRunStatus,
+    send_fallback: SendFallback,
+    record_unknown: impl FnOnce(),
+    record_delivery: RecordDelivery,
+) -> ResponseResult<()>
+where
+    SendFallback: FnOnce() -> SendFuture,
+    SendFuture: Future<Output = ResponseResult<()>>,
+    RecordDelivery: FnOnce(AskRunStatus, &'static str, Option<DeliveryCertainty>) -> RecordFuture,
+    RecordFuture: Future<Output = ()>,
+{
     if !may_send_fallback(certainty) {
-        state.ask_delivery_metrics.record_unknown_delivery_failure();
+        record_unknown();
         tracing::error!(
             ?certainty,
-            ask_run_id,
             "rich /ask delivery is unknown; suppressing fallback"
         );
-        record_ask_delivery(
-            state,
-            ask_run_id,
+        record_delivery(
             AskRunStatus::Failed,
             "rich_delivery_unknown",
             Some(certainty),
@@ -457,14 +483,14 @@ async fn fallback_after_finish_error(
         return Ok(());
     }
 
-    tracing::warn!(?certainty, %error, "rich /ask delivery rejected; sending fallback");
-    let result = send_ask_fallback(bot, chat_id, fallback_text).await;
+    tracing::warn!(?certainty, "rich /ask delivery rejected; sending fallback");
+    let result = send_fallback().await;
     let (status, outcome) = if result.is_ok() {
         (fallback_status, "fallback_delivered")
     } else {
         (AskRunStatus::Failed, "fallback_failed")
     };
-    record_ask_delivery(state, ask_run_id, status, outcome, Some(certainty)).await;
+    record_delivery(status, outcome, Some(certainty)).await;
     result
 }
 
@@ -859,28 +885,143 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_backend_delivery_suppresses_fake_fallback_and_records_audit() {
-        struct FakeBackend {
-            side_effect_started: bool,
-        }
-
-        let mut backend = FakeBackend {
-            side_effect_started: false,
+    #[tokio::test]
+    async fn unknown_backend_delivery_suppresses_fallback_in_real_finish_path() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         };
-        let mut fallback_calls = 0;
-        let mut audited_certainty = None;
 
-        backend.side_effect_started = true;
-        let certainty = DeliveryCertainty::Unknown;
-        if may_send_fallback(certainty) {
-            fallback_calls += 1;
-        } else {
-            audited_certainty = Some(certainty);
+        use teloxide::drafter::{
+            DrafterBackend, DrafterCapabilities, DrafterErrorClass, DrafterErrorDisposition,
+            DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority, DrafterRateLimitKey,
+            DrafterRateLimitScope, DrafterRateLimiter, PreviewAck,
+        };
+
+        #[derive(Debug)]
+        struct UnknownDeliveryError;
+
+        impl std::fmt::Display for UnknownDeliveryError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("connection lost after send")
+            }
         }
 
-        assert!(backend.side_effect_started);
-        assert_eq!(fallback_calls, 0);
-        assert_eq!(audited_certainty, Some(DeliveryCertainty::Unknown));
+        impl std::error::Error for UnknownDeliveryError {}
+
+        #[derive(Clone, Copy)]
+        struct TestLimiter;
+
+        impl DrafterRateLimiter for TestLimiter {
+            async fn acquire(
+                &self,
+                _key: DrafterRateLimitKey,
+                _priority: DrafterPriority,
+            ) -> DrafterPermit {
+                DrafterPermit::new()
+            }
+
+            fn penalize(&self, _scope: DrafterRateLimitScope, _retry_after: std::time::Duration) {}
+        }
+
+        struct UnknownDeliveryBackend {
+            side_effect_started: Arc<AtomicBool>,
+        }
+
+        impl DrafterBackend for UnknownDeliveryBackend {
+            type Preview = String;
+            type Final = String;
+            type SegmentOutput = String;
+            type Output = String;
+            type Error = UnknownDeliveryError;
+
+            fn capabilities(&self) -> DrafterCapabilities {
+                DrafterCapabilities {
+                    mode: DrafterMode::EditInPlace,
+                    expires_without_refresh: false,
+                    supports_draft_thinking: false,
+                    supports_rich_preview: false,
+                }
+            }
+
+            async fn update(&mut self, _preview: String) -> Result<PreviewAck, Self::Error> {
+                Ok(PreviewAck)
+            }
+
+            async fn commit_segment(
+                &mut self,
+                final_payload: &String,
+            ) -> Result<String, Self::Error> {
+                Ok(final_payload.clone())
+            }
+
+            async fn finish(&mut self, _final_payload: &String) -> Result<String, Self::Error> {
+                self.side_effect_started.store(true, Ordering::Relaxed);
+                Err(UnknownDeliveryError)
+            }
+
+            async fn abort(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn classify_error(
+                &self,
+                _operation: DrafterOperation,
+                _error: &Self::Error,
+            ) -> DrafterErrorDisposition {
+                DrafterErrorDisposition {
+                    class: DrafterErrorClass::Ambiguous,
+                    delivery: DeliveryCertainty::Unknown,
+                }
+            }
+        }
+
+        let side_effect_started = Arc::new(AtomicBool::new(false));
+        let (drafter, _sink) = Drafter::snapshots(
+            UnknownDeliveryBackend {
+                side_effect_started: Arc::clone(&side_effect_started),
+            },
+            TestLimiter,
+            DraftConfig::default(),
+        )
+        .expect("fake drafter should start");
+        let finish_error = drafter
+            .finish("final".to_owned())
+            .await
+            .expect_err("fake backend must lose delivery confirmation");
+
+        let metrics = Arc::new(crate::features::ask::metrics::AskDeliveryMetrics::default());
+        let fallback_calls = Arc::new(AtomicU64::new(0));
+        let audit = Arc::new(Mutex::new(None));
+        let fallback_calls_ref = Arc::clone(&fallback_calls);
+        let metrics_ref = Arc::clone(&metrics);
+        let audit_ref = Arc::clone(&audit);
+
+        apply_finish_error_policy(
+            finish_error_certainty(&finish_error),
+            AskRunStatus::Completed,
+            move || {
+                fallback_calls_ref.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            },
+            move || metrics_ref.record_unknown_delivery_failure(),
+            move |status, outcome, certainty| async move {
+                *audit_ref.lock().unwrap() = Some((status, outcome, certainty));
+            },
+        )
+        .await
+        .expect("unknown delivery is handled without a second response");
+
+        assert!(side_effect_started.load(Ordering::Relaxed));
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.snapshot().unknown_delivery_failures, 1);
+        let (status, outcome, certainty) = audit
+            .lock()
+            .unwrap()
+            .take()
+            .expect("unknown delivery audit");
+        assert_eq!(status.as_str(), "failed");
+        assert_eq!(outcome, "rich_delivery_unknown");
+        assert_eq!(certainty, Some(DeliveryCertainty::Unknown));
     }
 }

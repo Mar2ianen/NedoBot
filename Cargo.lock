@@ -313,7 +313,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3157,7 +3157,7 @@ checksum = "20f34339676cdcab560c9a82300c4c2581f68b9369aedf0fae86f2ff9565ff3e"
 [[package]]
 name = "teloxide"
 version = "0.18.0"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=70598097054d7765645e6bdcab2a5b8ae2c4422a#70598097054d7765645e6bdcab2a5b8ae2c4422a"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=e141bbc823fd9cd1ba8c59901e34da2282a0c4bd#e141bbc823fd9cd1ba8c59901e34da2282a0c4bd"
 dependencies = [
  "aquamarine",
  "bytes",
@@ -3183,7 +3183,7 @@ dependencies = [
 [[package]]
 name = "teloxide-core"
 version = "0.14.0"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=70598097054d7765645e6bdcab2a5b8ae2c4422a#70598097054d7765645e6bdcab2a5b8ae2c4422a"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=e141bbc823fd9cd1ba8c59901e34da2282a0c4bd#e141bbc823fd9cd1ba8c59901e34da2282a0c4bd"
 dependencies = [
  "bitflags 2.13.0",
  "bytes",
@@ -3215,7 +3215,7 @@ dependencies = [
 [[package]]
 name = "teloxide-macros"
 version = "0.11.0"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=70598097054d7765645e6bdcab2a5b8ae2c4422a#70598097054d7765645e6bdcab2a5b8ae2c4422a"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=e141bbc823fd9cd1ba8c59901e34da2282a0c4bd#e141bbc823fd9cd1ba8c59901e34da2282a0c4bd"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3846,7 +3846,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
