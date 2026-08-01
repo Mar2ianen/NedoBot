@@ -132,7 +132,7 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 
-Telegram lifecycle `/ask` использует shared Drafter: в личке во время исследования отправляется настоящий native rich draft, а в группах, где Telegram native drafts недоступны, один rich message отправляется и редактируется in place до финального ответа с reply на исходную команду. При ошибке агентского шага Drafter сохраняет preview по политике edit-backend; limiter общий для всех `/ask`-драфтеров процесса.
+Telegram lifecycle `/ask` полностью использует shared Drafter: каждое progress-событие проходит через synchronous `DraftSink` с latest-wins/coalescing, начальный preview принудительно отправляется через `flush`, а scheduler сам применяет shared limiter, throttle, retry/backoff и native-draft watchdog. В личке во время исследования отправляется настоящий native rich draft; в группах, где Telegram native drafts недоступны, один rich message отправляется и редактируется in place до финального ответа с reply на исходную команду. Успешный ответ закрывается через `finish`, а ошибка агентского шага — через `abort`; limiter общий для всех `/ask`-драфтеров процесса.
 
 ### Поиск фактов для первого комментария
 
@@ -403,7 +403,6 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /format_test <текст поста>
 /memory
 /ask <вопрос>
-/drafter_smoke
 /status day|week|month [-r|-p]
 /stats_day [-r|-p]
 /stats_week [-r|-p]
@@ -424,7 +423,6 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 `/userstats` принимает числовой Telegram ID, уже виденный ботом username или reply на сообщение пользователя. Без аргумента команда показывает отправителя. `UserStatsArgs` один раз нормализует command arguments: render-флаги `-r`/`--rich` и `-p`/`--plain` можно поставить до или после target, они не считаются частью username, а команда только с флагом сохраняет reply/sender fallback. Нормализованный target используется и для refresh профиля, и для построения отчёта. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
 
-`/drafter_smoke` доступна только debug-сборке и пользователю из `ask_private_user_ids`. В личке она проверяет native rich draft с Thinking-блоком и полный lifecycle; в `discussion_chat_id` — один rich message, который отправляется, редактируется in place и затем превращается в permanent rich final. Команда оставляет успешный финал в чате для визуальной проверки; Thinking-блоки отправляются только в native draft и намеренно не попадают в чатовый preview или финал.
 
 ## Prompt
 
