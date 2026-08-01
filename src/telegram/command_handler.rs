@@ -125,7 +125,7 @@ pub async fn handle_command(
                     send_html(&bot, msg.chat.id, escape_html(&report)).await?;
                 }
                 Err(err) => {
-                    tracing::error!(%err, "drafter smoke test failed");
+                    tracing::error!(error = ?err, "drafter smoke test failed");
                     send_html(
                         &bot,
                         msg.chat.id,
