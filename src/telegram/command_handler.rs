@@ -1,5 +1,6 @@
+use std::future::Future;
 use teloxide::{
-    drafter::{DraftConfig, Drafter},
+    drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter},
     prelude::*,
     types::{
         InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
@@ -12,8 +13,9 @@ use tokio::sync::mpsc;
 use crate::db::telegram::save_telegram_message;
 use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
+use crate::features::ask::repo;
 use crate::features::ask::service::AskService;
-use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress};
+use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, AskRunStatus};
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
@@ -28,7 +30,7 @@ use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
-use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
+use crate::telegram::render::{escape_html, send_html};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -108,21 +110,57 @@ pub async fn handle_command(
         }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Day, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                StatsPeriod::Day,
+                render,
+            )
+            .await?;
         }
         Command::StatsWeek(args) => {
             let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Week, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                StatsPeriod::Week,
+                render,
+            )
+            .await?;
         }
         Command::StatsMonth(args) => {
             let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                StatsPeriod::Month,
+                render,
+            )
+            .await?;
         }
         Command::Status(args) => {
             let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
             let render = render_from_message_or_args(&msg, &args);
             let period = status_period_from_args(raw_args).unwrap_or(StatsPeriod::Day);
-            send_chat_stats(&bot, msg.chat.id, pool, config, period, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                period,
+                render,
+            )
+            .await?;
         }
         Command::TopMsg(args) => {
             send_top_messages(
@@ -288,7 +326,7 @@ async fn handle_ask_command(
         reply_image_base64,
         allow_mutations: true,
     };
-    let ask_service = AskService::new(&state.pool, config);
+    let ask_service = AskService::new(&state.pool, config, &state.llm_formatter);
     let answer = ask_service.execute(input, Some(&progress_tx));
     tokio::pin!(answer);
     let mut progress_open = true;
@@ -314,39 +352,164 @@ async fn handle_ask_command(
     drop(permit);
     match answer {
         Ok(answer) => {
-            let markdown = answer.markdown;
-            let final_payload = match input_rich_markdown(markdown.clone()) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    if let Err(cleanup_err) = drafter.abort().await {
-                        tracing::debug!(%cleanup_err, "failed to clean up invalid /ask preview");
-                    }
-                    tracing::warn!(%err, "rich /ask answer is not deliverable; falling back");
-                    return send_ask_fallback(bot, msg.chat.id, &markdown).await;
+            let rendered = answer.rendered;
+            match drafter.finish(rendered.rich_message).await {
+                Ok(_) => {
+                    record_ask_delivery(
+                        state,
+                        answer.ask_run_id,
+                        AskRunStatus::Completed,
+                        "rich_delivered",
+                        None,
+                    )
+                    .await;
+                    Ok(())
                 }
-            };
-            match drafter.finish(final_payload).await {
-                Ok(_) => Ok(()),
                 Err(err) => {
-                    tracing::warn!(%err, "failed to deliver final rich /ask answer; falling back");
-                    send_ask_fallback(bot, msg.chat.id, &markdown).await
+                    fallback_after_finish_error(
+                        bot,
+                        msg.chat.id,
+                        state,
+                        answer.ask_run_id,
+                        AskRunStatus::Completed,
+                        &rendered.fallback_text,
+                        err,
+                    )
+                    .await
                 }
             }
         }
         Err(err) => {
             tracing::warn!(%err, error_kind = err.kind.as_str(), "ask assistant failed");
+            let ask_run_id = err.ask_run_id;
             let failure_message = ask_failure_message(err.kind);
             match drafter
                 .finish(InputRichMessage::markdown(failure_message))
                 .await
             {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    record_ask_delivery(
+                        state,
+                        ask_run_id,
+                        AskRunStatus::Failed,
+                        "failure_message_delivered",
+                        None,
+                    )
+                    .await;
+                    Ok(())
+                }
                 Err(finish_err) => {
-                    tracing::warn!(%finish_err, "failed to deliver rich /ask failure; falling back");
-                    send_ask_fallback(bot, msg.chat.id, failure_message).await
+                    fallback_after_finish_error(
+                        bot,
+                        msg.chat.id,
+                        state,
+                        ask_run_id,
+                        AskRunStatus::Failed,
+                        failure_message,
+                        finish_err,
+                    )
+                    .await
                 }
             }
         }
+    }
+}
+
+fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
+    matches!(
+        certainty,
+        DeliveryCertainty::NotAttempted | DeliveryCertainty::Rejected
+    )
+}
+
+fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
+    match error {
+        DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
+        DraftFinishError::WorkerStoppedAfterCommand { delivery }
+        | DraftFinishError::Backend { delivery, .. } => *delivery,
+    }
+}
+
+async fn fallback_after_finish_error(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    state: &AppState,
+    ask_run_id: Option<i64>,
+    fallback_status: AskRunStatus,
+    fallback_text: &str,
+    error: DraftFinishError<teloxide::RequestError>,
+) -> ResponseResult<()> {
+    let certainty = finish_error_certainty(&error);
+    if may_send_fallback(certainty) {
+        tracing::warn!(?certainty, %error, "rich /ask delivery rejected; sending fallback");
+    } else {
+        tracing::error!(
+            ?certainty,
+            %error,
+            ask_run_id,
+            "rich /ask delivery is unknown; suppressing fallback"
+        );
+    }
+    apply_finish_error_policy(
+        certainty,
+        fallback_status,
+        || send_ask_fallback(bot, chat_id, fallback_text),
+        || state.ask_delivery_metrics.record_unknown_delivery_failure(),
+        |status, outcome, certainty| {
+            record_ask_delivery(state, ask_run_id, status, outcome, certainty)
+        },
+    )
+    .await
+}
+
+async fn apply_finish_error_policy<SendFallback, SendFuture, RecordDelivery, RecordFuture>(
+    certainty: DeliveryCertainty,
+    fallback_status: AskRunStatus,
+    send_fallback: SendFallback,
+    record_unknown: impl FnOnce(),
+    record_delivery: RecordDelivery,
+) -> ResponseResult<()>
+where
+    SendFallback: FnOnce() -> SendFuture,
+    SendFuture: Future<Output = ResponseResult<()>>,
+    RecordDelivery: FnOnce(AskRunStatus, &'static str, Option<DeliveryCertainty>) -> RecordFuture,
+    RecordFuture: Future<Output = ()>,
+{
+    if !may_send_fallback(certainty) {
+        record_unknown();
+        record_delivery(
+            AskRunStatus::Failed,
+            "rich_delivery_unknown",
+            Some(certainty),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let result = send_fallback().await;
+    let (status, outcome) = if result.is_ok() {
+        (fallback_status, "fallback_delivered")
+    } else {
+        (AskRunStatus::Failed, "fallback_failed")
+    };
+    record_delivery(status, outcome, Some(certainty)).await;
+    result
+}
+
+async fn record_ask_delivery(
+    state: &AppState,
+    ask_run_id: Option<i64>,
+    status: AskRunStatus,
+    outcome: &str,
+    certainty: Option<DeliveryCertainty>,
+) {
+    let Some(ask_run_id) = ask_run_id else {
+        return;
+    };
+    if let Err(error) =
+        repo::finish_delivery(&state.pool, ask_run_id, status, outcome, certainty).await
+    {
+        tracing::warn!(%error, ask_run_id, outcome, "failed to record ask delivery outcome");
     }
 }
 
@@ -691,5 +854,176 @@ mod tests {
             .expect("edit progress should serialize");
         assert!(edit["markdown"].is_string());
         assert!(edit["blocks"].is_null());
+    }
+
+    #[test]
+    fn fallback_policy_allows_only_confirmed_non_delivery() {
+        assert!(may_send_fallback(DeliveryCertainty::NotAttempted));
+        assert!(may_send_fallback(DeliveryCertainty::Rejected));
+        assert!(!may_send_fallback(DeliveryCertainty::Unknown));
+    }
+
+    #[test]
+    fn finish_error_certainty_is_preserved_for_fallback_policy() {
+        let before = DraftFinishError::<teloxide::RequestError>::WorkerStoppedBeforeCommand;
+        assert_eq!(
+            finish_error_certainty(&before),
+            DeliveryCertainty::NotAttempted
+        );
+
+        let after = DraftFinishError::<teloxide::RequestError>::WorkerStoppedAfterCommand {
+            delivery: DeliveryCertainty::Unknown,
+        };
+        assert_eq!(finish_error_certainty(&after), DeliveryCertainty::Unknown);
+
+        let rejected = DraftFinishError::Backend {
+            source: teloxide::RequestError::MigrateToChatId(ChatId(42)),
+            class: teloxide::drafter::DrafterErrorClass::Permanent,
+            delivery: DeliveryCertainty::Rejected,
+        };
+        assert_eq!(
+            finish_error_certainty(&rejected),
+            DeliveryCertainty::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_delivery_suppresses_fallback_in_real_finish_path() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+
+        use teloxide::drafter::{
+            DrafterBackend, DrafterCapabilities, DrafterErrorClass, DrafterErrorDisposition,
+            DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority, DrafterRateLimitKey,
+            DrafterRateLimitScope, DrafterRateLimiter, PreviewAck,
+        };
+
+        #[derive(Debug)]
+        struct UnknownDeliveryError;
+
+        impl std::fmt::Display for UnknownDeliveryError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("connection lost after send")
+            }
+        }
+
+        impl std::error::Error for UnknownDeliveryError {}
+
+        #[derive(Clone, Copy)]
+        struct TestLimiter;
+
+        impl DrafterRateLimiter for TestLimiter {
+            async fn acquire(
+                &self,
+                _key: DrafterRateLimitKey,
+                _priority: DrafterPriority,
+            ) -> DrafterPermit {
+                DrafterPermit::new()
+            }
+
+            fn penalize(&self, _scope: DrafterRateLimitScope, _retry_after: std::time::Duration) {}
+        }
+
+        struct UnknownDeliveryBackend {
+            side_effect_started: Arc<AtomicBool>,
+        }
+
+        impl DrafterBackend for UnknownDeliveryBackend {
+            type Preview = String;
+            type Final = String;
+            type SegmentOutput = String;
+            type Output = String;
+            type Error = UnknownDeliveryError;
+
+            fn capabilities(&self) -> DrafterCapabilities {
+                DrafterCapabilities {
+                    mode: DrafterMode::EditInPlace,
+                    expires_without_refresh: false,
+                    supports_draft_thinking: false,
+                    supports_rich_preview: false,
+                }
+            }
+
+            async fn update(&mut self, _preview: String) -> Result<PreviewAck, Self::Error> {
+                Ok(PreviewAck)
+            }
+
+            async fn commit_segment(
+                &mut self,
+                final_payload: &String,
+            ) -> Result<String, Self::Error> {
+                Ok(final_payload.clone())
+            }
+
+            async fn finish(&mut self, _final_payload: &String) -> Result<String, Self::Error> {
+                self.side_effect_started.store(true, Ordering::Relaxed);
+                Err(UnknownDeliveryError)
+            }
+
+            async fn abort(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn classify_error(
+                &self,
+                _operation: DrafterOperation,
+                _error: &Self::Error,
+            ) -> DrafterErrorDisposition {
+                DrafterErrorDisposition {
+                    class: DrafterErrorClass::Ambiguous,
+                    delivery: DeliveryCertainty::Unknown,
+                }
+            }
+        }
+
+        let side_effect_started = Arc::new(AtomicBool::new(false));
+        let (drafter, _sink) = Drafter::snapshots(
+            UnknownDeliveryBackend {
+                side_effect_started: Arc::clone(&side_effect_started),
+            },
+            TestLimiter,
+            DraftConfig::default(),
+        )
+        .expect("fake drafter should start");
+        let finish_error = drafter
+            .finish("final".to_owned())
+            .await
+            .expect_err("fake backend must lose delivery confirmation");
+
+        let metrics = Arc::new(crate::features::ask::metrics::AskDeliveryMetrics::default());
+        let fallback_calls = Arc::new(AtomicU64::new(0));
+        let audit = Arc::new(Mutex::new(None));
+        let fallback_calls_ref = Arc::clone(&fallback_calls);
+        let metrics_ref = Arc::clone(&metrics);
+        let audit_ref = Arc::clone(&audit);
+
+        apply_finish_error_policy(
+            finish_error_certainty(&finish_error),
+            AskRunStatus::Completed,
+            move || {
+                fallback_calls_ref.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            },
+            move || metrics_ref.record_unknown_delivery_failure(),
+            move |status, outcome, certainty| async move {
+                *audit_ref.lock().unwrap() = Some((status, outcome, certainty));
+            },
+        )
+        .await
+        .expect("unknown delivery is handled without a second response");
+
+        assert!(side_effect_started.load(Ordering::Relaxed));
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.snapshot().unknown_delivery_failures, 1);
+        let (status, outcome, certainty) = audit
+            .lock()
+            .unwrap()
+            .take()
+            .expect("unknown delivery audit");
+        assert_eq!(status.as_str(), "failed");
+        assert_eq!(outcome, "rich_delivery_unknown");
+        assert_eq!(certainty, Some(DeliveryCertainty::Unknown));
     }
 }

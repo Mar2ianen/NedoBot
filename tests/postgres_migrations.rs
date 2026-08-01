@@ -4,11 +4,16 @@ use std::{
     sync::{Arc, mpsc::sync_channel},
 };
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
+use teloxide::utils::time::TimeContext;
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
+    ask::{
+        repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
+        types::AskRunStatus,
+    },
     chat_retrieval::{
         EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
         mark_embedding_failed, mark_embedding_ready,
@@ -55,6 +60,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
@@ -83,6 +89,172 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
     assert_job_lifecycle_observability(&pool).await;
+}
+
+async fn assert_ask_time_render_audit(pool: &PgPool) {
+    #[derive(sqlx::FromRow)]
+    struct AskTimeAuditRow {
+        status: String,
+        error_kind: Option<String>,
+        render_captured_now: Option<DateTime<Utc>>,
+        render_dialect: Option<String>,
+        render_timezone: Option<String>,
+        renderer_revision: Option<String>,
+        rendered_markdown: Option<String>,
+        render_version: Option<String>,
+        delivery_certainty: Option<String>,
+        delivery_outcome: Option<String>,
+        answer_markdown: Option<String>,
+    }
+
+    let columns: Vec<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'ask_runs' and column_name in ('render_captured_now', 'render_dialect', 'render_timezone', 'renderer_revision', 'rendered_markdown', 'render_version', 'delivery_certainty', 'delivery_outcome') order by column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("ask time render audit columns must be queryable");
+    assert_eq!(
+        columns,
+        vec![
+            "delivery_certainty".to_string(),
+            "delivery_outcome".to_string(),
+            "render_captured_now".to_string(),
+            "render_dialect".to_string(),
+            "render_timezone".to_string(),
+            "render_version".to_string(),
+            "rendered_markdown".to_string(),
+            "renderer_revision".to_string(),
+        ]
+    );
+
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 1_000_000) as i32;
+    let captured_now = Utc
+        .with_ymd_and_hms(2026, 8, 2, 12, 34, 56)
+        .single()
+        .unwrap();
+    let success_id = CreateAskRunParams {
+        chat_id: -1001932061163,
+        command_message_id: 9_800_000 + suffix,
+        requester_user_id: 9_800_000 + i64::from(suffix),
+        question: "time audit success",
+        reply_to_message_id: None,
+        provider: "test-provider",
+        model: Some("test-model"),
+    };
+    let success_id = tg_ai_bot_teloxide::features::ask::repo::create_run(pool, success_id)
+        .await
+        .expect("success ask run must be created through the production repo");
+    finish_run(
+        pool,
+        success_id,
+        AskRunStatus::DeliveryPending,
+        Some("source now/"),
+        RenderAudit {
+            captured_now: Some(captured_now),
+            dialect: Some("llm-v1".to_owned()),
+            timezone: Some("Europe/Moscow".to_owned()),
+            renderer_revision: Some("time-rendering-v2".to_owned()),
+            rendered_markdown: Some("compiled markdown".to_owned()),
+            version: Some("test-app".to_owned()),
+            delivery_certainty: None,
+            delivery_outcome: Some("rich_delivered".to_owned()),
+        },
+        None,
+    )
+    .await
+    .expect("success render audit must be written through finish_run");
+    finish_delivery(
+        pool,
+        success_id,
+        AskRunStatus::Completed,
+        "rich_delivered",
+        None,
+    )
+    .await
+    .expect("success delivery outcome must be finalized through the repo");
+    let success: AskTimeAuditRow = query_as(
+        "select status, error_kind, render_captured_now, render_dialect, render_timezone, renderer_revision, rendered_markdown, render_version, delivery_certainty, delivery_outcome, answer_markdown from ask_runs where id = $1",
+    )
+    .bind(success_id)
+    .fetch_one(pool)
+    .await
+    .expect("success render audit must round-trip");
+    assert_eq!(success.status, "completed");
+    assert_eq!(success.error_kind, None);
+    assert_eq!(success.render_captured_now, Some(captured_now));
+    assert_eq!(success.render_dialect.as_deref(), Some("llm-v1"));
+    assert_eq!(success.render_timezone.as_deref(), Some("Europe/Moscow"));
+    assert_eq!(
+        success.renderer_revision.as_deref(),
+        Some("time-rendering-v2")
+    );
+    assert_eq!(
+        success.rendered_markdown.as_deref(),
+        Some("compiled markdown")
+    );
+    assert_eq!(success.render_version.as_deref(), Some("test-app"));
+    assert_eq!(success.delivery_certainty, None);
+    assert_eq!(success.delivery_outcome.as_deref(), Some("rich_delivered"));
+    assert_eq!(success.answer_markdown.as_deref(), Some("source now/"));
+
+    let error_id = tg_ai_bot_teloxide::features::ask::repo::create_run(
+        pool,
+        CreateAskRunParams {
+            chat_id: -1001932061163,
+            command_message_id: 9_900_000 + suffix,
+            requester_user_id: 9_900_000 + i64::from(suffix),
+            question: "time audit error",
+            reply_to_message_id: None,
+            provider: "test-provider",
+            model: None,
+        },
+    )
+    .await
+    .expect("error ask run must be created through the production repo");
+    finish_run(
+        pool,
+        error_id,
+        AskRunStatus::Failed,
+        Some("source now+3hours/"),
+        RenderAudit {
+            captured_now: Some(captured_now),
+            dialect: Some("llm-v1".to_owned()),
+            timezone: Some("Europe/Moscow".to_owned()),
+            renderer_revision: Some("time-rendering-v2".to_owned()),
+            rendered_markdown: None,
+            version: Some("test-app".to_owned()),
+            delivery_certainty: Some(teloxide::drafter::DeliveryCertainty::NotAttempted),
+            delivery_outcome: Some("render_failed".to_owned()),
+        },
+        Some("render_validation"),
+    )
+    .await
+    .expect("failed render audit must be written through finish_run");
+    let error: AskTimeAuditRow = query_as(
+        "select status, error_kind, render_captured_now, render_dialect, render_timezone, renderer_revision, rendered_markdown, render_version, delivery_certainty, delivery_outcome, answer_markdown from ask_runs where id = $1",
+    )
+    .bind(error_id)
+    .fetch_one(pool)
+    .await
+    .expect("failed render audit must round-trip");
+    assert_eq!(error.status, "failed");
+    assert_eq!(error.error_kind.as_deref(), Some("render_validation"));
+    assert_eq!(error.render_captured_now, Some(captured_now));
+    assert_eq!(error.render_dialect.as_deref(), Some("llm-v1"));
+    assert_eq!(error.render_timezone.as_deref(), Some("Europe/Moscow"));
+    assert_eq!(
+        error.renderer_revision.as_deref(),
+        Some("time-rendering-v2")
+    );
+    assert_eq!(error.rendered_markdown, None);
+    assert_eq!(error.render_version.as_deref(), Some("test-app"));
+    assert_eq!(error.delivery_certainty.as_deref(), Some("not_attempted"));
+    assert_eq!(error.delivery_outcome.as_deref(), Some("render_failed"));
+    assert_eq!(error.answer_markdown.as_deref(), Some("source now+3hours/"));
 }
 
 async fn assert_job_lifecycle_observability(pool: &PgPool) {
@@ -2162,8 +2334,9 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         bot_comments: Vec::new(),
     };
 
-    let html = render_html::chat_stats(&data);
-    let rich = render_rich::chat_stats(&data, CHAT_ID);
+    let time = TimeContext::from_name("Europe/Moscow").expect("test time zone must be valid");
+    let html = render_html::chat_stats(&data, &time);
+    let rich = render_rich::chat_stats(&data, CHAT_ID, &time);
     let messages = format!("{}", summary.messages);
     let active_users = format!("{}", summary.active_users);
     assert!(html.contains(&messages));

@@ -2,7 +2,7 @@ use teloxide::{
     RequestError,
     adaptors::DefaultParseMode,
     drafter::{
-        CleanupFailure, DraftId, DrafterBackend, DrafterCapabilities, DrafterErrorClass,
+        CleanupFailure, DraftId, DrafterBackend, DrafterCapabilities, DrafterErrorDisposition,
         DrafterOperation, DrafterRateLimitKey, EditAbortPolicy, NativeRichBackend, PreviewAck,
         RichEditInPlaceBackend,
     },
@@ -114,7 +114,7 @@ impl DrafterBackend for AskDrafterBackend {
         &self,
         operation: DrafterOperation,
         error: &Self::Error,
-    ) -> DrafterErrorClass {
+    ) -> DrafterErrorDisposition {
         match self {
             Self::Native(backend) => backend.classify_error(operation, error),
             Self::Edit(backend) => backend.classify_error(operation, error),

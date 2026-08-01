@@ -2,6 +2,25 @@
 
 Архив того, что уже закрыто большим проходом рефактора. Активный следующий план лежит в [`REFACTOR_NEXT.md`](REFACTOR_NEXT.md).
 
+## Drafter и explicit time rendering
+
+Текущий `/ask` использует shared Drafter и отдельный time renderer из fork-версии
+teloxide. В private chat progress доставляется native draft, в группе — одним
+редактируемым rich-сообщением. Progress preview и compiled final payload
+разделены: финальный payload валидируется до `delivery_pending` и повторно
+используется для final delivery и её внутренних retry.
+
+Доставка постоянного результата и segment commit несут `DeliveryCertainty`:
+`NotAttempted` и подтверждённый `Rejected` допускают best-effort fallback с
+очисткой временного preview, а `Unknown` не создаёт второе сообщение и
+сохраняется в audit. Render audit хранит исходный и compiled Markdown,
+`captured_now`, dialect, timezone и точную renderer revision.
+
+При изменении этой границы сначала обновляются exact teloxide revision в
+`Cargo.toml` и `Cargo.lock`, затем выполняются проверки fork-а и NedoBot. В
+production release ориентируется на точный deployment tag, а не на один лишь
+`HEAD` рабочей ветки.
+
 ## Итоговое состояние
 
 Проект уже не выглядит как один большой `main.rs`. Сейчас это нормальный MVP-монолит с понятными контурами:

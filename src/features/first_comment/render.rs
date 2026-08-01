@@ -262,6 +262,7 @@ mod tests {
         Config {
             source_channel_id: -1001,
             discussion_chat_id: -1002,
+            render_timezone: "Europe/Moscow".to_string(),
             chat_invite_url: "https://t.me/+test".to_string(),
             chat_invite_label: "чате".to_string(),
             post_signature_marker: "Не теряем связь".to_string(),

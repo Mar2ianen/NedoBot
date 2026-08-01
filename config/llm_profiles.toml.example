@@ -203,6 +203,7 @@ models = ["ollama_minimax", "ollama_memory"]
 [runtime]
 source_channel_id = -1001575496091
 discussion_chat_id = -1001932061163
+render_timezone = "Europe/Moscow"
 chat_invite_label = "чате"
 post_signature_marker = "Не теряем связь"
 

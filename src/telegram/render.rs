@@ -46,8 +46,8 @@ pub async fn send_rich_html(
     .await
 }
 
-pub fn input_rich_markdown(markdown: impl Into<String>) -> ResponseResult<InputRichMessage> {
-    Ok(InputRichMessage::markdown(normalize_rich_text(markdown)?))
+pub fn validate_rich_markdown(markdown: &str) -> ResponseResult<()> {
+    normalize_rich_text(markdown.to_owned()).map(|_| ())
 }
 
 pub async fn send_rich_message(
@@ -133,6 +133,8 @@ fn disabled_link_preview() -> LinkPreviewOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
+    use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
     #[test]
     fn link_previews_are_disabled_for_every_text_send_path() {
@@ -147,7 +149,22 @@ mod tests {
 
     #[test]
     fn rich_markdown_input_keeps_telegram_limit() {
-        assert!(input_rich_markdown("## Ответ").is_ok());
-        assert!(input_rich_markdown("x".repeat(TELEGRAM_RICH_TEXT_LIMIT + 1)).is_err());
+        assert!(validate_rich_markdown("## Ответ").is_ok());
+        assert!(validate_rich_markdown(&"x".repeat(TELEGRAM_RICH_TEXT_LIMIT + 1)).is_err());
+    }
+
+    #[test]
+    fn generated_time_entities_pass_production_rich_validation() {
+        let context = TimeContext::from_name("Europe/Moscow").unwrap();
+        let instant = "2026-08-03T11:00:00Z".parse::<Timestamp>().unwrap();
+        let examples = [
+            DateTimeToken::instant_in(&context, instant, DateTimeFormat::Time).to_markdown(),
+            DateTimeToken::instant_in(&context, instant, DateTimeFormat::Date).to_markdown(),
+            DateTimeToken::instant_in(&context, instant, DateTimeFormat::DateTime).to_markdown(),
+        ];
+        for entity in examples {
+            assert!(validate_rich_markdown(&entity).is_ok(), "entity: {entity}");
+            assert!(validate_rich_markdown(&format!("**Время:** {entity}")).is_ok());
+        }
     }
 }

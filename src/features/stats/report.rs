@@ -1,5 +1,6 @@
 use sqlx::PgPool;
 use teloxide::prelude::*;
+use teloxide::utils::time::MainMarkdownFormatter;
 
 use crate::config::Config;
 use crate::features::stats::render_html;
@@ -15,6 +16,7 @@ pub async fn send_chat_stats(
     chat_id: ChatId,
     pool: &PgPool,
     config: &Config,
+    main_formatter: &MainMarkdownFormatter,
     period: StatsPeriod,
     render: StatsRender,
 ) -> ResponseResult<()> {
@@ -22,8 +24,10 @@ pub async fn send_chat_stats(
         .await
         .map_err(stats_error("failed to build chat stats"))?;
     let report = match render {
-        StatsRender::Html => render_html::chat_stats(&data),
-        StatsRender::Rich => render_rich::chat_stats(&data, config.discussion_chat_id),
+        StatsRender::Html => render_html::chat_stats(&data, main_formatter.time()),
+        StatsRender::Rich => {
+            render_rich::chat_stats(&data, config.discussion_chat_id, main_formatter.time())
+        }
     };
     send_stats_report(bot, chat_id, report, render).await?;
     Ok(())
