@@ -1,4 +1,9 @@
-use teloxide::{prelude::*, types::ReplyParameters, utils::command::BotCommands};
+use teloxide::{
+    drafter::{DraftConfig, Drafter, StatusThenRichBackend},
+    prelude::*,
+    types::ReplyParameters,
+    utils::command::BotCommands,
+};
 use tokio::sync::mpsc;
 
 use crate::db::telegram::save_telegram_message;
@@ -18,7 +23,7 @@ use crate::features::voice::pipeline::transcribe_reply;
 use crate::state::AppState;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
-use crate::telegram::render::{escape_html, send_html, send_rich_markdown_reply};
+use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -229,11 +234,23 @@ async fn handle_ask_command(
     let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
         teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy").into())
     })?;
-    let progress_message = bot
-        .send_message(msg.chat.id, ask_progress_message(AskProgress::Preparing))
-        .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
-        .await
-        .ok();
+    let backend = StatusThenRichBackend::new(bot.clone(), msg.chat.id)
+        .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply());
+    let (drafter, draft_sink) = Drafter::snapshots(
+        backend,
+        state.drafter_limiter.clone(),
+        DraftConfig::default(),
+    )
+    .map_err(|err| {
+        tracing::error!(%err, "failed to initialize /ask drafter");
+        teloxide::RequestError::Io(std::io::Error::other("failed to initialize ask drafter").into())
+    })?;
+    if let Err(err) = draft_sink.update(ask_progress_message(AskProgress::Preparing).to_owned()) {
+        tracing::debug!(%err, "failed to queue initial /ask progress preview");
+    }
+    if let Err(err) = drafter.flush().await {
+        tracing::debug!(%err, "failed to deliver initial /ask progress preview");
+    }
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let reply_context = build_ask_reply_context(msg, config.discussion_chat_id);
     let reply_image_base64 = match msg.reply_to_message() {
@@ -258,9 +275,9 @@ async fn handle_ask_command(
         allow_mutations: true,
     };
     let ask_service = AskService::new(&state.pool, config);
-    let answer = ask_service.execute(input, progress_message.as_ref().map(|_| &progress_tx));
+    let answer = ask_service.execute(input, Some(&progress_tx));
     tokio::pin!(answer);
-    let mut progress_open = progress_message.is_some();
+    let mut progress_open = true;
     let mut last_progress = AskProgress::Preparing;
     let answer = loop {
         tokio::select! {
@@ -268,13 +285,7 @@ async fn handle_ask_command(
             update = progress_rx.recv(), if progress_open => match update {
                 Some(update) if update != last_progress => {
                     last_progress = update;
-                    if let Some(progress_message) = &progress_message
-                        && let Err(err) = bot.edit_message_text(
-                            msg.chat.id,
-                            progress_message.id,
-                            ask_progress_message(update),
-                        ).await
-                    {
+                    if let Err(err) = draft_sink.update(ask_progress_message(update).to_owned()) {
                         tracing::debug!(%err, "failed to update ask progress message");
                     }
                 }
@@ -284,25 +295,31 @@ async fn handle_ask_command(
         }
     };
     drop(permit);
-    if let Some(progress_message) = progress_message
-        && let Err(err) = bot.delete_message(msg.chat.id, progress_message.id).await
-    {
-        tracing::debug!(%err, "failed to remove ask progress message");
-    }
     match answer {
         Ok(answer) => {
-            if send_rich_markdown_reply(bot, msg.chat.id, msg.id, answer.markdown.clone())
-                .await
-                .is_ok()
-            {
-                Ok(())
-            } else {
-                send_html(bot, msg.chat.id, escape_html(&answer.markdown))
-                    .await
-                    .map(|_| ())
+            let final_payload = match input_rich_markdown(answer.markdown) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    if let Err(cleanup_err) = drafter.abort().await {
+                        tracing::debug!(%cleanup_err, "failed to clean up invalid /ask preview");
+                    }
+                    return Err(err);
+                }
+            };
+            match drafter.finish(final_payload).await {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    tracing::error!(%err, "failed to deliver final /ask answer");
+                    Err(teloxide::RequestError::Io(
+                        std::io::Error::other("failed to deliver final ask answer").into(),
+                    ))
+                }
             }
         }
         Err(err) => {
+            if let Err(cleanup_err) = drafter.abort().await {
+                tracing::debug!(%cleanup_err, "failed to clean up /ask progress preview");
+            }
             tracing::warn!(%err, error_kind = err.kind.as_str(), "ask assistant failed");
             send_html(bot, msg.chat.id, ask_failure_message(err.kind))
                 .await

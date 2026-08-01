@@ -46,19 +46,8 @@ pub async fn send_rich_html(
     .await
 }
 
-pub async fn send_rich_markdown_reply(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    chat_id: ChatId,
-    reply_to_message_id: MessageId,
-    markdown: impl Into<String>,
-) -> ResponseResult<Message> {
-    send_rich_message_reply(
-        bot,
-        chat_id,
-        reply_to_message_id,
-        InputRichMessage::markdown(normalize_rich_text(markdown)?),
-    )
-    .await
+pub fn input_rich_markdown(markdown: impl Into<String>) -> ResponseResult<InputRichMessage> {
+    Ok(InputRichMessage::markdown(normalize_rich_text(markdown)?))
 }
 
 pub async fn send_rich_message(
@@ -154,5 +143,11 @@ mod tests {
         assert!(!options.prefer_small_media);
         assert!(!options.prefer_large_media);
         assert!(!options.show_above_text);
+    }
+
+    #[test]
+    fn rich_markdown_input_keeps_telegram_limit() {
+        assert!(input_rich_markdown("## Ответ").is_ok());
+        assert!(input_rich_markdown("x".repeat(TELEGRAM_RICH_TEXT_LIMIT + 1)).is_err());
     }
 }
