@@ -171,6 +171,7 @@ impl<'a> PendingToolCallAudit<'a> {
 
 #[derive(Clone, Copy)]
 pub enum AskRunStatus {
+    DeliveryPending,
     Completed,
     Failed,
 }
@@ -178,6 +179,7 @@ pub enum AskRunStatus {
 impl AskRunStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::DeliveryPending => "delivery_pending",
             Self::Completed => "completed",
             Self::Failed => "failed",
         }
