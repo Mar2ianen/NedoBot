@@ -85,6 +85,10 @@
   </tr>
 </table>
 
+### Lifecycle `/ask`
+
+В личных чатах progress идёт в Telegram native draft, а в группах — в одном rich-сообщении, которое редактируется до финала. Progress preview формируется отдельно от ответа модели. Финальный LLM Markdown компилируется один раз с фиксированным `captured_now`, валидируется до доставки и повторно используется только для final request и его внутренних retry. При подтверждённом отказе допускается fallback с best-effort очисткой progress; при неизвестной доставке второе сообщение не отправляется.
+
 ## Публичная база для исследования
 
 Для внешних MCP-клиентов доступен публичный read-only endpoint v2: `https://nedobot.chickenkiller.com/mcp/nedonews/v2`. Он выдаёт reviewed projections истории публичного чата, профилей, spam-разметки, заметок, расшифровок и аудита `/ask`, но не даёт SQL, записи, приватные чаты или raw Telegram payload. URL v2 намеренно отделён от удалённого legacy JSON-RPC-контракта: клиенты должны выполнить новое MCP discovery через `tools/list`. Точный опубликованный data surface зафиксирован в [MCP public data inventory](docs/MCP_PUBLIC_DATA.md); правила публикации новых данных — в [технической документации](docs/TECHNICAL.md#публичный-read-only-mcp).
@@ -117,6 +121,8 @@
 - [x] базовая расшифровка voice/audio/кружков через Groq ASR;
 - [x] агентный `/ask` с ограниченными read-only инструментами чата, web и GitHub;
 - [x] аудит `/ask`: запросы, инструменты, задержки и безопасные статусы ошибок;
+- [x] deterministic time rendering `/ask` с captured `now`, timezone, renderer revision и compiled-payload audit;
+- [x] delivery certainty для final/segment lifecycle и запрет fallback при `Unknown`;
 - [x] публичная HTTPS-раздача кэшированных аватарок Telegram;
 - [ ] timestamp в заголовках глав голосовых;
 - [x] ручная команда `/transcribe` reply на voice/audio/кружок;
@@ -135,7 +141,7 @@
 | `/ping` | Быстро проверяет, что бот жив. |
 | `/memory` | Показывает последние атомарные карточки истории и статус их обработки. |
 | `/transcribe` | Reply на voice, audio или кружок: запускает расшифровку. Работает при включённом voice-контуре, даже если автоматическая расшифровка выключена. |
-| `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет статус поиска, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Доступен всем участникам основного чата; в личке — только private allowlist. |
+| `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет отдельный progress preview, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Финальная доставка и fallback проходят через shared Drafter. Доступен всем участникам основного чата; в личке — только private allowlist. |
 | `/stats_day [-r\|-p]` | Статистика за текущий день чата, где день начинается в 05:00 по Москве. |
 | `/stats_week [-r\|-p]` | Статистика за текущую неделю с понедельника 05:00 по Москве. |
 | `/stats_month [-r\|-p]` | Статистика за текущий месяц с 1 числа 05:00 по Москве. |
@@ -156,8 +162,9 @@
 `/ask` не получает произвольный SQL или shell-доступ: модель видит только
 ограниченные read-only инструменты для сообщений, профилей, заметок и внешнего
 поиска. Выполнение сохраняет безопасный аудит: запрос, выбранные provider/model,
-имена и аргументы инструментов, задержки и нормализованные ошибки — без тел
-ответов инструментов и секретов.
+имена и аргументы инструментов, задержки, render metadata и delivery
+certainty — без тел ответов инструментов и секретов. `Unknown` delivery
+фиксируется отдельно и не вызывает второй пользовательский ответ.
 
 Кэшированные аватарки для rich-карточек раздаются только по HTTPS с
 `nedobot.chickenkiller.com/tg-ai-bot-static/avatars/`. Это отдельный узкий
@@ -167,7 +174,7 @@
 
 Rust, teloxide, PostgreSQL, LLM/Vision/ASR, prompt-файлы, память, RAG, импорт Telegram export и деплой на VPS.
 
-README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode, импорт истории и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md). Активный инженерный план лежит в [`docs/REFACTOR_NEXT.md`](docs/REFACTOR_NEXT.md), а уже закрытый рефактор заархивирован в [`docs/REFACTOR_DONE.md`](docs/REFACTOR_DONE.md).
+README остаётся витриной проекта. Все эксплуатационные детали, SQL, конфиги, деплой, нюансы Telegram privacy mode, импорт истории и ограничения Bot API лежат в [`docs/TECHNICAL.md`](docs/TECHNICAL.md). Контракт и приёмочные сценарии `/ask` собраны в [`docs/ASK_MVP_PLAN.md`](docs/ASK_MVP_PLAN.md). Активный инженерный план лежит в [`docs/REFACTOR_NEXT.md`](docs/REFACTOR_NEXT.md), а уже закрытый рефактор заархивирован в [`docs/REFACTOR_DONE.md`](docs/REFACTOR_DONE.md).
 
 ## Лицензия
 
