@@ -442,6 +442,13 @@ async fn fallback_after_finish_error(
     let certainty = finish_error_certainty(&error);
     if may_send_fallback(certainty) {
         tracing::warn!(?certainty, %error, "rich /ask delivery rejected; sending fallback");
+    } else {
+        tracing::error!(
+            ?certainty,
+            %error,
+            ask_run_id,
+            "rich /ask delivery is unknown; suppressing fallback"
+        );
     }
     apply_finish_error_policy(
         certainty,
@@ -470,10 +477,6 @@ where
 {
     if !may_send_fallback(certainty) {
         record_unknown();
-        tracing::error!(
-            ?certainty,
-            "rich /ask delivery is unknown; suppressing fallback"
-        );
         record_delivery(
             AskRunStatus::Failed,
             "rich_delivery_unknown",
@@ -483,7 +486,6 @@ where
         return Ok(());
     }
 
-    tracing::warn!(?certainty, "rich /ask delivery rejected; sending fallback");
     let result = send_fallback().await;
     let (status, outcome) = if result.is_ok() {
         (fallback_status, "fallback_delivered")

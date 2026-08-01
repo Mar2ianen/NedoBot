@@ -1,5 +1,14 @@
 # `/ask`: архитектура и план MVP
 
+> Статус текущей реализации: основной `/ask` контур уже работает через shared
+> Drafter и explicit time renderer. Progress preview отделён от compiled final
+> payload; final delivery проходит через `delivery_pending` и certainty policy.
+> Подтверждённый `NotAttempted`/`Rejected` допускает fallback с best-effort
+> очисткой временного preview, а `Unknown` не порождает второе сообщение.
+> Точные render metadata и delivery outcome сохраняются в `ask_runs`. Этот
+> документ сохраняет исходный MVP-контракт и приёмочные сценарии, а текущие
+> runtime-детали уточнены в [`docs/TECHNICAL.md`](TECHNICAL.md).
+
 ## 1. Цель
 
 Добавить команду `/ask <вопрос>`, которая отвечает как агентный помощник и при необходимости сама использует доступные источники:
