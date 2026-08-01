@@ -7,7 +7,7 @@ pub const TELEGRAM_SERVICE_USER_ID: i64 = 777_000;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ChatStatsSummaryRow {
-    start_label: String,
+    start_at: chrono::DateTime<chrono::Utc>,
     messages: i64,
     active_users: i64,
     replies: i64,
@@ -26,7 +26,7 @@ struct ChatStatsSummaryRow {
 impl From<ChatStatsSummaryRow> for ChatStatsSummary {
     fn from(row: ChatStatsSummaryRow) -> Self {
         Self {
-            start_label: row.start_label,
+            start_at: row.start_at,
             messages: row.messages,
             active_users: row.active_users,
             replies: row.replies,
@@ -212,7 +212,7 @@ pub async fn chat_stats_summary(
             where e.chat_id = $1 and e.event_at >= b.start_at and e.event_at < b.end_at
         )
         select
-            to_char((select start_at from bounds) at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as start_label,
+            (select start_at from bounds) as start_at,
             count(*)::bigint as messages,
             count(distinct user_id) filter (where source_channel_id is null and coalesce(user_id, 0) <> $4)::bigint as active_users,
             count(*) filter (where reply_to_message_id is not null)::bigint as replies,

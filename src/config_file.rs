@@ -9,6 +9,7 @@ use serde::Deserialize;
 pub struct RuntimeSettings {
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
+    pub render_timezone: String,
     pub chat_invite_label: String,
     pub post_signature_marker: String,
     pub llm_temperature: f32,
@@ -97,6 +98,7 @@ impl Default for RuntimeSettings {
         Self {
             source_channel_id: -1001575496091,
             discussion_chat_id: -1001932061163,
+            render_timezone: "Europe/Moscow".to_string(),
             chat_invite_label: "Присоединяйтесь к чату".to_string(),
             post_signature_marker: "Не теряем связь".to_string(),
             llm_temperature: 0.45,

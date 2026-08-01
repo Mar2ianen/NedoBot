@@ -5,14 +5,22 @@ use crate::features::stats::types::{
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
 use crate::text::normalize_ai_markers;
+use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
-pub fn chat_stats(data: &ChatStatsReportData) -> String {
+pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
     let summary = &data.summary;
     let attraction = &data.attraction;
+    let period_start = DateTimeToken::instant_in_unix(
+        time,
+        summary.start_at.timestamp(),
+        DateTimeFormat::DateTime,
+    )
+    .expect("Postgres timestamptz must fit into a Telegram timestamp")
+    .to_html();
     let mut report = format!(
-        "<b>Статистика за {}</b>\nПериод с <code>{}</code> МСК\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, 24ч <b>{}</b>, людей 30м <b>{}</b>",
+        "<b>Статистика за {}</b>\nПериод с {}\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, 24ч <b>{}</b>, людей 30м <b>{}</b>",
         data.period.title(),
-        escape_html(&summary.start_label),
+        period_start,
         summary.messages,
         summary.active_users,
         summary.replies,

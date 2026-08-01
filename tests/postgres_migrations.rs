@@ -7,6 +7,7 @@ use std::{
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
+use teloxide::utils::time::TimeContext;
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
     chat_retrieval::{
@@ -55,6 +56,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
@@ -83,6 +85,23 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
     assert_job_lifecycle_observability(&pool).await;
+}
+
+async fn assert_ask_time_render_audit(pool: &PgPool) {
+    let columns: Vec<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'ask_runs' and column_name in ('render_captured_now', 'render_dialect', 'render_version') order by column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("ask time render audit columns must be queryable");
+    assert_eq!(
+        columns,
+        vec![
+            "render_captured_now".to_string(),
+            "render_dialect".to_string(),
+            "render_version".to_string(),
+        ]
+    );
 }
 
 async fn assert_job_lifecycle_observability(pool: &PgPool) {
@@ -2162,8 +2181,9 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         bot_comments: Vec::new(),
     };
 
-    let html = render_html::chat_stats(&data);
-    let rich = render_rich::chat_stats(&data, CHAT_ID);
+    let time = TimeContext::from_name("Europe/Moscow").expect("test time zone must be valid");
+    let html = render_html::chat_stats(&data, &time);
+    let rich = render_rich::chat_stats(&data, CHAT_ID, &time);
     let messages = format!("{}", summary.messages);
     let active_users = format!("{}", summary.active_users);
     assert!(html.contains(&messages));

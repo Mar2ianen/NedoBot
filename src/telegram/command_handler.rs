@@ -28,7 +28,7 @@ use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
-use crate::telegram::render::{escape_html, input_rich_markdown, send_html};
+use crate::telegram::render::{escape_html, send_html, validate_rich_markdown};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -108,21 +108,57 @@ pub async fn handle_command(
         }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Day, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                StatsPeriod::Day,
+                render,
+            )
+            .await?;
         }
         Command::StatsWeek(args) => {
             let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Week, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                StatsPeriod::Week,
+                render,
+            )
+            .await?;
         }
         Command::StatsMonth(args) => {
             let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(&bot, msg.chat.id, pool, config, StatsPeriod::Month, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                StatsPeriod::Month,
+                render,
+            )
+            .await?;
         }
         Command::Status(args) => {
             let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
             let render = render_from_message_or_args(&msg, &args);
             let period = status_period_from_args(raw_args).unwrap_or(StatsPeriod::Day);
-            send_chat_stats(&bot, msg.chat.id, pool, config, period, render).await?;
+            send_chat_stats(
+                &bot,
+                msg.chat.id,
+                pool,
+                config,
+                &state.main_formatter,
+                period,
+                render,
+            )
+            .await?;
         }
         Command::TopMsg(args) => {
             send_top_messages(
@@ -288,7 +324,7 @@ async fn handle_ask_command(
         reply_image_base64,
         allow_mutations: true,
     };
-    let ask_service = AskService::new(&state.pool, config);
+    let ask_service = AskService::new(&state.pool, config, &state.llm_formatter);
     let answer = ask_service.execute(input, Some(&progress_tx));
     tokio::pin!(answer);
     let mut progress_open = true;
@@ -314,22 +350,19 @@ async fn handle_ask_command(
     drop(permit);
     match answer {
         Ok(answer) => {
-            let markdown = answer.markdown;
-            let final_payload = match input_rich_markdown(markdown.clone()) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    if let Err(cleanup_err) = drafter.abort().await {
-                        tracing::debug!(%cleanup_err, "failed to clean up invalid /ask preview");
-                    }
-                    tracing::warn!(%err, "rich /ask answer is not deliverable; falling back");
-                    return send_ask_fallback(bot, msg.chat.id, &markdown).await;
+            let rendered = answer.rendered;
+            if let Err(err) = validate_rich_markdown(&rendered.markdown) {
+                if let Err(cleanup_err) = drafter.abort().await {
+                    tracing::debug!(%cleanup_err, "failed to clean up invalid /ask preview");
                 }
-            };
-            match drafter.finish(final_payload).await {
+                tracing::warn!(%err, "rendered rich /ask answer is not deliverable; falling back");
+                return send_ask_fallback(bot, msg.chat.id, &rendered.fallback_text).await;
+            }
+            match drafter.finish(rendered.rich_message).await {
                 Ok(_) => Ok(()),
                 Err(err) => {
                     tracing::warn!(%err, "failed to deliver final rich /ask answer; falling back");
-                    send_ask_fallback(bot, msg.chat.id, &markdown).await
+                    send_ask_fallback(bot, msg.chat.id, &rendered.fallback_text).await
                 }
             }
         }

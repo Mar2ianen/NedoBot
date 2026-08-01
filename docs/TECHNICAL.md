@@ -111,6 +111,10 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 `LLM_PROFILES_PATH` необязателен только для локального запуска: без него загружается `config/llm_profiles.toml.example`. Для production unit обязан задавать абсолютный `LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml`; на относительный путь под systemd рассчитывать нельзя. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
 
+`runtime.render_timezone` задаёт IANA-зону для явного time rendering; текущий deployment использует `Europe/Moscow`. Значение проверяется на старте через teloxide feature `time-rendering`, поэтому неизвестная зона останавливает запуск. Основной Markdown dialect использует `@time(...)`, `@date(...)`, `@datetime(...)` и `@relative(...)` с `$bindings`, а LLM dialect — маркеры вида `14:::00/`, `2026-08-03 14:::00/`, `now/` и `now+3h/`. Время захватывается один раз за render call, после чего один и тот же typed payload используется для preview и final.
+
+Civil date/time и bare clock нормализуются через эту зону с compatible DST disambiguation: пропущенное локальное время сдвигается вперёд, неоднозначное выбирается детерминированно. Для точного автоматического события нужно передавать `Instant` или полный `CivilDateTime`; bare clock — best-effort представление.
+
 Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
@@ -133,6 +137,8 @@ GenAiTransport создаёт два долгоживущих клиента: di
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 
 Telegram lifecycle `/ask` полностью использует shared Drafter: каждое progress-событие проходит через synchronous `DraftSink` с latest-wins/coalescing, начальный preview принудительно отправляется через `flush`, а scheduler сам применяет shared limiter, throttle, retry/backoff и native-draft watchdog. В личке во время исследования отправляется настоящий native rich draft; в группах, где Telegram native drafts недоступны, один rich message отправляется и редактируется in place до финального ответа с reply на исходную команду. Успешный ответ закрывается через `finish`, а ошибка агентского шага — через `abort`; limiter общий для всех `/ask`-драфтеров процесса.
+
+Для `/ask` финальная модель ответа сначала проходит LLM time formatter, затем его `RenderedMessage.rich_message` передаётся в Drafter без повторного рендера. Если rich delivery или валидация Telegram payload не удалась, handler использует безопасный fallback-текст. `ask_runs` сохраняет исходный Markdown, captured `now`, dialect и версию renderer для последующего аудита и replay.
 
 ### Поиск фактов для первого комментария
 

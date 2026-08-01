@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use sqlx::types::Json;
 
@@ -11,6 +12,13 @@ pub struct CreateAskRunParams<'a> {
     pub reply_to_message_id: Option<i32>,
     pub provider: &'a str,
     pub model: Option<&'a str>,
+}
+
+#[derive(Default)]
+pub struct RenderAudit<'a> {
+    pub captured_now: Option<DateTime<Utc>>,
+    pub dialect: Option<&'a str>,
+    pub version: Option<&'a str>,
 }
 
 pub async fn create_run(pool: &PgPool, input: CreateAskRunParams<'_>) -> anyhow::Result<i64> {
@@ -73,6 +81,7 @@ pub async fn finish_run(
     ask_run_id: i64,
     status: AskRunStatus,
     answer_markdown: Option<&str>,
+    render: RenderAudit<'_>,
     error_kind: Option<&str>,
 ) -> anyhow::Result<()> {
     sqlx::query(
@@ -81,6 +90,9 @@ pub async fn finish_run(
         set status = $2,
             error_kind = $3,
             answer_markdown = $4,
+            render_captured_now = $5,
+            render_dialect = $6,
+            render_version = $7,
             tool_call_count = (select count(*) from ask_tool_calls where ask_run_id = $1),
             step_count = coalesce(
                 (select max(step_number) from ask_tool_calls where ask_run_id = $1),
@@ -94,6 +106,9 @@ pub async fn finish_run(
     .bind(status.as_str())
     .bind(error_kind)
     .bind(answer_markdown)
+    .bind(render.captured_now)
+    .bind(render.dialect)
+    .bind(render.version)
     .execute(pool)
     .await?;
     Ok(())
