@@ -5,6 +5,7 @@ use teloxide::utils::time::{LlmMarkdownFormatter, MainMarkdownFormatter, TimeCon
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
+use crate::features::ask::metrics::AskDeliveryMetrics;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -14,6 +15,7 @@ pub struct AppState {
     pub main_formatter: Arc<MainMarkdownFormatter>,
     pub ask_slots: Arc<Semaphore>,
     pub drafter_limiter: InProcessRateLimiter,
+    pub ask_delivery_metrics: Arc<AskDeliveryMetrics>,
 }
 
 impl AppState {
@@ -29,6 +31,7 @@ impl AppState {
             main_formatter: Arc::new(MainMarkdownFormatter::new((*time_context).clone())),
             ask_slots: Arc::new(Semaphore::new(ask_concurrency)),
             drafter_limiter: InProcessRateLimiter::default(),
+            ask_delivery_metrics: Arc::new(AskDeliveryMetrics::default()),
         }
     }
 }

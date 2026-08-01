@@ -1,5 +1,5 @@
 use teloxide::{
-    drafter::{DraftConfig, Drafter},
+    drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter},
     prelude::*,
     types::{
         InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
@@ -12,8 +12,9 @@ use tokio::sync::mpsc;
 use crate::db::telegram::save_telegram_message;
 use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
+use crate::features::ask::repo;
 use crate::features::ask::service::AskService;
-use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress};
+use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, AskRunStatus};
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
@@ -28,7 +29,7 @@ use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
-use crate::telegram::render::{escape_html, send_html, validate_rich_markdown};
+use crate::telegram::render::{escape_html, send_html};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -351,35 +352,136 @@ async fn handle_ask_command(
     match answer {
         Ok(answer) => {
             let rendered = answer.rendered;
-            if let Err(err) = validate_rich_markdown(&rendered.markdown) {
-                if let Err(cleanup_err) = drafter.abort().await {
-                    tracing::debug!(%cleanup_err, "failed to clean up invalid /ask preview");
-                }
-                tracing::warn!(%err, "rendered rich /ask answer is not deliverable; falling back");
-                return send_ask_fallback(bot, msg.chat.id, &rendered.fallback_text).await;
-            }
             match drafter.finish(rendered.rich_message).await {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    record_ask_delivery(
+                        state,
+                        answer.ask_run_id,
+                        AskRunStatus::Completed,
+                        "rich_delivered",
+                        None,
+                    )
+                    .await;
+                    Ok(())
+                }
                 Err(err) => {
-                    tracing::warn!(%err, "failed to deliver final rich /ask answer; falling back");
-                    send_ask_fallback(bot, msg.chat.id, &rendered.fallback_text).await
+                    fallback_after_finish_error(
+                        bot,
+                        msg.chat.id,
+                        state,
+                        answer.ask_run_id,
+                        AskRunStatus::Completed,
+                        &rendered.fallback_text,
+                        err,
+                    )
+                    .await
                 }
             }
         }
         Err(err) => {
             tracing::warn!(%err, error_kind = err.kind.as_str(), "ask assistant failed");
+            let ask_run_id = err.ask_run_id;
             let failure_message = ask_failure_message(err.kind);
             match drafter
                 .finish(InputRichMessage::markdown(failure_message))
                 .await
             {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    record_ask_delivery(
+                        state,
+                        ask_run_id,
+                        AskRunStatus::Failed,
+                        "failure_message_delivered",
+                        None,
+                    )
+                    .await;
+                    Ok(())
+                }
                 Err(finish_err) => {
-                    tracing::warn!(%finish_err, "failed to deliver rich /ask failure; falling back");
-                    send_ask_fallback(bot, msg.chat.id, failure_message).await
+                    fallback_after_finish_error(
+                        bot,
+                        msg.chat.id,
+                        state,
+                        ask_run_id,
+                        AskRunStatus::Failed,
+                        failure_message,
+                        finish_err,
+                    )
+                    .await
                 }
             }
         }
+    }
+}
+
+fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
+    matches!(
+        certainty,
+        DeliveryCertainty::NotAttempted | DeliveryCertainty::Rejected
+    )
+}
+
+fn finish_error_certainty(error: &DraftFinishError<teloxide::RequestError>) -> DeliveryCertainty {
+    match error {
+        DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
+        DraftFinishError::WorkerStoppedAfterCommand { delivery }
+        | DraftFinishError::Backend { delivery, .. } => *delivery,
+    }
+}
+
+async fn fallback_after_finish_error(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    state: &AppState,
+    ask_run_id: Option<i64>,
+    fallback_status: AskRunStatus,
+    fallback_text: &str,
+    error: DraftFinishError<teloxide::RequestError>,
+) -> ResponseResult<()> {
+    let certainty = finish_error_certainty(&error);
+    if !may_send_fallback(certainty) {
+        state.ask_delivery_metrics.record_unknown_delivery_failure();
+        tracing::error!(
+            ?certainty,
+            ask_run_id,
+            "rich /ask delivery is unknown; suppressing fallback"
+        );
+        record_ask_delivery(
+            state,
+            ask_run_id,
+            AskRunStatus::Failed,
+            "rich_delivery_unknown",
+            Some(certainty),
+        )
+        .await;
+        return Ok(());
+    }
+
+    tracing::warn!(?certainty, %error, "rich /ask delivery rejected; sending fallback");
+    let result = send_ask_fallback(bot, chat_id, fallback_text).await;
+    let (status, outcome) = if result.is_ok() {
+        (fallback_status, "fallback_delivered")
+    } else {
+        (AskRunStatus::Failed, "fallback_failed")
+    };
+    record_ask_delivery(state, ask_run_id, status, outcome, Some(certainty)).await;
+    result
+}
+
+async fn record_ask_delivery(
+    state: &AppState,
+    ask_run_id: Option<i64>,
+    status: AskRunStatus,
+    outcome: &str,
+    certainty: Option<DeliveryCertainty>,
+) {
+    let Some(ask_run_id) = ask_run_id else {
+        return;
+    };
+    if let Err(error) =
+        repo::finish_delivery(&state.pool, ask_run_id, status, outcome, certainty).await
+    {
+        tracing::warn!(%error, ask_run_id, outcome, "failed to record ask delivery outcome");
     }
 }
 
@@ -724,5 +826,61 @@ mod tests {
             .expect("edit progress should serialize");
         assert!(edit["markdown"].is_string());
         assert!(edit["blocks"].is_null());
+    }
+
+    #[test]
+    fn fallback_policy_allows_only_confirmed_non_delivery() {
+        assert!(may_send_fallback(DeliveryCertainty::NotAttempted));
+        assert!(may_send_fallback(DeliveryCertainty::Rejected));
+        assert!(!may_send_fallback(DeliveryCertainty::Unknown));
+    }
+
+    #[test]
+    fn finish_error_certainty_is_preserved_for_fallback_policy() {
+        let before = DraftFinishError::<teloxide::RequestError>::WorkerStoppedBeforeCommand;
+        assert_eq!(
+            finish_error_certainty(&before),
+            DeliveryCertainty::NotAttempted
+        );
+
+        let after = DraftFinishError::<teloxide::RequestError>::WorkerStoppedAfterCommand {
+            delivery: DeliveryCertainty::Unknown,
+        };
+        assert_eq!(finish_error_certainty(&after), DeliveryCertainty::Unknown);
+
+        let rejected = DraftFinishError::Backend {
+            source: teloxide::RequestError::MigrateToChatId(ChatId(42)),
+            class: teloxide::drafter::DrafterErrorClass::Permanent,
+            delivery: DeliveryCertainty::Rejected,
+        };
+        assert_eq!(
+            finish_error_certainty(&rejected),
+            DeliveryCertainty::Rejected
+        );
+    }
+
+    #[test]
+    fn unknown_backend_delivery_suppresses_fake_fallback_and_records_audit() {
+        struct FakeBackend {
+            side_effect_started: bool,
+        }
+
+        let mut backend = FakeBackend {
+            side_effect_started: false,
+        };
+        let mut fallback_calls = 0;
+        let mut audited_certainty = None;
+
+        backend.side_effect_started = true;
+        let certainty = DeliveryCertainty::Unknown;
+        if may_send_fallback(certainty) {
+            fallback_calls += 1;
+        } else {
+            audited_certainty = Some(certainty);
+        }
+
+        assert!(backend.side_effect_started);
+        assert_eq!(fallback_calls, 0);
+        assert_eq!(audited_certainty, Some(DeliveryCertainty::Unknown));
     }
 }
