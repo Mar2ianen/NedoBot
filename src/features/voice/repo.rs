@@ -20,6 +20,14 @@ pub struct VoiceJob {
     pub progress_message_id: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VoiceTransition {
+    RetryScheduled,
+    TerminalFailed,
+    DeliveryUnknown,
+    LeaseLost,
+}
+
 impl VoiceJob {
     pub fn media(&self) -> anyhow::Result<VoiceMedia> {
         let kind = VoiceMediaKind::parse(&self.media_kind)
@@ -186,6 +194,25 @@ pub async fn claim_next_voice_job(pool: &PgPool) -> anyhow::Result<Option<VoiceJ
     Ok(row.map(row_to_job))
 }
 
+pub async fn recover_expired_voice_deliveries(pool: &PgPool) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        update voice_transcription_jobs
+        set status = 'delivery_unknown',
+            error_kind = 'delivery_unknown',
+            error = 'delivery lease expired after Telegram send started',
+            processing_started_at = null,
+            lease_expires_at = null,
+            updated_at = now()
+        where status = 'delivering'
+          and lease_expires_at <= now()
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn save_progress_message(
     pool: &PgPool,
     job: &VoiceJob,
@@ -220,7 +247,9 @@ pub async fn mark_voice_job_phase(
             lease_expires_at = now() + ($3 * interval '1 second'),
             updated_at = now()
         where id = $1 and attempts = $4
-          and status in ('processing', 'downloading', 'transcribing', 'cleaning')
+          and status in (
+              'processing', 'downloading', 'transcribing', 'cleaning', 'delivering'
+          )
           and lease_expires_at > now()
         "#,
     )
@@ -238,13 +267,14 @@ pub async fn mark_voice_job_failed(
     job: &VoiceJob,
     error_kind: &str,
     error: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VoiceTransition> {
     let result = sqlx::query(
         r#"
         update voice_transcription_jobs
         set status = 'failed', error_kind = $2, error = $3,
             processing_started_at = null, lease_expires_at = null, updated_at = now()
-        where id = $1 and attempts = $4 and status <> 'sent'
+        where id = $1 and attempts = $4
+          and status not in ('sent', 'delivery_unknown')
         "#,
     )
     .bind(job.id)
@@ -253,7 +283,11 @@ pub async fn mark_voice_job_failed(
     .bind(job.attempts)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() == 1)
+    match result.rows_affected() {
+        0 => Ok(VoiceTransition::LeaseLost),
+        1 => Ok(VoiceTransition::TerminalFailed),
+        count => anyhow::bail!("voice failure transition unexpectedly affected {count} rows"),
+    }
 }
 
 pub async fn mark_voice_job_retry_or_failed(
@@ -261,16 +295,17 @@ pub async fn mark_voice_job_retry_or_failed(
     job: &VoiceJob,
     error_kind: &str,
     error: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<VoiceTransition> {
     let next_delay = VOICE_TRANSCRIPTION_RETRY.delay_seconds(job.attempts, None);
     if let Some(delay) = next_delay {
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             update voice_transcription_jobs
             set status = 'retry_wait', error_kind = $2, error = $3,
                 next_attempt_at = now() + ($4 * interval '1 second'),
                 processing_started_at = null, lease_expires_at = null, updated_at = now()
-            where id = $1 and attempts = $5 and status <> 'sent'
+            where id = $1 and attempts = $5
+              and status not in ('sent', 'delivery_unknown')
             "#,
         )
         .bind(job.id)
@@ -280,10 +315,45 @@ pub async fn mark_voice_job_retry_or_failed(
         .bind(job.attempts)
         .execute(pool)
         .await?;
+        match result.rows_affected() {
+            0 => Ok(VoiceTransition::LeaseLost),
+            1 => Ok(VoiceTransition::RetryScheduled),
+            count => anyhow::bail!("voice retry transition unexpectedly affected {count} rows"),
+        }
     } else {
-        mark_voice_job_failed(pool, job, error_kind, error).await?;
+        mark_voice_job_failed(pool, job, error_kind, error).await
     }
-    Ok(())
+}
+
+pub async fn mark_voice_job_delivery_unknown(
+    pool: &PgPool,
+    job: &VoiceJob,
+    error: &str,
+) -> anyhow::Result<VoiceTransition> {
+    let result = sqlx::query(
+        r#"
+        update voice_transcription_jobs
+        set status = 'delivery_unknown',
+            error_kind = 'delivery_unknown',
+            error = $2,
+            processing_started_at = null,
+            lease_expires_at = null,
+            updated_at = now()
+        where id = $1 and attempts = $3 and status = 'delivering'
+        "#,
+    )
+    .bind(job.id)
+    .bind(error)
+    .bind(job.attempts)
+    .execute(pool)
+    .await?;
+    match result.rows_affected() {
+        0 => Ok(VoiceTransition::LeaseLost),
+        1 => Ok(VoiceTransition::DeliveryUnknown),
+        count => {
+            anyhow::bail!("voice delivery-unknown transition unexpectedly affected {count} rows")
+        }
+    }
 }
 
 pub async fn mark_voice_job_skipped(
@@ -360,7 +430,7 @@ pub async fn save_voice_result(
             processing_started_at = null,
             lease_expires_at = null,
             updated_at = now()
-        where id = $1 and attempts = $9 and status = 'cleaning'
+        where id = $1 and attempts = $9 and status = 'delivering'
           and lease_expires_at > now()
         "#,
     )

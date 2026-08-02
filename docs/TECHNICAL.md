@@ -512,12 +512,14 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
 9. Сразу после preflight отправить reply `Расшифровка…`; для обычного результата заменить его через `editMessageText`, а для Rich/file варианта обновить его статусом и отправить полный payload отдельным сообщением.
 10. Сохранить raw ASR text, segments и raw JSON.
-10. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
-11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
-12. Собрать Telegram HTML через `telegram::html`.
-13. Отправить reply: одно сообщение или preview + `voice-transcript.txt`.
-14. Каждый job claim-ится через `FOR UPDATE SKIP LOCKED`, получает lease и CAS-переходы по `attempts`; transient failure переводит его в bounded `retry_wait`, исчерпание retry — в `failed`. Просроченные leases подбирает фоновый worker.
-14. Сохранить cleaned text, chapters JSON, final HTML и file id.
+11. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
+12. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
+13. Собрать Telegram HTML через `telegram::html`.
+14. Перевести job из `cleaning` в `delivering` перед первым постоянным Telegram side effect.
+15. Отправить reply: одно сообщение или preview + `voice-transcript.txt`.
+16. После подтверждённой доставки сохранить cleaned text, chapters JSON, final HTML и file id и перевести job в `sent`.
+17. Каждый job claim-ится через `FOR UPDATE SKIP LOCKED`, получает lease и CAS-переходы по `attempts`; pre-send/transient failure переводит его в bounded `retry_wait`, исчерпание retry — в `failed`.
+18. Неоднозначный network/timeout результат доставки, а также ошибка DB-finalization после успешной отправки, переводит job в `delivery_unknown` без автоматической повторной доставки. Просроченный lease в `delivering` также восстанавливается в `delivery_unknown`, а не подбирается как обычный processing job.
 
 ASR request:
 

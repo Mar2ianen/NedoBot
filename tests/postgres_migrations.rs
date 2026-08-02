@@ -50,8 +50,9 @@ use tg_ai_bot_teloxide::features::{
     },
     voice::{
         repo::{
-            claim_next_voice_job, claim_voice_job, create_voice_job, mark_voice_job_phase,
-            mark_voice_job_retry_or_failed, save_progress_message,
+            VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
+            mark_voice_job_delivery_unknown, mark_voice_job_phase, mark_voice_job_retry_or_failed,
+            recover_expired_voice_deliveries, save_progress_message,
         },
         types::{VoiceMedia, VoiceMediaKind},
     },
@@ -436,6 +437,140 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("due voice retry must be claimed");
     assert_eq!(retry_claim.id, job.id);
 
+    query("update voice_transcription_jobs set attempts = attempts + 1 where id = $1")
+        .bind(job.id)
+        .execute(pool)
+        .await
+        .expect("stale voice lease fixture must update attempts");
+    assert_eq!(
+        mark_voice_job_retry_or_failed(pool, &job, "stale", "stale lease")
+            .await
+            .expect("stale voice transition must be classified"),
+        VoiceTransition::LeaseLost,
+        "a CAS miss must not be reported as a successful retry"
+    );
+
+    let unknown_media = VoiceMedia {
+        message_id: message_id + 3,
+        file_id: format!("unknown-file-{suffix}"),
+        file_unique_id: Some(format!("unknown-unique-{suffix}")),
+        ..media.clone()
+    };
+    let unknown_id = create_voice_job(pool, &unknown_media)
+        .await
+        .expect("delivery-unknown voice job must be created")
+        .expect("delivery-unknown voice job id must be returned");
+    let unknown_job = claim_voice_job(pool, unknown_id)
+        .await
+        .expect("delivery-unknown voice job must be claimable")
+        .expect("delivery-unknown voice claim must be present");
+    assert!(
+        mark_voice_job_phase(pool, &unknown_job, "delivering")
+            .await
+            .expect("voice delivering phase must be persisted")
+    );
+    assert_eq!(
+        mark_voice_job_delivery_unknown(pool, &unknown_job, "ambiguous Telegram response")
+            .await
+            .expect("delivery-unknown transition must succeed"),
+        VoiceTransition::DeliveryUnknown
+    );
+    let unknown_status: String =
+        query_scalar("select status from voice_transcription_jobs where id = $1")
+            .bind(unknown_id)
+            .fetch_one(pool)
+            .await
+            .expect("delivery-unknown status must be readable");
+    assert_eq!(unknown_status, "delivery_unknown");
+    assert!(
+        claim_voice_job(pool, unknown_id)
+            .await
+            .expect("delivery-unknown job must be queryable")
+            .is_none(),
+        "an unknown Telegram outcome must never be retried automatically"
+    );
+
+    let active_delivery_media = VoiceMedia {
+        message_id: message_id + 4,
+        file_id: format!("active-delivery-file-{suffix}"),
+        file_unique_id: Some(format!("active-delivery-unique-{suffix}")),
+        ..media.clone()
+    };
+    let active_delivery_id = create_voice_job(pool, &active_delivery_media)
+        .await
+        .expect("active-delivery voice job must be created")
+        .expect("active-delivery voice job id must be returned");
+    let active_delivery_job = claim_voice_job(pool, active_delivery_id)
+        .await
+        .expect("active-delivery voice job must be claimable")
+        .expect("active-delivery voice claim must be present");
+    assert!(
+        mark_voice_job_phase(pool, &active_delivery_job, "delivering")
+            .await
+            .expect("active delivering phase must be persisted")
+    );
+    assert_eq!(
+        recover_expired_voice_deliveries(pool)
+            .await
+            .expect("active delivery recovery must succeed"),
+        0,
+        "an active delivering lease must not be recovered"
+    );
+    assert!(
+        claim_voice_job(pool, active_delivery_id)
+            .await
+            .expect("active delivering job must be queryable")
+            .is_none(),
+        "an active delivering lease must not be claimed as processing"
+    );
+
+    let expired_delivery_media = VoiceMedia {
+        message_id: message_id + 5,
+        file_id: format!("expired-delivery-file-{suffix}"),
+        file_unique_id: Some(format!("expired-delivery-unique-{suffix}")),
+        ..media.clone()
+    };
+    let expired_delivery_id = create_voice_job(pool, &expired_delivery_media)
+        .await
+        .expect("expired-delivery voice job must be created")
+        .expect("expired-delivery voice job id must be returned");
+    let expired_delivery_job = claim_voice_job(pool, expired_delivery_id)
+        .await
+        .expect("expired-delivery voice job must be claimable")
+        .expect("expired-delivery voice claim must be present");
+    assert!(
+        mark_voice_job_phase(pool, &expired_delivery_job, "delivering")
+            .await
+            .expect("expired delivering phase must be persisted")
+    );
+    query(
+        "update voice_transcription_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(expired_delivery_id)
+    .execute(pool)
+    .await
+    .expect("expired delivery lease must be made stale");
+    assert_eq!(
+        recover_expired_voice_deliveries(pool)
+            .await
+            .expect("expired delivery recovery must succeed"),
+        1
+    );
+    let expired_status: String =
+        query_scalar("select status from voice_transcription_jobs where id = $1")
+            .bind(expired_delivery_id)
+            .fetch_one(pool)
+            .await
+            .expect("expired delivery status must be readable");
+    assert_eq!(expired_status, "delivery_unknown");
+    assert!(
+        claim_voice_job(pool, expired_delivery_id)
+            .await
+            .expect("expired delivery job must be queryable")
+            .is_none(),
+        "an expired delivering job must not be replayed"
+    );
+
     let terminal_media = VoiceMedia {
         message_id: message_id + 1,
         file_id: format!("terminal-file-{suffix}"),
@@ -490,10 +625,13 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         "sent voice jobs must not be processed again"
     );
 
-    query("delete from voice_transcription_jobs where id in ($1, $2, $3)")
+    query("delete from voice_transcription_jobs where id in ($1, $2, $3, $4, $5, $6)")
         .bind(job.id)
         .bind(terminal_id)
         .bind(sent_id)
+        .bind(unknown_id)
+        .bind(active_delivery_id)
+        .bind(expired_delivery_id)
         .execute(pool)
         .await
         .expect("voice lifecycle fixtures must be cleaned up");
