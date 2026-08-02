@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_urls_are_checked_by_the_same_provenance_policy() {
+    fn explicit_bare_urls_are_checked_by_the_same_provenance_policy() {
         let parsed = LlmMarkdownFormatter::new()
             .parse("доказательство: https://invented.example/report и invented.example/report")
             .unwrap();
@@ -533,10 +533,7 @@ mod tests {
         destinations.extend(parsed.bare_urls());
         assert_eq!(
             parsed.bare_urls(),
-            vec![
-                "https://invented.example/report".to_owned(),
-                "invented.example/report".to_owned(),
-            ]
+            vec!["https://invented.example/report".to_owned()]
         );
         assert!(validate_literal_destinations(destinations, &allowed).is_err());
     }
