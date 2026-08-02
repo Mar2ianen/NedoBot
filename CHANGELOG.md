@@ -31,12 +31,12 @@ All notable changes to NedoBot are documented here.
 
 ### Changed
 
-- NedoBot pins the exact teloxide implementation used by the semantic Rich Text renderer (`65f3a1d4fb6d62c2a1bca38af15270eb2e5c5a4f`);
+- NedoBot pins the exact teloxide implementation used by the semantic Rich Text renderer (`35bd93175a6dc7cc05ec100caa4b44cdd72530db`);
 - `/ask` stores source Markdown separately from compiled Markdown so delivered Telegram payloads can be replayed without reparsing with a newer renderer or timezone database;
 - the current release candidate is covered by [teloxide PR #41](https://github.com/Mar2ianen/teloxide-fork/pull/41) and [NedoBot PR #11](https://github.com/Mar2ianen/NedoBot/pull/11).
 
 ### Verification
 
-- teloxide implementation revision pinned by `Cargo.toml`: `65f3a1d4fb6d62c2a1bca38af15270eb2e5c5a4f`;
+- teloxide implementation revision pinned by `Cargo.toml`: `35bd93175a6dc7cc05ec100caa4b44cdd72530db`;
 - teloxide documentation/PR review head and CI run IDs are intentionally kept in PR #41/#11 rather than this version-controlled changelog;
 - merge and deploy are intentionally not part of this release-candidate change.
