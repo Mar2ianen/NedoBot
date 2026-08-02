@@ -30,8 +30,8 @@ All notable changes to NedoBot are documented here.
 
 ### Verification
 
-- teloxide head: `36d2863199988be935f011e32ef5a3ae1da05137`;
-- NedoBot head: `38f4f57ee61cca49391987b5cfdb80b9bee1972d`;
-- teloxide CI: [30757236495](https://github.com/Mar2ianen/teloxide-fork/actions/runs/30757236495);
-- NedoBot CI: [30757384206](https://github.com/Mar2ianen/NedoBot/actions/runs/30757384206);
+- teloxide head: `20269818ba27de4c010c9ff52ad2fd4d080403a3`;
+- NedoBot head: `45d0ef298063ef903ac8d2d8a02c2abb397dca44`;
+- teloxide CI: [30759297569](https://github.com/Mar2ianen/teloxide-fork/actions/runs/30759297569);
+- NedoBot CI: [30759297818](https://github.com/Mar2ianen/NedoBot/actions/runs/30759297818);
 - merge and deploy are intentionally not part of this release-candidate change.
