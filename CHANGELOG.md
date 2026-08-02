@@ -10,9 +10,11 @@ All notable changes to NedoBot are documented here.
 - explicit time, trusted link-alias and custom-emoji bindings in one render context;
 - `chat`, `message_<id>` and `source_N` aliases built only from observed or trusted application data;
 - delivery certainty and immutable render audit fields for `captured_now`, dialect, timezone, renderer revision and compiled Markdown;
-- provenance validation for Markdown links and bare URLs before final delivery;
+- provenance validation for Markdown links and explicit-scheme bare URLs before final delivery;
 - safe fallback policy: fallback is allowed only for `NotAttempted` or confirmed `Rejected`, and is suppressed for `Unknown` delivery;
 - lifecycle previews through shared Drafter: native drafts in private chats and one editable Rich Message in groups.
+- durable voice transcription jobs with leases, bounded retries, recovery and CAS-guarded stage transitions;
+- RMCP child-process transport for external search instead of a hand-written JSON-lines protocol.
 
 ### Fixed
 
@@ -21,17 +23,18 @@ All notable changes to NedoBot are documented here.
 - temporary progress previews are cleaned best-effort after confirmed final rejection;
 - citations include bare Telegram message URLs as well as aliases and Markdown link destinations;
 - unknown or untrusted literal URLs are rejected before Telegram delivery.
+- ordinary dotted text is no longer classified as a bare URL; only explicit-scheme URLs enter provenance validation.
+- reaction import rejects totals outside the PostgreSQL integer range instead of truncating them.
+- literal LIKE filters escape `%`, `_` and `\\` while preserving case-sensitive and case-insensitive matching.
 
 ### Changed
 
-- NedoBot pins the exact teloxide implementation used by the semantic Rich Text renderer;
+- NedoBot pins the exact teloxide implementation used by the semantic Rich Text renderer (`6241c08b5f4f4f9d96c4c746728add6ad26761ff`);
 - `/ask` stores source Markdown separately from compiled Markdown so delivered Telegram payloads can be replayed without reparsing with a newer renderer or timezone database;
 - the current release candidate is covered by [teloxide PR #41](https://github.com/Mar2ianen/teloxide-fork/pull/41) and [NedoBot PR #11](https://github.com/Mar2ianen/NedoBot/pull/11).
 
 ### Verification
 
-- teloxide head: `20269818ba27de4c010c9ff52ad2fd4d080403a3`;
-- NedoBot head: `45d0ef298063ef903ac8d2d8a02c2abb397dca44`;
-- teloxide CI: [30759297569](https://github.com/Mar2ianen/teloxide-fork/actions/runs/30759297569);
-- NedoBot CI: [30759297818](https://github.com/Mar2ianen/NedoBot/actions/runs/30759297818);
+- teloxide implementation revision pinned by `Cargo.toml`: `6241c08b5f4f4f9d96c4c746728add6ad26761ff`;
+- teloxide documentation/PR review head and CI run IDs are intentionally kept in PR #41/#11 rather than this version-controlled changelog;
 - merge and deploy are intentionally not part of this release-candidate change.

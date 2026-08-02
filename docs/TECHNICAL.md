@@ -111,7 +111,7 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 `LLM_PROFILES_PATH` необязателен только для локального запуска: без него загружается `config/llm_profiles.toml.example`. Для production unit обязан задавать абсолютный `LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml`; на относительный путь под systemd рассчитывать нельзя. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
 
-`runtime.render_timezone` задаёт IANA-зону для явного time rendering; текущий deployment использует `Europe/Moscow`. Значение проверяется на старте через teloxide feature `rich-text`, поэтому неизвестная зона останавливает запуск. Общий semantic Rich Text pipeline доступен через canonical `teloxide::utils::rich_text` и имеет три явных frontend-а: HTML (`<tg-time>`, `<tg-emoji>`, `<a href>`), developer Markdown (`@time(...)`, `:alias:`, `[label](alias)`) и LLM Markdown (`14:::00/`, `now+3h/`, `:alias:`, `[label](alias)`). `/ask` использует LLM frontend с одним `RichTextRenderContext`: `chat` всегда разрешается из конфигурации, `message_<id>` строится только для реально наблюдавшихся сообщений, `source_N` — из URL, реально возвращённых web/GitHub search, а custom emoji aliases добавляются только для настроенных ID. Literal URL, включая raw/bare URL вне code spans и link destinations, в ответе допускается только если он присутствовал во входном вопросе/reply, был возвращён trusted tool evidence или входит в application allowlist; остальные destination отклоняются до delivery. Время захватывается один раз за render call. Progress preview формируется отдельно; compiled payload используется для final delivery и всех внутренних retry окончательной отправки. `Instant` задаёт точный абсолютный момент. `CivilDateTime` задаёт локальное civil time и при DST gap/fold разрешается детерминированной compatible policy, поэтому не является заранее точным instant. Bare clock дополнительно привязывается к локальной дате из одного `captured_now`; если для события нельзя детерминированно выбрать одну fold-инстанцию, вызывающий код обязан передать `Instant`.
+`runtime.render_timezone` задаёт IANA-зону для явного time rendering; текущий deployment использует `Europe/Moscow`. Значение проверяется на старте через teloxide feature `rich-text`, поэтому неизвестная зона останавливает запуск. Общий semantic Rich Text pipeline доступен через canonical `teloxide::utils::rich_text` и имеет три явных frontend-а: HTML (`<tg-time>`, `<tg-emoji>`, `<a href>`), developer Markdown (`@time(...)`, `:alias:`, `[label](alias)`) и LLM Markdown (`14:::00/`, `now+3h/`, `:alias:`, `[label](alias)`). `/ask` использует LLM frontend с одним `RichTextRenderContext`: `chat` всегда разрешается из конфигурации, `message_<id>` строится только для реально наблюдавшихся сообщений, `source_N` — из URL, реально возвращённых web/GitHub search, а custom emoji aliases добавляются только для настроенных ID. Literal URL, включая explicit-scheme raw/bare URL вне code spans и link destinations, в ответе допускается только если он присутствовал во входном вопросе/reply, был возвращён trusted tool evidence или входит в application allowlist; обычный dotted текст без URI scheme не сканируется как URL, а остальные destination отклоняются до delivery. Время захватывается один раз за render call. Progress preview формируется отдельно; compiled payload используется для final delivery и всех внутренних retry окончательной отправки. `Instant` задаёт точный абсолютный момент. `CivilDateTime` задаёт локальное civil time и при DST gap/fold разрешается детерминированной compatible policy, поэтому не является заранее точным instant. Bare clock дополнительно привязывается к локальной дате из одного `captured_now`; если для события нельзя детерминированно выбрать одну fold-инстанцию, вызывающий код обязан передать `Instant`.
 
 Civil date/time и bare clock нормализуются через эту зону с compatible DST disambiguation: пропущенное локальное время сдвигается вперёд, неоднозначное выбирается детерминированно. Для точного автоматического события нужно передавать `Instant`; `CivilDateTime` остаётся локальным временем с deterministic compatible resolution, а bare clock — best-effort представлением.
 
@@ -307,11 +307,29 @@ ssh vps-153 'podman ps'
 
 `https://nedobot.chickenkiller.com/mcp/nedonews/v2` — намеренно публичный MCP Streamable HTTP endpoint с данными только `НедоNews Chat`. Версия в URL отделяет RMCP-контракт от удалённого legacy JSON-RPC API: внешний клиент обязан выполнить `tools/list`, а не переиспользовать старые input/output schemas. Endpoint не даёт ни SQL, ни shell, ни доступ к `public.*`: отдельная PostgreSQL-роль `nedobot_mcp_ro` читает лишь явно перечисленные views схемы `mcp_public`.
 
-- Миграция `20260717180000_mcp_public_views.sql` задаёт scope и explicit-колонки. Private chat/DM и raw Telegram JSON не публикуются; полный reviewed inventory опубликованных view и полей находится в [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md).
+- Миграция `20260717180000_mcp_public_views.sql` задаёт scope и explicit-колонки. Foreign/private chat scope и raw Telegram API JSON не выдаются как общий доступ; personal-channel поля, явно включённые в `mcp_public`, входят в фактический контракт ниже. Полный reviewed inventory опубликованных view и полей находится в [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md).
 - `config/mcp_db_manifest.toml` — проверяемый allowlist views, колонок и их типов, а [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md) — его human-readable snapshot. При старте MCP сверяет manifest с БД и отказывается стартовать при schema drift.
 - Внешнему клиенту доступны только структурированные `db.*` и read-only domain tools; значения передаются bind-параметрами, лимит одной страницы — 200, effective column list — 40. Generic page собирается до logical rows budget 480 KiB, затем возвращает корректные `has_more`/`next_cursor`; запас учитывает дублирование RMCP text и structured content в wire response. Широкие views требуют явно передать `columns`. Одно text-поле может содержать до 8192 символов, domain message tools возвращают preview до 4096 символов; при превышении text, JSONB и array поля сообщают `_truncated_fields`, а preview заканчивается `…`. Aggregate `min`/`max` возвращает полное значение либо контролируемую ошибку budget. Соединений с БД — два, `statement_timeout` — 5 секунд.
 - `db.search_text` и `chat.search_messages` принимают `match_mode`: `contains` (дефолтный поиск подстроки) или `whole_word` (точное слово/фраза с PostgreSQL word boundaries). Флаг `case_sensitive=false` по умолчанию; для имён и терминов без ложных совпадений вроде `Оля`/`доля` использовать `match_mode: "whole_word"`.
 - JSON рекурсивно очищается от ключей наподобие `token`, `secret`, `authorization`, `database_url` и `invite_link`. В логах сохраняются только tool, table/columns/operators, количество строк и latency — без текстов сообщений и значений фильтров.
+
+### Public MCP data exposure contract
+
+Это фактический и сознательно принятый контракт экспозиции, а не обещание privacy-minimized projection. HTTP adapter по умолчанию слушает только `127.0.0.1` и не использует application authentication; если deployment настраивает внешний reverse proxy, именно он расширяет доступность endpoint-а и отвечает за внешний контроль доступа.
+
+`mcp_public` остаётся curated read model с reviewed scope и allowlist-ом, но обычные внутренние данные публичного chat read-model не скрываются только потому, что они внутренние. В зависимости от view и domain tool внешнему клиенту доступны, среди прочего:
+
+- `profile_photo_file_unique_id` и другие `file_unique_id` профиля или медиа;
+- сведения и последний текст personal channel;
+- raw voice transcripts, ASR segments и final render;
+- LLM prompts, responses и final output;
+- вопросы и ответы `/ask`, audit-поля и tool arguments;
+- anti-spam risk scores, reasons и labels;
+- admin event payload;
+- chat notes и user notes;
+- тексты сообщений и job errors.
+
+Sanitization удаляет только распознанные secret-like JSON keys и не является общим фильтром приватности. SQL, запись, shell и доступ к foreign/private chat scope по-прежнему не выдаются. Изменение этого набора — отдельный reviewed contract change; в текущем PR views, manifest и sanitization намеренно не меняются.
 
 Публикация новой таблицы или колонки — отдельный reviewed change: правка projection view, затем генерация и review manifest. Автоматически новые поля не раскрываются:
 
@@ -488,7 +506,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 2. Отфильтровать чужие чаты, ботов, команды и automatic forwards.
 3. Определить `VoiceMedia` из `voice`, `audio` или `video_note`.
 4. Сохранить исходное Telegram message в `telegram_messages`.
-5. Создать `voice_transcription_jobs`; повтор того же `(chat_id, message_id)` не создаёт новый job.
+5. Создать или возобновить `voice_transcription_jobs`; повтор того же `(chat_id, message_id)` не создаёт дубликат и не мешает reclaim просроченного lease.
 6. Проверить duration/file size до скачивания.
 7. Скачать файл через Telegram `getFile` во временный файл.
 8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
@@ -498,6 +516,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
 12. Собрать Telegram HTML через `telegram::html`.
 13. Отправить reply: одно сообщение или preview + `voice-transcript.txt`.
+14. Каждый job claim-ится через `FOR UPDATE SKIP LOCKED`, получает lease и CAS-переходы по `attempts`; transient failure переводит его в bounded `retry_wait`, исчерпание retry — в `failed`. Просроченные leases подбирает фоновый worker.
 14. Сохранить cleaned text, chapters JSON, final HTML и file id.
 
 ASR request:
