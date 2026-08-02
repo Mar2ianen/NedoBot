@@ -21,6 +21,8 @@
   ·
   <a href="docs/TECHNICAL.md">Docs</a>
   ·
+  <a href="CHANGELOG.md">Changelog</a>
+  ·
   <a href="docs/DEPLOYMENT.md">Deployment</a>
   ·
   <a href="prompts/first_comment.md">Prompt</a>
