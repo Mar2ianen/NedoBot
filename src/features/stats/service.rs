@@ -176,8 +176,8 @@ pub async fn user_stats_report_data(
     ) = cached.as_ref().map_or_else(
         || {
             (
-                "нет данных".to_string(),
-                "нет данных".to_string(),
+                None,
+                None,
                 "нет данных".to_string(),
                 "нет данных".to_string(),
                 None,
@@ -186,14 +186,8 @@ pub async fn user_stats_report_data(
         },
         |stats| {
             (
-                stats
-                    .first_seen_at
-                    .clone()
-                    .unwrap_or_else(|| "нет данных".to_string()),
-                stats
-                    .last_seen_at
-                    .clone()
-                    .unwrap_or_else(|| "нет данных".to_string()),
+                stats.first_seen_at,
+                stats.last_seen_at,
                 stats
                     .first_message_id
                     .map(|value| value.to_string())
@@ -218,7 +212,7 @@ pub async fn user_stats_report_data(
         profile_photo_file_unique_id: profile
             .as_ref()
             .and_then(|value| value.profile_photo_file_unique_id.clone()),
-        observed_at: member.as_ref().and_then(|value| value.observed_at.clone()),
+        observed_at: member.as_ref().and_then(|value| value.observed_at),
         written_tag: member.as_ref().and_then(|value| value.written_tag.clone()),
         user,
         first_seen_at,

@@ -4,6 +4,7 @@ use crate::features::stats::types::{
 };
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
+use chrono::{DateTime, Utc};
 use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
 pub fn chat_stats(
@@ -213,6 +214,7 @@ pub fn user_stats(
     data: Option<&UserStatsReportData>,
     requested_target: Option<&str>,
     discussion_chat_id: i64,
+    time: &TimeContext,
 ) -> String {
     let Some(data) = data else {
         return match requested_target.map(str::trim).filter(|value| !value.is_empty()) { Some(_) => "<h1>Профиль не найден</h1><p>Не нашёл пользователя. Используй id, username из уже виденных ботом пользователей или reply на сообщение.</p>".to_string(), None => "<h1>Профиль не найден</h1><p>Не понял, кого смотреть. Передай id, username или reply на сообщение.</p>".to_string() };
@@ -296,18 +298,20 @@ pub fn user_stats(
                 "первое сообщение".into(),
                 linked_message(
                     discussion_chat_id,
-                    &data.first_seen_at,
+                    data.first_seen_at.as_ref(),
                     &data.first_message_id,
-                    data.first_seen_days_ago
+                    data.first_seen_days_ago,
+                    time,
                 )
             ],
             vec![
                 "последнее сообщение".into(),
                 linked_message(
                     discussion_chat_id,
-                    &data.last_seen_at,
+                    data.last_seen_at.as_ref(),
                     &data.last_message_id,
-                    data.last_seen_days_ago
+                    data.last_seen_days_ago,
+                    time,
                 )
             ],
             vec!["частые слова".into(), top_words],
@@ -377,24 +381,23 @@ fn user_or_message_link(
 }
 fn linked_message(
     chat_id: i64,
-    date_label: &str,
+    date: Option<&DateTime<Utc>>,
     message_id: &str,
     days_ago: Option<i64>,
+    time: &TimeContext,
 ) -> String {
+    let date_label = crate::features::stats::render_html::format_datetime(time, date);
     let label = days_ago.map_or_else(
-        || date_label.to_string(),
+        || date_label.clone(),
         |days| format!("{date_label} ({days} дн. назад)"),
     );
     match message_id.parse::<i32>() {
-        Ok(message_id) => format!(
-            "{} (#<code>{}</code>)",
-            Html::link(label, message_url(chat_id, message_id)).into_string(),
-            message_id
-        ),
-        Err(_) => format!(
-            "{} (#<code>{}</code>)",
-            escape_html(date_label),
-            escape_html(message_id)
-        ),
+        Ok(message_id) => {
+            let message_link =
+                Html::link(format!("#{message_id}"), message_url(chat_id, message_id))
+                    .into_string();
+            format!("{label} ({message_link})")
+        }
+        Err(_) => format!("{} (#<code>{}</code>)", date_label, escape_html(message_id)),
     }
 }

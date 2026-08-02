@@ -79,31 +79,43 @@ pub async fn send_top_reacted(
     Ok(())
 }
 
+pub struct UserStatsTarget<'a> {
+    pub target: Option<&'a str>,
+    pub reply_user_id: Option<i64>,
+}
+
 pub async fn send_user_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
     config: &Config,
-    target: Option<&str>,
-    reply_user_id: Option<i64>,
+    main_formatter: &MainMarkdownFormatter,
+    target: UserStatsTarget<'_>,
     render: StatsRender,
 ) -> ResponseResult<()> {
-    if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
+    if let Some(user_id) = numeric_target_user_id(target.target).or(target.reply_user_id) {
         service::refresh_user_profile(bot, pool, config, user_id).await;
     }
-    let mut data = service::user_stats_report_data(pool, config, target, reply_user_id)
-        .await
-        .map_err(stats_error("failed to build user stats"))?;
+    let mut data =
+        service::user_stats_report_data(pool, config, target.target, target.reply_user_id)
+            .await
+            .map_err(stats_error("failed to build user stats"))?;
     if let (StatsRender::Rich, Some(data)) = (render, data.as_mut()) {
         service::enrich_user_stats_avatar(bot, config, data).await;
     }
     let report = match render {
-        StatsRender::Html => {
-            render_html::user_stats(data.as_ref(), target, config.discussion_chat_id)
-        }
-        StatsRender::Rich => {
-            render_rich::user_stats(data.as_ref(), target, config.discussion_chat_id)
-        }
+        StatsRender::Html => render_html::user_stats(
+            data.as_ref(),
+            target.target,
+            config.discussion_chat_id,
+            main_formatter.time(),
+        ),
+        StatsRender::Rich => render_rich::user_stats(
+            data.as_ref(),
+            target.target,
+            config.discussion_chat_id,
+            main_formatter.time(),
+        ),
     };
     send_stats_report(bot, chat_id, report, render).await?;
     Ok(())
