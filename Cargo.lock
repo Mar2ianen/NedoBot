@@ -3157,7 +3157,7 @@ checksum = "20f34339676cdcab560c9a82300c4c2581f68b9369aedf0fae86f2ff9565ff3e"
 [[package]]
 name = "teloxide"
 version = "0.18.0"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=e141bbc823fd9cd1ba8c59901e34da2282a0c4bd#e141bbc823fd9cd1ba8c59901e34da2282a0c4bd"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=a22d379e862889a4afdb9a5204f48dc8eb4a21df#a22d379e862889a4afdb9a5204f48dc8eb4a21df"
 dependencies = [
  "aquamarine",
  "bytes",
@@ -3183,7 +3183,7 @@ dependencies = [
 [[package]]
 name = "teloxide-core"
 version = "0.14.0"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=e141bbc823fd9cd1ba8c59901e34da2282a0c4bd#e141bbc823fd9cd1ba8c59901e34da2282a0c4bd"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=a22d379e862889a4afdb9a5204f48dc8eb4a21df#a22d379e862889a4afdb9a5204f48dc8eb4a21df"
 dependencies = [
  "bitflags 2.13.0",
  "bytes",
@@ -3215,7 +3215,7 @@ dependencies = [
 [[package]]
 name = "teloxide-macros"
 version = "0.11.0"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=e141bbc823fd9cd1ba8c59901e34da2282a0c4bd#e141bbc823fd9cd1ba8c59901e34da2282a0c4bd"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=a22d379e862889a4afdb9a5204f48dc8eb4a21df#a22d379e862889a4afdb9a5204f48dc8eb4a21df"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3260,6 +3260,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

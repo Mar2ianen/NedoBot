@@ -84,7 +84,7 @@
   <tr>
     <td width="50%">
       <h3>Универсальный /ask</h3>
-      <p>Показывает этапы исследования прямо в чате, ищет по истории и reply-веткам, понимает участников и фото в reply, при необходимости подключает web и GitHub и отвечает в Rich Markdown со ссылками на сообщения.</p>
+      <p>Показывает этапы исследования прямо в чате, ищет по истории и reply-веткам, понимает участников и фото в reply, при необходимости подключает web и GitHub и отвечает через semantic Rich Text: локализованное время, trusted link aliases и custom emoji bindings.</p>
     </td>
     <td width="50%">
       <h3>Безопасные инструменты</h3>
@@ -129,6 +129,7 @@
 - [x] базовая расшифровка voice/audio/кружков через Groq ASR;
 - [x] агентный `/ask` с ограниченными read-only инструментами чата, web и GitHub;
 - [x] аудит `/ask`: запросы, инструменты, задержки и безопасные статусы ошибок;
+- [x] semantic Rich Text `/ask`: LLM Markdown time markers, `chat`/`message_<id>` aliases и настроенные custom emoji bindings;
 - [x] deterministic time rendering `/ask` с captured `now`, timezone, renderer revision и compiled-payload audit;
 - [x] delivery certainty для final/segment lifecycle и запрет fallback при `Unknown`;
 - [x] публичная HTTPS-раздача кэшированных аватарок Telegram;
