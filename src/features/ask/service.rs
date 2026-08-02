@@ -377,11 +377,9 @@ impl<'a> AskService<'a> {
                 add_allowed_url(&mut allowed, &url);
             }
         }
-        for text in [Some(question), reply_context] {
-            if let Some(text) = text {
-                for url in extract_urls(text) {
-                    allowed.insert(url);
-                }
+        for text in [Some(question), reply_context].into_iter().flatten() {
+            for url in extract_urls(text) {
+                allowed.insert(url);
             }
         }
         validate_literal_destinations(parsed.link_destinations(), &allowed)
