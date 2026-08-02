@@ -14,6 +14,7 @@ All notable changes to NedoBot are documented here.
 - safe fallback policy: fallback is allowed only for `NotAttempted` or confirmed `Rejected`, and is suppressed for `Unknown` delivery;
 - lifecycle previews through shared Drafter: native drafts in private chats and one editable Rich Message in groups.
 - durable voice transcription jobs with leases, bounded retries, recovery and CAS-guarded stage transitions;
+- durable voice delivery now separates `delivering`, `sent` and `delivery_unknown`, so an ambiguous Telegram result or DB finalization failure is never replayed automatically;
 - RMCP child-process transport for external search instead of a hand-written JSON-lines protocol.
 
 ### Fixed
@@ -26,15 +27,16 @@ All notable changes to NedoBot are documented here.
 - ordinary dotted text is no longer classified as a bare URL; only explicit-scheme URLs enter provenance validation.
 - reaction import rejects totals outside the PostgreSQL integer range instead of truncating them.
 - literal LIKE filters escape `%`, `_` and `\\` while preserving case-sensitive and case-insensitive matching.
+- terminal Drafter deadlines clean confirmed non-deliveries under a fresh cleanup timeout without touching ambiguous previews.
 
 ### Changed
 
-- NedoBot pins the exact teloxide implementation used by the semantic Rich Text renderer (`a7364c69a6cfd553133c2b89d19f44f2718e377a`);
+- NedoBot pins the exact teloxide implementation used by the semantic Rich Text renderer (`65f3a1d4fb6d62c2a1bca38af15270eb2e5c5a4f`);
 - `/ask` stores source Markdown separately from compiled Markdown so delivered Telegram payloads can be replayed without reparsing with a newer renderer or timezone database;
 - the current release candidate is covered by [teloxide PR #41](https://github.com/Mar2ianen/teloxide-fork/pull/41) and [NedoBot PR #11](https://github.com/Mar2ianen/NedoBot/pull/11).
 
 ### Verification
 
-- teloxide implementation revision pinned by `Cargo.toml`: `a7364c69a6cfd553133c2b89d19f44f2718e377a`;
+- teloxide implementation revision pinned by `Cargo.toml`: `65f3a1d4fb6d62c2a1bca38af15270eb2e5c5a4f`;
 - teloxide documentation/PR review head and CI run IDs are intentionally kept in PR #41/#11 rather than this version-controlled changelog;
 - merge and deploy are intentionally not part of this release-candidate change.
