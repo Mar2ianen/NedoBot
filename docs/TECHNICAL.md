@@ -333,8 +333,9 @@ Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/
 Ручной redeploy из локальной папки выполняется только после dry-run и проверки production profile; не использовать старую сокращённую команду без exclusions:
 
 ```bash
-rsync -azn --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' ./ vps-153:/opt/tg-ai-bot-teloxide/
-rsync -az --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' ./ vps-153:/opt/tg-ai-bot-teloxide/
+rsync -azn --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' --exclude docs/LOCAL_WORKFLOW.md ./ vps-153:/opt/tg-ai-bot-teloxide/
+rsync -az --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' --exclude docs/LOCAL_WORKFLOW.md ./ vps-153:/opt/tg-ai-bot-teloxide/
+ssh vps-153 'chmod 755 /opt/tg-ai-bot-teloxide && runuser -u tg-ai-bot -- test -x /opt/tg-ai-bot-teloxide'
 rsync -az config/llm_profiles.toml.production.example vps-153:/etc/tg-ai-bot/llm_profiles.toml
 ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release'
 ssh vps-153 'systemctl restart tg-ai-bot-teloxide && systemctl is-active tg-ai-bot-teloxide'

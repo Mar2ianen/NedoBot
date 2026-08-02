@@ -52,11 +52,34 @@ rsync -azn --delete \
   --exclude static/ \
   --exclude backups/ \
   --exclude '*.dump' \
+  --exclude docs/LOCAL_WORKFLOW.md \
   ./ vps-153:/opt/tg-ai-bot-teloxide/
 ```
 
-После проверки списка изменений повторить команду без -n. Затем установить
-non-secret profile отдельно и проверить его наличие до рестарта:
+После проверки списка изменений повторить команду без -n, сохранив
+machine-specific `docs/LOCAL_WORKFLOW.md`:
+
+```bash
+rsync -az --delete \
+  --exclude target \
+  --exclude .git \
+  --exclude '.env*' \
+  --exclude static/ \
+  --exclude backups/ \
+  --exclude '*.dump' \
+  --exclude docs/LOCAL_WORKFLOW.md \
+  ./ vps-153:/opt/tg-ai-bot-teloxide/
+```
+
+После rsync отдельно проверить доступ сервисного пользователя к checkout:
+
+```bash
+ssh vps-153 'chmod 755 /opt/tg-ai-bot-teloxide && runuser -u tg-ai-bot -- test -x /opt/tg-ai-bot-teloxide'
+```
+
+Не выполнять рекурсивный `chmod`: MCP нужен только проход по каталогу и
+доступ к release binary. Затем установить non-secret profile отдельно и
+проверить его наличие до рестарта:
 
 ```bash
 rsync -az config/llm_profiles.toml.production.example \
@@ -88,8 +111,14 @@ ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedonews-mcp container-tg-ai
 ssh vps-153 'journalctl -u tg-ai-bot-teloxide -n 120 --no-pager'
 ssh vps-153 'journalctl -u nedonews-mcp -n 80 --no-pager'
 ssh vps-153 'podman ps'
-ssh vps-153 'curl -fsS http://127.0.0.1:8787/mcp/nedonews/v2'
+ssh vps-153 'curl -sS -o /dev/null -w "local=%{http_code} %{time_total}\n" http://127.0.0.1:8787/mcp/nedonews/v2'
+curl -sS -o /dev/null -w 'public=%{http_code} %{time_total}\n' https://nedobot.chickenkiller.com/mcp/nedonews/v2
 ```
+
+Для unauthenticated probe `403` на локальном endpoint и `405` на публичном
+GET могут быть нормальным результатом: health-check подтверждает, что route
+доступен, а не что MCP-клиент уже выполнил POST discovery. Реальный smoke
+должен использовать MCP client с разрешённым origin/auth контрактом.
 
 Для Telegram runtime smoke используется отдельный тестовый чат и команда
 /ping, затем /ask с коротким вопросом. Для /ask проверить:
