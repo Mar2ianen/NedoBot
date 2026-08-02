@@ -82,6 +82,8 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         )
         .await?;
         assert!(search["messages"].is_array());
+        assert!(search["total_count"].is_i64());
+        assert!(search["has_more"].is_boolean());
         let batch = call_object(
             &client,
             "chat.search_messages_batch",
@@ -89,6 +91,10 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         )
         .await?;
         assert!(batch["results"].is_array());
+        assert!(batch["results"][0]["total_count"].is_i64());
+        assert!(batch["results"][0]["has_more"].is_boolean());
+        let count = call_object(&client, "chat.count_messages", json!({"query": "бот"})).await?;
+        assert!(count["count"].is_i64());
         let message = call_object(
             &client,
             "chat.get_message",

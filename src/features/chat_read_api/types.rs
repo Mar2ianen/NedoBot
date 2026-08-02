@@ -12,15 +12,21 @@ pub struct ChatReadScope {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMatch {
+    Hybrid,
     FullText,
+    AnyTerms,
     Literal,
+    WholeWord,
 }
 
 impl MessageMatch {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            Self::Hybrid => "hybrid",
             Self::FullText => "full_text",
+            Self::AnyTerms => "any_terms",
             Self::Literal => "literal",
+            Self::WholeWord => "whole_word",
         }
     }
 }
@@ -55,6 +61,14 @@ pub struct MessageSearchRequest {
     pub match_mode: MessageMatch,
     pub sort: MessageSort,
     pub limit: i64,
+    pub include_forwards: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MessageSearchPage {
+    pub messages: Vec<ChatMessage>,
+    pub total_count: i64,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -86,6 +100,7 @@ pub struct RecentMessagesRequest {
     pub has_media: Option<bool>,
     pub sort: MessageSort,
     pub limit: i64,
+    pub include_forwards: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, sqlx::FromRow)]

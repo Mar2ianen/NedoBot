@@ -14,6 +14,10 @@ use tg_ai_bot_teloxide::features::{
         repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
         types::AskRunStatus,
     },
+    chat_read_api::{
+        service as chat_read_service,
+        types::{MessageMatch, MessageSearchRequest, MessageSort},
+    },
     chat_retrieval::{
         EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
         mark_embedding_failed, mark_embedding_ready,
@@ -73,6 +77,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
+    assert_chat_search_quality_path(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
@@ -2523,6 +2528,91 @@ async fn assert_public_mcp_scope(pool: &PgPool) {
     .expect("public MCP view query must succeed");
 
     assert_eq!(public_messages, vec!["discussion message"]);
+}
+
+async fn assert_chat_search_quality_path(pool: &PgPool) {
+    let extension: Option<String> =
+        query_scalar("select extname from pg_extension where extname = 'pg_trgm'")
+            .fetch_optional(pool)
+            .await
+            .expect("pg_trgm extension lookup must succeed");
+    assert_eq!(extension.as_deref(), Some("pg_trgm"));
+
+    let index_exists: bool = query_scalar(
+        "select exists (select 1 from pg_indexes where schemaname = 'public' and indexname = 'telegram_messages_ask_trgm_idx')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("chat search index lookup must succeed");
+    assert!(index_exists, "hybrid chat search index must be installed");
+
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 1_000_000) as i32;
+    let message_id = 9_600_000 + suffix;
+    let user_id = 9_600_000 + i64::from(suffix);
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, text)
+        values
+            ($1, $2, $3, false, 'hybrid quality marker alpha'),
+            ($1, $2 + 1, $3 + 1, true, 'hybrid quality marker alpha forwarded')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("chat search fixtures must be inserted");
+
+    let request = MessageSearchRequest {
+        query: "hybrid quality marker alpha".into(),
+        user_id: None,
+        date_from: None,
+        date_to: None,
+        reply_to_message_id: None,
+        has_links: None,
+        has_media: None,
+        match_mode: MessageMatch::Hybrid,
+        sort: MessageSort::Relevance,
+        limit: 10,
+        include_forwards: false,
+    };
+    let page = chat_read_service::search_messages(pool, -1001932061163, &request)
+        .await
+        .expect("hybrid search must execute through the production read service");
+    assert_eq!(page.total_count, 1);
+    assert!(!page.has_more);
+    assert_eq!(page.messages[0].message_id, message_id);
+
+    let fuzzy_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "hybrid quality marker alphx".into(),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("hybrid fuzzy search must execute through the production read service");
+    assert_eq!(fuzzy_page.total_count, 1);
+    assert_eq!(fuzzy_page.messages[0].message_id, message_id);
+
+    let with_forwards = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            ..request
+        },
+    )
+    .await
+    .expect("count search must execute through the production read service");
+    assert_eq!(with_forwards, 2);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

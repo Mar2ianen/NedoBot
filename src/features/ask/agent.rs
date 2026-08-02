@@ -55,6 +55,10 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Для вопроса «расскажи о человеке», «кто такой» или «что известно о» после resolve_user сначала вызови chat.get_user_profile. В нём есть точные агрегаты: message_rank=1 означает первое место по числу сообщений среди людей в чате; is_admin и admin_title — зафиксированный статус и title администратора. Не заменяй эти числа расплывчатой фразой «очень активен» и не придумывай title, если admin_title пустой.
 - Для фактического вопроса о переписке попробуй несколько разумных формулировок поиска. Используй full_text для тем и literal для точной цитаты, модели, ника или фразы. Не объявляй «не найдено» и не делай вывод о личном факте, пока не проверены и прямые слова автора, и отдельный тематический запрос по этому человеку.
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
+- По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count и has_more: не принимай top-k за полный результат.
+- По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
+- Для вопросов «сколько раз», «сколько сообщений», «какое количество сообщений» сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Не считай вручную длину выдачи.
+- Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
 - Для любого личного факта не ограничивайся названием темы. Первый широкий поиск делай через chat.search_messages_batch с отдельными короткими queries ["у меня", "мой", "сижу на", "пользуюсь", "купил", "заказал себе"] и нужным user_id — не добавляй тему в каждую строку. Затем извлеки из результатов кандидатов (имена, модели, продукты, места и т.п.), найди каждого literal-запросом и сравни даты/контекст. Не склеивай альтернативы пробелами: в full_text это означает, что все слова обязательны.
@@ -87,7 +91,7 @@ struct Evidence {
     source_urls: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ToolResult {
     value: Value,
     agent_preview: String,
@@ -113,6 +117,8 @@ impl ToolResult {
 
 #[derive(Default)]
 struct ResearchState {
+    count_required: bool,
+    count_queries: usize,
     personal_fact_required: bool,
     personal_statement_searches: usize,
     personal_topic_searches: usize,
@@ -126,6 +132,7 @@ struct ResearchState {
 impl ResearchState {
     fn for_question(question: &str) -> Self {
         Self {
+            count_required: asks_message_count(question),
             personal_fact_required: asks_personal_fact(question),
             ..Self::default()
         }
@@ -169,6 +176,7 @@ async fn answer_within_deadline(
     let mut evidence = Evidence::default();
     let mut research = ResearchState::for_question(question);
     let mut tool_signatures = HashSet::new();
+    let mut tool_cache = HashMap::<String, ToolResult>::new();
     let mut tool_call_count = 0usize;
     if let Some(reply_context) = reply_context.filter(|value| !value.trim().is_empty()) {
         push_observation(
@@ -250,6 +258,27 @@ async fn answer_within_deadline(
             let tracking_arguments = arguments.clone();
             let started = Instant::now();
 
+            if let Some(cached) = tool_cache.get(&signature) {
+                audit_tool_call(
+                    pool,
+                    ask_run_id,
+                    PendingToolCallAudit::duplicate(step, tool, arguments),
+                )
+                .await;
+                push_observation(
+                    &mut observations,
+                    format!(
+                        "TOOL_RESULT_UNTRUSTED {tool} (повторный вызов, использован кэш):\n{}",
+                        cached.agent_preview
+                    ),
+                );
+                tool_responses.push(ToolResponse::from_tool_call(
+                    &call,
+                    cached.agent_preview.clone(),
+                ));
+                continue;
+            }
+
             if tool_call_count >= config.ask_max_steps {
                 audit_tool_call(
                     pool,
@@ -311,21 +340,37 @@ async fn answer_within_deadline(
                 ));
                 continue;
             }
-            if !tool_signatures.insert(signature) {
+            if !tool_signatures.insert(signature.clone()) {
                 audit_tool_call(
                     pool,
                     ask_run_id,
                     PendingToolCallAudit::duplicate(step, tool, arguments),
                 )
                 .await;
-                push_observation(
-                    &mut observations,
-                    format!("SYSTEM: точный вызов {tool} с такими аргументами уже выполнялся."),
-                );
-                tool_responses.push(ToolResponse::from_tool_call(
-                    &call,
-                    json!({"error": "точный вызов уже выполнялся"}).to_string(),
-                ));
+                if let Some(cached) = tool_cache.get(&signature) {
+                    push_observation(
+                        &mut observations,
+                        format!(
+                            "TOOL_RESULT_UNTRUSTED {tool} (повторный вызов, использован кэш):\n{}",
+                            cached.agent_preview
+                        ),
+                    );
+                    tool_responses.push(ToolResponse::from_tool_call(
+                        &call,
+                        cached.agent_preview.clone(),
+                    ));
+                } else {
+                    push_observation(
+                        &mut observations,
+                        format!(
+                            "SYSTEM: точный вызов {tool} уже завершился ошибкой; измени аргументы или режим поиска."
+                        ),
+                    );
+                    tool_responses.push(ToolResponse::from_tool_call(
+                        &call,
+                        json!({"error": "точный вызов уже выполнялся с ошибкой"}).to_string(),
+                    ));
+                }
                 continue;
             }
 
@@ -346,6 +391,7 @@ async fn answer_within_deadline(
             .await
             {
                 Ok(result) => {
+                    tool_cache.insert(signature, result.clone());
                     audit_tool_call(
                         pool,
                         ask_run_id,
@@ -832,6 +878,11 @@ impl ResearchState {
                     personal_statement_query_count_values(executed_queries);
                 self.personal_topic_searches += personal_topic_query_count_values(executed_queries);
             }
+            "chat.count_messages" => {
+                if result.get("count").and_then(Value::as_i64).is_some() {
+                    self.count_queries += 1;
+                }
+            }
             "chat.get_recent_messages" => {
                 self.message_results += json_array_len(result);
             }
@@ -856,6 +907,11 @@ impl ResearchState {
     }
 
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
+        if self.count_required && self.count_queries == 0 {
+            return Some(
+                "SYSTEM: вопрос требует точного количества сообщений. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную.".to_string(),
+            );
+        }
         if self.personal_fact_required && self.personal_statement_searches == 0 {
             return Some(
                 "SYSTEM: вопрос относится к личному факту, но прямые высказывания от первого лица ещё не проверены. Следующим действием вызови chat.search_messages_batch с нужным user_id и ТОЧНО отдельными queries [\"у меня\", \"мой\", \"сижу на\", \"пользуюсь\", \"купил\", \"заказал себе\"].".to_string(),
@@ -1049,6 +1105,19 @@ fn asks_personal_fact(question: &str) -> bool {
             && question.contains(" у ")
 }
 
+fn asks_message_count(question: &str) -> bool {
+    let question = question.to_lowercase();
+    [
+        "сколько раз",
+        "сколько сообщений",
+        "количество сообщений",
+        "число сообщений",
+        "как часто",
+    ]
+    .iter()
+    .any(|marker| question.contains(marker))
+}
+
 fn overconfident_personal_inference(markdown: &str) -> bool {
     let markdown = markdown.to_lowercase();
     ["должен быть", "значит, сейчас", "следовательно, сейчас"]
@@ -1205,6 +1274,8 @@ mod tests {
         );
         assert!(prompt.contains("UNTRUSTED"));
         assert!(prompt.contains("Native tools"));
+        assert!(SYSTEM_PROMPT.contains("chat.count_messages"));
+        assert!(SYSTEM_PROMPT.contains("include_forwards=true"));
         assert!(!SYSTEM_PROMPT.contains("5700x3d"));
     }
 
@@ -1320,6 +1391,36 @@ mod tests {
             &json!([{"message_id": 1}]),
         );
         assert!(research.follow_up_instruction("Итог").is_none());
+    }
+
+    #[test]
+    fn count_questions_require_authoritative_count_tool() {
+        let mut research = ResearchState::for_question("сколько раз он писал про броню?");
+        assert!(research.count_required);
+        assert!(
+            research
+                .follow_up_instruction("Нашёл 10 сообщений")
+                .unwrap()
+                .contains("chat.count_messages")
+        );
+
+        research.record(
+            "chat.count_messages",
+            &json!({"query": "броня", "user_id": 42}),
+            &json!({"count": 32}),
+        );
+        assert_eq!(research.count_queries, 1);
+        assert!(
+            research
+                .follow_up_instruction("Всего 32 сообщения")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn count_policy_does_not_trigger_for_unique_people_questions() {
+        let research = ResearchState::for_question("сколько людей писали про Rust?");
+        assert!(!research.count_required);
     }
 
     #[test]

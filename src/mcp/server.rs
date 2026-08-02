@@ -125,6 +125,17 @@ impl ChatMcpServer {
     }
 
     #[tool(
+        name = "chat.count_messages",
+        description = "Точно считает сообщения публичного чата по тем же фильтрам, что и chat.search_messages. Используй для вопросов 'сколько раз' и 'сколько сообщений'."
+    )]
+    async fn count_messages(
+        &self,
+        Parameters(input): Parameters<chat::CountMessagesInput>,
+    ) -> Result<Json<Value>, rmcp::ErrorData> {
+        chat::count_messages(&self.api, input).await.map(Json)
+    }
+
+    #[tool(
         name = "chat.search_messages_batch",
         description = "Выполняет до шести поисков сообщений публичного чата."
     )]
@@ -406,6 +417,7 @@ mod tests {
             actual,
             [
                 "ask.list_runs",
+                "chat.count_messages",
                 "chat.get_message",
                 "chat.get_message_context",
                 "chat.get_recent_messages",
