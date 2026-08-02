@@ -921,7 +921,9 @@ fn cited_message_ids(markdown: &str) -> Vec<i32> {
                         .and_then(|value| value.parse::<i32>().ok())
                 })
                 .collect::<Vec<_>>();
-            (ids, parsed.link_destinations())
+            let mut literal_destinations = parsed.link_destinations();
+            literal_destinations.extend(parsed.bare_urls());
+            (ids, literal_destinations)
         })
         .unwrap_or_default();
     for destination in literal_destinations {
@@ -1349,15 +1351,22 @@ mod tests {
                 .unwrap()
                 .contains("330631")
         );
+        assert!(
+            research
+                .follow_up_instruction("Ещё ссылка: https://t.me/c/1932061163/330631")
+                .unwrap()
+                .contains("330631")
+        );
     }
 
     #[test]
-    fn cited_message_ids_only_accept_link_destinations() {
+    fn cited_message_ids_accept_links_and_bare_message_urls_only() {
         assert_eq!(
             cited_message_ids(
-                "текст message_99 и `message_100`, [сообщение](message_42) и [внешнее](https://example.com/message_43)"
+                "текст message_99 и `message_100`, [сообщение](message_42), \
+                 [внешнее](https://example.com/message_43) и https://t.me/c/1932061163/555"
             ),
-            vec![42]
+            vec![42, 555]
         );
     }
 
