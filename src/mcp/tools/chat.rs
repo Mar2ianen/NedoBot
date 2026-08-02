@@ -6,6 +6,7 @@ use sqlx::types::chrono::{DateTime, Utc};
 
 use crate::features::chat_read_api::{
     ChatReadApi,
+    service::MAX_SEARCH_OFFSET,
     types::{MessageMatch, MessageSearchRequest, MessageSort, RecentMessagesRequest},
 };
 
@@ -70,6 +71,7 @@ pub struct SearchMessagesInput {
     pub match_mode: Option<MatchMode>,
     pub sort: Option<Sort>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     #[serde(default)]
     pub include_forwards: bool,
 }
@@ -86,6 +88,7 @@ pub struct SearchMessagesBatchInput {
     pub match_mode: Option<MatchMode>,
     pub sort: Option<Sort>,
     pub limit_per_query: Option<i64>,
+    pub offset: Option<i64>,
     #[serde(default)]
     pub include_forwards: bool,
 }
@@ -153,6 +156,7 @@ pub struct BatchSearchResult {
     pub messages: serde_json::Value,
     pub total_count: i64,
     pub has_more: bool,
+    pub next_offset: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -195,6 +199,7 @@ fn search_request(input: SearchMessagesInput) -> Result<MessageSearchRequest, rm
     if input.query.trim().is_empty() {
         return Err(invalid_arguments("query must not be empty"));
     }
+    let offset = parse_offset(input.offset)?;
     Ok(MessageSearchRequest {
         query: input.query,
         user_id: input.user_id,
@@ -206,8 +211,17 @@ fn search_request(input: SearchMessagesInput) -> Result<MessageSearchRequest, rm
         match_mode: input.match_mode.unwrap_or(MatchMode::Hybrid).into(),
         sort: input.sort.unwrap_or(Sort::Relevance).into(),
         limit: input.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+        offset,
         include_forwards: input.include_forwards,
     })
+}
+
+fn parse_offset(value: Option<i64>) -> Result<i64, rmcp::ErrorData> {
+    let offset = value.unwrap_or(0);
+    if !(0..=MAX_SEARCH_OFFSET).contains(&offset) {
+        return Err(invalid_arguments("offset must be between 0 and 10000"));
+    }
+    Ok(offset)
 }
 
 pub async fn search_messages(
@@ -236,6 +250,7 @@ pub async fn count_messages(
         match_mode: input.match_mode.unwrap_or(MatchMode::Hybrid).into(),
         sort: MessageSort::Relevance,
         limit: 1,
+        offset: 0,
         include_forwards: input.include_forwards,
     };
     if request.query.trim().is_empty() {
@@ -259,6 +274,7 @@ pub async fn search_messages_batch(
         .limit_per_query
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_BATCH_LIMIT);
+    let offset = parse_offset(input.offset)?;
     let mut results = Vec::new();
     for query in queries {
         let messages = api
@@ -273,6 +289,7 @@ pub async fn search_messages_batch(
                 match_mode: input.match_mode.clone().unwrap_or(MatchMode::Hybrid).into(),
                 sort: input.sort.clone().unwrap_or(Sort::Relevance).into(),
                 limit,
+                offset,
                 include_forwards: input.include_forwards,
             })
             .await
@@ -281,6 +298,7 @@ pub async fn search_messages_batch(
             query,
             total_count: messages.total_count,
             has_more: messages.has_more,
+            next_offset: messages.next_offset,
             messages: serde_json::to_value(messages.messages)
                 .map_err(|_| read_error("cannot encode chat result"))?,
         });
@@ -497,6 +515,7 @@ mod tests {
             match_mode: None,
             sort: None,
             limit: None,
+            offset: None,
             include_forwards: false,
         })
         .unwrap_err();
@@ -530,10 +549,20 @@ mod tests {
             match_mode: None,
             sort: None,
             limit: None,
+            offset: None,
             include_forwards: false,
         })
         .unwrap();
         assert_eq!(request.match_mode, MessageMatch::Hybrid);
+        assert_eq!(request.offset, 0);
         assert!(!request.include_forwards);
+    }
+
+    #[test]
+    fn search_offset_is_bounded() {
+        let error = parse_offset(Some(-1)).unwrap_err();
+        assert_eq!(error.message, "offset must be between 0 and 10000");
+        assert!(parse_offset(Some(MAX_SEARCH_OFFSET)).is_ok());
+        assert!(parse_offset(Some(MAX_SEARCH_OFFSET + 1)).is_err());
     }
 }

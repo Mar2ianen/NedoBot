@@ -2559,7 +2559,8 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
             (chat_id, message_id, user_id, is_automatic_forward, text)
         values
             ($1, $2, $3, false, 'hybrid quality marker alpha'),
-            ($1, $2 + 1, $3 + 1, true, 'hybrid quality marker alpha forwarded')
+            ($1, $2 + 1, $3 + 1, true, 'hybrid quality marker alpha forwarded'),
+            ($1, $2 + 2, null, true, 'hybrid quality marker alpha forwarded without author')
         "#,
     )
     .bind(-1001932061163_i64)
@@ -2580,6 +2581,7 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         match_mode: MessageMatch::Hybrid,
         sort: MessageSort::Relevance,
         limit: 10,
+        offset: 0,
         include_forwards: false,
     };
     let page = chat_read_service::search_messages(pool, -1001932061163, &request)
@@ -2607,12 +2609,53 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         -1001932061163,
         &MessageSearchRequest {
             include_forwards: true,
-            ..request
+            ..request.clone()
         },
     )
     .await
     .expect("count search must execute through the production read service");
-    assert_eq!(with_forwards, 2);
+    assert_eq!(with_forwards, 3);
+    let first_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 0,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("first search page must execute through the production read service");
+    assert!(first_page.has_more);
+    assert_eq!(first_page.next_offset, Some(1));
+
+    let second_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 1,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("second search page must execute through the production read service");
+    assert_eq!(second_page.total_count, 3);
+    assert_eq!(second_page.next_offset, Some(2));
+
+    let with_anonymous_forward = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            ..request
+        },
+    )
+    .await
+    .expect("forwarded rows without authors must be searchable when opted in");
+    assert_eq!(with_anonymous_forward.total_count, 3);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
