@@ -8,6 +8,7 @@ use super::types::{
 
 const MAX_QUERY_CHARS: usize = 240;
 const MAX_RESULT_LIMIT: i64 = 50;
+pub(crate) const MAX_SEARCH_OFFSET: i64 = 10_000;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
 const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
 
@@ -95,7 +96,7 @@ pub async fn search_messages(
               and m.text is not null
               and m.deleted_by_bot_at is null
               and m.spam_marked_at is null
-              and m.user_id is not null
+              and (m.user_id is not null or $14::boolean)
               and not coalesce(p.is_bot, false)
               and ($14::boolean or not coalesce(m.is_automatic_forward, false))
               and ($5::bigint is null or m.user_id = $5)
@@ -127,6 +128,7 @@ pub async fn search_messages(
             created_at desc,
             message_id desc
         limit $12
+        offset $15
         "#,
     )
     .bind(chat_id)
@@ -143,15 +145,20 @@ pub async fn search_messages(
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
     .bind(request.match_mode.as_str())
     .bind(request.include_forwards)
+    .bind(request.offset.clamp(0, MAX_SEARCH_OFFSET))
     .fetch_all(pool)
     .await?;
 
     let total_count = rows.first().map(|row| row.total_count).unwrap_or(0);
     let messages = map_search_rows(chat_id, rows);
+    let offset = request.offset.clamp(0, MAX_SEARCH_OFFSET);
+    let next_offset =
+        (total_count > offset + messages.len() as i64).then_some(offset + messages.len() as i64);
     Ok(MessageSearchPage {
-        has_more: total_count > messages.len() as i64,
+        has_more: next_offset.is_some(),
         messages,
         total_count,
+        next_offset,
     })
 }
 
@@ -189,7 +196,7 @@ pub async fn recent_messages(
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
-          and m.user_id is not null
+          and (m.user_id is not null or $9::boolean)
           and not coalesce(p.is_bot, false)
           and ($9::boolean or not coalesce(m.is_automatic_forward, false))
           and ($2::bigint is null or m.user_id = $2)

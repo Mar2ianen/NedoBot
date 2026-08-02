@@ -162,14 +162,15 @@ search_text
 
 Контракт поиска общий для локального stdio-клиента `/ask` и публичного
 Streamable HTTP router-а. `chat.search_messages` возвращает страницу с полями
-`messages`, `total_count` и `has_more`; сервер ограничивает страницу 50
+`messages`, `total_count`, `has_more` и `next_offset`; сервер ограничивает страницу 50
 сообщениями. `chat.search_messages_batch` выполняет не более шести запросов и
-возвращает не более пяти сообщений на запрос. `chat.count_messages` использует
+возвращает не более пяти сообщений на запрос. `offset` позволяет запросить
+следующую страницу в пределах 10000 строк. `chat.count_messages` использует
 те же фильтры и является authoritative-путём для количества. Режимы поиска:
 `hybrid` (по умолчанию), `full_text`, `any_terms`, `literal` и `whole_word`;
 даты принимаются в RFC 3339 или `YYYY-MM-DD`. По умолчанию поиск исключает
 ботов, строки без пользователя и автоматические пересылки; `include_forwards`
-является явным opt-in. В `mcp_public` не добавляются строки или колонки и не
+является явным opt-in и также раскрывает forwarded rows без автора. В `mcp_public` не добавляются строки или колонки и не
 меняется его sanitization-контракт.
 
 ### Semantic tools

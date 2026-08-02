@@ -61,6 +61,9 @@ pub struct MessageSearchRequest {
     pub match_mode: MessageMatch,
     pub sort: MessageSort,
     pub limit: i64,
+    /// Zero-based page offset. The transport validates and bounds it before
+    /// constructing this request.
+    pub offset: i64,
     pub include_forwards: bool,
 }
 
@@ -69,6 +72,7 @@ pub struct MessageSearchPage {
     pub messages: Vec<ChatMessage>,
     pub total_count: i64,
     pub has_more: bool,
+    pub next_offset: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
