@@ -453,14 +453,14 @@ fn append_filters(
                     kind,
                 )?;
                 let pattern = match filter.op {
-                    FilterOp::Contains => format!("%{value}%"),
-                    FilterOp::StartsWith => format!("{value}%"),
-                    FilterOp::EndsWith => format!("%{value}"),
+                    FilterOp::Contains => format!("%{}%", escape_like_literal(&value)),
+                    FilterOp::StartsWith => format!("{}%", escape_like_literal(&value)),
+                    FilterOp::EndsWith => format!("%{}", escape_like_literal(&value)),
                     _ => unreachable!(),
                 };
                 binds.push(pattern);
                 format!(
-                    "{name}::text {} ${}",
+                    "{name}::text {} ${} escape '\\'",
                     if filter.case_sensitive {
                         "like"
                     } else {
@@ -761,6 +761,13 @@ fn regex_literal(value: &str) -> String {
         })
         .collect()
 }
+
+fn escape_like_literal(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
 async fn json_rows(pool: &PgPool, sql: &str, binds: &[String]) -> anyhow::Result<Vec<Value>> {
     let sql = format!("select to_jsonb(result_row) as row from ({sql}) result_row");
     bind_all(sqlx::query(&sql), binds)
@@ -990,6 +997,63 @@ mod tests {
     #[test]
     fn regex_literal_escapes_metacharacters() {
         assert_eq!(regex_literal("a+b"), "a\\+b");
+    }
+
+    #[test]
+    fn like_literal_escapes_wildcards_and_backslashes() {
+        assert_eq!(escape_like_literal("100%_done\\"), "100\\%\\_done\\\\");
+    }
+
+    #[test]
+    fn like_filters_bind_escaped_literals_and_explicit_escape_clause() {
+        let mut definition = table(&["id"]);
+        definition.columns.insert(
+            "text".to_owned(),
+            CatalogColumn {
+                pg_type: "text".to_owned(),
+                nullable: true,
+            },
+        );
+        for (value, operator, expected_pattern) in [
+            ("%", FilterOp::Contains, "%\\%%"),
+            ("_", FilterOp::StartsWith, "\\_%"),
+            ("\\", FilterOp::EndsWith, "%\\\\"),
+        ] {
+            let mut sql = String::new();
+            let mut binds = Vec::new();
+            append_filters(
+                &mut sql,
+                &definition,
+                &[Filter {
+                    column: "text".to_owned(),
+                    op: operator,
+                    value: Some(Value::String(value.to_owned())),
+                    values: vec![],
+                    case_sensitive: false,
+                }],
+                &mut binds,
+            )
+            .unwrap();
+            assert_eq!(binds, vec![expected_pattern]);
+            assert!(sql.contains("ilike $1 escape '\\'"));
+        }
+
+        let mut sql = String::new();
+        let mut binds = Vec::new();
+        append_filters(
+            &mut sql,
+            &definition,
+            &[Filter {
+                column: "text".to_owned(),
+                op: FilterOp::Contains,
+                value: Some(Value::String("literal".to_owned())),
+                values: vec![],
+                case_sensitive: true,
+            }],
+            &mut binds,
+        )
+        .unwrap();
+        assert!(sql.contains("like $1 escape '\\'"));
     }
 
     #[test]
