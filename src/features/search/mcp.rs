@@ -2,9 +2,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use rmcp::{
+    RoleClient, ServiceExt,
+    model::{CallToolRequestParams, CallToolResult, ContentBlock},
+    service::RunningService,
+    transport::TokioChildProcess,
+};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::config::Config;
@@ -84,11 +89,14 @@ async fn search_with_mcp(
     query: &SearchQuery,
 ) -> anyhow::Result<Vec<SearchResult>> {
     let process_config = McpProcessConfig::for_query(config, query)?;
-    let mut child = spawn_mcp_process(&process_config)?;
-    let result = run_mcp_flow(config, query, &process_config, &mut child).await;
+    let mut service = spawn_mcp_service(&process_config).await?;
+    let result = run_mcp_flow(config, query, &process_config, &service).await;
 
-    if let Err(err) = child.kill().await {
-        tracing::debug!(%err, "failed to kill MCP child process after search");
+    if let Err(err) = service
+        .close_with_timeout(Duration::from_secs(config.search_query_timeout_sec))
+        .await
+    {
+        tracing::debug!(%err, "failed to close MCP child service after search");
     }
 
     result
@@ -144,7 +152,9 @@ fn is_github_readonly_search_tool(tool_name: &str) -> bool {
     matches!(tool_name, "search_issues" | "search_code")
 }
 
-fn spawn_mcp_process(config: &McpProcessConfig) -> anyhow::Result<Child> {
+async fn spawn_mcp_service(
+    config: &McpProcessConfig,
+) -> anyhow::Result<RunningService<RoleClient, ()>> {
     let mut process = Command::new(&config.command);
     process
         .args(&config.args)
@@ -160,59 +170,35 @@ fn spawn_mcp_process(config: &McpProcessConfig) -> anyhow::Result<Child> {
         }
     }
 
-    Ok(process.spawn()?)
+    let transport = TokioChildProcess::builder(process)
+        .stderr(Stdio::null())
+        .spawn()?
+        .0;
+    Ok(().serve(transport).await?)
 }
 
 async fn run_mcp_flow(
     config: &Config,
     query: &SearchQuery,
     process_config: &McpProcessConfig,
-    child: &mut Child,
+    service: &RunningService<RoleClient, ()>,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("MCP child stdin is unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("MCP child stdout is unavailable"))?;
-    let mut stdout = BufReader::new(stdout).lines();
-
-    write_json_line(&mut stdin, &initialize_request()).await?;
-    read_json_line(&mut stdout).await?;
-
-    write_json_line(&mut stdin, &initialized_notification()).await?;
-
     let mut results = Vec::new();
-    let mut request_id = 2;
     for tool_name in &process_config.tool_names {
-        let request = tools_call_request(request_id, tool_name, tool_arguments(tool_name, query));
-        request_id += 1;
-        if let Err(err) = write_json_line(&mut stdin, &request).await {
-            tracing::warn!(
-                %err,
-                source = ?query.source,
-                tool = %tool_name,
-                result_count = results.len(),
-                "MCP search tool write failed after partial results"
-            );
-            break;
-        }
-
-        let response = match read_json_line(&mut stdout).await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    source = ?query.source,
-                    tool = %tool_name,
-                    result_count = results.len(),
-                    "MCP search tool failed after partial results"
-                );
-                break;
-            }
-        };
+        let response =
+            match call_mcp_tool(service, tool_name, tool_arguments(tool_name, query)).await {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        source = ?query.source,
+                        tool = %tool_name,
+                        result_count = results.len(),
+                        "MCP search tool failed after partial results"
+                    );
+                    break;
+                }
+            };
         match parse_mcp_tool_response(query.source, &response) {
             Ok(mut parsed) => results.append(&mut parsed),
             Err(err) => tracing::warn!(
@@ -229,18 +215,18 @@ async fn run_mcp_flow(
     if let Some(fetch_tool) = process_config.fetch_tool.as_deref() {
         let urls = fetch_urls(&results, config, config.search_fetch_top_n);
         for url in &urls {
-            let fetch_request = fetch_call_request(
-                request_id,
-                fetch_tool,
-                std::slice::from_ref(url),
-                config.search_fetch_max_chars,
-            );
-            request_id += 1;
-
-            let response = timeout(FETCH_RESPONSE_TIMEOUT, async {
-                write_json_line(&mut stdin, &fetch_request).await?;
-                read_json_line(&mut stdout).await
-            })
+            let response = timeout(
+                FETCH_RESPONSE_TIMEOUT,
+                call_mcp_tool(
+                    service,
+                    fetch_tool,
+                    fetch_tool_arguments(
+                        fetch_tool,
+                        std::slice::from_ref(url),
+                        config.search_fetch_max_chars,
+                    ),
+                ),
+            )
             .await;
             let response = match response {
                 Ok(Ok(response)) => response,
@@ -267,14 +253,7 @@ async fn run_mcp_flow(
     }
 
     if query.source == SearchSource::Github && process_config.fetch_tool.is_none() {
-        enrich_github_results(
-            &mut stdin,
-            &mut stdout,
-            &mut request_id,
-            &mut results,
-            config.search_fetch_top_n,
-        )
-        .await;
+        enrich_github_results(service, &mut results, config.search_fetch_top_n).await;
     }
 
     results.retain(|result| is_allowed_search_result(config, result));
@@ -282,47 +261,17 @@ async fn run_mcp_flow(
     Ok(results)
 }
 
-fn initialize_request() -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "tg-ai-bot-teloxide",
-                "version": "0.1.0"
-            }
-        }
-    })
-}
-
-fn initialized_notification() -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    })
-}
-
-fn fetch_call_request(id: u64, tool_name: &str, urls: &[String], max_chars: usize) -> Value {
-    tools_call_request(
-        id,
-        tool_name,
-        fetch_tool_arguments(tool_name, urls, max_chars),
-    )
-}
-
-fn tools_call_request(id: u64, tool_name: &str, arguments: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments
-        }
-    })
+async fn call_mcp_tool(
+    service: &RunningService<RoleClient, ()>,
+    tool_name: &str,
+    arguments: Value,
+) -> anyhow::Result<CallToolResult> {
+    let arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("MCP tool arguments must be an object"))?;
+    let request = CallToolRequestParams::new(tool_name.to_owned()).with_arguments(arguments);
+    Ok(service.call_tool(request).await?)
 }
 
 fn tool_name(config: &Config, source: SearchSource) -> &str {
@@ -358,14 +307,13 @@ fn tool_arguments(tool_name: &str, query: &SearchQuery) -> Value {
     }
 }
 
-fn github_fetch_call_request(id: u64, resource: &GithubResource) -> Value {
+fn github_fetch_tool_call(resource: &GithubResource) -> (&'static str, Value) {
     match resource {
         GithubResource::Issue {
             owner,
             repo,
             issue_number,
-        } => tools_call_request(
-            id,
+        } => (
             "get_issue",
             json!({
                 "owner": owner,
@@ -378,8 +326,7 @@ fn github_fetch_call_request(id: u64, resource: &GithubResource) -> Value {
             repo,
             path,
             reference,
-        } => tools_call_request(
-            id,
+        } => (
             "get_file_contents",
             json!({
                 "owner": owner,
@@ -488,20 +435,16 @@ fn enrich_results_with_fetch(results: &mut Vec<SearchResult>, fetched_results: V
 }
 
 async fn enrich_github_results(
-    stdin: &mut tokio::process::ChildStdin,
-    stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    request_id: &mut u64,
+    service: &RunningService<RoleClient, ()>,
     results: &mut [SearchResult],
     top_n: usize,
 ) {
     let resources = github_resources(results, top_n);
     for (index, resource) in resources {
-        let request = github_fetch_call_request(*request_id, &resource);
-        *request_id += 1;
+        let (tool_name, arguments) = github_fetch_tool_call(&resource);
 
         let response = match timeout(FETCH_RESPONSE_TIMEOUT, async {
-            write_json_line(stdin, &request).await?;
-            read_json_line(stdout).await
+            call_mcp_tool(service, tool_name, arguments).await
         })
         .await
         {
@@ -516,7 +459,7 @@ async fn enrich_github_results(
             }
         };
 
-        if let Some(fetched_text) = extract_github_fetch_text(&response) {
+        if let Some(fetched_text) = extract_github_fetch_text(&call_tool_result_json(&response)) {
             append_fetch_snippet(&mut results[index], &fetched_text);
         }
     }
@@ -551,57 +494,41 @@ fn append_fetch_snippet(result: &mut SearchResult, fetched_snippet: &str) {
     result.snippet = truncate_chars(combined.trim(), MAX_RESULT_SNIPPET_CHARS);
 }
 
-async fn write_json_line(
-    stdin: &mut tokio::process::ChildStdin,
-    value: &Value,
-) -> anyhow::Result<()> {
-    stdin
-        .write_all(serde_json::to_string(value)?.as_bytes())
-        .await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await?;
-    Ok(())
-}
-
-async fn read_json_line(
-    stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-) -> anyhow::Result<Value> {
-    let line = stdout
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("MCP child stdout closed"))?;
-    Ok(serde_json::from_str(&line)?)
-}
-
 fn parse_mcp_tool_response(
     source: SearchSource,
-    response: &Value,
+    response: &CallToolResult,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let Some(content) = response
-        .pointer("/result/content")
-        .and_then(Value::as_array)
-    else {
+    if response.is_error == Some(true) {
+        anyhow::bail!("MCP tool returned an error result");
+    }
+
+    let content = &response.content;
+    if content.is_empty() {
         return Ok(Vec::new());
-    };
+    }
 
     let mut results = Vec::new();
     for item in content {
-        if item
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind != "text")
-        {
-            continue;
-        }
-
-        let Some(text) = item.get("text").and_then(Value::as_str) else {
+        let ContentBlock::Text(text) = item else {
             continue;
         };
 
-        results.extend(parse_tool_output(source, text)?);
+        results.extend(parse_tool_output(source, &text.text)?);
     }
 
     Ok(results)
+}
+
+fn call_tool_result_json(response: &CallToolResult) -> Value {
+    let content = response
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            ContentBlock::Text(text) => Some(json!({"type": "text", "text": text.text})),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    json!({"result": {"content": content}})
 }
 
 fn parse_tool_output(source: SearchSource, text: &str) -> anyhow::Result<Vec<SearchResult>> {
