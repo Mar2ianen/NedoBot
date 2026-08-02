@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use teloxide::types::Message;
 
@@ -19,6 +17,15 @@ impl VoiceMediaKind {
             Self::Voice => "voice",
             Self::Audio => "audio",
             Self::VideoNote => "video_note",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "voice" => Some(Self::Voice),
+            "audio" => Some(Self::Audio),
+            "video_note" => Some(Self::VideoNote),
+            _ => None,
         }
     }
 }

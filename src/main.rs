@@ -25,14 +25,14 @@ use db::telegram::{
 use db::{build_pool, migrate};
 use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
-use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL};
+use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL, VOICE_TRANSCRIPTION_POLL};
 use features::memory::service::process_next_history_entry;
 use features::new_user_audit::service::process_next_new_user_audit_job;
 use features::spam_review::{apply_callback, parse_callback, process_next_review_delivery};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
-use features::voice::pipeline::maybe_transcribe_voice;
+use features::voice::pipeline::{maybe_transcribe_voice, process_next_voice_job};
 use llm::genai_transport::GenAiTransport;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_post_comment_worker(bot.clone(), state.clone());
     spawn_post_history_worker(state.clone());
     spawn_chat_retrieval_embedding_worker(state.clone());
+    spawn_voice_transcription_worker(bot.clone(), state.clone());
 
     let handler = dptree::entry()
         .branch(
@@ -168,6 +169,35 @@ fn spawn_chat_retrieval_embedding_worker(state: AppState) {
                     tracing::warn!(%err, "chat retrieval embedding worker failed");
                     tokio::time::sleep(std::time::Duration::from_secs(
                         state.config.chat_retrieval_embedding_poll_sec,
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_voice_transcription_worker(
+    bot: teloxide::adaptors::DefaultParseMode<Bot>,
+    state: AppState,
+) {
+    if !state.config.voice_transcription_enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            match process_next_voice_job(&bot, &state).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        VOICE_TRANSCRIPTION_POLL.idle_seconds(),
+                    ))
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "voice transcription worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        VOICE_TRANSCRIPTION_POLL.error_seconds(),
                     ))
                     .await;
                 }

@@ -48,6 +48,13 @@ use tg_ai_bot_teloxide::features::{
         render_html, render_rich, repo as stats_repo,
         types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
     },
+    voice::{
+        repo::{
+            claim_next_voice_job, claim_voice_job, create_voice_job, mark_voice_job_phase,
+            mark_voice_job_retry_or_failed, save_progress_message,
+        },
+        types::{VoiceMedia, VoiceMediaKind},
+    },
 };
 
 #[tokio::test]
@@ -89,6 +96,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
     assert_job_lifecycle_observability(&pool).await;
+    assert_voice_transcription_job_lifecycle(&pool).await;
 }
 
 async fn assert_ask_time_render_audit(pool: &PgPool) {
@@ -332,6 +340,163 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         oldest_ready_age < 3_600.0,
         "an old low-risk review must be excluded from oldest_ready_age: {oldest_ready_age}"
     );
+}
+
+async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 1_000_000) as i32;
+    let chat_id = -1001932061163;
+    let message_id = 9_700_000 + suffix;
+    let media = VoiceMedia {
+        chat_id,
+        message_id,
+        user_id: Some(9_700_000 + i64::from(suffix)),
+        kind: VoiceMediaKind::Voice,
+        file_id: format!("voice-file-{suffix}"),
+        file_unique_id: Some(format!("voice-unique-{suffix}")),
+        duration_sec: Some(42),
+        file_size: Some(1_024),
+        mime_type: Some("audio/ogg".to_owned()),
+    };
+    let job_id = create_voice_job(pool, &media)
+        .await
+        .expect("voice job must be created")
+        .expect("new voice job must return its id");
+
+    let (first_result, second_result) =
+        tokio::join!(claim_voice_job(pool, job_id), claim_voice_job(pool, job_id));
+    let first_claim = first_result.expect("first concurrent voice claim must succeed");
+    let second_claim = second_result.expect("second concurrent voice claim must succeed");
+    assert_eq!(
+        first_claim.is_some() as u8 + second_claim.is_some() as u8,
+        1
+    );
+    let mut job = first_claim
+        .or(second_claim)
+        .expect("the winning voice claim must be present");
+
+    assert!(
+        save_progress_message(pool, &job, 9_800_001)
+            .await
+            .expect("progress message must be persisted")
+    );
+    assert!(
+        mark_voice_job_phase(pool, &job, "downloading")
+            .await
+            .expect("voice phase transition must succeed")
+    );
+    assert!(
+        mark_voice_job_phase(pool, &job, "transcribing")
+            .await
+            .expect("voice phase transition must refresh the lease")
+    );
+
+    query(
+        "update voice_transcription_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .expect("voice lease must be made stale for recovery test");
+    job = claim_voice_job(pool, job.id)
+        .await
+        .expect("expired voice lease must be reclaimable")
+        .expect("expired voice lease must produce a recovery claim");
+    assert_eq!(job.attempts, 2);
+    assert_eq!(job.progress_message_id, Some(9_800_001));
+
+    mark_voice_job_retry_or_failed(pool, &job, "transient", "temporary ASR outage")
+        .await
+        .expect("transient voice failure must be scheduled for retry");
+    let retry_status: String =
+        query_scalar("select status from voice_transcription_jobs where id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .expect("voice retry status must be readable");
+    assert_eq!(retry_status, "retry_wait");
+    assert!(
+        claim_voice_job(pool, job.id)
+            .await
+            .expect("future voice retry must be queryable")
+            .is_none(),
+        "a voice retry must wait until next_attempt_at"
+    );
+    query("update voice_transcription_jobs set next_attempt_at = now() where id = $1")
+        .bind(job.id)
+        .execute(pool)
+        .await
+        .expect("voice retry must be made due for the next claim");
+    let retry_claim = claim_next_voice_job(pool)
+        .await
+        .expect("voice worker claim must succeed")
+        .expect("due voice retry must be claimed");
+    assert_eq!(retry_claim.id, job.id);
+
+    let terminal_media = VoiceMedia {
+        message_id: message_id + 1,
+        file_id: format!("terminal-file-{suffix}"),
+        file_unique_id: Some(format!("terminal-unique-{suffix}")),
+        ..media.clone()
+    };
+    let terminal_id = create_voice_job(pool, &terminal_media)
+        .await
+        .expect("terminal voice job must be created")
+        .expect("terminal voice job id must be returned");
+    let mut terminal_job = claim_voice_job(pool, terminal_id)
+        .await
+        .expect("terminal voice job must be claimable")
+        .expect("terminal voice claim must be present");
+    query("update voice_transcription_jobs set attempts = 6 where id = $1")
+        .bind(terminal_id)
+        .execute(pool)
+        .await
+        .expect("terminal retry fixture must update attempts");
+    terminal_job.attempts = 6;
+    mark_voice_job_retry_or_failed(pool, &terminal_job, "transient", "retry budget exhausted")
+        .await
+        .expect("exhausted voice retry budget must be finalized");
+    let terminal_status: String =
+        query_scalar("select status from voice_transcription_jobs where id = $1")
+            .bind(terminal_id)
+            .fetch_one(pool)
+            .await
+            .expect("terminal voice status must be readable");
+    assert_eq!(terminal_status, "failed");
+
+    let sent_media = VoiceMedia {
+        message_id: message_id + 2,
+        file_id: format!("sent-file-{suffix}"),
+        file_unique_id: Some(format!("sent-unique-{suffix}")),
+        ..media
+    };
+    let sent_id = create_voice_job(pool, &sent_media)
+        .await
+        .expect("sent voice job must be created")
+        .expect("sent voice job id must be returned");
+    query("update voice_transcription_jobs set status = 'sent' where id = $1")
+        .bind(sent_id)
+        .execute(pool)
+        .await
+        .expect("sent voice fixture must be finalized");
+    assert!(
+        claim_voice_job(pool, sent_id)
+            .await
+            .expect("sent voice job must be queryable")
+            .is_none(),
+        "sent voice jobs must not be processed again"
+    );
+
+    query("delete from voice_transcription_jobs where id in ($1, $2, $3)")
+        .bind(job.id)
+        .bind(terminal_id)
+        .bind(sent_id)
+        .execute(pool)
+        .await
+        .expect("voice lifecycle fixtures must be cleaned up");
 }
 
 async fn assert_post_history_entry_lease_lifecycle(pool: &PgPool) {

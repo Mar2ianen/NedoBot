@@ -7,8 +7,9 @@ use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
 use crate::features::voice::repo::{
-    create_voice_job, mark_voice_job_failed, mark_voice_job_status, save_asr_result,
-    save_voice_result,
+    VoiceJob, claim_next_voice_job, claim_voice_job, create_voice_job, mark_voice_job_failed,
+    mark_voice_job_phase, mark_voice_job_retry_or_failed, mark_voice_job_skipped, save_asr_result,
+    save_progress_message, save_voice_result,
 };
 use crate::features::voice::types::{AsrTranscript, VoiceMedia};
 use crate::state::AppState;
@@ -134,40 +135,100 @@ async fn transcribe_media_message(
         tracing::debug!(
             chat_id = media.chat_id,
             message_id = media.message_id,
-            "voice transcription job already exists"
+            "voice transcription job is already processing or terminal"
         );
         return Ok(true);
     };
 
+    let Some(job) = claim_voice_job(&state.pool, job_id).await? else {
+        tracing::debug!(
+            job_id,
+            "voice transcription job was claimed by another worker"
+        );
+        return Ok(true);
+    };
+    process_claimed_voice_job(bot, state, job, media).await?;
+    Ok(true)
+}
+
+pub async fn process_next_voice_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+) -> anyhow::Result<bool> {
+    let Some(job) = claim_next_voice_job(&state.pool).await? else {
+        return Ok(false);
+    };
+    let media = job.media()?;
+    process_claimed_voice_job(bot, state, job, media).await?;
+    Ok(true)
+}
+
+async fn process_claimed_voice_job(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    state: &AppState,
+    job: VoiceJob,
+    media: VoiceMedia,
+) -> anyhow::Result<()> {
     if let Err(skip) = validate_media(&media, &state.config) {
-        mark_voice_job_failed(&state.pool, job_id, &skip.user_message()).await?;
-        send_html_reply(
+        let progress_message_id = ensure_progress_message(bot, &state.pool, &job).await?;
+        mark_voice_job_failed(&state.pool, &job, "validation_failed", &skip.user_message()).await?;
+        edit_transcription_message(
             bot,
-            msg.chat.id,
-            msg.id,
-            crate::telegram::render::escape_html(&skip.user_message()),
+            ChatId(media.chat_id),
+            progress_message_id,
+            &skip.user_message(),
         )
         .await?;
-        return Ok(true);
+        return Ok(());
     }
 
-    let progress_message = send_html_reply(bot, msg.chat.id, msg.id, "Расшифровка…").await?;
-    if let Err(failure) =
-        process_voice_job(bot, msg, state, job_id, &media, progress_message.id).await
-    {
+    let progress_message_id = ensure_progress_message(bot, &state.pool, &job).await?;
+    if let Err(failure) = process_voice_job(bot, state, &job, &media, progress_message_id).await {
+        if matches!(failure, VoiceProcessingFailure::LeaseLost) {
+            tracing::warn!(job_id = job.id, "voice transcription lease was lost");
+            return Ok(());
+        }
         tracing::warn!(
-            job_id,
+            job_id = job.id,
             error_kind = failure.error_kind(),
             "voice transcription failed"
         );
-        mark_voice_job_failed(&state.pool, job_id, failure.error_kind()).await?;
+        mark_voice_job_retry_or_failed(
+            &state.pool,
+            &job,
+            failure.error_kind(),
+            failure
+                .user_message()
+                .unwrap_or("voice transcription failed"),
+        )
+        .await?;
         if let Some(message) = failure.user_message() {
-            edit_transcription_message(bot, msg.chat.id, progress_message.id, message).await?;
+            edit_transcription_message(bot, ChatId(media.chat_id), progress_message_id, message)
+                .await?;
         }
-        return Ok(true);
     }
+    Ok(())
+}
 
-    Ok(true)
+async fn ensure_progress_message(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    pool: &sqlx::PgPool,
+    job: &VoiceJob,
+) -> anyhow::Result<MessageId> {
+    if let Some(message_id) = job.progress_message_id {
+        return Ok(MessageId(message_id));
+    }
+    let progress = send_html_reply(
+        bot,
+        ChatId(job.chat_id),
+        MessageId(job.message_id),
+        "Расшифровка…",
+    )
+    .await?;
+    if !save_progress_message(pool, job, progress.id.0).await? {
+        anyhow::bail!("voice transcription lease lost while saving progress message");
+    }
+    Ok(progress.id)
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +237,7 @@ enum VoiceProcessingFailure {
     Asr,
     Cleanup,
     Delivery,
+    LeaseLost,
 }
 
 impl VoiceProcessingFailure {
@@ -185,6 +247,7 @@ impl VoiceProcessingFailure {
             Self::Asr => "asr_failed",
             Self::Cleanup => "cleanup_failed",
             Self::Delivery => "delivery_failed",
+            Self::LeaseLost => "lease_lost",
         }
     }
 
@@ -196,35 +259,39 @@ impl VoiceProcessingFailure {
             ),
             Self::Cleanup => Some("Не смог подготовить расшифровку. Попробуйте позже."),
             Self::Delivery => None,
+            Self::LeaseLost => None,
         }
     }
 }
 
 async fn process_voice_job(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
     state: &AppState,
-    job_id: i64,
+    job: &VoiceJob,
     media: &VoiceMedia,
     progress_message_id: MessageId,
 ) -> Result<(), VoiceProcessingFailure> {
-    mark_voice_job_status(&state.pool, job_id, "downloading")
+    mark_voice_job_phase(&state.pool, job, "downloading")
         .await
-        .map_err(|_| VoiceProcessingFailure::Download)?;
+        .map_err(|_| VoiceProcessingFailure::Download)?
+        .then_some(())
+        .ok_or(VoiceProcessingFailure::LeaseLost)?;
     let transcript = {
         let downloaded = download_media_file(bot, media)
             .await
             .map_err(|_| VoiceProcessingFailure::Download)?;
         tracing::info!(
-            job_id,
+            job_id = job.id,
             size = downloaded.size,
             media_kind = media.kind.as_str(),
             "downloaded media file for transcription"
         );
 
-        mark_voice_job_status(&state.pool, job_id, "transcribing")
+        mark_voice_job_phase(&state.pool, job, "transcribing")
             .await
-            .map_err(|_| VoiceProcessingFailure::Asr)?;
+            .map_err(|_| VoiceProcessingFailure::Asr)?
+            .then_some(())
+            .ok_or(VoiceProcessingFailure::LeaseLost)?;
         transcribe_audio(
             &state.config,
             &downloaded.path,
@@ -234,38 +301,57 @@ async fn process_voice_job(
         .await
         .map_err(|_| VoiceProcessingFailure::Asr)?
     };
-    save_asr_result(&state.pool, job_id, &transcript)
+    save_asr_result(&state.pool, job, &transcript)
         .await
-        .map_err(|_| VoiceProcessingFailure::Asr)?;
+        .map_err(|_| VoiceProcessingFailure::Asr)?
+        .then_some(())
+        .ok_or(VoiceProcessingFailure::LeaseLost)?;
     if !transcript_has_speech(&transcript) {
-        mark_voice_job_failed(&state.pool, job_id, NO_SPEECH_MESSAGE)
+        mark_voice_job_skipped(&state.pool, job, NO_SPEECH_MESSAGE)
             .await
-            .map_err(|_| VoiceProcessingFailure::Delivery)?;
-        edit_transcription_message(bot, msg.chat.id, progress_message_id, NO_SPEECH_MESSAGE)
-            .await
-            .map_err(|_| VoiceProcessingFailure::Delivery)?;
+            .map_err(|_| VoiceProcessingFailure::Delivery)?
+            .then_some(())
+            .ok_or(VoiceProcessingFailure::LeaseLost)?;
+        edit_transcription_message(
+            bot,
+            ChatId(media.chat_id),
+            progress_message_id,
+            NO_SPEECH_MESSAGE,
+        )
+        .await
+        .map_err(|_| VoiceProcessingFailure::Delivery)?;
         return Ok(());
     }
 
-    mark_voice_job_status(&state.pool, job_id, "cleaning")
+    mark_voice_job_phase(&state.pool, job, "cleaning")
         .await
-        .map_err(|_| VoiceProcessingFailure::Cleanup)?;
+        .map_err(|_| VoiceProcessingFailure::Cleanup)?
+        .then_some(())
+        .ok_or(VoiceProcessingFailure::LeaseLost)?;
     let cleanup = cleanup_transcript(&state.config, &transcript)
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
     let rendered = render_transcript(&cleanup.transcript, &state.config);
-    let sent = send_rendered_transcript(bot, msg, progress_message_id, &rendered)
-        .await
-        .map_err(|_| VoiceProcessingFailure::Delivery)?;
+    let sent = send_rendered_transcript(
+        bot,
+        ChatId(media.chat_id),
+        MessageId(media.message_id),
+        progress_message_id,
+        &rendered,
+    )
+    .await
+    .map_err(|_| VoiceProcessingFailure::Delivery)?;
     save_voice_result(
         &state.pool,
-        job_id,
+        job,
         &cleanup,
         &sent.html,
         sent.file_id.as_deref(),
     )
     .await
-    .map_err(|_| VoiceProcessingFailure::Delivery)?;
+    .map_err(|_| VoiceProcessingFailure::Delivery)?
+    .then_some(())
+    .ok_or(VoiceProcessingFailure::LeaseLost)?;
 
     Ok(())
 }
@@ -325,13 +411,14 @@ async fn edit_transcription_message(
 
 async fn send_rendered_transcript(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
+    chat_id: ChatId,
+    source_message_id: MessageId,
     progress_message_id: MessageId,
     rendered: &RenderedTranscript,
 ) -> anyhow::Result<SentRenderedTranscript> {
     match rendered {
         RenderedTranscript::Message { html } => {
-            edit_transcription_message(bot, msg.chat.id, progress_message_id, html).await?;
+            edit_transcription_message(bot, chat_id, progress_message_id, html).await?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: None,
@@ -340,41 +427,42 @@ async fn send_rendered_transcript(
         RenderedTranscript::RichMessage { html, fallback } => {
             edit_transcription_message(
                 bot,
-                msg.chat.id,
+                chat_id,
                 progress_message_id,
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
             .await?;
             let rich = InputRichMessage::html(html.clone()).skip_entity_detection(true);
-            match send_rich_message_reply(bot, msg.chat.id, msg.id, rich).await {
+            match send_rich_message_reply(bot, chat_id, source_message_id, rich).await {
                 Ok(_) => Ok(SentRenderedTranscript {
                     html: html.clone(),
                     file_id: None,
                 }),
-                Err(_) => send_regular_transcript(bot, msg, fallback).await,
+                Err(_) => send_regular_transcript(bot, chat_id, source_message_id, fallback).await,
             }
         }
         RenderedTranscript::MessageAndFile { .. } => {
             edit_transcription_message(
                 bot,
-                msg.chat.id,
+                chat_id,
                 progress_message_id,
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
             .await?;
-            send_regular_transcript(bot, msg, rendered).await
+            send_regular_transcript(bot, chat_id, source_message_id, rendered).await
         }
     }
 }
 
 async fn send_regular_transcript(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
+    chat_id: ChatId,
+    source_message_id: MessageId,
     rendered: &RenderedTranscript,
 ) -> anyhow::Result<SentRenderedTranscript> {
     match rendered {
         RenderedTranscript::Message { html } => {
-            send_html_reply(bot, msg.chat.id, msg.id, html).await?;
+            send_html_reply(bot, chat_id, source_message_id, html).await?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: None,
@@ -385,14 +473,14 @@ async fn send_regular_transcript(
             filename,
             body,
         } => {
-            send_html_reply(bot, msg.chat.id, msg.id, html).await?;
+            send_html_reply(bot, chat_id, source_message_id, html).await?;
             let sent = bot
                 .send_document(
-                    msg.chat.id,
+                    chat_id,
                     InputFile::memory(body.clone().into_bytes()).file_name(filename.clone()),
                 )
                 .reply_parameters(
-                    ReplyParameters::new(MessageId(msg.id.0)).allow_sending_without_reply(),
+                    ReplyParameters::new(source_message_id).allow_sending_without_reply(),
                 )
                 .await?;
             Ok(SentRenderedTranscript {
