@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 use std::sync::Arc;
 use teloxide::drafter::InProcessRateLimiter;
-use teloxide::utils::time::{LlmMarkdownFormatter, TimeContext};
+use teloxide::utils::{rich_text::LlmMarkdownFormatter, time::TimeContext};
 use tokio::sync::Semaphore;
 
 use crate::config::Config;

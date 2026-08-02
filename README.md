@@ -129,7 +129,7 @@
 - [x] базовая расшифровка voice/audio/кружков через Groq ASR;
 - [x] агентный `/ask` с ограниченными read-only инструментами чата, web и GitHub;
 - [x] аудит `/ask`: запросы, инструменты, задержки и безопасные статусы ошибок;
-- [x] semantic Rich Text `/ask`: LLM Markdown time markers, trusted `chat`/`message_<id>`/`source_N` aliases и настроенные custom emoji bindings;
+- [x] semantic Rich Text `/ask`: LLM Markdown time markers, trusted `chat`/`message_<id>`/`source_N` aliases, provenance-checked literal URLs и настроенные custom emoji bindings;
 - [x] deterministic time rendering `/ask` с captured `now`, timezone, renderer revision и compiled-payload audit;
 - [x] delivery certainty для final/segment lifecycle и запрет fallback при `Unknown`;
 - [x] публичная HTTPS-раздача кэшированных аватарок Telegram;
@@ -153,7 +153,7 @@
 | `/format_test <текст>` | Проверяет рендер первого комментария на произвольном тексте. |
 | `/memory` | Показывает последние атомарные карточки истории и статус их обработки. |
 | `/transcribe` | Reply на voice, audio или кружок: запускает расшифровку. Работает при включённом voice-контуре, даже если автоматическая расшифровка выключена. |
- | `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет отдельный progress preview, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Наблюдённые сообщения доступны как `message_<id>`, внешние результаты поиска — как `source_N`, а custom emoji — как `:alias:`. Финальная доставка и fallback проходят через shared Drafter. Доступен всем участникам основного чата; в личке — только private allowlist. |
+ | `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет отдельный progress preview, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Наблюдённые сообщения доступны как `message_<id>`, внешние результаты поиска — как `source_N`, а custom emoji — как `:alias:`. Literal URL принимаются только из вопроса/reply, trusted search evidence или application allowlist. Финальная доставка и fallback проходят через shared Drafter. Доступен всем участникам основного чата; в личке — только private allowlist. |
  | `/chat_note <текст>` | Сохраняет общую заметку чата; доступно владельцу и администраторам. |
  | `/user_note <текст>` | Сохраняет заметку об авторе сообщения в reply; доступно владельцу и администраторам. |
 | `/stats_day [-r\|-p]` | Статистика за текущий день чата, где день начинается в 05:00 по Москве. |
