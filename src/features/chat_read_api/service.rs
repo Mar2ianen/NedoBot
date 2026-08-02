@@ -2,11 +2,12 @@ use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
 use super::types::{
-    ChatInteraction, ChatMessage, ChatUserProfile, MessageSearchRequest, RecentMessagesRequest,
+    ChatInteraction, ChatMessage, ChatUserProfile, MessageMatch, MessageSearchPage,
+    MessageSearchRequest, RecentMessagesRequest,
 };
 
 const MAX_QUERY_CHARS: usize = 240;
-const MAX_RESULT_LIMIT: i64 = 20;
+const MAX_RESULT_LIMIT: i64 = 50;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
 const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
 
@@ -20,6 +21,19 @@ struct MessageRow {
     reply_to_message_id: Option<i32>,
     created_at: DateTime<Utc>,
     relevance: f32,
+}
+
+#[derive(FromRow)]
+struct SearchMessageRow {
+    message_id: i32,
+    user_id: Option<i64>,
+    author: String,
+    author_username: Option<String>,
+    text: String,
+    reply_to_message_id: Option<i32>,
+    created_at: DateTime<Utc>,
+    relevance: f32,
+    total_count: i64,
 }
 
 #[derive(FromRow)]
@@ -43,56 +57,82 @@ pub async fn search_messages(
     pool: &PgPool,
     chat_id: i64,
     request: &MessageSearchRequest,
-) -> anyhow::Result<Vec<ChatMessage>> {
+) -> anyhow::Result<MessageSearchPage> {
     let query = normalized_query(&request.query)?;
-    let rows = sqlx::query_as::<_, MessageRow>(
+    let ts_query = full_text_query(&query, &request.match_mode);
+    let whole_word_pattern = whole_word_pattern(&query);
+    let rows = sqlx::query_as::<_, SearchMessageRow>(
         r#"
-        select
-            m.message_id,
-            m.user_id,
-            coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
-                     nullif(p.username, ''),
-                     'Неизвестный пользователь') as author,
-            nullif(p.username, '') as author_username,
-            m.text,
-            m.reply_to_message_id,
-            m.created_at,
-            case when $11 = 'full_text' then greatest(
-                    ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
-                    ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
-                 ) else case when position(lower($2) in lower(coalesce(m.text, ''))) > 0 then 1::real else 0::real end
-            end as relevance
-        from mcp_public.telegram_messages m
-        left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
-        where m.chat_id = $1
-          and m.text is not null
-          and m.deleted_by_bot_at is null
-          and m.spam_marked_at is null
-          and (($11 = 'full_text' and (
-                   to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
-                or to_tsvector('simple', coalesce(m.text, '')) @@ websearch_to_tsquery('simple', $2)
-              )) or ($11 = 'literal' and position(lower($2) in lower(coalesce(m.text, ''))) > 0))
-          and ($3::bigint is null or m.user_id = $3)
-          and ($4::timestamptz is null or m.created_at >= $4)
-          and ($5::timestamptz is null or m.created_at <= $5)
-          and ($6::integer is null or m.reply_to_message_id = $6)
-          and ($7::boolean is null or m.has_links = $7)
-          and (
-              $8::boolean is null
-              or (m.has_photo or m.has_video or m.has_document or m.has_audio
-                  or m.has_voice or m.has_sticker or m.has_animation) = $8
-          )
+        with matched as (
+            select
+                m.message_id,
+                m.user_id,
+                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
+                         nullif(p.username, ''),
+                         'Неизвестный пользователь') as author,
+                nullif(p.username, '') as author_username,
+                m.text,
+                m.reply_to_message_id,
+                m.created_at,
+                (
+                    case
+                        when $13 in ('hybrid', 'full_text', 'any_terms') then greatest(
+                            ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
+                            ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
+                        )
+                        when $13 = 'literal' and position(lower($3) in lower(m.text)) > 0 then 1.0
+                        when $13 = 'whole_word' and m.text ~* $4 then 1.0
+                        else 0.0
+                    end
+                    + case when $13 = 'hybrid' and lower($3) <% lower(m.text)
+                           then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) * 0.25
+                           else 0.0
+                      end
+                )::real as relevance
+            from mcp_public.telegram_messages m
+            left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
+            where m.chat_id = $1
+              and m.text is not null
+              and m.deleted_by_bot_at is null
+              and m.spam_marked_at is null
+              and m.user_id is not null
+              and not coalesce(p.is_bot, false)
+              and ($14::boolean or not coalesce(m.is_automatic_forward, false))
+              and ($5::bigint is null or m.user_id = $5)
+              and ($6::timestamptz is null or m.created_at >= $6)
+              and ($7::timestamptz is null or m.created_at <= $7)
+              and ($8::integer is null or m.reply_to_message_id = $8)
+              and ($9::boolean is null or m.has_links = $9)
+              and (
+                  $10::boolean is null
+                  or (m.has_photo or m.has_video or m.has_document or m.has_audio
+                      or m.has_voice or m.has_sticker or m.has_animation) = $10
+              )
+              and (
+                  ($13 in ('hybrid', 'full_text', 'any_terms') and (
+                       to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
+                    or to_tsvector('simple', coalesce(m.text, '')) @@ websearch_to_tsquery('simple', $2)
+                  ))
+                  or ($13 = 'hybrid' and lower($3) <% lower(m.text))
+                  or ($13 = 'literal' and position(lower($3) in lower(m.text)) > 0)
+                  or ($13 = 'whole_word' and m.text ~* $4)
+              )
+        )
+        select *, count(*) over() as total_count
+        from matched
         order by
-            case when $9 = 'newest' then m.created_at end desc,
-            case when $9 = 'oldest' then m.created_at end asc,
+            case when $11 = 'newest' then created_at end desc,
+            case when $11 = 'oldest' then created_at end asc,
             relevance desc,
-            m.created_at desc,
-            m.message_id desc
-        limit $10
+            created_at desc,
+            message_id desc
+        limit $12
         "#,
     )
     .bind(chat_id)
+    .bind(&ts_query)
     .bind(&query)
+    .bind(&whole_word_pattern)
     .bind(request.user_id)
     .bind(request.date_from)
     .bind(request.date_to)
@@ -102,10 +142,34 @@ pub async fn search_messages(
     .bind(request.sort.as_str())
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
     .bind(request.match_mode.as_str())
+    .bind(request.include_forwards)
     .fetch_all(pool)
     .await?;
 
-    Ok(map_rows(chat_id, rows))
+    let total_count = rows.first().map(|row| row.total_count).unwrap_or(0);
+    let messages = map_search_rows(chat_id, rows);
+    Ok(MessageSearchPage {
+        has_more: total_count > messages.len() as i64,
+        messages,
+        total_count,
+    })
+}
+
+pub async fn count_messages(
+    pool: &PgPool,
+    chat_id: i64,
+    request: &MessageSearchRequest,
+) -> anyhow::Result<i64> {
+    Ok(search_messages(
+        pool,
+        chat_id,
+        &MessageSearchRequest {
+            limit: 1,
+            ..request.clone()
+        },
+    )
+    .await?
+    .total_count)
 }
 
 pub async fn recent_messages(
@@ -125,6 +189,9 @@ pub async fn recent_messages(
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
+          and m.user_id is not null
+          and not coalesce(p.is_bot, false)
+          and ($9::boolean or not coalesce(m.is_automatic_forward, false))
           and ($2::bigint is null or m.user_id = $2)
           and ($3::timestamptz is null or m.created_at >= $3)
           and ($4::timestamptz is null or m.created_at <= $4)
@@ -146,6 +213,7 @@ pub async fn recent_messages(
     .bind(request.has_media)
     .bind(request.sort.as_str())
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
+    .bind(request.include_forwards)
     .fetch_all(pool)
     .await?;
     Ok(map_rows(chat_id, rows))
@@ -367,6 +435,55 @@ pub async fn user_profile(
     Ok(profile)
 }
 
+fn full_text_query(query: &str, mode: &MessageMatch) -> String {
+    if matches!(mode, MessageMatch::AnyTerms) {
+        query
+            .split_whitespace()
+            .map(|term| term.to_owned())
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    } else {
+        query.to_owned()
+    }
+}
+
+fn whole_word_pattern(query: &str) -> String {
+    format!(
+        r"(?i)(^|[^[:alnum:]_]){}($|[^[:alnum:]_])",
+        regex_escape(query)
+    )
+}
+
+fn regex_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if r"\.^$|()[]{}*+?".contains(character) {
+                vec!['\\', character]
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
+fn map_search_rows(chat_id: i64, rows: Vec<SearchMessageRow>) -> Vec<ChatMessage> {
+    rows.into_iter()
+        .map(|row| ChatMessage {
+            source_id: source_id(row.message_id),
+            message_url: message_url(chat_id, row.message_id),
+            relevance: (row.relevance * 1000.0).round() as i32,
+            message_id: row.message_id,
+            user_id: row.user_id,
+            author: row.author,
+            author_url: author_url(row.author_username.as_deref()),
+            text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
+            reply_to_message_id: row.reply_to_message_id,
+            created_at: row.created_at.to_rfc3339(),
+        })
+        .collect()
+}
+
 fn map_rows(chat_id: i64, rows: Vec<MessageRow>) -> Vec<ChatMessage> {
     rows.into_iter()
         .map(|row| ChatMessage {
@@ -461,5 +578,24 @@ mod tests {
     #[test]
     fn rejects_empty_query() {
         assert!(normalized_query(" \n ").is_err());
+    }
+
+    #[test]
+    fn any_terms_builds_or_query_for_alternatives() {
+        assert_eq!(
+            full_text_query("броня защита", &MessageMatch::AnyTerms),
+            "броня OR защита"
+        );
+        assert_eq!(
+            full_text_query("броня защита", &MessageMatch::FullText),
+            "броня защита"
+        );
+    }
+
+    #[test]
+    fn whole_word_pattern_escapes_regex_metacharacters() {
+        let pattern = whole_word_pattern("Rust 1.85");
+        assert!(pattern.contains(r"Rust 1\.85"));
+        assert!(pattern.starts_with(r"(?i)(^|[^[:alnum:]_])"));
     }
 }

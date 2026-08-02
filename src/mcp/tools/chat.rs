@@ -20,15 +20,21 @@ const MAX_BATCH_LIMIT: i64 = 5;
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {
+    Hybrid,
     FullText,
+    AnyTerms,
     Literal,
+    WholeWord,
 }
 
 impl From<MatchMode> for MessageMatch {
     fn from(value: MatchMode) -> Self {
         match value {
+            MatchMode::Hybrid => Self::Hybrid,
             MatchMode::FullText => Self::FullText,
+            MatchMode::AnyTerms => Self::AnyTerms,
             MatchMode::Literal => Self::Literal,
+            MatchMode::WholeWord => Self::WholeWord,
         }
     }
 }
@@ -64,6 +70,8 @@ pub struct SearchMessagesInput {
     pub match_mode: Option<MatchMode>,
     pub sort: Option<Sort>,
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub include_forwards: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -78,6 +86,23 @@ pub struct SearchMessagesBatchInput {
     pub match_mode: Option<MatchMode>,
     pub sort: Option<Sort>,
     pub limit_per_query: Option<i64>,
+    #[serde(default)]
+    pub include_forwards: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CountMessagesInput {
+    pub query: String,
+    pub user_id: Option<i64>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub reply_to_message_id: Option<i32>,
+    pub has_links: Option<bool>,
+    pub has_media: Option<bool>,
+    pub match_mode: Option<MatchMode>,
+    #[serde(default)]
+    pub include_forwards: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -90,6 +115,8 @@ pub struct RecentMessagesInput {
     pub has_media: Option<bool>,
     pub sort: Option<Sort>,
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub include_forwards: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -124,16 +151,44 @@ pub struct UserProfileInput {
 pub struct BatchSearchResult {
     pub query: String,
     pub messages: serde_json::Value,
+    pub total_count: i64,
+    pub has_more: bool,
 }
 
-fn parse_timestamp(value: Option<String>) -> Result<Option<DateTime<Utc>>, rmcp::ErrorData> {
+#[derive(Clone, Copy)]
+enum DateBoundary {
+    Start,
+    End,
+}
+
+fn parse_timestamp(
+    value: Option<String>,
+    boundary: DateBoundary,
+) -> Result<Option<DateTime<Utc>>, rmcp::ErrorData> {
     value
-        .map(|value| {
-            DateTime::parse_from_rfc3339(&value)
-                .map(|value| value.with_timezone(&Utc))
-                .map_err(|_| invalid_arguments("timestamps must be RFC 3339"))
-        })
+        .map(|value| parse_timestamp_value(&value, boundary))
         .transpose()
+}
+
+fn parse_timestamp_value(
+    value: &str,
+    boundary: DateBoundary,
+) -> Result<DateTime<Utc>, rmcp::ErrorData> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
+        return Ok(value.with_timezone(&Utc));
+    }
+
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| invalid_arguments("timestamps must be RFC 3339 or YYYY-MM-DD"))?;
+    let time = match boundary {
+        DateBoundary::Start => chrono::NaiveTime::MIN,
+        DateBoundary::End => chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999)
+            .expect("valid end-of-day time"),
+    };
+    Ok(DateTime::<Utc>::from_naive_utc_and_offset(
+        date.and_time(time),
+        Utc,
+    ))
 }
 
 fn search_request(input: SearchMessagesInput) -> Result<MessageSearchRequest, rmcp::ErrorData> {
@@ -143,14 +198,15 @@ fn search_request(input: SearchMessagesInput) -> Result<MessageSearchRequest, rm
     Ok(MessageSearchRequest {
         query: input.query,
         user_id: input.user_id,
-        date_from: parse_timestamp(input.date_from)?,
-        date_to: parse_timestamp(input.date_to)?,
+        date_from: parse_timestamp(input.date_from, DateBoundary::Start)?,
+        date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
         reply_to_message_id: input.reply_to_message_id,
         has_links: input.has_links,
         has_media: input.has_media,
-        match_mode: input.match_mode.unwrap_or(MatchMode::FullText).into(),
+        match_mode: input.match_mode.unwrap_or(MatchMode::Hybrid).into(),
         sort: input.sort.unwrap_or(Sort::Relevance).into(),
         limit: input.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+        include_forwards: input.include_forwards,
     })
 }
 
@@ -158,11 +214,38 @@ pub async fn search_messages(
     api: &ChatReadApi,
     input: SearchMessagesInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
-    let messages = api
+    let page = api
         .search_messages(&search_request(input)?)
         .await
         .map_err(|_| read_error("chat search failed"))?;
-    messages_output("messages", messages)
+    serde_json::to_value(page).map_err(|_| read_error("cannot encode chat result"))
+}
+
+pub async fn count_messages(
+    api: &ChatReadApi,
+    input: CountMessagesInput,
+) -> Result<serde_json::Value, rmcp::ErrorData> {
+    let request = MessageSearchRequest {
+        query: input.query,
+        user_id: input.user_id,
+        date_from: parse_timestamp(input.date_from, DateBoundary::Start)?,
+        date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
+        reply_to_message_id: input.reply_to_message_id,
+        has_links: input.has_links,
+        has_media: input.has_media,
+        match_mode: input.match_mode.unwrap_or(MatchMode::Hybrid).into(),
+        sort: MessageSort::Relevance,
+        limit: 1,
+        include_forwards: input.include_forwards,
+    };
+    if request.query.trim().is_empty() {
+        return Err(invalid_arguments("query must not be empty"));
+    }
+    let count = api
+        .count_messages(&request)
+        .await
+        .map_err(|_| read_error("chat message count failed"))?;
+    Ok(serde_json::json!({"count": count}))
 }
 
 pub async fn search_messages_batch(
@@ -170,8 +253,8 @@ pub async fn search_messages_batch(
     input: SearchMessagesBatchInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
     let queries = normalize_batch_queries(input.queries)?;
-    let date_from = parse_timestamp(input.date_from)?;
-    let date_to = parse_timestamp(input.date_to)?;
+    let date_from = parse_timestamp(input.date_from, DateBoundary::Start)?;
+    let date_to = parse_timestamp(input.date_to, DateBoundary::End)?;
     let limit = input
         .limit_per_query
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
@@ -187,19 +270,18 @@ pub async fn search_messages_batch(
                 reply_to_message_id: None,
                 has_links: input.has_links,
                 has_media: input.has_media,
-                match_mode: input
-                    .match_mode
-                    .clone()
-                    .unwrap_or(MatchMode::FullText)
-                    .into(),
+                match_mode: input.match_mode.clone().unwrap_or(MatchMode::Hybrid).into(),
                 sort: input.sort.clone().unwrap_or(Sort::Relevance).into(),
                 limit,
+                include_forwards: input.include_forwards,
             })
             .await
             .map_err(|_| read_error("chat batch search failed"))?;
         results.push(BatchSearchResult {
             query,
-            messages: serde_json::to_value(messages)
+            total_count: messages.total_count,
+            has_more: messages.has_more,
+            messages: serde_json::to_value(messages.messages)
                 .map_err(|_| read_error("cannot encode chat result"))?,
         });
     }
@@ -238,12 +320,13 @@ pub async fn recent_messages(
     let messages = api
         .recent_messages(&RecentMessagesRequest {
             user_id: input.user_id,
-            date_from: parse_timestamp(input.date_from)?,
-            date_to: parse_timestamp(input.date_to)?,
+            date_from: parse_timestamp(input.date_from, DateBoundary::Start)?,
+            date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
             has_links: input.has_links,
             has_media: input.has_media,
-            sort: input.sort.unwrap_or(Sort::Newest).into(),
             limit: input.limit.unwrap_or(DEFAULT_RECENT_LIMIT),
+            sort: input.sort.unwrap_or(Sort::Newest).into(),
+            include_forwards: input.include_forwards,
         })
         .await
         .map_err(|_| read_error("recent message lookup failed"))?;
@@ -414,8 +497,43 @@ mod tests {
             match_mode: None,
             sort: None,
             limit: None,
+            include_forwards: false,
         })
         .unwrap_err();
         assert_eq!(error.message, "query must not be empty");
+    }
+
+    #[test]
+    fn date_only_filters_cover_the_requested_local_day_in_utc() {
+        let start = parse_timestamp_value("2026-03-25", DateBoundary::Start).unwrap();
+        let end = parse_timestamp_value("2026-03-25", DateBoundary::End).unwrap();
+        assert_eq!(start.to_rfc3339(), "2026-03-25T00:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-03-25T23:59:59.999999+00:00");
+        assert_eq!(
+            parse_timestamp_value("25.03.2026", DateBoundary::Start)
+                .unwrap_err()
+                .message,
+            "timestamps must be RFC 3339 or YYYY-MM-DD"
+        );
+    }
+
+    #[test]
+    fn default_search_mode_is_hybrid() {
+        let request = search_request(SearchMessagesInput {
+            query: "броня".into(),
+            user_id: None,
+            date_from: None,
+            date_to: None,
+            reply_to_message_id: None,
+            has_links: None,
+            has_media: None,
+            match_mode: None,
+            sort: None,
+            limit: None,
+            include_forwards: false,
+        })
+        .unwrap();
+        assert_eq!(request.match_mode, MessageMatch::Hybrid);
+        assert!(!request.include_forwards);
     }
 }
