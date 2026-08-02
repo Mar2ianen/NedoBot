@@ -1,5 +1,5 @@
-use teloxide::prelude::*;
 use teloxide::types::{InputFile, InputRichMessage, MessageId, ReplyParameters};
+use teloxide::{RequestError, prelude::*};
 
 use crate::db::telegram::save_telegram_message;
 use crate::features::voice::asr::transcribe_audio;
@@ -7,9 +7,10 @@ use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
 use crate::features::voice::repo::{
-    VoiceJob, claim_next_voice_job, claim_voice_job, create_voice_job, mark_voice_job_failed,
-    mark_voice_job_phase, mark_voice_job_retry_or_failed, mark_voice_job_skipped, save_asr_result,
-    save_progress_message, save_voice_result,
+    VoiceJob, VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
+    mark_voice_job_delivery_unknown, mark_voice_job_failed, mark_voice_job_phase,
+    mark_voice_job_retry_or_failed, mark_voice_job_skipped, recover_expired_voice_deliveries,
+    save_asr_result, save_progress_message, save_voice_result,
 };
 use crate::features::voice::types::{AsrTranscript, VoiceMedia};
 use crate::state::AppState;
@@ -130,6 +131,10 @@ async fn transcribe_media_message(
     };
 
     save_telegram_message(&state.pool, msg, &state.config).await?;
+    let recovered = recover_expired_voice_deliveries(&state.pool).await?;
+    if recovered > 0 {
+        tracing::warn!(count = recovered, "recovered expired voice delivery leases");
+    }
 
     let Some(job_id) = create_voice_job(&state.pool, &media).await? else {
         tracing::debug!(
@@ -155,6 +160,10 @@ pub async fn process_next_voice_job(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     state: &AppState,
 ) -> anyhow::Result<bool> {
+    let recovered = recover_expired_voice_deliveries(&state.pool).await?;
+    if recovered > 0 {
+        tracing::warn!(count = recovered, "recovered expired voice delivery leases");
+    }
     let Some(job) = claim_next_voice_job(&state.pool).await? else {
         return Ok(false);
     };
@@ -171,7 +180,13 @@ async fn process_claimed_voice_job(
 ) -> anyhow::Result<()> {
     if let Err(skip) = validate_media(&media, &state.config) {
         let progress_message_id = ensure_progress_message(bot, &state.pool, &job).await?;
-        mark_voice_job_failed(&state.pool, &job, "validation_failed", &skip.user_message()).await?;
+        let transition =
+            mark_voice_job_failed(&state.pool, &job, "validation_failed", &skip.user_message())
+                .await?;
+        if transition == VoiceTransition::LeaseLost {
+            tracing::warn!(job_id = job.id, "voice validation result lost its lease");
+            return Ok(());
+        }
         edit_transcription_message(
             bot,
             ChatId(media.chat_id),
@@ -188,12 +203,42 @@ async fn process_claimed_voice_job(
             tracing::warn!(job_id = job.id, "voice transcription lease was lost");
             return Ok(());
         }
+        if matches!(failure, VoiceProcessingFailure::DeliveryUnknown) {
+            match mark_voice_job_delivery_unknown(
+                &state.pool,
+                &job,
+                "Telegram delivery or DB finalization outcome is unknown",
+            )
+            .await?
+            {
+                VoiceTransition::DeliveryUnknown => {
+                    tracing::error!(
+                        job_id = job.id,
+                        "voice delivery outcome is unknown; automatic retry suppressed"
+                    );
+                }
+                VoiceTransition::LeaseLost => {
+                    tracing::warn!(
+                        job_id = job.id,
+                        "voice delivery-unknown transition lost its lease"
+                    );
+                }
+                transition => {
+                    tracing::error!(
+                        job_id = job.id,
+                        ?transition,
+                        "unexpected voice delivery-unknown transition"
+                    );
+                }
+            }
+            return Ok(());
+        }
         tracing::warn!(
             job_id = job.id,
             error_kind = failure.error_kind(),
             "voice transcription failed"
         );
-        mark_voice_job_retry_or_failed(
+        let transition = mark_voice_job_retry_or_failed(
             &state.pool,
             &job,
             failure.error_kind(),
@@ -202,6 +247,10 @@ async fn process_claimed_voice_job(
                 .unwrap_or("voice transcription failed"),
         )
         .await?;
+        if transition == VoiceTransition::LeaseLost {
+            tracing::warn!(job_id = job.id, "voice failure result lost its lease");
+            return Ok(());
+        }
         if let Some(message) = failure.user_message() {
             edit_transcription_message(bot, ChatId(media.chat_id), progress_message_id, message)
                 .await?;
@@ -236,7 +285,8 @@ enum VoiceProcessingFailure {
     Download,
     Asr,
     Cleanup,
-    Delivery,
+    DeliveryRejected,
+    DeliveryUnknown,
     LeaseLost,
 }
 
@@ -246,7 +296,8 @@ impl VoiceProcessingFailure {
             Self::Download => "download_failed",
             Self::Asr => "asr_failed",
             Self::Cleanup => "cleanup_failed",
-            Self::Delivery => "delivery_failed",
+            Self::DeliveryRejected => "delivery_rejected",
+            Self::DeliveryUnknown => "delivery_unknown",
             Self::LeaseLost => "lease_lost",
         }
     }
@@ -258,8 +309,35 @@ impl VoiceProcessingFailure {
                 "Не смог расшифровать запись: сервис распознавания временно недоступен. Попробуйте позже.",
             ),
             Self::Cleanup => Some("Не смог подготовить расшифровку. Попробуйте позже."),
-            Self::Delivery => None,
+            Self::DeliveryRejected | Self::DeliveryUnknown => None,
             Self::LeaseLost => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum VoiceDeliveryFailure {
+    Rejected,
+    Unknown,
+}
+
+fn classify_voice_delivery_error(error: &RequestError) -> VoiceDeliveryFailure {
+    match error {
+        RequestError::RetryAfter(_)
+        | RequestError::Api(_)
+        | RequestError::MigrateToChatId(_)
+        | RequestError::Validation(_) => VoiceDeliveryFailure::Rejected,
+        RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_) => {
+            VoiceDeliveryFailure::Unknown
+        }
+    }
+}
+
+impl From<VoiceDeliveryFailure> for VoiceProcessingFailure {
+    fn from(failure: VoiceDeliveryFailure) -> Self {
+        match failure {
+            VoiceDeliveryFailure::Rejected => Self::DeliveryRejected,
+            VoiceDeliveryFailure::Unknown => Self::DeliveryUnknown,
         }
     }
 }
@@ -309,7 +387,7 @@ async fn process_voice_job(
     if !transcript_has_speech(&transcript) {
         mark_voice_job_skipped(&state.pool, job, NO_SPEECH_MESSAGE)
             .await
-            .map_err(|_| VoiceProcessingFailure::Delivery)?
+            .map_err(|_| VoiceProcessingFailure::Cleanup)?
             .then_some(())
             .ok_or(VoiceProcessingFailure::LeaseLost)?;
         edit_transcription_message(
@@ -319,7 +397,7 @@ async fn process_voice_job(
             NO_SPEECH_MESSAGE,
         )
         .await
-        .map_err(|_| VoiceProcessingFailure::Delivery)?;
+        .map_err(|_| VoiceProcessingFailure::Cleanup)?;
         return Ok(());
     }
 
@@ -332,6 +410,11 @@ async fn process_voice_job(
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
     let rendered = render_transcript(&cleanup.transcript, &state.config);
+    mark_voice_job_phase(&state.pool, job, "delivering")
+        .await
+        .map_err(|_| VoiceProcessingFailure::DeliveryUnknown)?
+        .then_some(())
+        .ok_or(VoiceProcessingFailure::LeaseLost)?;
     let sent = send_rendered_transcript(
         bot,
         ChatId(media.chat_id),
@@ -340,8 +423,8 @@ async fn process_voice_job(
         &rendered,
     )
     .await
-    .map_err(|_| VoiceProcessingFailure::Delivery)?;
-    save_voice_result(
+    .map_err(VoiceProcessingFailure::from)?;
+    match save_voice_result(
         &state.pool,
         job,
         &cleanup,
@@ -349,9 +432,10 @@ async fn process_voice_job(
         sent.file_id.as_deref(),
     )
     .await
-    .map_err(|_| VoiceProcessingFailure::Delivery)?
-    .then_some(())
-    .ok_or(VoiceProcessingFailure::LeaseLost)?;
+    {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(VoiceProcessingFailure::DeliveryUnknown),
+    }
 
     Ok(())
 }
@@ -415,10 +499,12 @@ async fn send_rendered_transcript(
     source_message_id: MessageId,
     progress_message_id: MessageId,
     rendered: &RenderedTranscript,
-) -> anyhow::Result<SentRenderedTranscript> {
+) -> Result<SentRenderedTranscript, VoiceDeliveryFailure> {
     match rendered {
         RenderedTranscript::Message { html } => {
-            edit_transcription_message(bot, chat_id, progress_message_id, html).await?;
+            edit_transcription_message(bot, chat_id, progress_message_id, html)
+                .await
+                .map_err(|error| classify_voice_delivery_error(&error))?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: None,
@@ -431,14 +517,20 @@ async fn send_rendered_transcript(
                 progress_message_id,
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
-            .await?;
+            .await
+            .map_err(|error| classify_voice_delivery_error(&error))?;
             let rich = InputRichMessage::html(html.clone()).skip_entity_detection(true);
             match send_rich_message_reply(bot, chat_id, source_message_id, rich).await {
                 Ok(_) => Ok(SentRenderedTranscript {
                     html: html.clone(),
                     file_id: None,
                 }),
-                Err(_) => send_regular_transcript(bot, chat_id, source_message_id, fallback).await,
+                Err(error) => match classify_voice_delivery_error(&error) {
+                    VoiceDeliveryFailure::Rejected => {
+                        send_regular_transcript(bot, chat_id, source_message_id, fallback).await
+                    }
+                    VoiceDeliveryFailure::Unknown => Err(VoiceDeliveryFailure::Unknown),
+                },
             }
         }
         RenderedTranscript::MessageAndFile { .. } => {
@@ -448,7 +540,8 @@ async fn send_rendered_transcript(
                 progress_message_id,
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
-            .await?;
+            .await
+            .map_err(|error| classify_voice_delivery_error(&error))?;
             send_regular_transcript(bot, chat_id, source_message_id, rendered).await
         }
     }
@@ -459,10 +552,12 @@ async fn send_regular_transcript(
     chat_id: ChatId,
     source_message_id: MessageId,
     rendered: &RenderedTranscript,
-) -> anyhow::Result<SentRenderedTranscript> {
+) -> Result<SentRenderedTranscript, VoiceDeliveryFailure> {
     match rendered {
         RenderedTranscript::Message { html } => {
-            send_html_reply(bot, chat_id, source_message_id, html).await?;
+            send_html_reply(bot, chat_id, source_message_id, html)
+                .await
+                .map_err(|error| classify_voice_delivery_error(&error))?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: None,
@@ -473,7 +568,9 @@ async fn send_regular_transcript(
             filename,
             body,
         } => {
-            send_html_reply(bot, chat_id, source_message_id, html).await?;
+            send_html_reply(bot, chat_id, source_message_id, html)
+                .await
+                .map_err(|error| classify_voice_delivery_error(&error))?;
             let sent = bot
                 .send_document(
                     chat_id,
@@ -482,15 +579,14 @@ async fn send_regular_transcript(
                 .reply_parameters(
                     ReplyParameters::new(source_message_id).allow_sending_without_reply(),
                 )
-                .await?;
+                .await
+                .map_err(|_| VoiceDeliveryFailure::Unknown)?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: sent.document().map(|document| document.file.id.to_string()),
             })
         }
-        RenderedTranscript::RichMessage { .. } => {
-            anyhow::bail!("rich voice transcript fallback must be a regular message")
-        }
+        RenderedTranscript::RichMessage { .. } => Err(VoiceDeliveryFailure::Rejected),
     }
 }
 
@@ -520,6 +616,24 @@ mod tests {
     #[test]
     fn empty_transcript_is_not_speech() {
         assert!(!transcript_has_speech(&transcript("   ", Vec::new())));
+    }
+
+    #[test]
+    fn voice_delivery_classification_retries_only_confirmed_rejections() {
+        let rejected = RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(1));
+        assert_eq!(
+            classify_voice_delivery_error(&rejected),
+            VoiceDeliveryFailure::Rejected
+        );
+
+        let unknown = RequestError::Io(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "telegram request timed out",
+        )));
+        assert_eq!(
+            classify_voice_delivery_error(&unknown),
+            VoiceDeliveryFailure::Unknown
+        );
     }
 
     #[test]
