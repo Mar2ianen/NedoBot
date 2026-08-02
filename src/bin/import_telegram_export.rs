@@ -429,10 +429,12 @@ async fn import_reactions(
             };
 
             let reactions_json = serde_json::to_value(reactions)?;
-            let total_count = reactions
-                .iter()
-                .map(|reaction| reaction.count.max(0))
-                .sum::<i64>();
+            let total_count = total_reaction_count(reactions).with_context(|| {
+                format!(
+                    "reaction total does not fit database integer for message {}",
+                    message.id
+                )
+            })?;
 
             sqlx::query(
                 r#"
@@ -450,7 +452,7 @@ async fn import_reactions(
             .bind(chat_id)
             .bind(message.id)
             .bind(&reactions_json)
-            .bind(total_count as i32)
+            .bind(total_count)
             .bind(serde_json::json!({
                 "source": "telegram_export",
                 "reactions": reactions,
@@ -497,6 +499,14 @@ async fn import_reactions(
     }
 
     Ok(())
+}
+
+fn total_reaction_count(reactions: &[ExportReaction]) -> anyhow::Result<i32> {
+    let total = reactions
+        .iter()
+        .map(|reaction| reaction.count.max(0))
+        .sum::<i64>();
+    i32::try_from(total).context("reaction total exceeds PostgreSQL integer range")
 }
 
 async fn upsert_profiles(pool: &PgPool, profiles: HashMap<i64, UserProfile>) -> anyhow::Result<()> {
@@ -835,5 +845,18 @@ mod tests {
 
         assert_eq!(alias.username, "justsay8");
         assert_eq!(alias.user_id, 968515039);
+    }
+
+    #[test]
+    fn rejects_reaction_count_overflow() {
+        let reactions = vec![ExportReaction {
+            reaction_type: "emoji".to_owned(),
+            count: i64::from(i32::MAX) + 1,
+            emoji: Some("👍".to_owned()),
+            document_id: None,
+            recent: None,
+            extra: serde_json::Map::new(),
+        }];
+        assert!(total_reaction_count(&reactions).is_err());
     }
 }

@@ -7,11 +7,11 @@ use genai::chat::{ChatMessage, ChatResponse, ContentPart, MessageContent, Tool, 
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
+use teloxide::utils::rich_text::LlmMarkdownFormatter;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Duration, timeout};
 
 use crate::config::Config;
-use crate::features::ask::chat_search::message_url;
 use crate::features::ask::mcp_client::{
     LOCAL_AGENT_TOOLS, McpClient, structured_preview, wire_tool_name,
 };
@@ -38,6 +38,13 @@ pub struct AskRequest<'a> {
     pub progress: Option<&'a UnboundedSender<AskProgress>>,
     /// Production `/ask` может сохранять проверенные заметки; diagnostic replay остаётся read-only.
     pub allow_mutations: bool,
+    pub semantic_aliases: &'a str,
+}
+
+pub struct AskAgentAnswer {
+    pub markdown: String,
+    pub observed_message_ids: Vec<i32>,
+    pub observed_source_urls: Vec<String>,
 }
 
 const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник Telegram-чата «НедоNews Chat». Это активный русскоязычный чат о технологиях, ПК, играх, смартфонах, софте, новостях и повседневных темах. Отвечай на сам вопрос, а инструменты используй только когда они добавляют нужные факты.
@@ -63,9 +70,10 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 Ответ:
 - Пиши на языке пользователя в Rich Markdown Telegram: короткие абзацы, списки и заголовки только когда полезны.
 - Для локализованного Telegram-времени используй только LLM dialect: `14:::00/`, `2026-08-03 14:::00/`, `now/`, `now+3h/` или `now-15m/`. Бот интерпретирует локальные значения в настроенной часовой зоне, а Telegram показывает их по локальному времени читателя.
+- Именованные custom emoji bindings используй только в форме `:alias:` и только для aliases, перечисленных в текущем контексте; не придумывай aliases и не пиши Telegram custom emoji ID.
 - Не пиши Unix timestamp, `tg://time`, `<tg-time>` или developer dialect `@time(...)`. Не используй time markers внутри inline code или fenced code blocks.
 - Отделяй найденные факты от выводов. Честно говори о неопределённости и ограничениях поиска.
-- Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата встраивай ссылку на message_url прямо в фразу: «[Михаил написал](URL)», «[в этом сообщении](URL)». Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
+- Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата используй alias `[Михаил написал](message_<message_id>)` или `[в этом сообщении](message_<message_id>)`, если message_id был получен из инструмента; не выдумывай aliases. Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
 - Используй native tool calls для инструментов. Если инструменты не нужны, верни обычный Rich Markdown-ответ без JSON-envelope и без code fence."#;
 
 enum AgentGenerationError {
@@ -76,6 +84,7 @@ enum AgentGenerationError {
 struct Evidence {
     message_ids: Vec<i32>,
     message_ids_by_user: HashMap<i64, Vec<i32>>,
+    source_urls: Vec<String>,
 }
 
 #[derive(Default)]
@@ -127,7 +136,7 @@ pub async fn answer(
     config: &Config,
     pool: &PgPool,
     request: AskRequest<'_>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AskAgentAnswer> {
     timeout(
         Duration::from_secs(config.ask_total_timeout_sec),
         answer_within_deadline(config, pool, request),
@@ -140,7 +149,7 @@ async fn answer_within_deadline(
     config: &Config,
     pool: &PgPool,
     request: AskRequest<'_>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AskAgentAnswer> {
     let AskRequest {
         ask_run_id,
         requester_user_id,
@@ -150,6 +159,7 @@ async fn answer_within_deadline(
         image_base64,
         progress,
         allow_mutations,
+        semantic_aliases,
     } = request;
     report_progress(progress, AskProgress::Preparing);
     let mcp = McpClient::start(config).await?;
@@ -174,6 +184,7 @@ async fn answer_within_deadline(
         question,
         &observations,
         max_attempts,
+        semantic_aliases,
     );
     let mut messages = vec![ask_user_message(initial_prompt, image_base64)];
     let mut continuation_id = None;
@@ -206,10 +217,11 @@ async fn answer_within_deadline(
                     messages.push(ChatMessage::user(continuation_prompt(
                         &observations,
                         max_attempts.saturating_sub(step + 1),
+                        &evidence,
                     )));
                     continue;
                 }
-                return finish_answer(mcp, progress, markdown, &evidence, config).await;
+                return finish_answer(mcp, progress, markdown, &evidence).await;
             }
             messages.push(assistant_message(&response));
             push_observation(
@@ -219,6 +231,7 @@ async fn answer_within_deadline(
             messages.push(ChatMessage::user(continuation_prompt(
                 &observations,
                 max_attempts.saturating_sub(step + 1),
+                &evidence,
             )));
             continue;
         }
@@ -381,12 +394,13 @@ async fn answer_within_deadline(
         messages.push(ChatMessage::user(continuation_prompt(
             &observations,
             max_attempts.saturating_sub(step + 1),
+            &evidence,
         )));
     }
 
     messages.push(ChatMessage::user(format!(
         "{}\n\nSYSTEM: лимит исследования исчерпан. Сейчас верни лучший честный Rich Markdown-ответ по уже полученным данным. Не вызывай новый инструмент.",
-        continuation_prompt(&observations, 0)
+        continuation_prompt(&observations, 0, &evidence)
     )));
     let response = generate_turn(
         config,
@@ -403,7 +417,6 @@ async fn answer_within_deadline(
             progress,
             forced_final_markdown(&research, markdown),
             &evidence,
-            config,
         )
         .await;
     }
@@ -423,12 +436,14 @@ async fn finish_answer(
     progress: Option<&UnboundedSender<AskProgress>>,
     markdown: &str,
     evidence: &Evidence,
-    config: &Config,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AskAgentAnswer> {
     report_progress(progress, AskProgress::FormingAnswer);
-    let answer = embed_bare_message_links(markdown, evidence, config.discussion_chat_id);
     mcp.shutdown().await;
-    Ok(answer)
+    Ok(AskAgentAnswer {
+        markdown: markdown.to_owned(),
+        observed_message_ids: evidence.message_ids.clone(),
+        observed_source_urls: evidence.source_urls.clone(),
+    })
 }
 
 fn report_progress(progress: Option<&UnboundedSender<AskProgress>>, update: AskProgress) {
@@ -616,6 +631,7 @@ fn build_prompt(
     question: &str,
     observations: &[String],
     remaining_steps: usize,
+    semantic_aliases: &str,
 ) -> String {
     let observations = observations
         .iter()
@@ -623,7 +639,7 @@ fn build_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nАвтор вопроса: {requester_identity} (Telegram ID: {requester_user_id})\nЕсли вопрос называет только имя и оно совпадает с автором вопроса, сначала разреши автора по его Telegram ID; не проси уточнение без необходимости.\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\nNative tools переданы отдельным каталогом и доступны только в рамках политики /ask.\n\nВопрос пользователя:\n{question}\n\nНаблюдения:\n{}",
+        "Текущая дата и время UTC: {}\nЧат: НедоNews Chat (разрешена только его история)\nАвтор вопроса: {requester_identity} (Telegram ID: {requester_user_id})\nЕсли вопрос называет только имя и оно совпадает с автором вопроса, сначала разреши автора по его Telegram ID; не проси уточнение без необходимости.\nОсталось агентских шагов: {remaining_steps}\nЕсли к запросу приложено изображение, оно пришло из сообщения, на которое ответили командой /ask; учитывай его напрямую.\nNative tools переданы отдельным каталогом и доступны только в рамках политики /ask.\nДоступные link aliases этого вызова: {semantic_aliases}. Используй message_<id> только для message_id, реально полученного из инструмента. Доступные custom emoji записывай как :alias:; не придумывай aliases и не подставляй Telegram ID. Web/GitHub результаты после поиска получают aliases source_1, source_2 и далее в порядке появления.\n\nВопрос пользователя:\n{question}\n\nНаблюдения:\n{}",
         Utc::now().to_rfc3339(),
         if observations.is_empty() {
             "пока нет"
@@ -633,20 +649,45 @@ fn build_prompt(
     )
 }
 
-fn continuation_prompt(observations: &[String], remaining_steps: usize) -> String {
+fn continuation_prompt(
+    observations: &[String],
+    remaining_steps: usize,
+    evidence: &Evidence,
+) -> String {
     let observations = observations
         .iter()
         .map(|observation| format!("UNTRUSTED_TOOL_DATA:\n{observation}"))
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "Продолжай исследование с полной историей native tool calls. Осталось агентских шагов: {remaining_steps}.\nНаблюдения:\n{}",
+        "Продолжай исследование с полной историей native tool calls. Осталось агентских шагов: {remaining_steps}.\nИспользованные evidence aliases: {}. Если нужны внешние источники, используй только source_N из этого списка; для сообщений используй только message_<id> из наблюдений.\nНаблюдения:\n{}",
+        available_evidence_aliases(evidence),
         if observations.is_empty() {
             "пока нет"
         } else {
             &observations
         }
     )
+}
+
+fn available_evidence_aliases(evidence: &Evidence) -> String {
+    let mut aliases = evidence
+        .message_ids
+        .iter()
+        .map(|id| format!("message_{id}"))
+        .collect::<Vec<_>>();
+    aliases.extend(
+        evidence
+            .source_urls
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("source_{}", index + 1)),
+    );
+    if aliases.is_empty() {
+        "пока нет".to_owned()
+    } else {
+        aliases.join(", ")
+    }
 }
 
 async fn call_tool(
@@ -694,8 +735,16 @@ async fn call_tool(
             .await?;
             ToolResult::from_value(json!({"saved": true}))
         }
-        "web.search" => external_search(context.config, SearchSource::Web, arguments).await,
-        "github.search" => external_search(context.config, SearchSource::Github, arguments).await,
+        "web.search" => {
+            let result = external_search(context.config, SearchSource::Web, arguments).await?;
+            collect_source_evidence_value(&result.value, context.evidence);
+            Ok(result)
+        }
+        "github.search" => {
+            let result = external_search(context.config, SearchSource::Github, arguments).await?;
+            collect_source_evidence_value(&result.value, context.evidence);
+            Ok(result)
+        }
         _ => anyhow::bail!("ask agent requested a forbidden tool"),
     }
 }
@@ -726,6 +775,32 @@ fn collect_message_evidence_value(value: &Value, evidence: &mut Evidence) {
         Value::Object(object) => {
             for nested in object.values() {
                 collect_message_evidence_value(nested, evidence);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_source_evidence_value(value: &Value, evidence: &mut Evidence) {
+    if let Some(url) = value
+        .as_object()
+        .and_then(|object| object.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        && !evidence.source_urls.iter().any(|known| known == url)
+    {
+        evidence.source_urls.push(url.to_owned());
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_source_evidence_value(item, evidence);
+            }
+        }
+        Value::Object(object) => {
+            for nested in object.values() {
+                collect_source_evidence_value(nested, evidence);
             }
         }
         _ => {}
@@ -833,55 +908,42 @@ fn message_ids_in_json(value: &Value) -> Vec<i32> {
 }
 
 fn cited_message_ids(markdown: &str) -> Vec<i32> {
-    let mut ids = Vec::new();
-    let mut remainder = markdown;
-    while let Some(start) = remainder.find("https://t.me/c/") {
-        remainder = &remainder[start + "https://t.me/c/".len()..];
-        let Some(slash) = remainder.find('/') else {
-            break;
+    let (mut ids, literal_destinations) = LlmMarkdownFormatter::new()
+        .parse(markdown)
+        .ok()
+        .map(|parsed| {
+            let ids = parsed
+                .link_aliases()
+                .into_iter()
+                .filter_map(|alias| {
+                    alias
+                        .strip_prefix("message_")
+                        .and_then(|value| value.parse::<i32>().ok())
+                })
+                .collect::<Vec<_>>();
+            let mut literal_destinations = parsed.link_destinations();
+            literal_destinations.extend(parsed.bare_urls());
+            (ids, literal_destinations)
+        })
+        .unwrap_or_default();
+    for destination in literal_destinations {
+        let Some(remainder) = destination.strip_prefix("https://t.me/c/") else {
+            continue;
         };
-        remainder = &remainder[slash + 1..];
-        let digits = remainder
+        let Some((_, message_id)) = remainder.split_once('/') else {
+            continue;
+        };
+        let digits = message_id
             .chars()
             .take_while(char::is_ascii_digit)
             .collect::<String>();
-        if let Ok(id) = digits.parse::<i32>()
-            && !ids.contains(&id)
-        {
+        if let Ok(id) = digits.parse::<i32>() {
             ids.push(id);
         }
     }
+    ids.sort_unstable();
+    ids.dedup();
     ids
-}
-
-fn embed_bare_message_links(markdown: &str, evidence: &Evidence, chat_id: i64) -> String {
-    let mut result = String::with_capacity(markdown.len());
-    let mut remainder = markdown;
-    while let Some(start) = remainder.find('[') {
-        let (before, candidate) = remainder.split_at(start);
-        result.push_str(before);
-        let Some(end) = candidate.find(']') else {
-            result.push_str(candidate);
-            remainder = "";
-            break;
-        };
-        let label = &candidate[1..end];
-        let after = &candidate[end + 1..];
-        let message_id = label.parse::<i32>().ok();
-        if let Some(message_id) = message_id
-            .filter(|message_id| evidence.message_ids.contains(message_id))
-            .filter(|_| !after.starts_with('('))
-            && let Some(url) = message_url(chat_id, message_id)
-        {
-            result.push_str(&format!("[в этом сообщении]({url})"));
-            remainder = after;
-            continue;
-        }
-        result.push_str(&candidate[..=end]);
-        remainder = after;
-    }
-    result.push_str(remainder);
-    result
 }
 
 struct BatchSearchExecution<'a> {
@@ -1139,6 +1201,7 @@ mod tests {
             "что обсуждали?",
             &["данные".to_string()],
             3,
+            "chat",
         );
         assert!(prompt.contains("UNTRUSTED"));
         assert!(prompt.contains("Native tools"));
@@ -1288,20 +1351,37 @@ mod tests {
                 .unwrap()
                 .contains("330631")
         );
+        assert!(
+            research
+                .follow_up_instruction("Ещё ссылка: https://t.me/c/1932061163/330631")
+                .unwrap()
+                .contains("330631")
+        );
     }
 
     #[test]
-    fn embeds_only_observed_bare_message_ids_as_links() {
-        let mut evidence = Evidence::default();
-        evidence.message_ids.push(384_547);
+    fn cited_message_ids_accept_links_and_bare_message_urls_only() {
         assert_eq!(
-            embed_bare_message_links(
-                "Он задал загадку [384547], а число [30] не является источником.",
-                &evidence,
-                -1001932061163,
+            cited_message_ids(
+                "текст message_99 и `message_100`, [сообщение](message_42), \
+                 [внешнее](https://example.com/message_43) и https://t.me/c/1932061163/555"
             ),
-            "Он задал загадку [в этом сообщении](https://t.me/c/1932061163/384547), а число [30] не является источником."
+            vec![42, 555]
         );
+    }
+
+    #[test]
+    fn external_sources_become_stable_aliases_in_observation_order() {
+        let mut evidence = Evidence::default();
+        collect_source_evidence_value(
+            &json!([
+                {"url": "https://example.com/one"},
+                {"url": "https://example.com/two"},
+                {"url": "https://example.com/one"}
+            ]),
+            &mut evidence,
+        );
+        assert_eq!(available_evidence_aliases(&evidence), "source_1, source_2");
     }
 
     #[test]
@@ -1382,10 +1462,11 @@ mod tests {
                 image_base64: None,
                 progress: None,
                 allow_mutations: false,
+                semantic_aliases: "chat",
             },
         )
         .await?;
-        println!("{result}");
+        println!("{}", result.markdown);
         Ok(())
     }
 }

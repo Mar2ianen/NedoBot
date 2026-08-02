@@ -1,5 +1,5 @@
 use serde_json::Value;
-use teloxide::utils::time::RenderedMessage;
+use teloxide::utils::rich_text::RenderedMessage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskProgress {

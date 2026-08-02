@@ -21,6 +21,8 @@
   ·
   <a href="docs/TECHNICAL.md">Docs</a>
   ·
+  <a href="CHANGELOG.md">Changelog</a>
+  ·
   <a href="docs/DEPLOYMENT.md">Deployment</a>
   ·
   <a href="prompts/first_comment.md">Prompt</a>
@@ -84,7 +86,7 @@
   <tr>
     <td width="50%">
       <h3>Универсальный /ask</h3>
-      <p>Показывает этапы исследования прямо в чате, ищет по истории и reply-веткам, понимает участников и фото в reply, при необходимости подключает web и GitHub и отвечает в Rich Markdown со ссылками на сообщения.</p>
+      <p>Показывает этапы исследования прямо в чате, ищет по истории и reply-веткам, понимает участников и фото в reply, при необходимости подключает web и GitHub и отвечает через semantic Rich Text: локализованное время, trusted link aliases и custom emoji bindings.</p>
     </td>
     <td width="50%">
       <h3>Безопасные инструменты</h3>
@@ -99,7 +101,7 @@
 
 ## Публичная база для исследования
 
-Для внешних MCP-клиентов доступен публичный read-only endpoint v2: `https://nedobot.chickenkiller.com/mcp/nedonews/v2`. Он выдаёт reviewed projections истории публичного чата, профилей, spam-разметки, заметок, расшифровок и аудита `/ask`, но не даёт SQL, записи, приватные чаты или raw Telegram payload. URL v2 намеренно отделён от удалённого legacy JSON-RPC-контракта: клиенты должны выполнить новое MCP discovery через `tools/list`. Точный опубликованный data surface зафиксирован в [MCP public data inventory](docs/MCP_PUBLIC_DATA.md); правила публикации новых данных — в [технической документации](docs/TECHNICAL.md#публичный-read-only-mcp).
+Для внешних MCP-клиентов доступен публичный read-only endpoint v2: `https://nedobot.chickenkiller.com/mcp/nedonews/v2`. Это сознательно широкий curated read model публичного чата, а не privacy-minimized projection: фактический состав данных и отсутствие application authentication описаны в [контракте публичной экспозиции](docs/TECHNICAL.md#public-mcp-data-exposure-contract). SQL, запись и приватные чаты через endpoint недоступны. URL v2 намеренно отделён от удалённого legacy JSON-RPC-контракта: клиенты должны выполнить новое MCP discovery через `tools/list`. Точный опубликованный data surface зафиксирован в [MCP public data inventory](docs/MCP_PUBLIC_DATA.md).
 
 ## Вайб
 
@@ -129,6 +131,7 @@
 - [x] базовая расшифровка voice/audio/кружков через Groq ASR;
 - [x] агентный `/ask` с ограниченными read-only инструментами чата, web и GitHub;
 - [x] аудит `/ask`: запросы, инструменты, задержки и безопасные статусы ошибок;
+- [x] semantic Rich Text `/ask`: LLM Markdown time markers, trusted `chat`/`message_<id>`/`source_N` aliases, provenance-checked literal URLs и настроенные custom emoji bindings;
 - [x] deterministic time rendering `/ask` с captured `now`, timezone, renderer revision и compiled-payload audit;
 - [x] delivery certainty для final/segment lifecycle и запрет fallback при `Unknown`;
 - [x] публичная HTTPS-раздача кэшированных аватарок Telegram;
@@ -152,9 +155,9 @@
 | `/format_test <текст>` | Проверяет рендер первого комментария на произвольном тексте. |
 | `/memory` | Показывает последние атомарные карточки истории и статус их обработки. |
 | `/transcribe` | Reply на voice, audio или кружок: запускает расшифровку. Работает при включённом voice-контуре, даже если автоматическая расшифровка выключена. |
-| `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет отдельный progress preview, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Финальная доставка и fallback проходят через shared Drafter. Доступен всем участникам основного чата; в личке — только private allowlist. |
-| `/chat_note <текст>` | Сохраняет общую заметку чата; доступно владельцу и администраторам. |
-| `/user_note <текст>` | Сохраняет заметку об авторе сообщения в reply; доступно владельцу и администраторам. |
+ | `/ask <вопрос>` | Универсальный Rich Markdown-помощник. По ходу ответа обновляет отдельный progress preview, использует read-only историю чата, профили, reply-ветки, web и GitHub; в reply учитывает исходное сообщение и его фото. Наблюдённые сообщения доступны как `message_<id>`, внешние результаты поиска — как `source_N`, а custom emoji — как `:alias:`. Literal URL принимаются только из вопроса/reply, trusted search evidence или application allowlist. Финальная доставка и fallback проходят через shared Drafter. Доступен всем участникам основного чата; в личке — только private allowlist. |
+ | `/chat_note <текст>` | Сохраняет общую заметку чата; доступно владельцу и администраторам. |
+ | `/user_note <текст>` | Сохраняет заметку об авторе сообщения в reply; доступно владельцу и администраторам. |
 | `/stats_day [-r\|-p]` | Статистика за текущий день чата, где день начинается в 05:00 по Москве. |
 | `/stats_week [-r\|-p]` | Статистика за текущую неделю с понедельника 05:00 по Москве. |
 | `/stats_month [-r\|-p]` | Статистика за текущий месяц с 1 числа 05:00 по Москве. |
