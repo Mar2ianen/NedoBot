@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "postgres", "chrono", "uuid"] }
-teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "65f3a1d4fb6d62c2a1bca38af15270eb2e5c5a4f", features = ["macros", "drafter", "rich-text"] }
+teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "35bd93175a6dc7cc05ec100caa4b44cdd72530db", features = ["macros", "drafter", "rich-text"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-std", "io-util", "process", "sync", "time", "test-util"] }
 toml = "0.8"
