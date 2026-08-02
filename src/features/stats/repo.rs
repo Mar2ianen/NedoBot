@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::features::stats::types::{ChatStatsSummary, ReportWindow, StatsPeriod};
@@ -132,14 +133,14 @@ pub struct ChatMemberSnapshot {
     pub status: String,
     pub is_admin: bool,
     pub is_present: bool,
-    pub observed_at: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
     pub written_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatUserStats {
-    pub first_seen_at: Option<String>,
-    pub last_seen_at: Option<String>,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
     pub first_message_id: Option<i32>,
     pub last_message_id: Option<i32>,
     pub first_seen_days_ago: Option<i64>,
@@ -495,7 +496,7 @@ pub async fn chat_member_snapshot(
     sqlx::query_as(
         r#"
         select status, is_admin, is_present,
-               to_char(observed_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as observed_at,
+               observed_at,
                coalesce(nullif(raw_json #>> '{custom_title}', ''), nullif(raw_json #>> '{kind,custom_title}', ''),
                         nullif(raw_json #>> '{administrator,custom_title}', ''), nullif(raw_json #>> '{owner,custom_title}', ''),
                         nullif(raw_json #>> '{member,custom_title}', ''), nullif(raw_json #>> '{restricted,custom_title}', '')) as written_tag
@@ -516,8 +517,7 @@ pub async fn chat_user_stats(
 ) -> anyhow::Result<Option<ChatUserStats>> {
     sqlx::query_as(
         r#"
-        select to_char(first_seen_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as first_seen_at,
-               to_char(last_seen_at at time zone 'Europe/Moscow', 'YYYY-MM-DD HH24:MI') as last_seen_at,
+        select first_seen_at, last_seen_at,
                first_message_id, last_message_id,
                floor(extract(epoch from (now() - first_seen_at)) / 86400)::bigint as first_seen_days_ago,
                floor(extract(epoch from (now() - last_seen_at)) / 86400)::bigint as last_seen_days_ago,

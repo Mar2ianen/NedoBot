@@ -5,6 +5,7 @@ use crate::features::stats::types::{
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
 use crate::text::normalize_ai_markers;
+use chrono::{DateTime, Utc};
 use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
 pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
@@ -83,6 +84,15 @@ pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
     report
 }
 
+pub(crate) fn format_datetime(time: &TimeContext, value: Option<&DateTime<Utc>>) -> String {
+    value
+        .and_then(|value| {
+            DateTimeToken::instant_in_unix(time, value.timestamp(), DateTimeFormat::DateTime).ok()
+        })
+        .map(|token| token.to_html())
+        .unwrap_or_else(|| "нет данных".to_string())
+}
+
 pub fn top_messages(data: &TopMessagesReportData) -> String {
     let mut report = String::from("<b>Топ пишущих</b>\nЗа всё время\n");
     if data.users.is_empty() {
@@ -136,6 +146,7 @@ pub fn user_stats(
     data: Option<&UserStatsReportData>,
     requested_target: Option<&str>,
     discussion_chat_id: i64,
+    time: &TimeContext,
 ) -> String {
     let Some(data) = data else {
         return match requested_target.map(str::trim).filter(|value| !value.is_empty()) {
@@ -146,18 +157,20 @@ pub fn user_stats(
     format!(
         "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nКомментарии: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
         data.user.linked_with_badges(),
-        escape_html(data.observed_at.as_deref().unwrap_or("нет данных")),
+        format_datetime(time, data.observed_at.as_ref()),
         linked_message(
             discussion_chat_id,
-            &data.first_seen_at,
+            data.first_seen_at.as_ref(),
             &data.first_message_id,
-            data.first_seen_days_ago
+            data.first_seen_days_ago,
+            time,
         ),
         linked_message(
             discussion_chat_id,
-            &data.last_seen_at,
+            data.last_seen_at.as_ref(),
             &data.last_message_id,
-            data.last_seen_days_ago
+            data.last_seen_days_ago,
+            time,
         ),
         data.totals.messages,
         data.totals.replies,
@@ -214,24 +227,67 @@ pub fn message_url(chat_id: i64, message_id: i32) -> String {
 
 fn linked_message(
     chat_id: i64,
-    date_label: &str,
+    date: Option<&DateTime<Utc>>,
     message_id: &str,
     days_ago: Option<i64>,
+    time: &TimeContext,
 ) -> String {
+    let date_label = format_datetime(time, date);
     let label = days_ago.map_or_else(
-        || date_label.to_string(),
+        || date_label.clone(),
         |days| format!("{date_label} ({days} дн. назад)"),
     );
     match message_id.parse::<i32>() {
-        Ok(message_id) => format!(
-            "{} (#<code>{}</code>)",
-            Html::link(label, message_url(chat_id, message_id)).into_string(),
-            message_id
-        ),
-        Err(_) => format!(
-            "{} (#<code>{}</code>)",
-            escape_html(date_label),
-            escape_html(message_id)
-        ),
+        Ok(message_id) => {
+            let message_link =
+                Html::link(format!("#{message_id}"), message_url(chat_id, message_id))
+                    .into_string();
+            format!("{label} ({message_link})")
+        }
+        Err(_) => format!("{} (#<code>{}</code>)", date_label, escape_html(message_id)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use teloxide::utils::time::TimeContext;
+
+    use super::{format_datetime, linked_message};
+
+    #[test]
+    fn profile_datetime_uses_configured_render_timezone() {
+        let time = TimeContext::from_name("Europe/Moscow").unwrap();
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let rendered = format_datetime(&time, Some(&observed_at));
+
+        assert_eq!(
+            rendered,
+            r#"<tg-time unix="1785578400" format="Dt">2026-08-01 13:00</tg-time>"#
+        );
+    }
+
+    #[test]
+    fn missing_profile_datetime_keeps_report_fallback() {
+        let time = TimeContext::from_name("Europe/Moscow").unwrap();
+
+        assert_eq!(format_datetime(&time, None), "нет данных");
+    }
+
+    #[test]
+    fn linked_profile_message_keeps_time_entity_unescaped() {
+        let time = TimeContext::from_name("Europe/Moscow").unwrap();
+        let first_seen_at = DateTime::parse_from_rfc3339("2026-08-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let rendered = linked_message(-1001932061163, Some(&first_seen_at), "42", None, &time);
+
+        assert!(rendered.contains("<tg-time unix=\"1785578400\" format=\"Dt\">"));
+        assert!(!rendered.contains("&lt;tg-time"));
+        assert!(rendered.contains("<a href=\"https://t.me/c/1932061163/42\">#42</a>"));
     }
 }

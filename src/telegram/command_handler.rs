@@ -21,7 +21,7 @@ use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
-    send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
+    UserStatsTarget, send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::features::voice::pipeline::transcribe_reply;
@@ -192,8 +192,11 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                args.target.as_deref(),
-                fallback_user_id,
+                &state.main_formatter,
+                UserStatsTarget {
+                    target: args.target.as_deref(),
+                    reply_user_id: fallback_user_id,
+                },
                 args.render,
             )
             .await?;
@@ -674,8 +677,11 @@ pub async fn handle_reply_user_stats_command(
         msg.chat.id,
         pool,
         config,
-        None,
-        reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
+        &state.main_formatter,
+        UserStatsTarget {
+            target: None,
+            reply_user_id: reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
+        },
         render,
     )
     .await?;
