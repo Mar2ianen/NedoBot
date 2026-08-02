@@ -7,7 +7,7 @@ use genai::chat::{ChatMessage, ChatResponse, ContentPart, MessageContent, Tool, 
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
-use teloxide::utils::time::LlmMarkdownFormatter;
+use teloxide::utils::rich_text::LlmMarkdownFormatter;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Duration, timeout};
 
@@ -438,10 +438,9 @@ async fn finish_answer(
     evidence: &Evidence,
 ) -> anyhow::Result<AskAgentAnswer> {
     report_progress(progress, AskProgress::FormingAnswer);
-    let answer = annotate_bare_message_link_aliases(markdown, evidence);
     mcp.shutdown().await;
     Ok(AskAgentAnswer {
-        markdown: answer,
+        markdown: markdown.to_owned(),
         observed_message_ids: evidence.message_ids.clone(),
         observed_source_urls: evidence.source_urls.clone(),
     })
@@ -945,35 +944,6 @@ fn cited_message_ids(markdown: &str) -> Vec<i32> {
     ids
 }
 
-fn annotate_bare_message_link_aliases(markdown: &str, evidence: &Evidence) -> String {
-    let mut result = String::with_capacity(markdown.len());
-    let mut remainder = markdown;
-    while let Some(start) = remainder.find('[') {
-        let (before, candidate) = remainder.split_at(start);
-        result.push_str(before);
-        let Some(end) = candidate.find(']') else {
-            result.push_str(candidate);
-            remainder = "";
-            break;
-        };
-        let label = &candidate[1..end];
-        let after = &candidate[end + 1..];
-        let message_id = label.parse::<i32>().ok();
-        if let Some(message_id) = message_id
-            .filter(|message_id| evidence.message_ids.contains(message_id))
-            .filter(|_| !after.starts_with('('))
-        {
-            result.push_str(&format!("[в этом сообщении](message_{message_id})"));
-            remainder = after;
-            continue;
-        }
-        result.push_str(&candidate[..=end]);
-        remainder = after;
-    }
-    result.push_str(remainder);
-    result
-}
-
 struct BatchSearchExecution<'a> {
     count: usize,
     queries: Vec<&'a Value>,
@@ -1403,19 +1373,6 @@ mod tests {
             &mut evidence,
         );
         assert_eq!(available_evidence_aliases(&evidence), "source_1, source_2");
-    }
-
-    #[test]
-    fn embeds_only_observed_bare_message_ids_as_links() {
-        let mut evidence = Evidence::default();
-        evidence.message_ids.push(384_547);
-        assert_eq!(
-            annotate_bare_message_link_aliases(
-                "Он задал загадку [384547], а число [30] не является источником.",
-                &evidence,
-            ),
-            "Он задал загадку [в этом сообщении](message_384547), а число [30] не является источником."
-        );
     }
 
     #[test]

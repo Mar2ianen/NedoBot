@@ -1,10 +1,14 @@
 use chrono::{DateTime, Utc};
 use jiff::Timestamp;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use teloxide::types::CustomEmojiId;
-use teloxide::utils::time::{
-    CustomEmojiBinding, LLM_DIALECT_VERSION, LlmMarkdownFormatter, RichTextBindings,
-    RichTextPolicies, RichTextRenderContext, TIME_RENDERER_VERSION, TimeBindings, TimeContext,
+use teloxide::utils::{
+    rich_text::{
+        CustomEmojiBinding, LLM_DIALECT_VERSION, LlmMarkdownFormatter, RICH_TEXT_RENDERER_VERSION,
+        RichTextBindings, RichTextPolicies, RichTextRenderContext, UnknownLinkAliasPolicy,
+    },
+    time::{TimeBindings, TimeContext},
 };
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
@@ -88,10 +92,28 @@ impl<'a> AskService<'a> {
                             return Err(AskServiceError::new(kind, err, ask_run_id));
                         }
                     };
+                    if let Err(err) = self.validate_literal_link_provenance(
+                        &markdown,
+                        &answer.observed_message_ids,
+                        &answer.observed_source_urls,
+                        &input.question,
+                        input.reply_context.as_deref(),
+                    ) {
+                        tracing::warn!(%err, "ask answer contains an untrusted literal link");
+                        let kind = AskFailureKind::InvalidOutput;
+                        self.finish_run(
+                            ask_run_id,
+                            AskRunStatus::Failed,
+                            Some(&markdown),
+                            self.render_audit(captured_now, None),
+                            Some(kind),
+                        )
+                        .await;
+                        return Err(AskServiceError::new(kind, err, ask_run_id));
+                    }
                     let time_bindings = TimeBindings::default();
                     let mut policies = RichTextPolicies::llm();
-                    policies.unknown_link_alias =
-                        teloxide::utils::time::UnknownLinkAliasPolicy::Error;
+                    policies.unknown_link_alias = UnknownLinkAliasPolicy::Error;
                     let context =
                         RichTextRenderContext::for_llm(self.render_time, &time_bindings, &bindings)
                             .with_policies(policies);
@@ -272,7 +294,7 @@ impl<'a> AskService<'a> {
             captured_now: timestamp_to_chrono(captured_now),
             dialect: Some(LLM_DIALECT_VERSION.to_owned()),
             timezone: Some(self.config.render_timezone.clone()),
-            renderer_revision: Some(TIME_RENDERER_VERSION.to_owned()),
+            renderer_revision: Some(RICH_TEXT_RENDERER_VERSION.to_owned()),
             rendered_markdown: rendered_markdown.map(str::to_owned),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             ..RenderAudit::default()
@@ -331,6 +353,40 @@ impl<'a> AskService<'a> {
         Ok(bindings)
     }
 
+    fn validate_literal_link_provenance(
+        &self,
+        markdown: &str,
+        observed_message_ids: &[i32],
+        observed_source_urls: &[String],
+        question: &str,
+        reply_context: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let parsed = LlmMarkdownFormatter::new()
+            .parse(markdown)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut allowed = HashSet::new();
+        add_allowed_url(&mut allowed, &self.config.chat_invite_url);
+        for url in observed_source_urls {
+            add_allowed_url(&mut allowed, url);
+        }
+        for message_id in observed_message_ids {
+            if let Some(url) = crate::features::ask::chat_search::message_url(
+                self.config.discussion_chat_id,
+                *message_id,
+            ) {
+                add_allowed_url(&mut allowed, &url);
+            }
+        }
+        for text in [Some(question), reply_context] {
+            if let Some(text) = text {
+                for url in extract_urls(text) {
+                    allowed.insert(url);
+                }
+            }
+        }
+        validate_literal_destinations(parsed.link_destinations(), &allowed)
+    }
+
     fn semantic_aliases(&self) -> String {
         let link_aliases = ["chat", "message_<id>"];
         let mut emoji_aliases = Vec::new();
@@ -380,6 +436,80 @@ impl<'a> AskService<'a> {
 
 fn timestamp_to_chrono(timestamp: Timestamp) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(timestamp.as_second(), timestamp.subsec_nanosecond() as u32)
+}
+
+fn add_allowed_url(allowed: &mut HashSet<String>, value: &str) {
+    if let Some(value) = normalize_url(value) {
+        allowed.insert(value);
+    }
+}
+
+fn normalize_url(value: &str) -> Option<String> {
+    Url::parse(value).ok().map(|url| url.to_string())
+}
+
+fn extract_urls(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_whitespace().filter_map(|candidate| {
+        let candidate = candidate.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '.'
+            )
+        });
+        normalize_url(candidate)
+    })
+}
+
+fn validate_literal_destinations(
+    destinations: impl IntoIterator<Item = String>,
+    allowed: &HashSet<String>,
+) -> anyhow::Result<()> {
+    for destination in destinations {
+        let Some(normalized) = normalize_url(&destination) else {
+            anyhow::bail!("literal link is not a valid trusted URL: {destination}");
+        };
+        if !allowed.contains(&normalized) {
+            anyhow::bail!(
+                "literal link was not present in trusted input or tool evidence: {destination}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_links_must_come_from_trusted_inputs() {
+        let allowed = ["https://example.com/docs".to_owned()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(
+            validate_literal_destinations(vec!["https://example.com/docs".to_owned()], &allowed,)
+                .is_ok()
+        );
+        assert!(
+            validate_literal_destinations(
+                vec!["https://invented.example/foo".to_owned()],
+                &allowed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn urls_from_question_are_normalized_and_punctuation_is_ignored() {
+        assert_eq!(
+            extract_urls("см. (https://example.com/docs), затем tg://resolve?domain=test")
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.com/docs".to_owned(),
+                "tg://resolve?domain=test".to_owned(),
+            ]
+        );
+    }
 }
 
 #[derive(Debug)]
