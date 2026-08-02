@@ -382,7 +382,9 @@ impl<'a> AskService<'a> {
                 allowed.insert(url);
             }
         }
-        validate_literal_destinations(parsed.link_destinations(), &allowed)
+        let mut destinations = parsed.link_destinations();
+        destinations.extend(parsed.bare_urls());
+        validate_literal_destinations(destinations, &allowed)
     }
 
     fn semantic_aliases(&self) -> String {
@@ -443,7 +445,24 @@ fn add_allowed_url(allowed: &mut HashSet<String>, value: &str) {
 }
 
 fn normalize_url(value: &str) -> Option<String> {
-    Url::parse(value).ok().map(|url| url.to_string())
+    let candidate = if value.contains('.') && !has_uri_scheme(value) {
+        format!("https://{value}")
+    } else {
+        value.to_owned()
+    };
+    Url::parse(&candidate).ok().map(|url| url.to_string())
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some(colon) = value.bytes().position(|byte| byte == b':') else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    colon > 0
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1..colon]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
 }
 
 fn extract_urls(text: &str) -> impl Iterator<Item = String> + '_ {
@@ -495,6 +514,24 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_literal_destinations(
+                vec!["https://invented.example/report".to_owned()],
+                &allowed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bare_urls_are_checked_by_the_same_provenance_policy() {
+        let parsed = LlmMarkdownFormatter::new()
+            .parse("доказательство: https://invented.example/report")
+            .unwrap();
+        let allowed = HashSet::new();
+        let mut destinations = parsed.link_destinations();
+        destinations.extend(parsed.bare_urls());
+        assert!(validate_literal_destinations(destinations, &allowed).is_err());
     }
 
     #[test]
