@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use teloxide::types::CustomEmojiId;
 use teloxide::utils::time::{
     CustomEmojiBinding, LLM_DIALECT_VERSION, LlmMarkdownFormatter, RichTextBindings,
-    RichTextPolicies, RichTextRenderContext, TIME_RENDERER_VERSION,
+    RichTextPolicies, RichTextRenderContext, TIME_RENDERER_VERSION, TimeBindings, TimeContext,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
@@ -23,6 +23,7 @@ pub struct AskService<'a> {
     pool: &'a PgPool,
     config: &'a Config,
     llm_formatter: &'a LlmMarkdownFormatter,
+    render_time: &'a TimeContext,
 }
 
 impl<'a> AskService<'a> {
@@ -30,11 +31,13 @@ impl<'a> AskService<'a> {
         pool: &'a PgPool,
         config: &'a Config,
         llm_formatter: &'a LlmMarkdownFormatter,
+        render_time: &'a TimeContext,
     ) -> Self {
         Self {
             pool,
             config,
             llm_formatter,
+            render_time,
         }
     }
 
@@ -66,7 +69,10 @@ impl<'a> AskService<'a> {
             Ok(answer) => match rich_markdown::validate(&answer.markdown) {
                 Ok(markdown) => {
                     let captured_now = Timestamp::now();
-                    let bindings = match self.rich_text_bindings(&answer.observed_message_ids) {
+                    let bindings = match self.rich_text_bindings(
+                        &answer.observed_message_ids,
+                        &answer.observed_source_urls,
+                    ) {
                         Ok(bindings) => bindings,
                         Err(err) => {
                             tracing::warn!(%err, "failed to build ask rich-text bindings");
@@ -82,8 +88,13 @@ impl<'a> AskService<'a> {
                             return Err(AskServiceError::new(kind, err, ask_run_id));
                         }
                     };
-                    let context = RichTextRenderContext::new(self.llm_formatter.time(), &bindings)
-                        .with_policies(RichTextPolicies::llm());
+                    let time_bindings = TimeBindings::default();
+                    let mut policies = RichTextPolicies::llm();
+                    policies.unknown_link_alias =
+                        teloxide::utils::time::UnknownLinkAliasPolicy::Error;
+                    let context =
+                        RichTextRenderContext::for_llm(self.render_time, &time_bindings, &bindings)
+                            .with_policies(policies);
                     match self.llm_formatter.render_with_context_at(
                         &markdown,
                         &context,
@@ -268,7 +279,11 @@ impl<'a> AskService<'a> {
         }
     }
 
-    fn rich_text_bindings(&self, observed_message_ids: &[i32]) -> anyhow::Result<RichTextBindings> {
+    fn rich_text_bindings(
+        &self,
+        observed_message_ids: &[i32],
+        observed_source_urls: &[String],
+    ) -> anyhow::Result<RichTextBindings> {
         let mut bindings = RichTextBindings::new();
         bindings.insert_link("chat", Url::parse(&self.config.chat_invite_url)?)?;
         for message_id in observed_message_ids {
@@ -279,6 +294,9 @@ impl<'a> AskService<'a> {
                 continue;
             };
             bindings.insert_link(format!("message_{message_id}"), Url::parse(&url)?)?;
+        }
+        for (index, url) in observed_source_urls.iter().enumerate() {
+            bindings.insert_link(format!("source_{}", index + 1), Url::parse(url)?)?;
         }
         self.insert_custom_emoji(
             &mut bindings,
@@ -314,7 +332,8 @@ impl<'a> AskService<'a> {
     }
 
     fn semantic_aliases(&self) -> String {
-        let mut aliases = vec!["chat", "message_<id>"];
+        let link_aliases = ["chat", "message_<id>"];
+        let mut emoji_aliases = Vec::new();
         for (alias, value) in [
             ("comment", self.config.comment_custom_emoji_id.as_ref()),
             ("tech", self.config.tech_custom_emoji_id.as_ref()),
@@ -323,10 +342,19 @@ impl<'a> AskService<'a> {
             ("ryzen", self.config.ryzen_custom_emoji_id.as_ref()),
         ] {
             if value.is_some_and(|value| !value.is_empty()) {
-                aliases.push(alias);
+                emoji_aliases.push(format!(":{alias}:"));
             }
         }
-        aliases.join(", ")
+        let emoji_aliases = if emoji_aliases.is_empty() {
+            "нет".to_owned()
+        } else {
+            emoji_aliases.join(", ")
+        };
+        format!(
+            "link aliases: {}; custom emoji aliases: {}",
+            link_aliases.join(", "),
+            emoji_aliases,
+        )
     }
 
     fn insert_custom_emoji(

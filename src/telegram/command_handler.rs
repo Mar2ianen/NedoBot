@@ -115,7 +115,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.render_time,
                 StatsPeriod::Day,
                 render,
             )
@@ -128,7 +128,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.render_time,
                 StatsPeriod::Week,
                 render,
             )
@@ -141,7 +141,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.render_time,
                 StatsPeriod::Month,
                 render,
             )
@@ -156,7 +156,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.render_time,
                 period,
                 render,
             )
@@ -326,7 +326,12 @@ async fn handle_ask_command(
         reply_image_base64,
         allow_mutations: true,
     };
-    let ask_service = AskService::new(&state.pool, config, &state.llm_formatter);
+    let ask_service = AskService::new(
+        &state.pool,
+        config,
+        &state.llm_formatter,
+        &state.render_time,
+    );
     let answer = ask_service.execute(input, Some(&progress_tx));
     tokio::pin!(answer);
     let mut progress_open = true;
