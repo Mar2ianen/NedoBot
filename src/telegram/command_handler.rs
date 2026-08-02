@@ -358,7 +358,10 @@ async fn handle_ask_command(
     match answer {
         Ok(answer) => {
             let rendered = answer.rendered;
-            match drafter.finish(rendered.rich_message).await {
+            match drafter
+                .finish(rendered.rich_message.skip_entity_detection(true))
+                .await
+            {
                 Ok(_) => {
                     record_ask_delivery(
                         state,
@@ -389,7 +392,7 @@ async fn handle_ask_command(
             let ask_run_id = err.ask_run_id;
             let failure_message = ask_failure_message(err.kind);
             match drafter
-                .finish(InputRichMessage::markdown(failure_message))
+                .finish(InputRichMessage::markdown(failure_message).skip_entity_detection(true))
                 .await
             {
                 Ok(_) => {
@@ -431,6 +434,8 @@ fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     match error {
         DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
         DraftFinishError::WorkerStoppedAfterCommand { delivery }
+        | DraftFinishError::RequestTimeout { delivery }
+        | DraftFinishError::DeadlineExceeded { delivery }
         | DraftFinishError::Backend { delivery, .. } => *delivery,
     }
 }
