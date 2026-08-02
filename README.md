@@ -15,6 +15,8 @@
   ·
   <a href="docs/TECHNICAL.md">Docs</a>
   ·
+  <a href="docs/DEPLOYMENT.md">Deployment</a>
+  ·
   <a href="prompts/first_comment.md">Prompt</a>
   ·
   <a href="prompts/tech_rag.md">Tech RAG</a>
