@@ -58,7 +58,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count, has_more, next_offset и scan_limit_reached: для продолжения передай next_offset как offset, а при scan_limit_reached обозначь неполный охват и не пытайся обходить потолок.
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
-- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений.
+- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.search_messages или chat.search_messages_batch с теми же фильтрами и query, затем chat.count_messages с тем же нормализованным query, датами, scope и match_mode. Для date-scoped count сначала также сделай search с тем же периодом. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений. Дизъюнктивные structural-фильтры через «или» не форсируй в authoritative count: используй поиск и явно обозначь ограничение.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
@@ -240,6 +240,25 @@ impl CountRequestScope {
             && self.has_sticker == other.has_sticker
             && self.has_animation == other.has_animation
             && self.match_mode == other.match_mode
+            && self.include_forwards == other.include_forwards
+            && self.is_automatic_forward == other.is_automatic_forward
+    }
+
+    fn same_non_text_scope(&self, other: &Self) -> bool {
+        self.user_id == other.user_id
+            && self.date_from == other.date_from
+            && self.date_to == other.date_to
+            && self.reply_to_message_id == other.reply_to_message_id
+            && self.has_reply == other.has_reply
+            && self.has_links == other.has_links
+            && self.has_media == other.has_media
+            && self.has_photo == other.has_photo
+            && self.has_video == other.has_video
+            && self.has_document == other.has_document
+            && self.has_audio == other.has_audio
+            && self.has_voice == other.has_voice
+            && self.has_sticker == other.has_sticker
+            && self.has_animation == other.has_animation
             && self.include_forwards == other.include_forwards
             && self.is_automatic_forward == other.is_automatic_forward
     }
@@ -1073,10 +1092,10 @@ impl ResearchState {
                 } else {
                     self.search_scopes.push(base_scope);
                 }
-                if self
-                    .count_request
-                    .as_ref()
-                    .is_some_and(|count_request| !self.count_request_matches_search(count_request))
+                if self.count_requires_query
+                    && self.count_request.as_ref().is_some_and(|count_request| {
+                        !self.count_request_matches_search(count_request)
+                    })
                 {
                     self.count_queries = 0;
                     self.count_request = None;
@@ -1191,6 +1210,9 @@ impl ResearchState {
         if self.count_requires_query && !self.query_matches_search_scope(scope) {
             return false;
         }
+        if self.count_requires_date_scope && !self.count_request_matches_date_search(scope) {
+            return false;
+        }
 
         true
     }
@@ -1204,6 +1226,12 @@ impl ResearchState {
                         search_scope.query.as_deref(),
                     ))
         })
+    }
+
+    fn count_request_matches_date_search(&self, count_request: &CountRequestScope) -> bool {
+        self.search_scopes
+            .iter()
+            .any(|search_scope| count_request.same_non_text_scope(search_scope))
     }
 
     fn query_matches_search_scope(&self, scope: &CountRequestScope) -> bool {
@@ -1230,10 +1258,10 @@ impl ResearchState {
                     "SYSTEM: вопрос требует точного количества matching-сообщений. Сначала вызови chat.search_messages или chat.search_messages_batch с нужным query и структурными фильтрами, затем chat.count_messages с тем же нормализованным query и scope; не считай элементы top-k выдачи вручную и не выдавай этот count за число событий или вхождений слова."
                 }
                 Some(CountIntent::Filtered) => {
-                    "SYSTEM: вопрос требует точного количества сообщений по структурному фильтру. Следующим действием вызови chat.count_messages с соответствующим exact media field (has_photo/has_video/has_document/has_audio/has_voice/has_sticker/has_animation), has_media, has_links, has_reply, reply_to_message_id или include_forwards. Для количества только автоматических пересылок добавь is_automatic_forward=true; include_forwards=true без него добавляет пересылки к обычным сообщениям. query можно опустить. Не добавляй фиктивный текстовый query и не выдавай этот count за число событий или вхождений слова."
+                    "SYSTEM: вопрос требует точного количества сообщений по структурному фильтру. Если указан период, сначала вызови chat.search_messages с теми же датами, затем chat.count_messages. Иначе следующим действием вызови chat.count_messages с соответствующим exact media field (has_photo/has_video/has_document/has_audio/has_voice/has_sticker/has_animation), has_media, has_links, has_reply, reply_to_message_id или include_forwards. Для количества только автоматических пересылок добавь is_automatic_forward=true; include_forwards=true без него добавляет пересылки к обычным сообщениям. query можно опустить. Не добавляй фиктивный текстовый query и не выдавай этот count за число событий или вхождений слова."
                 }
                 Some(CountIntent::Total) | None => {
-                    "SYSTEM: вопрос требует точного количества сообщений. Для общего количества сообщений пользователя сначала вызови chat.resolve_user, затем chat.count_messages с user_id; query можно опустить. Не выдавай этот count за число событий или вхождений слова."
+                    "SYSTEM: вопрос требует точного количества сообщений. Для общего количества сообщений пользователя сначала вызови chat.resolve_user. Если указан период, перед count сначала вызови chat.search_messages с теми же датами; затем вызови chat.count_messages с user_id и тем же date scope. Без периода count_messages можно вызвать после resolve_user с user_id; query можно опустить. Не выдавай этот count за число событий или вхождений слова."
                 }
             };
             return Some(instruction.to_string());
@@ -1444,6 +1472,11 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
             .collect::<Vec<_>>();
         if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
             let requirements = structural_filter_requirements(&words[lead_index + 1..]);
+            if has_unsupported_structural_disjunction(&words[message_index + 1..], &requirements)
+                || has_unsupported_unanswered_scope(&words[message_index + 1..])
+            {
+                return None;
+            }
             let matching_scope = has_message_topic_marker(&words[message_index + 1..]);
             return Some(if matching_scope {
                 CountIntent::Matching
@@ -1521,6 +1554,7 @@ fn message_filter_requirements(question: &str) -> CountFilterRequirements {
 
 fn structural_filter_requirements(words: &[&str]) -> CountFilterRequirements {
     let mut requirements = CountFilterRequirements::default();
+    let mut last_polarity = None;
     for (index, word) in words.iter().enumerate() {
         let Some(next) = words.get(index + 1) else {
             continue;
@@ -1538,7 +1572,15 @@ fn structural_filter_requirements(words: &[&str]) -> CountFilterRequirements {
                 .and_then(|previous| words.get(previous))
                 .is_some_and(|previous| *previous == "не")
         });
-        let Some(value) = direct_value.or(containing_value) else {
+        let value = if let Some(value) = direct_value.or(containing_value) {
+            last_polarity = Some(value);
+            Some(value)
+        } else if *word == "и" {
+            last_polarity
+        } else {
+            None
+        };
+        let Some(value) = value else {
             continue;
         };
         if next.starts_with("ссыл") || next.starts_with("линк") || *next == "url" {
@@ -1565,22 +1607,77 @@ fn structural_filter_requirements(words: &[&str]) -> CountFilterRequirements {
     requirements
 }
 
+fn has_unsupported_structural_disjunction(
+    words: &[&str],
+    requirements: &CountFilterRequirements,
+) -> bool {
+    let has_structural_filter = requirements.has_links.is_some()
+        || requirements.has_media.is_some()
+        || requirements.has_photo.is_some()
+        || requirements.has_video.is_some()
+        || requirements.has_document.is_some()
+        || requirements.has_audio.is_some()
+        || requirements.has_voice.is_some()
+        || requirements.has_sticker.is_some()
+        || requirements.has_animation.is_some()
+        || requirements.has_reply.is_some()
+        || requirements.reply_to_message_id.is_some()
+        || requirements.include_forwards.is_some();
+    has_structural_filter && words.contains(&"или")
+}
+
+fn has_unsupported_unanswered_scope(words: &[&str]) -> bool {
+    words
+        .windows(2)
+        .any(|pair| pair[0] == "без" && is_reply_lexeme(pair[1]))
+}
+
 fn has_reply_requirement(words: &[&str]) -> Option<bool> {
     words.iter().enumerate().find_map(|(index, word)| {
-        if !word.starts_with("ответ") {
+        if !is_reply_lexeme(word) {
             return None;
         }
-        let negated = index
+        let previous = index
             .checked_sub(1)
             .and_then(|previous| words.get(previous))
-            .is_some_and(|previous| matches!(*previous, "без" | "не"));
-        Some(!negated)
+            .copied();
+        let previous_is_auxiliary = previous.is_some_and(|previous| {
+            previous.starts_with("был") || previous.starts_with("явля") || previous == "являлись"
+        });
+        let previous_is_negated_auxiliary = previous_is_auxiliary
+            && index
+                .checked_sub(2)
+                .and_then(|previous| words.get(previous))
+                .is_some_and(|previous| *previous == "не");
+        let is_specific_reply_target = words.get(index + 1).is_some_and(|next| *next == "на");
+        if previous_is_negated_auxiliary {
+            Some(false)
+        } else if previous_is_auxiliary || is_specific_reply_target {
+            Some(true)
+        } else {
+            None
+        }
     })
+}
+
+fn is_reply_lexeme(word: &str) -> bool {
+    matches!(
+        word,
+        "ответ"
+            | "ответа"
+            | "ответе"
+            | "ответом"
+            | "ответу"
+            | "ответы"
+            | "ответов"
+            | "ответами"
+            | "ответах"
+    )
 }
 
 fn reply_scope_requirement(words: &[&str]) -> Option<i64> {
     for (index, word) in words.iter().enumerate() {
-        if !word.starts_with("ответ") {
+        if !is_reply_lexeme(word) {
             continue;
         }
         let end = words.len().min(index + 6);
@@ -2427,6 +2524,8 @@ mod tests {
         assert!(prompt.contains("Native tools"));
         assert!(SYSTEM_PROMPT.contains("chat.count_messages"));
         assert!(SYSTEM_PROMPT.contains("include_forwards=true"));
+        assert!(SYSTEM_PROMPT.contains("сначала вызывай chat.search_messages"));
+        assert!(SYSTEM_PROMPT.contains("затем chat.count_messages"));
         assert!(!SYSTEM_PROMPT.contains("5700x3d"));
     }
 
@@ -2750,13 +2849,34 @@ mod tests {
         );
         assert_eq!(research.count_queries, 1);
 
-        let mut research = ResearchState::for_question("сколько сообщений с фото?");
+        let mut research = ResearchState::for_question("сколько сообщений с фото в июле?");
         research.record(
             "chat.count_messages",
             &json!({"has_photo": true, "query": "Rust"}),
             &json!({"count": 3}),
         );
         assert_eq!(research.count_queries, 0);
+
+        research.record(
+            "chat.search_messages",
+            &json!({
+                "query": "фото",
+                "has_photo": true,
+                "date_from": "2026-07-01",
+                "date_to": "2026-07-31"
+            }),
+            &json!([]),
+        );
+        research.record(
+            "chat.count_messages",
+            &json!({
+                "has_photo": true,
+                "date_from": "2026-07-01",
+                "date_to": "2026-07-31"
+            }),
+            &json!({"count": 3}),
+        );
+        assert_eq!(research.count_queries, 1);
 
         let mut research = ResearchState::for_question("сколько сообщений с фото?");
         research.record(
@@ -2835,6 +2955,40 @@ mod tests {
 
         let non_forwards = ResearchState::for_question("сколько сообщений без пересланных?");
         assert_eq!(non_forwards.count_requires_include_forwards, Some(false));
+
+        let coordinated = ResearchState::for_question("сколько сообщений с фото и видео?");
+        assert_eq!(coordinated.count_requires_has_photo, Some(true));
+        assert_eq!(coordinated.count_requires_has_video, Some(true));
+        assert_eq!(coordinated.count_intent, Some(CountIntent::Filtered));
+        assert!(asks_message_count("сколько сообщений с фото и видео?"));
+        assert!(!asks_message_count("сколько сообщений с фото или видео?"));
+
+        for question in [
+            "сколько сообщений про ответственность?",
+            "сколько сообщений про ответы API?",
+            "сколько сообщений содержит слово ответ?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_requires_has_reply,
+                None,
+                "question: {question}"
+            );
+        }
+        assert_eq!(
+            ResearchState::for_question("сколько сообщений были ответами?")
+                .count_requires_has_reply,
+            Some(true)
+        );
+        assert_eq!(
+            ResearchState::for_question("сколько сообщений не были ответами?")
+                .count_requires_has_reply,
+            Some(false)
+        );
+        assert!(
+            ResearchState::for_question("сколько сообщений без ответов?")
+                .count_intent
+                .is_none()
+        );
     }
 
     #[test]
@@ -2907,6 +3061,25 @@ mod tests {
             &json!({"count": 2}),
         );
         assert_eq!(research.count_queries, 1);
+    }
+
+    #[test]
+    fn structural_count_survives_later_text_search_with_another_match_mode() {
+        let mut research = ResearchState::for_question("сколько сообщений с фото?");
+        research.record(
+            "chat.count_messages",
+            &json!({"has_photo": true}),
+            &json!({"count": 3}),
+        );
+        assert_eq!(research.count_queries, 1);
+
+        research.record(
+            "chat.search_messages",
+            &json!({"query": "фото", "has_photo": true, "match_mode": "literal"}),
+            &json!([]),
+        );
+        assert_eq!(research.count_queries, 1);
+        assert!(research.count_request.is_some());
     }
 
     #[test]
