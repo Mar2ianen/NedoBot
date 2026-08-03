@@ -73,6 +73,7 @@ pub struct MessageSearchPage {
     pub total_count: i64,
     pub has_more: bool,
     pub next_offset: Option<i64>,
+    pub scan_limit_reached: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
