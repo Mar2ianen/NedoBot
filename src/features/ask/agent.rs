@@ -78,7 +78,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - Именованные custom emoji bindings используй только в форме `:alias:` и только для aliases, перечисленных в текущем контексте; не придумывай aliases и не пиши Telegram custom emoji ID.
 - Не пиши Unix timestamp, `tg://time`, `<tg-time>` или developer dialect `@time(...)`. Не используй time markers внутри inline code или fenced code blocks.
 - Отделяй найденные факты от выводов. Честно говори о неопределённости и ограничениях поиска.
-- Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата используй alias `[Михаил написал](message_<message_id>)` или `[в этом сообщении](message_<message_id>)`, если message_id был получен из инструмента; не выдумывай aliases. Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
+- Ссылайся только на URL, реально полученные от инструмента или данные пользователем. Если есть author_url, имя упомянутого автора делай Markdown-ссылкой. Для фактов из чата используй alias `[автор написал](message_<message_id>)` или `[в этом сообщении](message_<message_id>)`, если message_id был получен из инструмента; не выдумывай aliases. Никогда не пиши голый ID, `message_id` или `[384547]`; отдельный список источников в конце не нужен.
 - Используй native tool calls для инструментов. Если инструменты не нужны, верни обычный Rich Markdown-ответ без JSON-envelope и без code fence."#;
 
 enum AgentGenerationError {
@@ -122,6 +122,8 @@ struct ResearchState {
     count_intent: Option<CountIntent>,
     count_requires_date_scope: bool,
     count_requires_user_scope: bool,
+    count_requires_has_links: Option<bool>,
+    count_requires_has_media: Option<bool>,
     count_queries: usize,
     count_request: Option<CountRequestScope>,
     user_resolution_attempted: bool,
@@ -139,8 +141,9 @@ struct ResearchState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CountIntent {
-    TotalMessages,
-    MatchingMessages,
+    Total,
+    Matching,
+    Filtered,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,11 +207,15 @@ impl CountRequestScope {
 impl ResearchState {
     fn for_question(question: &str) -> Self {
         let count_intent = message_count_intent(question);
+        let (count_requires_has_links, count_requires_has_media) =
+            message_filter_requirements(question);
         Self {
             count_required: count_intent.is_some(),
             count_intent,
             count_requires_date_scope: question_mentions_date_scope(question),
             count_requires_user_scope: question_mentions_user_scope(question),
+            count_requires_has_links,
+            count_requires_has_media,
             personal_fact_required: asks_personal_fact(question),
             ..Self::default()
         }
@@ -1041,21 +1048,35 @@ impl ResearchState {
         }
 
         match self.count_intent {
-            Some(CountIntent::MatchingMessages) => scope
+            Some(CountIntent::Matching) => scope
                 .query
                 .as_deref()
                 .is_some_and(|query| !query.trim().is_empty()),
-            Some(CountIntent::TotalMessages) | None => true,
+            Some(CountIntent::Filtered) => {
+                let links_match = self
+                    .count_requires_has_links
+                    .is_none_or(|expected| scope.has_links == Some(expected));
+                let media_match = self
+                    .count_requires_has_media
+                    .is_none_or(|expected| scope.has_media == Some(expected));
+                let has_required_filter = self.count_requires_has_links.is_some()
+                    || self.count_requires_has_media.is_some();
+                links_match && media_match && has_required_filter
+            }
+            Some(CountIntent::Total) | None => true,
         }
     }
 
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
         if self.count_required && self.count_request.is_none() {
             let instruction = match self.count_intent {
-                Some(CountIntent::MatchingMessages) => {
+                Some(CountIntent::Matching) => {
                     "SYSTEM: вопрос требует точного количества matching-сообщений. Следующим действием вызови chat.count_messages с непустым query и теми же структурными фильтрами, а не считай элементы top-k выдачи вручную; не выдавай этот count за число событий или вхождений слова."
                 }
-                Some(CountIntent::TotalMessages) | None => {
+                Some(CountIntent::Filtered) => {
+                    "SYSTEM: вопрос требует точного количества сообщений по структурному фильтру. Следующим действием вызови chat.count_messages с соответствующим has_media/has_links; query можно опустить. Не добавляй фиктивный текстовый query и не выдавай этот count за число событий или вхождений слова."
+                }
+                Some(CountIntent::Total) | None => {
                     "SYSTEM: вопрос требует точного количества сообщений. Для общего количества сообщений пользователя сначала вызови chat.resolve_user, затем chat.count_messages с user_id; query можно опустить. Не выдавай этот count за число событий или вхождений слова."
                 }
             };
@@ -1265,13 +1286,18 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
             .split(|character: char| !character.is_alphanumeric())
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
-        if let Some((lead, message_index)) = explicit_message_count_phrase(&words) {
+        if let Some((lead, lead_index, message_index)) = explicit_message_count_phrase(&words) {
+            let (required_has_links, required_has_media) =
+                structural_filter_requirements(&words[lead_index + 1..]);
+            if required_has_links.is_some() || required_has_media.is_some() {
+                return Some(CountIntent::Filtered);
+            }
             let matching_scope =
                 lead == "скольких" || has_message_topic_marker(&words[message_index + 1..]);
             return Some(if matching_scope {
-                CountIntent::MatchingMessages
+                CountIntent::Matching
             } else {
-                CountIntent::TotalMessages
+                CountIntent::Total
             });
         }
 
@@ -1306,13 +1332,55 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
                 || tail.iter().any(|word| word.starts_with("чат"));
             writes && mentions_chat
         }) {
-            return Some(CountIntent::MatchingMessages);
+            return Some(CountIntent::Matching);
         }
     }
     None
 }
 
-fn explicit_message_count_phrase<'a>(words: &[&'a str]) -> Option<(&'a str, usize)> {
+fn message_filter_requirements(question: &str) -> (Option<bool>, Option<bool>) {
+    let question = question.to_lowercase();
+    for clause in question.split(is_count_clause_boundary) {
+        let words = clause
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        if let Some((_, lead_index, _)) = explicit_message_count_phrase(&words) {
+            return structural_filter_requirements(&words[lead_index + 1..]);
+        }
+    }
+    (None, None)
+}
+
+fn structural_filter_requirements(words: &[&str]) -> (Option<bool>, Option<bool>) {
+    let mut required_has_links = None;
+    let mut required_has_media = None;
+    for (index, word) in words.iter().enumerate() {
+        let Some(next) = words.get(index + 1) else {
+            continue;
+        };
+        let value = match *word {
+            "с" | "со" => true,
+            "без" => false,
+            _ => continue,
+        };
+        if next.starts_with("ссыл") || next.starts_with("линк") || *next == "url" {
+            required_has_links = Some(value);
+        }
+        if next.starts_with("фото")
+            || next.starts_with("фотограф")
+            || next.starts_with("изображ")
+            || next.starts_with("картин")
+            || next.starts_with("медиа")
+            || next.starts_with("видео")
+        {
+            required_has_media = Some(value);
+        }
+    }
+    (required_has_links, required_has_media)
+}
+
+fn explicit_message_count_phrase<'a>(words: &[&'a str]) -> Option<(&'a str, usize, usize)> {
     let leads = ["сколько", "скольких", "количество", "число"];
     let message_words = ["сообщений", "сообщениях"];
     for (index, lead) in words.iter().enumerate() {
@@ -1333,7 +1401,7 @@ fn explicit_message_count_phrase<'a>(words: &[&'a str]) -> Option<(&'a str, usiz
             }) {
                 continue;
             }
-            return Some((lead, message_index));
+            return Some((lead, index, message_index));
         }
     }
     None
@@ -1369,39 +1437,86 @@ fn is_count_clause_boundary(character: char) -> bool {
 
 fn question_mentions_date_scope(question: &str) -> bool {
     let question = question.to_lowercase();
-    question
-        .split(|character: char| !character.is_alphanumeric())
-        .any(is_date_scope_word)
+    for clause in question.split(is_count_clause_boundary) {
+        let words = clause
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let has_count_phrase = explicit_message_count_phrase(&words).is_some()
+            || words.windows(2).any(|pair| pair == ["сколько", "раз"]);
+        if has_count_phrase && words.iter().copied().any(is_date_scope_word) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_date_scope_word(word: &str) -> bool {
-    let date_markers = [
-        "сегодня",
-        "вчера",
-        "завтра",
-        "день",
-        "дня",
-        "дней",
-        "недел",
-        "месяц",
-        "месяца",
-        "год",
-        "года",
-        "квартал",
-        "июн",
-        "июл",
-        "авг",
-        "сентябр",
-        "октябр",
-        "ноябр",
-        "декабр",
-        "январ",
-        "феврал",
-        "март",
-        "апрел",
-        "период",
-    ];
-    date_markers.iter().any(|marker| word.starts_with(marker))
+    matches!(
+        word,
+        "сегодня"
+            | "вчера"
+            | "завтра"
+            | "день"
+            | "дня"
+            | "дней"
+            | "неделя"
+            | "неделе"
+            | "неделю"
+            | "недели"
+            | "недель"
+            | "месяц"
+            | "месяца"
+            | "месяцу"
+            | "месяце"
+            | "месяцем"
+            | "месяцев"
+            | "год"
+            | "года"
+            | "году"
+            | "годом"
+            | "квартал"
+            | "квартала"
+            | "квартале"
+            | "период"
+            | "периода"
+            | "январь"
+            | "января"
+            | "январе"
+            | "февраль"
+            | "февраля"
+            | "феврале"
+            | "март"
+            | "марта"
+            | "марте"
+            | "апрель"
+            | "апреля"
+            | "апреле"
+            | "май"
+            | "мая"
+            | "мае"
+            | "июнь"
+            | "июня"
+            | "июне"
+            | "июль"
+            | "июля"
+            | "июле"
+            | "август"
+            | "августа"
+            | "августе"
+            | "сентябрь"
+            | "сентября"
+            | "сентябре"
+            | "октябрь"
+            | "октября"
+            | "октябре"
+            | "ноябрь"
+            | "ноября"
+            | "ноябре"
+            | "декабрь"
+            | "декабря"
+            | "декабре"
+    )
 }
 
 fn question_mentions_user_scope(question: &str) -> bool {
@@ -1411,10 +1526,13 @@ fn question_mentions_user_scope(question: &str) -> bool {
             .split(|character: char| !character.is_alphanumeric())
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
-        if let Some((_, message_index)) = explicit_message_count_phrase(&words)
-            && user_scope_in_count_tail(&words[message_index + 1..])
-        {
-            return true;
+        if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
+            let before_messages = &words[lead_index + 1..message_index];
+            let after_messages = &words[message_index + 1..];
+            if user_scope_in_count_tail(before_messages) || user_scope_in_count_tail(after_messages)
+            {
+                return true;
+            }
         }
         for (index, pair) in words.windows(2).enumerate() {
             if pair == ["сколько", "раз"] && user_scope_in_count_tail(&words[index + 2..])
@@ -1427,12 +1545,14 @@ fn question_mentions_user_scope(question: &str) -> bool {
 }
 
 fn user_scope_in_count_tail(tail: &[&str]) -> bool {
-    let topic_index = message_topic_marker_index(tail);
-    let before_topic = topic_index.map_or(tail, |index| &tail[..index]);
-    if before_topic
-        .iter()
-        .any(|word| is_explicit_user_noun(word) || is_user_candidate(word))
+    if tail
+        .first()
+        .is_some_and(|word| is_genitive_user_reference(word))
     {
+        return true;
+    }
+
+    if tail.iter().any(|word| is_explicit_user_noun(word)) {
         return true;
     }
 
@@ -1486,6 +1606,34 @@ fn is_user_candidate(word: &str) -> bool {
         && word != "с"
 }
 
+fn is_genitive_user_reference(word: &str) -> bool {
+    is_explicit_user_noun(word)
+        || (!is_count_scope_noise(word)
+            && (matches!(
+                word,
+                "я" | "мы"
+                    | "ты"
+                    | "он"
+                    | "она"
+                    | "они"
+                    | "меня"
+                    | "тебя"
+                    | "него"
+                    | "неё"
+                    | "нее"
+                    | "их"
+                    | "них"
+                    | "его"
+                    | "ее"
+                    | "её"
+            ) || word.ends_with('а')
+                || word.ends_with('я')
+                || word.ends_with('и')
+                || word.ends_with('ы')
+                || word.ends_with("ой")
+                || word.ends_with("ей")))
+}
+
 fn is_explicit_user_noun(word: &str) -> bool {
     matches!(
         word,
@@ -1516,22 +1664,7 @@ fn is_count_verb(word: &str) -> bool {
 
 fn is_count_scope_noise(word: &str) -> bool {
     word.starts_with("чат")
-        || word.starts_with("дн")
-        || word.starts_with("недел")
-        || word.starts_with("месяц")
-        || word.starts_with("год")
-        || word.starts_with("январ")
-        || word.starts_with("феврал")
-        || word.starts_with("март")
-        || word.starts_with("апрел")
-        || word.starts_with("мая")
-        || word.starts_with("июн")
-        || word.starts_with("июл")
-        || word.starts_with("авг")
-        || word.starts_with("сентябр")
-        || word.starts_with("октябр")
-        || word.starts_with("ноябр")
-        || word.starts_with("декабр")
+        || is_date_scope_word(word)
         || word.chars().all(|character| character.is_ascii_digit())
         || matches!(
             word,
@@ -1542,6 +1675,9 @@ fn is_count_scope_noise(word: &str) -> bool {
                 | "от"
                 | "для"
                 | "у"
+                | "с"
+                | "со"
+                | "без"
                 | "и"
                 | "или"
                 | "этом"
@@ -1551,6 +1687,8 @@ fn is_count_scope_noise(word: &str) -> bool {
                 | "есть"
                 | "вышло"
                 | "получено"
+                | "осталось"
+                | "удалено"
                 | "всего"
                 | "все"
                 | "последний"
@@ -1558,6 +1696,11 @@ fn is_count_scope_noise(word: &str) -> bool {
                 | "этот"
                 | "прошлый"
                 | "прошлом"
+                | "ссылок"
+                | "фото"
+                | "фотографии"
+                | "медиа"
+                | "видео"
                 | "сообщение"
                 | "сообщения"
                 | "сообщений"
@@ -1872,13 +2015,13 @@ mod tests {
 
     #[test]
     fn count_gate_rejects_count_for_a_different_resolved_user() {
-        let mut research = ResearchState::for_question("сколько сообщений написала Оля?");
+        let mut research = ResearchState::for_question("сколько сообщений написал автор?");
         research.record("chat.count_messages", &json!({}), &json!({"count": 10}));
         assert_eq!(research.count_queries, 0);
 
         research.record(
             "chat.resolve_user",
-            &json!({"query": "Оля"}),
+            &json!({"query": "автор"}),
             &json!({"users": [{"telegram_user_id": 42, "recommended": true}]}),
         );
         research.record("chat.count_messages", &json!({}), &json!({"count": 10}));
@@ -1915,8 +2058,20 @@ mod tests {
     }
 
     #[test]
+    fn count_gate_requires_user_for_both_author_word_orders() {
+        for question in [
+            "сколько автор написал сообщений про Rust?",
+            "сколько сообщений про Rust написал автор?",
+        ] {
+            let mut research = ResearchState::for_question(question);
+            research.record("chat.count_messages", &json!({}), &json!({"count": 10}));
+            assert_eq!(research.count_queries, 0, "question: {question}");
+        }
+    }
+
+    #[test]
     fn count_gate_uses_only_current_recommended_resolution() {
-        let mut research = ResearchState::for_question("сколько сообщений написала Оля?");
+        let mut research = ResearchState::for_question("сколько сообщений написал автор?");
         research.record(
             "chat.count_messages",
             &json!({"user_id": 42}),
@@ -1926,7 +2081,7 @@ mod tests {
 
         research.record(
             "chat.resolve_user",
-            &json!({"query": "Оля"}),
+            &json!({"query": "автор"}),
             &json!({
                 "users": [
                     {"telegram_user_id": 42, "recommended": false},
@@ -1950,7 +2105,7 @@ mod tests {
 
         research.record(
             "chat.resolve_user",
-            &json!({"query": "Оля"}),
+            &json!({"query": "автор"}),
             &json!({"users": []}),
         );
         assert_eq!(research.count_queries, 0);
@@ -1960,10 +2115,10 @@ mod tests {
     #[test]
     fn matching_count_requires_a_text_query() {
         let mut research =
-            ResearchState::for_question("сколько сообщений Оля написала про Rust в июле?");
+            ResearchState::for_question("сколько сообщений автор написал про Rust в июле?");
         research.record(
             "chat.resolve_user",
-            &json!({"query": "Оля"}),
+            &json!({"query": "автор"}),
             &json!({"users": [{"telegram_user_id": 42, "recommended": true}]}),
         );
         research.record(
@@ -2005,12 +2160,37 @@ mod tests {
     }
 
     #[test]
+    fn structural_count_uses_declared_filters_without_fake_query() {
+        let mut research = ResearchState::for_question("сколько сообщений с фото?");
+        research.record(
+            "chat.count_messages",
+            &json!({"has_media": true}),
+            &json!({"count": 3}),
+        );
+        assert_eq!(research.count_queries, 1);
+
+        let mut research = ResearchState::for_question("сколько сообщений со ссылками?");
+        research.record(
+            "chat.count_messages",
+            &json!({"has_links": false}),
+            &json!({"count": 3}),
+        );
+        assert_eq!(research.count_queries, 0);
+        research.record(
+            "chat.count_messages",
+            &json!({"has_links": true}),
+            &json!({"count": 3}),
+        );
+        assert_eq!(research.count_queries, 1);
+    }
+
+    #[test]
     fn count_gate_requires_matching_structural_filters_after_search() {
         let mut research =
-            ResearchState::for_question("сколько сообщений Оля написала про Rust в июле?");
+            ResearchState::for_question("сколько сообщений автор написал про Rust в июле?");
         research.record(
             "chat.resolve_user",
-            &json!({"query": "Оля"}),
+            &json!({"query": "автор"}),
             &json!({"users": [{"telegram_user_id": 42, "recommended": true}]}),
         );
         research.record(
@@ -2047,66 +2227,93 @@ mod tests {
 
     #[test]
     fn count_policy_only_triggers_for_explicit_message_or_mention_counts() {
-        assert!(!asks_message_count("сколько раз Оля меняла ноутбук?"));
-        assert!(!asks_message_count("как часто Михаил ездит на велосипеде?"));
+        assert!(!asks_message_count("сколько раз автор менял ноутбук?"));
+        assert!(!asks_message_count(
+            "как часто пользователь ездил на велосипеде?"
+        ));
         assert!(!asks_message_count("сколько раз он подписал договор?"));
         assert!(!asks_message_count("сколько раз они переписали документ?"));
         assert!(!asks_message_count("У него несколько сообщений про Rust"));
-        assert!(!asks_message_count("сколько раз Оля писала код?"));
+        assert!(!asks_message_count("сколько раз автор писал код?"));
         assert!(!asks_message_count("сколько раз он писал заявление?"));
-        assert!(!asks_message_count("сколько раз Оля упоминала Rust?"));
-        assert!(!asks_message_count("сколько слов в сообщении Оли?"));
+        assert!(!asks_message_count("сколько раз автор упоминал Rust?"));
+        assert!(!asks_message_count("сколько слов в сообщении автора?"));
         assert!(!asks_message_count("сколько символов в этом сообщении?"));
         assert!(!asks_message_count(
             "сколько раз в сообщениях встречается Rust?"
         ));
         assert!(!asks_message_count(
-            "Сколько раз Оля меняла ноутбук, пока Михаил писал в чате?"
+            "Сколько раз автор менял ноутбук, пока другой пользователь писал в чате?"
         ));
-        assert!(asks_message_count("сколько сообщений написала Оля?"));
+        assert!(asks_message_count("сколько сообщений написал автор?"));
         assert!(asks_message_count(
-            "сколько всего сообщений Оля написала про Rust?"
-        ));
-        assert!(asks_message_count(
-            "сколько раз Оля написала про Rust в чате?"
+            "сколько всего сообщений автор написал про Rust?"
         ));
         assert!(asks_message_count(
-            "сколько раз за последний месяц Оля вообще писала про Rust именно в нашем чате?"
+            "сколько раз автор написал про Rust в чате?"
         ));
         assert!(asks_message_count(
-            "сколько раз Оля писала про Rust в чате?"
+            "сколько раз за последний месяц автор вообще писал про Rust именно в нашем чате?"
         ));
         assert!(asks_message_count(
-            "сколько раз Оля писала сообщение про Rust?"
+            "сколько раз автор писал про Rust в чате?"
         ));
-        assert!(asks_message_count("сколько сообщений Оли про Rust?"));
         assert!(asks_message_count(
-            "В скольких сообщениях Оля упоминала Rust?"
+            "сколько раз автор писал сообщение про Rust?"
+        ));
+        assert!(asks_message_count("сколько сообщений автора про Rust?"));
+        assert!(asks_message_count(
+            "В скольких сообщениях автор упоминал Rust?"
         ));
         assert!(asks_message_count("сколько сообщений с Rust?"));
         assert!(asks_message_count("сколько сообщений содержит Rust?"));
+        assert_eq!(
+            message_count_intent("сколько сообщений с фото?"),
+            Some(CountIntent::Filtered)
+        );
+        assert_eq!(
+            message_count_intent("сколько сообщений с ссылками?"),
+            Some(CountIntent::Filtered)
+        );
+        assert_eq!(
+            message_count_intent("сколько сообщений без ссылок?"),
+            Some(CountIntent::Filtered)
+        );
 
         for question in [
             "сколько сообщений было в чате?",
             "сколько сообщений в июле?",
             "сколько сообщений за последний месяц?",
+            "сколько сообщений без ссылок?",
+            "сколько сообщений осталось в чате?",
         ] {
-            assert!(!ResearchState::for_question(question).count_requires_user_scope);
+            assert!(
+                !ResearchState::for_question(question).count_requires_user_scope,
+                "unexpected user scope for {question}"
+            );
         }
         for question in [
-            "сколько сообщений написала Оля?",
-            "сколько сообщений про Rust написала Оля?",
-            "сколько раз в чате Оля писала про Rust?",
+            "сколько сообщений написал автор?",
+            "сколько сообщений про Rust написал автор?",
+            "сколько раз в чате автор писал про Rust?",
+            "сколько автор написал сообщений про Rust?",
+            "сколько автор отправил сообщений?",
         ] {
             assert!(ResearchState::for_question(question).count_requires_user_scope);
         }
+        for question in [
+            "сколько сообщений автор написал про деньги?",
+            "сколько сообщений автор написал про Мартин?",
+        ] {
+            assert!(!ResearchState::for_question(question).count_requires_date_scope);
+        }
         assert_eq!(
             message_count_intent("сколько сообщений с Rust?"),
-            Some(CountIntent::MatchingMessages)
+            Some(CountIntent::Matching)
         );
         assert_eq!(
             message_count_intent("сколько сообщений содержит Rust?"),
-            Some(CountIntent::MatchingMessages)
+            Some(CountIntent::Matching)
         );
     }
 
