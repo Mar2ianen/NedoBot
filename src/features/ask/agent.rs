@@ -57,7 +57,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count, has_more, next_offset и scan_limit_reached: для продолжения передай next_offset как offset, а при scan_limit_reached обозначь неполный охват и не пытайся обходить потолок.
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
-- Для вопросов «сколько раз», «сколько сообщений», «какое количество сообщений» сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Не считай вручную длину выдачи.
+- Для явных вопросов о количестве сообщений или упоминаний (например, «сколько сообщений», «сколько раз писал», «сколько раз упоминал», «сколько раз встречается в чате») сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
@@ -909,7 +909,7 @@ impl ResearchState {
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
         if self.count_required && self.count_queries == 0 {
             return Some(
-                "SYSTEM: вопрос требует точного количества сообщений. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную.".to_string(),
+                "SYSTEM: вопрос требует точного количества сообщений или упоминаний. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную.".to_string(),
             );
         }
         if self.personal_fact_required && self.personal_statement_searches == 0 {
@@ -1107,15 +1107,38 @@ fn asks_personal_fact(question: &str) -> bool {
 
 fn asks_message_count(question: &str) -> bool {
     let question = question.to_lowercase();
-    [
-        "сколько раз",
-        "сколько сообщений",
-        "количество сообщений",
-        "число сообщений",
-        "как часто",
-    ]
-    .iter()
-    .any(|marker| question.contains(marker))
+    let words = question
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.windows(2).any(|pair| {
+        pair == ["сколько", "сообщений"]
+            || pair == ["количество", "сообщений"]
+            || pair == ["число", "сообщений"]
+    }) {
+        return true;
+    }
+
+    let count_verbs = [
+        "писал",
+        "писала",
+        "писали",
+        "писало",
+        "упоминал",
+        "упоминала",
+        "упоминали",
+        "упоминало",
+    ];
+    words.windows(2).enumerate().any(|(index, pair)| {
+        if pair != ["сколько", "раз"] {
+            return false;
+        }
+        let tail = &words[index + 2..words.len().min(index + 7)];
+        count_verbs.iter().any(|verb| tail.contains(verb))
+            || tail
+                .windows(3)
+                .any(|window| window == ["встречается", "в", "чате"])
+    })
 }
 
 fn overconfident_personal_inference(markdown: &str) -> bool {
@@ -1415,6 +1438,17 @@ mod tests {
                 .follow_up_instruction("Всего 32 сообщения")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn count_policy_only_triggers_for_explicit_message_or_mention_counts() {
+        assert!(!asks_message_count("сколько раз Оля меняла ноутбук?"));
+        assert!(!asks_message_count("как часто Михаил ездит на велосипеде?"));
+        assert!(!asks_message_count("сколько раз он подписал договор?"));
+        assert!(!asks_message_count("сколько раз они переписали документ?"));
+        assert!(!asks_message_count("У него несколько сообщений про Rust"));
+        assert!(asks_message_count("сколько раз Оля писала про Rust?"));
+        assert!(asks_message_count("сколько сообщений Оли про Rust?"));
     }
 
     #[test]

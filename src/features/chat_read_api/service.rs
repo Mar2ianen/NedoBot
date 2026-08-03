@@ -25,15 +25,16 @@ struct MessageRow {
 }
 
 #[derive(FromRow)]
-struct SearchMessageRow {
-    message_id: i32,
+struct SearchPageRow {
+    message_id: Option<i32>,
     user_id: Option<i64>,
-    author: String,
+    author: Option<String>,
     author_username: Option<String>,
-    text: String,
+    text: Option<String>,
     reply_to_message_id: Option<i32>,
-    created_at: DateTime<Utc>,
-    relevance: f32,
+    created_at: Option<DateTime<Utc>>,
+    relevance: Option<f32>,
+    total_count: i64,
 }
 
 #[derive(FromRow)]
@@ -61,18 +62,9 @@ pub async fn search_messages(
     let query = normalized_query(&request.query)?;
     let ts_query = full_text_query(&query, &request.match_mode);
     let whole_word_pattern = whole_word_pattern(&query);
-    let total_count = count_matching_messages(
-        pool,
-        chat_id,
-        request,
-        &ts_query,
-        &query,
-        &whole_word_pattern,
-    )
-    .await?;
-    let rows = sqlx::query_as::<_, SearchMessageRow>(
+    let rows = sqlx::query_as::<_, SearchPageRow>(
         r#"
-        with matched as (
+        with matched as materialized (
             select
                 m.message_id,
                 m.user_id,
@@ -130,16 +122,32 @@ pub async fn search_messages(
                   or ($13 = 'whole_word' and m.text ~* $4)
               )
         )
-        select *
-        from matched
-        order by
-            case when $11 = 'newest' then created_at end desc,
-            case when $11 = 'oldest' then created_at end asc,
-            relevance desc,
-            created_at desc,
-            message_id desc
-        limit $12
-        offset $15
+        select
+            page.message_id,
+            page.user_id,
+            page.author,
+            page.author_username,
+            page.text,
+            page.reply_to_message_id,
+            page.created_at,
+            page.relevance,
+            total.total_count
+        from (
+            select count(*)::bigint as total_count
+            from matched
+        ) total
+        left join lateral (
+            select *
+            from matched
+            order by
+                case when $11 = 'newest' then created_at end desc,
+                case when $11 = 'oldest' then created_at end asc,
+                relevance desc,
+                created_at desc,
+                message_id desc
+            limit $12
+            offset $15
+        ) page on true
         "#,
     )
     .bind(chat_id)
@@ -160,7 +168,7 @@ pub async fn search_messages(
     .fetch_all(pool)
     .await?;
 
-    let messages = map_search_rows(chat_id, rows);
+    let (total_count, messages) = map_search_page_rows(chat_id, rows);
     let offset = request.offset.clamp(0, MAX_SEARCH_OFFSET);
     let (has_more, next_offset, scan_limit_reached) =
         page_metadata(total_count, offset, messages.len());
@@ -542,8 +550,8 @@ fn page_metadata(total_count: i64, offset: i64, message_count: usize) -> (bool, 
     let offset = offset.clamp(0, MAX_SEARCH_OFFSET);
     let page_end = offset + message_count as i64;
     let has_more = total_count > page_end;
-    let scan_limit_reached = has_more && page_end >= MAX_SEARCH_OFFSET;
-    let next_offset = (has_more && !scan_limit_reached).then_some(page_end);
+    let scan_limit_reached = has_more && page_end > MAX_SEARCH_OFFSET;
+    let next_offset = (has_more && page_end <= MAX_SEARCH_OFFSET).then_some(page_end);
     (has_more, next_offset, scan_limit_reached)
 }
 
@@ -560,21 +568,26 @@ fn regex_escape(value: &str) -> String {
         .collect()
 }
 
-fn map_search_rows(chat_id: i64, rows: Vec<SearchMessageRow>) -> Vec<ChatMessage> {
-    rows.into_iter()
-        .map(|row| ChatMessage {
-            source_id: source_id(row.message_id),
-            message_url: message_url(chat_id, row.message_id),
-            relevance: (row.relevance * 1000.0).round() as i32,
-            message_id: row.message_id,
-            user_id: row.user_id,
-            author: row.author,
-            author_url: author_url(row.author_username.as_deref()),
-            text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
-            reply_to_message_id: row.reply_to_message_id,
-            created_at: row.created_at.to_rfc3339(),
+fn map_search_page_rows(chat_id: i64, rows: Vec<SearchPageRow>) -> (i64, Vec<ChatMessage>) {
+    let total_count = rows.first().map_or(0, |row| row.total_count);
+    let messages = rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(ChatMessage {
+                source_id: source_id(row.message_id?),
+                message_url: message_url(chat_id, row.message_id?),
+                relevance: (row.relevance? * 1000.0).round() as i32,
+                message_id: row.message_id?,
+                user_id: row.user_id,
+                author: row.author?,
+                author_url: author_url(row.author_username.as_deref()),
+                text: first_chars(&row.text?, MAX_MESSAGE_PREVIEW_CHARS),
+                reply_to_message_id: row.reply_to_message_id,
+                created_at: row.created_at?.to_rfc3339(),
+            })
         })
-        .collect()
+        .collect();
+    (total_count, messages)
 }
 
 fn map_rows(chat_id: i64, rows: Vec<MessageRow>) -> Vec<ChatMessage> {
@@ -697,9 +710,10 @@ mod tests {
         assert_eq!(page_metadata(3, 3, 0), (false, None, false));
         assert_eq!(page_metadata(4, 4, 0), (false, None, false));
         assert_eq!(
-            page_metadata(10_002, MAX_SEARCH_OFFSET, 0),
-            (true, None, true)
+            page_metadata(10_001, 9_950, 50),
+            (true, Some(10_000), false)
         );
+        assert_eq!(page_metadata(10_002, 10_000, 1), (true, None, true));
         assert_eq!(page_metadata(3, 0, 1), (true, Some(1), false));
     }
 }
