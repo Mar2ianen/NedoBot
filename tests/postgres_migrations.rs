@@ -2585,6 +2585,21 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("exact media fixtures must be inserted");
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, reply_to_message_id, text)
+        values
+            ($1, $2 + 6, $3 + 6, false, $2, 'exact scope marker replied'),
+            ($1, $2 + 7, null, true, $2 + 6, 'exact scope marker forwarded reply')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("exact message scope fixtures must be inserted");
 
     let request = MessageSearchRequest {
         query: "hybrid quality marker alpha".into(),
@@ -2592,6 +2607,8 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         date_from: None,
         date_to: None,
         reply_to_message_id: None,
+        is_automatic_forward: None,
+        has_reply: None,
         has_links: None,
         has_media: None,
         has_photo: None,
@@ -2614,6 +2631,81 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     assert!(!page.has_more);
     assert!(!page.scan_limit_reached);
     assert_eq!(page.messages[0].message_id, message_id);
+
+    let exact_scope_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(true),
+            has_reply: Some(true),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact message scope search must execute through the production read service");
+    assert_eq!(exact_scope_page.total_count, 1);
+    assert_eq!(exact_scope_page.messages[0].message_id, message_id + 7);
+
+    let exact_non_forward_reply_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(false),
+            has_reply: Some(true),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact non-forward count must execute through the production read service");
+    assert_eq!(exact_non_forward_reply_count, 1);
+
+    let exact_forward_reply_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(true),
+            has_reply: Some(true),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact forward count must execute through the production read service");
+    assert_eq!(exact_forward_reply_count, 1);
+
+    let top_level_scope_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            has_reply: Some(false),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact top-level count must execute through the production read service");
+    assert_eq!(top_level_scope_count, 0);
+
+    let excluded_forward_scope_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(true),
+            has_reply: Some(true),
+            include_forwards: false,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("include_forwards must remain an exclusion boundary");
+    assert_eq!(excluded_forward_scope_count, 0);
 
     let photo_count = chat_read_service::count_messages(
         pool,

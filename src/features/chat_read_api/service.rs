@@ -119,6 +119,8 @@ pub async fn search_messages(
               and ($15::boolean is null or m.has_voice = $15)
               and ($16::boolean is null or m.has_sticker = $16)
               and ($17::boolean is null or m.has_animation = $17)
+              and ($23::boolean is null or m.is_automatic_forward = $23)
+              and ($24::boolean is null or (m.reply_to_message_id is not null) = $24)
               and (
                   ($20 in ('hybrid', 'full_text', 'any_terms') and (
                        to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
@@ -192,6 +194,8 @@ pub async fn search_messages(
     .bind(request.match_mode.as_str())
     .bind(request.include_forwards)
     .bind(request.offset.clamp(0, MAX_SEARCH_OFFSET))
+    .bind(request.is_automatic_forward)
+    .bind(request.has_reply)
     .fetch_all(pool)
     .await?;
 
@@ -271,6 +275,8 @@ async fn count_matching_messages(
           and ($15::boolean is null or m.has_voice = $15)
           and ($16::boolean is null or m.has_sticker = $16)
           and ($17::boolean is null or m.has_animation = $17)
+          and ($20::boolean is null or m.is_automatic_forward = $20)
+          and ($21::boolean is null or (m.reply_to_message_id is not null) = $21)
           and (
               $3 = ''
               or ($18 in ('hybrid', 'full_text', 'any_terms') and (
@@ -302,6 +308,8 @@ async fn count_matching_messages(
     .bind(request.has_animation)
     .bind(request.match_mode.as_str())
     .bind(request.include_forwards)
+    .bind(request.is_automatic_forward)
+    .bind(request.has_reply)
     .fetch_one(pool)
     .await
     .map_err(Into::into)
@@ -342,6 +350,8 @@ pub async fn recent_messages(
           and ($11::boolean is null or m.has_voice = $11)
           and ($12::boolean is null or m.has_sticker = $12)
           and ($13::boolean is null or m.has_animation = $13)
+          and ($17::boolean is null or m.is_automatic_forward = $17)
+          and ($18::boolean is null or (m.reply_to_message_id is not null) = $18)
         order by
             case when $14 = 'oldest' then m.created_at end asc,
             case when $14 <> 'oldest' then m.created_at end desc,
@@ -366,6 +376,8 @@ pub async fn recent_messages(
     .bind(request.sort.as_str())
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
     .bind(request.include_forwards)
+    .bind(request.is_automatic_forward)
+    .bind(request.has_reply)
     .fetch_all(pool)
     .await?;
     Ok(map_rows(chat_id, rows))
