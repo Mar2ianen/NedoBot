@@ -2560,7 +2560,8 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         values
             ($1, $2, $3, false, 'hybrid quality marker alpha'),
             ($1, $2 + 1, $3 + 1, true, 'hybrid quality marker alpha forwarded'),
-            ($1, $2 + 2, null, true, 'hybrid quality marker alpha forwarded without author')
+            ($1, $2 + 2, null, true, 'hybrid quality marker alpha nedobot quality anonymous forwarded marker'),
+            ($1, $2 + 3, null, false, 'hybrid quality marker alpha anonymous normal')
         "#,
     )
     .bind(-1001932061163_i64)
@@ -2589,6 +2590,7 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         .expect("hybrid search must execute through the production read service");
     assert_eq!(page.total_count, 1);
     assert!(!page.has_more);
+    assert!(!page.scan_limit_reached);
     assert_eq!(page.messages[0].message_id, message_id);
 
     let fuzzy_page = chat_read_service::search_messages(
@@ -2645,17 +2647,63 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     assert_eq!(second_page.total_count, 3);
     assert_eq!(second_page.next_offset, Some(2));
 
+    let at_total = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 3,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("empty terminal search page must execute through the production read service");
+    assert!(at_total.messages.is_empty());
+    assert_eq!(at_total.total_count, 3);
+    assert!(!at_total.has_more);
+    assert_eq!(at_total.next_offset, None);
+
+    let beyond_total = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 4,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("out-of-range search page must execute through the production read service");
+    assert!(beyond_total.messages.is_empty());
+    assert_eq!(beyond_total.total_count, 3);
+    assert!(!beyond_total.has_more);
+    assert_eq!(beyond_total.next_offset, None);
+
     let with_anonymous_forward = chat_read_service::search_messages(
         pool,
         -1001932061163,
         &MessageSearchRequest {
             include_forwards: true,
-            ..request
+            ..request.clone()
         },
     )
     .await
     .expect("forwarded rows without authors must be searchable when opted in");
     assert_eq!(with_anonymous_forward.total_count, 3);
+
+    let without_forward_opt_in = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: false,
+            ..request
+        },
+    )
+    .await
+    .expect("default search count must exclude anonymous non-forward rows");
+    assert_eq!(without_forward_opt_in, 1);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

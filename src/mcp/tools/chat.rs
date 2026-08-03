@@ -157,6 +157,7 @@ pub struct BatchSearchResult {
     pub total_count: i64,
     pub has_more: bool,
     pub next_offset: Option<i64>,
+    pub scan_limit_reached: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -299,6 +300,7 @@ pub async fn search_messages_batch(
             total_count: messages.total_count,
             has_more: messages.has_more,
             next_offset: messages.next_offset,
+            scan_limit_reached: messages.scan_limit_reached,
             messages: serde_json::to_value(messages.messages)
                 .map_err(|_| read_error("cannot encode chat result"))?,
         });

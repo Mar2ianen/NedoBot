@@ -34,7 +34,6 @@ struct SearchMessageRow {
     reply_to_message_id: Option<i32>,
     created_at: DateTime<Utc>,
     relevance: f32,
-    total_count: i64,
 }
 
 #[derive(FromRow)]
@@ -62,6 +61,15 @@ pub async fn search_messages(
     let query = normalized_query(&request.query)?;
     let ts_query = full_text_query(&query, &request.match_mode);
     let whole_word_pattern = whole_word_pattern(&query);
+    let total_count = count_matching_messages(
+        pool,
+        chat_id,
+        request,
+        &ts_query,
+        &query,
+        &whole_word_pattern,
+    )
+    .await?;
     let rows = sqlx::query_as::<_, SearchMessageRow>(
         r#"
         with matched as (
@@ -96,7 +104,10 @@ pub async fn search_messages(
               and m.text is not null
               and m.deleted_by_bot_at is null
               and m.spam_marked_at is null
-              and (m.user_id is not null or $14::boolean)
+              and (
+                  m.user_id is not null
+                  or ($14::boolean and coalesce(m.is_automatic_forward, false))
+              )
               and not coalesce(p.is_bot, false)
               and ($14::boolean or not coalesce(m.is_automatic_forward, false))
               and ($5::bigint is null or m.user_id = $5)
@@ -119,7 +130,7 @@ pub async fn search_messages(
                   or ($13 = 'whole_word' and m.text ~* $4)
               )
         )
-        select *, count(*) over() as total_count
+        select *
         from matched
         order by
             case when $11 = 'newest' then created_at end desc,
@@ -149,16 +160,16 @@ pub async fn search_messages(
     .fetch_all(pool)
     .await?;
 
-    let total_count = rows.first().map(|row| row.total_count).unwrap_or(0);
     let messages = map_search_rows(chat_id, rows);
     let offset = request.offset.clamp(0, MAX_SEARCH_OFFSET);
-    let next_offset =
-        (total_count > offset + messages.len() as i64).then_some(offset + messages.len() as i64);
+    let (has_more, next_offset, scan_limit_reached) =
+        page_metadata(total_count, offset, messages.len());
     Ok(MessageSearchPage {
-        has_more: next_offset.is_some(),
+        has_more,
         messages,
         total_count,
         next_offset,
+        scan_limit_reached,
     })
 }
 
@@ -167,16 +178,79 @@ pub async fn count_messages(
     chat_id: i64,
     request: &MessageSearchRequest,
 ) -> anyhow::Result<i64> {
-    Ok(search_messages(
+    let query = normalized_query(&request.query)?;
+    let ts_query = full_text_query(&query, &request.match_mode);
+    let whole_word_pattern = whole_word_pattern(&query);
+    count_matching_messages(
         pool,
         chat_id,
-        &MessageSearchRequest {
-            limit: 1,
-            ..request.clone()
-        },
+        request,
+        &ts_query,
+        &query,
+        &whole_word_pattern,
     )
-    .await?
-    .total_count)
+    .await
+}
+
+async fn count_matching_messages(
+    pool: &PgPool,
+    chat_id: i64,
+    request: &MessageSearchRequest,
+    ts_query: &str,
+    query: &str,
+    whole_word_pattern: &str,
+) -> anyhow::Result<i64> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        select count(*)::bigint
+        from mcp_public.telegram_messages m
+        left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
+        where m.chat_id = $1
+          and m.text is not null
+          and m.deleted_by_bot_at is null
+          and m.spam_marked_at is null
+          and (
+              m.user_id is not null
+              or ($12::boolean and coalesce(m.is_automatic_forward, false))
+          )
+          and not coalesce(p.is_bot, false)
+          and ($12::boolean or not coalesce(m.is_automatic_forward, false))
+          and ($5::bigint is null or m.user_id = $5)
+          and ($6::timestamptz is null or m.created_at >= $6)
+          and ($7::timestamptz is null or m.created_at <= $7)
+          and ($8::integer is null or m.reply_to_message_id = $8)
+          and ($9::boolean is null or m.has_links = $9)
+          and (
+              $10::boolean is null
+              or (m.has_photo or m.has_video or m.has_document or m.has_audio
+                  or m.has_voice or m.has_sticker or m.has_animation) = $10
+          )
+          and (
+              ($11 in ('hybrid', 'full_text', 'any_terms') and (
+                   to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
+                or to_tsvector('simple', coalesce(m.text, '')) @@ websearch_to_tsquery('simple', $2)
+              ))
+              or ($11 = 'hybrid' and lower($3) <% lower(m.text))
+              or ($11 = 'literal' and position(lower($3) in lower(m.text)) > 0)
+              or ($11 = 'whole_word' and m.text ~* $4)
+          )
+        "#,
+    )
+    .bind(chat_id)
+    .bind(ts_query)
+    .bind(query)
+    .bind(whole_word_pattern)
+    .bind(request.user_id)
+    .bind(request.date_from)
+    .bind(request.date_to)
+    .bind(request.reply_to_message_id)
+    .bind(request.has_links)
+    .bind(request.has_media)
+    .bind(request.match_mode.as_str())
+    .bind(request.include_forwards)
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn recent_messages(
@@ -196,7 +270,10 @@ pub async fn recent_messages(
         where m.chat_id = $1
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
-          and (m.user_id is not null or $9::boolean)
+          and (
+              m.user_id is not null
+              or ($9::boolean and coalesce(m.is_automatic_forward, false))
+          )
           and not coalesce(p.is_bot, false)
           and ($9::boolean or not coalesce(m.is_automatic_forward, false))
           and ($2::bigint is null or m.user_id = $2)
@@ -461,6 +538,15 @@ fn whole_word_pattern(query: &str) -> String {
     )
 }
 
+fn page_metadata(total_count: i64, offset: i64, message_count: usize) -> (bool, Option<i64>, bool) {
+    let offset = offset.clamp(0, MAX_SEARCH_OFFSET);
+    let page_end = offset + message_count as i64;
+    let has_more = total_count > page_end;
+    let scan_limit_reached = has_more && page_end >= MAX_SEARCH_OFFSET;
+    let next_offset = (has_more && !scan_limit_reached).then_some(page_end);
+    (has_more, next_offset, scan_limit_reached)
+}
+
 fn regex_escape(value: &str) -> String {
     value
         .chars()
@@ -604,5 +690,16 @@ mod tests {
         let pattern = whole_word_pattern("Rust 1.85");
         assert!(pattern.contains(r"Rust 1\.85"));
         assert!(pattern.starts_with(r"(?i)(^|[^[:alnum:]_])"));
+    }
+
+    #[test]
+    fn page_metadata_preserves_empty_page_count_and_scan_ceiling() {
+        assert_eq!(page_metadata(3, 3, 0), (false, None, false));
+        assert_eq!(page_metadata(4, 4, 0), (false, None, false));
+        assert_eq!(
+            page_metadata(10_002, MAX_SEARCH_OFFSET, 0),
+            (true, None, true)
+        );
+        assert_eq!(page_metadata(3, 0, 1), (true, Some(1), false));
     }
 }
