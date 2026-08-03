@@ -57,7 +57,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count, has_more, next_offset и scan_limit_reached: для продолжения передай next_offset как offset, а при scan_limit_reached обозначь неполный охват и не пытайся обходить потолок.
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
-- Для явных вопросов о количестве сообщений или упоминаний (например, «сколько сообщений», «сколько раз писал», «сколько раз упоминал», «сколько раз встречается в чате») сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений.
+- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
@@ -909,7 +909,7 @@ impl ResearchState {
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
         if self.count_required && self.count_queries == 0 {
             return Some(
-                "SYSTEM: вопрос требует точного количества сообщений или упоминаний. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную.".to_string(),
+                "SYSTEM: вопрос требует точного количества matching-сообщений. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную; не выдавай этот count за число событий или вхождений слова.".to_string(),
             );
         }
         if self.personal_fact_required && self.personal_statement_searches == 0 {
@@ -1115,29 +1115,30 @@ fn asks_message_count(question: &str) -> bool {
         pair == ["сколько", "сообщений"]
             || pair == ["количество", "сообщений"]
             || pair == ["число", "сообщений"]
+            || pair == ["скольких", "сообщениях"]
     }) {
         return true;
     }
 
-    let count_verbs = [
-        "писал",
-        "писала",
-        "писали",
-        "писало",
-        "упоминал",
-        "упоминала",
-        "упоминали",
-        "упоминало",
+    let count_verbs = ["писал", "писала", "писали", "писало"];
+    let message_words = [
+        "сообщение",
+        "сообщения",
+        "сообщений",
+        "сообщении",
+        "сообщениях",
     ];
     words.windows(2).enumerate().any(|(index, pair)| {
         if pair != ["сколько", "раз"] {
             return false;
         }
-        let tail = &words[index + 2..words.len().min(index + 7)];
-        count_verbs.iter().any(|verb| tail.contains(verb))
+        let tail = &words[index + 2..words.len().min(index + 10)];
+        let writes = count_verbs.iter().any(|verb| tail.contains(verb));
+        let mentions_chat = tail.iter().any(|word| message_words.contains(word))
             || tail
-                .windows(3)
-                .any(|window| window == ["встречается", "в", "чате"])
+                .windows(2)
+                .any(|window| window == ["в", "чат"] || window == ["в", "чате"]);
+        writes && mentions_chat
     })
 }
 
@@ -1418,7 +1419,7 @@ mod tests {
 
     #[test]
     fn count_questions_require_authoritative_count_tool() {
-        let mut research = ResearchState::for_question("сколько раз он писал про броню?");
+        let mut research = ResearchState::for_question("сколько раз он писал про броню в чате?");
         assert!(research.count_required);
         assert!(
             research
@@ -1447,8 +1448,19 @@ mod tests {
         assert!(!asks_message_count("сколько раз он подписал договор?"));
         assert!(!asks_message_count("сколько раз они переписали документ?"));
         assert!(!asks_message_count("У него несколько сообщений про Rust"));
-        assert!(asks_message_count("сколько раз Оля писала про Rust?"));
+        assert!(!asks_message_count("сколько раз Оля писала код?"));
+        assert!(!asks_message_count("сколько раз он писал заявление?"));
+        assert!(!asks_message_count("сколько раз Оля упоминала Rust?"));
+        assert!(asks_message_count(
+            "сколько раз Оля писала про Rust в чате?"
+        ));
+        assert!(asks_message_count(
+            "сколько раз Оля писала сообщение про Rust?"
+        ));
         assert!(asks_message_count("сколько сообщений Оли про Rust?"));
+        assert!(asks_message_count(
+            "В скольких сообщениях Оля упоминала Rust?"
+        ));
     }
 
     #[test]
