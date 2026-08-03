@@ -2617,6 +2617,19 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .await
     .expect("count search must execute through the production read service");
     assert_eq!(with_forwards, 3);
+    let user_message_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: String::new(),
+            user_id: Some(user_id),
+            include_forwards: false,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("filter-only count must execute through the production read service");
+    assert_eq!(user_message_count, 1);
     let oldest_page = chat_read_service::search_messages(
         pool,
         -1001932061163,
