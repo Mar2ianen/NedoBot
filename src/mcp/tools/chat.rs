@@ -96,7 +96,9 @@ pub struct SearchMessagesBatchInput {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CountMessagesInput {
-    pub query: String,
+    /// Optional text predicate. Omit it to count all messages matching the
+    /// structural filters, for example all messages of one user.
+    pub query: Option<String>,
     pub user_id: Option<i64>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
@@ -241,7 +243,7 @@ pub async fn count_messages(
     input: CountMessagesInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
     let request = MessageSearchRequest {
-        query: input.query,
+        query: input.query.unwrap_or_default(),
         user_id: input.user_id,
         date_from: parse_timestamp(input.date_from, DateBoundary::Start)?,
         date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
@@ -254,9 +256,6 @@ pub async fn count_messages(
         offset: 0,
         include_forwards: input.include_forwards,
     };
-    if request.query.trim().is_empty() {
-        return Err(invalid_arguments("query must not be empty"));
-    }
     let count = api
         .count_messages(&request)
         .await
@@ -522,6 +521,15 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.message, "query must not be empty");
+    }
+
+    #[test]
+    fn count_input_allows_filter_only_requests() {
+        let input = serde_json::from_value::<CountMessagesInput>(serde_json::json!({
+            "user_id": 42,
+        }))
+        .expect("count_messages must allow structural filters without a query");
+        assert!(input.query.is_none());
     }
 
     #[test]

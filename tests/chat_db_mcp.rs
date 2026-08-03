@@ -119,6 +119,9 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         assert_eq!(quality_results[1]["has_more"], false);
         let count = call_object(&client, "chat.count_messages", json!({"query": "бот"})).await?;
         assert!(count["count"].is_i64());
+        let user_count =
+            call_object(&client, "chat.count_messages", json!({"user_id": user_id})).await?;
+        assert!(user_count["count"].is_i64());
         let message = call_object(
             &client,
             "chat.get_message",

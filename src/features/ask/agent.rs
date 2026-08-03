@@ -26,6 +26,7 @@ const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
+const COUNT_INTENT_LOOKAHEAD_WORDS: usize = 24;
 const RESEARCH_BUDGET_EXHAUSTED_FALLBACK: &str = "Не могу дать надёжный ответ: для проверки нужны дополнительные поиски или контекст сообщений, но лимит исследования исчерпан. Лучше повторите вопрос с более узкими деталями.";
 
 pub struct AskRequest<'a> {
@@ -57,7 +58,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count, has_more, next_offset и scan_limit_reached: для продолжения передай next_offset как offset, а при scan_limit_reached обозначь неполный охват и не пытайся обходить потолок.
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
-- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений.
+- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.count_messages с теми же фильтрами, а затем при необходимости ищи примеры через chat.search_messages. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
@@ -119,6 +120,8 @@ impl ToolResult {
 struct ResearchState {
     count_required: bool,
     count_queries: usize,
+    count_request: Option<CountRequestScope>,
+    resolved_user_ids: HashSet<i64>,
     personal_fact_required: bool,
     personal_statement_searches: usize,
     personal_topic_searches: usize,
@@ -127,6 +130,50 @@ struct ResearchState {
     message_results: usize,
     context_reads: usize,
     context_message_ids: HashSet<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CountRequestScope {
+    query: Option<String>,
+    user_id: Option<i64>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    reply_to_message_id: Option<i64>,
+    has_links: Option<bool>,
+    has_media: Option<bool>,
+    match_mode: Option<String>,
+    include_forwards: bool,
+}
+
+impl CountRequestScope {
+    fn from_arguments(arguments: &Value) -> Self {
+        Self {
+            query: arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            user_id: arguments.get("user_id").and_then(Value::as_i64),
+            date_from: arguments
+                .get("date_from")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            date_to: arguments
+                .get("date_to")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            reply_to_message_id: arguments.get("reply_to_message_id").and_then(Value::as_i64),
+            has_links: arguments.get("has_links").and_then(Value::as_bool),
+            has_media: arguments.get("has_media").and_then(Value::as_bool),
+            match_mode: arguments
+                .get("match_mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            include_forwards: arguments
+                .get("include_forwards")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
 }
 
 impl ResearchState {
@@ -856,6 +903,15 @@ fn collect_source_evidence_value(value: &Value, evidence: &mut Evidence) {
 impl ResearchState {
     fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
         match tool {
+            "chat.resolve_user" => {
+                if let Some(users) = result.get("users").and_then(Value::as_array) {
+                    self.resolved_user_ids.extend(
+                        users.iter().filter_map(|user| {
+                            user.get("telegram_user_id").and_then(Value::as_i64)
+                        }),
+                    );
+                }
+            }
             "chat.search_messages" | "chat.search_messages_batch" => {
                 let executed_batch = (tool == "chat.search_messages_batch")
                     .then(|| batch_search_execution(result))
@@ -879,8 +935,14 @@ impl ResearchState {
                 self.personal_topic_searches += personal_topic_query_count_values(executed_queries);
             }
             "chat.count_messages" => {
-                if result.get("count").and_then(Value::as_i64).is_some() {
+                let count_scope = CountRequestScope::from_arguments(arguments);
+                let user_scope_matches = self.resolved_user_ids.is_empty()
+                    || count_scope
+                        .user_id
+                        .is_some_and(|user_id| self.resolved_user_ids.contains(&user_id));
+                if result.get("count").and_then(Value::as_i64).is_some() && user_scope_matches {
                     self.count_queries += 1;
+                    self.count_request = Some(count_scope);
                 }
             }
             "chat.get_recent_messages" => {
@@ -907,9 +969,9 @@ impl ResearchState {
     }
 
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
-        if self.count_required && self.count_queries == 0 {
+        if self.count_required && self.count_request.is_none() {
             return Some(
-                "SYSTEM: вопрос требует точного количества matching-сообщений. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную; не выдавай этот count за число событий или вхождений слова.".to_string(),
+                "SYSTEM: вопрос требует точного количества matching-сообщений. Следующим действием вызови chat.count_messages с тем же смысловым запросом и фильтрами, а не считай элементы top-k выдачи вручную; не выдавай этот count за число событий или вхождений слова. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query.".to_string(),
             );
         }
         if self.personal_fact_required && self.personal_statement_searches == 0 {
@@ -1111,16 +1173,6 @@ fn asks_message_count(question: &str) -> bool {
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
-    if words.windows(2).any(|pair| {
-        pair == ["сколько", "сообщений"]
-            || pair == ["количество", "сообщений"]
-            || pair == ["число", "сообщений"]
-            || pair == ["скольких", "сообщениях"]
-    }) {
-        return true;
-    }
-
-    let count_verbs = ["писал", "писала", "писали", "писало"];
     let message_words = [
         "сообщение",
         "сообщения",
@@ -1128,16 +1180,37 @@ fn asks_message_count(question: &str) -> bool {
         "сообщении",
         "сообщениях",
     ];
+    if words.iter().enumerate().any(|(index, word)| {
+        ["сколько", "скольких", "количество", "число"].contains(word)
+            && words[index + 1..words.len().min(index + 4)]
+                .iter()
+                .any(|candidate| message_words.contains(candidate))
+    }) {
+        return true;
+    }
+
+    let count_verbs = [
+        "писал",
+        "писала",
+        "писали",
+        "писало",
+        "написал",
+        "написала",
+        "написали",
+        "написало",
+        "отправил",
+        "отправила",
+        "отправили",
+        "отправило",
+    ];
     words.windows(2).enumerate().any(|(index, pair)| {
         if pair != ["сколько", "раз"] {
             return false;
         }
-        let tail = &words[index + 2..words.len().min(index + 10)];
+        let tail = &words[index + 2..words.len().min(index + 2 + COUNT_INTENT_LOOKAHEAD_WORDS)];
         let writes = count_verbs.iter().any(|verb| tail.contains(verb));
         let mentions_chat = tail.iter().any(|word| message_words.contains(word))
-            || tail
-                .windows(2)
-                .any(|window| window == ["в", "чат"] || window == ["в", "чате"]);
+            || tail.iter().any(|word| word.starts_with("чат"));
         writes && mentions_chat
     })
 }
@@ -1442,6 +1515,37 @@ mod tests {
     }
 
     #[test]
+    fn count_gate_rejects_count_for_a_different_resolved_user() {
+        let mut research = ResearchState::for_question("сколько сообщений написала Оля?");
+        research.record(
+            "chat.resolve_user",
+            &json!({"query": "Оля"}),
+            &json!({"users": [{"telegram_user_id": 42}]}),
+        );
+        research.record(
+            "chat.count_messages",
+            &json!({"user_id": 7}),
+            &json!({"count": 10}),
+        );
+        assert_eq!(research.count_queries, 0);
+        assert!(research.count_request.is_none());
+
+        research.record(
+            "chat.count_messages",
+            &json!({"user_id": 42, "date_from": "2026-01-01"}),
+            &json!({"count": 10}),
+        );
+        assert_eq!(research.count_queries, 1);
+        assert_eq!(
+            research
+                .count_request
+                .as_ref()
+                .and_then(|request| request.user_id),
+            Some(42)
+        );
+    }
+
+    #[test]
     fn count_policy_only_triggers_for_explicit_message_or_mention_counts() {
         assert!(!asks_message_count("сколько раз Оля меняла ноутбук?"));
         assert!(!asks_message_count("как часто Михаил ездит на велосипеде?"));
@@ -1451,6 +1555,16 @@ mod tests {
         assert!(!asks_message_count("сколько раз Оля писала код?"));
         assert!(!asks_message_count("сколько раз он писал заявление?"));
         assert!(!asks_message_count("сколько раз Оля упоминала Rust?"));
+        assert!(asks_message_count("сколько сообщений написала Оля?"));
+        assert!(asks_message_count(
+            "сколько всего сообщений Оля написала про Rust?"
+        ));
+        assert!(asks_message_count(
+            "сколько раз Оля написала про Rust в чате?"
+        ));
+        assert!(asks_message_count(
+            "сколько раз за последний месяц Оля вообще писала про Rust именно в нашем чате?"
+        ));
         assert!(asks_message_count(
             "сколько раз Оля писала про Rust в чате?"
         ));

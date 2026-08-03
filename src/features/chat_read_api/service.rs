@@ -199,7 +199,11 @@ pub async fn count_messages(
     chat_id: i64,
     request: &MessageSearchRequest,
 ) -> anyhow::Result<i64> {
-    let query = normalized_query(&request.query)?;
+    let query = if request.query.trim().is_empty() {
+        String::new()
+    } else {
+        normalized_query(&request.query)?
+    };
     let ts_query = full_text_query(&query, &request.match_mode);
     let whole_word_pattern = whole_word_pattern(&query);
     count_matching_messages(
@@ -227,7 +231,7 @@ async fn count_matching_messages(
         from mcp_public.telegram_messages m
         left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1
-          and m.text is not null
+          and ($3 = '' or m.text is not null)
           and m.deleted_by_bot_at is null
           and m.spam_marked_at is null
           and (
@@ -247,7 +251,8 @@ async fn count_matching_messages(
                   or m.has_voice or m.has_sticker or m.has_animation) = $10
           )
           and (
-              ($11 in ('hybrid', 'full_text', 'any_terms') and (
+              $3 = ''
+              or ($11 in ('hybrid', 'full_text', 'any_terms') and (
                    to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
                 or to_tsvector('simple', coalesce(m.text, '')) @@ websearch_to_tsquery('simple', $2)
               ))
