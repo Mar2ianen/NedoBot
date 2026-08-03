@@ -77,15 +77,15 @@ pub async fn search_messages(
                 m.created_at,
                 (
                     case
-                        when $13 in ('hybrid', 'full_text', 'any_terms') then greatest(
+                        when $20 in ('hybrid', 'full_text', 'any_terms') then greatest(
                             ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
                             ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
                         )
-                        when $13 = 'literal' and position(lower($3) in lower(m.text)) > 0 then 1.0
-                        when $13 = 'whole_word' and m.text ~* $4 then 1.0
+                        when $20 = 'literal' and position(lower($3) in lower(m.text)) > 0 then 1.0
+                        when $20 = 'whole_word' and m.text ~* $4 then 1.0
                         else 0.0
                     end
-                    + case when $13 = 'hybrid' and lower($3) <% lower(m.text)
+                    + case when $20 = 'hybrid' and lower($3) <% lower(m.text)
                            then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) * 0.25
                            else 0.0
                       end
@@ -98,10 +98,10 @@ pub async fn search_messages(
               and m.spam_marked_at is null
               and (
                   m.user_id is not null
-                  or ($14::boolean and coalesce(m.is_automatic_forward, false))
+                  or ($21::boolean and coalesce(m.is_automatic_forward, false))
               )
               and not coalesce(p.is_bot, false)
-              and ($14::boolean or not coalesce(m.is_automatic_forward, false))
+              and ($21::boolean or not coalesce(m.is_automatic_forward, false))
               and ($5::bigint is null or m.user_id = $5)
               and ($6::timestamptz is null or m.created_at >= $6)
               and ($7::timestamptz is null or m.created_at <= $7)
@@ -112,14 +112,21 @@ pub async fn search_messages(
                   or (m.has_photo or m.has_video or m.has_document or m.has_audio
                       or m.has_voice or m.has_sticker or m.has_animation) = $10
               )
+              and ($11::boolean is null or m.has_photo = $11)
+              and ($12::boolean is null or m.has_video = $12)
+              and ($13::boolean is null or m.has_document = $13)
+              and ($14::boolean is null or m.has_audio = $14)
+              and ($15::boolean is null or m.has_voice = $15)
+              and ($16::boolean is null or m.has_sticker = $16)
+              and ($17::boolean is null or m.has_animation = $17)
               and (
-                  ($13 in ('hybrid', 'full_text', 'any_terms') and (
+                  ($20 in ('hybrid', 'full_text', 'any_terms') and (
                        to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
                     or to_tsvector('simple', coalesce(m.text, '')) @@ websearch_to_tsquery('simple', $2)
                   ))
-                  or ($13 = 'hybrid' and lower($3) <% lower(m.text))
-                  or ($13 = 'literal' and position(lower($3) in lower(m.text)) > 0)
-                  or ($13 = 'whole_word' and m.text ~* $4)
+                  or ($20 = 'hybrid' and lower($3) <% lower(m.text))
+                  or ($20 = 'literal' and position(lower($3) in lower(m.text)) > 0)
+                  or ($20 = 'whole_word' and m.text ~* $4)
               )
         )
         select
@@ -141,8 +148,8 @@ pub async fn search_messages(
                 selected.*,
                 row_number() over (
                     order by
-                        case when $11 = 'newest' then selected.created_at end desc,
-                        case when $11 = 'oldest' then selected.created_at end asc,
+                        case when $18 = 'newest' then selected.created_at end desc,
+                        case when $18 = 'oldest' then selected.created_at end asc,
                         selected.relevance desc,
                         selected.created_at desc,
                         selected.message_id desc
@@ -151,13 +158,13 @@ pub async fn search_messages(
                 select *
                 from matched
                 order by
-                    case when $11 = 'newest' then created_at end desc,
-                    case when $11 = 'oldest' then created_at end asc,
+                    case when $18 = 'newest' then created_at end desc,
+                    case when $18 = 'oldest' then created_at end asc,
                     relevance desc,
                     created_at desc,
                     message_id desc
-                limit $12
-                offset $15
+                limit $19
+                offset $22
             ) selected
         ) page on true
         order by page.page_position
@@ -173,6 +180,13 @@ pub async fn search_messages(
     .bind(request.reply_to_message_id)
     .bind(request.has_links)
     .bind(request.has_media)
+    .bind(request.has_photo)
+    .bind(request.has_video)
+    .bind(request.has_document)
+    .bind(request.has_audio)
+    .bind(request.has_voice)
+    .bind(request.has_sticker)
+    .bind(request.has_animation)
     .bind(request.sort.as_str())
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
     .bind(request.match_mode.as_str())
@@ -236,10 +250,10 @@ async fn count_matching_messages(
           and m.spam_marked_at is null
           and (
               m.user_id is not null
-              or ($12::boolean and coalesce(m.is_automatic_forward, false))
+              or ($19::boolean and coalesce(m.is_automatic_forward, false))
           )
           and not coalesce(p.is_bot, false)
-          and ($12::boolean or not coalesce(m.is_automatic_forward, false))
+          and ($19::boolean or not coalesce(m.is_automatic_forward, false))
           and ($5::bigint is null or m.user_id = $5)
           and ($6::timestamptz is null or m.created_at >= $6)
           and ($7::timestamptz is null or m.created_at <= $7)
@@ -247,18 +261,25 @@ async fn count_matching_messages(
           and ($9::boolean is null or m.has_links = $9)
           and (
               $10::boolean is null
-              or (m.has_photo or m.has_video or m.has_document or m.has_audio
-                  or m.has_voice or m.has_sticker or m.has_animation) = $10
+                  or (m.has_photo or m.has_video or m.has_document or m.has_audio
+                      or m.has_voice or m.has_sticker or m.has_animation) = $10
           )
+          and ($11::boolean is null or m.has_photo = $11)
+          and ($12::boolean is null or m.has_video = $12)
+          and ($13::boolean is null or m.has_document = $13)
+          and ($14::boolean is null or m.has_audio = $14)
+          and ($15::boolean is null or m.has_voice = $15)
+          and ($16::boolean is null or m.has_sticker = $16)
+          and ($17::boolean is null or m.has_animation = $17)
           and (
               $3 = ''
-              or ($11 in ('hybrid', 'full_text', 'any_terms') and (
+              or ($18 in ('hybrid', 'full_text', 'any_terms') and (
                    to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
                 or to_tsvector('simple', coalesce(m.text, '')) @@ websearch_to_tsquery('simple', $2)
               ))
-              or ($11 = 'hybrid' and lower($3) <% lower(m.text))
-              or ($11 = 'literal' and position(lower($3) in lower(m.text)) > 0)
-              or ($11 = 'whole_word' and m.text ~* $4)
+              or ($18 = 'hybrid' and lower($3) <% lower(m.text))
+              or ($18 = 'literal' and position(lower($3) in lower(m.text)) > 0)
+              or ($18 = 'whole_word' and m.text ~* $4)
           )
         "#,
     )
@@ -272,6 +293,13 @@ async fn count_matching_messages(
     .bind(request.reply_to_message_id)
     .bind(request.has_links)
     .bind(request.has_media)
+    .bind(request.has_photo)
+    .bind(request.has_video)
+    .bind(request.has_document)
+    .bind(request.has_audio)
+    .bind(request.has_voice)
+    .bind(request.has_sticker)
+    .bind(request.has_animation)
     .bind(request.match_mode.as_str())
     .bind(request.include_forwards)
     .fetch_one(pool)
@@ -298,21 +326,28 @@ pub async fn recent_messages(
           and m.spam_marked_at is null
           and (
               m.user_id is not null
-              or ($9::boolean and coalesce(m.is_automatic_forward, false))
+              or ($16::boolean and coalesce(m.is_automatic_forward, false))
           )
           and not coalesce(p.is_bot, false)
-          and ($9::boolean or not coalesce(m.is_automatic_forward, false))
+          and ($16::boolean or not coalesce(m.is_automatic_forward, false))
           and ($2::bigint is null or m.user_id = $2)
           and ($3::timestamptz is null or m.created_at >= $3)
           and ($4::timestamptz is null or m.created_at <= $4)
           and ($5::boolean is null or m.has_links = $5)
           and ($6::boolean is null or (m.has_photo or m.has_video or m.has_document or m.has_audio or m.has_voice or m.has_sticker or m.has_animation) = $6)
+          and ($7::boolean is null or m.has_photo = $7)
+          and ($8::boolean is null or m.has_video = $8)
+          and ($9::boolean is null or m.has_document = $9)
+          and ($10::boolean is null or m.has_audio = $10)
+          and ($11::boolean is null or m.has_voice = $11)
+          and ($12::boolean is null or m.has_sticker = $12)
+          and ($13::boolean is null or m.has_animation = $13)
         order by
-            case when $7 = 'oldest' then m.created_at end asc,
-            case when $7 <> 'oldest' then m.created_at end desc,
-            case when $7 = 'oldest' then m.message_id end asc,
+            case when $14 = 'oldest' then m.created_at end asc,
+            case when $14 <> 'oldest' then m.created_at end desc,
+            case when $14 = 'oldest' then m.message_id end asc,
             m.message_id desc
-        limit $8
+        limit $15
         "#,
     )
     .bind(chat_id)
@@ -321,6 +356,13 @@ pub async fn recent_messages(
     .bind(request.date_to)
     .bind(request.has_links)
     .bind(request.has_media)
+    .bind(request.has_photo)
+    .bind(request.has_video)
+    .bind(request.has_document)
+    .bind(request.has_audio)
+    .bind(request.has_voice)
+    .bind(request.has_sticker)
+    .bind(request.has_animation)
     .bind(request.sort.as_str())
     .bind(request.limit.clamp(1, MAX_RESULT_LIMIT))
     .bind(request.include_forwards)

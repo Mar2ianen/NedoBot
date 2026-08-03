@@ -2570,6 +2570,21 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("chat search fixtures must be inserted");
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, text, has_photo, has_document)
+        values
+            ($1, $2 + 4, $3 + 4, false, 'exact media marker', true, false),
+            ($1, $2 + 5, $3 + 5, false, 'exact media marker', false, true)
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("exact media fixtures must be inserted");
 
     let request = MessageSearchRequest {
         query: "hybrid quality marker alpha".into(),
@@ -2579,6 +2594,13 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         reply_to_message_id: None,
         has_links: None,
         has_media: None,
+        has_photo: None,
+        has_video: None,
+        has_document: None,
+        has_audio: None,
+        has_voice: None,
+        has_sticker: None,
+        has_animation: None,
         match_mode: MessageMatch::Hybrid,
         sort: MessageSort::Relevance,
         limit: 10,
@@ -2592,6 +2614,43 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     assert!(!page.has_more);
     assert!(!page.scan_limit_reached);
     assert_eq!(page.messages[0].message_id, message_id);
+
+    let photo_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact media marker".into(),
+            has_photo: Some(true),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact photo count must execute through the production read service");
+    assert_eq!(photo_count, 1);
+    let document_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact media marker".into(),
+            has_document: Some(true),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact document count must execute through the production read service");
+    assert_eq!(document_count, 1);
+    let any_media_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact media marker".into(),
+            has_media: Some(true),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("generic media count must execute through the production read service");
+    assert_eq!(any_media_count, 2);
 
     let fuzzy_page = chat_read_service::search_messages(
         pool,
