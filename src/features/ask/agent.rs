@@ -125,6 +125,15 @@ struct ResearchState {
     count_requires_user_scope: bool,
     count_requires_has_links: Option<bool>,
     count_requires_has_media: Option<bool>,
+    count_requires_has_photo: Option<bool>,
+    count_requires_has_video: Option<bool>,
+    count_requires_has_document: Option<bool>,
+    count_requires_has_audio: Option<bool>,
+    count_requires_has_voice: Option<bool>,
+    count_requires_has_sticker: Option<bool>,
+    count_requires_has_animation: Option<bool>,
+    count_requires_reply_to_message_id: Option<i64>,
+    count_requires_include_forwards: Option<bool>,
     count_queries: usize,
     count_request: Option<CountRequestScope>,
     user_resolution_attempted: bool,
@@ -156,6 +165,13 @@ struct CountRequestScope {
     reply_to_message_id: Option<i64>,
     has_links: Option<bool>,
     has_media: Option<bool>,
+    has_photo: Option<bool>,
+    has_video: Option<bool>,
+    has_document: Option<bool>,
+    has_audio: Option<bool>,
+    has_voice: Option<bool>,
+    has_sticker: Option<bool>,
+    has_animation: Option<bool>,
     match_mode: Option<String>,
     include_forwards: bool,
 }
@@ -179,6 +195,13 @@ impl CountRequestScope {
             reply_to_message_id: arguments.get("reply_to_message_id").and_then(Value::as_i64),
             has_links: arguments.get("has_links").and_then(Value::as_bool),
             has_media: arguments.get("has_media").and_then(Value::as_bool),
+            has_photo: arguments.get("has_photo").and_then(Value::as_bool),
+            has_video: arguments.get("has_video").and_then(Value::as_bool),
+            has_document: arguments.get("has_document").and_then(Value::as_bool),
+            has_audio: arguments.get("has_audio").and_then(Value::as_bool),
+            has_voice: arguments.get("has_voice").and_then(Value::as_bool),
+            has_sticker: arguments.get("has_sticker").and_then(Value::as_bool),
+            has_animation: arguments.get("has_animation").and_then(Value::as_bool),
             match_mode: Some(
                 arguments
                     .get("match_mode")
@@ -200,24 +223,74 @@ impl CountRequestScope {
             && self.reply_to_message_id == other.reply_to_message_id
             && self.has_links == other.has_links
             && self.has_media == other.has_media
+            && self.has_photo == other.has_photo
+            && self.has_video == other.has_video
+            && self.has_document == other.has_document
+            && self.has_audio == other.has_audio
+            && self.has_voice == other.has_voice
+            && self.has_sticker == other.has_sticker
+            && self.has_animation == other.has_animation
             && self.match_mode == other.match_mode
             && self.include_forwards == other.include_forwards
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CountFilterRequirements {
+    has_links: Option<bool>,
+    has_media: Option<bool>,
+    has_photo: Option<bool>,
+    has_video: Option<bool>,
+    has_document: Option<bool>,
+    has_audio: Option<bool>,
+    has_voice: Option<bool>,
+    has_sticker: Option<bool>,
+    has_animation: Option<bool>,
+    reply_to_message_id: Option<i64>,
+    include_forwards: Option<bool>,
+}
+
+fn exact_filter_matches(expected: Option<bool>, actual: Option<bool>) -> bool {
+    match expected {
+        Some(expected) => actual == Some(expected),
+        None => actual.is_none(),
+    }
+}
+
+fn normalized_query(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalized_query_matches(left: Option<&str>, right: Option<&str>) -> bool {
+    left.zip(right)
+        .is_some_and(|(left, right)| normalized_query(left) == normalized_query(right))
+}
+
 impl ResearchState {
     fn for_question(question: &str) -> Self {
         let count_intent = message_count_intent(question);
-        let (count_requires_has_links, count_requires_has_media) =
-            message_filter_requirements(question);
+        let filter_requirements = message_filter_requirements(question);
         Self {
             count_required: count_intent.is_some(),
             count_intent,
             count_requires_query: matches!(count_intent, Some(CountIntent::Matching)),
             count_requires_date_scope: question_mentions_date_scope(question),
             count_requires_user_scope: question_mentions_user_scope(question),
-            count_requires_has_links,
-            count_requires_has_media,
+            count_requires_has_links: filter_requirements.has_links,
+            count_requires_has_media: filter_requirements.has_media,
+            count_requires_has_photo: filter_requirements.has_photo,
+            count_requires_has_video: filter_requirements.has_video,
+            count_requires_has_document: filter_requirements.has_document,
+            count_requires_has_audio: filter_requirements.has_audio,
+            count_requires_has_voice: filter_requirements.has_voice,
+            count_requires_has_sticker: filter_requirements.has_sticker,
+            count_requires_has_animation: filter_requirements.has_animation,
+            count_requires_reply_to_message_id: filter_requirements.reply_to_message_id,
+            count_requires_include_forwards: filter_requirements.include_forwards,
             personal_fact_required: asks_personal_fact(question),
             ..Self::default()
         }
@@ -959,17 +1032,6 @@ impl ResearchState {
                 }
             }
             "chat.search_messages" | "chat.search_messages_batch" => {
-                self.search_scopes
-                    .push(CountRequestScope::from_arguments(arguments));
-                if self.count_request.as_ref().is_some_and(|count_request| {
-                    !self
-                        .search_scopes
-                        .iter()
-                        .any(|search_scope| count_request.same_structural_filters(search_scope))
-                }) {
-                    self.count_queries = 0;
-                    self.count_request = None;
-                }
                 let executed_batch = (tool == "chat.search_messages_batch")
                     .then(|| batch_search_execution(result))
                     .flatten();
@@ -982,6 +1044,29 @@ impl ResearchState {
                     .as_ref()
                     .map(|execution| execution.queries.as_slice())
                     .unwrap_or(&argument_queries);
+                let base_scope = CountRequestScope::from_arguments(arguments);
+                if tool == "chat.search_messages_batch" {
+                    let mut added_scope = false;
+                    for query in executed_queries.iter().filter_map(|value| value.as_str()) {
+                        let mut scope = base_scope.clone();
+                        scope.query = Some(query.to_owned());
+                        self.search_scopes.push(scope);
+                        added_scope = true;
+                    }
+                    if !added_scope {
+                        self.search_scopes.push(base_scope);
+                    }
+                } else {
+                    self.search_scopes.push(base_scope);
+                }
+                if self
+                    .count_request
+                    .as_ref()
+                    .is_some_and(|count_request| !self.count_request_matches_search(count_request))
+                {
+                    self.count_queries = 0;
+                    self.count_request = None;
+                }
                 self.message_searches += searches;
                 if arguments.get("user_id").and_then(Value::as_i64).is_some() {
                     self.targeted_message_searches += searches;
@@ -1064,19 +1149,56 @@ impl ResearchState {
         if !links_match || !media_match {
             return false;
         }
-        if scope.reply_to_message_id.is_some() || scope.include_forwards {
+        if !self.count_requires_exact_media_matches(scope) {
             return false;
         }
-        if !self.search_scopes.is_empty()
-            && !self
-                .search_scopes
-                .iter()
-                .any(|search_scope| scope.same_structural_filters(search_scope))
+        let reply_matches = match self.count_requires_reply_to_message_id {
+            Some(expected) => scope.reply_to_message_id == Some(expected),
+            None => scope.reply_to_message_id.is_none(),
+        };
+        let forwards_match = match self.count_requires_include_forwards {
+            Some(expected) => scope.include_forwards == expected,
+            None => !scope.include_forwards,
+        };
+        if !reply_matches || !forwards_match {
+            return false;
+        }
+        if self.count_requires_query
+            && !self.search_scopes.is_empty()
+            && !self.query_matches_search_scope(scope)
         {
             return false;
         }
 
         true
+    }
+
+    fn count_request_matches_search(&self, count_request: &CountRequestScope) -> bool {
+        self.search_scopes.iter().any(|search_scope| {
+            count_request.same_structural_filters(search_scope)
+                && (!self.count_requires_query
+                    || normalized_query_matches(
+                        count_request.query.as_deref(),
+                        search_scope.query.as_deref(),
+                    ))
+        })
+    }
+
+    fn query_matches_search_scope(&self, scope: &CountRequestScope) -> bool {
+        self.search_scopes.iter().any(|search_scope| {
+            scope.same_structural_filters(search_scope)
+                && normalized_query_matches(scope.query.as_deref(), search_scope.query.as_deref())
+        })
+    }
+
+    fn count_requires_exact_media_matches(&self, scope: &CountRequestScope) -> bool {
+        exact_filter_matches(self.count_requires_has_photo, scope.has_photo)
+            && exact_filter_matches(self.count_requires_has_video, scope.has_video)
+            && exact_filter_matches(self.count_requires_has_document, scope.has_document)
+            && exact_filter_matches(self.count_requires_has_audio, scope.has_audio)
+            && exact_filter_matches(self.count_requires_has_voice, scope.has_voice)
+            && exact_filter_matches(self.count_requires_has_sticker, scope.has_sticker)
+            && exact_filter_matches(self.count_requires_has_animation, scope.has_animation)
     }
 
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
@@ -1086,7 +1208,7 @@ impl ResearchState {
                     "SYSTEM: вопрос требует точного количества matching-сообщений. Следующим действием вызови chat.count_messages с непустым query и теми же структурными фильтрами, а не считай элементы top-k выдачи вручную; не выдавай этот count за число событий или вхождений слова."
                 }
                 Some(CountIntent::Filtered) => {
-                    "SYSTEM: вопрос требует точного количества сообщений по структурному фильтру. Следующим действием вызови chat.count_messages с соответствующим has_media/has_links; query можно опустить. Не добавляй фиктивный текстовый query и не выдавай этот count за число событий или вхождений слова."
+                    "SYSTEM: вопрос требует точного количества сообщений по структурному фильтру. Следующим действием вызови chat.count_messages с соответствующим exact media field (has_photo/has_video/has_document/has_audio/has_voice/has_sticker/has_animation), has_media, has_links, reply_to_message_id или include_forwards; query можно опустить. Не добавляй фиктивный текстовый query и не выдавай этот count за число событий или вхождений слова."
                 }
                 Some(CountIntent::Total) | None => {
                     "SYSTEM: вопрос требует точного количества сообщений. Для общего количества сообщений пользователя сначала вызови chat.resolve_user, затем chat.count_messages с user_id; query можно опустить. Не выдавай этот count за число событий или вхождений слова."
@@ -1298,14 +1420,23 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
             .split(|character: char| !character.is_alphanumeric())
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
-        if let Some((lead, lead_index, message_index)) = explicit_message_count_phrase(&words) {
-            let (required_has_links, required_has_media) =
-                structural_filter_requirements(&words[lead_index + 1..]);
-            let matching_scope =
-                lead == "скольких" || has_message_topic_marker(&words[message_index + 1..]);
+        if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
+            let requirements = structural_filter_requirements(&words[lead_index + 1..]);
+            let matching_scope = has_message_topic_marker(&words[message_index + 1..]);
             return Some(if matching_scope {
                 CountIntent::Matching
-            } else if required_has_links.is_some() || required_has_media.is_some() {
+            } else if requirements.has_links.is_some()
+                || requirements.has_media.is_some()
+                || requirements.has_photo.is_some()
+                || requirements.has_video.is_some()
+                || requirements.has_document.is_some()
+                || requirements.has_audio.is_some()
+                || requirements.has_voice.is_some()
+                || requirements.has_sticker.is_some()
+                || requirements.has_animation.is_some()
+                || requirements.reply_to_message_id.is_some()
+                || requirements.include_forwards.is_some()
+            {
                 CountIntent::Filtered
             } else {
                 CountIntent::Total
@@ -1350,7 +1481,7 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
     None
 }
 
-fn message_filter_requirements(question: &str) -> (Option<bool>, Option<bool>) {
+fn message_filter_requirements(question: &str) -> CountFilterRequirements {
     let question = question.to_lowercase();
     for clause in split_count_clauses(&question) {
         let words = clause
@@ -1361,29 +1492,87 @@ fn message_filter_requirements(question: &str) -> (Option<bool>, Option<bool>) {
             return structural_filter_requirements(&words[lead_index + 1..]);
         }
     }
-    (None, None)
+    CountFilterRequirements::default()
 }
 
-fn structural_filter_requirements(words: &[&str]) -> (Option<bool>, Option<bool>) {
-    let mut required_has_links = None;
-    let mut required_has_media = None;
+fn structural_filter_requirements(words: &[&str]) -> CountFilterRequirements {
+    let mut requirements = CountFilterRequirements::default();
     for (index, word) in words.iter().enumerate() {
         let Some(next) = words.get(index + 1) else {
             continue;
         };
         let value = match *word {
-            "с" | "со" => true,
-            "без" => false,
+            "с" | "со" | "есть" | "были" | "было" | "имеет" | "содержит" | "содержат" => {
+                true
+            }
+            "без" | "нет" => false,
             _ => continue,
         };
         if next.starts_with("ссыл") || next.starts_with("линк") || *next == "url" {
-            required_has_links = Some(value);
-        }
-        if is_media_filter_word(next) {
-            required_has_media = Some(value);
+            requirements.has_links = Some(value);
+        } else if let Some(kind) = media_filter_kind(next) {
+            match kind {
+                MediaFilterKind::Generic => requirements.has_media = Some(value),
+                MediaFilterKind::Photo => requirements.has_photo = Some(value),
+                MediaFilterKind::Video => requirements.has_video = Some(value),
+                MediaFilterKind::Document => requirements.has_document = Some(value),
+                MediaFilterKind::Audio => requirements.has_audio = Some(value),
+                MediaFilterKind::Voice => requirements.has_voice = Some(value),
+                MediaFilterKind::Sticker => requirements.has_sticker = Some(value),
+                MediaFilterKind::Animation => requirements.has_animation = Some(value),
+            }
         }
     }
-    (required_has_links, required_has_media)
+    requirements.reply_to_message_id = reply_scope_requirement(words);
+    requirements.include_forwards = forward_scope_requirement(words);
+    requirements
+}
+
+fn reply_scope_requirement(words: &[&str]) -> Option<i64> {
+    for (index, word) in words.iter().enumerate() {
+        if !word.starts_with("ответ") {
+            continue;
+        }
+        let end = words.len().min(index + 6);
+        for marker_index in index + 1..end {
+            if words[marker_index] != "на" {
+                continue;
+            }
+            let mut target_index = marker_index + 1;
+            if words
+                .get(target_index)
+                .is_some_and(|word| word.starts_with("сообщен"))
+            {
+                target_index += 1;
+            }
+            if let Some(message_id) = words
+                .get(target_index)
+                .filter(|word| is_numeric_token(word))
+                .and_then(|word| word.parse::<i64>().ok())
+            {
+                return Some(message_id);
+            }
+        }
+    }
+    None
+}
+
+fn forward_scope_requirement(words: &[&str]) -> Option<bool> {
+    for (index, word) in words.iter().enumerate() {
+        let is_forward = word.starts_with("переслан")
+            || word.starts_with("пересыла")
+            || word.starts_with("форвард")
+            || *word == "forward";
+        if !is_forward {
+            continue;
+        }
+        let negated = index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| matches!(*previous, "без" | "не"));
+        return Some(!negated);
+    }
+    None
 }
 
 fn explicit_message_count_phrase<'a>(words: &[&'a str]) -> Option<(&'a str, usize, usize)> {
@@ -1432,6 +1621,7 @@ fn is_message_topic_marker(word: &str) -> bool {
             | "содержат"
     ) || word.starts_with("упомина")
         || word.starts_with("встреча")
+        || word.starts_with("содерж")
 }
 
 fn is_count_clause_boundary(character: char) -> bool {
@@ -1455,13 +1645,47 @@ fn split_count_clauses(question: &str) -> Vec<&str> {
             && characters
                 .get(index + 1)
                 .is_some_and(|(_, next)| next.is_ascii_digit());
-        if is_count_clause_boundary(character) && !decimal_date_separator {
+        let dependent_comma = character == ','
+            && is_dependent_count_clause_start(&question[byte_offset + character.len_utf8()..]);
+        if is_count_clause_boundary(character) && !decimal_date_separator && !dependent_comma {
             clauses.push(&question[start..byte_offset]);
             start = byte_offset + character.len_utf8();
         }
     }
     clauses.push(&question[start..]);
     clauses
+}
+
+fn is_dependent_count_clause_start(remainder: &str) -> bool {
+    let Some(word) = remainder
+        .split(|character: char| !character.is_alphanumeric())
+        .find(|word| !word.is_empty())
+    else {
+        return false;
+    };
+    word.starts_with("содержащ")
+        || word.starts_with("упомина")
+        || word.starts_with("встреча")
+        || word.starts_with("написан")
+        || word.starts_with("отправлен")
+        || matches!(
+            word,
+            "которые"
+                | "которых"
+                | "котором"
+                | "где"
+                | "было"
+                | "есть"
+                | "осталось"
+                | "в"
+                | "во"
+                | "за"
+                | "по"
+                | "до"
+                | "с"
+                | "со"
+                | "без"
+        )
 }
 
 fn question_mentions_date_scope(question: &str) -> bool {
@@ -1548,20 +1772,46 @@ fn is_date_scope_word(word: &str) -> bool {
     )
 }
 
-fn is_media_filter_word(word: &str) -> bool {
-    word.starts_with("фото")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaFilterKind {
+    Generic,
+    Photo,
+    Video,
+    Document,
+    Audio,
+    Voice,
+    Sticker,
+    Animation,
+}
+
+fn media_filter_kind(word: &str) -> Option<MediaFilterKind> {
+    if word.starts_with("фото")
         || word.starts_with("фотограф")
         || word.starts_with("изображ")
         || word.starts_with("картин")
-        || word.starts_with("медиа")
-        || word.starts_with("видео")
-        || word.starts_with("документ")
-        || word.starts_with("аудио")
-        || word.starts_with("голос")
-        || word.starts_with("стикер")
-        || word.starts_with("анимац")
-        || word == "gif"
-        || word.starts_with("гиф")
+    {
+        Some(MediaFilterKind::Photo)
+    } else if word.starts_with("видео") {
+        Some(MediaFilterKind::Video)
+    } else if word.starts_with("документ") {
+        Some(MediaFilterKind::Document)
+    } else if word.starts_with("аудио") {
+        Some(MediaFilterKind::Audio)
+    } else if word.starts_with("голос") {
+        Some(MediaFilterKind::Voice)
+    } else if word.starts_with("стикер") {
+        Some(MediaFilterKind::Sticker)
+    } else if word.starts_with("анимац") || word == "gif" || word.starts_with("гиф") {
+        Some(MediaFilterKind::Animation)
+    } else if word.starts_with("медиа") || word.starts_with("вложен") {
+        Some(MediaFilterKind::Generic)
+    } else {
+        None
+    }
+}
+
+fn is_media_filter_word(word: &str) -> bool {
+    media_filter_kind(word).is_some()
 }
 
 fn is_link_filter_word(word: &str) -> bool {
@@ -1739,7 +1989,11 @@ fn message_topic_marker_index(words: &[&str]) -> Option<usize> {
                 || words
                     .get(index.saturating_sub(1))
                     .is_some_and(|previous| is_count_verb(previous)));
-        if is_message_topic_marker(word) || preposition_topic {
+        let conjunction_topic = *word == "и"
+            && words
+                .get(index + 1)
+                .is_some_and(|next| !is_count_scope_noise(next));
+        if is_message_topic_marker(word) || preposition_topic || conjunction_topic {
             Some(index)
         } else {
             None
@@ -1857,7 +2111,23 @@ fn is_genitive_user_reference(word: &str) -> bool {
 fn is_explicit_user_noun(word: &str) -> bool {
     matches!(
         word,
-        "автор" | "автора" | "пользователь" | "пользователя" | "участник" | "участника"
+        "автор"
+            | "автора"
+            | "автору"
+            | "автором"
+            | "авторе"
+            | "авторы"
+            | "авторов"
+            | "пользователь"
+            | "пользователя"
+            | "пользователю"
+            | "пользователем"
+            | "пользователе"
+            | "участник"
+            | "участника"
+            | "участнику"
+            | "участником"
+            | "участнике"
     )
 }
 
@@ -2386,7 +2656,7 @@ mod tests {
         let mut research = ResearchState::for_question("сколько сообщений с фото?");
         research.record(
             "chat.count_messages",
-            &json!({"has_media": true}),
+            &json!({"has_photo": true}),
             &json!({"count": 3}),
         );
         assert_eq!(research.count_queries, 1);
@@ -2394,7 +2664,7 @@ mod tests {
         let mut research = ResearchState::for_question("сколько сообщений с фото?");
         research.record(
             "chat.count_messages",
-            &json!({"has_media": true, "query": "Rust"}),
+            &json!({"has_photo": true, "query": "Rust"}),
             &json!({"count": 3}),
         );
         assert_eq!(research.count_queries, 0);
@@ -2403,7 +2673,7 @@ mod tests {
         research.record(
             "chat.count_messages",
             &json!({
-                "has_media": true,
+                "has_photo": true,
                 "date_from": "2026-07-01",
                 "date_to": "2026-07-31"
             }),
@@ -2431,19 +2701,115 @@ mod tests {
         let mut research = ResearchState::for_question("сколько сообщений с фото про Rust?");
         assert_eq!(research.count_intent, Some(CountIntent::Matching));
         assert!(research.count_requires_query);
-        assert_eq!(research.count_requires_has_media, Some(true));
+        assert_eq!(research.count_requires_has_photo, Some(true));
 
         research.record(
             "chat.count_messages",
-            &json!({"has_media": true}),
+            &json!({"has_photo": true}),
             &json!({"count": 3}),
         );
         assert_eq!(research.count_queries, 0);
 
         research.record(
             "chat.count_messages",
-            &json!({"has_media": true, "query": "Rust"}),
+            &json!({"has_photo": true, "query": "Rust"}),
             &json!({"count": 3}),
+        );
+        assert_eq!(research.count_queries, 1);
+    }
+
+    #[test]
+    fn count_filters_preserve_exact_media_reply_and_forward_scope() {
+        let photo = ResearchState::for_question("сколько сообщений с фото?");
+        assert_eq!(photo.count_requires_has_photo, Some(true));
+        assert_eq!(photo.count_requires_has_media, None);
+        assert_eq!(photo.count_requires_has_document, None);
+
+        let generic = ResearchState::for_question("сколько сообщений с медиа?");
+        assert_eq!(generic.count_requires_has_media, Some(true));
+        assert_eq!(generic.count_requires_has_photo, None);
+
+        let reply =
+            ResearchState::for_question("сколько сообщений было ответами на сообщение 123?");
+        assert_eq!(reply.count_requires_reply_to_message_id, Some(123));
+        assert_eq!(reply.count_intent, Some(CountIntent::Filtered));
+
+        let forwards = ResearchState::for_question("сколько пересланных сообщений в чате?");
+        assert_eq!(forwards.count_requires_include_forwards, Some(true));
+        assert_eq!(forwards.count_intent, Some(CountIntent::Filtered));
+
+        let non_forwards = ResearchState::for_question("сколько сообщений без пересланных?");
+        assert_eq!(non_forwards.count_requires_include_forwards, Some(false));
+    }
+
+    #[test]
+    fn count_parser_handles_structural_forms_without_forcing_text_query() {
+        for question in [
+            "В скольких сообщениях есть фото?",
+            "В скольких сообщениях были ссылки?",
+            "В скольких сообщениях за июль?",
+            "В скольких сообщениях автора?",
+        ] {
+            let research = ResearchState::for_question(question);
+            assert!(!research.count_requires_query, "question: {question}");
+        }
+        assert_eq!(
+            ResearchState::for_question("В скольких сообщениях есть фото?")
+                .count_requires_has_photo,
+            Some(true)
+        );
+        assert_eq!(
+            ResearchState::for_question("В скольких сообщениях были ссылки?")
+                .count_requires_has_links,
+            Some(true)
+        );
+        assert!(
+            ResearchState::for_question("В скольких сообщениях за июль?").count_requires_date_scope
+        );
+        assert!(
+            ResearchState::for_question("В скольких сообщениях автора?").count_requires_user_scope
+        );
+    }
+
+    #[test]
+    fn count_parser_keeps_dependent_predicates_after_commas() {
+        let matching = ResearchState::for_question("Сколько сообщений, содержащих Rust?");
+        assert!(matching.count_requires_query);
+
+        let mixed = ResearchState::for_question("Сколько сообщений с фото, где упоминается Rust?");
+        assert!(mixed.count_requires_query);
+        assert_eq!(mixed.count_requires_has_photo, Some(true));
+
+        let scoped =
+            ResearchState::for_question("Сколько сообщений, написанных автором, было в июле?");
+        assert!(!scoped.count_requires_query);
+        assert!(scoped.count_requires_date_scope);
+        assert!(scoped.count_requires_user_scope);
+
+        assert!(!asks_message_count(
+            "Сколько раз автор менял ноутбук, пока другой пользователь писал в чате?"
+        ));
+    }
+
+    #[test]
+    fn matching_count_query_must_match_an_executed_search_query() {
+        let mut research = ResearchState::for_question("сколько сообщений про Rust?");
+        research.record(
+            "chat.search_messages",
+            &json!({"query": "Rust"}),
+            &json!([]),
+        );
+        research.record(
+            "chat.count_messages",
+            &json!({"query": "Python"}),
+            &json!({"count": 2}),
+        );
+        assert_eq!(research.count_queries, 0);
+
+        research.record(
+            "chat.count_messages",
+            &json!({"query": " rust  "}),
+            &json!({"count": 2}),
         );
         assert_eq!(research.count_queries, 1);
     }
@@ -2617,18 +2983,62 @@ mod tests {
             message_count_intent("сколько сообщений содержит Rust?"),
             Some(CountIntent::Matching)
         );
+        assert_eq!(
+            message_count_intent("В скольких сообщениях содержится Rust?"),
+            Some(CountIntent::Matching)
+        );
+        assert_eq!(
+            message_count_intent("сколько сообщений с фото и Rust?"),
+            Some(CountIntent::Matching)
+        );
 
-        for question in [
-            "сколько сообщений с документами?",
-            "сколько сообщений с аудио?",
-            "сколько сообщений с голосовыми?",
-            "сколько сообщений со стикерами?",
-            "сколько сообщений с анимациями?",
-            "сколько сообщений с gif?",
+        for (question, expected) in [
+            (
+                "сколько сообщений с документами?",
+                CountFilterRequirements {
+                    has_document: Some(true),
+                    ..CountFilterRequirements::default()
+                },
+            ),
+            (
+                "сколько сообщений с аудио?",
+                CountFilterRequirements {
+                    has_audio: Some(true),
+                    ..CountFilterRequirements::default()
+                },
+            ),
+            (
+                "сколько сообщений с голосовыми?",
+                CountFilterRequirements {
+                    has_voice: Some(true),
+                    ..CountFilterRequirements::default()
+                },
+            ),
+            (
+                "сколько сообщений со стикерами?",
+                CountFilterRequirements {
+                    has_sticker: Some(true),
+                    ..CountFilterRequirements::default()
+                },
+            ),
+            (
+                "сколько сообщений с анимациями?",
+                CountFilterRequirements {
+                    has_animation: Some(true),
+                    ..CountFilterRequirements::default()
+                },
+            ),
+            (
+                "сколько сообщений с gif?",
+                CountFilterRequirements {
+                    has_animation: Some(true),
+                    ..CountFilterRequirements::default()
+                },
+            ),
         ] {
             assert_eq!(
                 message_filter_requirements(question),
-                (None, Some(true)),
+                expected,
                 "question: {question}"
             );
         }
