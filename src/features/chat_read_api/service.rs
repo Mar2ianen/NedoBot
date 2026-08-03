@@ -137,17 +137,30 @@ pub async fn search_messages(
             from matched
         ) total
         left join lateral (
-            select *
-            from matched
-            order by
-                case when $11 = 'newest' then created_at end desc,
-                case when $11 = 'oldest' then created_at end asc,
-                relevance desc,
-                created_at desc,
-                message_id desc
-            limit $12
-            offset $15
+            select
+                selected.*,
+                row_number() over (
+                    order by
+                        case when $11 = 'newest' then selected.created_at end desc,
+                        case when $11 = 'oldest' then selected.created_at end asc,
+                        selected.relevance desc,
+                        selected.created_at desc,
+                        selected.message_id desc
+                ) as page_position
+            from (
+                select *
+                from matched
+                order by
+                    case when $11 = 'newest' then created_at end desc,
+                    case when $11 = 'oldest' then created_at end asc,
+                    relevance desc,
+                    created_at desc,
+                    message_id desc
+                limit $12
+                offset $15
+            ) selected
         ) page on true
+        order by page.page_position
         "#,
     )
     .bind(chat_id)

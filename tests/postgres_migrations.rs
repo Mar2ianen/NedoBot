@@ -2617,6 +2617,26 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .await
     .expect("count search must execute through the production read service");
     assert_eq!(with_forwards, 3);
+    let oldest_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            sort: MessageSort::Oldest,
+            limit: 3,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("oldest search page must preserve its declared order");
+    assert_eq!(
+        oldest_page
+            .messages
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>(),
+        vec![message_id + 2, message_id + 1, message_id]
+    );
     let first_page = chat_read_service::search_messages(
         pool,
         -1001932061163,
