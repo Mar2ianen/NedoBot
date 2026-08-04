@@ -417,11 +417,20 @@ fn contains_message_count_claim(markdown: &str) -> bool {
         let has_message_noun_after = sentence_indices.iter().copied().any(|other_index| {
             other_index > index
                 && other_index - index <= 3
-                && !is_contextual_identifier_position(markdown, &spans, &sentence_indices, index)
                 && is_message_count_target_noun(
                     &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
                 )
         });
+        let has_plain_message_label_before = sentence_indices
+            .iter()
+            .position(|&candidate| candidate == index)
+            .and_then(|count_position| count_position.checked_sub(1))
+            .and_then(|previous_position| sentence_indices.get(previous_position))
+            .is_some_and(|&other_index| {
+                is_message_count_label_noun(
+                    &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
+                ) && !is_contextual_identifier_position(markdown, &spans, &sentence_indices, index)
+            });
         let has_message_noun_before = sentence_indices.iter().copied().any(|other_index| {
             if other_index >= index
                 || index - other_index > 3
@@ -464,6 +473,7 @@ fn contains_message_count_claim(markdown: &str) -> bool {
         has_nearby_count_marker
             || has_message_noun_after
             || has_message_noun_before
+            || has_plain_message_label_before
             || has_anaphoric_count_marker(markdown, &spans, &sentence_indices, index)
     })
 }
@@ -493,12 +503,14 @@ fn is_date_like_count_position(
         .checked_sub(1)
         .and_then(|index| sentence_indices.get(index))
         .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    let previous_is_temporal_preposition = previous.as_deref().is_some_and(is_temporal_preposition);
     let adjacent_month = next.as_deref().is_some_and(is_month_word)
         || previous.as_deref().is_some_and(is_month_word);
     let adjacent_year_word = next
         .as_deref()
         .is_some_and(|word| matches!(word, "год" | "года" | "году" | "годом"));
-    (is_date_like_count_token(&word) && (adjacent_month || adjacent_year_word))
+    (is_date_like_count_token(&word)
+        && (adjacent_month || adjacent_year_word || previous_is_temporal_preposition))
         || (is_numeric_token(&word)
             && word.parse::<u32>().is_ok_and(|value| value <= 31)
             && adjacent_month)
@@ -604,23 +616,14 @@ fn has_anaphoric_count_marker(
             "их" | "таких"
         )
     });
-    let has_standalone_count_verb = preceding.iter().any(|&index| {
+    let has_unqualified_count_verb = preceding.iter().any(|&index| {
         let word = markdown[spans[index].0..spans[index].1].to_lowercase();
         matches!(
             word.as_str(),
-            "было"
-                | "была"
-                | "были"
-                | "стало"
-                | "стали"
-                | "оказалось"
-                | "оказались"
-                | "получилось"
-                | "получили"
-                | "насчитали"
+            "оказалось" | "оказались" | "получилось" | "получили" | "насчитали"
         )
     });
-    has_anaphoric_pronoun || has_standalone_count_verb
+    has_anaphoric_pronoun || has_unqualified_count_verb
 }
 
 fn contains_anaphoric_count_claim(markdown: &str) -> bool {
@@ -674,14 +677,14 @@ fn is_message_count_target_noun(word: &str) -> bool {
         || word.starts_with("запис")
 }
 
+fn is_message_count_label_noun(word: &str) -> bool {
+    matches!(word, "сообщения" | "сообщений" | "сообщениям")
+}
+
 fn is_non_count_identifier_word(word: &str) -> bool {
     matches!(
         word,
-        "сообщение"
-            | "сообщения"
-            | "сообщению"
-            | "сообщениям"
-            | "сообщении"
+        "сообщении"
             | "сообщением"
             | "сообщениях"
             | "версии"
@@ -704,12 +707,59 @@ fn is_contextual_identifier_position(
         .iter()
         .position(|&index| index == count_index)
         .unwrap_or(0);
-    position
+    let previous_index = position
         .checked_sub(1)
         .and_then(|previous| sentence_indices.get(previous))
-        .is_some_and(|&index| {
-            is_non_count_identifier_word(&markdown[spans[index].0..spans[index].1].to_lowercase())
-        })
+        .copied();
+    let previous_word =
+        previous_index.map(|index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    if previous_word
+        .as_deref()
+        .is_some_and(is_non_count_identifier_word)
+    {
+        return true;
+    }
+
+    let has_identifier_message_context = (0..position).rev().take(4).any(|message_position| {
+        let Some(&message_index) = sentence_indices.get(message_position) else {
+            return false;
+        };
+        let message_word = markdown[spans[message_index].0..spans[message_index].1].to_lowercase();
+        if is_message_locative_noun(&message_word) {
+            return true;
+        }
+        let previous_word = message_position
+            .checked_sub(1)
+            .and_then(|previous| sentence_indices.get(previous))
+            .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+        is_message_identifier_noun(&message_word)
+            && previous_word
+                .as_deref()
+                .is_some_and(is_identifier_preposition)
+    });
+    if has_identifier_message_context {
+        return true;
+    }
+
+    let next_word = sentence_indices
+        .get(position + 1)
+        .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    previous_word
+        .as_deref()
+        .is_some_and(is_identifier_preposition)
+        && next_word.as_deref().is_some_and(is_message_locative_noun)
+}
+
+fn is_message_identifier_noun(word: &str) -> bool {
+    word.starts_with("сообщен")
+}
+
+fn is_message_locative_noun(word: &str) -> bool {
+    matches!(word, "сообщении" | "сообщением" | "сообщениях")
+}
+
+fn is_identifier_preposition(word: &str) -> bool {
+    matches!(word, "в" | "во" | "для" | "к" | "на" | "по")
 }
 
 fn is_spelled_count_word(word: &str) -> bool {
@@ -2311,14 +2361,14 @@ fn has_person_like_subject(words: &[&str], verb_index: usize) -> bool {
     let before = verb_index
         .checked_sub(1)
         .and_then(|index| words.get(index))
-        .is_some_and(|word| is_person_like_user_word(word));
+        .is_some_and(|word| is_positional_user_reference(word));
     let before_with_modifier = verb_index
         .checked_sub(2)
         .and_then(|index| words.get(index))
         .is_some_and(|word| is_explicit_user_noun(word));
     let after = words
         .get(verb_index + 1)
-        .is_some_and(|word| is_person_like_user_word(word));
+        .is_some_and(|word| is_positional_user_reference(word));
     let after_with_modifier = words
         .get(verb_index + 2)
         .is_some_and(|word| is_explicit_user_noun(word));
@@ -2347,6 +2397,33 @@ fn is_person_like_user_word(word: &str) -> bool {
                 | "ее"
                 | "её"
         )
+}
+
+fn is_positional_user_reference(word: &str) -> bool {
+    if is_person_like_user_word(word) {
+        return true;
+    }
+    if word.is_empty()
+        || is_count_scope_noise(word)
+        || is_count_verb(word)
+        || is_message_topic_marker(word)
+        || is_reply_lexeme(word)
+        || is_forward_scope_word(word)
+    {
+        return false;
+    }
+    let has_unicode_alphabetic = word
+        .chars()
+        .any(|character| character.is_alphabetic() && !character.is_ascii());
+    has_unicode_alphabetic && !looks_like_object_noun(word)
+}
+
+fn looks_like_object_noun(word: &str) -> bool {
+    [
+        "а", "я", "ы", "и", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ом", "ем", "у", "ю",
+    ]
+    .iter()
+    .any(|suffix| word.ends_with(suffix))
 }
 
 fn is_user_reference_token(word: &str) -> bool {
@@ -2548,13 +2625,23 @@ fn has_parenthetical_structural_disjunction(source: &str) -> bool {
         }
         let left = atom_spans.iter().rev().find(|span| span.end <= index);
         let right = atom_spans.iter().find(|span| span.start > index);
-        let Some((_left, right)) = left.zip(right) else {
+        let Some((left, right)) = left.zip(right) else {
             return false;
         };
-        let gap_start = word_spans[index].1;
-        let gap_end = word_spans[right.start].0;
-        has_balanced_parenthetical_gap(&source_lower[gap_start..gap_end])
+        let left_gap_start = word_spans[left.end.saturating_sub(1)].1;
+        let left_gap_end = word_spans[index].0;
+        let right_gap_start = word_spans[index].1;
+        let right_gap_end = word_spans[right.start].0;
+        structural_source_gap_is_neutral(&source_lower[left_gap_start..left_gap_end])
+            && has_balanced_parenthetical_gap(&source_lower[right_gap_start..right_gap_end])
     })
+}
+
+fn structural_source_gap_is_neutral(gap: &str) -> bool {
+    policy_words(gap)
+        .iter()
+        .copied()
+        .all(is_structural_or_parenthetical_word)
 }
 
 fn has_balanced_parenthetical_gap(gap: &str) -> bool {
@@ -3206,11 +3293,21 @@ fn quoted_user_subject_near_count_verb(clause: &str) -> bool {
         .any(|(start, end)| {
             let before = lexical_words(&clause[..start]);
             let after = lexical_words(&clause[end..]);
-            let looks_like_user = lexical_region_looks_like_user_reference(&clause[start..end]);
-            looks_like_user
+            let strong_user_identity = lexical_region_has_strong_user_identity(&clause[start..end]);
+            strong_user_identity
                 && (before.last().is_some_and(|word| is_count_verb(word))
                     || bounded_user_context_after_lexical_region(&after))
         })
+}
+
+fn lexical_region_has_strong_user_identity(region: &str) -> bool {
+    let normalized = region.trim_matches(['«', '»', '"', '`']).to_lowercase();
+    normalized
+        .chars()
+        .any(|character| character.is_ascii_digit() || matches!(character, '_' | '@'))
+        || lexical_words(&normalized)
+            .iter()
+            .any(|word| is_explicit_user_noun(word) || is_ascii_identifier_token(word))
 }
 
 fn policy_word_spans(value: &str) -> Vec<(usize, usize)> {
@@ -3295,6 +3392,7 @@ fn lexical_region_looks_like_user_reference(region: &str) -> bool {
         is_explicit_user_noun(word)
             || is_user_reference_token(word)
             || is_ascii_identifier_token(word)
+            || (!word.is_ascii() && is_positional_user_reference(word))
     })
 }
 
@@ -3635,6 +3733,9 @@ fn is_bare_date_after_message(words: &[&str], index: usize) -> bool {
     let Some((_, _, message_index)) = explicit_message_count_phrase(words) else {
         return false;
     };
+    if is_reply_target_numeric_at(words, index) {
+        return false;
+    }
     index > message_index
         && words[message_index + 1..index]
             .iter()
@@ -3643,6 +3744,15 @@ fn is_bare_date_after_message(words: &[&str], index: usize) -> bool {
                 let word_index = message_index + 1 + offset;
                 !is_message_topic_marker(word) && !is_structural_filter_at(words, word_index)
             })
+}
+
+fn is_reply_target_numeric_at(words: &[&str], index: usize) -> bool {
+    index >= 2
+        && is_numeric_token(words.get(index).copied().unwrap_or_default())
+        && words
+            .get(index - 1)
+            .is_some_and(|word| word.starts_with("сообщен"))
+        && words.get(index - 2).is_some_and(|word| *word == "на")
 }
 
 fn is_temporal_date_construction_at(words: &[&str], index: usize) -> bool {
@@ -3934,7 +4044,7 @@ fn question_mentions_user_scope(question: &str) -> bool {
 fn user_scope_in_count_tail(tail: &[&str]) -> bool {
     if tail
         .first()
-        .is_some_and(|word| is_genitive_user_reference(word))
+        .is_some_and(|word| is_genitive_user_reference(word) || is_positional_user_reference(word))
     {
         return true;
     }
@@ -3947,7 +4057,7 @@ fn user_scope_in_count_tail(tail: &[&str]) -> bool {
         if (*word == "у" || *word == "от")
             && tail
                 .get(index + 1)
-                .is_some_and(|candidate| is_user_candidate(candidate))
+                .is_some_and(|candidate| is_positional_user_reference(candidate))
         {
             return true;
         }
@@ -3955,10 +4065,10 @@ fn user_scope_in_count_tail(tail: &[&str]) -> bool {
             let previous_is_user = index
                 .checked_sub(1)
                 .and_then(|previous| tail.get(previous))
-                .is_some_and(|candidate| is_user_candidate(candidate));
+                .is_some_and(|candidate| is_positional_user_reference(candidate));
             let next_is_user = tail
                 .get(index + 1)
-                .is_some_and(|candidate| is_user_candidate(candidate));
+                .is_some_and(|candidate| is_positional_user_reference(candidate));
             if previous_is_user || next_is_user {
                 return true;
             }
@@ -4005,10 +4115,6 @@ fn is_structural_filter_at(words: &[&str], index: usize) -> bool {
 
 fn has_message_topic_marker(words: &[&str]) -> bool {
     message_topic_marker_index(words).is_some()
-}
-
-fn is_user_candidate(word: &str) -> bool {
-    is_person_like_user_word(word)
 }
 
 fn is_genitive_user_reference(word: &str) -> bool {
@@ -4575,6 +4681,9 @@ mod tests {
             "Сколько сообщений от `systemd`?",
             "Сколько сообщений «@user»?",
             "Сколько сообщений `user_name`?",
+            "Сколько сообщений написал кириллическийник?",
+            "Сколько сообщений от кириллическийник?",
+            "Сколько сообщений «кириллическийник» написал?",
         ] {
             assert!(
                 ResearchState::for_question(question).count_requires_user_scope,
@@ -4986,6 +5095,13 @@ mod tests {
                 .count_policy,
             CountPolicy::Supported(CountIntent::Matching)
         );
+        assert_eq!(
+            ResearchState::for_question(
+                "сколько сообщений с фото про Rust или (например, Go) и с видео?"
+            )
+            .count_policy,
+            CountPolicy::Supported(CountIntent::Matching)
+        );
         for question in [
             "сколько сообщений с фото либо пересланных?",
             "сколько сообщений, которые были ответами или пересланными?",
@@ -5023,6 +5139,14 @@ mod tests {
             ResearchState::for_question("сколько сообщений содержит ответ на сообщение 42?");
         assert_eq!(text_reply_with_id.count_requires_has_reply, None);
         assert_eq!(text_reply_with_id.count_requires_reply_to_message_id, None);
+
+        let numeric_reply_target =
+            ResearchState::for_question("сколько сообщений было ответами на сообщение 2025?");
+        assert_eq!(
+            numeric_reply_target.count_requires_reply_to_message_id,
+            Some(2025)
+        );
+        assert!(!numeric_reply_target.count_requires_date_scope);
 
         let unanswered =
             ResearchState::for_question("сколько сообщений, на которые никто не ответил?");
@@ -5229,8 +5353,14 @@ mod tests {
             "Для сообщения 42 найден контекст.",
             "Ответ на сообщение 42 найден в истории.",
             "Результат для сообщения 42 доступен.",
+            "Это было в 2025.",
+            "В сообщении было 12 слов.",
+            "До исправления было 3 ошибки.",
         ] {
-            assert!(!contains_message_count_claim(explanation));
+            assert!(
+                !contains_message_count_claim(explanation),
+                "explanation: {explanation}"
+            );
             assert_eq!(
                 forced_final_markdown(&research, explanation),
                 format!("Точное количество сообщений по заданным условиям: 11.\n\n{explanation}")
@@ -5256,6 +5386,9 @@ mod tests {
             "Для сообщения 42 найден контекст.",
             "Ответ на сообщение 42 найден в истории.",
             "Результат для сообщения 42 доступен.",
+            "Это было в 2025.",
+            "В сообщении было 12 слов.",
+            "До исправления было 3 ошибки.",
             "В 42 сообщении обсуждался Rust.",
             "Около 3 месяцев назад обсуждение продолжалось.",
             "За 2025 год всего 1 раз меняли тему.",
