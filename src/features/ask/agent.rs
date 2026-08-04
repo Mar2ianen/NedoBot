@@ -745,11 +745,48 @@ fn is_contextual_identifier_position(
         .get(position + 1)
         .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
     let count_word = markdown[spans[count_index].0..spans[count_index].1].to_lowercase();
+    if is_message_identifier_list_position(markdown, spans, sentence_indices, count_index) {
+        return true;
+    }
     previous_word
         .as_deref()
         .is_some_and(is_identifier_preposition)
         && next_word.as_deref().is_some_and(is_message_locative_noun)
         && !is_date_like_count_token(&count_word)
+}
+
+fn is_message_identifier_list_position(
+    markdown: &str,
+    spans: &[(usize, usize)],
+    sentence_indices: &[usize],
+    count_index: usize,
+) -> bool {
+    let position = sentence_indices
+        .iter()
+        .position(|&index| index == count_index)
+        .unwrap_or(0);
+    let previous = position
+        .checked_sub(1)
+        .and_then(|index| sentence_indices.get(index))
+        .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    if !previous
+        .as_deref()
+        .is_some_and(|word| matches!(word, "сообщение" | "сообщения" | "сообщений"))
+    {
+        return false;
+    }
+    let next = |offset: usize| {
+        sentence_indices
+            .get(position + offset)
+            .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase())
+    };
+    if next(1).as_deref().is_some_and(is_numeric_token) {
+        return true;
+    }
+    next(1)
+        .as_deref()
+        .is_some_and(|word| matches!(word, "и" | "или"))
+        && next(2).as_deref().is_some_and(is_numeric_token)
 }
 
 fn is_message_identifier_noun(word: &str) -> bool {
@@ -2321,13 +2358,36 @@ fn recognized_message_count_phrase_count(
                 **word == "сколько"
                     && words.get(*index + 1) != Some(&"раз")
                     && explicit_message_count_at(words, *index).is_none()
-                    && has_implicit_author_message_count_at(words, *index, original_clause)
+                    && has_implicit_count_scope_at(words, *index, original_clause)
             })
             .count()
     } else {
         0
     };
     explicit + event + implicit
+}
+
+fn has_implicit_count_scope_at(words: &[&str], index: usize, original_clause: &str) -> bool {
+    if has_implicit_author_message_count_at(words, index, original_clause) {
+        return true;
+    }
+    let tail = &words[index + 1..];
+    let requirements = structural_filter_requirements(tail);
+    requirements.has_links.is_some()
+        || requirements.has_media.is_some()
+        || requirements.has_photo.is_some()
+        || requirements.has_video.is_some()
+        || requirements.has_document.is_some()
+        || requirements.has_audio.is_some()
+        || requirements.has_voice.is_some()
+        || requirements.has_sticker.is_some()
+        || requirements.has_animation.is_some()
+        || requirements.has_reply.is_some()
+        || requirements.reply_to_message_id.is_some()
+        || requirements.include_forwards.is_some()
+        || requirements.is_automatic_forward.is_some()
+        || words_have_date_scope(tail)
+        || user_scope_in_count_tail(tail)
 }
 
 fn has_event_message_count_clause(words: &[&str]) -> bool {
@@ -2596,6 +2656,9 @@ fn has_unsupported_structural_disjunction(
         return false;
     }
     let atom_spans = structural_atom_spans(words);
+    if has_structural_text_disjunction(words, &atom_spans) {
+        return true;
+    }
     if atom_spans.len() < 2 {
         return false;
     }
@@ -2611,6 +2674,31 @@ fn has_unsupported_structural_disjunction(
         })
     });
     direct_disjunction || has_parenthetical_structural_disjunction(source)
+}
+
+fn has_structural_text_disjunction(words: &[&str], atom_spans: &[StructuralAtomSpan]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        if !matches!(*word, "или" | "либо") {
+            return false;
+        }
+        let left = atom_spans.iter().rev().find(|span| span.end <= index);
+        let right = atom_spans.iter().find(|span| span.start > index);
+        let left_structural =
+            left.is_some_and(|span| structural_or_gap_is_neutral(words, span.end, index));
+        let right_structural =
+            right.is_some_and(|span| structural_or_gap_is_neutral(words, index + 1, span.start));
+        let left_text = has_text_query_scope(&words[..index]);
+        let right_text = has_text_query_scope(&words[index + 1..]);
+        (left_structural && right_text) || (left_text && right_structural)
+    })
+}
+
+fn has_text_query_scope(words: &[&str]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        is_message_topic_marker(word)
+            && !is_structural_filter_at(words, index)
+            && words.get(index + 1).is_some()
+    })
 }
 
 fn has_parenthetical_structural_disjunction(source: &str) -> bool {
@@ -2828,8 +2916,18 @@ fn structural_atom_for_filter_word(word: &str) -> Option<StructuralAtom> {
 }
 
 fn reply_target_end(words: &[&str], index: usize) -> Option<usize> {
-    let end = words.len().min(index + 6);
-    for marker_index in index + 1..end {
+    reply_target_index(words, index).map(|target_index| target_index + 1)
+}
+
+fn reply_target_index(words: &[&str], reply_index: usize) -> Option<usize> {
+    if words
+        .get(reply_index.checked_sub(1)?)
+        .is_some_and(|word| is_message_topic_marker(word))
+    {
+        return None;
+    }
+    let end = words.len().min(reply_index + 6);
+    for marker_index in reply_index + 1..end {
         if words[marker_index] != "на" {
             continue;
         }
@@ -2844,7 +2942,7 @@ fn reply_target_end(words: &[&str], index: usize) -> Option<usize> {
             .get(target_index)
             .is_some_and(|word| is_numeric_token(word))
         {
-            return Some(target_index + 1);
+            return Some(target_index);
         }
     }
     None
@@ -2955,32 +3053,12 @@ fn reply_scope_requirement(words: &[&str]) -> Option<i64> {
         if !is_reply_lexeme(word) {
             continue;
         }
-        if index
-            .checked_sub(1)
-            .and_then(|previous| words.get(previous))
-            .is_some_and(|previous| is_message_topic_marker(previous))
-        {
-            continue;
-        }
-        let end = words.len().min(index + 6);
-        for marker_index in index + 1..end {
-            if words[marker_index] != "на" {
-                continue;
-            }
-            let mut target_index = marker_index + 1;
-            if words
+        if let Some(target_index) = reply_target_index(words, index)
+            && let Some(message_id) = words
                 .get(target_index)
-                .is_some_and(|word| word.starts_with("сообщен"))
-            {
-                target_index += 1;
-            }
-            if let Some(message_id) = words
-                .get(target_index)
-                .filter(|word| is_numeric_token(word))
                 .and_then(|word| word.parse::<i64>().ok())
-            {
-                return Some(message_id);
-            }
+        {
+            return Some(message_id);
         }
     }
     None
@@ -3768,6 +3846,9 @@ fn is_temporal_year_at(words: &[&str], index: usize) -> bool {
     if parse_year_token(&word).is_none() {
         return false;
     }
+    if is_reply_target_numeric_at(words, index) {
+        return false;
+    }
     index
         .checked_sub(1)
         .and_then(|previous| words.get(previous))
@@ -3793,12 +3874,10 @@ fn is_bare_date_after_message(words: &[&str], index: usize) -> bool {
 }
 
 fn is_reply_target_numeric_at(words: &[&str], index: usize) -> bool {
-    index >= 2
-        && is_numeric_token(words.get(index).copied().unwrap_or_default())
-        && words
-            .get(index - 1)
-            .is_some_and(|word| word.starts_with("сообщен"))
-        && words.get(index - 2).is_some_and(|word| *word == "на")
+    is_numeric_token(words.get(index).copied().unwrap_or_default())
+        && words.iter().enumerate().any(|(reply_index, word)| {
+            is_reply_lexeme(word) && reply_target_index(words, reply_index) == Some(index)
+        })
 }
 
 fn is_temporal_date_construction_at(words: &[&str], index: usize) -> bool {
@@ -5137,6 +5216,16 @@ mod tests {
             ResearchState::for_question("сколько сообщений с фото про Rust или Go?").count_policy,
             CountPolicy::Supported(CountIntent::Matching)
         );
+        for question in [
+            "сколько сообщений с фото или про Rust?",
+            "сколько сообщений про Rust или с фото?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_policy,
+                CountPolicy::Unsupported(UnsupportedCountReason::StructuralDisjunction),
+                "question: {question}"
+            );
+        }
         assert_eq!(
             ResearchState::for_question("сколько сообщений с фото про Rust или Go и с видео?")
                 .count_policy,
@@ -5179,6 +5268,20 @@ mod tests {
     }
 
     #[test]
+    fn structural_and_scoped_elliptical_counts_are_not_partial() {
+        for question in [
+            "Сколько сообщений с фото, а сколько с видео?",
+            "Сколько сообщений со ссылками, а сколько без ссылок?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_policy,
+                CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts),
+                "question: {question}"
+            );
+        }
+    }
+
+    #[test]
     fn reply_text_is_not_mistaken_for_telegram_reply_scope() {
         let text_reply =
             ResearchState::for_question("сколько сообщений содержит ответ на вопрос о Rust?");
@@ -5196,6 +5299,13 @@ mod tests {
             Some(2025)
         );
         assert!(!numeric_reply_target.count_requires_date_scope);
+        let bare_numeric_reply_target =
+            ResearchState::for_question("сколько сообщений было ответами на 2025?");
+        assert_eq!(
+            bare_numeric_reply_target.count_requires_reply_to_message_id,
+            Some(2025)
+        );
+        assert!(!bare_numeric_reply_target.count_requires_date_scope);
 
         let unanswered =
             ResearchState::for_question("сколько сообщений, на которые никто не ответил?");
@@ -5418,6 +5528,8 @@ mod tests {
             "До исправления было 3 ошибки.",
             "После проверки получилось 3 ошибки.",
             "В сборке насчитали 12 предупреждений.",
+            "Сообщения 42 и 43 подтверждают вывод.",
+            "Сообщения 42–44 содержат примеры.",
         ] {
             assert!(
                 !contains_message_count_claim(explanation),
