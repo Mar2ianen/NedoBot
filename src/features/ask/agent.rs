@@ -414,6 +414,7 @@ fn contains_message_count_claim(markdown: &str) -> bool {
         let has_message_noun_after = sentence_indices.iter().copied().any(|other_index| {
             other_index > index
                 && other_index - index <= 3
+                && !is_contextual_identifier_position(markdown, &spans, &sentence_indices, index)
                 && is_message_count_target_noun(
                     &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
                 )
@@ -536,6 +537,17 @@ fn count_marker_supports_claim(
             .iter()
             .position(|&index| index == marker_index)
             .unwrap_or(count_position);
+        if marker_position > count_position
+            && sentence_indices
+                .get(count_position.checked_sub(1).unwrap_or(count_position))
+                .is_some_and(|&index| {
+                    is_non_count_identifier_word(
+                        &markdown[spans[index].0..spans[index].1].to_lowercase(),
+                    )
+                })
+        {
+            return false;
+        }
         let between = if marker_position < count_position {
             &sentence_indices[marker_position + 1..count_position]
         } else {
@@ -620,7 +632,10 @@ fn is_count_marker(word: &str) -> bool {
         || word.starts_with("итог")
         || word.starts_with("нашл")
         || word.starts_with("совпад")
+        || word.starts_with("совпал")
         || word.starts_with("найден")
+        || word.starts_with("подходящ")
+        || word.starts_with("результат")
         || matches!(word, "всего" | "около" | "примерно" | "порядка")
 }
 
@@ -638,6 +653,40 @@ fn is_message_count_target_noun(word: &str) -> bool {
         || word.starts_with("реплик")
         || word.starts_with("результат")
         || word.starts_with("запис")
+}
+
+fn is_non_count_identifier_word(word: &str) -> bool {
+    matches!(
+        word,
+        "сообщении"
+            | "сообщением"
+            | "сообщениях"
+            | "версии"
+            | "версия"
+            | "релиз"
+            | "релиза"
+            | "релизе"
+            | "сборке"
+            | "выпуске"
+    )
+}
+
+fn is_contextual_identifier_position(
+    markdown: &str,
+    spans: &[(usize, usize)],
+    sentence_indices: &[usize],
+    count_index: usize,
+) -> bool {
+    let position = sentence_indices
+        .iter()
+        .position(|&index| index == count_index)
+        .unwrap_or(0);
+    position
+        .checked_sub(1)
+        .and_then(|previous| sentence_indices.get(previous))
+        .is_some_and(|&index| {
+            is_non_count_identifier_word(&markdown[spans[index].0..spans[index].1].to_lowercase())
+        })
 }
 
 fn is_spelled_count_word(word: &str) -> bool {
@@ -2108,10 +2157,7 @@ fn message_count_policy(question: &str) -> CountPolicy {
     }
     for clause in split_count_clauses(&question) {
         let masked_clause = mask_lexical_regions(clause);
-        let words = masked_clause
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>();
+        let words = policy_words(&masked_clause);
         if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
             let requirements = structural_filter_requirements(&words[lead_index + 1..]);
             if has_unsupported_structural_disjunction(&words[message_index + 1..], &requirements) {
@@ -2157,10 +2203,7 @@ fn has_multiple_message_count_clauses(question: &str) -> bool {
     let mut has_prior_explicit_context = false;
     let mut count = 0;
     for (original_clause, masked_clause) in clauses.into_iter().zip(masked_clauses) {
-        let words = masked_clause
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>();
+        let words = policy_words(masked_clause);
         let explicit = (0..words.len())
             .filter(|&index| {
                 explicit_message_count_at(&words, index).is_some()
@@ -2258,6 +2301,7 @@ fn has_person_like_subject(words: &[&str], verb_index: usize) -> bool {
 fn is_person_like_user_word(word: &str) -> bool {
     is_explicit_user_noun(word)
         || is_user_reference_token(word)
+        || is_ascii_identifier_token(word)
         || matches!(
             word,
             "я" | "мы"
@@ -2286,6 +2330,16 @@ fn is_user_reference_token(word: &str) -> bool {
         .chars()
         .any(|character| character.is_ascii_digit() || matches!(character, '_' | '@'));
     has_ascii_letter && has_identity_marker
+}
+
+fn is_ascii_identifier_token(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '@'))
+        && word
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
 }
 
 fn count_phrase_is_topic_mention(words: &[&str], index: usize) -> bool {
@@ -2324,10 +2378,7 @@ fn is_message_word(word: &str) -> bool {
 fn message_filter_requirements(question: &str) -> CountFilterRequirements {
     let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
-        let words = clause
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>();
+        let words = policy_words(clause);
         if let Some((_, lead_index, _)) = explicit_message_count_phrase(&words) {
             return structural_filter_requirements(&words[lead_index + 1..]);
         }
@@ -2575,7 +2626,7 @@ fn structural_or_gap_is_neutral(words: &[&str], start: usize, end: usize) -> boo
     words[start..end]
         .iter()
         .copied()
-        .all(is_structural_neutral_modifier)
+        .all(is_structural_or_parenthetical_word)
 }
 
 fn is_structural_neutral_modifier(word: &str) -> bool {
@@ -2884,12 +2935,16 @@ fn split_count_clauses(question: &str) -> Vec<&str> {
             && characters
                 .get(index + 1)
                 .is_some_and(|(_, next)| next.is_ascii_digit());
-        let dependent_comma = character == ','
-            && is_dependent_count_clause_start(
-                &question[start..byte_offset],
-                &question[byte_offset + character.len_utf8()..],
-            );
-        if is_count_clause_boundary(character) && !decimal_date_separator && !dependent_comma {
+        let prefix = &question[start..byte_offset];
+        let remainder = &question[byte_offset + character.len_utf8()..];
+        let dependent_comma =
+            character == ',' && is_dependent_count_clause_start(prefix, remainder);
+        let structural_or_continuation = is_structural_or_continuation(prefix, remainder);
+        if is_count_clause_boundary(character)
+            && !decimal_date_separator
+            && !dependent_comma
+            && !structural_or_continuation
+        {
             clauses.push(&question[start..byte_offset]);
             start = byte_offset + character.len_utf8();
         }
@@ -2899,17 +2954,11 @@ fn split_count_clauses(question: &str) -> Vec<&str> {
 }
 
 fn is_dependent_count_clause_start(prefix: &str, remainder: &str) -> bool {
-    let prefix_words = prefix
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
+    let prefix_words = policy_words(prefix);
     let Some((_, _, message_index)) = explicit_message_count_phrase(&prefix_words) else {
         return false;
     };
-    let remainder_words = remainder
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
+    let remainder_words = policy_words(remainder);
     let Some(&first_word) = remainder_words.first() else {
         return false;
     };
@@ -2942,13 +2991,64 @@ fn is_dependent_count_clause_start(prefix: &str, remainder: &str) -> bool {
                         .is_some_and(|next| matches!(*next, "которые" | "которых" | "которым")))))
 }
 
+fn is_structural_or_continuation(prefix: &str, remainder: &str) -> bool {
+    let prefix_lower = prefix.to_lowercase();
+    let remainder_lower = remainder.to_lowercase();
+    let prefix_words = policy_words(&prefix_lower);
+    let remainder_words = policy_words(&remainder_lower);
+    let Some(or_index) = prefix_words
+        .iter()
+        .rposition(|word| matches!(*word, "или" | "либо"))
+    else {
+        return false;
+    };
+    if !prefix_words[..or_index]
+        .iter()
+        .copied()
+        .any(|word| structural_atom_for_filter_word(word).is_some())
+    {
+        return false;
+    }
+    let gap_is_parenthetical = prefix_words[or_index + 1..]
+        .iter()
+        .copied()
+        .all(is_structural_or_parenthetical_word);
+    if !gap_is_parenthetical {
+        return false;
+    }
+    let right_words = remainder_words.iter().take(12).copied();
+    if right_words.clone().any(is_count_lead_word) {
+        return false;
+    }
+    right_words.into_iter().any(|word| {
+        structural_atom_for_filter_word(word).is_some()
+            || is_forward_scope_word(word)
+            || is_reply_lexeme(word)
+    })
+}
+
+fn is_structural_or_parenthetical_word(word: &str) -> bool {
+    is_structural_neutral_modifier(word)
+        || matches!(
+            word,
+            "например"
+                | "точнее"
+                | "если"
+                | "сказать"
+                | "условно"
+                | "вроде"
+                | "так"
+        )
+}
+
+fn is_count_lead_word(word: &str) -> bool {
+    matches!(word, "сколько" | "скольких" | "количество" | "число")
+}
+
 fn question_mentions_date_scope(question: &str) -> bool {
     let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
-        let words = clause
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>();
+        let words = policy_words(clause);
         let has_count_phrase = explicit_message_count_phrase(&words).is_some()
             || words.windows(2).any(|pair| pair == ["сколько", "раз"]);
         if has_count_phrase && words_have_date_scope(&words) {
@@ -3027,9 +3127,16 @@ fn quoted_user_subject_near_count_verb(clause: &str) -> bool {
         })
 }
 
+fn policy_words(value: &str) -> Vec<&str> {
+    value
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
 fn lexical_words(value: &str) -> Vec<&str> {
     value
-        .split(|character: char| !character.is_alphanumeric())
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
         .filter(|word| !word.is_empty())
         .collect()
 }
@@ -3082,9 +3189,11 @@ fn lexical_region_looks_like_user_reference(region: &str) -> bool {
         return true;
     }
     let words = lexical_words(&normalized);
-    words
-        .iter()
-        .any(|word| is_explicit_user_noun(word) || is_user_reference_token(word))
+    words.iter().any(|word| {
+        is_explicit_user_noun(word)
+            || is_user_reference_token(word)
+            || is_ascii_identifier_token(word)
+    })
 }
 
 fn lexical_region_spans(question: &str) -> Vec<(usize, usize)> {
@@ -3381,26 +3490,29 @@ fn is_temporal_relative_period(words: &[&str], index: usize) -> bool {
 
 fn is_temporal_numeric_date_at(words: &[&str], index: usize) -> bool {
     is_numeric_date_at(words, index)
-        && index
+        && (index
             .checked_sub(1)
             .and_then(|previous| words.get(previous))
             .is_some_and(|word| is_temporal_preposition(word))
+            || is_bare_date_after_message(words, index))
 }
 
 fn is_temporal_day_month_at(words: &[&str], index: usize) -> bool {
     is_day_month_at(words, index)
-        && index
+        && (index
             .checked_sub(1)
             .and_then(|previous| words.get(previous))
             .is_some_and(|word| is_temporal_preposition(word))
+            || is_bare_date_after_message(words, index))
 }
 
 fn is_temporal_month_at(words: &[&str], index: usize) -> bool {
     is_month_word(words.get(index).copied().unwrap_or_default())
-        && index
+        && (index
             .checked_sub(1)
             .and_then(|previous| words.get(previous))
             .is_some_and(|word| is_temporal_preposition(word))
+            || is_bare_date_after_message(words, index))
 }
 
 fn is_temporal_year_at(words: &[&str], index: usize) -> bool {
@@ -3414,6 +3526,14 @@ fn is_temporal_year_at(words: &[&str], index: usize) -> bool {
         .checked_sub(1)
         .and_then(|previous| words.get(previous))
         .is_some_and(|word| is_temporal_preposition(word))
+        || is_bare_date_after_message(words, index)
+}
+
+fn is_bare_date_after_message(words: &[&str], index: usize) -> bool {
+    index
+        .checked_sub(1)
+        .and_then(|previous| words.get(previous))
+        .is_some_and(|word| is_message_word(word))
 }
 
 fn is_temporal_date_construction_at(words: &[&str], index: usize) -> bool {
@@ -3453,10 +3573,7 @@ fn has_temporal_relative_day(words: &[&str]) -> bool {
 fn expected_date_scope(question: &str) -> Option<ExpectedDateScope> {
     let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
-        let words = clause
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>();
+        let words = policy_words(clause);
         let has_count_phrase = explicit_message_count_phrase(&words).is_some()
             || words.windows(2).any(|pair| pair == ["сколько", "раз"]);
         if !has_count_phrase {
@@ -3681,10 +3798,7 @@ fn question_mentions_user_scope(question: &str) -> bool {
         .into_iter()
         .zip(split_count_clauses(&masked_question))
     {
-        let words = clause
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>();
+        let words = policy_words(clause);
         let quoted_user_scope = quoted_user_scope_in_clause(original_clause);
         if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
             if quoted_user_scope {
@@ -3785,10 +3899,7 @@ fn has_message_topic_marker(words: &[&str]) -> bool {
 }
 
 fn is_user_candidate(word: &str) -> bool {
-    !is_count_scope_noise(word)
-        && !is_count_verb(word)
-        && !is_message_topic_marker(word)
-        && word != "с"
+    is_person_like_user_word(word)
 }
 
 fn is_genitive_user_reference(word: &str) -> bool {
@@ -3897,7 +4008,11 @@ fn is_explicit_user_noun(word: &str) -> bool {
             | "участнику"
             | "участником"
             | "участнике"
-    )
+    ) || word.starts_with("модератор")
+        || word.starts_with("админ")
+        || word.starts_with("администратор")
+        || word.starts_with("владел")
+        || word.starts_with("редактор")
 }
 
 fn is_count_verb(word: &str) -> bool {
@@ -4769,6 +4884,9 @@ mod tests {
             "сколько сообщений, которые были ответами или автоматически пересланными?",
             "сколько сообщений с фото или только с видео?",
             "сколько сообщений с фото или только видео?",
+            "сколько сообщений с фото или, например, с видео?",
+            "сколько сообщений с фото или — если точнее — с видео?",
+            "сколько сообщений с фото либо (например) без видео?",
             "сколько сообщений с фото или не с видео?",
             "сколько сообщений с фото или не пересланные?",
             "сколько сообщений, которые были ответами либо не с видео?",
@@ -4876,6 +4994,9 @@ mod tests {
             "Сколько сообщений написал первый автор? А сколько написал второй автор?",
             "Сколько сообщений написал первый автор, а сколько написал user42?",
             "Сколько сообщений написал первый автор, а сколько написал `user42`?",
+            "Сколько сообщений написал первый автор, а сколько написал модератор?",
+            "Сколько сообщений написал первый автор, а сколько написал systemd?",
+            "Сколько сообщений написал первый автор, а сколько написал mod_team?",
             "Сколько сообщений написал первый автор? Сколько написал второй автор?",
         ] {
             assert_eq!(
@@ -4908,6 +5029,9 @@ mod tests {
             "Сколько сообщений «автор_1» сегодня отправил?",
             "Сколько сообщений `user42` в июле написал?",
             "Сколько сообщений «первый автор» обычно пишет?",
+            "Сколько сообщений «модератор» написал?",
+            "Сколько сообщений systemd написал?",
+            "Сколько сообщений mod_team написал?",
         ] {
             let research = ResearchState::for_question(question);
             assert!(research.count_requires_user_scope, "question: {question}");
@@ -4963,6 +5087,9 @@ mod tests {
             "Нашлось 12 постов.",
             "Всего — двенадцать.",
             "Около двенадцати сообщений.",
+            "Совпало 12.",
+            "Результат — 12.",
+            "Подходящих: 12.",
             "Сообщения найдены. Их было 12.",
             "Совпадений оказалось 12.",
             "Их ровно двенадцать.",
@@ -4980,6 +5107,8 @@ mod tests {
         for explanation in [
             "Пример — сообщение 42 про Rust.",
             "В 2025 году найден пост про Rust.",
+            "В сообщении 42 найден Rust.",
+            "В версии 12 сообщения сортируются иначе.",
         ] {
             assert!(!contains_message_count_claim(explanation));
             assert_eq!(
@@ -5002,6 +5131,8 @@ mod tests {
             "Сообщений было 12.",
             "В 2025 году найден пост про Rust.",
             "Пример — сообщение 42 про Rust.",
+            "В сообщении 42 найден Rust.",
+            "В версии 12 сообщения сортируются иначе.",
             "В 42 сообщении обсуждался Rust.",
             "Около 3 месяцев назад обсуждение продолжалось.",
             "За 2025 год всего 1 раз меняли тему.",
@@ -5074,6 +5205,20 @@ mod tests {
             date_scope_policy("сколько сообщений про июль?"),
             DateScopePolicy::NoDateRequested
         );
+        for question in [
+            "сколько сообщений 2025 года?",
+            "сколько сообщений 3 августа?",
+            "сколько сообщений июля?",
+        ] {
+            assert!(
+                ResearchState::for_question(question).count_requires_date_scope,
+                "question: {question}"
+            );
+            assert!(
+                expected_date_scope(question).is_some(),
+                "question: {question}"
+            );
+        }
         assert_eq!(
             date_scope_policy("сколько сообщений содержит 2026-07-01?"),
             DateScopePolicy::NoDateRequested
