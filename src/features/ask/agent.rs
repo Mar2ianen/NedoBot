@@ -65,6 +65,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
 - Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.search_messages или chat.search_messages_batch с теми же фильтрами и query, затем chat.count_messages с тем же нормализованным query, датами, scope и match_mode. Для date-scoped count сначала также сделай search с тем же периодом. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений. Дизъюнктивные structural-фильтры через «или/либо», несколько независимых count-вопросов и относительные периоды без точных дат не форсируй в authoritative count: используй поиск и явно обозначь ограничение. has_reply означает, что само сообщение является reply; не используй его для подсчёта сообщений, на которые кто-то ответил, или сообщений с дочерними ответами.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
+- После успешного chat.count_messages сервер сам добавит authoritative-строку с числом. В model-owned финальном тексте оставь только пояснение, примеры и ссылки; не повторяй и не оспаривай количество сообщений.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
 - Для любого личного факта не ограничивайся названием темы. Первый широкий поиск делай через chat.search_messages_batch с отдельными короткими queries ["у меня", "мой", "сижу на", "пользуюсь", "купил", "заказал себе"] и нужным user_id — не добавляй тему в каждую строку. Затем извлеки из результатов кандидатов (имена, модели, продукты, места и т.п.), найди каждого literal-запросом и сравни даты/контекст. Не склеивай альтернативы пробелами: в full_text это означает, что все слова обязательны.
@@ -378,12 +379,99 @@ fn normalized_query_matches(left: Option<&str>, right: Option<&str>) -> bool {
         .is_some_and(|(left, right)| normalized_query(left) == normalized_query(right))
 }
 
-fn markdown_mentions_count(markdown: &str, expected: i64) -> bool {
-    markdown
-        .split(|character: char| !character.is_ascii_digit())
-        .filter(|token| !token.is_empty())
-        .filter_map(|token| token.parse::<i64>().ok())
-        .any(|count| count == expected)
+fn message_count_claims(markdown: &str) -> Vec<i64> {
+    let spans = markdown_word_spans(markdown);
+    spans
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &(start, end))| {
+            let value = markdown[start..end].parse::<i64>().ok()?;
+            let previous = index
+                .checked_sub(1)
+                .and_then(|previous| spans.get(previous))
+                .map(|&(near_start, near_end)| &markdown[near_start..near_end]);
+            let next = spans
+                .get(index + 1)
+                .map(|&(near_start, near_end)| &markdown[near_start..near_end]);
+            let previous_two = index
+                .checked_sub(2)
+                .and_then(|previous| spans.get(previous))
+                .map(|&(near_start, near_end)| &markdown[near_start..near_end]);
+            let next_two = spans
+                .get(index + 2)
+                .map(|&(near_start, near_end)| &markdown[near_start..near_end]);
+            let has_message_noun = previous.is_some_and(|word| word.starts_with("сообщен"))
+                || next.is_some_and(|word| word.starts_with("сообщен"));
+            let has_count_marker = [previous, next, previous_two, next_two]
+                .into_iter()
+                .flatten()
+                .any(|word| {
+                    word.starts_with("количеств")
+                        || word.starts_with("итог")
+                        || word.starts_with("нашл")
+                        || word.starts_with("найден")
+                        || word == "всего"
+                })
+                && sentence_contains_message_noun(markdown, &spans, index);
+            (has_message_noun || has_count_marker).then_some(value)
+        })
+        .collect()
+}
+
+fn sentence_contains_message_noun(markdown: &str, spans: &[(usize, usize)], index: usize) -> bool {
+    let (start, end) = spans[index];
+    let sentence_start = markdown[..start]
+        .rfind(['.', '!', '?', '\n'])
+        .map_or(0, |boundary| boundary + 1);
+    let sentence_end = markdown[end..]
+        .find(['.', '!', '?', '\n'])
+        .map_or(markdown.len(), |boundary| end + boundary);
+    spans.iter().any(|&(word_start, word_end)| {
+        word_start >= sentence_start
+            && word_end <= sentence_end
+            && markdown[word_start..word_end].starts_with("сообщен")
+    })
+}
+
+fn markdown_word_spans(markdown: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, character) in markdown.char_indices() {
+        if character.is_alphanumeric() || character == '_' {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            spans.push((word_start, index));
+        }
+    }
+    if let Some(word_start) = start {
+        spans.push((word_start, markdown.len()));
+    }
+    spans
+}
+
+fn strip_message_count_claims(markdown: &str) -> String {
+    if message_count_claims(markdown).is_empty() {
+        return markdown.trim().to_owned();
+    }
+
+    let mut kept = String::new();
+    let mut segment_start = 0;
+    for (index, character) in markdown.char_indices() {
+        if !matches!(character, '.' | '!' | '?' | '\n') {
+            continue;
+        }
+        let segment_end = index + character.len_utf8();
+        let segment = &markdown[segment_start..segment_end];
+        if message_count_claims(segment).is_empty() {
+            kept.push_str(segment);
+        }
+        segment_start = segment_end;
+    }
+    let tail = &markdown[segment_start..];
+    if message_count_claims(tail).is_empty() {
+        kept.push_str(tail);
+    }
+    kept.trim().to_owned()
 }
 
 fn should_cache_tool_result(tool: &str) -> bool {
@@ -780,7 +868,12 @@ fn forced_final_markdown(research: &ResearchState, markdown: &str) -> String {
         return unsupported_count_fallback(reason).to_owned();
     }
     if let Some(count) = research.accepted_count {
-        return format!("Точное количество сообщений по заданным условиям: {count}.\n\n{markdown}");
+        let explanation = strip_message_count_claims(markdown);
+        return if explanation.is_empty() {
+            format!("Точное количество сообщений по заданным условиям: {count}.")
+        } else {
+            format!("Точное количество сообщений по заданным условиям: {count}.\n\n{explanation}")
+        };
     }
     if research.follow_up_instruction(markdown).is_some() {
         RESEARCH_BUDGET_EXHAUSTED_FALLBACK.to_owned()
@@ -1419,10 +1512,10 @@ impl ResearchState {
             return Some(instruction.to_string());
         }
         if let Some(count) = self.accepted_count
-            && !markdown_mentions_count(markdown, count)
+            && !message_count_claims(markdown).is_empty()
         {
             return Some(format!(
-                "SYSTEM: authoritative count result is {count}. Финальный текст должен явно содержать это число; не заменяй его другим количеством и не говори только, что сообщения найдены."
+                "SYSTEM: authoritative count result is {count} и будет добавлен сервером. Верни только пояснение без чисел и утверждений о количестве сообщений; не дублируй и не заменяй authoritative count в model-owned тексте."
             ));
         }
         if self.personal_fact_required && self.personal_statement_searches == 0 {
@@ -1630,7 +1723,7 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
 }
 
 fn message_count_policy(question: &str) -> CountPolicy {
-    let question = question.to_lowercase();
+    let question = mask_lexical_regions(&question.to_lowercase());
     if has_multiple_message_count_clauses(&question) {
         return CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts);
     }
@@ -1704,16 +1797,20 @@ fn recognized_message_count_phrase_count(words: &[&str]) -> usize {
         .filter(|(_, pair)| pair == &["сколько", "раз"])
         .filter(|(index, _)| has_event_message_count_at(words, *index))
         .count();
-    let implicit = words
-        .iter()
-        .enumerate()
-        .filter(|(index, word)| {
-            **word == "сколько"
-                && words.get(*index + 1) != Some(&"раз")
-                && explicit_message_count_at(words, *index).is_none()
-                && has_implicit_author_message_count_at(words, *index)
-        })
-        .count();
+    let implicit = if explicit > 0 {
+        words
+            .iter()
+            .enumerate()
+            .filter(|(index, word)| {
+                **word == "сколько"
+                    && words.get(*index + 1) != Some(&"раз")
+                    && explicit_message_count_at(words, *index).is_none()
+                    && has_implicit_author_message_count_at(words, *index)
+            })
+            .count()
+    } else {
+        0
+    };
     explicit + event + implicit
 }
 
@@ -1781,7 +1878,7 @@ fn is_message_word(word: &str) -> bool {
 }
 
 fn message_filter_requirements(question: &str) -> CountFilterRequirements {
-    let question = question.to_lowercase();
+    let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -1888,60 +1985,139 @@ fn has_unsupported_structural_disjunction(
         || requirements.reply_to_message_id.is_some()
         || requirements.include_forwards.is_some()
         || requirements.is_automatic_forward.is_some();
-    has_structural_filter
-        && words.iter().enumerate().any(|(index, word)| {
-            matches!(*word, "или" | "либо")
-                && structural_term_near(words, index, -1).is_some()
-                && structural_term_near(words, index, 1).is_some()
-        })
+    if !has_structural_filter {
+        return false;
+    }
+    let atom_spans = structural_atom_spans(words);
+    if atom_spans.len() < 2 {
+        return false;
+    }
+    words.iter().enumerate().any(|(index, word)| {
+        if !matches!(*word, "или" | "либо") {
+            return false;
+        }
+        let left = atom_spans.iter().rev().find(|span| span.end <= index);
+        let right = atom_spans.iter().find(|span| span.start > index);
+        left.is_some() && right.is_some()
+    })
 }
 
-fn structural_term_near(words: &[&str], index: usize, direction: isize) -> Option<StructuralAtom> {
-    let mut current = index as isize + direction;
-    for _ in 0..2 {
-        let word = current
-            .try_into()
-            .ok()
-            .and_then(|position: usize| words.get(position))?;
-        if matches!(*word, "с" | "со" | "без") {
-            current += direction;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StructuralAtomSpan {
+    start: usize,
+    end: usize,
+    atom: StructuralAtom,
+}
+
+fn structural_atom_spans(words: &[&str]) -> Vec<StructuralAtomSpan> {
+    let mut spans = Vec::new();
+    for index in 0..words.len() {
+        if spans
+            .last()
+            .is_some_and(|span: &StructuralAtomSpan| index < span.end)
+        {
             continue;
         }
-        return structural_atom_at(words, current as usize);
+        let Some(span) = structural_atom_span_at(words, index) else {
+            continue;
+        };
+        spans.push(span);
     }
-    None
+    spans
 }
 
-fn structural_atom_at(words: &[&str], index: usize) -> Option<StructuralAtom> {
+fn structural_atom_span_at(words: &[&str], index: usize) -> Option<StructuralAtomSpan> {
     let word = words.get(index).copied()?;
-    if is_link_filter_word(word) {
-        return Some(StructuralAtom::Link);
+    if let Some(atom) = structural_atom_for_filter_word(word)
+        && index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| matches!(*previous, "и" | "или" | "либо"))
+    {
+        return Some(StructuralAtomSpan {
+            start: index,
+            end: index + 1,
+            atom,
+        });
     }
-    if let Some(kind) = media_filter_kind(word) {
-        return Some(StructuralAtom::Media(kind));
+    if (matches!(
+        word,
+        "с" | "со" | "без" | "есть" | "были" | "было" | "имеет" | "содержит" | "содержат"
+    ) || word.starts_with("содерж"))
+        && let Some(next) = words.get(index + 1).copied()
+        && let Some(atom) = structural_atom_for_filter_word(next)
+    {
+        return Some(StructuralAtomSpan {
+            start: index,
+            end: index + 2,
+            atom,
+        });
     }
+
     if is_forward_scope_word(word) {
-        return Some(
-            if words
-                .get(index + 1)
-                .is_some_and(|next| *next == "пересылка")
-            {
+        let automatic = index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| *previous == "автоматически");
+        return Some(StructuralAtomSpan {
+            start: if automatic { index - 1 } else { index },
+            end: index + 1,
+            atom: if automatic {
                 StructuralAtom::AutomaticForward
             } else {
                 StructuralAtom::Forward
             },
-        );
+        });
     }
+
     if is_reply_lexeme(word) {
-        let previous_is_auxiliary = index
+        if let Some(end) = reply_target_end(words, index) {
+            return Some(StructuralAtomSpan {
+                start: index,
+                end,
+                atom: StructuralAtom::ReplyTo,
+            });
+        }
+        if index
             .checked_sub(1)
             .and_then(|previous| words.get(previous))
-            .is_some_and(|previous| is_reply_auxiliary(previous));
-        if previous_is_auxiliary {
-            return Some(StructuralAtom::IsReply);
+            .is_some_and(|previous| is_reply_auxiliary(previous))
+        {
+            return Some(StructuralAtomSpan {
+                start: index - 1,
+                end: index + 1,
+                atom: StructuralAtom::IsReply,
+            });
         }
-        if reply_scope_requirement(words).is_some() {
-            return Some(StructuralAtom::ReplyTo);
+    }
+    None
+}
+
+fn structural_atom_for_filter_word(word: &str) -> Option<StructuralAtom> {
+    if is_link_filter_word(word) {
+        return Some(StructuralAtom::Link);
+    }
+    media_filter_kind(word).map(StructuralAtom::Media)
+}
+
+fn reply_target_end(words: &[&str], index: usize) -> Option<usize> {
+    let end = words.len().min(index + 6);
+    for marker_index in index + 1..end {
+        if words[marker_index] != "на" {
+            continue;
+        }
+        let mut target_index = marker_index + 1;
+        if words
+            .get(target_index)
+            .is_some_and(|word| word.starts_with("сообщен"))
+        {
+            target_index += 1;
+        }
+        if words
+            .get(target_index)
+            .is_some_and(|word| is_numeric_token(word))
+        {
+            return Some(target_index + 1);
         }
     }
     None
@@ -2230,7 +2406,7 @@ fn is_dependent_count_clause_start(prefix: &str, remainder: &str) -> bool {
 }
 
 fn question_mentions_date_scope(question: &str) -> bool {
-    let question = strip_lexical_date_regions(&question.to_lowercase());
+    let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -2255,7 +2431,7 @@ fn date_scope_policy(question: &str) -> DateScopePolicy {
     }
 }
 
-fn strip_lexical_date_regions(question: &str) -> String {
+fn mask_lexical_regions(question: &str) -> String {
     let mut result = String::with_capacity(question.len());
     let mut closing_quote = None;
     for character in question.chars() {
@@ -2622,7 +2798,7 @@ fn has_temporal_relative_day(words: &[&str]) -> bool {
 }
 
 fn expected_date_scope(question: &str) -> Option<ExpectedDateScope> {
-    let question = strip_lexical_date_regions(&question.to_lowercase());
+    let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -2846,7 +3022,7 @@ fn expected_year_scope(year: i32) -> Option<ExpectedDateScope> {
 }
 
 fn question_mentions_user_scope(question: &str) -> bool {
-    let question = question.to_lowercase();
+    let question = mask_lexical_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -3444,6 +3620,11 @@ mod tests {
         assert!(
             research
                 .follow_up_instruction("Всего 32 сообщения")
+                .is_some()
+        );
+        assert!(
+            research
+                .follow_up_instruction("Нашёл Rust в сообщениях")
                 .is_none()
         );
     }
@@ -3890,6 +4071,9 @@ mod tests {
         for question in [
             "сколько сообщений с фото либо пересланных?",
             "сколько сообщений, которые были ответами или пересланными?",
+            "сколько сообщений, которые были ответами на сообщение 42 или пересланными?",
+            "сколько сообщений, которые были ответами или автоматически пересланными?",
+            "сколько сообщений с фото или только с видео?",
         ] {
             assert_eq!(
                 ResearchState::for_question(question).count_policy,
@@ -3961,10 +4145,28 @@ mod tests {
             message_count_intent("Сколько сообщений про количество сообщений?"),
             Some(CountIntent::Matching)
         );
+        for question in [
+            "Сколько сообщений содержит фразу «с фото или видео»?",
+            "Сколько сообщений содержит фразу «с фото»?",
+            "Сколько сообщений содержит фразу «с ответами»?",
+            "Сколько сообщений содержит фразу «сколько написала Оля»?",
+            "Сколько сообщений содержит фразу `с фото или видео`?",
+            "Сколько сообщений содержит фразу `сколько написала Оля`?",
+        ] {
+            assert_eq!(
+                message_count_intent(question),
+                Some(CountIntent::Matching),
+                "question: {question}"
+            );
+        }
+        assert_eq!(
+            message_count_policy("Сколько написал кода и сколько написал тестов?"),
+            CountPolicy::NotACountQuestion
+        );
     }
 
     #[test]
-    fn accepted_count_must_be_present_in_model_draft_and_final_is_server_authoritative() {
+    fn accepted_count_is_server_authoritative_and_explanation_is_count_free() {
         let mut research = ResearchState::for_question("сколько сообщений про Rust?");
         let arguments = json!({"query": "Rust"});
         research.record("chat.search_messages", &arguments, &json!([]));
@@ -3978,16 +4180,27 @@ mod tests {
         assert!(
             research
                 .follow_up_instruction("Сообщения найдены")
-                .is_some()
+                .is_none()
         );
         assert!(
             research
                 .follow_up_instruction("Всего 11 сообщений")
-                .is_none()
+                .is_some()
         );
         assert_eq!(
             forced_final_markdown(&research, "Всего 12 сообщений"),
-            "Точное количество сообщений по заданным условиям: 11.\n\nВсего 12 сообщений"
+            "Точное количество сообщений по заданным условиям: 11."
+        );
+        assert_eq!(
+            forced_final_markdown(&research, "Обсуждение касается Rust."),
+            "Точное количество сообщений по заданным условиям: 11.\n\nОбсуждение касается Rust."
+        );
+        assert_eq!(
+            forced_final_markdown(
+                &research,
+                "Нашлось 11 сообщений, хотя итоговое количество — 12."
+            ),
+            "Точное количество сообщений по заданным условиям: 11."
         );
     }
 
