@@ -440,6 +440,11 @@ fn contains_message_count_claim(markdown: &str) -> bool {
             {
                 return false;
             }
+            if is_message_locative_noun(
+                &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
+            ) {
+                return false;
+            }
             let noun_position = sentence_indices
                 .iter()
                 .position(|&candidate| candidate == other_index)
@@ -509,6 +514,10 @@ fn is_date_like_count_position(
     let adjacent_year_word = next
         .as_deref()
         .is_some_and(|word| matches!(word, "год" | "года" | "году" | "годом"));
+    let followed_by_message_noun = next.as_deref().is_some_and(is_message_identifier_noun);
+    if is_date_like_count_token(&word) && followed_by_message_noun {
+        return false;
+    }
     (is_date_like_count_token(&word)
         && (adjacent_month || adjacent_year_word || previous_is_temporal_preposition))
         || (is_numeric_token(&word)
@@ -616,14 +625,12 @@ fn has_anaphoric_count_marker(
             "их" | "таких"
         )
     });
-    let has_unqualified_count_verb = preceding.iter().any(|&index| {
-        let word = markdown[spans[index].0..spans[index].1].to_lowercase();
-        matches!(
-            word.as_str(),
-            "оказалось" | "оказались" | "получилось" | "получили" | "насчитали"
-        )
-    });
-    has_anaphoric_pronoun || has_unqualified_count_verb
+    let has_terminal_count_verb = sentence_indices.get(position + 1).is_none()
+        && preceding.iter().any(|&index| {
+            let word = markdown[spans[index].0..spans[index].1].to_lowercase();
+            matches!(word.as_str(), "получилось" | "получили" | "насчитали")
+        });
+    has_anaphoric_pronoun || has_terminal_count_verb
 }
 
 fn contains_anaphoric_count_claim(markdown: &str) -> bool {
@@ -720,34 +727,29 @@ fn is_contextual_identifier_position(
         return true;
     }
 
-    let has_identifier_message_context = (0..position).rev().take(4).any(|message_position| {
-        let Some(&message_index) = sentence_indices.get(message_position) else {
-            return false;
-        };
-        let message_word = markdown[spans[message_index].0..spans[message_index].1].to_lowercase();
-        if is_message_locative_noun(&message_word) {
-            return true;
-        }
-        let previous_word = message_position
-            .checked_sub(1)
-            .and_then(|previous| sentence_indices.get(previous))
-            .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
-        is_message_identifier_noun(&message_word)
-            && previous_word
-                .as_deref()
-                .is_some_and(is_identifier_preposition)
-    });
-    if has_identifier_message_context {
+    let previous_previous_word = position
+        .checked_sub(2)
+        .and_then(|previous| sentence_indices.get(previous))
+        .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    if previous_word
+        .as_deref()
+        .is_some_and(is_message_identifier_noun)
+        && previous_previous_word
+            .as_deref()
+            .is_some_and(is_identifier_preposition)
+    {
         return true;
     }
 
     let next_word = sentence_indices
         .get(position + 1)
         .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    let count_word = markdown[spans[count_index].0..spans[count_index].1].to_lowercase();
     previous_word
         .as_deref()
         .is_some_and(is_identifier_preposition)
         && next_word.as_deref().is_some_and(is_message_locative_noun)
+        && !is_date_like_count_token(&count_word)
 }
 
 fn is_message_identifier_noun(word: &str) -> bool {
@@ -3100,10 +3102,13 @@ fn split_count_clauses(question: &str) -> Vec<&str> {
             character == ',' && is_dependent_count_clause_start(prefix, remainder);
         let structural_or_continuation =
             is_structural_or_continuation(prefix, remainder, character);
+        let structural_or_prefix_continuation =
+            is_structural_or_prefix_continuation(prefix, remainder);
         if is_count_clause_boundary(character)
             && !decimal_date_separator
             && !dependent_comma
             && !structural_or_continuation
+            && !structural_or_prefix_continuation
         {
             clauses.push(&question[start..byte_offset]);
             start = byte_offset + character.len_utf8();
@@ -3190,6 +3195,39 @@ fn is_structural_or_continuation(prefix: &str, remainder: &str, boundary: char) 
             || is_forward_scope_word(word)
             || is_reply_lexeme(word)
     })
+}
+
+fn is_structural_or_prefix_continuation(prefix: &str, remainder: &str) -> bool {
+    let prefix_lower = prefix.to_lowercase();
+    let remainder_lower = remainder.to_lowercase();
+    let prefix_words = policy_words(&prefix_lower);
+    let remainder_words = policy_words(&remainder_lower);
+    let prefix_atoms = structural_atom_spans(&prefix_words);
+    let Some(prefix_atom) = prefix_atoms.last() else {
+        return false;
+    };
+    if !prefix_words[prefix_atom.end..]
+        .iter()
+        .copied()
+        .all(is_structural_or_parenthetical_word)
+    {
+        return false;
+    }
+    let Some(or_index) = remainder_words
+        .iter()
+        .take(8)
+        .position(|word| matches!(*word, "или" | "либо"))
+    else {
+        return false;
+    };
+    let right_words = &remainder_words[or_index + 1..];
+    remainder_words[..or_index]
+        .iter()
+        .copied()
+        .all(is_structural_or_parenthetical_word)
+        && structural_atom_spans(right_words)
+            .iter()
+            .any(|span| span.start == 0)
 }
 
 fn raw_suffix_after_coordination(value: &str) -> Option<&str> {
@@ -3308,6 +3346,12 @@ fn lexical_region_has_strong_user_identity(region: &str) -> bool {
         || lexical_words(&normalized)
             .iter()
             .any(|word| is_explicit_user_noun(word) || is_ascii_identifier_token(word))
+        || (region.trim_start().starts_with('«')
+            && region.trim_end().ends_with('»')
+            && !normalized.is_empty()
+            && lexical_words(&normalized)
+                .iter()
+                .all(|word| !is_count_scope_noise(word)))
 }
 
 fn policy_word_spans(value: &str) -> Vec<(usize, usize)> {
@@ -3392,7 +3436,9 @@ fn lexical_region_looks_like_user_reference(region: &str) -> bool {
         is_explicit_user_noun(word)
             || is_user_reference_token(word)
             || is_ascii_identifier_token(word)
-            || (!word.is_ascii() && is_positional_user_reference(word))
+            || (!word.is_ascii()
+                && word.chars().any(|character| character.is_alphabetic())
+                && !is_count_scope_noise(word))
     })
 }
 
@@ -4684,6 +4730,7 @@ mod tests {
             "Сколько сообщений написал кириллическийник?",
             "Сколько сообщений от кириллическийник?",
             "Сколько сообщений «кириллическийник» написал?",
+            "Сколько сообщений «сова» написала?",
         ] {
             assert!(
                 ResearchState::for_question(question).count_requires_user_scope,
@@ -5120,6 +5167,8 @@ mod tests {
             "сколько сообщений с фото или вообще без видео?",
             "сколько сообщений с фото или вовсе не с видео?",
             "сколько сообщений с фото либо совсем без видео?",
+            "Сколько сообщений с фото, например, или с видео?",
+            "Сколько сообщений с фото — условно — или с видео?",
         ] {
             assert_eq!(
                 ResearchState::for_question(question).count_policy,
@@ -5233,6 +5282,7 @@ mod tests {
             "Сколько сообщений написал первый автор, а сколько написал systemd?",
             "Сколько сообщений написал первый автор, а сколько написал mod_team?",
             "Сколько сообщений написал первый автор, а сколько написал кириллический_ник?",
+            "Сколько сообщений написал первый автор, а сколько написала «сова»?",
             "Сколько сообщений написал первый автор? Сколько написал второй автор?",
         ] {
             assert_eq!(
@@ -5318,6 +5368,16 @@ mod tests {
             "Точное количество сообщений по заданным условиям: 11."
         );
         for draft in [
+            "Всего в 2025 сообщениях найден Rust.",
+            "В сообщении указано: найдено 12 сообщений.",
+        ] {
+            assert_eq!(
+                forced_final_markdown(&research, draft),
+                "Точное количество сообщений по заданным условиям: 11.",
+                "draft: {draft}"
+            );
+        }
+        for draft in [
             "12 подходящих сообщений.",
             "Итого 12 подходящих сообщений.",
             "Двенадцать сообщений.",
@@ -5356,6 +5416,8 @@ mod tests {
             "Это было в 2025.",
             "В сообщении было 12 слов.",
             "До исправления было 3 ошибки.",
+            "После проверки получилось 3 ошибки.",
+            "В сборке насчитали 12 предупреждений.",
         ] {
             assert!(
                 !contains_message_count_claim(explanation),
