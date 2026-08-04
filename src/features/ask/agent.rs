@@ -32,6 +32,8 @@ const RESEARCH_BUDGET_EXHAUSTED_FALLBACK: &str = "Не могу дать над�
 const UNSUPPORTED_COUNT_REPLY_SCOPE: &str = "Точный подсчёт по этому запросу сейчас недоступен: текущий инструмент умеет считать сообщения, которые сами являются ответами, но не сообщения, получившие дочерние ответы.";
 const UNSUPPORTED_COUNT_STRUCTURAL_DISJUNCTION: &str = "Точный подсчёт по этому запросу сейчас недоступен: текущий инструмент не выражает объединение нескольких независимых условий через «или». Уточните один scope.";
 const UNSUPPORTED_COUNT_MULTIPLE: &str = "Точный подсчёт по этому запросу сейчас недоступен: в нём задано несколько независимых количеств. Разделите вопросы на отдельные запросы.";
+const UNSUPPORTED_COUNT_MULTI_VALUE_SCOPE: &str = "Точный подсчёт по этому запросу сейчас недоступен: один фильтр содержит несколько значений, а текущий инструмент принимает только одно. Уточните одного автора или одну целевую реплику.";
+const UNSUPPORTED_COUNT_CONFLICTING_SCOPE: &str = "Точный подсчёт по этому запросу сейчас недоступен: в нём одновременно заданы противоположные значения одного фильтра.";
 const UNSUPPORTED_COUNT_DATE_SCOPE: &str = "Точный подсчёт по этому запросу сейчас недоступен: относительный период нельзя однозначно сопоставить с датами. Уточните даты начала и конца.";
 
 pub struct AskRequest<'a> {
@@ -179,6 +181,8 @@ enum CountPolicy {
 enum UnsupportedCountReason {
     StructuralDisjunction,
     ScopedDisjunction,
+    MultiValueScope,
+    ConflictingScope,
     ReplyChildScope,
     MultipleCounts,
     UnsupportedDateScope,
@@ -196,6 +200,15 @@ enum DateScopePolicy {
 struct ExpectedDateScope {
     date_from: String,
     date_to: String,
+}
+
+impl ExpectedDateScope {
+    fn from_naive_dates(date_from: NaiveDate, date_to: NaiveDate) -> Option<Self> {
+        (date_from <= date_to).then(|| Self {
+            date_from: canonical_naive_date(date_from, DateBoundary::Start),
+            date_to: canonical_naive_date(date_to, DateBoundary::End),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,6 +361,7 @@ struct CountFilterRequirements {
     reply_to_message_id: Option<i64>,
     include_forwards: Option<bool>,
     is_automatic_forward: Option<bool>,
+    conflicting: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -654,7 +668,17 @@ fn contains_anaphoric_count_claim(markdown: &str) -> bool {
 }
 
 fn is_count_token(word: &str) -> bool {
-    word.parse::<i64>().is_ok() || is_spelled_count_word(word)
+    word.parse::<i64>().is_ok() || is_formatted_numeric_token(word) || is_spelled_count_word(word)
+}
+
+fn is_formatted_numeric_token(word: &str) -> bool {
+    let groups = word.split('_').collect::<Vec<_>>();
+    groups.len() > 1
+        && groups.iter().all(|group| {
+            !group.is_empty() && group.chars().all(|character| character.is_ascii_digit())
+        })
+        && groups[0].len() <= 3
+        && groups[1..].iter().all(|group| group.len() == 3)
 }
 
 fn is_count_marker(word: &str) -> bool {
@@ -1496,6 +1520,8 @@ fn unsupported_count_fallback(reason: UnsupportedCountReason) -> &'static str {
     match reason {
         UnsupportedCountReason::StructuralDisjunction
         | UnsupportedCountReason::ScopedDisjunction => UNSUPPORTED_COUNT_STRUCTURAL_DISJUNCTION,
+        UnsupportedCountReason::MultiValueScope => UNSUPPORTED_COUNT_MULTI_VALUE_SCOPE,
+        UnsupportedCountReason::ConflictingScope => UNSUPPORTED_COUNT_CONFLICTING_SCOPE,
         UnsupportedCountReason::ReplyChildScope => UNSUPPORTED_COUNT_REPLY_SCOPE,
         UnsupportedCountReason::MultipleCounts => UNSUPPORTED_COUNT_MULTIPLE,
         UnsupportedCountReason::UnsupportedDateScope => UNSUPPORTED_COUNT_DATE_SCOPE,
@@ -2341,11 +2367,22 @@ fn message_count_policy(question: &str) -> CountPolicy {
     if has_multiple_message_count_clauses(&question) {
         return CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts);
     }
+    if has_multiple_single_value_operands(&question) {
+        return CountPolicy::Unsupported(UnsupportedCountReason::MultiValueScope);
+    }
+    let question_requirements =
+        structural_filter_requirements(&policy_words(&mask_lexical_regions(&question)));
+    if question_requirements.conflicting {
+        return CountPolicy::Unsupported(UnsupportedCountReason::ConflictingScope);
+    }
     for clause in split_count_clauses(&question) {
         let masked_clause = mask_lexical_regions(clause);
         let words = policy_words(&masked_clause);
         if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
             let requirements = structural_filter_requirements(&words[lead_index + 1..]);
+            if requirements.conflicting {
+                return CountPolicy::Unsupported(UnsupportedCountReason::ConflictingScope);
+            }
             if has_unsupported_structural_disjunction(
                 &words[message_index + 1..],
                 &requirements,
@@ -2387,6 +2424,20 @@ fn message_count_policy(question: &str) -> CountPolicy {
         }
     }
     CountPolicy::NotACountQuestion
+}
+
+fn has_multiple_single_value_operands(question: &str) -> bool {
+    let lower_question = question.to_lowercase();
+    let masked_question = mask_lexical_regions(&lower_question);
+    let words = policy_words(&masked_question);
+    let Some((_, _, message_index)) = explicit_message_count_phrase(&words) else {
+        return false;
+    };
+    let tail = &words[message_index + 1..];
+    let quoted_users = quoted_user_operands_in_clause(&lower_question);
+    let bare_users = user_operand_values(tail).len();
+    let reply_targets = reply_target_values(tail);
+    quoted_users + bare_users > 1 || reply_targets.len() > 1
 }
 
 fn has_multiple_message_count_clauses(question: &str) -> bool {
@@ -2584,6 +2635,35 @@ fn is_positional_user_reference(word: &str) -> bool {
     has_unicode_alphabetic && !looks_like_object_noun(word)
 }
 
+fn user_operand_values(tail: &[&str]) -> HashSet<String> {
+    let mut values = HashSet::new();
+    for (index, word) in tail.iter().enumerate() {
+        let is_operand = is_positional_user_reference(word);
+        let has_identity_marker = is_user_reference_token(word) || is_explicit_user_noun(word);
+        let preceded_by_user_preposition = index
+            .checked_sub(1)
+            .and_then(|previous| tail.get(previous))
+            .is_some_and(|previous| matches!(*previous, "от" | "у"));
+        let preceded_by_coordination = index
+            .checked_sub(1)
+            .and_then(|previous| tail.get(previous))
+            .is_some_and(|previous| matches!(*previous, "и" | "или" | "либо" | "также"));
+        let follows_user = index > 0
+            && tail
+                .get(index - 1)
+                .is_some_and(|previous| is_positional_user_reference(previous));
+        if is_operand
+            && (preceded_by_user_preposition
+                || (preceded_by_coordination && !values.is_empty())
+                || (follows_user && !values.is_empty())
+                || (index == 0 && has_identity_marker))
+        {
+            values.insert((*word).to_owned());
+        }
+    }
+    values
+}
+
 fn looks_like_object_noun(word: &str) -> bool {
     [
         "а", "я", "ы", "и", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ом", "ем", "у", "ю",
@@ -2705,10 +2785,20 @@ fn structural_filter_requirements(words: &[&str]) -> CountFilterRequirements {
         }
     }
     requirements.has_reply = has_reply_requirement(words);
-    requirements.reply_to_message_id = reply_scope_requirement(words);
+    let reply_targets = reply_target_values(words);
+    requirements.reply_to_message_id = reply_targets.first().copied();
+    if reply_targets.len() > 1 {
+        requirements.conflicting = true;
+    }
+    if has_conflicting_reply_polarity(words) {
+        requirements.conflicting = true;
+    }
     requirements.include_forwards = forward_scope_requirement(words);
     if requirements.include_forwards == Some(true) {
         requirements.is_automatic_forward = Some(true);
+    }
+    if has_conflicting_forward_polarity(words) {
+        requirements.conflicting = true;
     }
     requirements
 }
@@ -2719,23 +2809,67 @@ fn set_structural_requirement(
     value: bool,
 ) -> bool {
     if is_link_filter_word(word) {
-        requirements.has_links = Some(value);
+        assign_bool_requirement(
+            &mut requirements.has_links,
+            value,
+            &mut requirements.conflicting,
+        );
         return true;
     }
     let Some(kind) = media_filter_kind(word) else {
         return false;
     };
     match kind {
-        MediaFilterKind::Generic => requirements.has_media = Some(value),
-        MediaFilterKind::Photo => requirements.has_photo = Some(value),
-        MediaFilterKind::Video => requirements.has_video = Some(value),
-        MediaFilterKind::Document => requirements.has_document = Some(value),
-        MediaFilterKind::Audio => requirements.has_audio = Some(value),
-        MediaFilterKind::Voice => requirements.has_voice = Some(value),
-        MediaFilterKind::Sticker => requirements.has_sticker = Some(value),
-        MediaFilterKind::Animation => requirements.has_animation = Some(value),
+        MediaFilterKind::Generic => assign_bool_requirement(
+            &mut requirements.has_media,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Photo => assign_bool_requirement(
+            &mut requirements.has_photo,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Video => assign_bool_requirement(
+            &mut requirements.has_video,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Document => assign_bool_requirement(
+            &mut requirements.has_document,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Audio => assign_bool_requirement(
+            &mut requirements.has_audio,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Voice => assign_bool_requirement(
+            &mut requirements.has_voice,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Sticker => assign_bool_requirement(
+            &mut requirements.has_sticker,
+            value,
+            &mut requirements.conflicting,
+        ),
+        MediaFilterKind::Animation => assign_bool_requirement(
+            &mut requirements.has_animation,
+            value,
+            &mut requirements.conflicting,
+        ),
     }
     true
+}
+
+fn assign_bool_requirement(slot: &mut Option<bool>, value: bool, conflicting: &mut bool) {
+    match slot {
+        None => *slot = Some(value),
+        Some(previous) if *previous == value => {}
+        Some(_) => *conflicting = true,
+    }
 }
 
 fn has_unsupported_structural_disjunction(
@@ -2744,7 +2878,7 @@ fn has_unsupported_structural_disjunction(
     source: &str,
 ) -> bool {
     let atom_spans = structural_atom_spans(words);
-    if has_scoped_disjunction(words, &atom_spans) {
+    if !atom_spans.is_empty() && has_scoped_disjunction(words, &atom_spans) {
         return true;
     }
     let has_structural_filter = requirements.has_links.is_some()
@@ -2878,7 +3012,9 @@ fn scope_operand_after_or_with_source(
     }
     let suffix_end = first_atom.map_or(words.len(), |span| span.start);
     let suffix = &words[or_index + 1..suffix_end];
-    if quoted_user_operand_near_or(source, masked_source, or_index, false)
+    if left == Some(ScopeOperand::Text) && starts_with_inherited_text_operand(suffix) {
+        Some(ScopeOperand::Text)
+    } else if quoted_user_operand_near_or(source, masked_source, or_index, false)
         || has_explicit_user_scope_operand(suffix)
     {
         Some(ScopeOperand::User)
@@ -3024,14 +3160,25 @@ fn has_explicit_user_scope_operand(tail: &[&str]) -> bool {
     }
     if tail
         .first()
-        .is_some_and(|word| is_genitive_user_reference(word))
+        .is_some_and(|word| is_genitive_user_reference(word) || is_user_reference_token(word))
     {
         return true;
     }
-    tail.first().is_some_and(|word| matches!(*word, "от" | "у"))
-        && tail
-            .get(1)
-            .is_some_and(|word| is_positional_user_reference(word))
+    tail.windows(2)
+        .any(|window| matches!(window[0], "от" | "у") && is_positional_user_reference(window[1]))
+}
+
+fn starts_with_inherited_text_operand(words: &[&str]) -> bool {
+    let Some(first) = words.first().copied() else {
+        return false;
+    };
+    !matches!(
+        first,
+        "от" | "у" | "в" | "во" | "за" | "с" | "со" | "без" | "по" | "до" | "на"
+    ) && !is_structural_filter_at(words, 0)
+        && !is_forward_scope_word(first)
+        && !is_reply_lexeme(first)
+        && !is_count_lead_word(first)
 }
 
 fn has_text_query_scope(words: &[&str]) -> bool {
@@ -3267,8 +3414,10 @@ fn reply_target_index(words: &[&str], reply_index: usize) -> Option<usize> {
     {
         return None;
     }
-    let end = words.len().min(reply_index + 8);
-    let marker_index = (reply_index + 1..end).find(|&index| words[index] == "на")?;
+    let marker_index = reply_index + 1;
+    if words.get(marker_index) != Some(&"на") {
+        return None;
+    }
     let mut target_index = marker_index + 1;
     if words
         .get(target_index)
@@ -3314,16 +3463,122 @@ fn reply_target_index(words: &[&str], reply_index: usize) -> Option<usize> {
         .map(|_| target_index)
 }
 
+fn reply_target_values(words: &[&str]) -> Vec<i64> {
+    let mut values = Vec::new();
+    for (reply_index, word) in words.iter().enumerate() {
+        if !is_reply_lexeme(word) {
+            continue;
+        }
+        let Some(target_index) = reply_target_index(words, reply_index) else {
+            continue;
+        };
+        if let Some(value) = words.get(target_index).and_then(|word| word.parse().ok()) {
+            values.push(value);
+        }
+        let mut index = target_index + 1;
+        while let Some(word) = words.get(index) {
+            if let Ok(value) = word.parse() {
+                let preceded_by_separator = index
+                    .checked_sub(1)
+                    .and_then(|previous| words.get(previous))
+                    .is_some_and(|previous| {
+                        matches!(*previous, "и" | "или" | "либо" | "также")
+                            || previous.parse::<i64>().is_ok()
+                    });
+                if preceded_by_separator {
+                    values.push(value);
+                    index += 1;
+                    continue;
+                }
+            }
+            if matches!(*word, "и" | "или" | "либо" | "также") {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn has_conflicting_reply_polarity(words: &[&str]) -> bool {
+    let mut positive = false;
+    let mut negative = false;
+    for (index, word) in words.iter().enumerate() {
+        if !is_reply_lexeme(word) {
+            continue;
+        }
+        let has_scope = index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| is_reply_auxiliary(previous))
+            || reply_target_index(words, index).is_some();
+        if !has_scope {
+            continue;
+        }
+        let negated = index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| *previous == "не")
+            || (index >= 2
+                && words[index - 2..index]
+                    .iter()
+                    .copied()
+                    .any(|word| word == "не"));
+        if negated {
+            negative = true;
+        } else {
+            positive = true;
+        }
+    }
+    let positive_auxiliary = words.iter().enumerate().any(|(index, word)| {
+        is_reply_auxiliary(word)
+            && !index
+                .checked_sub(1)
+                .and_then(|previous| words.get(previous))
+                .is_some_and(|previous| *previous == "не")
+    });
+    let negative_auxiliary = words
+        .windows(2)
+        .any(|window| window[0] == "не" && is_reply_auxiliary(window[1]));
+    (positive && negative)
+        || (positive_auxiliary
+            && negative_auxiliary
+            && words.iter().any(|word| is_reply_lexeme(word)))
+}
+
+fn has_conflicting_forward_polarity(words: &[&str]) -> bool {
+    let mut positive = false;
+    let mut negative = false;
+    for (index, word) in words.iter().enumerate() {
+        if !is_forward_scope_word(word) {
+            continue;
+        }
+        let negated = index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| matches!(*previous, "не" | "без"));
+        if negated {
+            negative = true;
+        } else {
+            positive = true;
+        }
+    }
+    positive && negative
+}
+
 fn has_unresolved_specific_reply_target(words: &[&str]) -> bool {
     words.iter().enumerate().any(|(reply_index, word)| {
         if !is_reply_lexeme(word) {
             return false;
         }
-        let end = words.len().min(reply_index + 8);
-        let Some(marker_index) = (reply_index + 1..end).find(|&index| words[index] == "на")
-        else {
+        let marker_index = reply_index + 1;
+        if words.get(marker_index) != Some(&"на") {
             return false;
-        };
+        }
+        let end = words.len().min(marker_index + 8);
         let Some(target_word) = words.get(marker_index + 1) else {
             return false;
         };
@@ -3805,6 +4060,29 @@ fn quoted_user_scope_in_clause(clause: &str) -> bool {
                     && lexical_region_looks_like_user_reference(&clause[start..end]);
             before_is_user_context || after_is_user_context || direct_subject_after_message_noun
         })
+}
+
+fn quoted_user_operands_in_clause(clause: &str) -> usize {
+    let regions = lexical_region_spans(clause);
+    regions
+        .iter()
+        .filter(|&&(start, end)| {
+            if !lexical_region_looks_like_user_reference(&clause[start..end]) {
+                return false;
+            }
+            let before = lexical_words(&clause[..start]);
+            let after = lexical_words(&clause[end..]);
+            let before_word = before.last().copied();
+            let after_word = after.first().copied();
+            before_word.is_some_and(|word| {
+                matches!(word, "от" | "у")
+                    || is_count_verb(word)
+                    || is_explicit_user_noun(word)
+                    || is_message_word(word)
+                    || matches!(word, "и" | "или" | "либо" | "также")
+            }) || after_word.is_some_and(|word| is_count_verb(word) || is_explicit_user_noun(word))
+        })
+        .count()
 }
 
 fn quoted_user_subject_near_count_verb(clause: &str) -> bool {
@@ -4334,10 +4612,7 @@ fn expected_date_scope(question: &str) -> Option<ExpectedDateScope> {
             .collect::<Vec<_>>();
         if let Some(first) = numeric_dates.first().copied() {
             let last = numeric_dates.last().copied().unwrap_or(first);
-            return Some(ExpectedDateScope {
-                date_from: canonical_naive_date(first, DateBoundary::Start),
-                date_to: canonical_naive_date(last, DateBoundary::End),
-            });
+            return ExpectedDateScope::from_naive_dates(first, last);
         }
 
         let day_month_dates = (0..words.len())
@@ -4346,14 +4621,14 @@ fn expected_date_scope(question: &str) -> Option<ExpectedDateScope> {
             .collect::<Vec<_>>();
         if let Some(first) = day_month_dates.first().copied() {
             let last = day_month_dates.last().copied().unwrap_or(first);
-            return Some(ExpectedDateScope {
-                date_from: canonical_naive_date(first, DateBoundary::Start),
-                date_to: canonical_naive_date(last, DateBoundary::End),
-            });
+            return ExpectedDateScope::from_naive_dates(first, last);
         }
 
         if let Some(scope) = expected_month_or_year_scope(&words) {
             return Some(scope);
+        }
+        if has_explicit_date_range(&words) {
+            return None;
         }
 
         if let Some(scope) = expected_relative_date_scope(&words) {
@@ -4361,6 +4636,17 @@ fn expected_date_scope(question: &str) -> Option<ExpectedDateScope> {
         }
     }
     None
+}
+
+fn has_explicit_date_range(words: &[&str]) -> bool {
+    words
+        .iter()
+        .position(|word| *word == "с")
+        .is_some_and(|start| words[start + 1..].contains(&"по"))
+        || words
+            .iter()
+            .position(|word| *word == "от")
+            .is_some_and(|start| words[start + 1..].contains(&"до"))
 }
 
 fn expected_month_or_year_scope(words: &[&str]) -> Option<ExpectedDateScope> {
@@ -4384,10 +4670,7 @@ fn expected_month_or_year_scope(words: &[&str]) -> Option<ExpectedDateScope> {
             (last_year, last_month + 1)
         };
         let to = NaiveDate::from_ymd_opt(next_year, next_month, 1)?.pred_opt()?;
-        return Some(ExpectedDateScope {
-            date_from: canonical_naive_date(from, DateBoundary::Start),
-            date_to: canonical_naive_date(to, DateBoundary::End),
-        });
+        return ExpectedDateScope::from_naive_dates(from, to);
     }
 
     let years = words
@@ -4405,10 +4688,7 @@ fn expected_month_or_year_scope(words: &[&str]) -> Option<ExpectedDateScope> {
     let last_year = years.last().copied().unwrap_or(first_year);
     let from = NaiveDate::from_ymd_opt(first_year, 1, 1)?;
     let to = NaiveDate::from_ymd_opt(last_year + 1, 1, 1)?.pred_opt()?;
-    Some(ExpectedDateScope {
-        date_from: canonical_naive_date(from, DateBoundary::Start),
-        date_to: canonical_naive_date(to, DateBoundary::End),
-    })
+    ExpectedDateScope::from_naive_dates(from, to)
 }
 
 fn question_numeric_date_at(words: &[&str], index: usize) -> Option<NaiveDate> {
@@ -4495,10 +4775,7 @@ fn expected_relative_date_scope(words: &[&str]) -> Option<ExpectedDateScope> {
         None
     };
     if let Some(day) = single_day {
-        return Some(ExpectedDateScope {
-            date_from: canonical_naive_date(day, DateBoundary::Start),
-            date_to: canonical_naive_date(day, DateBoundary::End),
-        });
+        return ExpectedDateScope::from_naive_dates(day, day);
     }
 
     if words
@@ -4509,10 +4786,7 @@ fn expected_relative_date_scope(words: &[&str]) -> Option<ExpectedDateScope> {
         let last_of_previous = first_of_current.pred_opt()?;
         let first_of_previous =
             NaiveDate::from_ymd_opt(last_of_previous.year(), last_of_previous.month(), 1)?;
-        return Some(ExpectedDateScope {
-            date_from: canonical_naive_date(first_of_previous, DateBoundary::Start),
-            date_to: canonical_naive_date(last_of_previous, DateBoundary::End),
-        });
+        return ExpectedDateScope::from_naive_dates(first_of_previous, last_of_previous);
     }
 
     if words
@@ -4526,10 +4800,7 @@ fn expected_relative_date_scope(words: &[&str]) -> Option<ExpectedDateScope> {
             (today.year(), today.month() + 1)
         };
         let last = NaiveDate::from_ymd_opt(next_year, next_month, 1)?.pred_opt()?;
-        return Some(ExpectedDateScope {
-            date_from: canonical_naive_date(first, DateBoundary::Start),
-            date_to: canonical_naive_date(last, DateBoundary::End),
-        });
+        return ExpectedDateScope::from_naive_dates(first, last);
     }
 
     if words
@@ -4564,10 +4835,7 @@ fn expected_relative_date_scope(words: &[&str]) -> Option<ExpectedDateScope> {
 fn expected_year_scope(year: i32) -> Option<ExpectedDateScope> {
     let from = NaiveDate::from_ymd_opt(year, 1, 1)?;
     let to = NaiveDate::from_ymd_opt(year + 1, 1, 1)?.pred_opt()?;
-    Some(ExpectedDateScope {
-        date_from: canonical_naive_date(from, DateBoundary::Start),
-        date_to: canonical_naive_date(to, DateBoundary::End),
-    })
+    ExpectedDateScope::from_naive_dates(from, to)
 }
 
 fn question_mentions_user_scope(question: &str) -> bool {
@@ -5732,6 +6000,9 @@ mod tests {
             "Сколько сообщений от модератора, или в июле?",
             "Сколько сообщений в июле, или в августе?",
             "Сколько сообщений про term_1, или от модератора?",
+            "Сколько сообщений от user42 или user43?",
+            "Сколько сообщений от mod_team либо user42?",
+            "Сколько сообщений от кириллический_ник или другой_ник?",
             "Сколько сообщений от «сова» или «лиса»?",
             "Сколько сообщений от модератора или «сова»?",
             "Сколько сообщений от «сова», или от «лиса»?",
@@ -5758,6 +6029,20 @@ mod tests {
         }
 
         for question in [
+            "Сколько сообщений от user42 и user43?",
+            "Сколько сообщений от user42, user43?",
+            "Сколько сообщений от «сова» и «лиса»?",
+            "Сколько сообщений было ответами на 42 и 43?",
+            "Сколько сообщений было ответами на 42, 43?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_policy,
+                CountPolicy::Unsupported(UnsupportedCountReason::MultiValueScope),
+                "multi-value scope: {question}"
+            );
+        }
+
+        for question in [
             "Сколько сообщений с фото, а сколько всего?",
             "Сколько сообщений от модератора, а сколько всего?",
             "Сколько сообщений было ответами на 42, а сколько на 43?",
@@ -5766,6 +6051,37 @@ mod tests {
                 ResearchState::for_question(question).count_policy,
                 CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts),
                 "independent count: {question}"
+            );
+        }
+
+        for question in [
+            "Сколько сообщений про term_1 или term_2 от модератора?",
+            "Сколько сообщений про term_1 или term_2 в июле?",
+            "Сколько сообщений про term_1 или term_2, написанных модератором?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_policy,
+                CountPolicy::Supported(CountIntent::Matching),
+                "common trailing scope: {question}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_boolean_scopes_are_not_last_write_wins() {
+        for question in [
+            "Сколько сообщений с фото и без фото?",
+            "Сколько сообщений со ссылками и без ссылок?",
+            "Сколько сообщений с видео, но без видео?",
+            "Сколько пересланных и не пересланных сообщений?",
+            "Сколько сообщений были и не были ответами?",
+        ] {
+            assert!(
+                matches!(
+                    ResearchState::for_question(question).count_policy,
+                    CountPolicy::Unsupported(UnsupportedCountReason::ConflictingScope)
+                ),
+                "question: {question}"
             );
         }
     }
@@ -5815,6 +6131,20 @@ mod tests {
             expected_date_scope("Сколько сообщений с 2024 по 2025 год?").expect("year range");
         assert_eq!(year_range.date_from, "2024-01-01T00:00:00.000000Z");
         assert_eq!(year_range.date_to, "2025-12-31T23:59:59.999999Z");
+
+        for question in [
+            "Сколько сообщений с декабря по январь?",
+            "Сколько сообщений с ноября по февраль?",
+            "Сколько сообщений с 2025 по 2024 год?",
+        ] {
+            assert_eq!(date_scope_policy(question), DateScopePolicy::Unsupported);
+            assert!(expected_date_scope(question).is_none());
+        }
+        let explicit_cross_year =
+            expected_date_scope("Сколько сообщений с декабря 2025 по январь 2026?")
+                .expect("explicit cross-year range");
+        assert_eq!(explicit_cross_year.date_from, "2025-12-01T00:00:00.000000Z");
+        assert_eq!(explicit_cross_year.date_to, "2026-01-31T23:59:59.999999Z");
     }
 
     #[test]
@@ -6048,6 +6378,7 @@ mod tests {
             "Сообщений 12 000.",
             "Сообщений 12\u{00a0}000.",
             "Сообщений 12\u{202f}000.",
+            "Сообщений 12_000.",
             "Сообщений 12,000.",
             "Сообщений 12.000.",
         ] {
