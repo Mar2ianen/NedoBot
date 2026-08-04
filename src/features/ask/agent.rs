@@ -387,25 +387,227 @@ fn contains_message_count_claim(markdown: &str) -> bool {
             return false;
         }
         let sentence_bounds = sentence_bounds(markdown, spans[index]);
-        let sentence_words = spans
+        let sentence_indices = spans
             .iter()
-            .filter(|&&(word_start, word_end)| {
+            .enumerate()
+            .filter(|&(_, &(word_start, word_end))| {
                 word_start >= sentence_bounds.0 && word_end <= sentence_bounds.1
             })
-            .map(|&(word_start, word_end)| markdown[word_start..word_end].to_lowercase())
+            .map(|(other_index, _)| other_index)
             .collect::<Vec<_>>();
-        let has_count_marker = sentence_words.iter().any(|word| is_count_marker(word));
-        let has_nearby_message_noun =
-            spans
+        if is_date_like_count_position(markdown, &spans, &sentence_indices, index) {
+            return false;
+        }
+        let has_nearby_count_marker = sentence_indices.iter().copied().any(|other_index| {
+            index.abs_diff(other_index) <= 3
+                && is_count_marker(
+                    &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
+                )
+                && count_marker_supports_claim(
+                    markdown,
+                    &spans,
+                    &sentence_indices,
+                    index,
+                    other_index,
+                )
+        });
+        let has_message_noun_after = sentence_indices.iter().copied().any(|other_index| {
+            other_index > index
+                && other_index - index <= 3
+                && is_message_count_target_noun(
+                    &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
+                )
+        });
+        let has_message_noun_before = sentence_indices.iter().copied().any(|other_index| {
+            if other_index >= index
+                || index - other_index > 3
+                || !is_message_count_noun(
+                    &markdown[spans[other_index].0..spans[other_index].1].to_lowercase(),
+                )
+            {
+                return false;
+            }
+            let noun_position = sentence_indices
                 .iter()
-                .enumerate()
-                .any(|(other_index, &(word_start, word_end))| {
-                    word_start >= sentence_bounds.0
-                        && word_end <= sentence_bounds.1
-                        && index.abs_diff(other_index) <= 3
-                        && is_message_count_noun(&markdown[word_start..word_end].to_lowercase())
-                });
-        has_count_marker || has_nearby_message_noun
+                .position(|&candidate| candidate == other_index)
+                .unwrap_or(0);
+            let count_position = sentence_indices
+                .iter()
+                .position(|&candidate| candidate == index)
+                .unwrap_or(noun_position);
+            sentence_indices[noun_position + 1..count_position]
+                .iter()
+                .any(|&between_index| {
+                    matches!(
+                        markdown[spans[between_index].0..spans[between_index].1]
+                            .to_lowercase()
+                            .as_str(),
+                        "было"
+                            | "была"
+                            | "были"
+                            | "стало"
+                            | "стали"
+                            | "оказалось"
+                            | "оказались"
+                            | "получилось"
+                            | "получили"
+                            | "насчитали"
+                            | "найдено"
+                            | "найдены"
+                    )
+                })
+        });
+        has_nearby_count_marker
+            || has_message_noun_after
+            || has_message_noun_before
+            || has_anaphoric_count_marker(markdown, &spans, &sentence_indices, index)
+    })
+}
+
+fn is_date_like_count_token(word: &str) -> bool {
+    word.len() == 4
+        && word
+            .parse::<u16>()
+            .is_ok_and(|year| (1900..=2200).contains(&year))
+}
+
+fn is_date_like_count_position(
+    markdown: &str,
+    spans: &[(usize, usize)],
+    sentence_indices: &[usize],
+    count_index: usize,
+) -> bool {
+    let word = markdown[spans[count_index].0..spans[count_index].1].to_lowercase();
+    let position = sentence_indices
+        .iter()
+        .position(|&index| index == count_index)
+        .unwrap_or(0);
+    let next = sentence_indices
+        .get(position + 1)
+        .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    let previous = position
+        .checked_sub(1)
+        .and_then(|index| sentence_indices.get(index))
+        .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+    let adjacent_month = next.as_deref().is_some_and(is_month_word)
+        || previous.as_deref().is_some_and(is_month_word);
+    let adjacent_year_word = next
+        .as_deref()
+        .is_some_and(|word| matches!(word, "год" | "года" | "году" | "годом"));
+    (is_date_like_count_token(&word) && (adjacent_month || adjacent_year_word))
+        || (is_numeric_token(&word)
+            && word.parse::<u32>().is_ok_and(|value| value <= 31)
+            && adjacent_month)
+}
+
+fn count_marker_supports_claim(
+    markdown: &str,
+    spans: &[(usize, usize)],
+    sentence_indices: &[usize],
+    count_index: usize,
+    marker_index: usize,
+) -> bool {
+    let count_position = sentence_indices
+        .iter()
+        .position(|&index| index == count_index)
+        .unwrap_or(0);
+    let marker_word = markdown[spans[marker_index].0..spans[marker_index].1].to_lowercase();
+    if matches!(marker_word.as_str(), "около" | "примерно" | "порядка") {
+        let next_words = sentence_indices[count_position + 1..]
+            .iter()
+            .take(2)
+            .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase());
+        if next_words
+            .clone()
+            .any(|word| is_count_scope_time_word(&word))
+        {
+            return false;
+        }
+    }
+    if marker_word == "всего"
+        && sentence_indices
+            .get(count_position + 1)
+            .is_some_and(|&index| markdown[spans[index].0..spans[index].1].to_lowercase() == "раз")
+    {
+        return false;
+    }
+    if marker_word.starts_with("найден") || marker_word.starts_with("нашл") {
+        let marker_position = sentence_indices
+            .iter()
+            .position(|&index| index == marker_index)
+            .unwrap_or(count_position);
+        let between = if marker_position < count_position {
+            &sentence_indices[marker_position + 1..count_position]
+        } else {
+            &[]
+        };
+        if between.iter().any(|&index| {
+            is_message_count_noun(&markdown[spans[index].0..spans[index].1].to_lowercase())
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_count_scope_time_word(word: &str) -> bool {
+    matches!(
+        word,
+        "день"
+            | "дня"
+            | "дней"
+            | "неделя"
+            | "недели"
+            | "недель"
+            | "месяц"
+            | "месяца"
+            | "месяцев"
+            | "год"
+            | "года"
+            | "лет"
+            | "раз"
+    )
+}
+
+fn has_anaphoric_count_marker(
+    markdown: &str,
+    spans: &[(usize, usize)],
+    sentence_indices: &[usize],
+    count_index: usize,
+) -> bool {
+    let position = sentence_indices
+        .iter()
+        .position(|&index| index == count_index)
+        .unwrap_or(0);
+    let start = position.saturating_sub(3);
+    sentence_indices[start..position].iter().any(|&index| {
+        matches!(
+            markdown[spans[index].0..spans[index].1]
+                .to_lowercase()
+                .as_str(),
+            "их" | "ровно" | "было" | "оказалось" | "стало" | "получилось"
+        )
+    }) && sentence_indices[start..position]
+        .iter()
+        .any(|&index| markdown[spans[index].0..spans[index].1].to_lowercase() == "их")
+}
+
+fn contains_anaphoric_count_claim(markdown: &str) -> bool {
+    let spans = markdown_word_spans(markdown);
+    spans.iter().enumerate().any(|(index, &(start, end))| {
+        let word = markdown[start..end].to_lowercase();
+        if !is_count_token(&word) {
+            return false;
+        }
+        let bounds = sentence_bounds(markdown, (start, end));
+        let sentence_indices = spans
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(word_start, word_end))| word_start >= bounds.0 && word_end <= bounds.1)
+            .map(|(other_index, _)| other_index)
+            .collect::<Vec<_>>();
+        !is_date_like_count_position(markdown, &spans, &sentence_indices, index)
+            && has_anaphoric_count_marker(markdown, &spans, &sentence_indices, index)
     })
 }
 
@@ -417,12 +619,21 @@ fn is_count_marker(word: &str) -> bool {
     word.starts_with("количеств")
         || word.starts_with("итог")
         || word.starts_with("нашл")
+        || word.starts_with("совпад")
         || word.starts_with("найден")
         || matches!(word, "всего" | "около" | "примерно" | "порядка")
 }
 
 fn is_message_count_noun(word: &str) -> bool {
     word.starts_with("сообщен")
+        || word.starts_with("пост")
+        || word.starts_with("реплик")
+        || word.starts_with("результат")
+        || word.starts_with("запис")
+}
+
+fn is_message_count_target_noun(word: &str) -> bool {
+    (word.starts_with("сообщен") && !matches!(word, "сообщении" | "сообщением" | "сообщениях"))
         || word.starts_with("пост")
         || word.starts_with("реплик")
         || word.starts_with("результат")
@@ -517,12 +728,66 @@ fn is_spelled_count_word(word: &str) -> bool {
 
 fn sentence_bounds(markdown: &str, (start, end): (usize, usize)) -> (usize, usize) {
     let sentence_start = markdown[..start]
-        .rfind(['.', '!', '?', '\n'])
-        .map_or(0, |boundary| boundary + 1);
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            is_sentence_boundary(markdown, index, character).then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
     let sentence_end = markdown[end..]
-        .find(['.', '!', '?', '\n'])
-        .map_or(markdown.len(), |boundary| end + boundary);
+        .char_indices()
+        .find_map(|(offset, character)| {
+            let index = end + offset;
+            is_sentence_boundary(markdown, index, character).then_some(index)
+        })
+        .unwrap_or(markdown.len());
     (sentence_start, sentence_end)
+}
+
+fn is_sentence_boundary(markdown: &str, index: usize, character: char) -> bool {
+    if !matches!(character, '.' | '!' | '?' | '\n') {
+        return false;
+    }
+    character != '.' || !is_inside_uri_token(markdown, index)
+}
+
+fn is_inside_uri_token(markdown: &str, index: usize) -> bool {
+    let start = markdown[..index]
+        .rfind(char::is_whitespace)
+        .map_or(0, |boundary| boundary + 1);
+    let end = markdown[index..]
+        .find(char::is_whitespace)
+        .map_or(markdown.len(), |offset| index + offset);
+    let token = &markdown[start..end];
+    let uri_start = token
+        .find("://")
+        .map(|scheme_separator| {
+            token[..scheme_separator]
+                .rfind(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '+' | '-' | '.')
+                })
+                .map_or(0, |boundary| boundary + 1)
+        })
+        .or_else(|| token.find("mailto:"));
+    let Some(uri_start) = uri_start else {
+        return false;
+    };
+    let relative_index = index - start;
+    if relative_index < uri_start {
+        return false;
+    }
+    let uri_end = token[uri_start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            matches!(character, ')' | ']' | '>').then_some(uri_start + offset)
+        })
+        .unwrap_or(token.len());
+    if relative_index >= uri_end {
+        return false;
+    }
+    token[relative_index + 1..uri_end].chars().any(|character| {
+        character.is_alphanumeric() || matches!(character, '/' | ':' | '?' | '%' | '#' | '-' | '_')
+    })
 }
 
 fn markdown_word_spans(markdown: &str) -> Vec<(usize, usize)> {
@@ -546,24 +811,46 @@ fn strip_message_count_claims(markdown: &str) -> String {
         return markdown.trim().to_owned();
     }
 
-    let mut kept = String::new();
+    let mut segments = Vec::new();
     let mut segment_start = 0;
     for (index, character) in markdown.char_indices() {
-        if !matches!(character, '.' | '!' | '?' | '\n') {
+        if !is_sentence_boundary(markdown, index, character) {
             continue;
         }
         let segment_end = index + character.len_utf8();
-        let segment = &markdown[segment_start..segment_end];
-        if !contains_message_count_claim(segment) {
-            kept.push_str(segment);
-        }
+        segments.push(&markdown[segment_start..segment_end]);
         segment_start = segment_end;
     }
-    let tail = &markdown[segment_start..];
-    if !contains_message_count_claim(tail) {
-        kept.push_str(tail);
+    if segment_start < markdown.len() {
+        segments.push(&markdown[segment_start..]);
     }
-    kept.trim().to_owned()
+
+    let mut kept: Vec<&str> = Vec::new();
+    for segment in segments {
+        if contains_message_count_claim(segment) {
+            if contains_anaphoric_count_claim(segment)
+                && kept
+                    .last()
+                    .is_some_and(|previous| is_count_introduction_segment(previous))
+            {
+                kept.pop();
+            }
+        } else {
+            kept.push(segment);
+        }
+    }
+    kept.concat().trim().to_owned()
+}
+
+fn is_count_introduction_segment(segment: &str) -> bool {
+    let lower_segment = segment.to_lowercase();
+    let words = lexical_words(&lower_segment);
+    words.iter().any(|word| {
+        word.starts_with("найден")
+            || word.starts_with("нашл")
+            || word.starts_with("совпад")
+            || word.starts_with("результат")
+    }) && words.iter().any(|word| is_message_count_noun(word))
 }
 
 fn should_cache_tool_result(tool: &str) -> bool {
@@ -1815,12 +2102,13 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
 }
 
 fn message_count_policy(question: &str) -> CountPolicy {
-    let question = mask_lexical_regions(&question.to_lowercase());
+    let question = question.to_lowercase();
     if has_multiple_message_count_clauses(&question) {
         return CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts);
     }
     for clause in split_count_clauses(&question) {
-        let words = clause
+        let masked_clause = mask_lexical_regions(clause);
+        let words = masked_clause
             .split(|character: char| !character.is_alphanumeric())
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
@@ -1863,42 +2151,34 @@ fn message_count_policy(question: &str) -> CountPolicy {
 }
 
 fn has_multiple_message_count_clauses(question: &str) -> bool {
-    let clauses = split_count_clauses(question)
-        .into_iter()
-        .map(|clause| {
-            clause
-                .split(|character: char| !character.is_alphanumeric())
-                .filter(|word| !word.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let masked_question = mask_lexical_regions(question);
+    let clauses = split_count_clauses(question);
+    let masked_clauses = split_count_clauses(&masked_question);
     let mut has_prior_explicit_context = false;
-    let count = clauses
-        .iter()
-        .map(|words| {
-            let explicit = (0..words.len())
-                .filter(|&index| {
-                    explicit_message_count_at(words, index).is_some()
-                        && !count_phrase_is_topic_mention(words, index)
-                })
-                .count();
-            let has_count_context = explicit > 0
-                || (has_prior_explicit_context && starts_with_elliptical_coordinator(words));
-            let recognized = recognized_message_count_phrase_count(words, has_count_context);
-            has_prior_explicit_context |= explicit > 0;
-            recognized
-        })
-        .sum::<usize>();
+    let mut count = 0;
+    for (original_clause, masked_clause) in clauses.into_iter().zip(masked_clauses) {
+        let words = masked_clause
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let explicit = (0..words.len())
+            .filter(|&index| {
+                explicit_message_count_at(&words, index).is_some()
+                    && !count_phrase_is_topic_mention(&words, index)
+            })
+            .count();
+        let has_count_context = explicit > 0 || has_prior_explicit_context;
+        count += recognized_message_count_phrase_count(&words, original_clause, has_count_context);
+        has_prior_explicit_context |= explicit > 0;
+    }
     count > 1
 }
 
-fn starts_with_elliptical_coordinator(words: &[&str]) -> bool {
-    words
-        .first()
-        .is_some_and(|word| matches!(*word, "а" | "и" | "но"))
-}
-
-fn recognized_message_count_phrase_count(words: &[&str], has_explicit_context: bool) -> usize {
+fn recognized_message_count_phrase_count(
+    words: &[&str],
+    original_clause: &str,
+    has_explicit_context: bool,
+) -> usize {
     let explicit = (0..words.len())
         .filter(|&index| {
             explicit_message_count_at(words, index).is_some()
@@ -1919,7 +2199,7 @@ fn recognized_message_count_phrase_count(words: &[&str], has_explicit_context: b
                 **word == "сколько"
                     && words.get(*index + 1) != Some(&"раз")
                     && explicit_message_count_at(words, *index).is_none()
-                    && has_implicit_author_message_count_at(words, *index)
+                    && has_implicit_author_message_count_at(words, *index, original_clause)
             })
             .count()
     } else {
@@ -1944,10 +2224,16 @@ fn has_event_message_count_at(words: &[&str], index: usize) -> bool {
     writes && (has_explicit_message_word || has_thematic_chat_scope)
 }
 
-fn has_implicit_author_message_count_at(words: &[&str], index: usize) -> bool {
+fn has_implicit_author_message_count_at(
+    words: &[&str],
+    index: usize,
+    original_clause: &str,
+) -> bool {
     let tail = &words[index + 1..words.len().min(index + 1 + COUNT_INTENT_LOOKAHEAD_WORDS)];
     tail.iter().enumerate().any(|(verb_index, word)| {
-        is_message_count_verb(word) && has_person_like_subject(tail, verb_index)
+        is_message_count_verb(word)
+            && (has_person_like_subject(tail, verb_index)
+                || quoted_user_subject_near_count_verb(original_clause))
     })
 }
 
@@ -1971,6 +2257,7 @@ fn has_person_like_subject(words: &[&str], verb_index: usize) -> bool {
 
 fn is_person_like_user_word(word: &str) -> bool {
     is_explicit_user_noun(word)
+        || is_user_reference_token(word)
         || matches!(
             word,
             "я" | "мы"
@@ -1989,6 +2276,16 @@ fn is_person_like_user_word(word: &str) -> bool {
                 | "ее"
                 | "её"
         )
+}
+
+fn is_user_reference_token(word: &str) -> bool {
+    let has_ascii_letter = word
+        .chars()
+        .any(|character| character.is_ascii_alphabetic());
+    let has_identity_marker = word
+        .chars()
+        .any(|character| character.is_ascii_digit() || matches!(character, '_' | '@'));
+    has_ascii_letter && has_identity_marker
 }
 
 fn count_phrase_is_topic_mention(words: &[&str], index: usize) -> bool {
@@ -2051,7 +2348,14 @@ fn structural_filter_requirements(words: &[&str]) -> CountFilterRequirements {
             }
             "без" | "нет" => Some(false),
             _ => None,
-        };
+        }
+        .map(|value| {
+            let negated = index
+                .checked_sub(1)
+                .and_then(|previous| words.get(previous))
+                .is_some_and(|previous| *previous == "не");
+            if negated { !value } else { value }
+        });
         let containing_value = word.starts_with("содерж").then(|| {
             !index
                 .checked_sub(1)
@@ -2195,7 +2499,7 @@ fn structural_atom_span_at(words: &[&str], index: usize) -> Option<StructuralAto
         && let Some(atom) = structural_atom_for_filter_word(next)
     {
         return Some(StructuralAtomSpan {
-            start: index,
+            start: structural_atom_prefix_start(words, index),
             end: index + 2,
             atom,
         });
@@ -2240,6 +2544,18 @@ fn structural_atom_span_at(words: &[&str], index: usize) -> Option<StructuralAto
     None
 }
 
+fn structural_atom_prefix_start(words: &[&str], index: usize) -> usize {
+    let mut start = index;
+    while start > 0
+        && words
+            .get(start - 1)
+            .is_some_and(|word| is_structural_atom_prefix_modifier(word))
+    {
+        start -= 1;
+    }
+    start
+}
+
 fn structural_atom_has_coordination_prefix(words: &[&str], index: usize) -> bool {
     let mut cursor = index;
     while cursor > 0
@@ -2272,6 +2588,23 @@ fn is_structural_neutral_modifier(word: &str) -> bool {
             | "автоматически"
             | "не"
             | "вообще"
+            | "вовсе"
+            | "совсем"
+    )
+}
+
+fn is_structural_atom_prefix_modifier(word: &str) -> bool {
+    matches!(
+        word,
+        "только"
+            | "лишь"
+            | "просто"
+            | "именно"
+            | "автоматически"
+            | "не"
+            | "вообще"
+            | "вовсе"
+            | "совсем"
     )
 }
 
@@ -2408,6 +2741,13 @@ fn is_answer_verb(word: &str) -> bool {
 fn reply_scope_requirement(words: &[&str]) -> Option<i64> {
     for (index, word) in words.iter().enumerate() {
         if !is_reply_lexeme(word) {
+            continue;
+        }
+        if index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| is_message_topic_marker(previous))
+        {
             continue;
         }
         let end = words.len().min(index + 6);
@@ -2658,22 +2998,93 @@ fn quoted_user_scope_in_clause(clause: &str) -> bool {
     lexical_region_spans(clause)
         .into_iter()
         .any(|(start, end)| {
-            let before = clause[..start]
-                .split(|character: char| !character.is_alphanumeric())
-                .filter(|word| !word.is_empty())
-                .collect::<Vec<_>>();
-            let after = clause[end..]
-                .split(|character: char| !character.is_alphanumeric())
-                .filter(|word| !word.is_empty())
-                .collect::<Vec<_>>();
+            let before = lexical_words(&clause[..start]);
+            let after = lexical_words(&clause[end..]);
+            let looks_like_user = lexical_region_looks_like_user_reference(&clause[start..end]);
             let before_is_user_context = before.last().is_some_and(|word| {
-                matches!(*word, "от" | "у") || is_count_verb(word) || is_explicit_user_noun(word)
+                matches!(*word, "от" | "у")
+                    || (looks_like_user && (is_count_verb(word) || is_explicit_user_noun(word)))
             });
-            let after_is_user_context = after
-                .first()
-                .is_some_and(|word| is_count_verb(word) || is_explicit_user_noun(word));
-            before_is_user_context || after_is_user_context
+            let after_is_user_context =
+                looks_like_user && bounded_user_context_after_lexical_region(&after);
+            let direct_subject_after_message_noun =
+                before.last().is_some_and(|word| is_message_word(word))
+                    && lexical_region_looks_like_user_reference(&clause[start..end]);
+            before_is_user_context || after_is_user_context || direct_subject_after_message_noun
         })
+}
+
+fn quoted_user_subject_near_count_verb(clause: &str) -> bool {
+    lexical_region_spans(clause)
+        .into_iter()
+        .any(|(start, end)| {
+            let before = lexical_words(&clause[..start]);
+            let after = lexical_words(&clause[end..]);
+            let looks_like_user = lexical_region_looks_like_user_reference(&clause[start..end]);
+            looks_like_user
+                && (before.last().is_some_and(|word| is_count_verb(word))
+                    || bounded_user_context_after_lexical_region(&after))
+        })
+}
+
+fn lexical_words(value: &str) -> Vec<&str> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn bounded_user_context_after_lexical_region(words: &[&str]) -> bool {
+    for word in words.iter().take(5) {
+        if is_count_verb(word) || is_explicit_user_noun(word) {
+            return true;
+        }
+        if !is_neutral_user_subject_modifier(word) {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_neutral_user_subject_modifier(word: &str) -> bool {
+    is_date_scope_word(word)
+        || is_month_word(word)
+        || is_numeric_token(word)
+        || matches!(
+            word,
+            "в" | "во"
+                | "с"
+                | "со"
+                | "на"
+                | "за"
+                | "по"
+                | "обычно"
+                | "часто"
+                | "редко"
+                | "иногда"
+                | "только"
+                | "сам"
+                | "сама"
+                | "само"
+                | "сами"
+        )
+}
+
+fn lexical_region_looks_like_user_reference(region: &str) -> bool {
+    let normalized = region.trim_matches(['«', '»', '"', '`']).to_lowercase();
+    if normalized
+        .chars()
+        .any(|character| matches!(character, '@' | '_'))
+        && normalized
+            .chars()
+            .any(|character| character.is_alphabetic())
+    {
+        return true;
+    }
+    let words = lexical_words(&normalized);
+    words
+        .iter()
+        .any(|word| is_explicit_user_noun(word) || is_user_reference_token(word))
 }
 
 fn lexical_region_spans(question: &str) -> Vec<(usize, usize)> {
@@ -3938,6 +4349,8 @@ mod tests {
             "Сколько сообщений написал «автор_1»?",
             "Сколько сообщений «автор_1» написал?",
             "Сколько сообщений от `systemd`?",
+            "Сколько сообщений «@user»?",
+            "Сколько сообщений `user_name`?",
         ] {
             assert!(
                 ResearchState::for_question(question).count_requires_user_scope,
@@ -3949,6 +4362,10 @@ mod tests {
                 "Сколько сообщений содержит «Rust»? Что написал «автор_1»?"
             )
             .count_requires_user_scope
+        );
+        assert_eq!(
+            message_count_policy("Сколько сообщений про Rust? А сколько `строк` написал?"),
+            CountPolicy::Supported(CountIntent::Matching)
         );
     }
 
@@ -4062,6 +4479,11 @@ mod tests {
             &json!({"count": 3}),
         );
         assert_eq!(research.count_queries, 1);
+
+        let not_photo = message_filter_requirements("Сколько сообщений не с фото?");
+        assert_eq!(not_photo.has_photo, Some(false));
+        let not_video = message_filter_requirements("Сколько сообщений вовсе не с видео?");
+        assert_eq!(not_video.has_video, Some(false));
 
         let mut research = ResearchState::for_question("сколько сообщений с фото в июле?");
         research.record(
@@ -4351,6 +4773,8 @@ mod tests {
             "сколько сообщений с фото или не пересланные?",
             "сколько сообщений, которые были ответами либо не с видео?",
             "сколько сообщений с фото или вообще без видео?",
+            "сколько сообщений с фото или вовсе не с видео?",
+            "сколько сообщений с фото либо совсем без видео?",
         ] {
             assert_eq!(
                 ResearchState::for_question(question).count_policy,
@@ -4366,6 +4790,10 @@ mod tests {
             ResearchState::for_question("сколько сообщений содержит ответ на вопрос о Rust?");
         assert_eq!(text_reply.count_requires_has_reply, None);
         assert_eq!(text_reply.count_intent, Some(CountIntent::Matching));
+        let text_reply_with_id =
+            ResearchState::for_question("сколько сообщений содержит ответ на сообщение 42?");
+        assert_eq!(text_reply_with_id.count_requires_has_reply, None);
+        assert_eq!(text_reply_with_id.count_requires_reply_to_message_id, None);
 
         let unanswered =
             ResearchState::for_question("сколько сообщений, на которые никто не ответил?");
@@ -4446,6 +4874,9 @@ mod tests {
             "Сколько сообщений написал первый автор, а сколько написал второй автор?",
             "Сколько сообщений написал первый автор; а сколько написал второй автор?",
             "Сколько сообщений написал первый автор? А сколько написал второй автор?",
+            "Сколько сообщений написал первый автор, а сколько написал user42?",
+            "Сколько сообщений написал первый автор, а сколько написал `user42`?",
+            "Сколько сообщений написал первый автор? Сколько написал второй автор?",
         ] {
             assert_eq!(
                 message_count_policy(question),
@@ -4456,6 +4887,34 @@ mod tests {
         assert_eq!(
             message_count_policy("Сколько сообщений про Rust? А сколько написал кода?"),
             CountPolicy::Supported(CountIntent::Matching)
+        );
+        for question in [
+            "Сколько сообщений написал первый автор, а сколько написал user42?",
+            "Сколько сообщений написал первый автор, а сколько написал `user42`?",
+            "Сколько сообщений написал первый автор? Сколько написал второй автор?",
+        ] {
+            assert_eq!(
+                message_count_policy(question),
+                CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts),
+                "question: {question}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_subjects_keep_user_scope_without_personal_names() {
+        for question in [
+            "Сколько сообщений «автор_1» вчера написал?",
+            "Сколько сообщений «автор_1» сегодня отправил?",
+            "Сколько сообщений `user42` в июле написал?",
+            "Сколько сообщений «первый автор» обычно пишет?",
+        ] {
+            let research = ResearchState::for_question(question);
+            assert!(research.count_requires_user_scope, "question: {question}");
+        }
+        assert!(
+            !ResearchState::for_question("Сколько сообщений содержит «Rust»?")
+                .count_requires_user_scope
         );
     }
 
@@ -4504,6 +4963,9 @@ mod tests {
             "Нашлось 12 постов.",
             "Всего — двенадцать.",
             "Около двенадцати сообщений.",
+            "Сообщения найдены. Их было 12.",
+            "Совпадений оказалось 12.",
+            "Их ровно двенадцать.",
         ] {
             assert_eq!(
                 forced_final_markdown(&research, draft),
@@ -4511,6 +4973,48 @@ mod tests {
                 "draft: {draft}"
             );
         }
+        assert_eq!(
+            forced_final_markdown(&research, "Обсуждение касается Rust. Их было 12."),
+            "Точное количество сообщений по заданным условиям: 11.\n\nОбсуждение касается Rust."
+        );
+        for explanation in [
+            "Пример — сообщение 42 про Rust.",
+            "В 2025 году найден пост про Rust.",
+        ] {
+            assert!(!contains_message_count_claim(explanation));
+            assert_eq!(
+                forced_final_markdown(&research, explanation),
+                format!("Точное количество сообщений по заданным условиям: 11.\n\n{explanation}")
+            );
+        }
+        let link_explanation = "Пример: [сообщение](https://example.com/2025/report).";
+        assert_eq!(
+            forced_final_markdown(&research, link_explanation),
+            format!("Точное количество сообщений по заданным условиям: 11.\n\n{link_explanation}")
+        );
+        let linked_count_claim = "Пример: [сообщение](https://example.com/2025/report). Итого 12.";
+        assert_eq!(
+            forced_final_markdown(&research, linked_count_claim),
+            "Точное количество сообщений по заданным условиям: 11.\n\nПример: [сообщение](https://example.com/2025/report)."
+        );
+        for draft in [
+            "Найдено 12.",
+            "Сообщений было 12.",
+            "В 2025 году найден пост про Rust.",
+            "Пример — сообщение 42 про Rust.",
+            "В 42 сообщении обсуждался Rust.",
+            "Около 3 месяцев назад обсуждение продолжалось.",
+            "За 2025 год всего 1 раз меняли тему.",
+        ] {
+            assert_eq!(
+                contains_message_count_claim(draft),
+                matches!(draft, "Найдено 12." | "Сообщений было 12."),
+                "draft: {draft}"
+            );
+        }
+        assert!(contains_message_count_claim(
+            "В 2025 году было 2025 сообщений."
+        ));
     }
 
     #[test]
