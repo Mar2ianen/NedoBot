@@ -775,18 +775,38 @@ fn is_message_identifier_list_position(
     {
         return false;
     }
-    let next = |offset: usize| {
-        sentence_indices
-            .get(position + offset)
-            .map(|&index| markdown[spans[index].0..spans[index].1].to_lowercase())
-    };
-    if next(1).as_deref().is_some_and(is_numeric_token) {
+    let next_index = |offset: usize| sentence_indices.get(position + offset).copied();
+    let first_next = next_index(1);
+    if first_next.is_some_and(|index| {
+        let word = &markdown[spans[index].0..spans[index].1];
+        is_numeric_token(word)
+            && is_explicit_message_identifier_separator(
+                &markdown[spans[count_index].1..spans[index].0],
+            )
+    }) {
         return true;
     }
-    next(1)
-        .as_deref()
-        .is_some_and(|word| matches!(word, "и" | "или"))
-        && next(2).as_deref().is_some_and(is_numeric_token)
+    let second_next = next_index(2);
+    first_next.is_some_and(|index| matches!(&markdown[spans[index].0..spans[index].1], "и" | "или"))
+        && second_next.is_some_and(|index| {
+            let word = &markdown[spans[index].0..spans[index].1];
+            is_numeric_token(word)
+                && is_explicit_message_identifier_separator(
+                    &markdown[spans[count_index].1..spans[index].0],
+                )
+        })
+}
+
+fn is_explicit_message_identifier_separator(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let words = policy_words(trimmed);
+    words.iter().all(|word| matches!(*word, "и" | "или"))
+        || trimmed
+            .chars()
+            .any(|character| matches!(character, ',' | '-' | '–' | '—'))
 }
 
 fn is_message_identifier_noun(word: &str) -> bool {
@@ -2388,6 +2408,7 @@ fn has_implicit_count_scope_at(words: &[&str], index: usize, original_clause: &s
         || requirements.is_automatic_forward.is_some()
         || words_have_date_scope(tail)
         || user_scope_in_count_tail(tail)
+        || has_text_query_scope(tail)
 }
 
 fn has_event_message_count_clause(words: &[&str]) -> bool {
@@ -2639,6 +2660,10 @@ fn has_unsupported_structural_disjunction(
     requirements: &CountFilterRequirements,
     source: &str,
 ) -> bool {
+    let atom_spans = structural_atom_spans(words);
+    if has_scoped_disjunction(words, &atom_spans) {
+        return true;
+    }
     let has_structural_filter = requirements.has_links.is_some()
         || requirements.has_media.is_some()
         || requirements.has_photo.is_some()
@@ -2654,10 +2679,6 @@ fn has_unsupported_structural_disjunction(
         || requirements.is_automatic_forward.is_some();
     if !has_structural_filter {
         return false;
-    }
-    let atom_spans = structural_atom_spans(words);
-    if has_structural_text_disjunction(words, &atom_spans) {
-        return true;
     }
     if atom_spans.len() < 2 {
         return false;
@@ -2676,21 +2697,90 @@ fn has_unsupported_structural_disjunction(
     direct_disjunction || has_parenthetical_structural_disjunction(source)
 }
 
-fn has_structural_text_disjunction(words: &[&str], atom_spans: &[StructuralAtomSpan]) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeOperand {
+    Text,
+    User,
+    Date,
+    Structural,
+}
+
+fn has_scoped_disjunction(words: &[&str], atom_spans: &[StructuralAtomSpan]) -> bool {
     words.iter().enumerate().any(|(index, word)| {
         if !matches!(*word, "или" | "либо") {
             return false;
         }
-        let left = atom_spans.iter().rev().find(|span| span.end <= index);
-        let right = atom_spans.iter().find(|span| span.start > index);
-        let left_structural =
-            left.is_some_and(|span| structural_or_gap_is_neutral(words, span.end, index));
-        let right_structural =
-            right.is_some_and(|span| structural_or_gap_is_neutral(words, index + 1, span.start));
-        let left_text = has_text_query_scope(&words[..index]);
-        let right_text = has_text_query_scope(&words[index + 1..]);
-        (left_structural && right_text) || (left_text && right_structural)
+        let left = scope_operand_before_or(words, atom_spans, index);
+        let right = scope_operand_after_or(words, atom_spans, index, left);
+        match (left, right) {
+            (Some(ScopeOperand::Text), Some(ScopeOperand::Text)) | (None, _) | (_, None) => false,
+            (Some(_), Some(_)) => true,
+        }
     })
+}
+
+fn scope_operand_before_or(
+    words: &[&str],
+    atom_spans: &[StructuralAtomSpan],
+    or_index: usize,
+) -> Option<ScopeOperand> {
+    let last_atom = atom_spans.iter().rev().find(|span| span.end <= or_index);
+    if last_atom.is_some_and(|span| structural_or_gap_is_neutral(words, span.end, or_index)) {
+        return Some(ScopeOperand::Structural);
+    }
+    let suffix_start = last_atom.map_or(0, |span| span.end);
+    let suffix = &words[suffix_start..or_index];
+    if has_text_query_scope(suffix) {
+        Some(ScopeOperand::Text)
+    } else if has_explicit_user_scope_operand(suffix) {
+        Some(ScopeOperand::User)
+    } else if words_have_date_scope(suffix) {
+        Some(ScopeOperand::Date)
+    } else {
+        None
+    }
+}
+
+fn scope_operand_after_or(
+    words: &[&str],
+    atom_spans: &[StructuralAtomSpan],
+    or_index: usize,
+    left: Option<ScopeOperand>,
+) -> Option<ScopeOperand> {
+    let first_atom = atom_spans.iter().find(|span| span.start > or_index);
+    if first_atom.is_some_and(|span| structural_or_gap_is_neutral(words, or_index + 1, span.start))
+    {
+        return Some(ScopeOperand::Structural);
+    }
+    let suffix_end = first_atom.map_or(words.len(), |span| span.start);
+    let suffix = &words[or_index + 1..suffix_end];
+    if has_text_query_scope(suffix) {
+        Some(ScopeOperand::Text)
+    } else if has_explicit_user_scope_operand(suffix) {
+        Some(ScopeOperand::User)
+    } else if words_have_date_scope(suffix) {
+        Some(ScopeOperand::Date)
+    } else if left == Some(ScopeOperand::Text) && !suffix.is_empty() {
+        Some(ScopeOperand::Text)
+    } else {
+        None
+    }
+}
+
+fn has_explicit_user_scope_operand(tail: &[&str]) -> bool {
+    if tail.iter().copied().any(is_explicit_user_noun) {
+        return true;
+    }
+    if tail
+        .first()
+        .is_some_and(|word| is_genitive_user_reference(word))
+    {
+        return true;
+    }
+    tail.first().is_some_and(|word| matches!(*word, "от" | "у"))
+        && tail
+            .get(1)
+            .is_some_and(|word| is_positional_user_reference(word))
 }
 
 fn has_text_query_scope(words: &[&str]) -> bool {
@@ -2927,25 +3017,18 @@ fn reply_target_index(words: &[&str], reply_index: usize) -> Option<usize> {
         return None;
     }
     let end = words.len().min(reply_index + 6);
-    for marker_index in reply_index + 1..end {
-        if words[marker_index] != "на" {
-            continue;
-        }
-        let mut target_index = marker_index + 1;
-        if words
-            .get(target_index)
-            .is_some_and(|word| word.starts_with("сообщен"))
-        {
-            target_index += 1;
-        }
-        if words
-            .get(target_index)
-            .is_some_and(|word| is_numeric_token(word))
-        {
-            return Some(target_index);
-        }
+    let marker_index = (reply_index + 1..end).find(|&index| words[index] == "на")?;
+    let mut target_index = marker_index + 1;
+    if words
+        .get(target_index)
+        .is_some_and(|word| word.starts_with("сообщен"))
+    {
+        target_index += 1;
     }
-    None
+    words
+        .get(target_index)
+        .filter(|word| is_numeric_token(word))
+        .map(|_| target_index)
 }
 
 fn has_unsupported_reply_child_scope(words: &[&str]) -> bool {
@@ -5219,6 +5302,9 @@ mod tests {
         for question in [
             "сколько сообщений с фото или про Rust?",
             "сколько сообщений про Rust или с фото?",
+            "сколько сообщений с фото или от модератора?",
+            "сколько сообщений с фото или в июле?",
+            "сколько сообщений про Rust или от модератора?",
         ] {
             assert_eq!(
                 ResearchState::for_question(question).count_policy,
@@ -5272,6 +5358,8 @@ mod tests {
         for question in [
             "Сколько сообщений с фото, а сколько с видео?",
             "Сколько сообщений со ссылками, а сколько без ссылок?",
+            "Сколько сообщений про term_1, а сколько про term_2?",
+            "Сколько сообщений про term_1 и сколько про term_2?",
         ] {
             assert_eq!(
                 ResearchState::for_question(question).count_policy,
@@ -5306,6 +5394,11 @@ mod tests {
             Some(2025)
         );
         assert!(!bare_numeric_reply_target.count_requires_date_scope);
+        let topical_year = ResearchState::for_question(
+            "сколько сообщений было ответами на вопрос про планы на 2025 год?",
+        );
+        assert_eq!(topical_year.count_requires_reply_to_message_id, None);
+        assert!(topical_year.count_requires_date_scope);
 
         let unanswered =
             ResearchState::for_question("сколько сообщений, на которые никто не ответил?");
@@ -5504,6 +5597,7 @@ mod tests {
             "Сообщения найдены. Их было 12.",
             "Совпадений оказалось 12.",
             "Их ровно двенадцать.",
+            "Сообщений 12 000.",
         ] {
             assert_eq!(
                 forced_final_markdown(&research, draft),
@@ -5530,6 +5624,7 @@ mod tests {
             "В сборке насчитали 12 предупреждений.",
             "Сообщения 42 и 43 подтверждают вывод.",
             "Сообщения 42–44 содержат примеры.",
+            "Сообщения 42, 43 подтверждают вывод.",
         ] {
             assert!(
                 !contains_message_count_claim(explanation),
