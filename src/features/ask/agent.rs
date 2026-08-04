@@ -398,6 +398,9 @@ fn contains_message_count_claim(markdown: &str) -> bool {
         if is_date_like_count_position(markdown, &spans, &sentence_indices, index) {
             return false;
         }
+        if is_contextual_identifier_position(markdown, &spans, &sentence_indices, index) {
+            return false;
+        }
         let has_nearby_count_marker = sentence_indices.iter().copied().any(|other_index| {
             index.abs_diff(other_index) <= 3
                 && is_count_marker(
@@ -592,16 +595,32 @@ fn has_anaphoric_count_marker(
         .position(|&index| index == count_index)
         .unwrap_or(0);
     let start = position.saturating_sub(3);
-    sentence_indices[start..position].iter().any(|&index| {
+    let preceding = &sentence_indices[start..position];
+    let has_anaphoric_pronoun = preceding.iter().any(|&index| {
         matches!(
             markdown[spans[index].0..spans[index].1]
                 .to_lowercase()
                 .as_str(),
-            "их" | "ровно" | "было" | "оказалось" | "стало" | "получилось"
+            "их" | "таких"
         )
-    }) && sentence_indices[start..position]
-        .iter()
-        .any(|&index| markdown[spans[index].0..spans[index].1].to_lowercase() == "их")
+    });
+    let has_standalone_count_verb = preceding.iter().any(|&index| {
+        let word = markdown[spans[index].0..spans[index].1].to_lowercase();
+        matches!(
+            word.as_str(),
+            "было"
+                | "была"
+                | "были"
+                | "стало"
+                | "стали"
+                | "оказалось"
+                | "оказались"
+                | "получилось"
+                | "получили"
+                | "насчитали"
+        )
+    });
+    has_anaphoric_pronoun || has_standalone_count_verb
 }
 
 fn contains_anaphoric_count_claim(markdown: &str) -> bool {
@@ -658,7 +677,11 @@ fn is_message_count_target_noun(word: &str) -> bool {
 fn is_non_count_identifier_word(word: &str) -> bool {
     matches!(
         word,
-        "сообщении"
+        "сообщение"
+            | "сообщения"
+            | "сообщению"
+            | "сообщениям"
+            | "сообщении"
             | "сообщением"
             | "сообщениях"
             | "версии"
@@ -2160,7 +2183,11 @@ fn message_count_policy(question: &str) -> CountPolicy {
         let words = policy_words(&masked_clause);
         if let Some((_, lead_index, message_index)) = explicit_message_count_phrase(&words) {
             let requirements = structural_filter_requirements(&words[lead_index + 1..]);
-            if has_unsupported_structural_disjunction(&words[message_index + 1..], &requirements) {
+            if has_unsupported_structural_disjunction(
+                &words[message_index + 1..],
+                &requirements,
+                &masked_clause,
+            ) {
                 return CountPolicy::Unsupported(UnsupportedCountReason::StructuralDisjunction);
             }
             if has_unsupported_reply_child_scope(&words[lead_index + 1..]) {
@@ -2323,13 +2350,11 @@ fn is_person_like_user_word(word: &str) -> bool {
 }
 
 fn is_user_reference_token(word: &str) -> bool {
-    let has_ascii_letter = word
-        .chars()
-        .any(|character| character.is_ascii_alphabetic());
+    let has_alphabetic = word.chars().any(char::is_alphabetic);
     let has_identity_marker = word
         .chars()
         .any(|character| character.is_ascii_digit() || matches!(character, '_' | '@'));
-    has_ascii_letter && has_identity_marker
+    has_alphabetic && has_identity_marker
 }
 
 fn is_ascii_identifier_token(word: &str) -> bool {
@@ -2473,6 +2498,7 @@ fn set_structural_requirement(
 fn has_unsupported_structural_disjunction(
     words: &[&str],
     requirements: &CountFilterRequirements,
+    source: &str,
 ) -> bool {
     let has_structural_filter = requirements.has_links.is_some()
         || requirements.has_media.is_some()
@@ -2494,7 +2520,7 @@ fn has_unsupported_structural_disjunction(
     if atom_spans.len() < 2 {
         return false;
     }
-    words.iter().enumerate().any(|(index, word)| {
+    let direct_disjunction = words.iter().enumerate().any(|(index, word)| {
         if !matches!(*word, "или" | "либо") {
             return false;
         }
@@ -2504,7 +2530,53 @@ fn has_unsupported_structural_disjunction(
             structural_or_gap_is_neutral(words, left.end, index)
                 && structural_or_gap_is_neutral(words, index + 1, right.start)
         })
+    });
+    direct_disjunction || has_parenthetical_structural_disjunction(source)
+}
+
+fn has_parenthetical_structural_disjunction(source: &str) -> bool {
+    let source_lower = source.to_lowercase();
+    let word_spans = policy_word_spans(&source_lower);
+    let words = word_spans
+        .iter()
+        .map(|&(start, end)| &source_lower[start..end])
+        .collect::<Vec<_>>();
+    let atom_spans = structural_atom_spans(&words);
+    words.iter().enumerate().any(|(index, word)| {
+        if !matches!(*word, "или" | "либо") {
+            return false;
+        }
+        let left = atom_spans.iter().rev().find(|span| span.end <= index);
+        let right = atom_spans.iter().find(|span| span.start > index);
+        let Some((_left, right)) = left.zip(right) else {
+            return false;
+        };
+        let gap_start = word_spans[index].1;
+        let gap_end = word_spans[right.start].0;
+        has_balanced_parenthetical_gap(&source_lower[gap_start..gap_end])
     })
+}
+
+fn has_balanced_parenthetical_gap(gap: &str) -> bool {
+    let gap = gap.trim();
+    if gap.is_empty() {
+        return false;
+    }
+    if gap.starts_with('(') {
+        return gap.contains(')');
+    }
+    if gap.starts_with(',') {
+        return gap.rfind(',').is_some_and(|last_comma| {
+            !gap[last_comma + 1..].trim().contains(char::is_alphanumeric)
+        });
+    }
+    if gap.starts_with('—') || gap.starts_with('–') {
+        return gap
+            .char_indices()
+            .skip(1)
+            .any(|(_, character)| character == '—' || character == '–');
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2939,7 +3011,8 @@ fn split_count_clauses(question: &str) -> Vec<&str> {
         let remainder = &question[byte_offset + character.len_utf8()..];
         let dependent_comma =
             character == ',' && is_dependent_count_clause_start(prefix, remainder);
-        let structural_or_continuation = is_structural_or_continuation(prefix, remainder);
+        let structural_or_continuation =
+            is_structural_or_continuation(prefix, remainder, character);
         if is_count_clause_boundary(character)
             && !decimal_date_separator
             && !dependent_comma
@@ -2991,7 +3064,7 @@ fn is_dependent_count_clause_start(prefix: &str, remainder: &str) -> bool {
                         .is_some_and(|next| matches!(*next, "которые" | "которых" | "которым")))))
 }
 
-fn is_structural_or_continuation(prefix: &str, remainder: &str) -> bool {
+fn is_structural_or_continuation(prefix: &str, remainder: &str, boundary: char) -> bool {
     let prefix_lower = prefix.to_lowercase();
     let remainder_lower = remainder.to_lowercase();
     let prefix_words = policy_words(&prefix_lower);
@@ -3009,11 +3082,16 @@ fn is_structural_or_continuation(prefix: &str, remainder: &str) -> bool {
     {
         return false;
     }
-    let gap_is_parenthetical = prefix_words[or_index + 1..]
+    let gap_is_neutral = prefix_words[or_index + 1..]
         .iter()
         .copied()
         .all(is_structural_or_parenthetical_word);
-    if !gap_is_parenthetical {
+    let raw_gap = raw_suffix_after_coordination(&prefix_lower).unwrap_or_default();
+    let has_parenthetical_punctuation = matches!(boundary, ',' | '(' | ')' | '—' | '–')
+        || raw_gap
+            .chars()
+            .any(|character| matches!(character, ',' | '(' | ')' | '—' | '–'));
+    if !gap_is_neutral && !has_parenthetical_punctuation {
         return false;
     }
     let right_words = remainder_words.iter().take(12).copied();
@@ -3025,6 +3103,14 @@ fn is_structural_or_continuation(prefix: &str, remainder: &str) -> bool {
             || is_forward_scope_word(word)
             || is_reply_lexeme(word)
     })
+}
+
+fn raw_suffix_after_coordination(value: &str) -> Option<&str> {
+    let spans = policy_word_spans(value);
+    spans
+        .iter()
+        .rfind(|&&(start, end)| matches!(&value[start..end], "или" | "либо"))
+        .map(|&(_, end)| &value[end..])
 }
 
 fn is_structural_or_parenthetical_word(word: &str) -> bool {
@@ -3125,6 +3211,22 @@ fn quoted_user_subject_near_count_verb(clause: &str) -> bool {
                 && (before.last().is_some_and(|word| is_count_verb(word))
                     || bounded_user_context_after_lexical_region(&after))
         })
+}
+
+fn policy_word_spans(value: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character.is_alphanumeric() || character == '_' {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            spans.push((word_start, index));
+        }
+    }
+    if let Some(word_start) = start {
+        spans.push((word_start, value.len()));
+    }
+    spans
 }
 
 fn policy_words(value: &str) -> Vec<&str> {
@@ -3530,10 +3632,17 @@ fn is_temporal_year_at(words: &[&str], index: usize) -> bool {
 }
 
 fn is_bare_date_after_message(words: &[&str], index: usize) -> bool {
-    index
-        .checked_sub(1)
-        .and_then(|previous| words.get(previous))
-        .is_some_and(|word| is_message_word(word))
+    let Some((_, _, message_index)) = explicit_message_count_phrase(words) else {
+        return false;
+    };
+    index > message_index
+        && words[message_index + 1..index]
+            .iter()
+            .enumerate()
+            .all(|(offset, word)| {
+                let word_index = message_index + 1 + offset;
+                !is_message_topic_marker(word) && !is_structural_filter_at(words, word_index)
+            })
 }
 
 fn is_temporal_date_construction_at(words: &[&str], index: usize) -> bool {
@@ -4887,6 +4996,8 @@ mod tests {
             "сколько сообщений с фото или, например, с видео?",
             "сколько сообщений с фото или — если точнее — с видео?",
             "сколько сообщений с фото либо (например) без видео?",
+            "сколько сообщений с фото или, к примеру, с видео?",
+            "сколько сообщений с фото или, скажем, с видео?",
             "сколько сообщений с фото или не с видео?",
             "сколько сообщений с фото или не пересланные?",
             "сколько сообщений, которые были ответами либо не с видео?",
@@ -4997,6 +5108,7 @@ mod tests {
             "Сколько сообщений написал первый автор, а сколько написал модератор?",
             "Сколько сообщений написал первый автор, а сколько написал systemd?",
             "Сколько сообщений написал первый автор, а сколько написал mod_team?",
+            "Сколько сообщений написал первый автор, а сколько написал кириллический_ник?",
             "Сколько сообщений написал первый автор? Сколько написал второй автор?",
         ] {
             assert_eq!(
@@ -5032,6 +5144,8 @@ mod tests {
             "Сколько сообщений «модератор» написал?",
             "Сколько сообщений systemd написал?",
             "Сколько сообщений mod_team написал?",
+            "Сколько сообщений написал кириллический_ник?",
+            "Сколько сообщений от кириллический_ник?",
         ] {
             let research = ResearchState::for_question(question);
             assert!(research.count_requires_user_scope, "question: {question}");
@@ -5090,6 +5204,9 @@ mod tests {
             "Совпало 12.",
             "Результат — 12.",
             "Подходящих: 12.",
+            "Таких было 12.",
+            "Получилось 12.",
+            "Насчитали 12.",
             "Сообщения найдены. Их было 12.",
             "Совпадений оказалось 12.",
             "Их ровно двенадцать.",
@@ -5109,6 +5226,9 @@ mod tests {
             "В 2025 году найден пост про Rust.",
             "В сообщении 42 найден Rust.",
             "В версии 12 сообщения сортируются иначе.",
+            "Для сообщения 42 найден контекст.",
+            "Ответ на сообщение 42 найден в истории.",
+            "Результат для сообщения 42 доступен.",
         ] {
             assert!(!contains_message_count_claim(explanation));
             assert_eq!(
@@ -5133,13 +5253,23 @@ mod tests {
             "Пример — сообщение 42 про Rust.",
             "В сообщении 42 найден Rust.",
             "В версии 12 сообщения сортируются иначе.",
+            "Для сообщения 42 найден контекст.",
+            "Ответ на сообщение 42 найден в истории.",
+            "Результат для сообщения 42 доступен.",
             "В 42 сообщении обсуждался Rust.",
             "Около 3 месяцев назад обсуждение продолжалось.",
             "За 2025 год всего 1 раз меняли тему.",
         ] {
             assert_eq!(
                 contains_message_count_claim(draft),
-                matches!(draft, "Найдено 12." | "Сообщений было 12."),
+                matches!(
+                    draft,
+                    "Найдено 12."
+                        | "Сообщений было 12."
+                        | "Таких было 12."
+                        | "Получилось 12."
+                        | "Насчитали 12."
+                ),
                 "draft: {draft}"
             );
         }
@@ -5214,6 +5344,17 @@ mod tests {
                 ResearchState::for_question(question).count_requires_date_scope,
                 "question: {question}"
             );
+            assert!(
+                expected_date_scope(question).is_some(),
+                "question: {question}"
+            );
+        }
+        for question in [
+            "сколько сообщений модератора 2025 года?",
+            "сколько сообщений модератор написал 3 августа?",
+        ] {
+            let research = ResearchState::for_question(question);
+            assert!(research.count_requires_date_scope, "question: {question}");
             assert!(
                 expected_date_scope(question).is_some(),
                 "question: {question}"
