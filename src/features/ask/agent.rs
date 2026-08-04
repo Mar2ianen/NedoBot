@@ -29,6 +29,10 @@ const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
 const COUNT_INTENT_LOOKAHEAD_WORDS: usize = 24;
 const RESEARCH_BUDGET_EXHAUSTED_FALLBACK: &str = "Не могу дать надёжный ответ: для проверки нужны дополнительные поиски или контекст сообщений, но лимит исследования исчерпан. Лучше повторите вопрос с более узкими деталями.";
+const UNSUPPORTED_COUNT_REPLY_SCOPE: &str = "Точный подсчёт по этому запросу сейчас недоступен: текущий инструмент умеет считать сообщения, которые сами являются ответами, но не сообщения, получившие дочерние ответы.";
+const UNSUPPORTED_COUNT_STRUCTURAL_DISJUNCTION: &str = "Точный подсчёт по этому запросу сейчас недоступен: текущий инструмент не выражает дизъюнкцию structural-фильтров через «или». Уточните один тип фильтра.";
+const UNSUPPORTED_COUNT_MULTIPLE: &str = "Точный подсчёт по этому запросу сейчас недоступен: в нём задано несколько независимых количеств. Разделите вопросы на отдельные запросы.";
+const UNSUPPORTED_COUNT_DATE_SCOPE: &str = "Точный подсчёт по этому запросу сейчас недоступен: относительный период нельзя однозначно сопоставить с датами. Уточните даты начала и конца.";
 
 pub struct AskRequest<'a> {
     pub ask_run_id: Option<i64>,
@@ -59,7 +63,7 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count, has_more, next_offset и scan_limit_reached: для продолжения передай next_offset как offset, а при scan_limit_reached обозначь неполный охват и не пытайся обходить потолок.
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
-- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.search_messages или chat.search_messages_batch с теми же фильтрами и query, затем chat.count_messages с тем же нормализованным query, датами, scope и match_mode. Для date-scoped count сначала также сделай search с тем же периодом. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений. Дизъюнктивные structural-фильтры через «или» не форсируй в authoritative count: используй поиск и явно обозначь ограничение.
+- Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.search_messages или chat.search_messages_batch с теми же фильтрами и query, затем chat.count_messages с тем же нормализованным query, датами, scope и match_mode. Для date-scoped count сначала также сделай search с тем же периодом. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений. Дизъюнктивные structural-фильтры через «или», несколько независимых count-вопросов и относительные периоды без точных дат не форсируй в authoritative count: используй поиск и явно обозначь ограничение. has_reply означает, что само сообщение является reply; не используй его для подсчёта сообщений, на которые кто-то ответил, или сообщений с дочерними ответами.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
@@ -140,7 +144,8 @@ struct ResearchState {
     count_requires_is_automatic_forward: Option<bool>,
     count_queries: usize,
     count_request: Option<CountRequestScope>,
-    expected_date_scope: Option<ExpectedDateScope>,
+    accepted_count: Option<i64>,
+    date_scope_policy: DateScopePolicy,
     user_resolution_attempted: bool,
     resolved_user_ids: HashSet<i64>,
     search_scopes: Vec<CountRequestScope>,
@@ -172,7 +177,17 @@ enum CountPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnsupportedCountReason {
     StructuralDisjunction,
-    UnansweredMessages,
+    ReplyChildScope,
+    MultipleCounts,
+    UnsupportedDateScope,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum DateScopePolicy {
+    #[default]
+    NoDateRequested,
+    Exact(ExpectedDateScope),
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,9 +368,21 @@ fn normalized_query_matches(left: Option<&str>, right: Option<&str>) -> bool {
         .is_some_and(|(left, right)| normalized_query(left) == normalized_query(right))
 }
 
+fn should_cache_tool_result(tool: &str) -> bool {
+    tool != "chat.count_messages"
+}
+
 impl ResearchState {
     fn for_question(question: &str) -> Self {
-        let count_policy = message_count_policy(question);
+        let date_scope_policy = date_scope_policy(question);
+        let count_policy = match message_count_policy(question) {
+            CountPolicy::Supported(_)
+                if matches!(&date_scope_policy, DateScopePolicy::Unsupported) =>
+            {
+                CountPolicy::Unsupported(UnsupportedCountReason::UnsupportedDateScope)
+            }
+            policy => policy,
+        };
         let count_intent = match count_policy {
             CountPolicy::Supported(intent) => Some(intent),
             CountPolicy::NotACountQuestion | CountPolicy::Unsupported(_) => None,
@@ -366,7 +393,10 @@ impl ResearchState {
             count_policy,
             count_intent,
             count_requires_query: matches!(count_intent, Some(CountIntent::Matching)),
-            count_requires_date_scope: question_mentions_date_scope(question),
+            count_requires_date_scope: !matches!(
+                &date_scope_policy,
+                DateScopePolicy::NoDateRequested
+            ),
             count_requires_user_scope: question_mentions_user_scope(question),
             count_requires_has_links: filter_requirements.has_links,
             count_requires_has_media: filter_requirements.has_media,
@@ -381,7 +411,7 @@ impl ResearchState {
             count_requires_has_reply: filter_requirements.has_reply,
             count_requires_include_forwards: filter_requirements.include_forwards,
             count_requires_is_automatic_forward: filter_requirements.is_automatic_forward,
-            expected_date_scope: expected_date_scope(question),
+            date_scope_policy: date_scope_policy.clone(),
             personal_fact_required: asks_personal_fact(question),
             ..Self::default()
         }
@@ -464,6 +494,15 @@ async fn answer_within_deadline(
 
         if tool_calls.is_empty() {
             if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
+                if let CountPolicy::Unsupported(reason) = research.count_policy {
+                    return finish_answer(
+                        mcp,
+                        progress,
+                        unsupported_count_fallback(reason),
+                        &evidence,
+                    )
+                    .await;
+                }
                 if let Some(instruction) = research.follow_up_instruction(markdown) {
                     messages.push(assistant_message(&response));
                     push_observation(
@@ -507,10 +546,9 @@ async fn answer_within_deadline(
             let tracking_arguments = arguments.clone();
             let started = Instant::now();
 
-            if let Some(cached) = tool_cache.get(&signature) {
-                if tool == "chat.count_messages" {
-                    research.revalidate_cached_count(arguments, &cached.value);
-                }
+            if should_cache_tool_result(tool)
+                && let Some(cached) = tool_cache.get(&signature)
+            {
                 audit_tool_call(
                     pool,
                     ask_run_id,
@@ -592,7 +630,7 @@ async fn answer_within_deadline(
                 ));
                 continue;
             }
-            if !tool_signatures.insert(signature.clone()) {
+            if !tool_signatures.insert(signature.clone()) && should_cache_tool_result(tool) {
                 audit_tool_call(
                     pool,
                     ask_run_id,
@@ -643,7 +681,9 @@ async fn answer_within_deadline(
             .await
             {
                 Ok(result) => {
-                    tool_cache.insert(signature, result.clone());
+                    if should_cache_tool_result(tool) {
+                        tool_cache.insert(signature, result.clone());
+                    }
                     audit_tool_call(
                         pool,
                         ask_run_id,
@@ -722,10 +762,22 @@ async fn answer_within_deadline(
 }
 
 fn forced_final_markdown<'a>(research: &ResearchState, markdown: &'a str) -> &'a str {
+    if let CountPolicy::Unsupported(reason) = research.count_policy {
+        return unsupported_count_fallback(reason);
+    }
     if research.follow_up_instruction(markdown).is_some() {
         RESEARCH_BUDGET_EXHAUSTED_FALLBACK
     } else {
         markdown
+    }
+}
+
+fn unsupported_count_fallback(reason: UnsupportedCountReason) -> &'static str {
+    match reason {
+        UnsupportedCountReason::StructuralDisjunction => UNSUPPORTED_COUNT_STRUCTURAL_DISJUNCTION,
+        UnsupportedCountReason::ReplyChildScope => UNSUPPORTED_COUNT_REPLY_SCOPE,
+        UnsupportedCountReason::MultipleCounts => UNSUPPORTED_COUNT_MULTIPLE,
+        UnsupportedCountReason::UnsupportedDateScope => UNSUPPORTED_COUNT_DATE_SCOPE,
     }
 }
 
@@ -1106,17 +1158,6 @@ fn collect_source_evidence_value(value: &Value, evidence: &mut Evidence) {
 }
 
 impl ResearchState {
-    fn revalidate_cached_count(&mut self, arguments: &Value, result: &Value) {
-        if !result.get("count").and_then(Value::as_i64).is_some() {
-            return;
-        }
-        let scope = CountRequestScope::from_arguments(arguments);
-        if self.count_scope_satisfies_intent(&scope) {
-            self.count_queries = self.count_queries.max(1);
-            self.count_request = Some(scope);
-        }
-    }
-
     fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
         match tool {
             "chat.resolve_user" => {
@@ -1124,6 +1165,7 @@ impl ResearchState {
                 self.resolved_user_ids.clear();
                 self.count_queries = 0;
                 self.count_request = None;
+                self.accepted_count = None;
                 self.search_scopes.clear();
                 if let Some(users) = result.get("users").and_then(Value::as_array) {
                     self.resolved_user_ids
@@ -1171,6 +1213,7 @@ impl ResearchState {
                 {
                     self.count_queries = 0;
                     self.count_request = None;
+                    self.accepted_count = None;
                 }
                 self.message_searches += searches;
                 if arguments.get("user_id").and_then(Value::as_i64).is_some() {
@@ -1183,11 +1226,12 @@ impl ResearchState {
             }
             "chat.count_messages" => {
                 let count_scope = CountRequestScope::from_arguments(arguments);
-                if result.get("count").and_then(Value::as_i64).is_some()
+                if let Some(count) = result.get("count").and_then(Value::as_i64)
                     && self.count_scope_satisfies_intent(&count_scope)
                 {
                     self.count_queries += 1;
                     self.count_request = Some(count_scope);
+                    self.accepted_count = Some(count);
                 }
             }
             "chat.get_recent_messages" => {
@@ -1238,12 +1282,13 @@ impl ResearchState {
         }
 
         let has_date_scope = scope.date_from.is_some() || scope.date_to.is_some();
-        if self.count_requires_date_scope {
-            if scope.date_from.is_none() || scope.date_to.is_none() {
+        match &self.date_scope_policy {
+            DateScopePolicy::NoDateRequested if has_date_scope => return false,
+            DateScopePolicy::Exact(_) if scope.date_from.is_none() || scope.date_to.is_none() => {
                 return false;
             }
-        } else if has_date_scope {
-            return false;
+            DateScopePolicy::Unsupported => return false,
+            DateScopePolicy::NoDateRequested | DateScopePolicy::Exact(_) => {}
         }
 
         let links_match = match self.count_requires_has_links {
@@ -1285,7 +1330,9 @@ impl ResearchState {
         if self.count_requires_query && !self.query_matches_search_scope(scope) {
             return false;
         }
-        if self.count_requires_date_scope && !self.count_request_matches_date_search(scope) {
+        if matches!(&self.date_scope_policy, DateScopePolicy::Exact(_))
+            && !self.count_request_matches_date_search(scope)
+        {
             return false;
         }
 
@@ -1312,10 +1359,14 @@ impl ResearchState {
     }
 
     fn date_scope_matches_question(&self, scope: &CountRequestScope) -> bool {
-        self.expected_date_scope.as_ref().is_none_or(|expected| {
-            scope.date_from.as_deref() == Some(expected.date_from.as_str())
-                && scope.date_to.as_deref() == Some(expected.date_to.as_str())
-        })
+        match &self.date_scope_policy {
+            DateScopePolicy::NoDateRequested => true,
+            DateScopePolicy::Exact(expected) => {
+                scope.date_from.as_deref() == Some(expected.date_from.as_str())
+                    && scope.date_to.as_deref() == Some(expected.date_to.as_str())
+            }
+            DateScopePolicy::Unsupported => false,
+        }
     }
 
     fn query_matches_search_scope(&self, scope: &CountRequestScope) -> bool {
@@ -1336,21 +1387,6 @@ impl ResearchState {
     }
 
     fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
-        if let CountPolicy::Unsupported(reason) = self.count_policy
-            && !unsupported_count_answer_is_safe(markdown)
-        {
-            let reason = match reason {
-                UnsupportedCountReason::StructuralDisjunction => {
-                    "запрос содержит дизъюнкцию structural-фильтров («или»), для которой текущий count tool не даёт точного результата"
-                }
-                UnsupportedCountReason::UnansweredMessages => {
-                    "запрос спрашивает о сообщениях, на которые никто не ответил; текущий has_reply фильтрует сами reply, а не дочерние ответы"
-                }
-            };
-            return Some(format!(
-                "SYSTEM: нельзя выдавать точный count_messages для этого запроса: {reason}. Объясни ограничение пользователю и не называй число точным; можно привести примеры через поиск."
-            ));
-        }
         if self.count_required && self.count_request.is_none() {
             let instruction = match self.count_intent {
                 Some(CountIntent::Matching) => {
@@ -1571,6 +1607,9 @@ fn message_count_intent(question: &str) -> Option<CountIntent> {
 
 fn message_count_policy(question: &str) -> CountPolicy {
     let question = question.to_lowercase();
+    if has_multiple_count_intents(&question) {
+        return CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts);
+    }
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -1581,8 +1620,8 @@ fn message_count_policy(question: &str) -> CountPolicy {
             if has_unsupported_structural_disjunction(&words[message_index + 1..], &requirements) {
                 return CountPolicy::Unsupported(UnsupportedCountReason::StructuralDisjunction);
             }
-            if has_unsupported_unanswered_scope(&words[message_index + 1..]) {
-                return CountPolicy::Unsupported(UnsupportedCountReason::UnansweredMessages);
+            if has_unsupported_reply_child_scope(&words[message_index + 1..]) {
+                return CountPolicy::Unsupported(UnsupportedCountReason::ReplyChildScope);
             }
             let matching_scope = has_message_topic_marker(&words[message_index + 1..]);
             return CountPolicy::Supported(if matching_scope {
@@ -1644,6 +1683,18 @@ fn message_count_policy(question: &str) -> CountPolicy {
         }
     }
     CountPolicy::NotACountQuestion
+}
+
+fn has_multiple_count_intents(question: &str) -> bool {
+    let words = question
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let count_leads = words
+        .iter()
+        .filter(|word| matches!(**word, "сколько" | "скольких" | "количество" | "число"))
+        .count();
+    count_leads > 1
 }
 
 fn message_filter_requirements(question: &str) -> CountFilterRequirements {
@@ -1756,17 +1807,41 @@ fn has_unsupported_structural_disjunction(
     has_structural_filter && words.contains(&"или")
 }
 
-fn has_unsupported_unanswered_scope(words: &[&str]) -> bool {
-    words
+fn has_unsupported_reply_child_scope(words: &[&str]) -> bool {
+    if words
         .windows(2)
         .any(|pair| pair[0] == "без" && is_reply_lexeme(pair[1]))
-        || words.windows(5).any(|window| {
-            window[0] == "на"
-                && matches!(window[1], "которые" | "которых" | "которым")
-                && window[2] == "никто"
-                && window[3] == "не"
-                && is_answer_verb(window[4])
-        })
+    {
+        return true;
+    }
+    if words.windows(2).any(|pair| {
+        (pair[0] == "с" || pair[0] == "со" || pair[0].starts_with("получ"))
+            && is_reply_lexeme(pair[1])
+    }) {
+        return true;
+    }
+    if words.windows(3).any(|window| {
+        window[0] == "на"
+            && matches!(window[1], "которые" | "которых" | "которым")
+            && is_answer_verb(window[2])
+    }) || words.windows(3).any(|window| {
+        matches!(window[0], "которые" | "которых" | "которым")
+            && window[1].starts_with("получ")
+            && is_reply_lexeme(window[2])
+    }) {
+        return true;
+    }
+
+    words.windows(5).any(|window| {
+        window[0] == "на"
+            && matches!(window[1], "которые" | "которых" | "которым")
+            && window[2] == "никто"
+            && window[3] == "не"
+            && is_answer_verb(window[4])
+    }) || (reply_scope_requirement(words).is_some()
+        && words.windows(3).any(|window| {
+            window[0] == "не" && is_reply_auxiliary(window[1]) && is_reply_lexeme(window[2])
+        }))
 }
 
 fn has_reply_requirement(words: &[&str]) -> Option<bool> {
@@ -1778,9 +1853,7 @@ fn has_reply_requirement(words: &[&str]) -> Option<bool> {
             .checked_sub(1)
             .and_then(|previous| words.get(previous))
             .copied();
-        let previous_is_auxiliary = previous.is_some_and(|previous| {
-            previous.starts_with("был") || previous.starts_with("явля") || previous == "являлись"
-        });
+        let previous_is_auxiliary = previous.is_some_and(is_reply_auxiliary);
         let previous_is_negated_auxiliary = previous_is_auxiliary
             && index
                 .checked_sub(2)
@@ -1795,6 +1868,10 @@ fn has_reply_requirement(words: &[&str]) -> Option<bool> {
             None
         }
     })
+}
+
+fn is_reply_auxiliary(word: &str) -> bool {
+    word.starts_with("был") || word.starts_with("явля") || word == "являлись"
 }
 
 fn is_reply_lexeme(word: &str) -> bool {
@@ -2001,6 +2078,16 @@ fn question_mentions_date_scope(question: &str) -> bool {
         }
     }
     false
+}
+
+fn date_scope_policy(question: &str) -> DateScopePolicy {
+    if !question_mentions_date_scope(question) {
+        return DateScopePolicy::NoDateRequested;
+    }
+    match expected_date_scope(question) {
+        Some(expected) => DateScopePolicy::Exact(expected),
+        None => DateScopePolicy::Unsupported,
+    }
 }
 
 fn is_date_scope_word(word: &str) -> bool {
@@ -2781,46 +2868,6 @@ fn answer_claims_insufficient_data(markdown: &str) -> bool {
     .any(|marker| markdown.contains(marker))
 }
 
-fn unsupported_count_answer_is_safe(markdown: &str) -> bool {
-    let markdown = markdown.to_lowercase();
-    let limitation = [
-        "не могу точно посчитать",
-        "нельзя точно посчитать",
-        "невозможно точно посчитать",
-        "точное количество невозможно",
-        "точно посчитать невозможно",
-        "точное количество не поддерживается",
-        "не поддерживается текущим инструментом",
-        "не позволяет получить точное количество",
-        "не выражается через точный count",
-    ]
-    .iter()
-    .any(|marker| markdown.contains(marker));
-    limitation
-        && !markdown.chars().any(|character| character.is_ascii_digit())
-        && !markdown
-            .split(|character: char| !character.is_alphabetic())
-            .any(|word| {
-                matches!(
-                    word,
-                    "ноль"
-                        | "один"
-                        | "одна"
-                        | "два"
-                        | "две"
-                        | "три"
-                        | "четыре"
-                        | "пять"
-                        | "шесть"
-                        | "семь"
-                        | "восемь"
-                        | "девять"
-                        | "десять"
-                        | "несколько"
-                )
-            })
-}
-
 fn push_observation(observations: &mut Vec<String>, observation: String) {
     observations.push(first_chars(&observation, MAX_OBSERVATION_CHARS));
     while observations
@@ -3490,18 +3537,18 @@ mod tests {
     }
 
     #[test]
-    fn cached_count_is_revalidated_after_search_provenance() {
+    fn count_is_reexecuted_after_search_provenance() {
         let mut research = ResearchState::for_question("сколько сообщений про Rust?");
         let arguments = json!({"query": "Rust"});
-        let result = json!({"count": 2});
-
-        research.revalidate_cached_count(&arguments, &result);
+        research.record("chat.count_messages", &arguments, &json!({"count": 10}));
         assert_eq!(research.count_queries, 0);
 
         research.record("chat.search_messages", &arguments, &json!([]));
-        research.revalidate_cached_count(&arguments, &result);
+        research.record("chat.count_messages", &arguments, &json!({"count": 11}));
         assert_eq!(research.count_queries, 1);
-        assert!(research.count_request.is_some());
+        assert_eq!(research.accepted_count, Some(11));
+        assert!(!should_cache_tool_result("chat.count_messages"));
+        assert!(should_cache_tool_result("chat.search_messages"));
     }
 
     #[test]
@@ -3532,9 +3579,22 @@ mod tests {
             ResearchState::for_question("сколько сообщений, на которые никто не ответил?");
         assert_eq!(
             unanswered.count_policy,
-            CountPolicy::Unsupported(UnsupportedCountReason::UnansweredMessages)
+            CountPolicy::Unsupported(UnsupportedCountReason::ReplyChildScope)
         );
         assert!(!unanswered.count_required);
+
+        for question in [
+            "сколько сообщений с ответами?",
+            "сколько сообщений, на которые ответили?",
+            "сколько сообщений получили ответы?",
+            "сколько сообщений не были ответами на сообщение 42?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_policy,
+                CountPolicy::Unsupported(UnsupportedCountReason::ReplyChildScope),
+                "question: {question}"
+            );
+        }
     }
 
     #[test]
@@ -3550,23 +3610,29 @@ mod tests {
             &json!({"count": 3}),
         );
         assert_eq!(research.count_queries, 0);
-        assert!(
-            research
-                .follow_up_instruction("Точный ответ: 3 сообщения")
-                .is_some()
+        assert_eq!(
+            forced_final_markdown(&research, "Нельзя точно посчитать, найдено 11 сообщений"),
+            UNSUPPORTED_COUNT_STRUCTURAL_DISJUNCTION
         );
-        assert!(research
-            .follow_up_instruction(
-                "Нельзя точно посчитать этот вариант: текущий инструмент не поддерживает дизъюнкцию."
-            )
-            .is_none());
-        assert!(
-            research
-                .follow_up_instruction(
-                    "Нельзя точно посчитать этот вариант, но найдено 3 сообщения."
-                )
-                .is_some()
-        );
+    }
+
+    #[test]
+    fn multiple_count_questions_are_not_partially_authoritative() {
+        for question in [
+            "Сколько сообщений с фото, а сколько сообщений с видео?",
+            "Сколько сообщений написал один автор и сколько написала другой автор?",
+        ] {
+            let research = ResearchState::for_question(question);
+            assert_eq!(
+                research.count_policy,
+                CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts),
+                "question: {question}"
+            );
+            assert_eq!(
+                forced_final_markdown(&research, "Фото: 10, видео: 20"),
+                UNSUPPORTED_COUNT_MULTIPLE
+            );
+        }
     }
 
     #[test]
@@ -3580,6 +3646,16 @@ mod tests {
         assert!(explicit_year_only.date_from.starts_with("2025-01-01T"));
         assert!(expected_date_scope("сколько сообщений было за год?").is_some());
         assert!(expected_date_scope("сколько сообщений было за прошлый месяц?").is_some());
+        let unsupported_relative =
+            ResearchState::for_question("сколько сообщений за последний месяц?");
+        assert_eq!(
+            unsupported_relative.date_scope_policy,
+            DateScopePolicy::Unsupported
+        );
+        assert_eq!(
+            unsupported_relative.count_policy,
+            CountPolicy::Unsupported(UnsupportedCountReason::UnsupportedDateScope)
+        );
         let mut research = ResearchState::for_question("сколько сообщений в июле?");
         research.record(
             "chat.search_messages",
@@ -3619,6 +3695,25 @@ mod tests {
             &json!({"count": 1}),
         );
         assert_eq!(research.count_queries, 1);
+
+        let mut research = ResearchState::for_question("сколько сообщений за последний месяц?");
+        research.record(
+            "chat.search_messages",
+            &json!({
+                "date_from": "2020-01-01",
+                "date_to": "2020-01-31"
+            }),
+            &json!([]),
+        );
+        research.record(
+            "chat.count_messages",
+            &json!({
+                "date_from": "2020-01-01",
+                "date_to": "2020-01-31"
+            }),
+            &json!({"count": 4}),
+        );
+        assert_eq!(research.count_queries, 0);
     }
 
     #[test]
