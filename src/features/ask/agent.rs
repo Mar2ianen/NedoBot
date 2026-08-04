@@ -348,6 +348,16 @@ struct CountFilterRequirements {
     is_automatic_forward: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StructuralAtom {
+    Link,
+    Media(MediaFilterKind),
+    IsReply,
+    ReplyTo,
+    Forward,
+    AutomaticForward,
+}
+
 fn exact_filter_matches(expected: Option<bool>, actual: Option<bool>) -> bool {
     match expected {
         Some(expected) => actual == Some(expected),
@@ -770,7 +780,7 @@ fn forced_final_markdown(research: &ResearchState, markdown: &str) -> String {
         return unsupported_count_fallback(reason).to_owned();
     }
     if let Some(count) = research.accepted_count {
-        return format!("Точное количество сообщений по заданным условиям: {count}.");
+        return format!("Точное количество сообщений по заданным условиям: {count}.\n\n{markdown}");
     }
     if research.follow_up_instruction(markdown).is_some() {
         RESEARCH_BUDGET_EXHAUSTED_FALLBACK.to_owned()
@@ -1683,7 +1693,10 @@ fn has_multiple_message_count_clauses(question: &str) -> bool {
 
 fn recognized_message_count_phrase_count(words: &[&str]) -> usize {
     let explicit = (0..words.len())
-        .filter(|&index| explicit_message_count_at(words, index).is_some())
+        .filter(|&index| {
+            explicit_message_count_at(words, index).is_some()
+                && !count_phrase_is_topic_mention(words, index)
+        })
         .count();
     let event = words
         .windows(2)
@@ -1722,8 +1735,24 @@ fn has_event_message_count_at(words: &[&str], index: usize) -> bool {
 
 fn has_implicit_author_message_count_at(words: &[&str], index: usize) -> bool {
     let tail = &words[index + 1..words.len().min(index + 1 + COUNT_INTENT_LOOKAHEAD_WORDS)];
-    tail.iter().copied().any(is_message_count_verb)
-        && tail.iter().copied().any(is_message_author_marker)
+    tail.iter().enumerate().any(|(verb_index, word)| {
+        is_message_count_verb(word)
+            && (verb_index
+                .checked_sub(1)
+                .and_then(|previous| tail.get(previous))
+                .is_some_and(|candidate| is_user_candidate(candidate))
+                || tail
+                    .get(verb_index + 1)
+                    .is_some_and(|candidate| is_user_candidate(candidate)))
+    })
+}
+
+fn count_phrase_is_topic_mention(words: &[&str], index: usize) -> bool {
+    let coordination_boundary = words[..index]
+        .iter()
+        .rposition(|word| matches!(*word, "и" | "а" | "но"));
+    let prefix = &words[coordination_boundary.map_or(0, |boundary| boundary + 1)..index];
+    prefix.iter().copied().any(is_message_topic_marker)
 }
 
 fn is_message_count_verb(word: &str) -> bool {
@@ -1748,19 +1777,6 @@ fn is_message_word(word: &str) -> bool {
     matches!(
         word,
         "сообщение" | "сообщения" | "сообщений" | "сообщении" | "сообщениях"
-    )
-}
-
-fn is_message_author_marker(word: &str) -> bool {
-    matches!(
-        word,
-        "автор"
-            | "автора"
-            | "автором"
-            | "пользователь"
-            | "пользователя"
-            | "участник"
-            | "участника"
     )
 }
 
@@ -1867,32 +1883,68 @@ fn has_unsupported_structural_disjunction(
         || requirements.has_audio.is_some()
         || requirements.has_voice.is_some()
         || requirements.has_sticker.is_some()
-        || requirements.has_animation.is_some();
+        || requirements.has_animation.is_some()
+        || requirements.has_reply.is_some()
+        || requirements.reply_to_message_id.is_some()
+        || requirements.include_forwards.is_some()
+        || requirements.is_automatic_forward.is_some();
     has_structural_filter
         && words.iter().enumerate().any(|(index, word)| {
             matches!(*word, "или" | "либо")
-                && structural_term_near(words, index, -1)
-                && structural_term_near(words, index, 1)
+                && structural_term_near(words, index, -1).is_some()
+                && structural_term_near(words, index, 1).is_some()
         })
 }
 
-fn structural_term_near(words: &[&str], index: usize, direction: isize) -> bool {
+fn structural_term_near(words: &[&str], index: usize, direction: isize) -> Option<StructuralAtom> {
     let mut current = index as isize + direction;
     for _ in 0..2 {
-        let Some(word) = current
+        let word = current
             .try_into()
             .ok()
-            .and_then(|position: usize| words.get(position))
-        else {
-            return false;
-        };
+            .and_then(|position: usize| words.get(position))?;
         if matches!(*word, "с" | "со" | "без") {
             current += direction;
             continue;
         }
-        return is_link_filter_word(word) || media_filter_kind(word).is_some();
+        return structural_atom_at(words, current as usize);
     }
-    false
+    None
+}
+
+fn structural_atom_at(words: &[&str], index: usize) -> Option<StructuralAtom> {
+    let word = words.get(index).copied()?;
+    if is_link_filter_word(word) {
+        return Some(StructuralAtom::Link);
+    }
+    if let Some(kind) = media_filter_kind(word) {
+        return Some(StructuralAtom::Media(kind));
+    }
+    if is_forward_scope_word(word) {
+        return Some(
+            if words
+                .get(index + 1)
+                .is_some_and(|next| *next == "пересылка")
+            {
+                StructuralAtom::AutomaticForward
+            } else {
+                StructuralAtom::Forward
+            },
+        );
+    }
+    if is_reply_lexeme(word) {
+        let previous_is_auxiliary = index
+            .checked_sub(1)
+            .and_then(|previous| words.get(previous))
+            .is_some_and(|previous| is_reply_auxiliary(previous));
+        if previous_is_auxiliary {
+            return Some(StructuralAtom::IsReply);
+        }
+        if reply_scope_requirement(words).is_some() {
+            return Some(StructuralAtom::ReplyTo);
+        }
+    }
+    None
 }
 
 fn has_unsupported_reply_child_scope(words: &[&str]) -> bool {
@@ -1926,19 +1978,21 @@ fn has_unsupported_reply_child_scope(words: &[&str]) -> bool {
         return true;
     }
 
-    words.windows(5).any(|window| {
+    let direct_child_scope = words.windows(5).any(|window| {
         window[0] == "на"
             && matches!(window[1], "которые" | "которых" | "которым")
             && window[2] == "никто"
             && window[3] == "не"
             && is_answer_verb(window[4])
-    }) || (reply_scope_requirement(words).is_some()
-        && words
-            .windows(2)
-            .any(|window| window[0] == "не" && is_reply_lexeme(window[1]))
-        || words.windows(3).any(|window| {
-            window[0] == "не" && is_reply_auxiliary(window[1]) && is_reply_lexeme(window[2])
-        }))
+    });
+    let direct_negation = words
+        .windows(2)
+        .any(|window| window[0] == "не" && is_reply_lexeme(window[1]));
+    let auxiliary_negation = words.windows(3).any(|window| {
+        window[0] == "не" && is_reply_auxiliary(window[1]) && is_reply_lexeme(window[2])
+    });
+    direct_child_scope
+        || (reply_scope_requirement(words).is_some() && (direct_negation || auxiliary_negation))
 }
 
 fn has_reply_requirement(words: &[&str]) -> Option<bool> {
@@ -2024,11 +2078,7 @@ fn reply_scope_requirement(words: &[&str]) -> Option<i64> {
 
 fn forward_scope_requirement(words: &[&str]) -> Option<bool> {
     for (index, word) in words.iter().enumerate() {
-        let is_forward = word.starts_with("переслан")
-            || word.starts_with("пересыла")
-            || word.starts_with("форвард")
-            || *word == "forward";
-        if !is_forward {
+        if !is_forward_scope_word(word) {
             continue;
         }
         let negated = index
@@ -2038,6 +2088,13 @@ fn forward_scope_requirement(words: &[&str]) -> Option<bool> {
         return Some(!negated);
     }
     None
+}
+
+fn is_forward_scope_word(word: &str) -> bool {
+    word.starts_with("переслан")
+        || word.starts_with("пересыла")
+        || word.starts_with("форвард")
+        || word == "forward"
 }
 
 fn explicit_message_count_phrase<'a>(words: &[&'a str]) -> Option<(&'a str, usize, usize)> {
@@ -2173,7 +2230,7 @@ fn is_dependent_count_clause_start(prefix: &str, remainder: &str) -> bool {
 }
 
 fn question_mentions_date_scope(question: &str) -> bool {
-    let question = question.to_lowercase();
+    let question = strip_lexical_date_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -2196,6 +2253,32 @@ fn date_scope_policy(question: &str) -> DateScopePolicy {
         Some(expected) => DateScopePolicy::Exact(expected),
         None => DateScopePolicy::Unsupported,
     }
+}
+
+fn strip_lexical_date_regions(question: &str) -> String {
+    let mut result = String::with_capacity(question.len());
+    let mut closing_quote = None;
+    for character in question.chars() {
+        if let Some(closing) = closing_quote {
+            if character == closing {
+                closing_quote = None;
+            }
+            result.push(' ');
+            continue;
+        }
+        let opening = match character {
+            '«' => Some('»'),
+            '"' | '`' => Some(character),
+            _ => None,
+        };
+        if opening.is_some() {
+            closing_quote = opening;
+            result.push(' ');
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn is_date_scope_word(word: &str) -> bool {
@@ -2539,7 +2622,7 @@ fn has_temporal_relative_day(words: &[&str]) -> bool {
 }
 
 fn expected_date_scope(question: &str) -> Option<ExpectedDateScope> {
-    let question = question.to_lowercase();
+    let question = strip_lexical_date_regions(&question.to_lowercase());
     for clause in split_count_clauses(&question) {
         let words = clause
             .split(|character: char| !character.is_alphanumeric())
@@ -3804,6 +3887,16 @@ mod tests {
             ResearchState::for_question("сколько сообщений с фото про Rust или Go?").count_policy,
             CountPolicy::Supported(CountIntent::Matching)
         );
+        for question in [
+            "сколько сообщений с фото либо пересланных?",
+            "сколько сообщений, которые были ответами или пересланными?",
+        ] {
+            assert_eq!(
+                ResearchState::for_question(question).count_policy,
+                CountPolicy::Unsupported(UnsupportedCountReason::StructuralDisjunction),
+                "question: {question}"
+            );
+        }
     }
 
     #[test]
@@ -3820,6 +3913,13 @@ mod tests {
             CountPolicy::Unsupported(UnsupportedCountReason::ReplyChildScope)
         );
         assert!(!unanswered.count_required);
+
+        let non_reply = ResearchState::for_question("сколько сообщений не были ответами?");
+        assert_eq!(
+            non_reply.count_policy,
+            CountPolicy::Supported(CountIntent::Filtered)
+        );
+        assert_eq!(non_reply.count_requires_has_reply, Some(false));
 
         for question in [
             "сколько сообщений с ответами?",
@@ -3853,6 +3953,14 @@ mod tests {
             message_count_intent("Сколько сообщений содержит слово «число»?"),
             Some(CountIntent::Matching)
         );
+        assert_eq!(
+            message_count_policy("Сколько сообщений написал Олег и сколько написала Оля?"),
+            CountPolicy::Unsupported(UnsupportedCountReason::MultipleCounts)
+        );
+        assert_eq!(
+            message_count_intent("Сколько сообщений про количество сообщений?"),
+            Some(CountIntent::Matching)
+        );
     }
 
     #[test]
@@ -3879,7 +3987,7 @@ mod tests {
         );
         assert_eq!(
             forced_final_markdown(&research, "Всего 12 сообщений"),
-            "Точное количество сообщений по заданным условиям: 11."
+            "Точное количество сообщений по заданным условиям: 11.\n\nВсего 12 сообщений"
         );
     }
 
@@ -3944,6 +4052,17 @@ mod tests {
             date_scope_policy("сколько сообщений содержит 2026-07-01?"),
             DateScopePolicy::NoDateRequested
         );
+        for question in [
+            "сколько сообщений содержит фразу «в мае»?",
+            "сколько сообщений содержит фразу \"в 2025 году\"?",
+            "сколько сообщений со словами `на сегодня`?",
+        ] {
+            assert_eq!(
+                date_scope_policy(question),
+                DateScopePolicy::NoDateRequested,
+                "question: {question}"
+            );
+        }
         assert!(matches!(
             date_scope_policy("сколько сообщений было в мае?"),
             DateScopePolicy::Exact(_)
