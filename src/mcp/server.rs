@@ -125,6 +125,17 @@ impl ChatMcpServer {
     }
 
     #[tool(
+        name = "chat.count_messages",
+        description = "Точно считает matching-сообщения публичного чата по тем же фильтрам, что и chat.search_messages. Используй для вопросов 'сколько сообщений', 'в скольких сообщениях' и явного количества написанных сообщений. Поле query можно опустить для structural count. Для точных типов используй has_photo, has_video, has_document, has_audio, has_voice, has_sticker или has_animation; has_media означает любое медиа. reply_to_message_id выбирает ответы на конкретное сообщение, has_reply фильтрует, является ли само сообщение reply; он не означает, что на сообщение кто-то ответил. include_forwards добавляет пересылки к обычным сообщениям, а is_automatic_forward=true ограничивает выдачу только автоматическими пересылками. Не используй как число событий, уникальных авторов или вхождений внутри сообщения."
+    )]
+    async fn count_messages(
+        &self,
+        Parameters(input): Parameters<chat::CountMessagesInput>,
+    ) -> Result<Json<Value>, rmcp::ErrorData> {
+        chat::count_messages(&self.api, input).await.map(Json)
+    }
+
+    #[tool(
         name = "chat.search_messages_batch",
         description = "Выполняет до шести поисков сообщений публичного чата."
     )]
@@ -406,6 +417,7 @@ mod tests {
             actual,
             [
                 "ask.list_runs",
+                "chat.count_messages",
                 "chat.get_message",
                 "chat.get_message_context",
                 "chat.get_recent_messages",

@@ -82,6 +82,10 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         )
         .await?;
         assert!(search["messages"].is_array());
+        assert!(search["total_count"].is_i64());
+        assert!(search["has_more"].is_boolean());
+        assert!(search["next_offset"].is_null() || search["next_offset"].is_i64());
+        assert!(search["scan_limit_reached"].is_boolean());
         let batch = call_object(
             &client,
             "chat.search_messages_batch",
@@ -89,6 +93,35 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         )
         .await?;
         assert!(batch["results"].is_array());
+        assert!(batch["results"][0]["total_count"].is_i64());
+        assert!(batch["results"][0]["has_more"].is_boolean());
+        assert!(batch["results"][0]["scan_limit_reached"].is_boolean());
+        let quality_batch = call_object(
+            &client,
+            "chat.search_messages_batch",
+            json!({
+                "queries": [
+                    "hybrid quality marker alpha",
+                    "nedobot quality anonymous forwarded marker"
+                ],
+                "include_forwards": true,
+                "match_mode": "literal",
+                "limit_per_query": 1
+            }),
+        )
+        .await?;
+        let quality_results = quality_batch["results"]
+            .as_array()
+            .context("quality batch must return two results")?;
+        assert_eq!(quality_results[0]["total_count"], 3);
+        assert_eq!(quality_results[0]["has_more"], true);
+        assert_eq!(quality_results[1]["total_count"], 1);
+        assert_eq!(quality_results[1]["has_more"], false);
+        let count = call_object(&client, "chat.count_messages", json!({"query": "бот"})).await?;
+        assert!(count["count"].is_i64());
+        let user_count =
+            call_object(&client, "chat.count_messages", json!({"user_id": user_id})).await?;
+        assert!(user_count["count"].is_i64());
         let message = call_object(
             &client,
             "chat.get_message",
