@@ -750,6 +750,10 @@ nullable = true
 pg_type = "timestamp with time zone"
 nullable = true
 
+[tables.telegram_messages.columns.forwarded_from]
+pg_type = "text"
+nullable = true
+
 [tables.telegram_messages.columns.has_animation]
 pg_type = "boolean"
 nullable = true
@@ -787,6 +791,10 @@ pg_type = "bigint"
 nullable = true
 
 [tables.telegram_messages.columns.is_automatic_forward]
+pg_type = "boolean"
+nullable = true
+
+[tables.telegram_messages.columns.is_forwarded]
 pg_type = "boolean"
 nullable = true
 

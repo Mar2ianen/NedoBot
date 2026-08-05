@@ -156,9 +156,9 @@ pub async fn save_telegram_message(
                 is_automatic_forward, text, raw_json, reply_to_message_id,
                 reply_to_user_id, sender_chat_id, via_bot_id, has_photo, has_video,
                 has_document, has_audio, has_voice, has_sticker, has_animation,
-                has_links
+                has_links, is_forwarded
             )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         on conflict (chat_id, message_id) do update set
             text = excluded.text,
             raw_json = excluded.raw_json,
@@ -174,6 +174,7 @@ pub async fn save_telegram_message(
             has_sticker = excluded.has_sticker,
             has_animation = excluded.has_animation,
             has_links = excluded.has_links,
+            is_forwarded = excluded.is_forwarded,
             updated_at = now()
         returning (xmax = 0) as inserted
         "#,
@@ -198,6 +199,7 @@ pub async fn save_telegram_message(
     .bind(msg.sticker().is_some())
     .bind(msg.animation().is_some())
     .bind(message_has_links(msg))
+    .bind(msg.forward_origin().is_some())
     .fetch_one(pool)
     .await?;
 
