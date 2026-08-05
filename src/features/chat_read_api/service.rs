@@ -13,6 +13,7 @@ const MAX_RESULT_LIMIT: i64 = 50;
 pub(crate) const MAX_SEARCH_OFFSET: i64 = 10_000;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
 const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
+const MAX_SEMANTIC_CANDIDATES: i64 = 5_000;
 
 #[derive(FromRow)]
 struct MessageRow {
@@ -85,7 +86,23 @@ pub async fn search_messages_with_semantic(
     let query_embedding = query_embedding.as_deref().unwrap_or_default();
     let rows = sqlx::query_as::<_, SearchPageRow>(
         r#"
-        with matched as materialized (
+        with semantic_candidates as materialized (
+            select
+                e.chat_id,
+                e.message_id,
+                greatest(
+                    1.0 - (e.embedding <=> nullif($26, '')::vector),
+                    0.0
+                )::real as semantic_relevance
+            from telegram_message_embeddings e
+            where e.chat_id = $1
+              and e.status = 'ready'
+              and e.embedding_model = $27
+              and nullif($26, '') is not null
+            order by e.embedding <=> nullif($26, '')::vector
+            limit $28
+        ),
+        matched as materialized (
             select
                 m.message_id,
                 m.user_id,
@@ -98,9 +115,14 @@ pub async fn search_messages_with_semantic(
                 m.text,
                 m.reply_to_message_id,
                m.created_at,
-               (
+                (
                     case
-                        when $20 in ('hybrid', 'full_text', 'any_terms') then greatest(
+                        when $20 = 'hybrid' and $26 <> '' then
+                            least(greatest(
+                                ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
+                                ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
+                            ), 1.0) * 0.45
+                        when $20 in ('full_text', 'any_terms') then greatest(
                             ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
                             ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
                         )
@@ -109,23 +131,21 @@ pub async fn search_messages_with_semantic(
                         else 0.0
                     end
                     + case when $20 = 'hybrid' and lower($3) <% lower(m.text)
-                           then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) * 0.25
+                           then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) *
+                                case when $26 <> '' then 0.10 else 0.25 end
                            else 0.0
                       end
                     + case when $20 = 'hybrid'
                                 and $26 <> ''
-                                and e.embedding is not null
-                           then greatest(1.0 - (e.embedding <=> $26::vector), 0.0)
+                           then coalesce(semantic.semantic_relevance, 0.0) * 0.55
                            else 0.0
                       end
                 )::real as relevance
             from mcp_public.telegram_messages m
             left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
-            left join telegram_message_embeddings e
-              on e.chat_id = m.chat_id
-             and e.message_id = m.message_id
-             and e.status = 'ready'
-             and e.embedding_model = $27
+            left join semantic_candidates semantic
+              on semantic.chat_id = m.chat_id
+             and semantic.message_id = m.message_id
             where m.chat_id = $1
               and m.text is not null
               and m.deleted_by_bot_at is null
@@ -170,7 +190,7 @@ pub async fn search_messages_with_semantic(
                   or ($20 = 'hybrid' and lower($3) <% lower(m.text))
                   or ($20 = 'literal' and position(lower($3) in lower(m.text)) > 0)
                   or ($20 = 'whole_word' and m.text ~* $4)
-                  or ($20 = 'hybrid' and $26 <> '' and e.embedding is not null)
+                  or ($20 = 'hybrid' and semantic.message_id is not null)
               )
         )
         select
@@ -247,6 +267,7 @@ pub async fn search_messages_with_semantic(
             .map(|config| config.embedding_model.as_str())
             .unwrap_or_default(),
     )
+    .bind(MAX_SEMANTIC_CANDIDATES)
     .fetch_all(pool)
     .await?;
 
