@@ -12,8 +12,8 @@ pub mod types;
 
 use catalog::PublicCatalog;
 use types::{
-    ChatInteraction, ChatMessage, ChatReadScope, ChatUserProfile, MessageSearchRequest,
-    RecentMessagesRequest,
+    ChatInteraction, ChatMessage, ChatReadScope, ChatUserProfile, MessageSearchPage,
+    MessageSearchRequest, RecentMessagesRequest,
 };
 
 /// One scoped read-model shared by every MCP transport.
@@ -60,8 +60,12 @@ impl ChatReadApi {
     pub async fn search_messages(
         &self,
         request: &MessageSearchRequest,
-    ) -> anyhow::Result<Vec<ChatMessage>> {
+    ) -> anyhow::Result<MessageSearchPage> {
         service::search_messages(&self.pool, self.scope.discussion_chat_id, request).await
+    }
+
+    pub async fn count_messages(&self, request: &MessageSearchRequest) -> anyhow::Result<i64> {
+        service::count_messages(&self.pool, self.scope.discussion_chat_id, request).await
     }
 
     pub async fn recent_messages(

@@ -24,6 +24,7 @@ pub const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github
 pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
     "chat.resolve_user",
     "chat.get_user_profile",
+    "chat.count_messages",
     "chat.search_messages",
     "chat.search_messages_batch",
     "chat.get_recent_messages",
@@ -85,6 +86,7 @@ impl McpClient {
             .map_err(|_| anyhow::anyhow!("chat DB MCP tools/list timed out"))??;
         reject_local_tool_collisions(&tools)?;
         let catalog = format_tool_catalog(&tools)?;
+        ensure_required_ask_tools(&catalog)?;
         anyhow::ensure!(
             !catalog.tool_names.is_empty(),
             "chat DB MCP did not advertise an ASK-policy tool"
@@ -142,6 +144,16 @@ struct ToolCatalog {
     tool_names: HashSet<String>,
     genai_tools: Vec<GenAiTool>,
     wire_to_canonical: HashMap<String, String>,
+}
+
+fn ensure_required_ask_tools(catalog: &ToolCatalog) -> anyhow::Result<()> {
+    for required in ["chat.search_messages", "chat.count_messages"] {
+        anyhow::ensure!(
+            catalog.tool_names.contains(required),
+            "chat DB MCP is missing required ASK tool {required}"
+        );
+    }
+    Ok(())
 }
 
 /// OpenAI-compatible function names do not accept the dotted MCP namespace.
@@ -375,5 +387,17 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("collides"));
+    }
+
+    #[test]
+    fn ask_catalog_requires_search_and_count_tools() {
+        let catalog = format_tool_catalog(&[Tool::new(
+            "chat.search_messages",
+            "schema",
+            serde_json::Map::new(),
+        )])
+        .unwrap();
+        let error = ensure_required_ask_tools(&catalog).unwrap_err().to_string();
+        assert!(error.contains("chat.count_messages"));
     }
 }

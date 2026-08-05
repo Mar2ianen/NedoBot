@@ -12,15 +12,21 @@ pub struct ChatReadScope {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMatch {
+    Hybrid,
     FullText,
+    AnyTerms,
     Literal,
+    WholeWord,
 }
 
 impl MessageMatch {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            Self::Hybrid => "hybrid",
             Self::FullText => "full_text",
+            Self::AnyTerms => "any_terms",
             Self::Literal => "literal",
+            Self::WholeWord => "whole_word",
         }
     }
 }
@@ -50,11 +56,33 @@ pub struct MessageSearchRequest {
     pub date_from: Option<DateTime<Utc>>,
     pub date_to: Option<DateTime<Utc>>,
     pub reply_to_message_id: Option<i32>,
+    pub is_automatic_forward: Option<bool>,
+    pub has_reply: Option<bool>,
     pub has_links: Option<bool>,
     pub has_media: Option<bool>,
+    pub has_photo: Option<bool>,
+    pub has_video: Option<bool>,
+    pub has_document: Option<bool>,
+    pub has_audio: Option<bool>,
+    pub has_voice: Option<bool>,
+    pub has_sticker: Option<bool>,
+    pub has_animation: Option<bool>,
     pub match_mode: MessageMatch,
     pub sort: MessageSort,
     pub limit: i64,
+    /// Zero-based page offset. The transport validates and bounds it before
+    /// constructing this request.
+    pub offset: i64,
+    pub include_forwards: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MessageSearchPage {
+    pub messages: Vec<ChatMessage>,
+    pub total_count: i64,
+    pub has_more: bool,
+    pub next_offset: Option<i64>,
+    pub scan_limit_reached: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -82,10 +110,20 @@ pub struct RecentMessagesRequest {
     pub user_id: Option<i64>,
     pub date_from: Option<DateTime<Utc>>,
     pub date_to: Option<DateTime<Utc>>,
+    pub is_automatic_forward: Option<bool>,
+    pub has_reply: Option<bool>,
     pub has_links: Option<bool>,
     pub has_media: Option<bool>,
+    pub has_photo: Option<bool>,
+    pub has_video: Option<bool>,
+    pub has_document: Option<bool>,
+    pub has_audio: Option<bool>,
+    pub has_voice: Option<bool>,
+    pub has_sticker: Option<bool>,
+    pub has_animation: Option<bool>,
     pub sort: MessageSort,
     pub limit: i64,
+    pub include_forwards: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, sqlx::FromRow)]

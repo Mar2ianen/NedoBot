@@ -134,6 +134,7 @@ Semantic use-cases:
 ```text
 search_messages
 search_messages_batch
+count_messages
 recent_messages
 get_message
 message_context
@@ -158,6 +159,20 @@ search_text
 ```
 
 `ChatReadApi` не возвращает `rmcp::model::*` и не принимает MCP `CallToolRequest`.
+
+Контракт поиска общий для локального stdio-клиента `/ask` и публичного
+Streamable HTTP router-а. `chat.search_messages` возвращает страницу с полями
+`messages`, `total_count`, `has_more`, `next_offset` и `scan_limit_reached`; сервер ограничивает страницу 50
+сообщениями. `chat.search_messages_batch` выполняет не более шести запросов и
+возвращает не более пяти сообщений на запрос. `offset` позволяет запросить
+следующую страницу в пределах 10000 строк; при достижении потолка `has_more=true`,
+`next_offset=null`, `scan_limit_reached=true`. `chat.count_messages` использует
+те же фильтры и является authoritative-путём для количества matching-сообщений. `query` можно опустить для подсчёта всех строк по структурным фильтрам. Инструмент не считает количество событий или вхождений слова внутри сообщения. Режимы поиска:
+`hybrid` (по умолчанию), `full_text`, `any_terms`, `literal` и `whole_word`;
+даты принимаются в RFC 3339 или `YYYY-MM-DD`. По умолчанию поиск исключает
+ботов, строки без пользователя и автоматические пересылки; `include_forwards`
+является явным opt-in и также раскрывает forwarded rows без автора. В `mcp_public` не добавляются строки или колонки и не
+меняется его sanitization-контракт.
 
 ### Semantic tools
 

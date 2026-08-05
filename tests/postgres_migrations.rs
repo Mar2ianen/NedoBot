@@ -14,6 +14,10 @@ use tg_ai_bot_teloxide::features::{
         repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
         types::AskRunStatus,
     },
+    chat_read_api::{
+        service as chat_read_service,
+        types::{MessageMatch, MessageSearchRequest, MessageSort},
+    },
     chat_retrieval::{
         EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
         mark_embedding_failed, mark_embedding_ready,
@@ -73,6 +77,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
+    assert_chat_search_quality_path(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
@@ -2523,6 +2528,366 @@ async fn assert_public_mcp_scope(pool: &PgPool) {
     .expect("public MCP view query must succeed");
 
     assert_eq!(public_messages, vec!["discussion message"]);
+}
+
+async fn assert_chat_search_quality_path(pool: &PgPool) {
+    let extension: Option<String> =
+        query_scalar("select extname from pg_extension where extname = 'pg_trgm'")
+            .fetch_optional(pool)
+            .await
+            .expect("pg_trgm extension lookup must succeed");
+    assert_eq!(extension.as_deref(), Some("pg_trgm"));
+
+    let index_exists: bool = query_scalar(
+        "select exists (select 1 from pg_indexes where schemaname = 'public' and indexname = 'telegram_messages_ask_trgm_idx')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("chat search index lookup must succeed");
+    assert!(index_exists, "hybrid chat search index must be installed");
+
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 1_000_000) as i32;
+    let message_id = 9_600_000 + suffix;
+    let user_id = 9_600_000 + i64::from(suffix);
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, text)
+        values
+            ($1, $2, $3, false, 'hybrid quality marker alpha'),
+            ($1, $2 + 1, $3 + 1, true, 'hybrid quality marker alpha forwarded'),
+            ($1, $2 + 2, null, true, 'hybrid quality marker alpha nedobot quality anonymous forwarded marker'),
+            ($1, $2 + 3, null, false, 'hybrid quality marker alpha anonymous normal')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("chat search fixtures must be inserted");
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, text, has_photo, has_document)
+        values
+            ($1, $2 + 4, $3 + 4, false, 'exact media marker', true, false),
+            ($1, $2 + 5, $3 + 5, false, 'exact media marker', false, true)
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("exact media fixtures must be inserted");
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, reply_to_message_id, text)
+        values
+            ($1, $2 + 6, $3 + 6, false, $2, 'exact scope marker replied'),
+            ($1, $2 + 7, null, true, $2 + 6, 'exact scope marker forwarded reply')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("exact message scope fixtures must be inserted");
+
+    let request = MessageSearchRequest {
+        query: "hybrid quality marker alpha".into(),
+        user_id: None,
+        date_from: None,
+        date_to: None,
+        reply_to_message_id: None,
+        is_automatic_forward: None,
+        has_reply: None,
+        has_links: None,
+        has_media: None,
+        has_photo: None,
+        has_video: None,
+        has_document: None,
+        has_audio: None,
+        has_voice: None,
+        has_sticker: None,
+        has_animation: None,
+        match_mode: MessageMatch::Hybrid,
+        sort: MessageSort::Relevance,
+        limit: 10,
+        offset: 0,
+        include_forwards: false,
+    };
+    let page = chat_read_service::search_messages(pool, -1001932061163, &request)
+        .await
+        .expect("hybrid search must execute through the production read service");
+    assert_eq!(page.total_count, 1);
+    assert!(!page.has_more);
+    assert!(!page.scan_limit_reached);
+    assert_eq!(page.messages[0].message_id, message_id);
+
+    let exact_scope_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(true),
+            has_reply: Some(true),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact message scope search must execute through the production read service");
+    assert_eq!(exact_scope_page.total_count, 1);
+    assert_eq!(exact_scope_page.messages[0].message_id, message_id + 7);
+
+    let exact_non_forward_reply_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(false),
+            has_reply: Some(true),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact non-forward count must execute through the production read service");
+    assert_eq!(exact_non_forward_reply_count, 1);
+
+    let exact_forward_reply_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(true),
+            has_reply: Some(true),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact forward count must execute through the production read service");
+    assert_eq!(exact_forward_reply_count, 1);
+
+    let top_level_scope_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            has_reply: Some(false),
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact top-level count must execute through the production read service");
+    assert_eq!(top_level_scope_count, 0);
+
+    let excluded_forward_scope_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact scope marker".into(),
+            is_automatic_forward: Some(true),
+            has_reply: Some(true),
+            include_forwards: false,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("include_forwards must remain an exclusion boundary");
+    assert_eq!(excluded_forward_scope_count, 0);
+
+    let photo_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact media marker".into(),
+            has_photo: Some(true),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact photo count must execute through the production read service");
+    assert_eq!(photo_count, 1);
+    let document_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact media marker".into(),
+            has_document: Some(true),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("exact document count must execute through the production read service");
+    assert_eq!(document_count, 1);
+    let any_media_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "exact media marker".into(),
+            has_media: Some(true),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("generic media count must execute through the production read service");
+    assert_eq!(any_media_count, 2);
+
+    let fuzzy_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "hybrid quality marker alphx".into(),
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("hybrid fuzzy search must execute through the production read service");
+    assert_eq!(fuzzy_page.total_count, 1);
+    assert_eq!(fuzzy_page.messages[0].message_id, message_id);
+
+    let with_forwards = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("count search must execute through the production read service");
+    assert_eq!(with_forwards, 3);
+    let user_message_count = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: String::new(),
+            user_id: Some(user_id),
+            include_forwards: false,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("filter-only count must execute through the production read service");
+    assert_eq!(user_message_count, 1);
+    let oldest_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            sort: MessageSort::Oldest,
+            limit: 3,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("oldest search page must preserve its declared order");
+    assert_eq!(
+        oldest_page
+            .messages
+            .iter()
+            .map(|message| message.message_id)
+            .collect::<Vec<_>>(),
+        vec![message_id + 2, message_id + 1, message_id]
+    );
+    let first_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 0,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("first search page must execute through the production read service");
+    assert!(first_page.has_more);
+    assert_eq!(first_page.next_offset, Some(1));
+
+    let second_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 1,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("second search page must execute through the production read service");
+    assert_eq!(second_page.total_count, 3);
+    assert_eq!(second_page.next_offset, Some(2));
+
+    let at_total = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 3,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("empty terminal search page must execute through the production read service");
+    assert!(at_total.messages.is_empty());
+    assert_eq!(at_total.total_count, 3);
+    assert!(!at_total.has_more);
+    assert_eq!(at_total.next_offset, None);
+
+    let beyond_total = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 1,
+            offset: 4,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("out-of-range search page must execute through the production read service");
+    assert!(beyond_total.messages.is_empty());
+    assert_eq!(beyond_total.total_count, 3);
+    assert!(!beyond_total.has_more);
+    assert_eq!(beyond_total.next_offset, None);
+
+    let with_anonymous_forward = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("forwarded rows without authors must be searchable when opted in");
+    assert_eq!(with_anonymous_forward.total_count, 3);
+
+    let without_forward_opt_in = chat_read_service::count_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: false,
+            ..request
+        },
+    )
+    .await
+    .expect("default search count must exclude anonymous non-forward rows");
+    assert_eq!(without_forward_opt_in, 1);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
