@@ -28,7 +28,7 @@
 | `telegram_message_edits` | `id` | 8 | Наблюдаемые изменения сообщений. |
 | `telegram_message_reaction_counts` | `chat_id`, `message_id` | 6 | Агрегированные реакции сообщений. |
 | `telegram_message_reactions` | `id` | 9 | История изменений реакций. |
-| `telegram_messages` | `chat_id`, `message_id` | 32 | Текст, автор, reply- и media-метаданные сообщений публичного чата. |
+| `telegram_messages` | `chat_id`, `message_id` | 34 | Текст, автор, reply-, media- и forward-метаданные сообщений публичного чата. |
 | `telegram_new_user_profile_audits` | `chat_id`, `telegram_user_id` | 91 | Признаки и результат антиспам-анализа нового участника. |
 | `telegram_profile_identity_observations` | `telegram_user_id`, `snapshot_key` | 7 | Наблюдения нормализованных имени, username и аватара. |
 | `telegram_user_notes` | `id` | 11 | Заметки об участнике, привязанные к публичному чату. |
@@ -46,6 +46,7 @@ MCP.
 - пользовательский текст: `telegram_messages.text`, old/new text edit-истории, заметки, ASR transcript и cleanup-результаты;
 - результаты генерации: `llm_generations.prompt`, `response`, `final_html`, а также `/ask` question/answer;
 - profile и anti-spam metadata, включая username/display name, bio, статусы участников, risk labels и причины;
+- forward provenance: `telegram_messages.is_forwarded` и `telegram_messages.forwarded_from` позволяют отличить автора сохранённой строки от источника пересланного текста;
 - stable Telegram/file-derived identifiers, которые явно перечислены в manifest.
 
 ## Как обновлять
