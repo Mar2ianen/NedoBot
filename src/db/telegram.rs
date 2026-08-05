@@ -349,6 +349,10 @@ async fn upsert_chat_user_activity(
         return Ok(());
     }
 
+    if msg.from.as_ref().is_some_and(|user| user.is_bot) {
+        return Ok(());
+    }
+
     let Some(user_id) = msg.from.as_ref().map(|user| user.id.0 as i64) else {
         return Ok(());
     };

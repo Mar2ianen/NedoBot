@@ -402,6 +402,10 @@ async fn deliver_prepared_post_comment(
         Err(error) => return handle_post_comment_send_error(state, job, &error).await,
     };
 
+    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await {
+        tracing::warn!(%err, message_id = sent.id.0, "failed to save bot comment message");
+    }
+
     finalize_completed_post_comment_job(bot, state, job, completed, sent.id.0).await
 }
 

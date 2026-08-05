@@ -362,7 +362,11 @@ async fn handle_ask_command(
                 .finish(rendered.rich_message.skip_entity_detection(true))
                 .await
             {
-                Ok(_) => {
+                Ok(sent) => {
+                    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await
+                    {
+                        tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask answer message");
+                    }
                     record_ask_delivery(
                         state,
                         answer.ask_run_id,
@@ -395,7 +399,11 @@ async fn handle_ask_command(
                 .finish(InputRichMessage::markdown(failure_message).skip_entity_detection(true))
                 .await
             {
-                Ok(_) => {
+                Ok(sent) => {
+                    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await
+                    {
+                        tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask failure message");
+                    }
                     record_ask_delivery(
                         state,
                         ask_run_id,
