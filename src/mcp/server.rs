@@ -115,7 +115,7 @@ impl ChatMcpServer {
 
     #[tool(
         name = "chat.search_messages",
-        description = "Ищет сообщения публичного чата. В режиме hybrid объединяет русский/simple full-text, fuzzy pg_trgm и semantic similarity по RuBERT embeddings, если embeddings включены. Semantic ranking не использует затухание по возрасту сообщения; фильтры date_from/date_to применяются только если их явно передать."
+        description = "Ищет сообщения публичного чата. В режиме hybrid объединяет русский/simple full-text, fuzzy pg_trgm и semantic similarity по EmbeddingGemma embeddings, если embeddings включены. Semantic ranking не использует затухание по возрасту сообщения; фильтры date_from/date_to применяются только если их явно передать."
     )]
     async fn search_messages(
         &self,
