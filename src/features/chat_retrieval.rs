@@ -466,16 +466,68 @@ pub async fn process_next_embedding_batch(pool: &PgPool, config: &Config) -> any
             finalize_embedding_failures(pool, &jobs, "embedding_batch_cardinality").await?;
         }
         Err(err) => {
-            let error_kind = if err.to_string().contains("429") {
-                "http_429"
-            } else {
-                "embedding_failed"
-            };
-            finalize_embedding_failures(pool, &jobs, error_kind).await?;
-            tracing::warn!(%err, jobs = jobs.len(), "chat retrieval embedding batch failed");
+            tracing::warn!(
+                %err,
+                jobs = jobs.len(),
+                "chat retrieval embedding batch failed; retrying jobs individually"
+            );
+            retry_embedding_jobs_individually(pool, config, &jobs).await?;
         }
     }
     Ok(true)
+}
+
+async fn retry_embedding_jobs_individually(
+    pool: &PgPool,
+    config: &Config,
+    jobs: &[EmbeddingJob],
+) -> anyhow::Result<()> {
+    for job in jobs {
+        let result = embed_chat_documents_batch(config, &[job.text.as_str()]).await;
+        match result {
+            Ok(mut embeddings) if embeddings.len() == 1 => {
+                if mark_embedding_ready(
+                    pool,
+                    job,
+                    &embeddings.remove(0),
+                    &config.chat_retrieval_embedding_model,
+                )
+                .await?
+                    == CasResult::LeaseLost
+                {
+                    tracing::debug!(
+                        chat_id = job.chat_id,
+                        message_id = job.message_id,
+                        "chat retrieval embedding ready finalization lost lease"
+                    );
+                }
+            }
+            Ok(embeddings) => {
+                mark_embedding_failed(pool, job, "embedding_batch_cardinality").await?;
+                tracing::warn!(
+                    chat_id = job.chat_id,
+                    message_id = job.message_id,
+                    returned_embeddings = embeddings.len(),
+                    "single chat retrieval embedding returned unexpected cardinality"
+                );
+            }
+            Err(err) => {
+                let error_kind = if err.to_string().contains("429") {
+                    "http_429"
+                } else {
+                    "embedding_failed"
+                };
+                mark_embedding_failed(pool, job, error_kind).await?;
+                tracing::debug!(
+                    %err,
+                    chat_id = job.chat_id,
+                    message_id = job.message_id,
+                    "single chat retrieval embedding failed"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn claim_embedding_jobs(
