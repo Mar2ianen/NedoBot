@@ -354,6 +354,7 @@ async fn query_embedding(
     match embed_chat_query_at(
         &config.embedding_url,
         config.timeout_sec,
+        &config.embedding_model,
         &config.query_prefix,
         query,
     )

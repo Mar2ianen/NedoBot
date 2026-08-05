@@ -2987,10 +2987,15 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
     let embedding_server = tokio::spawn(async move {
         let vector = embedding;
         let app = Router::new().route(
-            "/embedding",
+            "/v1/embeddings",
             post(move || {
                 let vector = vector.clone();
-                async move { Json(serde_json::json!([{ "embedding": [vector] }])) }
+                async move {
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [{ "index": 0, "embedding": vector }]
+                    }))
+                }
             }),
         );
         axum::serve(listener, app)

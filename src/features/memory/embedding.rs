@@ -14,13 +14,20 @@ struct EmbedRequest<'a> {
 }
 
 #[derive(Serialize)]
-struct LlamaEmbeddingRequest<'a> {
-    content: &'a str,
+struct LlamaEmbeddingsRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
 }
 
 #[derive(Deserialize)]
-struct LlamaEmbeddingRow {
-    embedding: Vec<Vec<f32>>,
+struct LlamaEmbeddingData {
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct LlamaEmbeddingsResponse {
+    data: Vec<LlamaEmbeddingData>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +93,7 @@ pub async fn embed_chat_query(config: &Config, text: &str) -> anyhow::Result<Vec
     embed_chat_query_at(
         &config.chat_retrieval_embedding_url,
         config.chat_retrieval_embedding_timeout_sec,
+        &config.chat_retrieval_embedding_model,
         &config.chat_retrieval_embedding_query_prefix,
         text,
     )
@@ -95,11 +103,16 @@ pub async fn embed_chat_query(config: &Config, text: &str) -> anyhow::Result<Vec
 pub async fn embed_chat_query_at(
     embedding_url: &str,
     timeout_sec: u64,
+    model: &str,
     query_prefix: &str,
     text: &str,
 ) -> anyhow::Result<Vec<f32>> {
     let input = format!("{query_prefix}{text}");
-    let embedding = request_llama_embedding(embedding_url, timeout_sec, &input).await?;
+    let mut embeddings =
+        request_llama_embeddings(embedding_url, timeout_sec, model, vec![input]).await?;
+    let embedding = embeddings
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("llama.cpp embedding response is empty"))?;
     validate_embedding_dimensions(&embedding, CHAT_EMBEDDING_DIMENSIONS)?;
     Ok(embedding)
 }
@@ -108,17 +121,23 @@ pub async fn embed_chat_documents_batch(
     config: &Config,
     texts: &[&str],
 ) -> anyhow::Result<Vec<Vec<f32>>> {
-    let mut embeddings = Vec::with_capacity(texts.len());
-    for text in texts {
-        let input = format!("{}{text}", config.chat_retrieval_embedding_document_prefix);
-        let embedding = request_llama_embedding(
-            &config.chat_retrieval_embedding_url,
-            config.chat_retrieval_embedding_timeout_sec,
-            &input,
-        )
-        .await?;
-        validate_embedding_dimensions(&embedding, CHAT_EMBEDDING_DIMENSIONS)?;
-        embeddings.push(embedding);
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let inputs = texts
+        .iter()
+        .map(|text| format!("{}{text}", config.chat_retrieval_embedding_document_prefix))
+        .collect::<Vec<_>>();
+    let embeddings = request_llama_embeddings(
+        &config.chat_retrieval_embedding_url,
+        config.chat_retrieval_embedding_timeout_sec,
+        &config.chat_retrieval_embedding_model,
+        inputs,
+    )
+    .await?;
+    for embedding in &embeddings {
+        validate_embedding_dimensions(embedding, CHAT_EMBEDDING_DIMENSIONS)?;
     }
     Ok(embeddings)
 }
@@ -134,31 +153,51 @@ pub async fn embed_chat_queries_batch(
     Ok(embeddings)
 }
 
-async fn request_llama_embedding(
+async fn request_llama_embeddings(
     embedding_url: &str,
     timeout_sec: u64,
-    content: &str,
-) -> anyhow::Result<Vec<f32>> {
+    model: &str,
+    inputs: Vec<String>,
+) -> anyhow::Result<Vec<Vec<f32>>> {
     let response = http::client(Duration::from_secs(timeout_sec))?
-        .post(format!("{}/embedding", embedding_url.trim_end_matches('/')))
-        .json(&LlamaEmbeddingRequest { content })
+        .post(format!(
+            "{}/v1/embeddings",
+            embedding_url.trim_end_matches('/')
+        ))
+        .json(&LlamaEmbeddingsRequest {
+            model,
+            input: &inputs,
+        })
         .send()
         .await?
         .error_for_status()?
-        .json::<Vec<LlamaEmbeddingRow>>()
+        .json::<LlamaEmbeddingsResponse>()
         .await?;
-    let row = response
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("llama.cpp embedding response is empty"))?;
-    let mut embeddings = row.embedding;
-    if embeddings.len() != 1 {
+
+    if response.data.len() != inputs.len() {
         anyhow::bail!(
-            "llama.cpp embedding response contains {} rows",
-            embeddings.len()
+            "llama.cpp embedding response contains {} rows for {} inputs",
+            response.data.len(),
+            inputs.len()
         );
     }
-    Ok(embeddings.pop().expect("embedding row count checked above"))
+    let mut embeddings = response
+        .data
+        .into_iter()
+        .map(|row| (row.index, row.embedding))
+        .collect::<Vec<_>>();
+    embeddings.sort_by_key(|(index, _)| *index);
+    if embeddings
+        .iter()
+        .enumerate()
+        .any(|(expected, (actual, _))| *actual != expected)
+    {
+        anyhow::bail!("llama.cpp embedding response indexes are not contiguous");
+    }
+    Ok(embeddings
+        .into_iter()
+        .map(|(_, embedding)| embedding)
+        .collect())
 }
 
 pub fn pgvector_literal(values: &[f32]) -> anyhow::Result<String> {
