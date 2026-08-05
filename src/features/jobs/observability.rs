@@ -53,25 +53,25 @@ const POST_COMMENT_RECLAIMS_SQL: &str =
 
 const EMBEDDING_STATUS_SQL: &str = r#"
     select status, count(*)::bigint, coalesce(sum(attempts), 0)::bigint
-    from telegram_message_embeddings
+    from telegram_message_embeddings_gemma
     group by status
     order by status
 "#;
 const EMBEDDING_ERROR_SQL: &str = r#"
     select error_kind, count(*)::bigint, coalesce(sum(attempts), 0)::bigint,
            count(*) filter (where status = 'failed')::bigint
-    from telegram_message_embeddings
+    from telegram_message_embeddings_gemma
     where error_kind is not null
     group by error_kind
     order by error_kind
 "#;
 const EMBEDDING_READY_AGE_SQL: &str = r#"
     select extract(epoch from now() - min(next_attempt_at))::double precision
-    from telegram_message_embeddings
+    from telegram_message_embeddings_gemma
     where status in ('pending', 'retry_wait') and next_attempt_at <= now()
 "#;
 const EMBEDDING_RECLAIMS_SQL: &str =
-    "select coalesce(sum(lease_reclaim_count), 0)::bigint from telegram_message_embeddings";
+    "select coalesce(sum(lease_reclaim_count), 0)::bigint from telegram_message_embeddings_gemma";
 
 const HISTORY_STATUS_SQL: &str = r#"
     select status, count(*)::bigint, coalesce(sum(attempts), 0)::bigint

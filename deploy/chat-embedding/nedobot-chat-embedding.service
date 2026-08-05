@@ -1,0 +1,23 @@
+[Unit]
+Description=NedoBot EmbeddingGemma Q4 llama.cpp service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/podman rm -f nedobot-chat-embedding
+ExecStart=/usr/bin/podman run --rm --name nedobot-chat-embedding \
+    --memory=900m --cpus=2 \
+    -p 127.0.0.1:8795:8080 \
+    -v nedobot_chat_embedding:/models:ro \
+    ghcr.io/ggml-org/llama.cpp:server \
+    -m /models/embeddinggemma-300M-qat-Q4_0.gguf \
+    --embedding --pooling mean --embd-normalize 2 \
+    --host 0.0.0.0 --port 8080 --threads 2 --parallel 1
+ExecStop=/usr/bin/podman stop --ignore -t 10 nedobot-chat-embedding
+
+[Install]
+WantedBy=multi-user.target

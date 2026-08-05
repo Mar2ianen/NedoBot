@@ -8,7 +8,10 @@ use crate::features::jobs::{
     claim::CasResult,
     policy::{CHAT_EMBEDDING_LEASE, CHAT_EMBEDDING_RETRY},
 };
-use crate::features::memory::embedding::{embed_text_batch, pgvector_literal};
+use crate::features::memory::embedding::{
+    CHAT_EMBEDDING_DIMENSIONS, embed_chat_documents_batch, embed_chat_queries_batch,
+    pgvector_literal_for_dimensions,
+};
 use crate::features::search::types::ResearchPlan;
 
 const SHADOW_CANDIDATE_LIMIT: i64 = 12;
@@ -95,8 +98,8 @@ pub async fn run_shadow_retrieval(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    for embedding in embed_text_batch(config, &semantic_queries).await? {
-        let embedding = pgvector_literal(&embedding)?;
+    for embedding in embed_chat_queries_batch(config, &semantic_queries).await? {
+        let embedding = pgvector_literal_for_dimensions(&embedding, CHAT_EMBEDDING_DIMENSIONS)?;
         merge_candidates(
             &mut candidates,
             load_semantic_candidates(pool, chat_id, &embedding, config).await?,
@@ -228,17 +231,17 @@ async fn load_candidates(
     let rows = sqlx::query(r#"
         select m.message_id, m.text,
                (extract(epoch from (now() - m.created_at)) / 86400.0)::double precision as age_days,
-               (case when $5 = 'semantic' then 1.0 - (e.embedding <=> $2::vector) else 0.0 end)::double precision as semantic_score,
+               (case when $5 = 'semantic' then 1.0 - (e.embedding <=> $2::halfvec) else 0.0 end)::double precision as semantic_score,
                (case when $5 = 'lexical' then greatest(ts_rank_cd(to_tsvector('russian', m.text), websearch_to_tsquery('russian', $2)), ts_rank_cd(to_tsvector('simple', m.text), websearch_to_tsquery('simple', $2))) else 0.0 end)::double precision as lexical_score,
                (case when $5 = 'exact' then $6 else 0.0 end)::double precision as exact_score
         from telegram_messages m
-        left join telegram_message_embeddings e on e.chat_id = m.chat_id and e.message_id = m.message_id and e.status = 'ready'
+        left join telegram_message_embeddings_gemma e on e.chat_id = m.chat_id and e.message_id = m.message_id and e.status = 'ready'
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1 and m.created_at >= now() - ($3 * interval '1 day')
           and m.deleted_by_bot_at is null and m.spam_marked_at is null and m.is_automatic_forward = false
           and m.user_id is not null and coalesce(p.is_bot, false) = false
           and (($5 = 'semantic' and e.embedding is not null) or ($5 = 'lexical' and (to_tsvector('russian', m.text) @@ websearch_to_tsquery('russian', $2) or to_tsvector('simple', m.text) @@ websearch_to_tsquery('simple', $2))) or ($5 = 'exact' and m.text ~* $2))
-        order by case when $5 = 'semantic' then e.embedding <=> $2::vector end, m.created_at desc
+        order by case when $5 = 'semantic' then e.embedding <=> $2::halfvec end, m.created_at desc
         limit $4
     "#).bind(chat_id).bind(query).bind(config.chat_retrieval_window_days.clamp(1, 90)).bind(SHADOW_CANDIDATE_LIMIT).bind(kind).bind(exact_score).fetch_all(pool).await?;
     Ok(rows
@@ -361,7 +364,7 @@ pub async fn enqueue_message_embedding(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
-        insert into telegram_message_embeddings (chat_id, message_id, status)
+        insert into telegram_message_embeddings_gemma (chat_id, message_id, status)
         select m.chat_id, m.message_id, 'pending'
         from telegram_messages m
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
@@ -383,7 +386,7 @@ pub async fn enqueue_message_embedding(
             lease_expires_at = null,
             error_kind = null,
             updated_at = now()
-        where telegram_message_embeddings.status <> 'processing'
+        where telegram_message_embeddings_gemma.status <> 'processing'
         "#,
     )
     .bind(chat_id)
@@ -401,11 +404,11 @@ pub async fn enqueue_backfill_batch(
 ) -> anyhow::Result<usize> {
     let result = sqlx::query(
         r#"
-        insert into telegram_message_embeddings (chat_id, message_id, status)
+        insert into telegram_message_embeddings_gemma (chat_id, message_id, status)
         select m.chat_id, m.message_id, 'pending'
         from telegram_messages m
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
-        left join telegram_message_embeddings e
+        left join telegram_message_embeddings_gemma e
           on e.chat_id = m.chat_id and e.message_id = m.message_id
         where m.chat_id = $1
           and e.chat_id is null
@@ -434,10 +437,16 @@ pub async fn process_next_embedding_batch(pool: &PgPool, config: &Config) -> any
     }
 
     let texts = jobs.iter().map(|job| job.text.as_str()).collect::<Vec<_>>();
-    match embed_text_batch(config, &texts).await {
+    match embed_chat_documents_batch(config, &texts).await {
         Ok(embeddings) if embedding_batch_matches_claimed_jobs(&jobs, &embeddings) => {
             for (job, embedding) in jobs.iter().zip(embeddings) {
-                if mark_embedding_ready(pool, job, &embedding, &config.rag_embedding_model).await?
+                if mark_embedding_ready(
+                    pool,
+                    job,
+                    &embedding,
+                    &config.chat_retrieval_embedding_model,
+                )
+                .await?
                     == CasResult::LeaseLost
                 {
                     tracing::debug!(
@@ -521,13 +530,13 @@ async fn claim_embedding_jobs_matching(
         r#"
         with candidate as (
             select e.chat_id, e.message_id
-            from telegram_message_embeddings e
+            from telegram_message_embeddings_gemma e
             where ({predicate})
             order by {order_by}
             for update of e skip locked
             limit $1
         )
-        update telegram_message_embeddings e
+        update telegram_message_embeddings_gemma e
         set status = case when nullif(trim(m.text), '') is not null
                               and m.user_id is not null
                               and coalesce(p.is_bot, false) = false
@@ -611,11 +620,11 @@ pub async fn mark_embedding_ready(
     embedding: &[f32],
     model: &str,
 ) -> anyhow::Result<CasResult> {
-    let embedding = pgvector_literal(embedding)?;
+    let embedding = pgvector_literal_for_dimensions(embedding, CHAT_EMBEDDING_DIMENSIONS)?;
     let update = sqlx::query(
         r#"
-        update telegram_message_embeddings e
-        set embedding = case when m.text = $3 then $4::vector else null end,
+        update telegram_message_embeddings_gemma e
+        set embedding = case when m.text = $3 then $4::halfvec else null end,
             embedding_model = case when m.text = $3 then $5 else null end,
             status = case when m.text = $3 then 'ready' else 'pending' end,
             error_kind = null,
@@ -650,7 +659,7 @@ pub async fn mark_embedding_failed(
         .unwrap_or(("failed", 0));
     let update = sqlx::query(
         r#"
-        update telegram_message_embeddings
+        update telegram_message_embeddings_gemma
         set status = $3, error_kind = $4,
             next_attempt_at = now() + ($5 * interval '1 second'),
             processing_started_at = null,

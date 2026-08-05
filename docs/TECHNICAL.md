@@ -292,7 +292,7 @@ Runner запускает локальный Podman PostgreSQL, пересозд
   - `nedobot-rag-embedding.service`
   - `nedonews-mcp.service`
 
-PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg16-bookworm` на том же persistent volume. RuBERT Tiny 2 обслуживается локальным CPU-only Text Embeddings Inference на `127.0.0.1:8788`; наружу этот порт не публикуется.
+PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg16-bookworm` на том же persistent volume. RuBERT Tiny 2 обслуживается локальным CPU-only Text Embeddings Inference на `127.0.0.1:8788` для memory/audit-потоков. Chat retrieval использует отдельный CPU-only `llama.cpp`-сервис на `127.0.0.1:8795` с официальным QAT `EmbeddingGemma` Q4 и 768-мерными `halfvec`; наружу оба embedding-порта не публикуются.
 
 Полезные команды:
 
@@ -350,7 +350,22 @@ podman exec -i tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot \
   -f - < deploy/nedonews-mcp/bootstrap-role.sql
 ```
 
-Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; туда не передаются Telegram или LLM secrets и ему не нужен writable checkout. Для semantic leg `chat.search_messages` в env задаются `ASK_CHAT_EMBEDDING_URL`, `ASK_CHAT_EMBEDDING_MODEL` и `ASK_CHAT_EMBEDDING_TIMEOUT_SEC`; роль MCP получает column-level `SELECT` только на нужные поля `telegram_message_embeddings`. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
+Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; туда не передаются Telegram или LLM secrets и ему не нужен writable checkout. Для semantic leg `chat.search_messages` в env задаются `ASK_CHAT_EMBEDDING_URL`, `ASK_CHAT_EMBEDDING_MODEL`, `ASK_CHAT_EMBEDDING_TIMEOUT_SEC` и `ASK_CHAT_EMBEDDING_QUERY_PREFIX`; роль MCP получает column-level `SELECT` только на нужные поля `telegram_message_embeddings_gemma`. Перед включением `nedobot-chat-embedding.service` модель `embeddinggemma-300M-qat-Q4_0.gguf` нужно один раз положить в volume `nedobot_chat_embedding` из GGUF-конвертации официальных Google QAT-весов. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
+
+Подготовка chat embedding volume на production host выполняется отдельно от кода и миграции:
+
+```bash
+podman volume create nedobot_chat_embedding
+podman run --rm \
+  -v nedobot_chat_embedding:/models \
+  docker.io/curlimages/curl:8.10.1 \
+  -fL -o /models/embeddinggemma-300M-qat-Q4_0.gguf \
+  https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf
+podman run --rm -v nedobot_chat_embedding:/models:ro docker.io/library/alpine:3.22 \
+  sha256sum /models/embeddinggemma-300M-qat-Q4_0.gguf
+```
+
+После установки unit-файла `deploy/chat-embedding/nedobot-chat-embedding.service` нужно выполнить `systemctl daemon-reload`, запустить `nedobot-chat-embedding` и проверить `curl -fsS http://127.0.0.1:8795/health` до перезапуска MCP и бота.
 
 Ручной redeploy из локальной папки выполняется только после dry-run и проверки production profile; не использовать старую сокращённую команду без exclusions:
 
