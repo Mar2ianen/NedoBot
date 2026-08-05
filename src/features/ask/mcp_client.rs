@@ -14,6 +14,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::config::Config;
+use crate::features::chat_read_api::types::{
+    CHAT_EMBEDDING_MODEL_ENV, CHAT_EMBEDDING_TIMEOUT_ENV, CHAT_EMBEDDING_URL_ENV,
+};
 
 // Reserve space for the agent's untrusted-result envelope; never raw-truncate JSON there.
 const MAX_TOOL_RESULT_CHARS: usize = 11_000;
@@ -73,6 +76,15 @@ impl McpClient {
             }
         }
         command.env("DISCUSSION_CHAT_ID", config.discussion_chat_id.to_string());
+        if config.chat_retrieval_embeddings_enabled {
+            command
+                .env(CHAT_EMBEDDING_URL_ENV, &config.rag_embedding_url)
+                .env(CHAT_EMBEDDING_MODEL_ENV, &config.rag_embedding_model)
+                .env(
+                    CHAT_EMBEDDING_TIMEOUT_ENV,
+                    config.rag_embedding_timeout_sec.to_string(),
+                );
+        }
 
         let transport = TokioChildProcess::builder(command)
             .stderr(Stdio::null())

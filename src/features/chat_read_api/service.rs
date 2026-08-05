@@ -3,8 +3,10 @@ use sqlx::{FromRow, PgPool};
 
 use super::types::{
     ChatInteraction, ChatMessage, ChatUserProfile, MessageMatch, MessageSearchPage,
-    MessageSearchRequest, RecentMessagesRequest,
+    MessageSearchRequest, RecentMessagesRequest, SemanticSearchConfig,
 };
+
+use crate::features::memory::embedding::{embed_text_at, pgvector_literal};
 
 const MAX_QUERY_CHARS: usize = 240;
 const MAX_RESULT_LIMIT: i64 = 50;
@@ -67,9 +69,20 @@ pub async fn search_messages(
     chat_id: i64,
     request: &MessageSearchRequest,
 ) -> anyhow::Result<MessageSearchPage> {
+    search_messages_with_semantic(pool, chat_id, request, None).await
+}
+
+pub async fn search_messages_with_semantic(
+    pool: &PgPool,
+    chat_id: i64,
+    request: &MessageSearchRequest,
+    semantic_config: Option<&SemanticSearchConfig>,
+) -> anyhow::Result<MessageSearchPage> {
     let query = normalized_query(&request.query)?;
     let ts_query = full_text_query(&query, &request.match_mode);
     let whole_word_pattern = whole_word_pattern(&query);
+    let query_embedding = query_embedding(semantic_config, request, &query).await?;
+    let query_embedding = query_embedding.as_deref().unwrap_or_default();
     let rows = sqlx::query_as::<_, SearchPageRow>(
         r#"
         with matched as materialized (
@@ -84,8 +97,8 @@ pub async fn search_messages(
                 m.forwarded_from,
                 m.text,
                 m.reply_to_message_id,
-                m.created_at,
-                (
+               m.created_at,
+               (
                     case
                         when $20 in ('hybrid', 'full_text', 'any_terms') then greatest(
                             ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
@@ -99,9 +112,20 @@ pub async fn search_messages(
                            then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) * 0.25
                            else 0.0
                       end
+                    + case when $20 = 'hybrid'
+                                and $26 <> ''
+                                and e.embedding is not null
+                           then greatest(1.0 - (e.embedding <=> $26::vector), 0.0)
+                           else 0.0
+                      end
                 )::real as relevance
             from mcp_public.telegram_messages m
             left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
+            left join telegram_message_embeddings e
+              on e.chat_id = m.chat_id
+             and e.message_id = m.message_id
+             and e.status = 'ready'
+             and e.embedding_model = $27
             where m.chat_id = $1
               and m.text is not null
               and m.deleted_by_bot_at is null
@@ -146,6 +170,7 @@ pub async fn search_messages(
                   or ($20 = 'hybrid' and lower($3) <% lower(m.text))
                   or ($20 = 'literal' and position(lower($3) in lower(m.text)) > 0)
                   or ($20 = 'whole_word' and m.text ~* $4)
+                  or ($20 = 'hybrid' and $26 <> '' and e.embedding is not null)
               )
         )
         select
@@ -216,6 +241,12 @@ pub async fn search_messages(
     .bind(request.is_automatic_forward)
     .bind(request.has_reply)
     .bind(request.is_forwarded)
+    .bind(query_embedding)
+    .bind(
+        semantic_config
+            .map(|config| config.embedding_model.as_str())
+            .unwrap_or_default(),
+    )
     .fetch_all(pool)
     .await?;
 
@@ -230,6 +261,33 @@ pub async fn search_messages(
         next_offset,
         scan_limit_reached,
     })
+}
+
+async fn query_embedding(
+    semantic_config: Option<&SemanticSearchConfig>,
+    request: &MessageSearchRequest,
+    query: &str,
+) -> anyhow::Result<Option<String>> {
+    if query.is_empty() || !matches!(request.match_mode, MessageMatch::Hybrid) {
+        return Ok(None);
+    }
+    let Some(config) = semantic_config else {
+        return Ok(None);
+    };
+
+    match embed_text_at(&config.embedding_url, config.timeout_sec, query).await {
+        Ok(embedding) => match pgvector_literal(&embedding) {
+            Ok(literal) => Ok(Some(literal)),
+            Err(error) => {
+                tracing::warn!(%error, "semantic chat query vector is invalid; continuing with lexical search");
+                Ok(None)
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, "semantic chat query failed; continuing with lexical search");
+            Ok(None)
+        }
+    }
 }
 
 pub async fn count_messages(
