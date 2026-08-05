@@ -15,7 +15,10 @@ const MAX_RESULT_LIMIT: i64 = 50;
 pub(crate) const MAX_SEARCH_OFFSET: i64 = 10_000;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
 const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
-const MAX_SEMANTIC_CANDIDATES: i64 = 5_000;
+// Семантические кандидаты — приблизительная подсказка, а не второй полный
+// набор совпадений. Слабые cosine-совпадения не должны раздувать total_count.
+const MAX_SEMANTIC_CANDIDATES: i64 = 1_000;
+const MIN_SEMANTIC_RELEVANCE: f32 = 0.60;
 
 #[derive(FromRow)]
 struct MessageRow {
@@ -199,6 +202,7 @@ pub async fn search_messages_with_semantic(
               and ($23::boolean is null or m.is_automatic_forward = $23)
               and ($24::boolean is null or (m.reply_to_message_id is not null) = $24)
               and ($25::boolean is null or m.is_forwarded = $25)
+              and semantic.semantic_relevance >= $29
         ),
         matched as materialized (
             select
@@ -323,6 +327,7 @@ pub async fn search_messages_with_semantic(
             .unwrap_or_default(),
     )
     .bind(MAX_SEMANTIC_CANDIDATES)
+    .bind(MIN_SEMANTIC_RELEVANCE)
     .fetch_all(pool)
     .await?;
 
