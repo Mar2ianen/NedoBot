@@ -6,7 +6,9 @@ use super::types::{
     MessageSearchRequest, RecentMessagesRequest, SemanticSearchConfig,
 };
 
-use crate::features::memory::embedding::{embed_text_at, pgvector_literal};
+use crate::features::memory::embedding::{
+    CHAT_EMBEDDING_DIMENSIONS, embed_chat_query_at, pgvector_literal_for_dimensions,
+};
 
 const MAX_QUERY_CHARS: usize = 240;
 const MAX_RESULT_LIMIT: i64 = 50;
@@ -91,15 +93,15 @@ pub async fn search_messages_with_semantic(
                 e.chat_id,
                 e.message_id,
                 greatest(
-                    1.0 - (e.embedding <=> $26::vector),
+                    1.0 - (e.embedding <=> $26::halfvec),
                     0.0
                 )::real as semantic_relevance
-            from telegram_message_embeddings e
+            from telegram_message_embeddings_gemma e
             where e.chat_id = $1
               and e.status = 'ready'
               and e.embedding_model = $27
               and $26 is not null
-            order by (e.embedding <=> $26::vector) + 0.0
+            order by (e.embedding <=> $26::halfvec) + 0.0
             limit $28
         ),
         candidate_ids as materialized (
@@ -349,14 +351,23 @@ async fn query_embedding(
         return Ok(None);
     };
 
-    match embed_text_at(&config.embedding_url, config.timeout_sec, query).await {
-        Ok(embedding) => match pgvector_literal(&embedding) {
-            Ok(literal) => Ok(Some(literal)),
-            Err(error) => {
-                tracing::warn!(%error, "semantic chat query vector is invalid; continuing with lexical search");
-                Ok(None)
+    match embed_chat_query_at(
+        &config.embedding_url,
+        config.timeout_sec,
+        &config.query_prefix,
+        query,
+    )
+    .await
+    {
+        Ok(embedding) => {
+            match pgvector_literal_for_dimensions(&embedding, CHAT_EMBEDDING_DIMENSIONS) {
+                Ok(literal) => Ok(Some(literal)),
+                Err(error) => {
+                    tracing::warn!(%error, "semantic chat query vector is invalid; continuing with lexical search");
+                    Ok(None)
+                }
             }
-        },
+        }
         Err(error) => {
             tracing::warn!(%error, "semantic chat query failed; continuing with lexical search");
             Ok(None)

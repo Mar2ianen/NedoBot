@@ -10,8 +10,8 @@ use crate::{
         ChatReadApi,
         catalog::PublicCatalog,
         types::{
-            CHAT_EMBEDDING_MODEL_ENV, CHAT_EMBEDDING_TIMEOUT_ENV, CHAT_EMBEDDING_URL_ENV,
-            SemanticSearchConfig,
+            CHAT_EMBEDDING_MODEL_ENV, CHAT_EMBEDDING_QUERY_PREFIX_ENV, CHAT_EMBEDDING_TIMEOUT_ENV,
+            CHAT_EMBEDDING_URL_ENV, SemanticSearchConfig,
         },
     },
     mcp::server::ChatMcpServer,
@@ -62,7 +62,12 @@ fn semantic_search_from_env() -> anyhow::Result<Option<SemanticSearchConfig>> {
     let embedding_url = env::var(CHAT_EMBEDDING_URL_ENV).ok();
     let embedding_model = env::var(CHAT_EMBEDDING_MODEL_ENV).ok();
     let timeout = env::var(CHAT_EMBEDDING_TIMEOUT_ENV).ok();
-    if embedding_url.is_none() && embedding_model.is_none() && timeout.is_none() {
+    let query_prefix = env::var(CHAT_EMBEDDING_QUERY_PREFIX_ENV).ok();
+    if embedding_url.is_none()
+        && embedding_model.is_none()
+        && timeout.is_none()
+        && query_prefix.is_none()
+    {
         return Ok(None);
     }
 
@@ -88,11 +93,17 @@ fn semantic_search_from_env() -> anyhow::Result<Option<SemanticSearchConfig>> {
         timeout_sec > 0,
         "{CHAT_EMBEDDING_TIMEOUT_ENV} must be greater than zero"
     );
+    let query_prefix = required_value(
+        CHAT_EMBEDDING_QUERY_PREFIX_ENV,
+        query_prefix
+            .ok_or_else(|| anyhow::anyhow!("{CHAT_EMBEDDING_QUERY_PREFIX_ENV} is required"))?,
+    )?;
 
     Ok(Some(SemanticSearchConfig {
         embedding_url,
         embedding_model,
         timeout_sec,
+        query_prefix,
     }))
 }
 

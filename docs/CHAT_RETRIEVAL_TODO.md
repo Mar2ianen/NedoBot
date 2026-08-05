@@ -74,7 +74,7 @@
 
 ## 2. Embeddings сообщений и фоновая обработка
 
-- [x] Добавить additive-миграцию для `telegram_message_embeddings`.
+- [x] Добавить additive-миграции для legacy RuBERT `telegram_message_embeddings` и chat retrieval `telegram_message_embeddings_gemma` (`halfvec(768)`).
 - [ ] Хранить `chat_id`, `message_id`, `embedding vector(312)`, модель, статус, attempts и timestamps.
 - [ ] Добавить HNSW-индекс с cosine distance.
 - [ ] Не считать embeddings для:

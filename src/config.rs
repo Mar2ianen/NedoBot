@@ -54,6 +54,11 @@ pub struct Config {
     pub rag_min_similarity: f32,
     pub rag_temporal_half_life_days: f32,
     pub chat_retrieval_embeddings_enabled: bool,
+    pub chat_retrieval_embedding_url: String,
+    pub chat_retrieval_embedding_model: String,
+    pub chat_retrieval_embedding_timeout_sec: u64,
+    pub chat_retrieval_embedding_query_prefix: String,
+    pub chat_retrieval_embedding_document_prefix: String,
     pub chat_retrieval_embedding_batch_size: usize,
     pub chat_retrieval_embedding_poll_sec: u64,
     pub chat_retrieval_shadow_enabled: bool,
@@ -157,6 +162,12 @@ impl Config {
             rag_min_similarity: runtime.rag_min_similarity,
             rag_temporal_half_life_days: runtime.rag_temporal_half_life_days,
             chat_retrieval_embeddings_enabled: runtime.chat_retrieval_embeddings_enabled,
+            chat_retrieval_embedding_url: runtime.chat_retrieval_embedding_url,
+            chat_retrieval_embedding_model: runtime.chat_retrieval_embedding_model,
+            chat_retrieval_embedding_timeout_sec: runtime.chat_retrieval_embedding_timeout_sec,
+            chat_retrieval_embedding_query_prefix: runtime.chat_retrieval_embedding_query_prefix,
+            chat_retrieval_embedding_document_prefix: runtime
+                .chat_retrieval_embedding_document_prefix,
             chat_retrieval_embedding_batch_size: runtime.chat_retrieval_embedding_batch_size,
             chat_retrieval_embedding_poll_sec: runtime.chat_retrieval_embedding_poll_sec,
             chat_retrieval_shadow_enabled: runtime.chat_retrieval_shadow_enabled,
@@ -462,7 +473,31 @@ impl Config {
             return;
         }
 
-        self.validate_embedding_config(errors);
+        require_http_url(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_URL",
+            &self.chat_retrieval_embedding_url,
+        );
+        require_non_empty(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_MODEL",
+            &self.chat_retrieval_embedding_model,
+        );
+        require_positive(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_TIMEOUT_SEC",
+            self.chat_retrieval_embedding_timeout_sec,
+        );
+        require_non_empty(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_QUERY_PREFIX",
+            &self.chat_retrieval_embedding_query_prefix,
+        );
+        require_non_empty(
+            errors,
+            "CHAT_RETRIEVAL_EMBEDDING_DOCUMENT_PREFIX",
+            &self.chat_retrieval_embedding_document_prefix,
+        );
         require_positive(
             errors,
             "CHAT_RETRIEVAL_EMBEDDING_BATCH_SIZE",
@@ -676,6 +711,12 @@ mod tests {
             rag_min_similarity: 0.55,
             rag_temporal_half_life_days: 180.0,
             chat_retrieval_embeddings_enabled: false,
+            chat_retrieval_embedding_url: "http://127.0.0.1:8795".to_string(),
+            chat_retrieval_embedding_model: "ggml-org/embeddinggemma-300M-qat-q4_0-GGUF"
+                .to_string(),
+            chat_retrieval_embedding_timeout_sec: 30,
+            chat_retrieval_embedding_query_prefix: "task: search result | query: ".to_string(),
+            chat_retrieval_embedding_document_prefix: "title: none | text: ".to_string(),
             chat_retrieval_embedding_batch_size: 16,
             chat_retrieval_embedding_poll_sec: 5,
             chat_retrieval_shadow_enabled: false,
@@ -1106,10 +1147,9 @@ models = ["primary", "fallback"]
     }
 
     #[test]
-    fn shadow_retrieval_requires_embedding_ingestion_and_embedding_config() {
+    fn shadow_retrieval_requires_embedding_ingestion_and_chat_embedding_config() {
         let mut config = config();
         config.chat_retrieval_shadow_enabled = true;
-        config.rag_embedding_url.clear();
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
@@ -1119,8 +1159,9 @@ models = ["primary", "fallback"]
         assert!(!error.contains("RAG_EMBEDDING_URL must not be empty"));
 
         config.chat_retrieval_embeddings_enabled = true;
+        config.chat_retrieval_embedding_url.clear();
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
-        assert!(error.contains("RAG_EMBEDDING_URL must not be empty"));
+        assert!(error.contains("CHAT_RETRIEVAL_EMBEDDING_URL must not be empty"));
     }
 
     #[test]
@@ -1139,11 +1180,11 @@ models = ["primary", "fallback"]
     fn embedding_ingestion_requires_an_absolute_http_endpoint() {
         let mut config = config();
         config.chat_retrieval_embeddings_enabled = true;
-        config.rag_embedding_url = "not a URL".to_string();
+        config.chat_retrieval_embedding_url = "not a URL".to_string();
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
-        assert!(error.contains("RAG_EMBEDDING_URL must be an absolute HTTP(S) URL"));
+        assert!(error.contains("CHAT_RETRIEVAL_EMBEDDING_URL must be an absolute HTTP(S) URL"));
     }
 
     #[test]
