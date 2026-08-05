@@ -18,6 +18,8 @@ struct MessageRow {
     user_id: Option<i64>,
     author: String,
     author_username: Option<String>,
+    is_forwarded: bool,
+    forwarded_from: Option<String>,
     text: String,
     reply_to_message_id: Option<i32>,
     created_at: DateTime<Utc>,
@@ -30,6 +32,8 @@ struct SearchPageRow {
     user_id: Option<i64>,
     author: Option<String>,
     author_username: Option<String>,
+    is_forwarded: Option<bool>,
+    forwarded_from: Option<String>,
     text: Option<String>,
     reply_to_message_id: Option<i32>,
     created_at: Option<DateTime<Utc>>,
@@ -43,6 +47,8 @@ struct InteractionRow {
     user_id: Option<i64>,
     author: String,
     author_username: Option<String>,
+    is_forwarded: bool,
+    forwarded_from: Option<String>,
     text: String,
     reply_to_message_id: Option<i32>,
     created_at: DateTime<Utc>,
@@ -50,6 +56,8 @@ struct InteractionRow {
     replied_to_user_id: Option<i64>,
     replied_to_author: Option<String>,
     replied_to_username: Option<String>,
+    replied_to_is_forwarded: Option<bool>,
+    replied_to_forwarded_from: Option<String>,
     replied_to_text: Option<String>,
     replied_to_created_at: Option<DateTime<Utc>>,
 }
@@ -72,6 +80,8 @@ pub async fn search_messages(
                          nullif(p.username, ''),
                          'Неизвестный пользователь') as author,
                 nullif(p.username, '') as author_username,
+                m.is_forwarded,
+                m.forwarded_from,
                 m.text,
                 m.reply_to_message_id,
                 m.created_at,
@@ -98,10 +108,16 @@ pub async fn search_messages(
               and m.spam_marked_at is null
               and (
                   m.user_id is not null
-                  or ($21::boolean and coalesce(m.is_automatic_forward, false))
+                  or ($21::boolean and (
+                      coalesce(m.is_forwarded, false)
+                      or coalesce(m.is_automatic_forward, false)
+                  ))
               )
               and not coalesce(p.is_bot, false)
-              and ($21::boolean or not coalesce(m.is_automatic_forward, false))
+              and ($21::boolean or not (
+                  coalesce(m.is_forwarded, false)
+                  or coalesce(m.is_automatic_forward, false)
+              ))
               and ($5::bigint is null or m.user_id = $5)
               and ($6::timestamptz is null or m.created_at >= $6)
               and ($7::timestamptz is null or m.created_at <= $7)
@@ -121,6 +137,7 @@ pub async fn search_messages(
               and ($17::boolean is null or m.has_animation = $17)
               and ($23::boolean is null or m.is_automatic_forward = $23)
               and ($24::boolean is null or (m.reply_to_message_id is not null) = $24)
+              and ($25::boolean is null or m.is_forwarded = $25)
               and (
                   ($20 in ('hybrid', 'full_text', 'any_terms') and (
                        to_tsvector('russian', coalesce(m.text, '')) @@ websearch_to_tsquery('russian', $2)
@@ -136,6 +153,8 @@ pub async fn search_messages(
             page.user_id,
             page.author,
             page.author_username,
+            page.is_forwarded,
+            page.forwarded_from,
             page.text,
             page.reply_to_message_id,
             page.created_at,
@@ -196,6 +215,7 @@ pub async fn search_messages(
     .bind(request.offset.clamp(0, MAX_SEARCH_OFFSET))
     .bind(request.is_automatic_forward)
     .bind(request.has_reply)
+    .bind(request.is_forwarded)
     .fetch_all(pool)
     .await?;
 
@@ -254,10 +274,16 @@ async fn count_matching_messages(
           and m.spam_marked_at is null
           and (
               m.user_id is not null
-              or ($19::boolean and coalesce(m.is_automatic_forward, false))
+              or ($19::boolean and (
+                  coalesce(m.is_forwarded, false)
+                  or coalesce(m.is_automatic_forward, false)
+              ))
           )
           and not coalesce(p.is_bot, false)
-          and ($19::boolean or not coalesce(m.is_automatic_forward, false))
+          and ($19::boolean or not (
+              coalesce(m.is_forwarded, false)
+              or coalesce(m.is_automatic_forward, false)
+          ))
           and ($5::bigint is null or m.user_id = $5)
           and ($6::timestamptz is null or m.created_at >= $6)
           and ($7::timestamptz is null or m.created_at <= $7)
@@ -277,6 +303,7 @@ async fn count_matching_messages(
           and ($17::boolean is null or m.has_animation = $17)
           and ($20::boolean is null or m.is_automatic_forward = $20)
           and ($21::boolean is null or (m.reply_to_message_id is not null) = $21)
+          and ($22::boolean is null or m.is_forwarded = $22)
           and (
               $3 = ''
               or ($18 in ('hybrid', 'full_text', 'any_terms') and (
@@ -310,6 +337,7 @@ async fn count_matching_messages(
     .bind(request.include_forwards)
     .bind(request.is_automatic_forward)
     .bind(request.has_reply)
+    .bind(request.is_forwarded)
     .fetch_one(pool)
     .await
     .map_err(Into::into)
@@ -325,6 +353,8 @@ pub async fn recent_messages(
         select m.message_id, m.user_id,
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''), nullif(p.username, ''), 'Неизвестный пользователь') as author,
                nullif(p.username, '') as author_username,
+               m.is_forwarded,
+               m.forwarded_from,
                coalesce(m.text, '[медиа без текста]') as text,
                m.reply_to_message_id, m.created_at, 0::real as relevance
         from mcp_public.telegram_messages m
@@ -334,10 +364,16 @@ pub async fn recent_messages(
           and m.spam_marked_at is null
           and (
               m.user_id is not null
-              or ($16::boolean and coalesce(m.is_automatic_forward, false))
+              or ($16::boolean and (
+                  coalesce(m.is_forwarded, false)
+                  or coalesce(m.is_automatic_forward, false)
+              ))
           )
           and not coalesce(p.is_bot, false)
-          and ($16::boolean or not coalesce(m.is_automatic_forward, false))
+          and ($16::boolean or not (
+              coalesce(m.is_forwarded, false)
+              or coalesce(m.is_automatic_forward, false)
+          ))
           and ($2::bigint is null or m.user_id = $2)
           and ($3::timestamptz is null or m.created_at >= $3)
           and ($4::timestamptz is null or m.created_at <= $4)
@@ -352,6 +388,7 @@ pub async fn recent_messages(
           and ($13::boolean is null or m.has_animation = $13)
           and ($17::boolean is null or m.is_automatic_forward = $17)
           and ($18::boolean is null or (m.reply_to_message_id is not null) = $18)
+          and ($19::boolean is null or m.is_forwarded = $19)
         order by
             case when $14 = 'oldest' then m.created_at end asc,
             case when $14 <> 'oldest' then m.created_at end desc,
@@ -378,6 +415,7 @@ pub async fn recent_messages(
     .bind(request.include_forwards)
     .bind(request.is_automatic_forward)
     .bind(request.has_reply)
+    .bind(request.is_forwarded)
     .fetch_all(pool)
     .await?;
     Ok(map_rows(chat_id, rows))
@@ -399,6 +437,8 @@ pub async fn message_context(
                      nullif(p.username, ''),
                      'Неизвестный пользователь') as author,
             nullif(p.username, '') as author_username,
+            m.is_forwarded,
+            m.forwarded_from,
             coalesce(m.text, '[медиа без текста]') as text,
             m.reply_to_message_id,
             m.created_at,
@@ -429,22 +469,28 @@ pub async fn reply_thread(
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let rows = sqlx::query_as::<_, MessageRow>(r#"
         with recursive ancestors as (
-            select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at, 0 as depth
+            select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at,
+                   m.is_forwarded, m.forwarded_from, 0 as depth
             from mcp_public.telegram_messages m
             where m.chat_id = $1 and m.message_id = $2 and m.deleted_by_bot_at is null and m.spam_marked_at is null
             union all
-            select parent.message_id, parent.user_id, parent.text, parent.reply_to_message_id, parent.created_at, ancestors.depth + 1
+            select parent.message_id, parent.user_id, parent.text, parent.reply_to_message_id,
+                   parent.created_at, parent.is_forwarded, parent.forwarded_from, ancestors.depth + 1
             from mcp_public.telegram_messages parent join ancestors on ancestors.reply_to_message_id = parent.message_id
             where parent.chat_id = $1 and ancestors.depth < 5 and parent.deleted_by_bot_at is null and parent.spam_marked_at is null
         ), descendants as (
-            select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at, 0 as depth
+            select m.message_id, m.user_id, m.text, m.reply_to_message_id, m.created_at,
+                   m.is_forwarded, m.forwarded_from, 0 as depth
             from mcp_public.telegram_messages m
             where m.chat_id = $1 and m.message_id = $2 and m.deleted_by_bot_at is null and m.spam_marked_at is null
             union all
-            select child.message_id, child.user_id, child.text, child.reply_to_message_id, child.created_at, descendants.depth + 1
+            select child.message_id, child.user_id, child.text, child.reply_to_message_id,
+                   child.created_at, child.is_forwarded, child.forwarded_from, descendants.depth + 1
             from descendants
             join lateral (
-                select candidate.message_id, candidate.user_id, candidate.text, candidate.reply_to_message_id, candidate.created_at
+                select candidate.message_id, candidate.user_id, candidate.text,
+                       candidate.reply_to_message_id, candidate.created_at,
+                       candidate.is_forwarded, candidate.forwarded_from
                 from mcp_public.telegram_messages candidate
                 where candidate.chat_id = $1
                   and candidate.reply_to_message_id = descendants.message_id
@@ -455,12 +501,16 @@ pub async fn reply_thread(
             ) child on true
             where descendants.depth < 3
         ), thread as (
-            select message_id, user_id, text, reply_to_message_id, created_at from ancestors
+            select message_id, user_id, text, reply_to_message_id, created_at,
+                   is_forwarded, forwarded_from from ancestors
             union
-            select message_id, user_id, text, reply_to_message_id, created_at from descendants
+            select message_id, user_id, text, reply_to_message_id, created_at,
+                   is_forwarded, forwarded_from from descendants
         )
         select thread.message_id, thread.user_id, coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''), nullif(p.username, ''), 'Неизвестный пользователь') as author,
                nullif(p.username, '') as author_username,
+               thread.is_forwarded,
+               thread.forwarded_from,
                coalesce(thread.text, '[медиа без текста]') as text, thread.reply_to_message_id, thread.created_at, 0::real as relevance
         from thread left join mcp_public.telegram_user_profiles p on p.telegram_user_id = thread.user_id
         order by thread.created_at asc, thread.message_id asc
@@ -482,6 +532,8 @@ pub async fn user_interactions(
                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
                         nullif(p.username, ''), 'Неизвестный пользователь') as author,
                nullif(p.username, '') as author_username,
+               m.is_forwarded,
+               m.forwarded_from,
                coalesce(m.text, '[медиа без текста]') as text,
                m.reply_to_message_id, m.created_at,
                replied.message_id as replied_to_message_id,
@@ -489,6 +541,8 @@ pub async fn user_interactions(
                coalesce(nullif(concat_ws(' ', replied_profile.first_name, replied_profile.last_name), ''),
                         nullif(replied_profile.username, ''), 'Неизвестный пользователь') as replied_to_author,
                nullif(replied_profile.username, '') as replied_to_username,
+               replied.is_forwarded as replied_to_is_forwarded,
+               replied.forwarded_from as replied_to_forwarded_from,
                coalesce(replied.text, '[медиа без текста]') as replied_to_text,
                replied.created_at as replied_to_created_at
         from mcp_public.telegram_messages m
@@ -522,6 +576,8 @@ pub async fn user_interactions(
                 user_id: row.user_id,
                 author: row.author,
                 author_url: author_url(row.author_username.as_deref()),
+                is_forwarded: row.is_forwarded,
+                forwarded_from: row.forwarded_from,
                 text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
                 reply_to_message_id: row.reply_to_message_id,
                 created_at: row.created_at.to_rfc3339(),
@@ -536,6 +592,8 @@ pub async fn user_interactions(
                     .replied_to_author
                     .unwrap_or_else(|| "Неизвестный пользователь".to_string()),
                 author_url: author_url(row.replied_to_username.as_deref()),
+                is_forwarded: row.replied_to_is_forwarded.unwrap_or(false),
+                forwarded_from: row.replied_to_forwarded_from,
                 text: first_chars(
                     row.replied_to_text
                         .as_deref()
@@ -653,6 +711,8 @@ fn map_search_page_rows(chat_id: i64, rows: Vec<SearchPageRow>) -> (i64, Vec<Cha
                 user_id: row.user_id,
                 author: row.author?,
                 author_url: author_url(row.author_username.as_deref()),
+                is_forwarded: row.is_forwarded.unwrap_or(false),
+                forwarded_from: row.forwarded_from,
                 text: first_chars(&row.text?, MAX_MESSAGE_PREVIEW_CHARS),
                 reply_to_message_id: row.reply_to_message_id,
                 created_at: row.created_at?.to_rfc3339(),
@@ -672,6 +732,8 @@ fn map_rows(chat_id: i64, rows: Vec<MessageRow>) -> Vec<ChatMessage> {
             user_id: row.user_id,
             author: row.author,
             author_url: author_url(row.author_username.as_deref()),
+            is_forwarded: row.is_forwarded,
+            forwarded_from: row.forwarded_from,
             text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
             reply_to_message_id: row.reply_to_message_id,
             created_at: row.created_at.to_rfc3339(),

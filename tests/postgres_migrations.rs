@@ -2556,12 +2556,12 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     query(
         r#"
         insert into telegram_messages
-            (chat_id, message_id, user_id, is_automatic_forward, text)
+            (chat_id, message_id, user_id, is_automatic_forward, is_forwarded, text)
         values
-            ($1, $2, $3, false, 'hybrid quality marker alpha'),
-            ($1, $2 + 1, $3 + 1, true, 'hybrid quality marker alpha forwarded'),
-            ($1, $2 + 2, null, true, 'hybrid quality marker alpha nedobot quality anonymous forwarded marker'),
-            ($1, $2 + 3, null, false, 'hybrid quality marker alpha anonymous normal')
+            ($1, $2, $3, false, false, 'hybrid quality marker alpha'),
+            ($1, $2 + 1, $3 + 1, false, true, 'hybrid quality marker alpha forwarded'),
+            ($1, $2 + 2, null, true, true, 'hybrid quality marker alpha nedobot quality anonymous forwarded marker'),
+            ($1, $2 + 3, null, false, false, 'hybrid quality marker alpha anonymous normal')
         "#,
     )
     .bind(-1001932061163_i64)
@@ -2570,6 +2570,22 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("chat search fixtures must be inserted");
+    query(
+        r#"
+        update telegram_messages
+        set raw_json = jsonb_build_object(
+            'forward_origin', jsonb_build_object(
+                'sender_user', jsonb_build_object('username', 'forwarded_user')
+            )
+        )
+        where chat_id = $1 and message_id = $2 + 1
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .execute(pool)
+    .await
+    .expect("manual forward metadata fixture must be updated");
     query(
         r#"
         insert into telegram_messages
@@ -2608,6 +2624,7 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
         date_to: None,
         reply_to_message_id: None,
         is_automatic_forward: None,
+        is_forwarded: None,
         has_reply: None,
         has_links: None,
         has_media: None,
@@ -2768,6 +2785,27 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .await
     .expect("count search must execute through the production read service");
     assert_eq!(with_forwards, 3);
+    let forwarded_page = chat_read_service::search_messages(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            include_forwards: true,
+            limit: 10,
+            ..request.clone()
+        },
+    )
+    .await
+    .expect("forward metadata search must execute through the production read service");
+    let manual_forward = forwarded_page
+        .messages
+        .iter()
+        .find(|message| message.message_id == message_id + 1)
+        .expect("manual forwarded fixture must be visible with opt-in");
+    assert!(manual_forward.is_forwarded);
+    assert_eq!(
+        manual_forward.forwarded_from.as_deref(),
+        Some("forwarded_user")
+    );
     let user_message_count = chat_read_service::count_messages(
         pool,
         -1001932061163,

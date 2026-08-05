@@ -434,6 +434,8 @@ mod tests {
                 user_id: Some(1),
                 author: "Марс".to_string(),
                 author_url: None,
+                is_forwarded: false,
+                forwarded_from: None,
                 text: "Исходный вопрос".to_string(),
                 reply_to_message_id: None,
                 created_at: "2026-07-26T00:00:00Z".to_string(),

@@ -67,6 +67,9 @@ pub struct SearchMessagesInput {
     pub date_to: Option<String>,
     pub reply_to_message_id: Option<i32>,
     pub is_automatic_forward: Option<bool>,
+    /// Filters all Telegram forwards, including manual user forwards. Set
+    /// include_forwards=true when requesting forwarded rows explicitly.
+    pub is_forwarded: Option<bool>,
     pub has_reply: Option<bool>,
     pub has_links: Option<bool>,
     pub has_media: Option<bool>,
@@ -93,6 +96,9 @@ pub struct SearchMessagesBatchInput {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
     pub is_automatic_forward: Option<bool>,
+    /// Filters all Telegram forwards, including manual user forwards. Set
+    /// include_forwards=true when requesting forwarded rows explicitly.
+    pub is_forwarded: Option<bool>,
     pub has_reply: Option<bool>,
     pub has_links: Option<bool>,
     pub has_media: Option<bool>,
@@ -122,6 +128,9 @@ pub struct CountMessagesInput {
     pub date_to: Option<String>,
     pub reply_to_message_id: Option<i32>,
     pub is_automatic_forward: Option<bool>,
+    /// Filters all Telegram forwards, including manual user forwards. Set
+    /// include_forwards=true when requesting forwarded rows explicitly.
+    pub is_forwarded: Option<bool>,
     pub has_reply: Option<bool>,
     pub has_links: Option<bool>,
     pub has_media: Option<bool>,
@@ -144,6 +153,9 @@ pub struct RecentMessagesInput {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
     pub is_automatic_forward: Option<bool>,
+    /// Filters all Telegram forwards, including manual user forwards. Set
+    /// include_forwards=true when requesting forwarded rows explicitly.
+    pub is_forwarded: Option<bool>,
     pub has_reply: Option<bool>,
     pub has_links: Option<bool>,
     pub has_media: Option<bool>,
@@ -246,6 +258,7 @@ fn search_request(input: SearchMessagesInput) -> Result<MessageSearchRequest, rm
         date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
         reply_to_message_id: input.reply_to_message_id,
         is_automatic_forward: input.is_automatic_forward,
+        is_forwarded: input.is_forwarded,
         has_reply: input.has_reply,
         has_links: input.has_links,
         has_media: input.has_media,
@@ -294,6 +307,7 @@ pub async fn count_messages(
         date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
         reply_to_message_id: input.reply_to_message_id,
         is_automatic_forward: input.is_automatic_forward,
+        is_forwarded: input.is_forwarded,
         has_reply: input.has_reply,
         has_links: input.has_links,
         has_media: input.has_media,
@@ -339,6 +353,7 @@ pub async fn search_messages_batch(
                 date_to,
                 reply_to_message_id: None,
                 is_automatic_forward: input.is_automatic_forward,
+                is_forwarded: input.is_forwarded,
                 has_reply: input.has_reply,
                 has_links: input.has_links,
                 has_media: input.has_media,
@@ -405,6 +420,7 @@ pub async fn recent_messages(
             date_from: parse_timestamp(input.date_from, DateBoundary::Start)?,
             date_to: parse_timestamp(input.date_to, DateBoundary::End)?,
             is_automatic_forward: input.is_automatic_forward,
+            is_forwarded: input.is_forwarded,
             has_reply: input.has_reply,
             has_links: input.has_links,
             has_media: input.has_media,
@@ -584,6 +600,7 @@ mod tests {
             date_to: None,
             reply_to_message_id: None,
             is_automatic_forward: None,
+            is_forwarded: None,
             has_reply: None,
             has_links: None,
             has_media: None,
@@ -636,6 +653,7 @@ mod tests {
             date_to: None,
             reply_to_message_id: None,
             is_automatic_forward: None,
+            is_forwarded: None,
             has_reply: None,
             has_links: None,
             has_media: None,

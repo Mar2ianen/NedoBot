@@ -357,13 +357,14 @@ async fn import_messages(
                         is_automatic_forward, text, raw_json, created_at, reply_to_message_id,
                         reply_to_user_id, sender_chat_id, via_bot_id, has_photo, has_video,
                         has_document, has_audio, has_voice, has_sticker, has_animation,
-                        has_links
+                        has_links, is_forwarded
                     )
-                values ($1, $2, $3, $4, null, $5, $6, $7, $8, $9, null, $10, null, $11, $12, $13, $14, $15, $16, $17, $18)
+                values ($1, $2, $3, $4, null, $5, $6, $7, $8, $9, null, $10, null, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                 on conflict (chat_id, message_id) do update set
                     user_id = coalesce(telegram_messages.user_id, excluded.user_id),
                     source_channel_id = coalesce(telegram_messages.source_channel_id, excluded.source_channel_id),
                     is_automatic_forward = telegram_messages.is_automatic_forward or excluded.is_automatic_forward,
+                    is_forwarded = telegram_messages.is_forwarded or excluded.is_forwarded,
                     text = coalesce(nullif(telegram_messages.text, ''), excluded.text),
                     created_at = least(telegram_messages.created_at, excluded.created_at),
                     reply_to_message_id = coalesce(telegram_messages.reply_to_message_id, excluded.reply_to_message_id),
@@ -396,6 +397,7 @@ async fn import_messages(
             .bind(matches!(media_type, Some("sticker")))
             .bind(matches!(media_type, Some("animation")))
             .bind(message_has_links(message))
+            .bind(message.forwarded_from.is_some() || message.forwarded_from_id.is_some())
             .execute(&mut *tx)
             .await?;
 
