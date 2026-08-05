@@ -83,7 +83,7 @@ pub async fn search_messages_with_semantic(
     let ts_query = full_text_query(&query, &request.match_mode);
     let whole_word_pattern = whole_word_pattern(&query);
     let query_embedding = query_embedding(semantic_config, request, &query).await?;
-    let query_embedding = query_embedding.as_deref().unwrap_or_default();
+    let query_embedding = query_embedding.as_deref();
     let rows = sqlx::query_as::<_, SearchPageRow>(
         r#"
         with semantic_candidates as materialized (
@@ -91,15 +91,15 @@ pub async fn search_messages_with_semantic(
                 e.chat_id,
                 e.message_id,
                 greatest(
-                    1.0 - (e.embedding <=> nullif($26, '')::vector),
+                    1.0 - (e.embedding <=> $26::vector),
                     0.0
                 )::real as semantic_relevance
             from telegram_message_embeddings e
             where e.chat_id = $1
               and e.status = 'ready'
               and e.embedding_model = $27
-              and nullif($26, '') is not null
-            order by e.embedding <=> nullif($26, '')::vector
+              and $26 is not null
+            order by e.embedding <=> $26::vector
             limit $28
         ),
         matched as materialized (
@@ -117,7 +117,7 @@ pub async fn search_messages_with_semantic(
                m.created_at,
                 (
                     case
-                        when $20 = 'hybrid' and $26 <> '' then
+                        when $20 = 'hybrid' and $26 is not null then
                             least(greatest(
                                 ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
                                 ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
@@ -132,11 +132,11 @@ pub async fn search_messages_with_semantic(
                     end
                     + case when $20 = 'hybrid' and lower($3) <% lower(m.text)
                            then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) *
-                                case when $26 <> '' then 0.10 else 0.25 end
+                                case when $26 is not null then 0.10 else 0.25 end
                            else 0.0
                       end
                     + case when $20 = 'hybrid'
-                                and $26 <> ''
+                                and $26 is not null
                            then coalesce(semantic.semantic_relevance, 0.0) * 0.55
                            else 0.0
                       end
