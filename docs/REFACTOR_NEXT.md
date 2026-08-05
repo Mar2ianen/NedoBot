@@ -1,6 +1,6 @@
 # Следующая инженерная цель: post-migration verification
 
-Unified audit, voice follow-up и миграция на fork `teloxide 0.18` закрыты и развёрнуты на `vps-153`. Самописные raw Bot API paths заменены typed methods fork-а; production-like Telegram smoke и release CI прошли. Deployment boundary зафиксирован тегом `deploy-2026-07-31-teloxide-fork`.
+Unified audit, voice follow-up, миграция на fork `teloxide 0.18` и текущий model-driven `/ask` release закрыты и развёрнуты на `vps-153`. Самописные raw Bot API paths заменены typed methods fork-а; production-like Telegram smoke и release CI прошли. Deployment boundary зафиксирован тегом `deploy-2026-08-05-ask-author-evidence`.
 
 ## Закрытый voice follow-up
 
