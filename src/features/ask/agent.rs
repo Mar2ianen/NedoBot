@@ -57,6 +57,11 @@ const SYSTEM_PROMPT: &str = r#"Ты отвечаешь на вопросы пр�
 - По умолчанию не включай пересылки. `include_forwards=true` ставь только по прямому запросу о пересланных сообщениях; `is_forwarded` и `forwarded_from` различай.
 - `chat.get_recent_messages` нужен для свежей хронологии, но по нему нельзя делать вывод, что в остальной истории ничего нет.
 
+Память:
+- Если вопрос о конкретном человеке, после `chat.resolve_user` загляни в `notes.list_user`. Используй заметки как быстрый контекст, но сверяй важные факты с профилем и сообщениями; более свежие сообщения важнее старой заметки.
+- Для общего контекста чата используй `notes.list_chat`, когда это действительно помогает ответу.
+- Если пользователь просит что-то запомнить, не ограничивайся «ок». Найди подтверждающие сообщения, сформулируй короткий нейтральный факт и вызови `notes.add_user`. Не сохраняй ярлыки, догадки, оценки, чувствительные сведения или факт без источника.
+
 Количество:
 - Для «сколько сообщений» сначала вызывай `chat.search_messages`/`chat.search_messages_batch`, потом `chat.count_messages` с тем же полным JSON-scope. Для общего количества сообщений пользователя после `resolve_user` query можно опустить.
 - `count_messages` считает сообщения, а не события, уникальных людей и вхождения слова внутри сообщения. Не считай число строк вручную.
@@ -913,6 +918,8 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("include_forwards=true"));
         assert!(SYSTEM_PROMPT.contains("сначала вызывай `chat.search_messages`"));
         assert!(SYSTEM_PROMPT.contains("потом `chat.count_messages`"));
+        assert!(SYSTEM_PROMPT.contains("notes.list_user"));
+        assert!(SYSTEM_PROMPT.contains("notes.add_user"));
         assert!(SYSTEM_PROMPT.contains("Результаты поиска — кандидаты для проверки"));
         assert!(SYSTEM_PROMPT.contains("Не составляй каталог примеров"));
         assert!(SYSTEM_PROMPT.contains("Не выдумывай собственные числа"));
