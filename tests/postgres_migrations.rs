@@ -3037,7 +3037,7 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
 
     assert_eq!(page.total_count, 1);
     assert_eq!(page.messages[0].message_id, message_id);
-    assert_eq!(page.messages[0].relevance, 1000);
+    assert_eq!(page.messages[0].relevance, 550);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

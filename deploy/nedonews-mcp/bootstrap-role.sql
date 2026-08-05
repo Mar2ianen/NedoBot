@@ -20,3 +20,6 @@ grant connect on database tg_ai_bot to nedobot_mcp_ro;
 revoke all on schema public from nedobot_mcp_ro;
 grant usage on schema mcp_public to nedobot_mcp_ro;
 grant select on all tables in schema mcp_public to nedobot_mcp_ro;
+grant usage on schema public to nedobot_mcp_ro;
+grant select (chat_id, message_id, embedding, embedding_model, status)
+    on table public.telegram_message_embeddings to nedobot_mcp_ro;
