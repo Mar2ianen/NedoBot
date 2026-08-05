@@ -14,7 +14,6 @@ pub(crate) const MAX_SEARCH_OFFSET: i64 = 10_000;
 const MAX_CONTEXT_MESSAGES: i64 = 5;
 const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
 const MAX_SEMANTIC_CANDIDATES: i64 = 5_000;
-const SEMANTIC_HNSW_EF_SEARCH: &str = "200";
 
 #[derive(FromRow)]
 struct MessageRow {
@@ -85,13 +84,6 @@ pub async fn search_messages_with_semantic(
     let whole_word_pattern = whole_word_pattern(&query);
     let query_embedding = query_embedding(semantic_config, request, &query).await?;
     let query_embedding = query_embedding.as_deref();
-    let mut transaction = pool.begin().await?;
-    if query_embedding.is_some() {
-        sqlx::query("select set_config('hnsw.ef_search', $1, true)")
-            .bind(SEMANTIC_HNSW_EF_SEARCH)
-            .execute(&mut *transaction)
-            .await?;
-    }
     let rows = sqlx::query_as::<_, SearchPageRow>(
         r#"
         with semantic_candidates as materialized (
@@ -107,7 +99,7 @@ pub async fn search_messages_with_semantic(
               and e.status = 'ready'
               and e.embedding_model = $27
               and $26 is not null
-            order by e.embedding <=> $26::vector
+            order by (e.embedding <=> $26::vector) + 0.0
             limit $28
         ),
         candidate_ids as materialized (
@@ -329,9 +321,8 @@ pub async fn search_messages_with_semantic(
             .unwrap_or_default(),
     )
     .bind(MAX_SEMANTIC_CANDIDATES)
-    .fetch_all(&mut *transaction)
+    .fetch_all(pool)
     .await?;
-    transaction.commit().await?;
 
     let (total_count, messages) = map_search_page_rows(chat_id, rows);
     let offset = request.offset.clamp(0, MAX_SEARCH_OFFSET);
