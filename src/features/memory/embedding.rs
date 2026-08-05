@@ -26,12 +26,28 @@ enum EmbedResponse {
 }
 
 pub async fn embed_text(config: &Config, text: &str) -> anyhow::Result<Vec<f32>> {
+    let embedding = embed_text_at(
+        &config.rag_embedding_url,
+        config.rag_embedding_timeout_sec,
+        text,
+    )
+    .await?;
+    tracing::info!(
+        model = %config.rag_embedding_model,
+        dimensions = embedding.len(),
+        "RAG embedding completed"
+    );
+    Ok(embedding)
+}
+
+pub async fn embed_text_at(
+    embedding_url: &str,
+    timeout_sec: u64,
+    text: &str,
+) -> anyhow::Result<Vec<f32>> {
     let started = Instant::now();
-    let response = http::client(Duration::from_secs(config.rag_embedding_timeout_sec))?
-        .post(format!(
-            "{}/embed",
-            config.rag_embedding_url.trim_end_matches('/')
-        ))
+    let response = http::client(Duration::from_secs(timeout_sec))?
+        .post(format!("{}/embed", embedding_url.trim_end_matches('/')))
         .json(&EmbedRequest {
             inputs: text,
             truncate: true,
@@ -53,11 +69,10 @@ pub async fn embed_text(config: &Config, text: &str) -> anyhow::Result<Vec<f32>>
         }
     };
     validate_embedding(&embedding)?;
-    tracing::info!(
-        model = %config.rag_embedding_model,
+    tracing::debug!(
         dimensions = embedding.len(),
         latency_ms = started.elapsed().as_millis(),
-        "RAG embedding completed"
+        "query embedding completed"
     );
     Ok(embedding)
 }

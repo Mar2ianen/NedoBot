@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, mpsc::sync_channel},
 };
 
+use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
@@ -16,7 +17,7 @@ use tg_ai_bot_teloxide::features::{
     },
     chat_read_api::{
         service as chat_read_service,
-        types::{MessageMatch, MessageSearchRequest, MessageSort},
+        types::{MessageMatch, MessageSearchRequest, MessageSort, SemanticSearchConfig},
     },
     chat_retrieval::{
         EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
@@ -2926,6 +2927,117 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     .await
     .expect("default search count must exclude anonymous non-forward rows");
     assert_eq!(without_forward_opt_in, 1);
+
+    assert_semantic_search_uses_embeddings_without_freshness_decay(pool).await;
+}
+
+async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &PgPool) {
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 1_000_000) as i32;
+    let message_id = 9_700_000 + suffix;
+    let user_id = 9_700_000 + i64::from(suffix);
+    let embedding = std::iter::once(1.0_f32)
+        .chain(std::iter::repeat_n(0.0_f32, 311))
+        .collect::<Vec<_>>();
+    let embedding_literal = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, is_automatic_forward, is_forwarded, text, created_at)
+        values ($1, $2, $3, false, false, 'semantic vector fixture without lexical overlap', '1999-01-01T00:00:00Z')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("semantic search message fixture must be inserted");
+    query(
+        r#"
+        insert into telegram_message_embeddings
+            (chat_id, message_id, embedding, embedding_model, status)
+        values ($1, $2, $3::vector, 'test-rubert', 'ready')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(&embedding_literal)
+    .execute(pool)
+    .await
+    .expect("semantic search embedding fixture must be inserted");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("embedding fixture listener must bind");
+    let address = listener
+        .local_addr()
+        .expect("embedding fixture listener must have an address");
+    let embedding_server = tokio::spawn(async move {
+        let vector = embedding;
+        let app = Router::new().route(
+            "/embed",
+            post(move || {
+                let vector = vector.clone();
+                async move { Json(vector) }
+            }),
+        );
+        axum::serve(listener, app)
+            .await
+            .expect("embedding fixture server must run");
+    });
+
+    let page = chat_read_service::search_messages_with_semantic(
+        pool,
+        -1001932061163,
+        &MessageSearchRequest {
+            query: "term_without_lexical_match".into(),
+            user_id: None,
+            date_from: None,
+            date_to: None,
+            reply_to_message_id: None,
+            is_automatic_forward: None,
+            is_forwarded: None,
+            has_reply: None,
+            has_links: None,
+            has_media: None,
+            has_photo: None,
+            has_video: None,
+            has_document: None,
+            has_audio: None,
+            has_voice: None,
+            has_sticker: None,
+            has_animation: None,
+            match_mode: MessageMatch::Hybrid,
+            sort: MessageSort::Relevance,
+            limit: 1,
+            offset: 0,
+            include_forwards: false,
+        },
+        Some(&SemanticSearchConfig {
+            embedding_url: format!("http://{address}"),
+            embedding_model: "test-rubert".into(),
+            timeout_sec: 5,
+        }),
+    )
+    .await
+    .expect("semantic chat search must execute through the production read service");
+    embedding_server.abort();
+
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.messages[0].message_id, message_id);
+    assert_eq!(page.messages[0].relevance, 1000);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

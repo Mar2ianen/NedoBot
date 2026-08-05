@@ -9,6 +9,17 @@ pub struct ChatReadScope {
     pub source_channel_id: i64,
 }
 
+pub const CHAT_EMBEDDING_URL_ENV: &str = "ASK_CHAT_EMBEDDING_URL";
+pub const CHAT_EMBEDDING_MODEL_ENV: &str = "ASK_CHAT_EMBEDDING_MODEL";
+pub const CHAT_EMBEDDING_TIMEOUT_ENV: &str = "ASK_CHAT_EMBEDDING_TIMEOUT_SEC";
+
+#[derive(Clone, Debug)]
+pub struct SemanticSearchConfig {
+    pub embedding_url: String,
+    pub embedding_model: String,
+    pub timeout_sec: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMatch {

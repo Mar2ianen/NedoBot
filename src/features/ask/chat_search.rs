@@ -10,5 +10,5 @@ pub use crate::features::chat_read_api::service::{
 #[allow(unused_imports)]
 pub use crate::features::chat_read_api::types::{
     ChatInteraction, ChatMessage, ChatReadScope, ChatUserProfile, MessageMatch, MessageSearchPage,
-    MessageSearchRequest, MessageSort, RecentMessagesRequest,
+    MessageSearchRequest, MessageSort, RecentMessagesRequest, SemanticSearchConfig,
 };

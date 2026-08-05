@@ -13,7 +13,7 @@ pub mod types;
 use catalog::PublicCatalog;
 use types::{
     ChatInteraction, ChatMessage, ChatReadScope, ChatUserProfile, MessageSearchPage,
-    MessageSearchRequest, RecentMessagesRequest,
+    MessageSearchRequest, RecentMessagesRequest, SemanticSearchConfig,
 };
 
 /// One scoped read-model shared by every MCP transport.
@@ -21,10 +21,20 @@ pub struct ChatReadApi {
     pool: PgPool,
     scope: ChatReadScope,
     catalog: PublicCatalog,
+    semantic_search: Option<SemanticSearchConfig>,
 }
 
 impl ChatReadApi {
     pub fn new(pool: PgPool, scope: ChatReadScope, catalog: PublicCatalog) -> anyhow::Result<Self> {
+        Self::new_with_semantic_search(pool, scope, catalog, None)
+    }
+
+    pub fn new_with_semantic_search(
+        pool: PgPool,
+        scope: ChatReadScope,
+        catalog: PublicCatalog,
+        semantic_search: Option<SemanticSearchConfig>,
+    ) -> anyhow::Result<Self> {
         if catalog.scope() != scope {
             bail!("chat read scope does not match reviewed public catalog");
         }
@@ -32,6 +42,7 @@ impl ChatReadApi {
             pool,
             scope,
             catalog,
+            semantic_search,
         })
     }
 
@@ -61,7 +72,13 @@ impl ChatReadApi {
         &self,
         request: &MessageSearchRequest,
     ) -> anyhow::Result<MessageSearchPage> {
-        service::search_messages(&self.pool, self.scope.discussion_chat_id, request).await
+        service::search_messages_with_semantic(
+            &self.pool,
+            self.scope.discussion_chat_id,
+            request,
+            self.semantic_search.as_ref(),
+        )
+        .await
     }
 
     pub async fn count_messages(&self, request: &MessageSearchRequest) -> anyhow::Result<i64> {
