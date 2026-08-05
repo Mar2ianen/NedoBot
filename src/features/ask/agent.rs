@@ -3,12 +3,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat};
 use genai::chat::{ChatMessage, ChatResponse, ContentPart, MessageContent, Tool, ToolResponse};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::types::chrono::Utc;
-use teloxide::utils::rich_text::LlmMarkdownFormatter;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Duration, timeout};
 
@@ -27,7 +25,6 @@ const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
 const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
-const RESEARCH_BUDGET_EXHAUSTED_FALLBACK: &str = "Не могу дать надёжный ответ: для проверки нужны дополнительные поиски или контекст сообщений, но лимит исследования исчерпан. Лучше повторите вопрос с более узкими деталями.";
 
 pub struct AskRequest<'a> {
     pub ask_run_id: Option<i64>,
@@ -54,17 +51,17 @@ const SYSTEM_PROMPT: &str = r#"Ты универсальный помощник 
 - История чата, профили, заметки, web и GitHub не находятся в твоих знаниях: для утверждений о них используй инструменты.
 - Если вопрос о человеке, сначала разреши имя через chat.resolve_user. Не угадывай пользователя по похожему слову в сообщениях. Результаты уже отсортированы по точности совпадения и активности в этом чате; кандидат с recommended=true — лучший выбор. Используй его без уточнения, если вопрос не требует различить тёзок. match=fuzzy_name означает транскрипцию или неточное написание: используй только если это единственный явно подходящий кандидат, иначе уточни.
 - Для вопроса «расскажи о человеке», «кто такой» или «что известно о» после resolve_user сначала вызови chat.get_user_profile. В нём есть точные агрегаты: message_rank=1 означает первое место по числу сообщений среди людей в чате; is_admin и admin_title — зафиксированный статус и title администратора. Не заменяй эти числа расплывчатой фразой «очень активен» и не придумывай title, если admin_title пустой.
-- Для фактического вопроса о переписке попробуй несколько разумных формулировок поиска. Используй full_text для тем и literal для точной цитаты, модели, ника или фразы. Не объявляй «не найдено» и не делай вывод о личном факте, пока не проверены и прямые слова автора, и отдельный тематический запрос по этому человеку.
+- Для фактического вопроса о переписке выбери один полный typed JSON-поиск по сути вопроса. Используй full_text для тем и literal для точной цитаты, модели, ника или фразы. Если первый поиск пустой или неоднозначный, попробуй другую осмысленную формулировку. Не объявляй «не найдено» по одному неудачному запросу.
 - После перспективного результата проверяй chat.get_message_context или chat.get_reply_thread, если смысл зависит от соседних сообщений или reply.
 - По умолчанию chat.search_messages использует hybrid: русский full-text плюс устойчивое к опечаткам совпадение. Используй any_terms для альтернативных слов, full_text для темы, literal для точной цитаты/модели/ника, whole_word для отдельного имени или термина. Даты передавай как YYYY-MM-DD или RFC 3339; дата без времени включает весь день. Результат содержит messages, total_count, has_more, next_offset и scan_limit_reached: для продолжения передай next_offset как offset, а при scan_limit_reached обозначь неполный охват и не пытайся обходить потолок.
 - По умолчанию поиск исключает сообщения ботов, сообщения без автора и автоматические пересылки. Включай include_forwards=true только когда вопрос прямо относится к пересланным постам или содержимому канала.
 - Для явных вопросов о количестве matching-сообщений (например, «сколько сообщений», «в скольких сообщениях» или «сколько раз писал про Rust в чате») сначала вызывай chat.search_messages или chat.search_messages_batch с теми же фильтрами и query, затем chat.count_messages с тем же нормализованным query, датами, scope и match_mode. Для date-scoped count сначала также сделай search с тем же периодом. Для общего количества сообщений пользователя после resolve_user передай user_id и можешь опустить query. Этот инструмент считает сообщения, а не события и не число вхождений слова внутри одного сообщения: для «сколько раз упоминал» или «сколько раз встречается» не выдавай count_messages за occurrence count. Не считай вручную длину выдачи и не трактуй голые «сколько раз» или «как часто» как число сообщений. Дизъюнктивные structural-фильтры через «или/либо», несколько независимых count-вопросов и относительные периоды без точных дат не форсируй в authoritative count: используй поиск и явно обозначь ограничение. has_reply означает, что само сообщение является reply; не используй его для подсчёта сообщений, на которые кто-то ответил, или сообщений с дочерними ответами.
-- Для count не пытайся угадывать scope по отдельным словам, окончаниям или имени автора. Сформируй один полный JSON scope из аргументов typed tool: query, user_id, даты, match_mode и структурные фильтры. Если вопрос нельзя выразить одним таким scope, не выдавай count как точный. Сервер проверяет только согласованность JSON scope между search и count; он не является русским синтаксическим анализатором.
+- Для count не пытайся угадывать scope по отдельным словам, окончаниям или имени автора. Сформируй один полный JSON scope из аргументов typed tool: query, user_id, даты, match_mode и структурные фильтры. Если вопрос нельзя выразить одним таким scope, явно объясни ограничение вместо частичного числа.
 - Для вопроса «сколько людей» или «у скольких пользователей» chat.count_messages не заменяет подсчёт уникальных авторов: собери подтверждённых авторов через поиск и явно обозначь неполноту, если полный охват не доказан.
-- После успешного chat.count_messages сервер сам добавит authoritative-строку с числом. В model-owned финальном тексте оставь только пояснение, примеры и ссылки; не повторяй и не оспаривай количество сообщений.
+- После успешного chat.count_messages используй возвращённое число как authoritative и объясни его пользователю вместе с найденными примерами и ссылками. Не выдумывай собственные числа и не считай длину выдачи вместо результата инструмента.
 - Различай слова автора о себе, пересказ, совет, шутку, цитату и сообщение о другом человеке. Учитывай даты и противоречащие более новые сообщения.
 - Покупка, заказ, намерение, рекомендация и шутка подтверждают только событие в указанную дату, но не текущее владение или состояние. Не пиши «сейчас у него» или «должен быть» без более позднего прямого подтверждения использования. При конфликте проверь контекст каждого ключевого сообщения, перечисли подтверждённые события и оставь текущий факт неопределённым.
-- Для любого личного факта не ограничивайся названием темы. Первый широкий поиск делай через chat.search_messages_batch с отдельными короткими queries ["у меня", "мой", "сижу на", "пользуюсь", "купил", "заказал себе"] и нужным user_id — не добавляй тему в каждую строку. Затем извлеки из результатов кандидатов (имена, модели, продукты, места и т.п.), найди каждого literal-запросом и сравни даты/контекст. Не склеивай альтернативы пробелами: в full_text это означает, что все слова обязательны.
+- Для вопроса о факте конкретного участника сначала вызови chat.resolve_user, затем сделай focused chat.search_messages по буквальной теме вопроса с тем же user_id. Сначала ищи слова пользователя без придуманных вариантов и гипотез (например, не заменяй название предмета на предполагаемую модель или тип), просматривай всю релевантную выдачу и при необходимости используй pagination. Если найденное сообщение зависит от соседнего контекста, вызови chat.get_message_context или chat.get_reply_thread. Не требуй обязательной формы «у меня» и не делай вывод о текущем состоянии по одному косвенному событию.
 - Для вопроса «сколько людей», «у скольких» или другого подсчёта сначала отдели упоминание темы от подтверждённого личного владения. Не выдавай количество найденных сообщений за количество людей: считай только уникальных авторов с подтверждающими сообщениями и явно называй неполный результат «как минимум», если поиск не может доказать полноту.
 - chat.get_recent_messages нужен для сводки свежего обсуждения, хронологии или последних сообщений конкретного участника без поискового запроса.
 - chat.get_user_interactions показывает прямые reply вместе с сообщением, на которое ответили. Это доказательство общения в чате: сначала прочитай обе стороны, назови число и темы взаимодействий. Оно не доказывает личные отношения вне чата, но отсутствие таких отношений нельзя выдавать за отсутствие reply.
@@ -118,167 +115,8 @@ impl ToolResult {
     }
 }
 
-#[derive(Default)]
-struct ResearchState {
-    count_queries: usize,
-    count_request: Option<CountRequestScope>,
-    /// Не принятый text-count: нужен search с тем же typed scope и повторный count.
-    pending_count_scope: Option<CountRequestScope>,
-    accepted_count: Option<i64>,
-    search_scopes: Vec<CountRequestScope>,
-    personal_fact_required: bool,
-    personal_statement_searches: usize,
-    personal_topic_searches: usize,
-    message_searches: usize,
-    targeted_message_searches: usize,
-    message_results: usize,
-    context_reads: usize,
-    context_message_ids: HashSet<i32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CountRequestScope {
-    query: Option<String>,
-    user_id: Option<i64>,
-    date_from: Option<String>,
-    date_to: Option<String>,
-    reply_to_message_id: Option<i64>,
-    has_reply: Option<bool>,
-    has_links: Option<bool>,
-    has_media: Option<bool>,
-    has_photo: Option<bool>,
-    has_video: Option<bool>,
-    has_document: Option<bool>,
-    has_audio: Option<bool>,
-    has_voice: Option<bool>,
-    has_sticker: Option<bool>,
-    has_animation: Option<bool>,
-    match_mode: Option<String>,
-    include_forwards: bool,
-    is_automatic_forward: Option<bool>,
-}
-
-#[derive(Clone, Copy)]
-enum DateBoundary {
-    Start,
-    End,
-}
-
-fn canonical_scope_date(value: &str, boundary: DateBoundary) -> String {
-    if let Ok(value) = DateTime::parse_from_rfc3339(value) {
-        return value
-            .with_timezone(&Utc)
-            .to_rfc3339_opts(SecondsFormat::Micros, true);
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return canonical_naive_date(date, boundary);
-    }
-    value.trim().to_owned()
-}
-
-fn canonical_naive_date(date: NaiveDate, boundary: DateBoundary) -> String {
-    let time = match boundary {
-        DateBoundary::Start => NaiveTime::MIN,
-        DateBoundary::End => {
-            NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).expect("valid end-of-day time")
-        }
-    };
-    DateTime::<Utc>::from_naive_utc_and_offset(date.and_time(time), Utc)
-        .to_rfc3339_opts(SecondsFormat::Micros, true)
-}
-
-impl CountRequestScope {
-    fn from_arguments(arguments: &Value) -> Self {
-        Self {
-            query: arguments
-                .get("query")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|query| !query.is_empty())
-                .map(str::to_owned),
-            user_id: arguments.get("user_id").and_then(Value::as_i64),
-            date_from: arguments
-                .get("date_from")
-                .and_then(Value::as_str)
-                .map(|value| canonical_scope_date(value, DateBoundary::Start)),
-            date_to: arguments
-                .get("date_to")
-                .and_then(Value::as_str)
-                .map(|value| canonical_scope_date(value, DateBoundary::End)),
-            reply_to_message_id: arguments.get("reply_to_message_id").and_then(Value::as_i64),
-            has_reply: arguments.get("has_reply").and_then(Value::as_bool),
-            has_links: arguments.get("has_links").and_then(Value::as_bool),
-            has_media: arguments.get("has_media").and_then(Value::as_bool),
-            has_photo: arguments.get("has_photo").and_then(Value::as_bool),
-            has_video: arguments.get("has_video").and_then(Value::as_bool),
-            has_document: arguments.get("has_document").and_then(Value::as_bool),
-            has_audio: arguments.get("has_audio").and_then(Value::as_bool),
-            has_voice: arguments.get("has_voice").and_then(Value::as_bool),
-            has_sticker: arguments.get("has_sticker").and_then(Value::as_bool),
-            has_animation: arguments.get("has_animation").and_then(Value::as_bool),
-            match_mode: Some(
-                arguments
-                    .get("match_mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("hybrid")
-                    .to_owned(),
-            ),
-            include_forwards: arguments
-                .get("include_forwards")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            is_automatic_forward: arguments
-                .get("is_automatic_forward")
-                .and_then(Value::as_bool),
-        }
-    }
-
-    fn same_structural_filters(&self, other: &Self) -> bool {
-        self.user_id == other.user_id
-            && self.date_from == other.date_from
-            && self.date_to == other.date_to
-            && self.reply_to_message_id == other.reply_to_message_id
-            && self.has_reply == other.has_reply
-            && self.has_links == other.has_links
-            && self.has_media == other.has_media
-            && self.has_photo == other.has_photo
-            && self.has_video == other.has_video
-            && self.has_document == other.has_document
-            && self.has_audio == other.has_audio
-            && self.has_voice == other.has_voice
-            && self.has_sticker == other.has_sticker
-            && self.has_animation == other.has_animation
-            && self.match_mode == other.match_mode
-            && self.include_forwards == other.include_forwards
-            && self.is_automatic_forward == other.is_automatic_forward
-    }
-}
-
-fn normalized_query(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn normalized_query_matches(left: Option<&str>, right: Option<&str>) -> bool {
-    left.zip(right)
-        .is_some_and(|(left, right)| normalized_query(left) == normalized_query(right))
-}
-
 fn should_cache_tool_result(tool: &str) -> bool {
     tool != "chat.count_messages"
-}
-
-impl ResearchState {
-    fn for_runtime_question(question: &str) -> Self {
-        // Семантику count не извлекаем из русского текста: её задаёт JSON tool call модели.
-        Self {
-            personal_fact_required: asks_personal_fact(question),
-            ..Self::default()
-        }
-    }
 }
 
 pub async fn answer(
@@ -316,7 +154,6 @@ async fn answer_within_deadline(
     agent_tools.extend(local_agent_tools());
     let mut observations = Vec::new();
     let mut evidence = Evidence::default();
-    let mut research = ResearchState::for_runtime_question(question);
     let mut tool_signatures = HashSet::new();
     let mut tool_cache = HashMap::<String, ToolResult>::new();
     let mut tool_call_count = 0usize;
@@ -357,22 +194,7 @@ async fn answer_within_deadline(
 
         if tool_calls.is_empty() {
             if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
-                if let Some(instruction) = research.follow_up_instruction(markdown) {
-                    messages.push(assistant_message(&response));
-                    push_observation(
-                        &mut observations,
-                        format!("DRAFT_FINAL_UNTRUSTED:\n{markdown}"),
-                    );
-                    push_observation(&mut observations, instruction);
-                    messages.push(ChatMessage::user(continuation_prompt(
-                        &observations,
-                        max_attempts.saturating_sub(step + 1),
-                        &evidence,
-                    )));
-                    continue;
-                }
-                let final_markdown = forced_final_markdown(&research, markdown);
-                return finish_answer(mcp, progress, &final_markdown, &evidence).await;
+                return finish_answer(mcp, progress, markdown, &evidence).await;
             }
             messages.push(assistant_message(&response));
             push_observation(
@@ -551,7 +373,6 @@ async fn answer_within_deadline(
                         ),
                     )
                     .await;
-                    research.record(tool, &tracking_arguments, &result.value);
                     push_observation(
                         &mut observations,
                         format!("TOOL_RESULT_UNTRUSTED {tool}:\n{}", result.agent_preview),
@@ -592,7 +413,7 @@ async fn answer_within_deadline(
     }
 
     messages.push(ChatMessage::user(format!(
-        "{}\n\nSYSTEM: лимит исследования исчерпан. Сейчас верни лучший честный Rich Markdown-ответ по уже полученным данным. Не вызывай новый инструмент.",
+        "{}\n\nSYSTEM: достигнут лимит шагов модели. Сейчас верни лучший честный Rich Markdown-ответ по уже полученным данным. Не вызывай новый инструмент.",
         continuation_prompt(&observations, 0, &evidence)
     )));
     let response = generate_turn(
@@ -605,26 +426,9 @@ async fn answer_within_deadline(
     .await
     .map_err(|AgentGenerationError::Request(error)| error)?;
     if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
-        let final_markdown = forced_final_markdown(&research, markdown);
-        return finish_answer(mcp, progress, &final_markdown, &evidence).await;
+        return finish_answer(mcp, progress, markdown, &evidence).await;
     }
     anyhow::bail!("ask agent did not produce a final answer")
-}
-
-fn forced_final_markdown(research: &ResearchState, markdown: &str) -> String {
-    if let Some(count) = research.accepted_count {
-        let explanation = markdown.trim();
-        return if explanation.is_empty() {
-            format!("Точное количество сообщений по заданным условиям: {count}.")
-        } else {
-            format!("Точное количество сообщений по заданным условиям: {count}.\n\n{explanation}")
-        };
-    }
-    if research.follow_up_instruction(markdown).is_some() {
-        RESEARCH_BUDGET_EXHAUSTED_FALLBACK.to_owned()
-    } else {
-        markdown.to_owned()
-    }
 }
 
 async fn finish_answer(
@@ -1003,364 +807,6 @@ fn collect_source_evidence_value(value: &Value, evidence: &mut Evidence) {
     }
 }
 
-impl ResearchState {
-    fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
-        match tool {
-            "chat.search_messages" | "chat.search_messages_batch" => {
-                let executed_batch = (tool == "chat.search_messages_batch")
-                    .then(|| batch_search_execution(result))
-                    .flatten();
-                let argument_queries = argument_queries(arguments);
-                let searches = executed_batch
-                    .as_ref()
-                    .map(|execution| execution.count)
-                    .unwrap_or_else(|| requested_search_count(tool, arguments));
-                let executed_queries = executed_batch
-                    .as_ref()
-                    .map(|execution| execution.queries.as_slice())
-                    .unwrap_or(&argument_queries);
-                let base_scope = CountRequestScope::from_arguments(arguments);
-                if tool == "chat.search_messages_batch" {
-                    let mut added_scope = false;
-                    for query in executed_queries.iter().filter_map(|value| value.as_str()) {
-                        let mut scope = base_scope.clone();
-                        scope.query = Some(query.to_owned());
-                        self.search_scopes.push(scope);
-                        added_scope = true;
-                    }
-                    if !added_scope {
-                        self.search_scopes.push(base_scope);
-                    }
-                } else {
-                    self.search_scopes.push(base_scope);
-                }
-                self.message_searches += searches;
-                if arguments.get("user_id").and_then(Value::as_i64).is_some() {
-                    self.targeted_message_searches += searches;
-                }
-                self.message_results += count_message_results(result);
-                self.personal_statement_searches +=
-                    personal_statement_query_count_values(executed_queries);
-                self.personal_topic_searches += personal_topic_query_count_values(executed_queries);
-            }
-            "chat.count_messages" => {
-                let count_scope = CountRequestScope::from_arguments(arguments);
-                if let Some(count) = result.get("count").and_then(Value::as_i64) {
-                    if self.count_scope_satisfies_intent(&count_scope) {
-                        self.count_queries += 1;
-                        self.count_request = Some(count_scope);
-                        self.pending_count_scope = None;
-                        self.accepted_count = Some(count);
-                    } else {
-                        self.count_queries = 0;
-                        self.count_request = None;
-                        self.accepted_count = None;
-                        // Не даём filter-only count обойти ранее отклонённый
-                        // text-count: для него по-прежнему нужен тот же query.
-                        if !(count_scope.query.is_none()
-                            && self
-                                .pending_count_scope
-                                .as_ref()
-                                .is_some_and(|pending| pending.query.is_some()))
-                        {
-                            self.pending_count_scope = Some(count_scope);
-                        }
-                    }
-                }
-            }
-            "chat.get_recent_messages" => {
-                self.message_results += json_array_len(result);
-            }
-            "chat.get_message" | "chat.get_message_context" | "chat.get_reply_thread" => {
-                self.context_reads += 1;
-                self.message_results += json_array_len(result);
-                if let Some(message_id) = arguments
-                    .get("message_id")
-                    .and_then(Value::as_i64)
-                    .and_then(|id| i32::try_from(id).ok())
-                {
-                    self.context_message_ids.insert(message_id);
-                }
-            }
-            "chat.get_user_interactions" => {
-                self.context_reads += 1;
-                self.message_results += json_array_len(result);
-                self.context_message_ids.extend(message_ids_in_json(result));
-            }
-            _ => {}
-        }
-    }
-
-    fn count_scope_satisfies_intent(&self, scope: &CountRequestScope) -> bool {
-        // The model owns the semantic interpretation of the user's question.
-        // The server only proves that a text count repeats an already executed
-        // search with the identical typed scope. Structural-only counts are
-        // self-contained JSON requests and do not need a guessed language plan.
-        if scope.query.is_none()
-            && self
-                .pending_count_scope
-                .as_ref()
-                .is_some_and(|pending| pending.query.is_some())
-        {
-            return false;
-        }
-        scope.query.is_none() || self.query_matches_search_scope(scope)
-    }
-
-    fn query_matches_search_scope(&self, scope: &CountRequestScope) -> bool {
-        self.search_scopes.iter().any(|search_scope| {
-            scope.same_structural_filters(search_scope)
-                && normalized_query_matches(scope.query.as_deref(), search_scope.query.as_deref())
-        })
-    }
-
-    fn follow_up_instruction(&self, markdown: &str) -> Option<String> {
-        if self.pending_count_scope.is_some() {
-            return Some(
-                "SYSTEM: предыдущий chat.count_messages не стал authoritative: для text scope сначала выполни chat.search_messages или chat.search_messages_batch с тем же полным JSON scope, затем повтори chat.count_messages с теми же query и фильтрами. Не используй предыдущее число и не считай выдачу вручную.".to_string(),
-            );
-        }
-        if self.personal_fact_required && self.personal_statement_searches == 0 {
-            return Some(
-                "SYSTEM: вопрос относится к личному факту, но прямые высказывания от первого лица ещё не проверены. Следующим действием вызови chat.search_messages_batch с нужным user_id и ТОЧНО отдельными queries [\"у меня\", \"мой\", \"сижу на\", \"пользуюсь\", \"купил\", \"заказал себе\"].".to_string(),
-            );
-        }
-        if self.personal_fact_required && self.personal_topic_searches == 0 {
-            return Some(
-                "SYSTEM: для личного факта ещё нет отдельного тематического поиска по этому человеку. Следующим действием вызови chat.search_messages или chat.search_messages_batch с темой вопроса, user_id найденного участника и несколькими синонимами. После перспективной выдачи проверь контекст лучшего сообщения.".to_string(),
-            );
-        }
-        if self.targeted_message_searches == 1 {
-            return Some(
-                "SYSTEM: для вывода о сообщениях конкретного участника одного запроса недостаточно. Следующим действием сделай другой тематический запрос с тем же user_id или используй chat.search_messages_batch для нескольких независимых формулировок.".to_string(),
-            );
-        }
-        if self.message_searches == 1 && answer_claims_insufficient_data(markdown) {
-            return Some(
-                "SYSTEM: нельзя делать отрицательный вывод после одного поискового запроса. Следующим действием попробуй ещё одну осмысленную формулировку или другой match_mode.".to_string(),
-            );
-        }
-        if let Some(message_id) = cited_message_ids(markdown)
-            .into_iter()
-            .find(|message_id| !self.context_message_ids.contains(message_id))
-        {
-            return Some(format!(
-                "SYSTEM: финальный ответ ссылается на сообщение {message_id}, но его контекст ещё не проверен. Следующим действием вызови chat.get_message_context для message_id={message_id}."
-            ));
-        }
-        if self.personal_fact_required && overconfident_personal_inference(markdown) {
-            return Some(
-                "SYSTEM: формулировка о текущем личном факте слишком уверенная: заказ, покупка, план или шутка не доказывают текущее состояние. Перепиши final без «должен быть» и явно отдели подтверждённые события от неизвестного текущего состояния.".to_string(),
-            );
-        }
-        if self.targeted_message_searches >= 2
-            && self.message_results > 0
-            && self.context_reads == 0
-        {
-            return Some(
-                "SYSTEM: перед финальным выводом следующим действием обязательно вызови chat.get_message_context или chat.get_reply_thread для лучшего найденного сообщения.".to_string(),
-            );
-        }
-        None
-    }
-}
-
-fn message_ids_in_json(value: &Value) -> Vec<i32> {
-    let mut evidence = Evidence::default();
-    collect_message_evidence_value(value, &mut evidence);
-    evidence.message_ids
-}
-
-fn cited_message_ids(markdown: &str) -> Vec<i32> {
-    let (mut ids, literal_destinations) = LlmMarkdownFormatter::new()
-        .parse(markdown)
-        .ok()
-        .map(|parsed| {
-            let ids = parsed
-                .link_aliases()
-                .into_iter()
-                .filter_map(|alias| {
-                    alias
-                        .strip_prefix("message_")
-                        .and_then(|value| value.parse::<i32>().ok())
-                })
-                .collect::<Vec<_>>();
-            let mut literal_destinations = parsed.link_destinations();
-            literal_destinations.extend(parsed.bare_urls());
-            (ids, literal_destinations)
-        })
-        .unwrap_or_default();
-    for destination in literal_destinations {
-        let Some(remainder) = destination.strip_prefix("https://t.me/c/") else {
-            continue;
-        };
-        let Some((_, message_id)) = remainder.split_once('/') else {
-            continue;
-        };
-        let digits = message_id
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>();
-        if let Ok(id) = digits.parse::<i32>() {
-            ids.push(id);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-struct BatchSearchExecution<'a> {
-    count: usize,
-    queries: Vec<&'a Value>,
-}
-
-fn batch_search_execution(result: &Value) -> Option<BatchSearchExecution<'_>> {
-    let results = result.get("results")?.as_array()?;
-    Some(BatchSearchExecution {
-        count: results.len(),
-        queries: results
-            .iter()
-            .filter_map(|item| item.get("query"))
-            .collect(),
-    })
-}
-
-fn requested_search_count(tool: &str, arguments: &Value) -> usize {
-    if tool == "chat.search_messages_batch" {
-        arguments
-            .get("queries")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(1)
-    } else {
-        1
-    }
-}
-
-fn argument_queries(arguments: &Value) -> Vec<&Value> {
-    arguments
-        .get("queries")
-        .and_then(Value::as_array)
-        .map(|queries| queries.iter().collect())
-        .unwrap_or_else(|| arguments.get("query").into_iter().collect())
-}
-
-fn personal_statement_query_count(arguments: &Value) -> usize {
-    personal_statement_query_count_values(&argument_queries(arguments))
-}
-
-fn personal_statement_query_count_values(queries: &[&Value]) -> usize {
-    const MARKERS: &[&str] = &[
-        "у меня",
-        "мой",
-        "моя",
-        "сижу на",
-        "пользуюсь",
-        "купил",
-        "заказал себе",
-    ];
-    queries
-        .iter()
-        .filter_map(|query| query.as_str())
-        .map(|query| query.trim().to_lowercase())
-        .filter(|query| MARKERS.contains(&query.as_str()))
-        .count()
-}
-
-fn personal_topic_query_count_values(queries: &[&Value]) -> usize {
-    queries
-        .iter()
-        .filter_map(|query| query.as_str())
-        .map(|query| query.trim().to_lowercase())
-        .filter(|query| !is_personal_statement_marker(query))
-        .count()
-}
-
-fn is_personal_statement_marker(query: &str) -> bool {
-    [
-        "у меня",
-        "мой",
-        "моя",
-        "сижу на",
-        "пользуюсь",
-        "купил",
-        "заказал себе",
-    ]
-    .contains(&query)
-}
-
-fn asks_personal_fact(question: &str) -> bool {
-    let question = format!(" {} ", question.to_lowercase());
-    [
-        " у него ",
-        " у неё ",
-        " у нее ",
-        " его ",
-        " её ",
-        " ее ",
-        " пользуется ",
-        " использует ",
-        " владеет ",
-        " живёт ",
-        " живет ",
-        " работает ",
-        " любит ",
-    ]
-    .iter()
-    .any(|marker| question.contains(marker))
-        || (question.contains(" какой ") || question.contains(" какая "))
-            && question.contains(" у ")
-}
-
-fn overconfident_personal_inference(markdown: &str) -> bool {
-    let markdown = markdown.to_lowercase();
-    ["должен быть", "значит, сейчас", "следовательно, сейчас"]
-        .iter()
-        .any(|marker| markdown.contains(marker))
-}
-
-fn json_array_len(value: &Value) -> usize {
-    match value {
-        Value::Array(items) => items.len(),
-        Value::Object(object) => ["messages", "results", "context", "thread", "interactions"]
-            .iter()
-            .find_map(|field| object.get(*field).and_then(Value::as_array).map(Vec::len))
-            .unwrap_or(0),
-        _ => 0,
-    }
-}
-
-fn count_message_results(value: &Value) -> usize {
-    count_message_results_value(value)
-}
-
-fn count_message_results_value(value: &Value) -> usize {
-    let own = usize::from(value.get("message_id").and_then(Value::as_i64).is_some());
-    own + match value {
-        Value::Array(items) => items.iter().map(count_message_results_value).sum(),
-        Value::Object(object) => object.values().map(count_message_results_value).sum(),
-        _ => 0,
-    }
-}
-
-fn answer_claims_insufficient_data(markdown: &str) -> bool {
-    let markdown = markdown.to_lowercase();
-    [
-        "не найден",
-        "нет сообщен",
-        "информации нет",
-        "нет информации",
-        "информация отсутствует",
-        "данных недостаточно",
-        "невозможно определить",
-        "не удалось найти",
-        "отсутствует",
-    ]
-    .iter()
-    .any(|marker| markdown.contains(marker))
-}
-
 fn push_observation(observations: &mut Vec<String>, observation: String) {
     observations.push(first_chars(&observation, MAX_OBSERVATION_CHARS));
     while observations
@@ -1558,208 +1004,6 @@ mod tests {
     }
 
     #[test]
-    fn research_policy_retries_early_negative_answers_and_reads_context() {
-        let mut research = ResearchState::default();
-        research.record(
-            "chat.search_messages",
-            &json!({"user_id": 42, "query": "тема"}),
-            &json!([{"message_id": 1}]),
-        );
-        assert!(
-            research
-                .follow_up_instruction("Информация не найдена")
-                .unwrap()
-                .contains("конкретного участника")
-        );
-        research.record(
-            "chat.search_messages",
-            &json!({"user_id": 42, "query": "другая формулировка"}),
-            &json!([]),
-        );
-        assert!(
-            research
-                .follow_up_instruction("Предварительный ответ")
-                .unwrap()
-                .contains("get_message_context")
-        );
-        research.record(
-            "chat.get_message_context",
-            &json!({"message_id": 1}),
-            &json!([{"message_id": 1}]),
-        );
-        assert!(research.follow_up_instruction("Итог").is_none());
-    }
-
-    #[test]
-    fn runtime_count_gate_does_not_reparse_question_text() {
-        let mut research = ResearchState::for_runtime_question("Сколько сообщений про term_1?");
-        let scope = json!({
-            "query": "term_2",
-            "match_mode": "literal",
-            "user_id": 42,
-            "date_from": "2025-01-01",
-            "date_to": "2025-01-31"
-        });
-
-        research.record("chat.search_messages", &scope, &json!({"messages": []}));
-        research.record("chat.count_messages", &scope, &json!({"count": 7}));
-
-        // Семантику между вопросом и JSON выбирает модель; сервер проверяет
-        // только, что search и count используют один полный typed scope.
-        assert_eq!(research.accepted_count, Some(7));
-        assert_eq!(research.count_queries, 1);
-    }
-
-    #[test]
-    fn runtime_count_gate_requires_search_for_text_scope_but_not_structural_scope() {
-        let mut text_count = ResearchState::for_runtime_question("count by a text scope");
-        text_count.record(
-            "chat.count_messages",
-            &json!({"query": "term_1"}),
-            &json!({"count": 3}),
-        );
-        assert_eq!(text_count.accepted_count, None);
-        assert!(
-            text_count.follow_up_instruction("Черновик").is_some_and(
-                |instruction| instruction.contains("сначала выполни chat.search_messages")
-            )
-        );
-
-        let mut structural_count = ResearchState::for_runtime_question("count by typed filters");
-        structural_count.record(
-            "chat.count_messages",
-            &json!({"user_id": 42, "has_photo": true}),
-            &json!({"count": 4}),
-        );
-        assert_eq!(structural_count.accepted_count, Some(4));
-    }
-
-    #[test]
-    fn structural_count_survives_later_text_search_with_another_match_mode() {
-        let mut research = ResearchState::for_runtime_question("count by typed filters");
-        research.record(
-            "chat.count_messages",
-            &json!({"has_photo": true}),
-            &json!({"count": 3}),
-        );
-        assert_eq!(research.count_queries, 1);
-
-        research.record(
-            "chat.search_messages",
-            &json!({"query": "фото", "has_photo": true, "match_mode": "literal"}),
-            &json!([]),
-        );
-        assert_eq!(research.count_queries, 1);
-        assert!(research.count_request.is_some());
-    }
-
-    #[test]
-    fn count_is_reexecuted_after_search_provenance() {
-        let mut research = ResearchState::for_runtime_question("count by a text scope");
-        let arguments = json!({"query": "Rust"});
-        research.record("chat.count_messages", &arguments, &json!({"count": 10}));
-        assert_eq!(research.count_queries, 0);
-
-        research.record("chat.search_messages", &arguments, &json!([]));
-        research.record("chat.count_messages", &arguments, &json!({"count": 11}));
-        assert_eq!(research.count_queries, 1);
-        assert_eq!(research.accepted_count, Some(11));
-        assert!(!should_cache_tool_result("chat.count_messages"));
-        assert!(should_cache_tool_result("chat.search_messages"));
-    }
-
-    #[test]
-    fn rejected_text_count_cannot_be_replaced_by_filter_only_count() {
-        let mut research = ResearchState::for_runtime_question("count by a text scope");
-        research.record(
-            "chat.count_messages",
-            &json!({"query": "term_1"}),
-            &json!({"count": 3}),
-        );
-        assert!(research.pending_count_scope.is_some());
-
-        research.record("chat.count_messages", &json!({}), &json!({"count": 99}));
-
-        assert_eq!(research.accepted_count, None);
-        assert_eq!(research.count_queries, 0);
-        assert_eq!(
-            research
-                .pending_count_scope
-                .as_ref()
-                .and_then(|scope| scope.query.as_deref()),
-            Some("term_1")
-        );
-    }
-
-    #[test]
-    fn accepted_count_is_server_authoritative_and_explanation_is_preserved() {
-        let mut research = ResearchState::for_runtime_question("count request");
-        let arguments = json!({
-            "query": "term_1",
-            "match_mode": "literal"
-        });
-        research.record("chat.search_messages", &arguments, &json!([]));
-        research.record("chat.count_messages", &arguments, &json!({"count": 11}));
-
-        assert_eq!(
-            forced_final_markdown(&research, "Обсуждение содержит пример message_42."),
-            "Точное количество сообщений по заданным условиям: 11.\n\nОбсуждение содержит пример message_42."
-        );
-        assert!(
-            research
-                .follow_up_instruction("Модельное пояснение с числом 12")
-                .is_none()
-        );
-    }
-    #[test]
-    fn detects_generic_personal_fact_intent_and_separate_statement_queries() {
-        assert!(asks_personal_fact("какой процессор у пользователя"));
-        assert!(asks_personal_fact("чем он пользуется"));
-        assert!(!asks_personal_fact("объясни разницу TCP и UDP"));
-        assert_eq!(
-            personal_statement_query_count(&json!({
-                "queries": ["у меня", "мой", "купил", "мой процессор"]
-            })),
-            3
-        );
-    }
-
-    #[test]
-    fn requires_context_for_every_cited_chat_message() {
-        assert_eq!(
-            cited_message_ids(
-                "[первое](https://t.me/c/1932061163/330631) и [второе](https://t.me/c/1932061163/378272)"
-            ),
-            vec![330631, 378272]
-        );
-        let mut research = ResearchState::default();
-        research.context_message_ids.insert(378272);
-        assert!(
-            research
-                .follow_up_instruction("[источник](https://t.me/c/1932061163/330631)")
-                .unwrap()
-                .contains("330631")
-        );
-        assert!(
-            research
-                .follow_up_instruction("Ещё ссылка: https://t.me/c/1932061163/330631")
-                .unwrap()
-                .contains("330631")
-        );
-    }
-
-    #[test]
-    fn cited_message_ids_accept_links_and_bare_message_urls_only() {
-        assert_eq!(
-            cited_message_ids(
-                "текст message_99 и `message_100`, [сообщение](message_42), \
-                 [внешнее](https://example.com/message_43) и https://t.me/c/1932061163/555"
-            ),
-            vec![42, 555]
-        );
-    }
-
-    #[test]
     fn external_sources_become_stable_aliases_in_observation_order() {
         let mut evidence = Evidence::default();
         collect_source_evidence_value(
@@ -1771,59 +1015,6 @@ mod tests {
             &mut evidence,
         );
         assert_eq!(available_evidence_aliases(&evidence), "source_1, source_2");
-    }
-
-    #[test]
-    fn object_root_collections_count_for_research_and_audit() {
-        let value = json!({"context": [{"message_id": 1}, {"message_id": 2}]});
-        assert_eq!(json_array_len(&value), 2);
-        assert_eq!(tool_result_count(&value), Some(2));
-        assert_eq!(count_message_results(&value), 2);
-    }
-
-    #[test]
-    fn batch_search_research_uses_actual_executed_queries() {
-        let arguments = json!({
-            "user_id": 42,
-            "queries": ["у меня", "мой", "процессор", "купил", "лишний"]
-        });
-        let result = json!({
-            "results": [
-                {"query": "у меня", "messages": []},
-                {"query": "мой", "messages": []},
-                {"query": "процессор", "messages": []}
-            ]
-        });
-        let mut research = ResearchState::default();
-
-        research.record("chat.search_messages_batch", &arguments, &result);
-
-        assert_eq!(research.message_searches, 3);
-        assert_eq!(research.targeted_message_searches, 3);
-        assert_eq!(research.personal_statement_searches, 2);
-        assert_eq!(research.personal_topic_searches, 1);
-    }
-
-    #[test]
-    fn forced_final_research_validation_uses_controlled_fallback() {
-        let research = ResearchState::for_runtime_question("какой процессор у него?");
-        let unchecked_markdown = "У него Ryzen 9";
-
-        assert_eq!(
-            forced_final_markdown(&research, unchecked_markdown),
-            RESEARCH_BUDGET_EXHAUSTED_FALLBACK
-        );
-        assert!(!RESEARCH_BUDGET_EXHAUSTED_FALLBACK.contains(unchecked_markdown));
-    }
-
-    #[test]
-    fn rejects_overconfident_current_state_from_indirect_events() {
-        assert!(overconfident_personal_inference(
-            "После заказа у него должен быть новый процессор"
-        ));
-        assert!(!overconfident_personal_inference(
-            "Он написал, что заказал процессор; текущее состояние неизвестно"
-        ));
     }
 
     #[tokio::test]
