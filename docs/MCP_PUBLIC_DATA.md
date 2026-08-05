@@ -47,6 +47,7 @@ MCP.
 - результаты генерации: `llm_generations.prompt`, `response`, `final_html`, а также `/ask` question/answer;
 - profile и anti-spam metadata, включая username/display name, bio, статусы участников, risk labels и причины;
 - forward provenance: `telegram_messages.is_forwarded` и `telegram_messages.forwarded_from` позволяют отличить автора сохранённой строки от источника пересланного текста;
+- message tools: каждый message DTO содержит `user_id` и явное `author_name`; `author` сохраняется как backward-compatible alias. `chat.get_reply_thread` отдаёт JSON с `root_message_id` и `thread`, чтобы модель не восстанавливала корень ветки по неименованному массиву;
 - stable Telegram/file-derived identifiers, которые явно перечислены в manifest.
 
 ## Как обновлять

@@ -487,7 +487,10 @@ pub async fn reply_thread(
         .reply_thread(input.message_id)
         .await
         .map_err(|_| read_error("reply thread lookup failed"))?;
-    messages_output("thread", messages)
+    Ok(serde_json::json!({
+        "root_message_id": input.message_id,
+        "thread": messages,
+    }))
 }
 
 pub async fn user_interactions(

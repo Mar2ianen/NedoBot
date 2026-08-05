@@ -568,13 +568,15 @@ pub async fn user_interactions(
     Ok(rows
         .into_iter()
         .map(|row| {
+            let author_name = row.author;
             let message = ChatMessage {
                 source_id: source_id(row.message_id),
                 message_url: message_url(chat_id, row.message_id),
                 relevance: 0,
                 message_id: row.message_id,
                 user_id: row.user_id,
-                author: row.author,
+                author_name: author_name.clone(),
+                author: author_name,
                 author_url: author_url(row.author_username.as_deref()),
                 is_forwarded: row.is_forwarded,
                 forwarded_from: row.forwarded_from,
@@ -582,29 +584,33 @@ pub async fn user_interactions(
                 reply_to_message_id: row.reply_to_message_id,
                 created_at: row.created_at.to_rfc3339(),
             };
-            let replied_to = row.replied_to_message_id.map(|message_id| ChatMessage {
-                source_id: source_id(message_id),
-                message_url: message_url(chat_id, message_id),
-                relevance: 0,
-                message_id,
-                user_id: row.replied_to_user_id,
-                author: row
+            let replied_to = row.replied_to_message_id.map(|message_id| {
+                let author_name = row
                     .replied_to_author
-                    .unwrap_or_else(|| "Неизвестный пользователь".to_string()),
-                author_url: author_url(row.replied_to_username.as_deref()),
-                is_forwarded: row.replied_to_is_forwarded.unwrap_or(false),
-                forwarded_from: row.replied_to_forwarded_from,
-                text: first_chars(
-                    row.replied_to_text
-                        .as_deref()
-                        .unwrap_or("[медиа без текста]"),
-                    MAX_MESSAGE_PREVIEW_CHARS,
-                ),
-                reply_to_message_id: None,
-                created_at: row
-                    .replied_to_created_at
-                    .map(|value| value.to_rfc3339())
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| "Неизвестный пользователь".to_string());
+                ChatMessage {
+                    source_id: source_id(message_id),
+                    message_url: message_url(chat_id, message_id),
+                    relevance: 0,
+                    message_id,
+                    user_id: row.replied_to_user_id,
+                    author_name: author_name.clone(),
+                    author: author_name,
+                    author_url: author_url(row.replied_to_username.as_deref()),
+                    is_forwarded: row.replied_to_is_forwarded.unwrap_or(false),
+                    forwarded_from: row.replied_to_forwarded_from,
+                    text: first_chars(
+                        row.replied_to_text
+                            .as_deref()
+                            .unwrap_or("[медиа без текста]"),
+                        MAX_MESSAGE_PREVIEW_CHARS,
+                    ),
+                    reply_to_message_id: None,
+                    created_at: row
+                        .replied_to_created_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_default(),
+                }
             });
             ChatInteraction {
                 message,
@@ -703,13 +709,15 @@ fn map_search_page_rows(chat_id: i64, rows: Vec<SearchPageRow>) -> (i64, Vec<Cha
     let messages = rows
         .into_iter()
         .filter_map(|row| {
+            let author_name = row.author?;
             Some(ChatMessage {
                 source_id: source_id(row.message_id?),
                 message_url: message_url(chat_id, row.message_id?),
                 relevance: (row.relevance? * 1000.0).round() as i32,
                 message_id: row.message_id?,
                 user_id: row.user_id,
-                author: row.author?,
+                author_name: author_name.clone(),
+                author: author_name,
                 author_url: author_url(row.author_username.as_deref()),
                 is_forwarded: row.is_forwarded.unwrap_or(false),
                 forwarded_from: row.forwarded_from,
@@ -724,19 +732,23 @@ fn map_search_page_rows(chat_id: i64, rows: Vec<SearchPageRow>) -> (i64, Vec<Cha
 
 fn map_rows(chat_id: i64, rows: Vec<MessageRow>) -> Vec<ChatMessage> {
     rows.into_iter()
-        .map(|row| ChatMessage {
-            source_id: source_id(row.message_id),
-            message_url: message_url(chat_id, row.message_id),
-            relevance: (row.relevance * 1000.0).round() as i32,
-            message_id: row.message_id,
-            user_id: row.user_id,
-            author: row.author,
-            author_url: author_url(row.author_username.as_deref()),
-            is_forwarded: row.is_forwarded,
-            forwarded_from: row.forwarded_from,
-            text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
-            reply_to_message_id: row.reply_to_message_id,
-            created_at: row.created_at.to_rfc3339(),
+        .map(|row| {
+            let author_name = row.author;
+            ChatMessage {
+                source_id: source_id(row.message_id),
+                message_url: message_url(chat_id, row.message_id),
+                relevance: (row.relevance * 1000.0).round() as i32,
+                message_id: row.message_id,
+                user_id: row.user_id,
+                author_name: author_name.clone(),
+                author: author_name,
+                author_url: author_url(row.author_username.as_deref()),
+                is_forwarded: row.is_forwarded,
+                forwarded_from: row.forwarded_from,
+                text: first_chars(&row.text, MAX_MESSAGE_PREVIEW_CHARS),
+                reply_to_message_id: row.reply_to_message_id,
+                created_at: row.created_at.to_rfc3339(),
+            }
         })
         .collect()
 }

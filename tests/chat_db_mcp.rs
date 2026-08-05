@@ -130,6 +130,7 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         .await?;
         assert_eq!(message["found"], true);
         assert_eq!(message["message"]["message_id"], message_id);
+        assert!(message["message"]["author_name"].is_string());
         let context = call_object(
             &client,
             "chat.get_message_context",
@@ -143,6 +144,7 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
             json!({"message_id": message_id}),
         )
         .await?;
+        assert_eq!(thread["root_message_id"], message_id);
         assert!(thread["thread"].is_array());
         let interactions = call_object(
             &client,

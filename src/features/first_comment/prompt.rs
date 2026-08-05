@@ -432,7 +432,8 @@ mod tests {
             messages: vec![ChatMessage {
                 message_id: 41,
                 user_id: Some(1),
-                author: "Марс".to_string(),
+                author_name: "thread_user".to_string(),
+                author: "thread_user".to_string(),
                 author_url: None,
                 is_forwarded: false,
                 forwarded_from: None,
@@ -446,7 +447,7 @@ mod tests {
         };
         let chat_evidence = [ChatEvidence {
             candidate: &candidate,
-            author_name: "Луна",
+            author_name: "evidence_author",
             context: Some(&expanded),
         }];
         let prompt = build_llm_prompt_parts_with_chat_evidence(FirstCommentPromptInput {
@@ -462,7 +463,10 @@ mod tests {
         let context = context_json(&prompt);
 
         assert_eq!(context["chat_evidence"][0]["message_id"], 42);
-        assert_eq!(context["chat_evidence"][0]["author_name"], "Луна");
+        assert_eq!(
+            context["chat_evidence"][0]["author_name"],
+            "evidence_author"
+        );
         assert_eq!(context["chat_evidence"][0]["context_kind"], "reply_thread");
         assert_eq!(
             context["chat_evidence"][0]["context"][0]["text"],
