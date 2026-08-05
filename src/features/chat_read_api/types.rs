@@ -90,6 +90,9 @@ pub struct MessageSearchPage {
 pub struct ChatMessage {
     pub message_id: i32,
     pub user_id: Option<i64>,
+    /// Явное имя автора для модели; `user_id` остаётся стабильным ключом.
+    pub author_name: String,
+    /// Совместимый alias `author_name` для существующих потребителей.
     pub author: String,
     pub author_url: Option<String>,
     pub is_forwarded: bool,

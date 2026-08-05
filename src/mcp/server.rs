@@ -183,7 +183,7 @@ impl ChatMcpServer {
 
     #[tool(
         name = "chat.get_reply_thread",
-        description = "Возвращает reply thread сообщения."
+        description = "Возвращает JSON-ветку сообщения: root_message_id и упорядоченный массив thread. Каждый message содержит user_id, явное author_name, ссылку author_url, reply_to_message_id и message_url; для пересылок также is_forwarded и forwarded_from."
     )]
     async fn reply_thread(
         &self,
