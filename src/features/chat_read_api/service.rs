@@ -102,50 +102,12 @@ pub async fn search_messages_with_semantic(
             order by e.embedding <=> $26::vector
             limit $28
         ),
-        matched as materialized (
+        candidate_ids as materialized (
             select
-                m.message_id,
-                m.user_id,
-                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
-                         nullif(p.username, ''),
-                         'Неизвестный пользователь') as author,
-                nullif(p.username, '') as author_username,
-                m.is_forwarded,
-                m.forwarded_from,
-                m.text,
-                m.reply_to_message_id,
-               m.created_at,
-                (
-                    case
-                        when $20 = 'hybrid' and $26 is not null then
-                            least(greatest(
-                                ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
-                                ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
-                            ), 1.0) * 0.45
-                        when $20 in ('full_text', 'any_terms') then greatest(
-                            ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
-                            ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
-                        )
-                        when $20 = 'literal' and position(lower($3) in lower(m.text)) > 0 then 1.0
-                        when $20 = 'whole_word' and m.text ~* $4 then 1.0
-                        else 0.0
-                    end
-                    + case when $20 = 'hybrid' and lower($3) <% lower(m.text)
-                           then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) *
-                                case when $26 is not null then 0.10 else 0.25 end
-                           else 0.0
-                      end
-                    + case when $20 = 'hybrid'
-                                and $26 is not null
-                           then coalesce(semantic.semantic_relevance, 0.0) * 0.55
-                           else 0.0
-                      end
-                )::real as relevance
+                m.chat_id,
+                m.message_id
             from mcp_public.telegram_messages m
             left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
-            left join semantic_candidates semantic
-              on semantic.chat_id = m.chat_id
-             and semantic.message_id = m.message_id
             where m.chat_id = $1
               and m.text is not null
               and m.deleted_by_bot_at is null
@@ -190,8 +152,99 @@ pub async fn search_messages_with_semantic(
                   or ($20 = 'hybrid' and lower($3) <% lower(m.text))
                   or ($20 = 'literal' and position(lower($3) in lower(m.text)) > 0)
                   or ($20 = 'whole_word' and m.text ~* $4)
-                  or ($20 = 'hybrid' and semantic.message_id is not null)
               )
+            union
+            select
+                semantic.chat_id,
+                semantic.message_id
+            from semantic_candidates semantic
+            join mcp_public.telegram_messages m
+              on m.chat_id = semantic.chat_id
+             and m.message_id = semantic.message_id
+            left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
+            where m.chat_id = $1
+              and m.text is not null
+              and m.deleted_by_bot_at is null
+              and m.spam_marked_at is null
+              and (
+                  m.user_id is not null
+                  or ($21::boolean and (
+                      coalesce(m.is_forwarded, false)
+                      or coalesce(m.is_automatic_forward, false)
+                  ))
+              )
+              and not coalesce(p.is_bot, false)
+              and ($21::boolean or not (
+                  coalesce(m.is_forwarded, false)
+                  or coalesce(m.is_automatic_forward, false)
+              ))
+              and ($5::bigint is null or m.user_id = $5)
+              and ($6::timestamptz is null or m.created_at >= $6)
+              and ($7::timestamptz is null or m.created_at <= $7)
+              and ($8::integer is null or m.reply_to_message_id = $8)
+              and ($9::boolean is null or m.has_links = $9)
+              and (
+                  $10::boolean is null
+                  or (m.has_photo or m.has_video or m.has_document or m.has_audio
+                      or m.has_voice or m.has_sticker or m.has_animation) = $10
+              )
+              and ($11::boolean is null or m.has_photo = $11)
+              and ($12::boolean is null or m.has_video = $12)
+              and ($13::boolean is null or m.has_document = $13)
+              and ($14::boolean is null or m.has_audio = $14)
+              and ($15::boolean is null or m.has_sticker = $15)
+              and ($16::boolean is null or m.has_animation = $16)
+              and ($23::boolean is null or m.is_automatic_forward = $23)
+              and ($24::boolean is null or (m.reply_to_message_id is not null) = $24)
+              and ($25::boolean is null or m.is_forwarded = $25)
+        ),
+        matched as materialized (
+            select
+                m.message_id,
+                m.user_id,
+                coalesce(nullif(concat_ws(' ', p.first_name, p.last_name), ''),
+                         nullif(p.username, ''),
+                         'Неизвестный пользователь') as author,
+                nullif(p.username, '') as author_username,
+                m.is_forwarded,
+                m.forwarded_from,
+                m.text,
+                m.reply_to_message_id,
+               m.created_at,
+                (
+                    case
+                        when $20 = 'hybrid' and $26 is not null then
+                            least(greatest(
+                                ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
+                                ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
+                            ), 1.0) * 0.45
+                        when $20 in ('full_text', 'any_terms') then greatest(
+                            ts_rank_cd(to_tsvector('russian', coalesce(m.text, '')), websearch_to_tsquery('russian', $2)),
+                            ts_rank_cd(to_tsvector('simple', coalesce(m.text, '')), websearch_to_tsquery('simple', $2))
+                        )
+                        when $20 = 'literal' and position(lower($3) in lower(m.text)) > 0 then 1.0
+                        when $20 = 'whole_word' and m.text ~* $4 then 1.0
+                        else 0.0
+                    end
+                    + case when $20 = 'hybrid' and lower($3) <% lower(m.text)
+                           then greatest(word_similarity(lower($3), lower(m.text)) - 0.6, 0.0) *
+                                case when $26 is not null then 0.10 else 0.25 end
+                           else 0.0
+                      end
+                    + case when $20 = 'hybrid'
+                                and $26 is not null
+                           then coalesce(semantic.semantic_relevance, 0.0) * 0.55
+                           else 0.0
+                      end
+                )::real as relevance
+            from candidate_ids candidate
+            join mcp_public.telegram_messages m
+              on m.chat_id = candidate.chat_id
+             and m.message_id = candidate.message_id
+            left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
+            left join semantic_candidates semantic
+              on semantic.chat_id = m.chat_id
+             and semantic.message_id = m.message_id
         )
         select
             page.message_id,
