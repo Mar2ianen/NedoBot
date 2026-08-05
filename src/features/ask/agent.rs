@@ -699,6 +699,7 @@ async fn call_tool(
         tool if context.mcp.has_tool(tool) => {
             let result = context.mcp.call(tool, arguments).await?;
             collect_message_evidence_value(&result.value, context.evidence);
+            collect_url_field_evidence(&result.value, "author_url", context.evidence);
             Ok(ToolResult {
                 value: result.value,
                 agent_preview: result.agent_preview,
@@ -782,9 +783,13 @@ fn collect_message_evidence_value(value: &Value, evidence: &mut Evidence) {
 }
 
 fn collect_source_evidence_value(value: &Value, evidence: &mut Evidence) {
+    collect_url_field_evidence(value, "url", evidence);
+}
+
+fn collect_url_field_evidence(value: &Value, field: &str, evidence: &mut Evidence) {
     if let Some(url) = value
         .as_object()
-        .and_then(|object| object.get("url"))
+        .and_then(|object| object.get(field))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|url| !url.is_empty())
@@ -795,12 +800,12 @@ fn collect_source_evidence_value(value: &Value, evidence: &mut Evidence) {
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_source_evidence_value(item, evidence);
+                collect_url_field_evidence(item, field, evidence);
             }
         }
         Value::Object(object) => {
             for nested in object.values() {
-                collect_source_evidence_value(nested, evidence);
+                collect_url_field_evidence(nested, field, evidence);
             }
         }
         _ => {}
@@ -1015,6 +1020,27 @@ mod tests {
             &mut evidence,
         );
         assert_eq!(available_evidence_aliases(&evidence), "source_1, source_2");
+    }
+
+    #[test]
+    fn mcp_author_urls_become_trusted_evidence() {
+        let mut evidence = Evidence::default();
+        collect_url_field_evidence(
+            &json!([
+                {"author_url": "https://t.me/user42"},
+                {"author_url": "https://t.me/user43"},
+                {"author_url": "https://t.me/user42"}
+            ]),
+            "author_url",
+            &mut evidence,
+        );
+        assert_eq!(
+            evidence.source_urls,
+            [
+                "https://t.me/user42".to_owned(),
+                "https://t.me/user43".to_owned(),
+            ]
+        );
     }
 
     #[tokio::test]
