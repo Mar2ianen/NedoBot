@@ -9,6 +9,10 @@
 4. атомарная materialization score/signals и review request;
 5. отдельная bounded Telegram delivery только при `risk_score >= 70`.
 
+Audit job, assessment, score и `spam_review_requests` сохраняются независимо от
+возраста первого сообщения. Если первому сообщению уже больше 5 минут, review
+request остаётся в БД для аудита, но не claim-ится и не отправляется в Telegram.
+
 Avatar и first-message являются секциями единого assessment. Отдельных
 очередей, LLM routes и workers для них нет. Старые таблицы и миграции остаются
 в БД для backward compatibility, но runtime их больше не enqueue-ит и не
@@ -54,6 +58,7 @@ score.
 - bounded generation and materialization retries with terminal states;
 - missing avatar is a valid text-only assessment, not an endless retry;
 - one audit job and one review request per canonical snapshot/user;
+- first-message age over five minutes suppresses only Telegram review delivery, while the DB audit/review row remains;
 - score `69` has no delivery attempt, score `70` is claimable;
 - stale workers cannot change score, signals or review state.
 

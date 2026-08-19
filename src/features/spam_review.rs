@@ -13,6 +13,7 @@ use crate::{
 const OWNER_USERNAME: &str = "Chechulinm";
 const REVIEW_DELIVERY_RISK_THRESHOLD: i32 = 70;
 const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
+pub(crate) const FIRST_MESSAGE_REVIEW_MAX_AGE_SECONDS: i64 = 5 * 60;
 
 pub struct SpamReview {
     pub id: i64,
@@ -105,16 +106,28 @@ async fn claim_review_delivery(
     let row = sqlx::query(
         r#"
         with candidate as (
-            select id
-            from spam_review_requests
-            where status = 'pending'
-              and risk_score >= $3
-              and ($1::bigint is null or id = $1)
-              and (
-                  (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
-                  or (notification_status = 'processing' and notification_lease_expires_at <= now())
+            select review.id
+            from spam_review_requests review
+            where review.status = 'pending'
+              and review.risk_score >= $3
+              and ($1::bigint is null or review.id = $1)
+              and exists (
+                  select 1
+                  from telegram_new_user_profile_audits audit
+                  join telegram_messages first_message
+                    on first_message.chat_id = audit.chat_id
+                   and first_message.message_id = audit.first_message_id
+                  where audit.chat_id = review.chat_id
+                    and audit.telegram_user_id = review.telegram_user_id
+                    and first_message.user_id = audit.telegram_user_id
+                    and first_message.source_channel_id is null
+                    and first_message.created_at >= now() - ($4 * interval '1 second')
               )
-            order by notification_next_attempt_at, id
+              and (
+                  (review.notification_status in ('pending', 'retry_wait') and review.notification_next_attempt_at <= now())
+                  or (review.notification_status = 'processing' and review.notification_lease_expires_at <= now())
+              )
+            order by review.notification_next_attempt_at, review.id
             for update skip locked
             limit 1
         )
@@ -138,6 +151,7 @@ async fn claim_review_delivery(
     .bind(request_id)
     .bind(DELIVERY_LEASE_SECONDS)
     .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .bind(FIRST_MESSAGE_REVIEW_MAX_AGE_SECONDS)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
