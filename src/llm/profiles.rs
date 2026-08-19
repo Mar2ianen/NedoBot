@@ -96,6 +96,7 @@ pub enum ThinkingMode {
     None,
     Budget,
     LevelLow,
+    LevelHigh,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,6 +386,12 @@ models = ["ollama_memory"]
 
         assert!(profiles.routes.contains_key("first_comment"));
         assert!(profiles.routes.contains_key("voice_cleanup"));
+        assert!(
+            profiles
+                .resolve_route("first_comment", &RouteRequirements::default())
+                .unwrap()
+                .fallback_on_validation_failure
+        );
     }
 
     #[test]
@@ -467,6 +474,7 @@ models = ["ollama_memory"]
         assert_eq!(
             image_models,
             [
+                ("gemini", "gemini-3.7-flash"),
                 ("gemini", "gemini-3.6-flash"),
                 ("gemini", "gemini-3.5-flash"),
                 ("gemini", "gemini-3.5-flash-lite"),
@@ -486,6 +494,7 @@ models = ["ollama_memory"]
         assert_eq!(
             text_models,
             [
+                ("gemini", "gemini-3.7-flash"),
                 ("gemini", "gemini-3.6-flash"),
                 ("gemini", "gemini-3.5-flash"),
                 ("gemini", "gemini-3.5-flash-lite"),

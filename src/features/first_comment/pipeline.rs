@@ -324,7 +324,17 @@ async fn process_post_comment_job(
         },
     )
     .await
-    .map_err(|error| CommentErrorKind::from_llm_error(&error))?;
+    .map_err(|error| {
+        if let Some(failure) = error.downcast_ref::<crate::llm::types::ValidationFailure>() {
+            tracing::warn!(
+                job_id = job.id,
+                discussion_message_id = job.discussion_message_id,
+                validation_reason = failure.reason.as_str(),
+                "first comment validation fallback exhausted"
+            );
+        }
+        CommentErrorKind::from_llm_error(&error)
+    })?;
     let draft = parse_first_comment_draft(&generation.content)
         .map_err(|_| CommentErrorKind::InvalidInput)?;
     if draft

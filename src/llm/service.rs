@@ -5,7 +5,9 @@ use crate::llm::genai_transport::{
     GenAiChatRequest, GenAiRequest, GenAiTransport, ImageInput, ModelTarget,
 };
 use crate::llm::profiles::{RouteRequirements, RouteSelection};
-use crate::llm::types::{GeneratedText, LlmAttempt, LlmTransportError, StructuredOutput};
+use crate::llm::types::{
+    GeneratedText, LlmAttempt, LlmTransportError, StructuredOutput, ValidationFailure,
+};
 
 pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
@@ -108,10 +110,26 @@ async fn generate_text_with_profile_checked(
                     if let Some(validate) = options.output_validator
                         && let Err(err) = validate(&generation.content)
                     {
+                        let validation_reason = err.downcast_ref::<ValidationFailure>().map_or(
+                            crate::llm::types::ValidationFailureReason::Unknown,
+                            |failure| failure.reason,
+                        );
+                        let response_chars = generation.content.chars().count();
                         attempts.push(LlmAttempt {
                             outcome: "validation_failed".to_string(),
+                            validation_reason: Some(validation_reason),
                             ..llm_attempt
                         });
+                        tracing::warn!(
+                            route,
+                            fallback_index,
+                            provider = selection.provider_key,
+                            model = selection.model.model,
+                            attempt,
+                            response_chars,
+                            validation_reason = validation_reason.as_str(),
+                            "LLM generation output failed validation"
+                        );
                         last_error = Some(err);
                         if attempt < VALIDATION_RETRY_ATTEMPTS {
                             attempt_prompt = validation_retry_prompt(
@@ -144,6 +162,7 @@ async fn generate_text_with_profile_checked(
                         provider: selection.provider_key.to_string(),
                         model: selection.model.model.clone(),
                         outcome: classify_attempt_error(&err),
+                        validation_reason: None,
                     });
                     last_error = Some(err);
                     if empty_response && attempt < VALIDATION_RETRY_ATTEMPTS {
@@ -328,6 +347,7 @@ async fn generate_profile_once(
             provider: selection.provider_key.to_string(),
             model: selection.model.model.clone(),
             outcome: "success".to_string(),
+            validation_reason: None,
         }],
     })
 }
@@ -759,8 +779,13 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
             std::env::set_var("PROFILE_SWITCH_FALLBACK_KEY", "test-key");
         }
         let validator = |content: &str| -> anyhow::Result<()> {
-            anyhow::ensure!(content == "valid", "invalid output");
-            Ok(())
+            if content == "valid" {
+                Ok(())
+            } else {
+                Err(crate::llm::types::validation_error(
+                    crate::llm::types::ValidationFailureReason::TooShort,
+                ))
+            }
         };
         let mut config = config();
         config.llm_profiles = Some(switching_profiles(address, "invalid", "valid", false));
@@ -777,8 +802,17 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
         assert_eq!(generated.content, "valid");
         assert_eq!(generated.attempts.len(), 3);
         assert_eq!(generated.attempts[0].outcome, "validation_failed");
+        assert_eq!(
+            generated.attempts[0].validation_reason,
+            Some(crate::llm::types::ValidationFailureReason::TooShort)
+        );
         assert_eq!(generated.attempts[1].outcome, "validation_failed");
+        assert_eq!(
+            generated.attempts[1].validation_reason,
+            Some(crate::llm::types::ValidationFailureReason::TooShort)
+        );
         assert_eq!(generated.attempts[2].provider, "fallback");
+        assert_eq!(generated.attempts[2].validation_reason, None);
         unsafe {
             std::env::remove_var("PROFILE_SWITCH_PRIMARY_KEY");
             std::env::remove_var("PROFILE_SWITCH_FALLBACK_KEY");

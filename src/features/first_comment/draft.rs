@@ -9,6 +9,7 @@ use crate::features::first_comment::quality::validate_comment_output;
 use crate::features::search::mcp::is_safe_fetch_url;
 use crate::features::search::policy::{is_allowed_comment_text, is_allowed_source_url};
 use crate::features::search::types::SearchResult;
+use crate::llm::types::{ValidationFailureReason, validation_error};
 
 const GENERIC_SOURCE_LINK_LABELS: &[&str] = &[
     "детали",
@@ -76,8 +77,8 @@ pub fn parse_first_comment_draft(value: &str) -> anyhow::Result<FirstCommentDraf
     let trimmed = value.trim();
     let draft = match serde_json::from_str(trimmed) {
         Ok(draft) => draft,
-        Err(err) if looks_like_structured_output(trimmed) => {
-            anyhow::bail!("first comment response must be a JSON object: {err}")
+        Err(_) if looks_like_structured_output(trimmed) => {
+            return Err(validation_error(ValidationFailureReason::InvalidJson));
         }
         Err(_) => FirstCommentDraft {
             comment: trimmed.to_string(),
@@ -87,12 +88,12 @@ pub fn parse_first_comment_draft(value: &str) -> anyhow::Result<FirstCommentDraf
     };
 
     if draft.used_search_result_id == Some(0) {
-        anyhow::bail!("used_search_result_id must start at 1");
+        return Err(validation_error(ValidationFailureReason::InvalidMetadata));
     }
     if draft.used_chat_message_ids.len() > 3
         || draft.used_chat_message_ids.iter().any(|id| *id <= 0)
     {
-        anyhow::bail!("used_chat_message_ids must contain at most three positive IDs");
+        return Err(validation_error(ValidationFailureReason::InvalidMetadata));
     }
 
     Ok(draft)
@@ -148,24 +149,24 @@ pub fn validate_first_comment_draft_with_search_policy_and_chat(
         if source_link.is_some()
             && (!is_safe_fetch_url(&result.url) || !is_allowed_source_url(config, &result.url))
         {
-            anyhow::bail!("selected source link is not allowed by source policy");
+            return Err(validation_error(ValidationFailureReason::SourceLink));
         }
     }
 
     if draft.used_search_result_id.is_some() && source_link.is_none() {
-        anyhow::bail!("used search result must have a SOURCE_LINK");
+        return Err(validation_error(ValidationFailureReason::SearchProvenance));
     }
 
     if let Some(source_link) = source_link {
         if !source_link_available {
-            anyhow::bail!("SOURCE_LINK is disabled for this comment");
+            return Err(validation_error(ValidationFailureReason::SourceLink));
         }
         if draft.used_search_result_id != Some(source_link.result_id) {
-            anyhow::bail!("SOURCE_LINK result ID must match used_search_result_id");
+            return Err(validation_error(ValidationFailureReason::SearchProvenance));
         }
         let result = search_result_by_id(search_results, source_link.result_id)?;
         if !is_safe_fetch_url(&result.url) || !is_allowed_source_url(config, &result.url) {
-            anyhow::bail!("selected source link is not allowed by source policy");
+            return Err(validation_error(ValidationFailureReason::SourceLink));
         }
         let source_name = search_result_source_name(result);
         if !source_link
@@ -173,7 +174,7 @@ pub fn validate_first_comment_draft_with_search_policy_and_chat(
             .to_lowercase()
             .contains(&source_name.to_lowercase())
         {
-            anyhow::bail!("SOURCE_LINK label must name the linked source: {source_name}");
+            return Err(validation_error(ValidationFailureReason::SourceLink));
         }
     }
 
@@ -188,7 +189,7 @@ fn validate_comment_body(
     let (visible_comment, source_link) = replace_source_link_placeholder(&draft.comment)?;
     let (visible_comment, evidence_ids) = replace_chat_evidence_placeholders(&visible_comment)?;
     if evidence_ids != draft.used_chat_message_ids {
-        anyhow::bail!("used_chat_message_ids must exactly match chat evidence placeholders");
+        return Err(validation_error(ValidationFailureReason::ChatEvidence));
     }
     if evidence_ids.is_empty() {
         validate_comment_output(&visible_comment)?;
@@ -199,12 +200,12 @@ fn validate_comment_body(
                 .any(|id| !allowed_chat_message_ids.contains(id))
             || draft.used_chat_message_ids != evidence_ids
         {
-            anyhow::bail!("chat evidence IDs do not match the confirmed retrieval context");
+            return Err(validation_error(ValidationFailureReason::ChatEvidence));
         }
         validate_comment_output(&format!("{visible_comment} {{CHAT_LINK}}"))?;
     }
     if !is_allowed_comment_text(config, &visible_comment) {
-        anyhow::bail!("first comment contains a blocked term");
+        return Err(validation_error(ValidationFailureReason::BlockedTerm));
     }
     Ok(source_link)
 }
@@ -221,7 +222,7 @@ fn replace_chat_evidence_placeholders(text: &str) -> anyhow::Result<(String, Vec
         let (before, after_start) = rest.split_at(start);
         visible.push_str(before);
         let Some(end) = after_start.find('}') else {
-            anyhow::bail!("unterminated chat evidence placeholder")
+            return Err(validation_error(ValidationFailureReason::ChatEvidence));
         };
         let token = &after_start[..=end];
         let placeholder = parse_chat_evidence_placeholder(token)?;
@@ -245,7 +246,7 @@ pub fn parse_chat_evidence_placeholder(token: &str) -> anyhow::Result<ChatEviden
             .parse::<i32>()
             .ok()
             .filter(|id| *id > 0)
-            .ok_or_else(|| anyhow::anyhow!("malformed chat evidence placeholder: {token}"))?;
+            .ok_or_else(|| validation_error(ValidationFailureReason::ChatEvidence))?;
         return Ok(ChatEvidencePlaceholder {
             message_id,
             message_label: None,
@@ -255,15 +256,15 @@ pub fn parse_chat_evidence_placeholder(token: &str) -> anyhow::Result<ChatEviden
     let value = token
         .strip_prefix("{CHAT_MESSAGE:")
         .and_then(|value| value.strip_suffix('}'))
-        .ok_or_else(|| anyhow::anyhow!("malformed chat evidence placeholder: {token}"))?;
+        .ok_or_else(|| validation_error(ValidationFailureReason::ChatEvidence))?;
     let (id, label) = value
         .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("CHAT_MESSAGE must contain message ID and label"))?;
+        .ok_or_else(|| validation_error(ValidationFailureReason::ChatEvidence))?;
     let message_id = id
         .parse::<i32>()
         .ok()
         .filter(|id| *id > 0)
-        .ok_or_else(|| anyhow::anyhow!("malformed chat evidence placeholder: {token}"))?;
+        .ok_or_else(|| validation_error(ValidationFailureReason::ChatEvidence))?;
     let label = label.trim();
     if label.is_empty()
         || label.chars().count() > 40
@@ -271,7 +272,7 @@ pub fn parse_chat_evidence_placeholder(token: &str) -> anyhow::Result<ChatEviden
             .chars()
             .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || ch == '-')
     {
-        anyhow::bail!("CHAT_MESSAGE label contains unsupported characters");
+        return Err(validation_error(ValidationFailureReason::ChatEvidence));
     }
     Ok(ChatEvidencePlaceholder {
         message_id,
@@ -283,39 +284,39 @@ fn search_result_by_id(
     results: &[SearchResult],
     result_id: usize,
 ) -> anyhow::Result<&SearchResult> {
-    results.get(result_id - 1).ok_or_else(|| {
-        anyhow::anyhow!("used_search_result_id does not exist in this search context")
-    })
+    results
+        .get(result_id - 1)
+        .ok_or_else(|| validation_error(ValidationFailureReason::SearchProvenance))
 }
 
 pub fn parse_source_link_placeholder(token: &str) -> anyhow::Result<SourceLinkPlaceholder> {
     let value = token
         .strip_prefix("{SOURCE_LINK:")
         .and_then(|value| value.strip_suffix('}'))
-        .ok_or_else(|| anyhow::anyhow!("malformed SOURCE_LINK placeholder: {token}"))?;
+        .ok_or_else(|| validation_error(ValidationFailureReason::SourceLink))?;
     let (result_id, label) = value
         .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("SOURCE_LINK must contain result ID and label"))?;
+        .ok_or_else(|| validation_error(ValidationFailureReason::SourceLink))?;
     let result_id = result_id
         .trim()
         .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("SOURCE_LINK result ID must be a positive integer"))?;
+        .map_err(|_| validation_error(ValidationFailureReason::SourceLink))?;
     if result_id == 0 {
-        anyhow::bail!("SOURCE_LINK result ID must start at 1");
+        return Err(validation_error(ValidationFailureReason::SourceLink));
     }
 
     let label = label.trim();
     if label.is_empty() || label.chars().count() > 40 {
-        anyhow::bail!("SOURCE_LINK label must contain 1 to 40 characters");
+        return Err(validation_error(ValidationFailureReason::SourceLink));
     }
     if !label
         .chars()
         .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '-' | '+'))
     {
-        anyhow::bail!("SOURCE_LINK label contains unsupported characters");
+        return Err(validation_error(ValidationFailureReason::SourceLink));
     }
     if GENERIC_SOURCE_LINK_LABELS.contains(&label.to_lowercase().as_str()) {
-        anyhow::bail!("SOURCE_LINK label must be part of the sentence, not a generic pointer");
+        return Err(validation_error(ValidationFailureReason::SourceLink));
     }
 
     Ok(SourceLinkPlaceholder {
@@ -335,10 +336,10 @@ fn replace_source_link_placeholder(
         let (before, after_start) = rest.split_at(start);
         visible.push_str(before);
         let Some(end) = after_start.find('}') else {
-            anyhow::bail!("unterminated SOURCE_LINK placeholder");
+            return Err(validation_error(ValidationFailureReason::SourceLink));
         };
         if source_link.is_some() {
-            anyhow::bail!("first comment contains multiple SOURCE_LINK placeholders");
+            return Err(validation_error(ValidationFailureReason::SourceLink));
         }
 
         let placeholder = parse_source_link_placeholder(&after_start[..=end])?;
@@ -370,11 +371,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_markdown_wrapped_json() {
-        assert!(parse_first_comment_draft(
+    fn rejects_markdown_wrapped_json_with_typed_reason() {
+        let error = parse_first_comment_draft(
             "```json\n{\"comment\":\"Память дорожает. Прайсы в {CHAT_LINK}\",\"used_search_result_id\":null}\n```",
         )
-        .is_err());
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::llm::types::ValidationFailure>()
+                .map(|failure| failure.reason),
+            Some(ValidationFailureReason::InvalidJson)
+        );
     }
 
     #[test]
@@ -434,15 +442,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_chat_evidence_outside_retrieval_context() {
-        assert!(validate_first_comment_draft_with_search_policy_and_chat(
+    fn rejects_chat_evidence_outside_retrieval_context_with_typed_reason() {
+        let error = validate_first_comment_draft_with_search_policy_and_chat(
             r#"{"comment":"{CHAT_AUTHOR:99} разбирал TPM, похожую боль можно продолжить здесь","used_search_result_id":null,"used_chat_message_ids":[99]}"#,
             &[],
             false,
             &Config::from_env().expect("test configuration must parse"),
             &[42],
         )
-        .is_err());
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::llm::types::ValidationFailure>()
+                .map(|failure| failure.reason),
+            Some(ValidationFailureReason::ChatEvidence)
+        );
     }
 
     #[test]

@@ -47,6 +47,20 @@ egress = "direct"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_COMPAT_API_KEY"
 
+[models.gemini_37_comment]
+provider = "gemini"
+model = "gemini-3.7-flash"
+
+[models.gemini_37_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_high"
+
 [models.gemini_comment]
 provider = "gemini"
 model = "gemini-3.6-flash"
@@ -139,7 +153,7 @@ model = "gemma-4-31b"
 supports_images = true
 supports_tools = true
 supports_system_prompt = true
-structured_output = "json_schema"
+structured_output = "json_object"
 context_window_tokens = 131072
 max_output_tokens = 8192
 request_timeout_sec = 45
@@ -176,12 +190,15 @@ thinking = "none"
 
 [routes.first_comment]
 models = [
+  "gemini_37_comment",
   "gemini_comment",
   "gemini_flash_comment",
   "gemini_flash_lite_comment",
   "ollama_memory",
 ]
-fallback_on_validation_failure = false
+# Для комментария действует строгий product-validator; при нарушении
+# контракта одной моделью нужно перейти к следующей модели route.
+fallback_on_validation_failure = true
 
 [routes.memory]
 models = ["ollama_memory"]
