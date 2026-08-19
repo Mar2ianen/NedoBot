@@ -1321,12 +1321,23 @@ async fn assert_unified_enqueue_and_finalizer_share_lock_order(pool: &PgPool) {
 async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_097;
+    const FIRST_MESSAGE_ID: i32 = 9_000_097;
     let input = serde_json::json!({"schema_version": "fixture-v1"});
     query(
-        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)",
+        "insert into telegram_messages (chat_id, message_id, user_id, text, created_at) values ($1, $2, $3, 'stale materialization fixture', now() - interval '6 minutes')",
+    )
+    .bind(CHAT_ID)
+    .bind(FIRST_MESSAGE_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale materialization first message must be inserted");
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, $3, 0, 'low', '[]'::jsonb)",
     )
     .bind(CHAT_ID)
     .bind(USER_ID)
+    .bind(FIRST_MESSAGE_ID)
     .execute(pool)
     .await
     .expect("shadow replay audit baseline must be inserted");
@@ -1409,6 +1420,15 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             .await
             .expect("materialized replay state must be stored");
     assert_eq!(state, ("succeeded".to_string(), "succeeded".to_string()));
+    let review_count: i64 = query_scalar(
+        "select count(*) from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("stale materialization review count must be queryable");
+    assert_eq!(review_count, 1);
 }
 
 async fn assert_audit_generation_is_durable_before_materialization(pool: &PgPool) {
@@ -1733,9 +1753,18 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
 async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_002;
-    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+    const FIRST_MESSAGE_ID: i32 = 9_000_002;
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, 'review fixture')")
+        .bind(CHAT_ID)
+        .bind(FIRST_MESSAGE_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review CAS first message must exist");
+    query("insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, $3)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("review CAS chat user must exist");
@@ -1744,9 +1773,10 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
         .execute(pool)
         .await
         .expect("review CAS profile must exist");
-    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)")
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, $3, 80, 'high', '[]'::jsonb)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("high-risk audit must exist");
@@ -1796,9 +1826,18 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
 async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_006;
-    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+    const FIRST_MESSAGE_ID: i32 = 9_000_006;
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, 'review fixture')")
+        .bind(CHAT_ID)
+        .bind(FIRST_MESSAGE_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review payload CAS first message must exist");
+    query("insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, $3)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("review payload CAS chat user must exist");
@@ -1807,9 +1846,10 @@ async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(poo
         .execute(pool)
         .await
         .expect("review payload CAS profile must exist");
-    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[{\"label\": \"single_message_account\"}]'::jsonb)")
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, $3, 80, 'high', '[{\"label\": \"single_message_account\"}]'::jsonb)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("high-risk payload CAS audit must exist");
@@ -1877,9 +1917,18 @@ async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(poo
 async fn assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_007;
-    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+    const FIRST_MESSAGE_ID: i32 = 9_000_007;
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, 'review fixture')")
+        .bind(CHAT_ID)
+        .bind(FIRST_MESSAGE_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale failure first message must exist");
+    query("insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, $3)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("stale failure chat user must exist");
@@ -1888,9 +1937,10 @@ async fn assert_stale_review_delivery_failure_does_not_finalize_replaced_payload
         .execute(pool)
         .await
         .expect("stale failure profile must exist");
-    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[{\"label\": \"single_message_account\"}]'::jsonb)")
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, $3, 80, 'high', '[{\"label\": \"single_message_account\"}]'::jsonb)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("stale failure audit must exist");
@@ -1975,10 +2025,19 @@ async fn assert_stale_review_delivery_failure_does_not_finalize_replaced_payload
 async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_004;
+    const FIRST_MESSAGE_ID: i32 = 9_000_004;
 
-    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, 'review fixture')")
+        .bind(CHAT_ID)
+        .bind(FIRST_MESSAGE_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("review retry first message must exist");
+    query("insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, $3)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("review retry chat user must exist");
@@ -1987,9 +2046,10 @@ async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("review retry profile must exist");
-    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)")
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, $3, 80, 'high', '[]'::jsonb)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("high-risk retry audit must exist");
@@ -2081,9 +2141,18 @@ async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
 async fn assert_terminal_review_delivery_stays_closed(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_003;
-    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+    const FIRST_MESSAGE_ID: i32 = 9_000_003;
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, 'review fixture')")
+        .bind(CHAT_ID)
+        .bind(FIRST_MESSAGE_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("terminal review first message must exist");
+    query("insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, $3)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("terminal review chat user must exist");
@@ -2092,9 +2161,10 @@ async fn assert_terminal_review_delivery_stays_closed(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("terminal review profile must exist");
-    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)")
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, $3, 80, 'high', '[]'::jsonb)")
         .bind(CHAT_ID)
         .bind(USER_ID)
+        .bind(FIRST_MESSAGE_ID)
         .execute(pool)
         .await
         .expect("terminal high-risk audit must exist");
@@ -2452,7 +2522,16 @@ async fn assert_agent_note_contract(pool: &PgPool) {
 async fn assert_review_deduplication(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 42;
+    const STALE_USER_ID: i64 = 43;
 
+    query(
+        "insert into telegram_messages (chat_id, message_id, user_id, text, created_at) values ($1, 200, $2, 'fresh fixture', now())",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("fresh first message must be inserted");
     query(
         "insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, 200)",
     )
@@ -2472,10 +2551,10 @@ async fn assert_review_deduplication(pool: &PgPool) {
         r#"
         insert into telegram_new_user_profile_audits
             (
-                chat_id, telegram_user_id, risk_baseline_score,
+                chat_id, telegram_user_id, first_message_id, risk_baseline_score,
                 risk_baseline_signals, risk_score, risk_level, risk_signal_breakdown
             )
-        values ($1, $2, 65, '[]'::jsonb, 65, 'medium', '[]'::jsonb)
+        values ($1, $2, 200, 65, '[]'::jsonb, 65, 'medium', '[]'::jsonb)
         "#,
     )
     .bind(CHAT_ID)
@@ -2625,6 +2704,64 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .await
     .expect("review count query must succeed");
     assert_eq!(review_count, 1);
+
+    query(
+        "insert into telegram_messages (chat_id, message_id, user_id, text, created_at) values ($1, 201, $2, 'stale fixture', now() - interval '6 minutes')",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale first message must be inserted");
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, first_message_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 201, 80, 'high', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale audit must be inserted");
+    let stale_review = create_review(pool, CHAT_ID, STALE_USER_ID)
+        .await
+        .expect("stale review check must succeed");
+    assert!(
+        stale_review.is_none(),
+        "stale first message must not create or claim a Telegram review"
+    );
+    let stale_review_count: i64 = query_scalar(
+        "select count(*) from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("stale review count must be queryable");
+    assert_eq!(stale_review_count, 1);
+
+    query(
+        "update spam_review_requests set notification_next_attempt_at = now() where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale review delivery fixture must be made due");
+    let stale_claim = claim_next_review_delivery(pool)
+        .await
+        .expect("stale review delivery claim must succeed");
+    assert!(
+        stale_claim.is_none(),
+        "stale review must not be claimed for Telegram delivery"
+    );
+    let stale_notification_status: String = query_scalar(
+        "select notification_status from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(STALE_USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("stale notification status must be queryable");
+    assert_eq!(stale_notification_status, "pending");
 }
 
 async fn assert_comment_job_lifecycle(pool: &PgPool) {
