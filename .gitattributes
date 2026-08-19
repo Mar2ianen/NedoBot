@@ -1,2 +1,5 @@
 # Shell-скрипты остаются в репозитории, но не должны влиять на GitHub language bar.
 *.sh linguist-detectable=false
+
+# SQL-миграции остаются подсвеченными как SQL, но не должны влиять на GitHub language bar.
+*.sql linguist-detectable=false
