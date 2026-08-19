@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use jiff::Timestamp;
 use sqlx::PgPool;
-use teloxide::utils::time::{LLM_DIALECT_VERSION, LlmMarkdownFormatter, TIME_RENDERER_VERSION};
+use teloxide::utils::time::{
+    LLM_DIALECT_VERSION, LlmMarkdownFormatter, TIME_RENDERER_VERSION, TimeContext,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Config;
@@ -18,6 +20,7 @@ pub struct AskService<'a> {
     pool: &'a PgPool,
     config: &'a Config,
     llm_formatter: &'a LlmMarkdownFormatter,
+    time_context: &'a TimeContext,
 }
 
 impl<'a> AskService<'a> {
@@ -25,11 +28,13 @@ impl<'a> AskService<'a> {
         pool: &'a PgPool,
         config: &'a Config,
         llm_formatter: &'a LlmMarkdownFormatter,
+        time_context: &'a TimeContext,
     ) -> Self {
         Self {
             pool,
             config,
             llm_formatter,
+            time_context,
         }
     }
 
@@ -59,7 +64,10 @@ impl<'a> AskService<'a> {
             Ok(answer) => match rich_markdown::validate(&answer) {
                 Ok(markdown) => {
                     let captured_now = Timestamp::now();
-                    match self.llm_formatter.render_at(&markdown, captured_now) {
+                    match self
+                        .llm_formatter
+                        .render_at(&markdown, self.time_context, captured_now)
+                    {
                         Ok(rendered) => {
                             let render = self.render_audit(captured_now, Some(&rendered.markdown));
                             if let Err(err) = validate_rich_markdown(&rendered.markdown) {
