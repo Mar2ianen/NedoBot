@@ -1,6 +1,6 @@
 use std::future::Future;
 use teloxide::{
-    drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter},
+    drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter, DrafterRequestError},
     prelude::*,
     types::{
         InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
@@ -115,7 +115,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.time_context,
                 StatsPeriod::Day,
                 render,
             )
@@ -128,7 +128,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.time_context,
                 StatsPeriod::Week,
                 render,
             )
@@ -141,7 +141,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.time_context,
                 StatsPeriod::Month,
                 render,
             )
@@ -156,7 +156,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
-                &state.main_formatter,
+                &state.time_context,
                 period,
                 render,
             )
@@ -326,7 +326,12 @@ async fn handle_ask_command(
         reply_image_base64,
         allow_mutations: true,
     };
-    let ask_service = AskService::new(&state.pool, config, &state.llm_formatter);
+    let ask_service = AskService::new(
+        &state.pool,
+        config,
+        &state.llm_formatter,
+        &state.time_context,
+    );
     let answer = ask_service.execute(input, Some(&progress_tx));
     tokio::pin!(answer);
     let mut progress_open = true;
@@ -424,9 +429,14 @@ fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
 
 fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     match error {
-        DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
+        DraftFinishError::WorkerStoppedBeforeCommand | DraftFinishError::RateLimiter(_) => {
+            DeliveryCertainty::NotAttempted
+        }
         DraftFinishError::WorkerStoppedAfterCommand { delivery }
+        | DraftFinishError::RequestTimeout { delivery }
+        | DraftFinishError::DeadlineExceeded { delivery }
         | DraftFinishError::Backend { delivery, .. } => *delivery,
+        _ => DeliveryCertainty::NotAttempted,
     }
 }
 
@@ -437,7 +447,7 @@ async fn fallback_after_finish_error(
     ask_run_id: Option<i64>,
     fallback_status: AskRunStatus,
     fallback_text: &str,
-    error: DraftFinishError<teloxide::RequestError>,
+    error: DraftFinishError<DrafterRequestError>,
 ) -> ResponseResult<()> {
     let certainty = finish_error_certainty(&error);
     if may_send_fallback(certainty) {
@@ -895,9 +905,10 @@ mod tests {
         };
 
         use teloxide::drafter::{
-            DrafterBackend, DrafterCapabilities, DrafterErrorClass, DrafterErrorDisposition,
-            DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority, DrafterRateLimitKey,
-            DrafterRateLimitScope, DrafterRateLimiter, PreviewAck,
+            DrafterAcquireError, DrafterBackend, DrafterCapabilities, DrafterErrorClass,
+            DrafterErrorDisposition, DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority,
+            DrafterRateLimitKey, DrafterRateLimitScope, DrafterRateLimiter, DrafterRequestClass,
+            PreviewAck,
         };
 
         #[derive(Debug)]
@@ -919,8 +930,9 @@ mod tests {
                 &self,
                 _key: DrafterRateLimitKey,
                 _priority: DrafterPriority,
-            ) -> DrafterPermit {
-                DrafterPermit::new()
+                _request_class: DrafterRequestClass,
+            ) -> Result<DrafterPermit, DrafterAcquireError> {
+                Ok(DrafterPermit::new())
             }
 
             fn penalize(&self, _scope: DrafterRateLimitScope, _retry_after: std::time::Duration) {}

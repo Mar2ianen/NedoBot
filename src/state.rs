@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 use std::sync::Arc;
 use teloxide::drafter::InProcessRateLimiter;
-use teloxide::utils::time::{LlmMarkdownFormatter, MainMarkdownFormatter, TimeContext};
+use teloxide::utils::time::{LlmMarkdownFormatter, TimeContext};
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
@@ -12,7 +12,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Config,
     pub llm_formatter: Arc<LlmMarkdownFormatter>,
-    pub main_formatter: Arc<MainMarkdownFormatter>,
+    pub time_context: Arc<TimeContext>,
     pub ask_slots: Arc<Semaphore>,
     pub drafter_limiter: InProcessRateLimiter,
     pub ask_delivery_metrics: Arc<AskDeliveryMetrics>,
@@ -27,8 +27,8 @@ impl AppState {
         Self {
             pool,
             config,
-            llm_formatter: Arc::new(LlmMarkdownFormatter::new((*time_context).clone())),
-            main_formatter: Arc::new(MainMarkdownFormatter::new((*time_context).clone())),
+            llm_formatter: Arc::new(LlmMarkdownFormatter::new()),
+            time_context,
             ask_slots: Arc::new(Semaphore::new(ask_concurrency)),
             drafter_limiter: InProcessRateLimiter::default(),
             ask_delivery_metrics: Arc::new(AskDeliveryMetrics::default()),
