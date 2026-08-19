@@ -83,7 +83,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=
 Environment=LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml
 ```
 
-Не использовать под systemd относительный `config/llm_profiles.toml.example` и не заменять production profile простым копированием example: provider topology и значения `[runtime]` должны быть перенесены из фактического deployment-конфига.
+Не использовать под systemd относительный `config/llm_profiles.toml.example` и не заменять production profile простым копированием example: provider topology и значения `[runtime]` должны быть перенесены из фактического deployment-конфига. При изменении route policy (например, `fallback_on_validation_failure`) нужно синхронно обновить deployment-копию, проверить её до запуска и перезапустить сервис; правка example-файла сама по себе production не меняет.
 
 `config/llm_profiles.toml.example` содержит provider/model profiles, task routes и все статические лимиты, флаги, идентификаторы чатов, пути и tool allowlists. API keys, DSN, invite URL и proxy URL туда не переносятся.
 
@@ -117,7 +117,7 @@ Civil date/time и bare clock нормализуются через эту зо�
 
 Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
-На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
+На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. При отказе output validator LLM service пишет в journal только route, fallback index, provider, model, номер попытки, размер ответа и безопасный `validation_reason`; полный prompt и ответ модели не логируются. Для `first_comment` причины типизированы (`missing_chat_link`, `raw_link`, `generic_cta`, `invalid_json`, `chat_evidence`, `source_link`, `blocked_term` и другие), а тот же код сохраняется в `llm_generations.attempts` при успешном fallback. Полная topology приведена в `config/llm_profiles.toml.example`.
 
 Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
 
@@ -366,13 +366,16 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `adult_personal_channel_promo` - личный/personal channel пользователя ведёт на adult-промо, инвайт-ссылки или схожий funnel.
 - Для первого текстового сообщения сохраняются LLM-маркеры кампании, RuBERT-вектор и сходство с вручную подтверждённым спамом. Эти сигналы лишь повышают review-риск; автоматической пометки спамером нет.
 
-Для каждого нового пользователя бот сохраняет один audit-запрос в
-`spam_review_requests`, включая low и medium risk. Карточка для ревью с тегом
-`@Chechulinm` отправляется только когда актуальный `risk_score >= 70` (`high`):
-порог проверяется и перед Telegram API call, и DB constraint'ом при claim/delivery.
+Для каждого нового пользователя бот сохраняет audit, score и review-запрос
+в `spam_review_requests` в БД. Возраст первого сообщения не отменяет job и не
+удаляет review row. Если первому сообщению уже больше 5 минут, stale review
+остаётся только для аудита и не claim-ится на Telegram-доставку. Карточка для
+ревью с тегом `@Chechulinm` отправляется только когда актуальный
+`risk_score >= 70` (`high`): порог проверяется и перед Telegram API call, и DB
+constraint'ом при claim/delivery.
 Пользователь с меньшим score не может получить карточку даже при ошибочном caller-е.
-Поздние сигналы аватара или первого сообщения могут сделать уже сохранённый audit
-доставляемым. Кнопки «Верно: спамер» и «Неверно: не спамер» доступны только
+Поздние сигналы аватара или первого сообщения обновляют audit и score, но после
+пятиминутного окна не создают и не доставляют review card. Кнопки «Верно: спамер» и «Неверно: не спамер» доступны только
 `runtime.owner_telegram_id`; первое решение атомарно закрывает запрос и убирает
 клавиатуру. Технические labels риска в карточке переводятся в понятные причины. Кнопки доступны только владельцу, заданному через `runtime.owner_telegram_id`.
 
