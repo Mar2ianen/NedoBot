@@ -790,6 +790,10 @@ nullable = true
 pg_type = "boolean"
 nullable = true
 
+[tables.telegram_messages.columns.is_forwarded]
+pg_type = "boolean"
+nullable = true
+
 [tables.telegram_messages.columns.message_id]
 pg_type = "integer"
 nullable = true
@@ -848,6 +852,10 @@ nullable = true
 
 [tables.telegram_messages.columns.via_bot_id]
 pg_type = "bigint"
+nullable = true
+
+[tables.telegram_messages.columns.forwarded_from]
+pg_type = "text"
 nullable = true
 
 [tables.telegram_new_user_profile_audits]
