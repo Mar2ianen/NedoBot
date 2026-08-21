@@ -42,7 +42,8 @@ use tg_ai_bot_teloxide::features::{
         scoring::ScoreComponents,
     },
     spam_review::{
-        claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
+        apply_callback, claim_next_review_delivery, create_review, mark_review_delivery_succeeded,
+        send_review,
     },
     stats::{
         render_html, render_rich, repo as stats_repo,
@@ -60,6 +61,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_spam_label_events(&pool).await;
+    assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
@@ -2239,6 +2242,188 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         public_messages_view.as_deref(),
         Some("mcp_public.telegram_messages")
     );
+}
+
+async fn assert_spam_label_events(pool: &PgPool) {
+    let columns: Vec<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'spam_label_events' order by ordinal_position",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("spam label event table must be queryable");
+    assert_eq!(
+        columns,
+        vec![
+            "id",
+            "chat_id",
+            "telegram_user_id",
+            "label",
+            "subtype",
+            "source",
+            "reason",
+            "evidence",
+            "operator_telegram_user_id",
+            "created_at",
+        ]
+    );
+
+    let legacy_spam_count: i64 =
+        query_scalar("select count(*) from telegram_chat_users where is_spammer")
+            .fetch_one(pool)
+            .await
+            .expect("legacy spammer count must be queryable");
+    let event_count: i64 =
+        query_scalar("select count(*) from spam_label_events where label = 'spam'")
+            .fetch_one(pool)
+            .await
+            .expect("backfilled spam label count must be queryable");
+    assert!(
+        event_count >= legacy_spam_count,
+        "every legacy spammer must have a durable label event"
+    );
+
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .subsec_nanos() as i64;
+    let user_id = 9_700_000_000 + suffix;
+    query(
+        "insert into telegram_chat_users (chat_id, telegram_user_id, is_spammer, spam_score, spam_type, spam_reason, spam_last_marked_at) values (-1001932061163, $1, true, 100, 'promo_dm_bait', 'migration fixture', now())",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("legacy spammer fixture must be insertable");
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260821100000_spam_label_events.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("spam label migration must preserve an idempotent backfill");
+    let backfilled: (String, String, String) = query_as(
+        "select label, subtype, source from spam_label_events where chat_id = -1001932061163 and telegram_user_id = $1 order by id desc limit 1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("legacy fixture must receive a durable label event");
+    assert_eq!(
+        backfilled,
+        (
+            "spam".to_string(),
+            "promo_dm_bait".to_string(),
+            "legacy_backfill".to_string()
+        )
+    );
+    query("delete from spam_label_events where chat_id = -1001932061163 and telegram_user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("spam label fixture events must be removable");
+    query(
+        "delete from telegram_chat_users where chat_id = -1001932061163 and telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("spam label fixture user must be removable");
+}
+
+async fn assert_review_decisions_write_spam_label_events(pool: &PgPool) {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .subsec_nanos() as i64;
+    let spam_user_id = 9_800_000_000 + suffix;
+    let normal_user_id = spam_user_id + 1;
+    let owner_id = 5_939_287_960_i64;
+    for user_id in [spam_user_id, normal_user_id] {
+        query("insert into telegram_chat_users (chat_id, telegram_user_id) values (-1001932061163, $1)")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("review decision fixture user must be insertable");
+    }
+    let spam_request_id: i64 = query_scalar(
+        "insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals) values (-1001932061163, $1, 90, $2::jsonb) returning id",
+    )
+    .bind(spam_user_id)
+    .bind(serde_json::json!([{"label": "personal_channel_adult_links"}]))
+    .fetch_one(pool)
+    .await
+    .expect("spam review fixture must be insertable");
+    let normal_request_id: i64 = query_scalar(
+        "insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals) values (-1001932061163, $1, 80, '[]'::jsonb) returning id",
+    )
+    .bind(normal_user_id)
+    .fetch_one(pool)
+    .await
+    .expect("normal review fixture must be insertable");
+
+    assert_eq!(
+        apply_callback(pool, spam_request_id, "spam", owner_id)
+            .await
+            .expect("spam review decision must succeed"),
+        Some("Помечено как спамер.")
+    );
+    assert_eq!(
+        apply_callback(pool, normal_request_id, "normal", owner_id)
+            .await
+            .expect("normal review decision must succeed"),
+        Some("Помечено как не спамер.")
+    );
+
+    let spam_event: (String, String, String, i64) = query_as(
+        "select label, subtype, source, operator_telegram_user_id from spam_label_events where chat_id = -1001932061163 and telegram_user_id = $1 order by id desc limit 1",
+    )
+    .bind(spam_user_id)
+    .fetch_one(pool)
+    .await
+    .expect("spam review must write a durable label event");
+    assert_eq!(
+        spam_event,
+        (
+            "spam".to_string(),
+            "adult_personal_channel_promo".to_string(),
+            "owner_review".to_string(),
+            owner_id
+        )
+    );
+    let normal_event: (String, String, String, i64) = query_as(
+        "select label, subtype, source, operator_telegram_user_id from spam_label_events where chat_id = -1001932061163 and telegram_user_id = $1 order by id desc limit 1",
+    )
+    .bind(normal_user_id)
+    .fetch_one(pool)
+    .await
+    .expect("normal review must write a durable label event");
+    assert_eq!(
+        normal_event,
+        (
+            "not_spam".to_string(),
+            "confirmed_normal".to_string(),
+            "owner_review".to_string(),
+            owner_id
+        )
+    );
+
+    query("delete from spam_label_events where chat_id = -1001932061163 and telegram_user_id in ($1, $2)")
+        .bind(spam_user_id)
+        .bind(normal_user_id)
+        .execute(pool)
+        .await
+        .expect("review decision fixture events must be removable");
+    query("delete from spam_review_requests where chat_id = -1001932061163 and telegram_user_id in ($1, $2)")
+        .bind(spam_user_id)
+        .bind(normal_user_id)
+        .execute(pool)
+        .await
+        .expect("review decision fixtures must be removable");
+    query("delete from telegram_chat_users where chat_id = -1001932061163 and telegram_user_id in ($1, $2)")
+        .bind(spam_user_id)
+        .bind(normal_user_id)
+        .execute(pool)
+        .await
+        .expect("review decision fixture users must be removable");
 }
 
 async fn assert_sent_comment_requires_sent_at(pool: &PgPool) {
