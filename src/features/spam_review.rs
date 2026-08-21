@@ -7,6 +7,10 @@ use teloxide::{
 
 use crate::{
     features::jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
+    features::spam_labels::{
+        LabelEvent, normal_label_evidence, owner_review_spam_subtype,
+        record_label_event_in_transaction,
+    },
     telegram::html,
 };
 
@@ -510,7 +514,7 @@ pub async fn apply_callback(
         _ => return Ok(None),
     };
     let mut tx = pool.begin().await?;
-    let row = sqlx::query("update spam_review_requests set status = $2, reviewed_at = now(), reviewed_by_user_id = $3 where id = $1 and status = 'pending' returning chat_id, telegram_user_id")
+    let row = sqlx::query("update spam_review_requests set status = $2, reviewed_at = now(), reviewed_by_user_id = $3 where id = $1 and status = 'pending' returning chat_id, telegram_user_id, risk_signals")
         .bind(request_id).bind(status).bind(owner_id).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         tx.commit().await?;
@@ -519,9 +523,41 @@ pub async fn apply_callback(
     if decision == "spam" {
         let chat_id: i64 = row.get("chat_id");
         let user_id: i64 = row.get("telegram_user_id");
+        let risk_signals: Value = row.get("risk_signals");
         sqlx::query("update telegram_chat_users set is_spammer = true, spam_score = greatest(spam_score, 100), spam_last_marked_at = now(), spam_reason = 'Owner-confirmed spammer', spam_type = 'llm_generic_comment', spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', '1'::jsonb, true), updated_at = now() where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = 'Owner-confirmed spammer', spam_source = 'manual_owner_confirmation', spam_type = coalesce(spam_type, 'llm_generic_comment') where chat_id = $1 and user_id = $2 and source_channel_id is null").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("update telegram_chat_users set spam_message_count = (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null), spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', to_jsonb((select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null)), true) where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
+        record_label_event_in_transaction(
+            &mut tx,
+            LabelEvent {
+                chat_id,
+                telegram_user_id: user_id,
+                label: "spam",
+                subtype: owner_review_spam_subtype(&risk_signals),
+                source: "owner_review",
+                reason: "Owner-confirmed spammer",
+                evidence: &risk_signals,
+                operator_telegram_user_id: Some(owner_id),
+            },
+        )
+        .await?;
+    } else {
+        let chat_id: i64 = row.get("chat_id");
+        let user_id: i64 = row.get("telegram_user_id");
+        record_label_event_in_transaction(
+            &mut tx,
+            LabelEvent {
+                chat_id,
+                telegram_user_id: user_id,
+                label: "not_spam",
+                subtype: "confirmed_normal",
+                source: "owner_review",
+                reason: "Owner rejected spam review",
+                evidence: &normal_label_evidence(request_id),
+                operator_telegram_user_id: Some(owner_id),
+            },
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(Some(if decision == "spam" {
@@ -603,6 +639,19 @@ fn human_label(label: &str) -> &str {
         "only_channel_post_comments" => "комментирует только посты канала",
         "reply_to_channel_post_not_comment" => "ответил прямо на пост, не на обсуждение",
         "display_name_reused_by_spammers" => "имя уже встречалось у размеченных спамеров",
+        "display_name_reused_by_mixed_labels" => {
+            "имя встречалось и у спамеров, и у подтверждённых нормальных пользователей"
+        }
+        "display_name_reused_by_confirmed_normal" => {
+            "имя встречалось только у подтверждённых нормальных пользователей"
+        }
+        "username_reused_by_spammers" => "username уже встречался у размеченных спамеров",
+        "username_reused_by_mixed_labels" => {
+            "username встречался и у спамеров, и у подтверждённых нормальных пользователей"
+        }
+        "username_reused_by_confirmed_normal" => {
+            "username встречался только у подтверждённых нормальных пользователей"
+        }
         "username_random_suffix" => "username похож на автоматически созданный",
         "mixed_script_profile_homoglyphs" => {
             "в имени смешаны похожие латинские и кириллические буквы"

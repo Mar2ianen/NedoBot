@@ -174,9 +174,19 @@ pub(crate) async fn template_match_count(
         r#"
         select distinct m.text
         from telegram_messages m
+        join telegram_chat_users u
+          on u.chat_id = m.chat_id and u.telegram_user_id = m.user_id
+        left join lateral (
+            select e.label
+            from spam_label_events e
+            where e.chat_id = m.chat_id and e.telegram_user_id = m.user_id
+            order by e.created_at desc, e.id desc
+            limit 1
+        ) labels on true
         where m.chat_id = $1
           and m.spam_marked_at is not null
           and m.user_id <> $2
+          and coalesce(labels.label, case when u.is_spammer then 'spam' end) = 'spam'
           and m.text is not null
         "#,
     )
@@ -200,7 +210,15 @@ pub(crate) async fn spam_similarity(pool: &PgPool, embedding: &str) -> anyhow::R
         from telegram_new_user_profile_audits a
         join telegram_chat_users u
           on u.chat_id = a.chat_id and u.telegram_user_id = a.telegram_user_id
-        where u.is_spammer and a.first_message_embedding is not null
+        left join lateral (
+            select e.label
+            from spam_label_events e
+            where e.chat_id = a.chat_id and e.telegram_user_id = a.telegram_user_id
+            order by e.created_at desc, e.id desc
+            limit 1
+        ) labels on true
+        where coalesce(labels.label, case when u.is_spammer then 'spam' end) = 'spam'
+          and a.first_message_embedding is not null
         "#,
     )
     .bind(embedding)

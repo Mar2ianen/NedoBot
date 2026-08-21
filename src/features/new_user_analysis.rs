@@ -61,11 +61,13 @@ struct NewUserFeatures {
     username: Option<String>,
     username_reuse_count: i64,
     username_reuse_spammer_count: i64,
+    username_reuse_not_spam_count: i64,
     first_name: Option<String>,
     last_name: Option<String>,
     display_name: Option<String>,
     display_name_reuse_count: i64,
     display_name_reuse_spammer_count: i64,
+    display_name_reuse_not_spam_count: i64,
     is_bot: bool,
     is_premium: Option<bool>,
     language_code: Option<String>,
@@ -254,7 +256,7 @@ impl RiskAccumulator {
     }
 
     fn finish(mut self) -> RiskAnalysis {
-        self.score = self.score.min(100);
+        self.score = self.score.clamp(0, 100);
         let level = match self.score {
             70.. => "high",
             40..=69 => "medium",
@@ -352,6 +354,12 @@ fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> V
         "profile": {
             "username": bounded_audit_text(features.username.as_deref()),
             "display_name": bounded_audit_text(features.display_name.as_deref()),
+            "label_reuse": {
+                "username_spam": features.username_reuse_spammer_count,
+                "username_not_spam": features.username_reuse_not_spam_count,
+                "display_name_spam": features.display_name_reuse_spammer_count,
+                "display_name_not_spam": features.display_name_reuse_not_spam_count,
+            },
             "bio_preview": bounded_audit_text(features.bio.as_deref()),
             "profile_photo_unique_id": features.profile_photo_file_unique_id,
         },
@@ -385,6 +393,14 @@ fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAn
             "has_profile_photo": has_profile_photo(features),
             "avatar_image_available": false,
             "profile_photo_reuse_count": features.profile_photo_reuse_count,
+            "label_reuse": {
+                "username_total": features.username_reuse_count,
+                "username_spam": features.username_reuse_spammer_count,
+                "username_not_spam": features.username_reuse_not_spam_count,
+                "display_name_total": features.display_name_reuse_count,
+                "display_name_spam": features.display_name_reuse_spammer_count,
+                "display_name_not_spam": features.display_name_reuse_not_spam_count,
+            },
         },
         "activity": {
             "first_seen_at": features.first_seen_at.map(|value| value.to_rfc3339()),
@@ -594,11 +610,13 @@ async fn load_features(
             p.username,
             coalesce(uns.reuse_count, 0)::bigint as username_reuse_count,
             coalesce(uns.reuse_spammer_count, 0)::bigint as username_reuse_spammer_count,
+            coalesce(uns.reuse_not_spam_count, 0)::bigint as username_reuse_not_spam_count,
             p.first_name,
             p.last_name,
             nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') as display_name,
             coalesce(dns.reuse_count, 0)::bigint as display_name_reuse_count,
             coalesce(dns.reuse_spammer_count, 0)::bigint as display_name_reuse_spammer_count,
+            coalesce(dns.reuse_not_spam_count, 0)::bigint as display_name_reuse_not_spam_count,
             coalesce(p.is_bot, false) as is_bot,
             p.is_premium,
             p.language_code,
@@ -643,10 +661,20 @@ async fn load_features(
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
-                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+                count(*) filter (
+                    where coalesce(labels.label, case when coalesce(cu2.is_spammer, false) then 'spam' end) = 'spam'
+                )::bigint as reuse_spammer_count,
+                count(*) filter (where labels.label = 'not_spam')::bigint as reuse_not_spam_count
             from telegram_user_profiles p2
             left join telegram_chat_users cu2
               on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
+            left join lateral (
+                select e.label
+                from spam_label_events e
+                where e.chat_id = $1 and e.telegram_user_id = p2.telegram_user_id
+                order by e.created_at desc, e.id desc
+                limit 1
+            ) labels on true
             where nullif(lower(trim(p.username)), '') is not null
               and lower(trim(p2.username)) = lower(trim(p.username))
               and p2.telegram_user_id <> p.telegram_user_id
@@ -654,10 +682,20 @@ async fn load_features(
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
-                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+                count(*) filter (
+                    where coalesce(labels.label, case when coalesce(cu2.is_spammer, false) then 'spam' end) = 'spam'
+                )::bigint as reuse_spammer_count,
+                count(*) filter (where labels.label = 'not_spam')::bigint as reuse_not_spam_count
             from telegram_user_profiles p2
             left join telegram_chat_users cu2
               on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
+            left join lateral (
+                select e.label
+                from spam_label_events e
+                where e.chat_id = $1 and e.telegram_user_id = p2.telegram_user_id
+                order by e.created_at desc, e.id desc
+                limit 1
+            ) labels on true
             where nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') is not null
               and lower(nullif(trim(concat_ws(' ', p2.first_name, p2.last_name)), '')) = lower(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''))
               and p2.telegram_user_id <> p.telegram_user_id
@@ -731,11 +769,13 @@ async fn load_features(
             username: row.get("username"),
             username_reuse_count: row.get("username_reuse_count"),
             username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
+            username_reuse_not_spam_count: row.get("username_reuse_not_spam_count"),
             first_name: row.get("first_name"),
             last_name: row.get("last_name"),
             display_name: row.get("display_name"),
             display_name_reuse_count: row.get("display_name_reuse_count"),
             display_name_reuse_spammer_count: row.get("display_name_reuse_spammer_count"),
+            display_name_reuse_not_spam_count: row.get("display_name_reuse_not_spam_count"),
             is_bot: row.get("is_bot"),
             is_premium: row.get("is_premium"),
             language_code: row.get("language_code"),
@@ -900,12 +940,32 @@ fn recent_id_signal(
 }
 
 fn username_signal(features: &NewUserFeatures, stats: &UsernameStats) -> Option<RiskSignal> {
+    if features.username_reuse_spammer_count > 0 && features.username_reuse_not_spam_count > 0 {
+        return Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 8,
+            label: "username_reused_by_mixed_labels",
+            reason: "Username has appeared on both manually marked spammers and confirmed normal users",
+        });
+    }
     if features.username_reuse_spammer_count > 0 {
         return Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
             coefficient: 22,
             label: "username_reused_by_spammers",
             reason: "Username has already appeared on manually marked spammers",
+        });
+    }
+    if features.username_reuse_not_spam_count > 0
+        && features.username_reuse_not_spam_count == features.username_reuse_count
+        && features.username_reuse_count <= 2
+        && features.message_count <= 3
+    {
+        return Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: -4,
+            label: "username_reused_by_confirmed_normal",
+            reason: "Username has only appeared on confirmed normal users",
         });
     }
     if features.username_reuse_count > 0 && features.message_count <= 3 {
@@ -936,16 +996,38 @@ fn username_signal(features: &NewUserFeatures, stats: &UsernameStats) -> Option<
 fn display_name_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match (
         features.display_name_reuse_spammer_count,
+        features.display_name_reuse_not_spam_count,
         features.display_name_reuse_count,
         features.message_count,
     ) {
-        (spammer_count, _, _) if spammer_count > 0 => Some(RiskSignal {
+        (spammer_count, normal_count, _, _) if spammer_count > 0 && normal_count > 0 => {
+            Some(RiskSignal {
+                class: SpamClass::LlmProfileBait,
+                coefficient: 8,
+                label: "display_name_reused_by_mixed_labels",
+                reason: "Display name has appeared on both manually marked spammers and confirmed normal users",
+            })
+        }
+        (spammer_count, _, _, _) if spammer_count > 0 => Some(RiskSignal {
             class: SpamClass::LlmProfileBait,
             coefficient: 22,
             label: "display_name_reused_by_spammers",
             reason: "Display name has already appeared on manually marked spammers",
         }),
-        (0, reuse_count, message_count) if reuse_count > 0 && message_count <= 3 => {
+        (0, normal_count, reuse_count, message_count)
+            if normal_count > 0
+                && normal_count == reuse_count
+                && reuse_count <= 2
+                && message_count <= 3 =>
+        {
+            Some(RiskSignal {
+                class: SpamClass::LlmProfileBait,
+                coefficient: -4,
+                label: "display_name_reused_by_confirmed_normal",
+                reason: "Display name has only appeared on confirmed normal users",
+            })
+        }
+        (0, _, reuse_count, message_count) if reuse_count > 0 && message_count <= 3 => {
             Some(RiskSignal {
                 class: SpamClass::LlmProfileBait,
                 coefficient: 10,
@@ -1531,6 +1613,10 @@ async fn save_audit_in_transaction(
         "profile_photo_reuse_count": features.profile_photo_reuse_count,
         "username_reuse_count": features.username_reuse_count,
         "username_reuse_spammer_count": features.username_reuse_spammer_count,
+        "username_reuse_not_spam_count": features.username_reuse_not_spam_count,
+        "display_name_reuse_count": features.display_name_reuse_count,
+        "display_name_reuse_spammer_count": features.display_name_reuse_spammer_count,
+        "display_name_reuse_not_spam_count": features.display_name_reuse_not_spam_count,
         "first_name_feminine_pattern": looks_like_feminine_first_name(features.first_name.as_deref()),
         "chat_context": {
             "only_replies_or_comments": only_replies_or_comments(features),

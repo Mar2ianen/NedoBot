@@ -12,6 +12,7 @@ pub mod memory;
 pub mod new_user_analysis;
 pub mod new_user_audit;
 pub mod search;
+pub mod spam_labels;
 pub mod spam_review;
 pub mod stats;
 pub mod user_profiles;
