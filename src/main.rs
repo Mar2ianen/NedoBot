@@ -28,6 +28,7 @@ use features::first_comment::pipeline::{maybe_comment_post, process_next_post_co
 use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL};
 use features::memory::service::process_next_history_entry;
 use features::new_user_audit::service::process_next_new_user_audit_job;
+use features::reports::{self, ReportActionResult};
 use features::spam_review::{apply_callback, parse_callback, process_next_review_delivery};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
@@ -77,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
     spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
+    spawn_report_delivery_worker(bot.inner().clone(), state.clone());
     spawn_post_comment_worker(bot.clone(), state.clone());
     spawn_post_history_worker(state.clone());
     spawn_chat_retrieval_embedding_worker(state.clone());
@@ -240,6 +242,10 @@ async fn handle_callback_query(
     query: CallbackQuery,
     state: AppState,
 ) -> ResponseResult<()> {
+    if let Some((report_id, action)) = query.data.as_deref().and_then(reports::parse_callback) {
+        return handle_report_callback(&bot, &query, &state, report_id, action).await;
+    }
+
     let Some(owner_id) = state.config.owner_telegram_id else {
         return Ok(());
     };
@@ -269,6 +275,72 @@ async fn handle_callback_query(
         Err(err) => {
             tracing::error!(%err, request_id, "failed to apply spam review callback");
             bot.answer_callback_query(query.id)
+                .text("Не удалось сохранить решение.")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_report_callback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    query: &CallbackQuery,
+    state: &AppState,
+    report_id: i64,
+    action: reports::ReportAction,
+) -> ResponseResult<()> {
+    let actor_id = query.from.id.0 as i64;
+    if !reports::is_admin_callback_actor(bot.inner(), &state.config, actor_id).await {
+        bot.answer_callback_query(query.id.clone())
+            .text("Недостаточно прав.")
+            .await?;
+        return Ok(());
+    }
+
+    match reports::apply_action(&state.pool, report_id, action, actor_id).await {
+        Ok(ReportActionResult::Applied(resolution)) => {
+            let text = match resolution {
+                reports::ReportResolution::Accepted => "Репорт принят.",
+                reports::ReportResolution::Rejected => "Репорт отклонён.",
+                reports::ReportResolution::Pending => "Решение сохранено.",
+            };
+            bot.answer_callback_query(query.id.clone())
+                .text(text)
+                .await?;
+            if let Some(message) = query.regular_message() {
+                match reports::load_report(&state.pool, report_id).await {
+                    Ok(card) => {
+                        if let Err(err) = bot
+                            .inner()
+                            .edit_message_rich_text(
+                                message.chat.id,
+                                message.id,
+                                reports::render_report(&card),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%err, report_id, "failed to update report card after decision");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, report_id, "failed to reload report card after decision");
+                    }
+                }
+            }
+        }
+        Ok(ReportActionResult::AlreadyResolved) => {
+            bot.answer_callback_query(query.id.clone())
+                .text("Решение уже принято.")
+                .await?;
+        }
+        Ok(ReportActionResult::Missing) => {
+            bot.answer_callback_query(query.id.clone())
+                .text("Репорт не найден.")
+                .await?;
+        }
+        Err(err) => {
+            tracing::error!(%err, report_id, "failed to apply report callback");
+            bot.answer_callback_query(query.id.clone())
                 .text("Не удалось сохранить решение.")
                 .await?;
         }
@@ -312,6 +384,29 @@ fn spawn_spam_review_delivery_worker(bot: Bot, state: AppState) {
                 }
                 Err(err) => {
                     tracing::warn!(%err, "spam review delivery worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_report_delivery_worker(bot: Bot, state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match reports::process_next_delivery(&bot, &state.pool).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
+                    ))
+                    .await
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "report delivery worker failed");
                     tokio::time::sleep(std::time::Duration::from_secs(
                         EXTERNAL_ANALYSIS_POLL.error_seconds(),
                     ))
