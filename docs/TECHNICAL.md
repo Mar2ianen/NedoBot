@@ -333,7 +333,7 @@ Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/
 Ручной redeploy из локальной папки:
 
 ```bash
-rsync -az --delete --exclude target --exclude .git --exclude .env ./ vps-153:/opt/tg-ai-bot-teloxide/
+rsync -az --delete --exclude target --exclude .git --exclude '.env*' --exclude static/ --exclude backups/ --exclude '*.dump' ./ vps-153:/opt/tg-ai-bot-teloxide/
 ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release && systemctl restart tg-ai-bot-teloxide && systemctl is-active tg-ai-bot-teloxide && systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 ```
 
