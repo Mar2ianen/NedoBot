@@ -143,6 +143,9 @@ pub fn validate_first_comment_draft_with_search_policy_and_chat(
 ) -> anyhow::Result<()> {
     let draft = parse_first_comment_draft(value)?;
     let source_link = validate_comment_body(&draft, config, allowed_chat_message_ids)?;
+    if source_link.is_some() {
+        validate_source_link_placement(&draft.comment)?;
+    }
 
     if let Some(result_id) = draft.used_search_result_id {
         let result = search_result_by_id(search_results, result_id)?;
@@ -311,7 +314,7 @@ pub fn parse_source_link_placeholder(token: &str) -> anyhow::Result<SourceLinkPl
     }
     if !label
         .chars()
-        .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '-' | '+'))
+        .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '-' | '+' | '\''))
     {
         return Err(validation_error(ValidationFailureReason::SourceLink));
     }
@@ -350,6 +353,36 @@ fn replace_source_link_placeholder(
 
     visible.push_str(rest);
     Ok((visible, source_link))
+}
+
+fn validate_source_link_placement(text: &str) -> anyhow::Result<()> {
+    let Some(start) = text.find("{SOURCE_LINK") else {
+        return Ok(());
+    };
+    let Some(end) = text[start..].find('}') else {
+        return Err(validation_error(ValidationFailureReason::SourceLink));
+    };
+    let before = &text[..start];
+    let after = &text[start + end + 1..];
+    let sentence_before = before
+        .rsplit(['.', '!', '?'])
+        .next()
+        .unwrap_or(before)
+        .to_lowercase();
+    let source_is_terminal = after
+        .trim()
+        .chars()
+        .all(|ch| matches!(ch, '.' | ',' | '!' | '?' | ';' | ':'));
+
+    if source_is_terminal
+        && (sentence_before.contains("{chat_link")
+            || sentence_before.contains("как пишет")
+            || sentence_before.contains("как сообщает"))
+    {
+        return Err(validation_error(ValidationFailureReason::SourceLink));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -546,8 +579,32 @@ mod tests {
                 r#"{"comment":"Версия 2.0 уже вышла. Детали в {CHAT_LINK:чатике}","used_search_result_id":1}"#,
                 &results,
                 true,
-            )
-            .is_err()
+        )
+        .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_source_attribution_detached_after_chat_link() {
+        let results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Web,
+            title: "Power draw".to_string(),
+            url: "https://example.com/power".to_string(),
+            snippet: "The card draws more power.".to_string(),
+        }];
+
+        let error = validate_first_comment_draft_with_search(
+            r#"{"comment":"Разобрать энергопотребление можно в {CHAT_LINK:чатике}, как пишет {SOURCE_LINK:1:Example}","used_search_result_id":1}"#,
+            &results,
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::llm::types::ValidationFailure>()
+                .map(|failure| failure.reason),
+            Some(ValidationFailureReason::SourceLink)
         );
     }
 

@@ -1,8 +1,9 @@
 use serde_json::Value;
 use teloxide::types::{
-    InputRichBlock, InputRichBlockButtons, InputRichBlockExpandableBlockQuotation,
-    InputRichBlockParagraph, InputRichBlockSectionHeading, InputRichMessage, RichMessageButton,
-    RichText, RichTextBold, RichTextUrl,
+    FileId, InputFile, InputMediaPhoto, InputRichBlock, InputRichBlockButtons,
+    InputRichBlockExpandableBlockQuotation, InputRichBlockParagraph, InputRichBlockPhoto,
+    InputRichBlockSectionHeading, InputRichMessage, RichMessageButton, RichText, RichTextBold,
+    RichTextUrl,
 };
 
 use super::repo::{ReportCard, ReportResolution};
@@ -17,7 +18,9 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
         card.reported_user_id,
     );
     let reporter_name = display_name_from_snapshot(&card.reporter_snapshot, card.reporter_user_id);
-    let target_url = format!("tg://user?id={}", card.reported_user_id);
+    let target_link = profile_url(card)
+        .map(|url| linked(target_name.clone(), url))
+        .unwrap_or_else(|| plain(target_name.clone()));
     let message_link = message_url(card.chat_id, card.message_id);
     let mut blocks = vec![
         InputRichBlock::Heading(InputRichBlockSectionHeading {
@@ -26,7 +29,7 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
         }),
         InputRichBlock::Paragraph(paragraph([
             bold("Цель: "),
-            linked(target_name, target_url.clone()),
+            target_link,
             plain(format!(" · id={}", card.reported_user_id)),
         ])),
         InputRichBlock::Paragraph(paragraph([
@@ -43,6 +46,16 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
             )),
         ])),
     ];
+
+    if let Some(file_id) = card.profile_photo_file_id.as_deref() {
+        blocks.insert(
+            1,
+            InputRichBlock::Photo(InputRichBlockPhoto {
+                photo: InputMediaPhoto::new(InputFile::file_id(FileId(file_id.to_owned()))),
+                caption: None,
+            }),
+        );
+    }
 
     if let Some(reply_to_message_id) = card.target_reply_to_message_id {
         blocks.push(InputRichBlock::Paragraph(paragraph([
@@ -83,26 +96,17 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
         plain(truncate(&spam_summary(card), 900)),
     ])));
 
-    blocks.push(InputRichBlock::Buttons(buttons(
-        card,
-        message_link,
-        target_url,
-    )));
+    blocks.push(InputRichBlock::Buttons(buttons(card, message_link)));
     InputRichMessage::blocks(blocks)
 }
 
-fn buttons(
-    card: &ReportCard,
-    message_link: Option<String>,
-    target_url: String,
-) -> InputRichBlockButtons {
+fn buttons(card: &ReportCard, message_link: Option<String>) -> InputRichBlockButtons {
     let mut values = Vec::new();
     if let Some(message_link) = message_link {
         values.push(RichMessageButton::url("Открыть сообщение", message_link).style("primary"));
     } else {
         values.push(RichMessageButton::disabled("Сообщение недоступно"));
     }
-    values.push(RichMessageButton::url("Профиль", target_url));
     match card.resolution {
         ReportResolution::Pending => {
             values.push(
@@ -139,6 +143,20 @@ fn linked(text: impl Into<String>, url: String) -> RichText {
         text: Box::new(plain(text)),
         url,
     })
+}
+
+fn profile_url(card: &ReportCard) -> Option<String> {
+    let username = card
+        .profile_username
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| card.target_snapshot.get("username").and_then(Value::as_str))?
+        .trim();
+    let valid = (5..=32).contains(&username.len())
+        && username
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || character == b'_');
+    valid.then(|| format!("https://t.me/{username}"))
 }
 
 fn display_name(
@@ -354,6 +372,7 @@ mod tests {
             target_snapshot: json!({"first_name": "Target"}),
             resolution: ReportResolution::Pending,
             profile_username: None,
+            profile_photo_file_id: None,
             profile_first_name: Some("Target".to_owned()),
             profile_last_name: None,
             profile_is_bot: Some(false),
@@ -405,5 +424,49 @@ mod tests {
         rendered
             .validate_with(&teloxide::RichMessageContext::Send)
             .expect("report card must pass Bot API rich-message validation");
+    }
+
+    #[test]
+    fn profile_link_uses_public_username_and_not_user_profile_button() {
+        let mut card = card();
+        card.profile_username = Some("target_user".to_owned());
+        let rendered = render_report(&card);
+        let blocks = rendered.blocks_ref().expect("typed rich blocks");
+        let buttons = blocks
+            .iter()
+            .find_map(|block| match block {
+                InputRichBlock::Buttons(buttons) => Some(buttons),
+                _ => None,
+            })
+            .expect("report card buttons");
+
+        assert_eq!(buttons.buttons.len(), 3);
+        assert!(buttons.buttons.iter().all(|button| {
+            button
+                .url
+                .as_deref()
+                .is_none_or(|url| !url.starts_with("tg://"))
+        }));
+        let serialized_buttons = serde_json::to_string(buttons).expect("serialize buttons");
+        let serialized = serde_json::to_string(&rendered).expect("serialize rich report");
+        assert!(serialized.contains("https://t.me/target_user"));
+        assert!(!serialized_buttons.contains("Профиль"));
+        rendered
+            .validate_with(&teloxide::RichMessageContext::Send)
+            .expect("report card must pass Bot API rich-message validation");
+    }
+
+    #[test]
+    fn includes_profile_photo_as_a_rich_photo_block() {
+        let mut card = card();
+        card.profile_photo_file_id = Some("avatar-file-id".to_owned());
+        let rendered = render_report(&card);
+        let value = serde_json::to_value(&rendered).expect("serialize rich report");
+
+        assert_eq!(value["blocks"][1]["type"], "photo");
+        assert_eq!(value["blocks"][1]["photo"]["media"], "avatar-file-id");
+        rendered
+            .validate_with(&teloxide::RichMessageContext::Send)
+            .expect("report card with avatar must pass Bot API rich-message validation");
     }
 }

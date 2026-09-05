@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::features::first_comment::draft::{
     parse_chat_evidence_placeholder, parse_source_link_placeholder,
 };
+use crate::features::first_comment::prompt::search_result_source_name;
 use crate::features::search::types::SearchResult;
 use crate::features::search::{mcp::is_safe_fetch_url, policy::is_allowed_source_url};
 use crate::telegram::html::{Html, link};
@@ -221,8 +222,17 @@ fn source_link_target<'a>(
     let placeholder = parse_source_link_placeholder(token).ok()?;
     let result = search_results.get(placeholder.result_id.checked_sub(1)?)?;
     let url = result.url.trim();
-    (is_safe_fetch_url(url) && is_allowed_source_url(config, url))
-        .then_some((placeholder.label, url))
+    if !is_safe_fetch_url(url) || !is_allowed_source_url(config, url) {
+        return None;
+    }
+
+    let canonical_name = search_result_source_name(result);
+    let label = if placeholder.label.eq_ignore_ascii_case(&canonical_name) {
+        canonical_name
+    } else {
+        placeholder.label
+    };
+    Some((label, url))
 }
 
 fn chat_link_label(token: &str, config: &Config) -> Option<String> {
@@ -426,6 +436,24 @@ mod tests {
 
         assert!(html.contains(r#"<a href="https://example.com/court">решению суда</a>"#));
         assert!(html.contains(r#"<a href="https://t.me/+test">чатике</a>"#));
+    }
+
+    #[test]
+    fn canonicalizes_known_source_name_when_model_only_changes_case() {
+        let search_results = vec![SearchResult {
+            source: crate::features::search::types::SearchSource::Github,
+            title: "Release".to_string(),
+            url: "https://github.com/example/project/releases/tag/v1".to_string(),
+            snippet: "Release notes".to_string(),
+        }];
+
+        let html = build_comment_html_with_sources(
+            "Обновление вышло в {SOURCE_LINK:1:Github}. Продолжение в {CHAT_LINK}",
+            &config(),
+            &search_results,
+        );
+
+        assert!(html.contains(r#">GitHub</a>"#));
     }
 
     #[test]

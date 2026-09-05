@@ -82,7 +82,7 @@ impl CommentDirectives {
                 "second"
             },
             search_usage: if search_available {
-                "prefer_additive"
+                "optional_only_if_materially_new"
             } else {
                 "ignore"
             },
@@ -299,6 +299,23 @@ pub(crate) fn search_result_source_name(result: &SearchResult) -> String {
 fn source_name_from_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?.trim_start_matches("www.");
+    let canonical = match host {
+        "github.com" => Some("GitHub"),
+        "youtube.com" | "youtu.be" => Some("YouTube"),
+        "gamesradar.com" => Some("GamesRadar"),
+        "nvidiareview.com" => Some("NvidiaReview"),
+        "topcpu.net" => Some("TopCPU"),
+        "runtimewire.com" => Some("RuntimeWire"),
+        "techpowerup.com" => Some("TechPowerUp"),
+        "theverge.com" => Some("The Verge"),
+        "tomshardware.com" => Some("Tom's Hardware"),
+        "videocardz.com" => Some("VideoCardz"),
+        _ => None,
+    };
+    if let Some(canonical) = canonical {
+        return Some(canonical.to_string());
+    }
+
     let name = host.split('.').next()?.trim();
     (!name.is_empty()).then(|| {
         let mut chars = name.chars();
@@ -533,7 +550,7 @@ mod tests {
             snippet: "Release notes".to_string(),
         };
 
-        assert_eq!(search_result_source_name(&result), "Github");
+        assert_eq!(search_result_source_name(&result), "GitHub");
     }
 
     #[test]
@@ -648,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn directives_prefer_additive_context_when_linkable_search_exists() {
+    fn directives_keep_search_optional_when_linkable_search_exists() {
         let search_context = SearchContext {
             plan: None,
             queries: Vec::new(),
@@ -666,7 +683,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(directives).unwrap()["search_usage"],
-            "prefer_additive"
+            "optional_only_if_materially_new"
         );
         assert_eq!(
             serde_json::to_value(directives).unwrap()["chat_link_position"],

@@ -219,7 +219,7 @@ async fn handle_report_command(
             bot,
             msg.chat.id,
             msg.id,
-            "Репорт можно отправить только reply на сообщение человека в основном чате.",
+            "Ошибка: команду можно использовать только ответом на сообщение человека в основном чате.",
         )
         .await?;
         return Ok(());
@@ -230,38 +230,64 @@ async fn handle_report_command(
             bot,
             msg.chat.id,
             msg.id,
-            "Не удалось определить автора сообщения для репорта.",
+            "Ошибка: не удалось определить автора сообщения.",
         )
         .await?;
         return Ok(());
     };
 
-    let admin_ids = reports::resolve_admin_ids(bot.inner(), &state.pool, &state.config)
-        .await
-        .map_err(reports::report_error)?;
+    let admin_ids = match reports::resolve_admin_ids(bot.inner(), &state.pool, &state.config).await
+    {
+        Ok(admin_ids) => admin_ids,
+        Err(err) => {
+            tracing::error!(%err, "failed to resolve report admins");
+            send_html_reply(
+                bot,
+                msg.chat.id,
+                msg.id,
+                "Ошибка: не удалось подготовить отправку администраторам. Попробуй позже.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let creation = match reports::create_report(&state.pool, &target, &admin_ids).await {
         Ok(ReportCreation::RateLimited) => {
             send_html_reply(
                 bot,
                 msg.chat.id,
                 msg.id,
-                "Ты уже отправлял репорт в последние 10 минут. Повтори позже.",
+                "Ты уже создавал обращение в последние 10 минут. Повтори позже.",
             )
             .await?;
             return Ok(());
         }
         Ok(creation) => creation,
-        Err(err) => return Err(reports::report_error(err)),
+        Err(err) => {
+            tracing::error!(%err, "failed to save report");
+            send_html_reply(
+                bot,
+                msg.chat.id,
+                msg.id,
+                "Ошибка: не удалось подготовить отправку администраторам. Попробуй позже.",
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     let text = match creation {
         ReportCreation::Created(_) if admin_ids.is_empty() => {
-            "Репорт сохранён, но сейчас не найден администратор для личной доставки."
+            "Ошибка: не найден администратор для доставки. Попробуй позже."
         }
-        ReportCreation::Created(_) => "Репорт принят и поставлен в очередь для администраторов.",
-        ReportCreation::AlreadyExists(_) => "Это сообщение уже репортировали; повтор не отправлен.",
+        ReportCreation::Created(_) => {
+            "Обращение зарегистрировано и поставлено в очередь для администраторов."
+        }
+        ReportCreation::AlreadyExists(_) => {
+            "Это сообщение уже отправляли на рассмотрение; повтор не отправлен."
+        }
         ReportCreation::RateLimited => {
-            "Ты уже отправлял репорт в последние 10 минут. Повтори позже."
+            "Ты уже создавал обращение в последние 10 минут. Повтори позже."
         }
     };
     send_html_reply(bot, msg.chat.id, msg.id, text).await?;
