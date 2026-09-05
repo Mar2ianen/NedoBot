@@ -47,6 +47,20 @@ egress = "direct"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_COMPAT_API_KEY"
 
+[models.gemini_38_comment]
+provider = "gemini"
+model = "gemini-3.8-flash"
+
+[models.gemini_38_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_low"
+
 [models.gemini_37_comment]
 provider = "gemini"
 model = "gemini-3.7-flash"
@@ -190,6 +204,7 @@ thinking = "none"
 
 [routes.first_comment]
 models = [
+  "gemini_38_comment",
   "gemini_37_comment",
   "gemini_comment",
   "gemini_flash_comment",

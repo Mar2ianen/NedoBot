@@ -565,11 +565,6 @@ pub async fn load_report(pool: &PgPool, report_id: i64) -> anyhow::Result<Report
     repo::load_report(pool, report_id).await
 }
 
-pub fn report_error(err: anyhow::Error) -> teloxide::RequestError {
-    tracing::error!(%err, "failed to process /report");
-    teloxide::RequestError::Io(std::io::Error::other("report processing failed").into())
-}
-
 pub fn report_target_context(msg: &Message, config: &crate::config::Config) -> anyhow::Result<()> {
     if msg.chat.id.0 != config.discussion_chat_id {
         anyhow::bail!("/report is available only in the discussion chat")
