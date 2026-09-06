@@ -1,6 +1,8 @@
 use teloxide::{
     prelude::*,
-    types::{InputRichMessage, LinkPreviewOptions, MessageId, ReplyParameters},
+    types::{
+        InputRichMessage, InputRichMessageMedia, LinkPreviewOptions, MessageId, ReplyParameters,
+    },
 };
 
 use crate::telegram::html::{self, TELEGRAM_TEXT_LIMIT, is_safe_len};
@@ -42,6 +44,20 @@ pub async fn send_rich_html(
         bot,
         chat_id,
         InputRichMessage::html(normalize_rich_text(html)?),
+    )
+    .await
+}
+
+pub async fn send_rich_html_with_media(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    html: impl Into<String>,
+    media: impl IntoIterator<Item = InputRichMessageMedia>,
+) -> ResponseResult<Message> {
+    send_rich_message(
+        bot,
+        chat_id,
+        InputRichMessage::html(normalize_rich_text(html)?).media(media),
     )
     .await
 }

@@ -20,8 +20,9 @@ pub struct CleanupResult {
 pub async fn cleanup_transcript(
     config: &Config,
     transcript: &AsrTranscript,
+    alternatives: &[AsrTranscript],
 ) -> anyhow::Result<CleanupResult> {
-    let prompt = build_user_prompt(config.voice_short_text_max_chars, transcript);
+    let prompt = build_user_prompt(config.voice_short_text_max_chars, transcript, alternatives);
     let generation = match generate_cleanup_content(config, &prompt).await {
         Ok(generation) => generation,
         Err(err) => {
@@ -38,9 +39,9 @@ pub async fn cleanup_transcript(
         }
     };
 
-    let clean = match parse_cleanup_json(&generation.content)
-        .and_then(|clean| validate_cleanup_against_asr(&clean, transcript).map(|_| clean))
-    {
+    let clean = match parse_cleanup_json(&generation.content).and_then(|clean| {
+        validate_cleanup_against_asr(&clean, transcript, alternatives).map(|_| clean)
+    }) {
         Ok(clean) => clean,
         Err(err) => {
             tracing::warn!(%err, "voice cleanup changed ASR beyond safe limits, using raw ASR transcript");
@@ -75,8 +76,39 @@ async fn generate_cleanup_content(
     .await
 }
 
-fn build_user_prompt(short_limit: usize, transcript: &AsrTranscript) -> String {
-    let source = if transcript.segments.is_empty() {
+fn build_user_prompt(
+    short_limit: usize,
+    transcript: &AsrTranscript,
+    alternatives: &[AsrTranscript],
+) -> String {
+    let source = format_transcript_source(transcript);
+    let alternative_sources = alternatives
+        .iter()
+        .enumerate()
+        .map(|(index, alternative)| {
+            format!(
+                "ALTERNATIVE_SOURCE_TRANSCRIPT_{} ({}/{}):\n{}",
+                index + 1,
+                alternative.provider,
+                alternative.model,
+                format_transcript_source(alternative),
+            )
+        })
+        .collect::<Vec<_>>();
+    let alternatives = if alternative_sources.is_empty() {
+        "ALTERNATIVE_SOURCE_TRANSCRIPTS: none".to_string()
+    } else {
+        alternative_sources.join("\n\n")
+    };
+
+    format!(
+        "SHORT_LIMIT={short_limit}\n\nPRIMARY_SOURCE_TRANSCRIPT ({}/{}):\n{source}\n\n{alternatives}",
+        transcript.provider, transcript.model,
+    )
+}
+
+fn format_transcript_source(transcript: &AsrTranscript) -> String {
+    if transcript.segments.is_empty() {
         transcript.text.clone()
     } else {
         transcript
@@ -92,14 +124,13 @@ fn build_user_prompt(short_limit: usize, transcript: &AsrTranscript) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    };
-
-    format!("SHORT_LIMIT={short_limit}\n\nSOURCE_TRANSCRIPT:\n{source}")
+    }
 }
 
 fn validate_cleanup_against_asr(
     clean: &CleanTranscript,
     transcript: &AsrTranscript,
+    _alternatives: &[AsrTranscript],
 ) -> anyhow::Result<()> {
     validate_cleanup_text(&transcript.text, &clean.text)?;
 
@@ -368,11 +399,31 @@ mod tests {
             raw_json: serde_json::json!({}),
         };
 
-        let prompt = build_user_prompt(400, &transcript);
+        let prompt = build_user_prompt(400, &transcript, &[]);
 
         assert!(prompt.contains("SOURCE_TRANSCRIPT"));
+        assert!(prompt.contains("PRIMARY_SOURCE_TRANSCRIPT (groq/whisper)"));
         assert!(prompt.contains("[0:02-0:05] единственный источник"));
         assert!(!prompt.contains(&transcript.text));
+    }
+
+    #[test]
+    fn prompt_includes_alternative_asr_without_replacing_primary() {
+        let primary = transcript_with_text("Вышла Gemma 4 31B.");
+        let alternative = AsrTranscript {
+            provider: "gemini".to_string(),
+            model: "gemini-3.5-transcribe".to_string(),
+            request_id: None,
+            text: "Вышла Gemma 4 31B, кажется.".to_string(),
+            segments: Vec::new(),
+            raw_json: serde_json::json!({}),
+        };
+
+        let prompt = build_user_prompt(400, &primary, &[alternative]);
+
+        assert!(prompt.contains("PRIMARY_SOURCE_TRANSCRIPT (groq/whisper)"));
+        assert!(prompt.contains("ALTERNATIVE_SOURCE_TRANSCRIPT_1 (gemini/gemini-3.5-transcribe)"));
+        assert!(prompt.contains("Вышла Gemma 4 31B, кажется."));
     }
 
     #[test]
@@ -419,8 +470,8 @@ mod tests {
         let with_new_number = plain_cleanup(&format!("{} 2027", raw));
         let rewritten = plain_cleanup("короткое резюме");
 
-        assert!(validate_cleanup_against_asr(&with_new_number, &transcript).is_err());
-        assert!(validate_cleanup_against_asr(&rewritten, &transcript).is_err());
+        assert!(validate_cleanup_against_asr(&with_new_number, &transcript, &[]).is_err());
+        assert!(validate_cleanup_against_asr(&rewritten, &transcript, &[]).is_err());
     }
 
     #[test]
@@ -428,7 +479,7 @@ mod tests {
         let transcript = transcript_with_text("Вышла Gemma 4 31B и новый драйвер для Vulkan.");
         let clean = plain_cleanup("Вышла Gemma 4 31B, и новый драйвер для Vulkan.");
 
-        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+        assert!(validate_cleanup_against_asr(&clean, &transcript, &[]).is_ok());
     }
 
     #[test]
@@ -438,7 +489,7 @@ mod tests {
         );
         let clean = plain_cleanup("Без Mac нельзя писать под iOS. Продолжаем разговор.");
 
-        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+        assert!(validate_cleanup_against_asr(&clean, &transcript, &[]).is_ok());
     }
 
     #[test]
@@ -446,7 +497,7 @@ mod tests {
         let transcript = transcript_with_text("Модель Fable 5 пока не вышла.");
         let clean = plain_cleanup("Модель Claude 5 пока не вышла.");
 
-        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+        assert!(validate_cleanup_against_asr(&clean, &transcript, &[]).is_ok());
     }
 
     #[test]
@@ -454,7 +505,7 @@ mod tests {
         let transcript = transcript_with_text("Проверим грок и клинап.");
         let clean = plain_cleanup("Проверим groq и cleanup.");
 
-        assert!(validate_cleanup_against_asr(&clean, &transcript).is_ok());
+        assert!(validate_cleanup_against_asr(&clean, &transcript, &[]).is_ok());
     }
 
     fn transcript_with_text(text: &str) -> AsrTranscript {

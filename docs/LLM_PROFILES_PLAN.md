@@ -25,7 +25,8 @@ provider transport -> model profile -> task route
 - `context_window_tokens`;
 - `max_output_tokens`;
 - `request_timeout_sec`;
-- `thinking`: `none`, `budget` или `level_low`.
+- `thinking`: `none`, provider-default reasoning (`default` для Groq Qwen), `budget`,
+  `level_low` или `level_high`.
 
 Новые capabilities добавляются только когда их использует pipeline. Нельзя выводить возможности из model ID.
 

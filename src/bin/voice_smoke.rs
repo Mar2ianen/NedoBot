@@ -3,7 +3,7 @@ use tg_ai_bot_teloxide::{
     config::Config,
     db::{build_pool, migrate},
     features::voice::{
-        asr::transcribe_audio,
+        asr::transcribe_audio_with_shadow,
         cleanup::cleanup_transcript,
         download::download_media_file,
         types::{VoiceMedia, VoiceMediaKind},
@@ -35,21 +35,22 @@ async fn main() -> anyhow::Result<()> {
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
 
     let downloaded = download_media_file(&bot, &media).await?;
-    let transcript = transcribe_audio(
+    let (transcript, alternatives) = transcribe_audio_with_shadow(
         &config,
         &downloaded.path,
         &downloaded.filename,
         downloaded.mime_type.as_deref(),
     )
     .await?;
-    let cleanup = cleanup_transcript(&config, &transcript).await?;
+    let cleanup = cleanup_transcript(&config, &transcript, &alternatives).await?;
 
     println!(
-        "voice smoke passed: source_message_id={} media_kind={} asr={}/{} raw_chars={} cleanup={}/{} cleaned_chars={} chapters={}",
+        "voice smoke passed: source_message_id={} media_kind={} asr={}/{} alternatives={} raw_chars={} cleanup={}/{} cleaned_chars={} chapters={}",
         media.message_id,
         media.kind.as_str(),
         transcript.provider,
         transcript.model,
+        alternatives.len(),
         transcript.text.chars().count(),
         cleanup.provider,
         cleanup.model,
