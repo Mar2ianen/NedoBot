@@ -2,7 +2,7 @@ use teloxide::prelude::*;
 use teloxide::types::{InputFile, InputRichMessage, MessageId, ReplyParameters};
 
 use crate::db::telegram::save_telegram_message;
-use crate::features::voice::asr::transcribe_audio;
+use crate::features::voice::asr::transcribe_audio_with_shadow;
 use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
@@ -211,7 +211,7 @@ async fn process_voice_job(
     mark_voice_job_status(&state.pool, job_id, "downloading")
         .await
         .map_err(|_| VoiceProcessingFailure::Download)?;
-    let transcript = {
+    let (transcript, alternatives) = {
         let downloaded = download_media_file(bot, media)
             .await
             .map_err(|_| VoiceProcessingFailure::Download)?;
@@ -225,7 +225,7 @@ async fn process_voice_job(
         mark_voice_job_status(&state.pool, job_id, "transcribing")
             .await
             .map_err(|_| VoiceProcessingFailure::Asr)?;
-        transcribe_audio(
+        transcribe_audio_with_shadow(
             &state.config,
             &downloaded.path,
             &downloaded.filename,
@@ -234,7 +234,7 @@ async fn process_voice_job(
         .await
         .map_err(|_| VoiceProcessingFailure::Asr)?
     };
-    save_asr_result(&state.pool, job_id, &transcript)
+    save_asr_result(&state.pool, job_id, &transcript, &alternatives)
         .await
         .map_err(|_| VoiceProcessingFailure::Asr)?;
     if !transcript_has_speech(&transcript) {
@@ -250,7 +250,7 @@ async fn process_voice_job(
     mark_voice_job_status(&state.pool, job_id, "cleaning")
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
-    let cleanup = cleanup_transcript(&state.config, &transcript)
+    let cleanup = cleanup_transcript(&state.config, &transcript, &alternatives)
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
     let rendered = render_transcript(&cleanup.transcript, &state.config);

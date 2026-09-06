@@ -283,6 +283,8 @@ mod tests {
             voice_language: "ru".to_string(),
             voice_asr_provider: "groq".to_string(),
             voice_asr_model: "whisper-large-v3-turbo".to_string(),
+            voice_asr_shadow_enabled: false,
+            voice_asr_shadow_model: "gemini-3.5-transcribe".to_string(),
             voice_asr_temperature: 0.0,
             voice_cleanup_temperature: 0.2,
             voice_cleanup_max_tokens: 1800,

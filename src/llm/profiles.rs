@@ -94,6 +94,7 @@ pub enum StructuredOutputMode {
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingMode {
     None,
+    Default,
     Budget,
     LevelLow,
     LevelHigh,
@@ -172,7 +173,7 @@ impl LlmProfiles {
             }
             require_non_empty("model", name, "model", &model.model)?;
             let provider = &self.providers[&model.provider];
-            validate_capabilities(name, provider.driver, &model.capabilities)?;
+            validate_capabilities(name, provider, &model.capabilities)?;
         }
         for (name, route) in &self.routes {
             validate_profile_name("route", name)?;
@@ -320,7 +321,7 @@ fn validate_http_url(kind: &str, name: &str, value: &str) -> anyhow::Result<()> 
 
 fn validate_capabilities(
     name: &str,
-    driver: LlmDriver,
+    provider: &ProviderProfile,
     capabilities: &ModelCapabilities,
 ) -> anyhow::Result<()> {
     if capabilities.context_window_tokens == 0 {
@@ -337,8 +338,18 @@ fn validate_capabilities(
     if capabilities.request_timeout_sec == 0 {
         anyhow::bail!("model profile {name:?} request_timeout_sec must be greater than 0");
     }
-    if capabilities.thinking != ThinkingMode::None && driver != LlmDriver::Gemini {
-        anyhow::bail!("model profile {name:?} enables thinking for a non-Gemini provider");
+    let adapter = provider.genai_adapter();
+    if capabilities.thinking != ThinkingMode::None
+        && !matches!(adapter, GenAiAdapter::Gemini | GenAiAdapter::Groq)
+    {
+        anyhow::bail!(
+            "model profile {name:?} enables thinking for an unsupported provider adapter {adapter:?}"
+        );
+    }
+    if capabilities.thinking == ThinkingMode::Default && adapter != GenAiAdapter::Groq {
+        anyhow::bail!(
+            "model profile {name:?} uses the Groq-only default thinking mode with adapter {adapter:?}"
+        );
     }
     match capabilities.structured_output {
         StructuredOutputMode::JsonSchema
@@ -422,13 +433,13 @@ models = ["ollama_memory"]
             .resolve_route("voice_cleanup", &RouteRequirements::default())
             .unwrap();
 
-        assert_eq!(selections.selections.len(), 2);
+        assert_eq!(selections.selections.len(), 3);
         assert_eq!(
             (
                 selections.selections[0].provider_key,
                 selections.selections[0].model.model.as_str()
             ),
-            ("groq", "llama-3.3-70b-versatile")
+            ("groq", "qwen/qwen3.8-27b")
         );
         assert_eq!(
             selections.selections[0].provider.driver,
@@ -443,9 +454,46 @@ models = ["ollama_memory"]
                 selections.selections[1].provider_key,
                 selections.selections[1].model.model.as_str()
             ),
+            ("groq", "qwen/qwen3.6-27b")
+        );
+        assert_eq!(
+            selections.selections[1].capabilities.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+        assert_eq!(
+            (
+                selections.selections[2].provider_key,
+                selections.selections[2].model.model.as_str()
+            ),
             ("ollama_cloud", "gemma4:31b")
         );
-        assert!(!selections.fallback_on_validation_failure);
+        assert!(selections.fallback_on_validation_failure);
+    }
+
+    #[test]
+    fn ask_route_keeps_reasoning_across_qwen_fallbacks() {
+        let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
+
+        let selections = profiles
+            .resolve_route("ask", &RouteRequirements::default())
+            .unwrap();
+
+        assert_eq!(selections.selections.len(), 3);
+        assert_eq!(selections.selections[0].model.model, "qwen/qwen3.8-27b");
+        assert_eq!(selections.selections[1].model.model, "qwen/qwen3.6-27b");
+        assert_eq!(selections.selections[2].model.model, "gemma4:31b");
+        assert_eq!(
+            selections.selections[0].capabilities.thinking,
+            ThinkingMode::Default
+        );
+        assert_eq!(
+            selections.selections[1].capabilities.thinking,
+            ThinkingMode::Default
+        );
+        assert_eq!(
+            selections.selections[2].capabilities.thinking,
+            ThinkingMode::None
+        );
     }
 
     #[test]
