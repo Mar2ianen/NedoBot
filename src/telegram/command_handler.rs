@@ -24,8 +24,6 @@ use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, 
 #[cfg(feature = "auto-comment")]
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 #[cfg(feature = "auto-comment")]
-use crate::features::first_comment::pipeline::download_largest_photo_base64;
-#[cfg(feature = "auto-comment")]
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 use crate::features::memory::report::send_memory_notes;
@@ -42,6 +40,8 @@ use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 #[cfg(feature = "ask")]
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
+#[cfg(feature = "ask")]
+use crate::telegram::media::download_largest_photo_base64;
 use crate::telegram::render::{escape_html, send_html};
 
 pub async fn handle_command(
