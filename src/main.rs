@@ -7,6 +7,7 @@ use teloxide::{
     },
 };
 
+mod community;
 mod config;
 mod config_file;
 mod db;
@@ -25,6 +26,7 @@ use db::telegram::{
 use db::{build_pool, migrate};
 use features::chat_retrieval::process_next_embedding_batch;
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
+use features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL, VOICE_TRANSCRIPTION_POLL};
 use features::memory::service::process_next_history_entry;
 use features::new_user_audit::service::process_next_new_user_audit_job;
@@ -57,8 +59,20 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     config.validate_runtime_secrets()?;
+    tracing::info!(
+        instance_id = %config.community.instance.id,
+        instance_name = %config.community.instance.display_name,
+        risk_profile = ?config.community.moderation.risk_profile,
+        "starting configured community instance"
+    );
+    for chat_id in config.managed_chat_ids() {
+        if let Some(chat) = config.chat_by_id(chat_id) {
+            tracing::info!(chat_key = %chat.key, chat_id, "managed Telegram chat");
+        }
+    }
     GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
+    preflight_managed_chats(&bot, &config).await?;
     let pool = build_pool().await?;
     migrate(&pool).await?;
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
@@ -76,8 +90,12 @@ async fn main() -> anyhow::Result<()> {
     if state.config.new_user_audit_enabled {
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
-    spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
-    spawn_post_comment_worker(bot.clone(), state.clone());
+    if state.config.community.moderation.enabled {
+        spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
+    }
+    if state.config.community.first_comment.enabled {
+        spawn_post_comment_worker(bot.clone(), state.clone());
+    }
     spawn_post_history_worker(state.clone());
     spawn_chat_retrieval_embedding_worker(state.clone());
     spawn_voice_transcription_worker(bot.clone(), state.clone());
@@ -212,6 +230,14 @@ async fn handle_message(
     state: AppState,
     profile_refresh_queue: ProfileRefreshQueue,
 ) -> ResponseResult<()> {
+    if !is_managed_chat(&state.config, msg.chat.id.0) {
+        tracing::debug!(chat_id = msg.chat.id.0, "ignored message from unknown chat");
+        return Ok(());
+    }
+    if let Err(err) = ingest_message(&state.pool, &msg, &state.config).await {
+        tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
+        return Ok(());
+    }
     enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
 
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
@@ -236,7 +262,9 @@ fn enqueue_message_author_profile_refresh(
     state: &AppState,
     profile_refresh_queue: &ProfileRefreshQueue,
 ) {
-    if msg.chat.id.0 != state.config.discussion_chat_id || msg.is_automatic_forward() {
+    if !managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ingest)
+        || msg.is_automatic_forward()
+    {
         return;
     }
 
@@ -270,10 +298,8 @@ async fn handle_callback_query(
     query: CallbackQuery,
     state: AppState,
 ) -> ResponseResult<()> {
-    let Some(owner_id) = state.config.owner_telegram_id else {
-        return Ok(());
-    };
-    if query.from.id.0 as i64 != owner_id {
+    let reviewer_id = query.from.id.0 as i64;
+    if !state.config.reviewer_user_ids().contains(&reviewer_id) {
         bot.answer_callback_query(query.id)
             .text("Недостаточно прав.")
             .await?;
@@ -282,7 +308,7 @@ async fn handle_callback_query(
     let Some((request_id, decision)) = query.data.as_deref().and_then(parse_callback) else {
         return Ok(());
     };
-    match apply_callback(&state.pool, request_id, decision, owner_id).await {
+    match apply_callback(&state.pool, request_id, decision, reviewer_id).await {
         Ok(Some(text)) => {
             bot.answer_callback_query(query.id.clone())
                 .text(text)
@@ -332,7 +358,7 @@ fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
 fn spawn_spam_review_delivery_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
-            match process_next_review_delivery(&bot, &state.pool).await {
+            match process_next_review_delivery(&bot, &state.pool, &state.config).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     tokio::time::sleep(std::time::Duration::from_secs(
@@ -356,6 +382,9 @@ async fn handle_message_reaction(
     reaction: MessageReactionUpdated,
     state: AppState,
 ) -> ResponseResult<()> {
+    if !is_managed_chat(&state.config, reaction.chat.id.0) {
+        return Ok(());
+    }
     if let Err(err) = save_message_reaction(&state.pool, &reaction).await {
         tracing::error!(%err, "failed to save message reaction");
     }
@@ -367,6 +396,9 @@ async fn handle_message_reaction_count(
     reaction_count: MessageReactionCountUpdated,
     state: AppState,
 ) -> ResponseResult<()> {
+    if !is_managed_chat(&state.config, reaction_count.chat.id.0) {
+        return Ok(());
+    }
     if let Err(err) = save_message_reaction_count(&state.pool, &reaction_count).await {
         tracing::error!(%err, "failed to save message reaction count");
     }
@@ -375,6 +407,9 @@ async fn handle_message_reaction_count(
 }
 
 async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<()> {
+    if !is_managed_chat(&state.config, msg.chat.id.0) {
+        return Ok(());
+    }
     if let Err(err) = save_edited_telegram_message(&state.pool, &msg, &state.config).await {
         tracing::error!(%err, "failed to save edited message");
     }
@@ -383,6 +418,9 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
 }
 
 async fn handle_chat_member(member: ChatMemberUpdated, state: AppState) -> ResponseResult<()> {
+    if !is_managed_chat(&state.config, member.chat.id.0) {
+        return Ok(());
+    }
     if let Err(err) = save_chat_member_event(&state.pool, &member).await {
         tracing::error!(%err, "failed to save chat member event");
     }
@@ -395,19 +433,31 @@ async fn warn_if_reaction_updates_unavailable(
     config: &Config,
 ) -> anyhow::Result<()> {
     let me = bot.get_me().await?;
-    let member = bot
-        .get_chat_member(ChatId(config.discussion_chat_id), me.id)
-        .await?;
-
-    if !matches!(
-        member.kind,
-        ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
-    ) {
-        tracing::warn!(
-            status = ?member.kind,
-            "bot is not chat administrator; Telegram will not send message_reaction updates"
-        );
+    for chat_id in config.managed_chat_ids() {
+        let member = bot.get_chat_member(ChatId(chat_id), me.id).await?;
+        if !matches!(
+            member.kind,
+            ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
+        ) {
+            tracing::warn!(
+                chat_id,
+                status = ?member.kind,
+                "bot is not chat administrator; Telegram will not send message_reaction updates"
+            );
+        }
     }
 
+    Ok(())
+}
+
+async fn preflight_managed_chats(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    for chat_id in config.managed_chat_ids() {
+        bot.get_chat(ChatId(chat_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("managed chat {chat_id} preflight failed: {error}"))?;
+    }
     Ok(())
 }

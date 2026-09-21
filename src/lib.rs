@@ -1,3 +1,4 @@
+pub mod community;
 pub mod config;
 pub(crate) mod config_file;
 pub mod db;

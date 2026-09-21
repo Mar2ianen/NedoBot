@@ -10,7 +10,6 @@ use teloxide::{
 };
 use tokio::sync::mpsc;
 
-use crate::db::telegram::save_telegram_message;
 use crate::features::ask::chat_search::message_url;
 use crate::features::ask::notes::{add_chat_note, add_user_note};
 use crate::features::ask::repo;
@@ -19,6 +18,7 @@ use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, 
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
+use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
@@ -41,8 +41,29 @@ pub async fn handle_command(
     let pool = &state.pool;
     let config = &state.config;
 
-    if let Err(err) = save_telegram_message(pool, &msg, config).await {
-        tracing::error!(%err, "failed to save command message");
+    if !msg.chat.is_private() && !is_managed_chat(config, msg.chat.id.0) {
+        tracing::debug!(chat_id = msg.chat.id.0, "ignored command from unknown chat");
+        return Ok(());
+    }
+    if is_managed_chat(config, msg.chat.id.0)
+        && let Err(err) = ingest_message(pool, &msg, config).await
+    {
+        tracing::error!(%err, "failed to ingest command message");
+        return Ok(());
+    }
+    let is_stats_command = matches!(
+        &cmd,
+        Command::StatsDay(_)
+            | Command::StatsWeek(_)
+            | Command::StatsMonth(_)
+            | Command::Status(_)
+            | Command::TopMsg(_)
+            | Command::TopReact(_)
+            | Command::UserStats(_)
+            | Command::UserStatus(_)
+    );
+    if is_stats_command && !managed_chat_allows(config, msg.chat.id.0, |chat| chat.stats) {
+        return Ok(());
     }
 
     match cmd {
@@ -114,7 +135,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 StatsPeriod::Day,
                 render,
@@ -127,7 +148,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 StatsPeriod::Week,
                 render,
@@ -140,7 +161,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 StatsPeriod::Month,
                 render,
@@ -155,7 +176,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 period,
                 render,
@@ -167,7 +188,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
             )
             .await?;
@@ -177,7 +198,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
             )
             .await?;
@@ -192,6 +213,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
+                msg.chat.id.0,
                 args.target.as_deref(),
                 fallback_user_id,
                 args.render,
@@ -213,7 +235,7 @@ async fn handle_note_command(
     let Some(author) = msg.from.as_ref() else {
         return Ok(());
     };
-    if msg.chat.id.0 != state.config.discussion_chat_id {
+    if !managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ask) {
         return Ok(());
     }
     let allowed = state.config.owner_telegram_id == Some(author.id.0 as i64)
@@ -263,16 +285,25 @@ async fn handle_ask_command(
     let Some(user) = msg.from.as_ref() else {
         return Ok(());
     };
-    let is_private_allowed =
-        msg.chat.is_private() && config.ask_private_user_ids.contains(&(user.id.0 as i64));
-    let is_discussion_chat = msg.chat.id.0 == config.discussion_chat_id;
-    if !config.ask_enabled || (!is_discussion_chat && !is_private_allowed) {
+    let private_scope_chat_id = config
+        .community
+        .ask
+        .default_chat
+        .as_deref()
+        .and_then(|key| config.chat_by_key(key))
+        .map(|chat| chat.config.id);
+    let is_private_allowed = msg.chat.is_private()
+        && private_scope_chat_id.is_some()
+        && config.ask_private_user_ids.contains(&(user.id.0 as i64));
+    let is_ask_chat = managed_chat_allows(config, msg.chat.id.0, |chat| chat.ask);
+    if !config.ask_enabled || (!is_ask_chat && !is_private_allowed) {
         return Ok(());
     }
     if question.trim().is_empty() {
         send_html(bot, msg.chat.id, "Напиши вопрос: /ask <вопрос>.").await?;
         return Ok(());
     }
+    let scope_chat_id = private_scope_chat_id.unwrap_or(msg.chat.id.0);
 
     let use_native_draft = msg.chat.is_private();
     let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
@@ -304,7 +335,7 @@ async fn handle_ask_command(
         tracing::debug!(%err, "failed to deliver initial /ask progress preview");
     }
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let reply_context = build_ask_reply_context(msg, config.discussion_chat_id);
+    let reply_context = build_ask_reply_context(msg, scope_chat_id);
     let reply_image_base64 = match msg.reply_to_message() {
         Some(reply) => match download_largest_photo_base64(bot, reply, config).await {
             Ok(image) => image,
@@ -317,6 +348,7 @@ async fn handle_ask_command(
     };
     let input = AskCommandInput {
         chat_id: msg.chat.id.0,
+        scope_chat_id,
         command_message_id: msg.id.0,
         requester_user_id: user.id.0 as i64,
         requester_identity: requester_identity(user),
@@ -329,6 +361,7 @@ async fn handle_ask_command(
     let ask_service = AskService::new(
         &state.pool,
         config,
+        scope_chat_id,
         &state.llm_formatter,
         &state.render_time,
     );
@@ -363,8 +396,7 @@ async fn handle_ask_command(
                 .await
             {
                 Ok(sent) => {
-                    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await
-                    {
+                    if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
                         tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask answer message");
                     }
                     record_ask_delivery(
@@ -400,8 +432,7 @@ async fn handle_ask_command(
                 .await
             {
                 Ok(sent) => {
-                    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await
-                    {
+                    if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
                         tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask failure message");
                     }
                     record_ask_delivery(
@@ -677,8 +708,11 @@ pub async fn handle_reply_user_stats_command(
     let pool = &state.pool;
     let config = &state.config;
 
-    if let Err(err) = save_telegram_message(pool, &msg, config).await {
-        tracing::error!(%err, "failed to save command message");
+    if is_managed_chat(config, msg.chat.id.0)
+        && let Err(err) = ingest_message(pool, &msg, config).await
+    {
+        tracing::error!(%err, "failed to ingest command message");
+        return Ok(false);
     }
 
     let render = msg
@@ -692,6 +726,7 @@ pub async fn handle_reply_user_stats_command(
         msg.chat.id,
         pool,
         config,
+        msg.chat.id.0,
         None,
         reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
         render,

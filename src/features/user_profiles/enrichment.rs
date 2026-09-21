@@ -142,8 +142,9 @@ async fn process_profile_refresh_job(
 
 async fn process_refreshed_profile(pool: &PgPool, config: &Config, job: ProfileRefreshJob) {
     if config.new_user_audit_enabled
+        && config.chat_allows(job.chat_id, |chat| chat.moderation)
         && let Err(err) =
-            enqueue_new_user_audit_for_profile_refresh(pool, job.chat_id, job.user_id).await
+            enqueue_new_user_audit_for_profile_refresh(pool, config, job.chat_id, job.user_id).await
     {
         tracing::warn!(%err, user_id = job.user_id, "failed to save unified new user audit baseline and job");
     }

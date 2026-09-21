@@ -7,6 +7,7 @@ pub mod ask;
 pub mod chat_read_api;
 pub mod chat_retrieval;
 pub mod first_comment;
+pub mod ingest;
 pub mod jobs;
 pub mod memory;
 pub mod new_user_analysis;

@@ -21,10 +21,9 @@ pub const USER_TOP_WORDS_LIMIT: i64 = 10;
 
 pub async fn chat_stats_report_data(
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     period: crate::features::stats::types::StatsPeriod,
 ) -> anyhow::Result<ChatStatsReportData> {
-    let chat_id = config.discussion_chat_id;
     let window = repo::report_window(pool, period).await?;
     let summary = repo::chat_stats_summary(pool, chat_id, window).await?;
     let attraction = repo::chat_attraction_metrics(pool, chat_id, window).await?;
@@ -61,10 +60,10 @@ pub async fn chat_stats_report_data(
 
 pub async fn top_messages_report_data(
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     limit: i64,
 ) -> anyhow::Result<TopMessagesReportData> {
-    let users = repo::top_message_users(pool, config.discussion_chat_id, limit)
+    let users = repo::top_message_users(pool, chat_id, limit)
         .await?
         .into_iter()
         .map(|row| TopMessageUser {
@@ -95,10 +94,10 @@ pub async fn top_messages_report_data(
 
 pub async fn top_reacted_report_data(
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     limit: i64,
 ) -> anyhow::Result<TopReactedReportData> {
-    let messages = repo::top_reacted_messages(pool, config.discussion_chat_id, limit)
+    let messages = repo::top_reacted_messages(pool, chat_id, limit)
         .await?
         .into_iter()
         .map(|row| TopReactedMessage {
@@ -135,14 +134,13 @@ pub async fn top_reacted_report_data(
 
 pub async fn user_stats_report_data(
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     target: Option<&str>,
     reply_user_id: Option<i64>,
 ) -> anyhow::Result<Option<UserStatsReportData>> {
     let Some(user_id) = repo::resolve_user_id(pool, target, reply_user_id).await? else {
         return Ok(None);
     };
-    let chat_id = config.discussion_chat_id;
     let profile = repo::user_profile(pool, user_id).await?;
     let member = repo::chat_member_snapshot(pool, chat_id, user_id).await?;
     let cached = repo::chat_user_stats(pool, chat_id, user_id).await?;
@@ -254,10 +252,10 @@ pub async fn enrich_user_stats_avatar(
 pub async fn refresh_user_profile(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     user_id: i64,
 ) {
-    if let Err(err) = refresh_chat_member_snapshot(bot, pool, config, user_id).await {
+    if let Err(err) = refresh_chat_member_snapshot(bot, pool, chat_id, user_id).await {
         tracing::debug!(%err, user_id, "failed to refresh member snapshot from Telegram");
     }
     if let Err(err) = refresh_profile(bot.inner(), pool, user_id).await {
@@ -268,13 +266,13 @@ pub async fn refresh_user_profile(
 pub async fn refresh_top_message_users(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
 ) {
     refresh_ranked_users(
         bot,
         pool,
-        config,
-        repo::top_message_user_ids(pool, config.discussion_chat_id, RICH_TOP_LIMIT).await,
+        chat_id,
+        repo::top_message_user_ids(pool, chat_id, RICH_TOP_LIMIT).await,
     )
     .await;
 }
@@ -282,13 +280,13 @@ pub async fn refresh_top_message_users(
 pub async fn refresh_top_reacted_users(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
 ) {
     refresh_ranked_users(
         bot,
         pool,
-        config,
-        repo::top_reacted_user_ids(pool, config.discussion_chat_id, RICH_TOP_LIMIT).await,
+        chat_id,
+        repo::top_reacted_user_ids(pool, chat_id, RICH_TOP_LIMIT).await,
     )
     .await;
 }
@@ -296,7 +294,7 @@ pub async fn refresh_top_reacted_users(
 async fn refresh_ranked_users(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     user_ids: anyhow::Result<Vec<i64>>,
 ) {
     let user_ids = match user_ids {
@@ -307,7 +305,7 @@ async fn refresh_ranked_users(
         }
     };
     for user_id in user_ids {
-        if let Err(err) = refresh_chat_member_snapshot(bot, pool, config, user_id).await {
+        if let Err(err) = refresh_chat_member_snapshot(bot, pool, chat_id, user_id).await {
             tracing::debug!(%err, user_id, "failed to refresh ranked user from Telegram");
         }
     }

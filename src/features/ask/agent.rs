@@ -27,6 +27,7 @@ const MAX_CONTEXT_CHARS: usize = 48_000;
 const MAX_CORRECTION_STEPS: usize = 3;
 
 pub struct AskRequest<'a> {
+    pub scope_chat_id: i64,
     pub ask_run_id: Option<i64>,
     pub requester_user_id: i64,
     pub requester_identity: &'a str,
@@ -96,6 +97,7 @@ struct ToolResult {
 struct ToolCallContext<'a> {
     config: &'a Config,
     pool: &'a PgPool,
+    scope_chat_id: i64,
     requester_user_id: i64,
     evidence: &'a mut Evidence,
     mcp: &'a McpClient,
@@ -134,6 +136,7 @@ async fn answer_within_deadline(
     request: AskRequest<'_>,
 ) -> anyhow::Result<AskAgentAnswer> {
     let AskRequest {
+        scope_chat_id,
         ask_run_id,
         requester_user_id,
         requester_identity,
@@ -145,7 +148,7 @@ async fn answer_within_deadline(
         semantic_aliases,
     } = request;
     report_progress(progress, AskProgress::Preparing);
-    let mcp = McpClient::start(config).await?;
+    let mcp = McpClient::start_for_scope(config, scope_chat_id).await?;
     let mut agent_tools = mcp.genai_tools().to_vec();
     agent_tools.extend(local_agent_tools());
     let mut observations = Vec::new();
@@ -343,6 +346,7 @@ async fn answer_within_deadline(
                 ToolCallContext {
                     config,
                     pool,
+                    scope_chat_id,
                     requester_user_id,
                     evidence: &mut evidence,
                     mcp: &mcp,
@@ -723,7 +727,7 @@ async fn call_tool(
                 .unwrap_or_default();
             add_user_note_from_search(
                 context.pool,
-                context.config.discussion_chat_id,
+                context.scope_chat_id,
                 user_id,
                 context.requester_user_id,
                 note,
@@ -1074,6 +1078,7 @@ mod tests {
                 image_base64: None,
                 progress: None,
                 allow_mutations: false,
+                scope_chat_id: config.discussion_chat_id,
                 semantic_aliases: "chat",
             },
         )

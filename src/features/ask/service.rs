@@ -26,6 +26,7 @@ use crate::telegram::render::validate_rich_markdown;
 pub struct AskService<'a> {
     pool: &'a PgPool,
     config: &'a Config,
+    scope_chat_id: i64,
     llm_formatter: &'a LlmMarkdownFormatter,
     render_time: &'a TimeContext,
 }
@@ -34,12 +35,14 @@ impl<'a> AskService<'a> {
     pub fn new(
         pool: &'a PgPool,
         config: &'a Config,
+        scope_chat_id: i64,
         llm_formatter: &'a LlmMarkdownFormatter,
         render_time: &'a TimeContext,
     ) -> Self {
         Self {
             pool,
             config,
+            scope_chat_id,
             llm_formatter,
             render_time,
         }
@@ -56,6 +59,7 @@ impl<'a> AskService<'a> {
             self.config,
             self.pool,
             AskRequest {
+                scope_chat_id: input.scope_chat_id,
                 ask_run_id,
                 requester_user_id: input.requester_user_id,
                 requester_identity: &input.requester_identity,
@@ -309,10 +313,9 @@ impl<'a> AskService<'a> {
         let mut bindings = RichTextBindings::new();
         bindings.insert_link("chat", Url::parse(&self.config.chat_invite_url)?)?;
         for message_id in observed_message_ids {
-            let Some(url) = crate::features::ask::chat_search::message_url(
-                self.config.discussion_chat_id,
-                *message_id,
-            ) else {
+            let Some(url) =
+                crate::features::ask::chat_search::message_url(self.scope_chat_id, *message_id)
+            else {
                 continue;
             };
             bindings.insert_link(format!("message_{message_id}"), Url::parse(&url)?)?;
@@ -370,10 +373,9 @@ impl<'a> AskService<'a> {
             add_allowed_url(&mut allowed, url);
         }
         for message_id in observed_message_ids {
-            if let Some(url) = crate::features::ask::chat_search::message_url(
-                self.config.discussion_chat_id,
-                *message_id,
-            ) {
+            if let Some(url) =
+                crate::features::ask::chat_search::message_url(self.scope_chat_id, *message_id)
+            {
                 add_allowed_url(&mut allowed, &url);
             }
         }
