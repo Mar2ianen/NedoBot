@@ -140,6 +140,7 @@ async fn claim_review_delivery(
             notification_lease_expires_at = now() + ($2 * interval '1 second'),
             notification_delivery_risk_score = request.risk_score,
             notification_delivery_risk_signals = request.risk_signals,
+            notification_delivery_review_threshold = request.review_threshold,
             notification_error_kind = null
         from candidate
         where request.id = candidate.id
@@ -316,8 +317,11 @@ async fn confirm_review_delivery_payload(
           and notification_lease_expires_at > now()
           and risk_score >= $6
           and (risk_score, risk_signals) is not distinct from ($3, $4::jsonb)
-          and (notification_delivery_risk_score, notification_delivery_risk_signals)
-              is not distinct from ($3, $4::jsonb)
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($3, $4::jsonb, $6)
         "#,
     )
     .bind(review.id)
@@ -336,7 +340,7 @@ async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> an
         r#"
         update spam_review_requests
         set notification_status = case
-                when risk_score >= $5 then 'retry_wait'
+                when risk_score >= review_threshold then 'retry_wait'
                 else 'pending'
             end,
             notification_next_attempt_at = now(),
@@ -347,8 +351,11 @@ async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> an
           and notification_attempts = $2
           and status = 'pending'
           and notification_status = 'processing'
-          and (notification_delivery_risk_score, notification_delivery_risk_signals)
-              is not distinct from ($3, $4::jsonb)
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($3, $4::jsonb, $5)
           and (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
         "#,
     )
@@ -399,6 +406,11 @@ pub async fn mark_review_delivery_succeeded(
           and notification_attempts = $5
           and status = 'pending'
           and notification_status = 'processing'
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($3, $4::jsonb, $6)
         "#,
     )
     .bind(review.id)
@@ -406,6 +418,7 @@ pub async fn mark_review_delivery_succeeded(
     .bind(review.risk_score)
     .bind(&review.risk_signals)
     .bind(review.notification_attempts)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
@@ -496,8 +509,11 @@ async fn mark_review_delivery_failed(
           and status = 'pending'
           and notification_status = 'processing'
           and (risk_score, risk_signals) is not distinct from ($8, $9::jsonb)
-          and (notification_delivery_risk_score, notification_delivery_risk_signals)
-              is not distinct from ($8, $9::jsonb)
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($8, $9::jsonb, $10)
         "#,
     )
     .bind(review.id)
@@ -509,6 +525,7 @@ async fn mark_review_delivery_failed(
     .bind(review.notification_attempts)
     .bind(review.risk_score)
     .bind(&review.risk_signals)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
