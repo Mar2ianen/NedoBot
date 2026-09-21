@@ -459,17 +459,38 @@ impl Config {
                     .to_string(),
             );
         }
-        if self.ask_enabled
-            && self
+        if self.ask_enabled {
+            let missing_ask_chat_invites = self
                 .community
-                .ask
-                .default_chat
-                .as_deref()
-                .and_then(|key| self.chat_by_key(key))
-                .and_then(|chat| self.chat_invite_url_for_chat(chat.config.id))
-                .is_none()
-        {
-            errors.push("ask.enabled=true requires an invite URL for ask.default_chat".to_string());
+                .chats
+                .iter()
+                .filter(|(_, chat)| chat.ask)
+                .filter(|(_, chat)| self.chat_invite_url_for_chat(chat.id).is_none())
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>();
+            if !missing_ask_chat_invites.is_empty() {
+                errors.push(format!(
+                    "ask.enabled=true requires an invite URL for every ask chat: {}",
+                    missing_ask_chat_invites.join(", ")
+                ));
+            }
+
+            if let Some(default_chat_key) = self.community.ask.default_chat.as_deref() {
+                match self.chat_by_key(default_chat_key) {
+                    None => errors.push(format!(
+                        "ask.default_chat references unknown chat {default_chat_key:?}"
+                    )),
+                    Some(chat)
+                        if self.chat_invite_url_for_chat(chat.config.id).is_none()
+                            && !missing_ask_chat_invites.contains(&default_chat_key) =>
+                    {
+                        errors.push(format!(
+                            "ask.enabled=true requires an invite URL for ask.default_chat {default_chat_key:?}"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
         }
         if self.ask_enabled && !cfg!(feature = "ask") {
             errors.push("ASK_ENABLED=true but binary lacks cargo feature ask".to_string());
@@ -1737,5 +1758,45 @@ models = ["primary", "fallback"]
         assert!(err.contains("ASK_ENABLED=true requires OWNER_TELEGRAM_ID"));
         assert!(err.contains("LLM_PROFILES_PATH must configure authoritative LLM routes"));
         assert!(err.contains("ASK_ENABLED=true requires ASK_DB_MCP_COMMAND"));
+    }
+
+    #[test]
+    fn group_only_ask_does_not_require_default_chat() {
+        let mut config = config();
+        config.ask_enabled = true;
+        config.owner_telegram_id = Some(5939287960);
+        config.ask_db_mcp_command = Some("ask-mcp".to_string());
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(!error.contains("ask.default_chat"));
+    }
+
+    #[test]
+    fn ask_validates_invites_for_every_ask_chat() {
+        let mut config = config();
+        config.ask_enabled = true;
+        config.owner_telegram_id = Some(5939287960);
+        config.ask_db_mcp_command = Some("ask-mcp".to_string());
+        config.community.chats.insert(
+            "gravel".to_string(),
+            crate::config_file::ChatConfig {
+                id: -1003,
+                ingest: true,
+                moderation: false,
+                stats: false,
+                voice: false,
+                ask: true,
+                review_destination: false,
+                invite_url_env: None,
+                invite_label: None,
+            },
+        );
+        config.chat_registry = ChatRegistry::new(&config.community).unwrap();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("every ask chat"));
+        assert!(error.contains("gravel"));
     }
 }

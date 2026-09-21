@@ -483,10 +483,16 @@ fn project_unified_user_audit_snapshot(
             "risk_profile_version": config.risk_profile_version,
             "telegram_id_model_version": config.telegram_id_model_version,
             "review_threshold": config.review_threshold,
-            "telegram_id_risk_ratio": config
+            "telegram_id_spam_probability": config
                 .telegram_id_model
                 .as_ref()
-                .map(|model| telegram_id_risk_ratio(features.telegram_user_id, model)),
+                .map(|model| telegram_id_spam_probability(features.telegram_user_id, model)),
+            "telegram_id_risk_coefficient": config.telegram_id_model.as_ref().map(|model| {
+                telegram_id_risk_coefficient(telegram_id_spam_probability(
+                    features.telegram_user_id,
+                    model,
+                ))
+            }),
             "score": risk.score,
             "level": risk.level,
             "primary_class": risk.primary_class,
@@ -943,27 +949,44 @@ fn recent_id_signal(
     features: &NewUserFeatures,
     config: &NewUserAnalysisConfig,
 ) -> Option<RiskSignal> {
-    let ratio = config
-        .telegram_id_model
-        .as_ref()
-        .map(|model| telegram_id_risk_ratio(features.telegram_user_id, model))
-        .or(features.id_rank_ratio);
-    match ratio.is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold) {
-        true => Some(RiskSignal {
+    if let Some(model) = config.telegram_id_model.as_ref() {
+        let probability = telegram_id_spam_probability(features.telegram_user_id, model);
+        let coefficient = telegram_id_risk_coefficient(probability);
+        return (coefficient > 0).then_some(RiskSignal {
+            class: SpamClass::FreshAccount,
+            coefficient,
+            label: "telegram_id_spam_probability",
+            reason: "Configured 4PL model assigns spam probability to the Telegram user id",
+        });
+    }
+
+    features
+        .id_rank_ratio
+        .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold)
+        .then_some(RiskSignal {
             class: SpamClass::FreshAccount,
             coefficient: 15,
             label: "recent_high_telegram_id",
             reason: "Telegram user id is in the recent high-id range observed by the bot",
-        }),
-        false => None,
-    }
+        })
 }
 
-fn telegram_id_risk_ratio(user_id: i64, model: &TelegramIdRiskModel) -> f64 {
+const TELEGRAM_ID_PROBABILITY_SIGNAL_FLOOR: f64 = 0.10;
+const TELEGRAM_ID_PROBABILITY_SIGNAL_CEILING: f64 = 0.85;
+const TELEGRAM_ID_MAX_RISK_COEFFICIENT: f64 = 15.0;
+
+fn telegram_id_spam_probability(user_id: i64, model: &TelegramIdRiskModel) -> f64 {
     let id_billion = (user_id.max(0) as f64) / 1_000_000_000.0;
     let exponent = (model.k * (id_billion - model.midpoint_billion)).clamp(-60.0, 60.0);
     let sigmoid = 1.0 / (1.0 + (-exponent).exp());
     model.floor + (model.ceil - model.floor) * sigmoid
+}
+
+fn telegram_id_risk_coefficient(probability: f64) -> i32 {
+    let normalized = ((probability - TELEGRAM_ID_PROBABILITY_SIGNAL_FLOOR)
+        / (TELEGRAM_ID_PROBABILITY_SIGNAL_CEILING - TELEGRAM_ID_PROBABILITY_SIGNAL_FLOOR))
+        .clamp(0.0, 1.0);
+    (TELEGRAM_ID_MAX_RISK_COEFFICIENT * normalized).round() as i32
 }
 
 fn username_signal(features: &NewUserFeatures, stats: &UsernameStats) -> Option<RiskSignal> {
@@ -1585,10 +1608,15 @@ async fn save_audit_in_transaction(
         .personal_channel_last_text
         .as_deref()
         .map(char_count_i32);
-    let telegram_id_risk_ratio = config
+    let telegram_id_spam_probability = config
         .telegram_id_model
         .as_ref()
-        .map(|model| telegram_id_risk_ratio(features.telegram_user_id, model));
+        .map(|model| telegram_id_spam_probability(features.telegram_user_id, model));
+    let telegram_id_risk_coefficient_value =
+        telegram_id_spam_probability.map(telegram_id_risk_coefficient);
+    let telegram_user_id_is_recent = features
+        .id_rank_ratio
+        .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold);
     let raw_features = json!({
         "dc": {
             "available": profile_photo_dc.dc_id.is_some(),
@@ -1610,7 +1638,8 @@ async fn save_audit_in_transaction(
             "midpoint_billion": model.midpoint_billion,
             "version": model.version,
         })),
-        "telegram_id_risk_ratio": telegram_id_risk_ratio,
+        "telegram_id_spam_probability": telegram_id_spam_probability,
+        "telegram_id_risk_coefficient": telegram_id_risk_coefficient_value,
         "known_risk_classes": SpamClass::all().map(SpamClass::as_str),
         "profile_photo_file_id_present": features.profile_photo_file_id.is_some(),
         "profile_photo_file_unique_id_present": features.profile_photo_file_unique_id.is_some(),
@@ -1699,9 +1728,7 @@ async fn save_audit_in_transaction(
         values.push_bind(features.text_texture.repetitive_pattern);
         values.push_bind(id_bucket(features.telegram_user_id));
         values.push_bind(features.id_rank_ratio);
-        values.push_bind(
-            telegram_id_risk_ratio.is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold),
-        );
+        values.push_bind(telegram_user_id_is_recent);
         values.push_bind(&features.username);
         values.push_bind(features.username.as_deref().map(char_count_i32));
         values.push_bind(username_stats.has_digits);
@@ -2306,7 +2333,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn telegram_id_risk_ratio_uses_configured_four_pl_model() {
+    fn telegram_id_risk_signal_scales_configured_four_pl_probability() {
         let model = TelegramIdRiskModel {
             floor: 0.1,
             ceil: 0.9,
@@ -2314,12 +2341,19 @@ mod tests {
             midpoint_billion: 8.0,
             version: "test-4pl".to_string(),
         };
-        let lower = telegram_id_risk_ratio(7_000_000_000, &model);
-        let middle = telegram_id_risk_ratio(8_000_000_000, &model);
-        let upper = telegram_id_risk_ratio(9_000_000_000, &model);
+        let lower = telegram_id_spam_probability(7_000_000_000, &model);
+        let middle = telegram_id_spam_probability(8_000_000_000, &model);
+        let upper_middle = telegram_id_spam_probability(8_500_000_000, &model);
+        let upper = telegram_id_spam_probability(9_000_000_000, &model);
 
-        assert!(lower < middle && middle < upper);
+        assert!(lower < middle && middle < upper_middle && upper_middle < upper);
         assert!((middle - 0.5).abs() < 1e-9);
+        assert_eq!(telegram_id_risk_coefficient(lower), 0);
+        assert_eq!(telegram_id_risk_coefficient(middle), 8);
+        assert_eq!(telegram_id_risk_coefficient(upper_middle), 14);
+        assert_eq!(telegram_id_risk_coefficient(upper), 15);
+        assert_eq!(telegram_id_risk_coefficient(0.09), 0);
+        assert_eq!(telegram_id_risk_coefficient(0.86), 15);
     }
 
     #[test]
