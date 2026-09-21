@@ -61,6 +61,10 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn start(config: &Config) -> anyhow::Result<Self> {
+        Self::start_for_scope(config, config.discussion_chat_id).await
+    }
+
+    pub async fn start_for_scope(config: &Config, scope_chat_id: i64) -> anyhow::Result<Self> {
         let command = config
             .ask_db_mcp_command
             .as_deref()
@@ -76,7 +80,7 @@ impl McpClient {
                 command.env(name, value);
             }
         }
-        command.env("DISCUSSION_CHAT_ID", config.discussion_chat_id.to_string());
+        command.env("DISCUSSION_CHAT_ID", scope_chat_id.to_string());
         if config.chat_retrieval_embeddings_enabled {
             command
                 .env(CHAT_EMBEDDING_URL_ENV, &config.chat_retrieval_embedding_url)

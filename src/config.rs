@@ -26,6 +26,8 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
     "paperpaper.ru",
 ];
 
+use crate::community::ChatRegistry;
+use crate::config_file::{CommunityConfig, RiskProfile, TelegramIdRiskModel};
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
 
 const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
@@ -33,6 +35,8 @@ const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct Config {
+    pub community: CommunityConfig,
+    pub chat_registry: ChatRegistry,
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
     pub render_timezone: String,
@@ -128,6 +132,49 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn chat_by_id(&self, chat_id: i64) -> Option<crate::community::ChatRef<'_>> {
+        self.chat_registry.chat_by_id(&self.community, chat_id)
+    }
+
+    pub fn chat_by_key(&self, key: &str) -> Option<crate::community::ChatRef<'_>> {
+        self.chat_registry.chat_by_key(&self.community, key)
+    }
+
+    pub fn managed_chat_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.chat_registry.managed_chat_ids()
+    }
+
+    pub fn chat_allows(
+        &self,
+        chat_id: i64,
+        feature: fn(&crate::config_file::ChatConfig) -> bool,
+    ) -> bool {
+        self.chat_by_id(chat_id)
+            .is_some_and(|chat| feature(chat.config))
+    }
+
+    pub fn moderation_risk_profile(&self) -> Option<&RiskProfile> {
+        self.community
+            .risk_profiles
+            .get(self.community.moderation.risk_profile.trim())
+    }
+
+    pub fn reviewer_user_ids(&self) -> &[i64] {
+        &self.community.moderation.reviewer_user_ids
+    }
+
+    pub fn first_comment_route_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> impl Iterator<Item = &crate::config_file::FirstCommentRoute> {
+        let chat_key = self.chat_by_id(chat_id).map(|chat| chat.key);
+        self.community
+            .first_comment
+            .routes
+            .iter()
+            .filter(move |route| chat_key.as_deref() == Some(route.discussion_chat.as_str()))
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let llm_profiles_path = env_optional("LLM_PROFILES_PATH")
             .or_else(|| Some(DEFAULT_LLM_PROFILES_PATH.to_string()));
@@ -139,14 +186,46 @@ impl Config {
             .as_ref()
             .map(|profiles| profiles.runtime.clone())
             .ok_or_else(|| anyhow::anyhow!("LLM profile runtime settings are not configured"))?;
+        let profiles = llm_profiles
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("LLM profiles are not configured"))?;
+        let community = community_config_from_profiles(profiles)?;
+        let chat_registry = ChatRegistry::new(&community)?;
+        let primary_chat_id = primary_chat_id(&community, &chat_registry)?;
+        let first_comment_route = primary_first_comment_route(&community, &chat_registry);
+        let source_channel_id = first_comment_route
+            .map(|route| route.source_channel_id)
+            .or(runtime.source_channel_id)
+            .unwrap_or_default();
+        let chat_invite_label = first_comment_route
+            .map(|route| route.invite_label.clone())
+            .filter(|value| !value.trim().is_empty())
+            .or(runtime.chat_invite_label)
+            .unwrap_or_default();
+        let post_signature_marker = first_comment_route
+            .map(|route| route.post_signature_marker.clone())
+            .filter(|value| !value.trim().is_empty())
+            .or(runtime.post_signature_marker)
+            .unwrap_or_default();
+        let invite_url_env = first_comment_route
+            .and_then(|route| route.invite_url_env.as_deref())
+            .unwrap_or("CHAT_INVITE_URL");
+        let chat_invite_url = env_optional(invite_url_env).unwrap_or_default();
+        let community_voice_enabled = community.voice.enabled;
+        let community_ask_enabled = community.ask.enabled;
+        let community_timezone = community.instance.timezone.clone();
+        let community_owner_id = community.telegram.owners.first().copied();
+        let community_moderation_enabled = community.moderation.enabled;
 
         Ok(Self {
-            source_channel_id: runtime.source_channel_id,
-            discussion_chat_id: runtime.discussion_chat_id,
-            render_timezone: runtime.render_timezone,
-            chat_invite_url: env_or("CHAT_INVITE_URL", "https://t.me/+RxmPtw7Bs-IxNzEy"),
-            chat_invite_label: runtime.chat_invite_label,
-            post_signature_marker: runtime.post_signature_marker,
+            community,
+            chat_registry,
+            source_channel_id,
+            discussion_chat_id: primary_chat_id,
+            render_timezone: community_timezone,
+            chat_invite_url,
+            chat_invite_label,
+            post_signature_marker,
             llm_profiles_path,
             llm_profiles,
             llm_temperature: runtime.llm_temperature,
@@ -205,12 +284,12 @@ impl Config {
             search_github_mcp_env: runtime.search_github_mcp_env,
             search_github_mcp_tools: runtime.search_github_mcp_tools,
             groq_api_key: env_or("GROQ_API_KEY", ""),
-            new_user_audit_enabled: runtime.new_user_audit_enabled,
+            new_user_audit_enabled: runtime.new_user_audit_enabled || community_moderation_enabled,
             new_user_audit_max_tokens: runtime.new_user_audit_max_tokens,
             gemini_thinking_budget: runtime.gemini_thinking_budget,
-            owner_telegram_id: runtime.owner_telegram_id,
+            owner_telegram_id: runtime.owner_telegram_id.or(community_owner_id),
             send_owner_preview: runtime.send_owner_preview,
-            ask_enabled: runtime.ask_enabled,
+            ask_enabled: runtime.ask_enabled || community_ask_enabled,
             ask_allow_chat_admins: runtime.ask_allow_chat_admins,
             ask_private_user_ids: runtime.ask_private_user_ids,
             ask_llm_temperature: runtime.ask_llm_temperature,
@@ -230,7 +309,8 @@ impl Config {
             amd_custom_emoji_id: runtime.amd_custom_emoji_id,
             radeon_custom_emoji_id: runtime.radeon_custom_emoji_id,
             ryzen_custom_emoji_id: runtime.ryzen_custom_emoji_id,
-            voice_transcription_enabled: runtime.voice_transcription_enabled,
+            voice_transcription_enabled: runtime.voice_transcription_enabled
+                || community_voice_enabled,
             voice_auto_transcribe: runtime.voice_auto_transcribe,
             voice_max_duration_sec: runtime.voice_max_duration_sec,
             voice_max_file_mb: runtime.voice_max_file_mb,
@@ -250,6 +330,31 @@ impl Config {
 
     pub fn validate_runtime_secrets(&self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
+
+        if let Err(error) = validate_community_config(&self.community, &self.chat_registry) {
+            errors.push(error.to_string());
+        }
+
+        if self.community.first_comment.enabled && self.chat_invite_url.trim().is_empty() {
+            errors.push(
+                "first_comment.enabled=true requires CHAT_INVITE_URL or the configured invite URL environment variable"
+                    .to_string(),
+            );
+        }
+        if self.ask_enabled && !cfg!(feature = "ask") {
+            errors.push("ASK_ENABLED=true but binary lacks cargo feature ask".to_string());
+        }
+        if self.voice_transcription_enabled && !cfg!(feature = "voice") {
+            errors.push(
+                "voice transcription is enabled but binary lacks cargo feature voice".to_string(),
+            );
+        }
+        if self.new_user_audit_enabled && !cfg!(feature = "moderation") {
+            errors.push(
+                "new-user moderation is enabled but binary lacks cargo feature moderation"
+                    .to_string(),
+            );
+        }
 
         if let Err(error) = teloxide::utils::time::TimeContext::from_name(&self.render_timezone) {
             errors.push(format!("invalid RENDER_TIMEZONE: {error}"));
@@ -639,8 +744,202 @@ where
         .map_err(|_| anyhow::anyhow!("{key} must be {expected}"))
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+fn community_config_from_profiles(profiles: &LlmProfiles) -> anyhow::Result<CommunityConfig> {
+    let instance = profiles
+        .instance
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing required [instance] community configuration"))?;
+    let telegram = profiles
+        .telegram
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing required [telegram] community configuration"))?;
+    let chats = profiles
+        .chats
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing required [chats.*] community configuration"))?;
+    if chats.is_empty() {
+        anyhow::bail!("community configuration must define at least one managed chat");
+    }
+
+    let community = CommunityConfig {
+        instance,
+        telegram,
+        chats,
+        moderation: profiles.moderation.clone().unwrap_or_default(),
+        spam_reputation: profiles.spam_reputation.clone().unwrap_or_default(),
+        voice: profiles.voice.clone().unwrap_or_default(),
+        ask: profiles.ask.clone().unwrap_or_default(),
+        first_comment: profiles.first_comment.clone().unwrap_or_default(),
+        public_mcp: profiles.public_mcp.clone().unwrap_or_default(),
+        risk_profiles: profiles.risk_profiles.clone(),
+    };
+    let registry = ChatRegistry::new(&community)?;
+    validate_community_config(&community, &registry)?;
+    Ok(community)
+}
+
+fn validate_community_config(
+    community: &CommunityConfig,
+    registry: &ChatRegistry,
+) -> anyhow::Result<()> {
+    if community.instance.id.trim().is_empty() {
+        anyhow::bail!("instance.id must not be empty");
+    }
+    if community.instance.display_name.trim().is_empty() {
+        anyhow::bail!("instance.display_name must not be empty");
+    }
+    if community.instance.timezone.trim().is_empty() {
+        anyhow::bail!("instance.timezone must not be empty");
+    }
+    if community.moderation.enabled {
+        require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
+        let profile_name = community.moderation.risk_profile.trim();
+        if profile_name.is_empty() {
+            anyhow::bail!("moderation.enabled=true requires moderation.risk_profile");
+        }
+        let profile = community
+            .risk_profiles
+            .get(profile_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown moderation risk profile {profile_name:?}"))?;
+        validate_risk_profile(profile_name, profile)?;
+        let review_chat = community.moderation.review_chat.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("moderation.enabled=true requires moderation.review_chat")
+        })?;
+        let review_chat = registry
+            .chat_by_key(community, review_chat)
+            .ok_or_else(|| anyhow::anyhow!("moderation.review_chat references unknown chat"))?;
+        if !review_chat.config.review_destination {
+            anyhow::bail!("moderation.review_chat must point to a review_destination chat");
+        }
+        if community.moderation.reviewer_user_ids.is_empty() {
+            anyhow::bail!("moderation.enabled=true requires reviewer_user_ids");
+        }
+    }
+
+    if community.spam_reputation.enabled
+        && community
+            .spam_reputation
+            .sqlite_path
+            .as_deref()
+            .is_none_or(|path| path.trim().is_empty())
+    {
+        anyhow::bail!("spam_reputation.enabled=true requires sqlite_path");
+    }
+    if community.spam_reputation.enabled {
+        require_compiled_feature("spam-sync", cfg!(feature = "spam-sync"))?;
+    }
+
+    if community.first_comment.enabled {
+        require_compiled_feature("auto-comment", cfg!(feature = "auto-comment"))?;
+        if community.first_comment.routes.is_empty() {
+            anyhow::bail!("first_comment.enabled=true requires at least one route");
+        }
+        let mut source_channels = std::collections::BTreeSet::new();
+        for route in &community.first_comment.routes {
+            if !source_channels.insert(route.source_channel_id) {
+                anyhow::bail!("first_comment routes must use unique source_channel_id values");
+            }
+            let chat = registry
+                .chat_by_key(community, &route.discussion_chat)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "first_comment route references unknown discussion chat {:?}",
+                        route.discussion_chat
+                    )
+                })?;
+            if !chat.config.ingest {
+                anyhow::bail!("first_comment discussion chat must have ingest=true");
+            }
+        }
+    }
+
+    if community.voice.enabled
+        && !community.chats.values().any(|chat| chat.voice)
+        && !community.voice.private_enabled
+    {
+        anyhow::bail!(
+            "voice.enabled=true requires a voice-enabled managed chat or private_enabled"
+        );
+    }
+    if community.voice.enabled {
+        require_compiled_feature("voice", cfg!(feature = "voice"))?;
+    }
+    if community.ask.enabled && !community.chats.values().any(|chat| chat.ask) {
+        anyhow::bail!("ask.enabled=true requires at least one ask-enabled managed chat");
+    }
+    if community.ask.enabled {
+        require_compiled_feature("ask", cfg!(feature = "ask"))?;
+    }
+    if community.public_mcp.enabled {
+        require_compiled_feature("public-mcp", cfg!(feature = "public-mcp"))?;
+    }
+    Ok(())
+}
+
+fn require_compiled_feature(name: &str, enabled: bool) -> anyhow::Result<()> {
+    if !enabled {
+        anyhow::bail!(
+            "community feature {name:?} is enabled in config but missing from this binary"
+        );
+    }
+    Ok(())
+}
+
+fn validate_risk_profile(name: &str, profile: &RiskProfile) -> anyhow::Result<()> {
+    if profile.old_user_message_threshold < 0 {
+        anyhow::bail!("risk profile {name:?} has a negative old_user_message_threshold");
+    }
+    if !(0..=100).contains(&profile.review_threshold) {
+        anyhow::bail!("risk profile {name:?} review_threshold must be between 0 and 100");
+    }
+    if let Some(model) = &profile.telegram_id {
+        validate_telegram_id_model(name, model)?;
+    }
+    Ok(())
+}
+
+fn validate_telegram_id_model(name: &str, model: &TelegramIdRiskModel) -> anyhow::Result<()> {
+    if !model.floor.is_finite()
+        || !model.ceil.is_finite()
+        || !model.k.is_finite()
+        || !model.midpoint_billion.is_finite()
+        || model.floor < 0.0
+        || model.ceil > 1.0
+        || model.floor >= model.ceil
+        || model.k <= 0.0
+        || model.midpoint_billion <= 0.0
+        || model.version.trim().is_empty()
+    {
+        anyhow::bail!("risk profile {name:?} has an invalid telegram_id model");
+    }
+    Ok(())
+}
+
+fn primary_chat_id(community: &CommunityConfig, registry: &ChatRegistry) -> anyhow::Result<i64> {
+    if let Some(route) = primary_first_comment_route(community, registry) {
+        return registry
+            .chat_by_key(community, &route.discussion_chat)
+            .map(|chat| chat.config.id)
+            .ok_or_else(|| anyhow::anyhow!("first_comment route references an unknown chat"));
+    }
+    community
+        .chats
+        .values()
+        .find(|chat| chat.ingest)
+        .or_else(|| community.chats.values().next())
+        .map(|chat| chat.id)
+        .ok_or_else(|| anyhow::anyhow!("community must define a managed chat"))
+}
+
+fn primary_first_comment_route<'a>(
+    community: &'a CommunityConfig,
+    registry: &'a ChatRegistry,
+) -> Option<&'a crate::config_file::FirstCommentRoute> {
+    community.first_comment.routes.iter().find(|route| {
+        registry
+            .chat_by_key(community, &route.discussion_chat)
+            .is_some()
+    })
 }
 
 fn env_optional(key: &str) -> Option<String> {
@@ -648,6 +947,56 @@ fn env_optional(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
+    use std::collections::BTreeMap;
+
+    use crate::config_file::{
+        AskConfig, ChatConfig, FirstCommentConfig, InstanceConfig, ModerationConfig,
+        PublicMcpConfig, SpamReputationConfig, TelegramConfig, UnknownChatPolicy, VoiceConfig,
+    };
+
+    let community = CommunityConfig {
+        instance: InstanceConfig {
+            id: "test".to_string(),
+            display_name: "Test community".to_string(),
+            timezone: "Europe/Moscow".to_string(),
+        },
+        telegram: TelegramConfig {
+            unknown_chat_policy: UnknownChatPolicy::Ignore,
+            owners: vec![],
+        },
+        chats: BTreeMap::from([(
+            "main".to_string(),
+            ChatConfig {
+                id: -1002,
+                ingest: true,
+                moderation: true,
+                stats: true,
+                voice: true,
+                ask: true,
+                review_destination: true,
+            },
+        )]),
+        moderation: ModerationConfig::default(),
+        spam_reputation: SpamReputationConfig::default(),
+        voice: VoiceConfig {
+            enabled: false,
+            private_enabled: false,
+        },
+        ask: AskConfig::default(),
+        first_comment: FirstCommentConfig::default(),
+        public_mcp: PublicMcpConfig::default(),
+        risk_profiles: BTreeMap::new(),
+    };
+    let registry = ChatRegistry::new(&community).expect("test community must be valid");
+    (community, registry)
 }
 
 #[cfg(test)]
@@ -690,6 +1039,8 @@ mod tests {
 
     fn config() -> Config {
         Config {
+            community: test_community_config().0,
+            chat_registry: test_community_config().1,
             source_channel_id: -1001,
             discussion_chat_id: -1002,
             render_timezone: "Europe/Moscow".to_string(),
@@ -832,6 +1183,20 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("invalid type"));
+    }
+
+    #[test]
+    fn community_scope_is_required_for_a_runnable_profile() {
+        let content = include_str!("../config/llm_profiles.toml.example");
+        let legacy_only = content
+            .split("[instance]")
+            .next()
+            .expect("example must contain instance section");
+        let profiles = LlmProfiles::from_toml(legacy_only).expect("LLM profile should parse");
+        let error = community_config_from_profiles(&profiles)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing required [instance]"));
     }
 
     #[test]

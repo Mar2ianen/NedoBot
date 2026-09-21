@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::config_file::RuntimeSettings;
+use crate::config_file::{
+    AskConfig, ChatConfig, FirstCommentConfig, InstanceConfig, ModerationConfig, PublicMcpConfig,
+    RiskProfile, RuntimeSettings, SpamReputationConfig, TelegramConfig, VoiceConfig,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,6 +14,30 @@ pub struct LlmProfiles {
     pub models: BTreeMap<String, ModelProfile>,
     pub routes: BTreeMap<String, RouteProfile>,
     pub runtime: RuntimeSettings,
+    /// Community policy is kept beside the LLM topology for the existing
+    /// deployment contract, but is intentionally separate from provider
+    /// routing. Optional here so low-level profile tests can stay focused on
+    /// LLM topology; `Config::from_env` requires it for a runnable bot.
+    #[serde(default)]
+    pub instance: Option<InstanceConfig>,
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
+    #[serde(default)]
+    pub chats: Option<BTreeMap<String, ChatConfig>>,
+    #[serde(default)]
+    pub moderation: Option<ModerationConfig>,
+    #[serde(default)]
+    pub spam_reputation: Option<SpamReputationConfig>,
+    #[serde(default)]
+    pub voice: Option<VoiceConfig>,
+    #[serde(default)]
+    pub ask: Option<AskConfig>,
+    #[serde(default)]
+    pub first_comment: Option<FirstCommentConfig>,
+    #[serde(default)]
+    pub public_mcp: Option<PublicMcpConfig>,
+    #[serde(default)]
+    pub risk_profiles: BTreeMap<String, RiskProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

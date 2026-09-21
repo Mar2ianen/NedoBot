@@ -4,6 +4,18 @@ version = "0.12.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+# Keep the current Nedonews binary as the default release profile while making
+# community-only builds explicit and fail-fast when config requests a missing
+# application module.
+default = ["auto-comment", "ask", "voice", "public-mcp", "moderation"]
+auto-comment = []
+ask = []
+voice = []
+public-mcp = []
+moderation = []
+spam-sync = []
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"

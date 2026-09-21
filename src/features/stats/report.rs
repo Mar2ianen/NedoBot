@@ -15,17 +15,17 @@ pub async fn send_chat_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
-    config: &Config,
+    stats_scope_chat_id: i64,
     render_time: &TimeContext,
     period: StatsPeriod,
     render: StatsRender,
 ) -> ResponseResult<()> {
-    let data = service::chat_stats_report_data(pool, config, period)
+    let data = service::chat_stats_report_data(pool, stats_scope_chat_id, period)
         .await
         .map_err(stats_error("failed to build chat stats"))?;
     let report = match render {
         StatsRender::Html => render_html::chat_stats(&data, render_time),
-        StatsRender::Rich => render_rich::chat_stats(&data, config.discussion_chat_id, render_time),
+        StatsRender::Rich => render_rich::chat_stats(&data, stats_scope_chat_id, render_time),
     };
     send_stats_report(bot, chat_id, report, render).await?;
     Ok(())
@@ -35,15 +35,15 @@ pub async fn send_top_messages(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
-    config: &Config,
+    stats_scope_chat_id: i64,
     render: StatsRender,
 ) -> ResponseResult<()> {
-    service::refresh_top_message_users(bot, pool, config).await;
+    service::refresh_top_message_users(bot, pool, stats_scope_chat_id).await;
     let limit = match render {
         StatsRender::Html => HTML_TOP_LIMIT,
         StatsRender::Rich => RICH_TOP_LIMIT,
     };
-    let data = service::top_messages_report_data(pool, config, limit)
+    let data = service::top_messages_report_data(pool, stats_scope_chat_id, limit)
         .await
         .map_err(stats_error("failed to build top messages report"))?;
     let report = match render {
@@ -58,50 +58,49 @@ pub async fn send_top_reacted(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
-    config: &Config,
+    stats_scope_chat_id: i64,
     render: StatsRender,
 ) -> ResponseResult<()> {
-    service::refresh_top_reacted_users(bot, pool, config).await;
+    service::refresh_top_reacted_users(bot, pool, stats_scope_chat_id).await;
     let limit = match render {
         StatsRender::Html => HTML_TOP_LIMIT,
         StatsRender::Rich => RICH_TOP_LIMIT,
     };
-    let data = service::top_reacted_report_data(pool, config, limit)
+    let data = service::top_reacted_report_data(pool, stats_scope_chat_id, limit)
         .await
         .map_err(stats_error("failed to build top reacted report"))?;
     let report = match render {
-        StatsRender::Html => render_html::top_reacted(&data, config.discussion_chat_id),
-        StatsRender::Rich => render_rich::top_reacted(&data, config.discussion_chat_id),
+        StatsRender::Html => render_html::top_reacted(&data, stats_scope_chat_id),
+        StatsRender::Rich => render_rich::top_reacted(&data, stats_scope_chat_id),
     };
     send_stats_report(bot, chat_id, report, render).await?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_user_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
     config: &Config,
+    stats_scope_chat_id: i64,
     target: Option<&str>,
     reply_user_id: Option<i64>,
     render: StatsRender,
 ) -> ResponseResult<()> {
     if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
-        service::refresh_user_profile(bot, pool, config, user_id).await;
+        service::refresh_user_profile(bot, pool, stats_scope_chat_id, user_id).await;
     }
-    let mut data = service::user_stats_report_data(pool, config, target, reply_user_id)
-        .await
-        .map_err(stats_error("failed to build user stats"))?;
+    let mut data =
+        service::user_stats_report_data(pool, stats_scope_chat_id, target, reply_user_id)
+            .await
+            .map_err(stats_error("failed to build user stats"))?;
     if let (StatsRender::Rich, Some(data)) = (render, data.as_mut()) {
         service::enrich_user_stats_avatar(bot, config, data).await;
     }
     let report = match render {
-        StatsRender::Html => {
-            render_html::user_stats(data.as_ref(), target, config.discussion_chat_id)
-        }
-        StatsRender::Rich => {
-            render_rich::user_stats(data.as_ref(), target, config.discussion_chat_id)
-        }
+        StatsRender::Html => render_html::user_stats(data.as_ref(), target, stats_scope_chat_id),
+        StatsRender::Rich => render_rich::user_stats(data.as_ref(), target, stats_scope_chat_id),
     };
     send_stats_report(bot, chat_id, report, render).await?;
     Ok(())

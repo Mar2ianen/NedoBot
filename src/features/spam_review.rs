@@ -10,18 +10,18 @@ use crate::{
     telegram::html,
 };
 
-const OWNER_USERNAME: &str = "Chechulinm";
-const REVIEW_DELIVERY_RISK_THRESHOLD: i32 = 70;
 const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
 
 pub struct SpamReview {
     pub id: i64,
     pub chat_id: i64,
+    pub destination_chat_id: i64,
     pub first_message_id: Option<i32>,
     pub notification_message_id: Option<i32>,
     pub notification_attempts: i32,
     pub notification_consecutive_failures: i32,
     pub risk_score: i32,
+    pub review_threshold: i32,
     pub risk_signals: Value,
     pub text: String,
 }
@@ -83,15 +83,27 @@ pub async fn create_review(
     let Some(request_id) = request_id else {
         return Ok(None);
     };
-    claim_review_delivery(pool, Some(request_id)).await
+    claim_review_delivery(pool, Some(request_id), None).await
 }
 
+#[allow(dead_code)] // Compatibility API for callers that use the legacy source-chat destination.
 pub async fn claim_next_review_delivery(pool: &PgPool) -> anyhow::Result<Option<SpamReview>> {
-    claim_review_delivery(pool, None).await
+    claim_review_delivery(pool, None, None).await
 }
 
-pub async fn process_next_review_delivery(bot: &Bot, pool: &PgPool) -> anyhow::Result<bool> {
-    let Some(review) = claim_next_review_delivery(pool).await? else {
+pub async fn claim_next_review_delivery_with_config(
+    pool: &PgPool,
+    config: &crate::config::Config,
+) -> anyhow::Result<Option<SpamReview>> {
+    claim_review_delivery(pool, None, Some(config)).await
+}
+
+pub async fn process_next_review_delivery(
+    bot: &Bot,
+    pool: &PgPool,
+    config: &crate::config::Config,
+) -> anyhow::Result<bool> {
+    let Some(review) = claim_next_review_delivery_with_config(pool, config).await? else {
         return Ok(false);
     };
     send_review(bot, pool, &review).await?;
@@ -101,7 +113,11 @@ pub async fn process_next_review_delivery(bot: &Bot, pool: &PgPool) -> anyhow::R
 async fn claim_review_delivery(
     pool: &PgPool,
     request_id: Option<i64>,
+    config: Option<&crate::config::Config>,
 ) -> anyhow::Result<Option<SpamReview>> {
+    let review_threshold = config
+        .and_then(|config| config.moderation_risk_profile())
+        .map_or(70, |profile| profile.review_threshold);
     let row = sqlx::query(
         r#"
         with candidate as (
@@ -137,14 +153,21 @@ async fn claim_review_delivery(
     )
     .bind(request_id)
     .bind(DELIVERY_LEASE_SECONDS)
-    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .bind(review_threshold)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    review_from_row(pool, row).await.map(Some)
+    review_from_row(pool, row, config, review_threshold)
+        .await
+        .map(Some)
 }
 
-async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::Result<SpamReview> {
+async fn review_from_row(
+    pool: &PgPool,
+    row: sqlx::postgres::PgRow,
+    config: Option<&crate::config::Config>,
+    review_threshold: i32,
+) -> anyhow::Result<SpamReview> {
     let id: i64 = row.get("id");
     let chat_id: i64 = row.get("chat_id");
     let user_id: i64 = row.get("telegram_user_id");
@@ -161,6 +184,10 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
     "#).bind(chat_id).bind(user_id).fetch_one(pool).await?;
     let name: String = profile.get("name");
     let username: Option<String> = profile.get("username");
+    let destination_chat_id = config
+        .and_then(|config| config.community.moderation.review_chat.as_deref())
+        .and_then(|key| config.and_then(|config| config.chat_by_key(key)))
+        .map_or(chat_id, |chat| chat.config.id);
     let reasons = human_signals(&signals);
     let profile_url = format!("tg://user?id={user_id}");
     let profile_link = html::link(&name, &profile_url).into_string();
@@ -170,17 +197,19 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
         .map(|value| html::link(format!("@{value}"), format!("https://t.me/{value}")).into_string())
         .unwrap_or_else(|| "без username".into());
     let text = format!(
-        "@{OWNER_USERNAME}, <b>проверка нового участника</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Сигналы:</b>\n{}",
+        "<b>Проверка нового участника</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Сигналы:</b>\n{}",
         profile_link, username, id_link, score, reasons
     );
     Ok(SpamReview {
         id,
         chat_id,
+        destination_chat_id,
         first_message_id: profile.get("first_message_id"),
         notification_message_id,
         notification_attempts,
         notification_consecutive_failures,
         risk_score: score,
+        review_threshold,
         risk_signals: signals,
         text,
     })
@@ -206,17 +235,23 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
     }
 
     let result = if let Some(message_id) = review.notification_message_id {
-        bot.edit_message_text(ChatId(review.chat_id), MessageId(message_id), &review.text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(review_keyboard(review.id))
-            .await
-            .map(|_| message_id)
+        bot.edit_message_text(
+            ChatId(review.destination_chat_id),
+            MessageId(message_id),
+            &review.text,
+        )
+        .parse_mode(ParseMode::Html)
+        .reply_markup(review_keyboard(review.id))
+        .await
+        .map(|_| message_id)
     } else {
         let mut request = bot
-            .send_message(ChatId(review.chat_id), &review.text)
+            .send_message(ChatId(review.destination_chat_id), &review.text)
             .parse_mode(ParseMode::Html)
             .reply_markup(review_keyboard(review.id));
-        if let Some(message_id) = review.first_message_id {
+        if review.destination_chat_id == review.chat_id
+            && let Some(message_id) = review.first_message_id
+        {
             request = request.reply_parameters(
                 ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
             );
@@ -295,7 +330,7 @@ async fn confirm_review_delivery_payload(
     .bind(review.risk_score)
     .bind(&review.risk_signals)
     .bind(DELIVERY_LEASE_SECONDS)
-    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
@@ -326,7 +361,7 @@ async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> an
     .bind(review.notification_attempts)
     .bind(review.risk_score)
     .bind(&review.risk_signals)
-    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     Ok(())

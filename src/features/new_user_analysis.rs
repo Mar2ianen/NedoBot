@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
 use crate::{
+    config::Config,
     features::new_user_audit::{
         prompt::PROMPT_VERSION,
         repo::{
@@ -15,10 +16,14 @@ use crate::{
     text::{has_mixed_script_homoglyphs, normalize_cyrillic_homoglyphs},
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NewUserAnalysisConfig {
     pub recent_id_ratio_threshold: f64,
     pub old_user_message_threshold: i64,
+    pub review_threshold: i32,
+    pub risk_profile: String,
+    pub risk_profile_version: String,
+    pub telegram_id_model_version: Option<String>,
 }
 
 impl Default for NewUserAnalysisConfig {
@@ -26,6 +31,34 @@ impl Default for NewUserAnalysisConfig {
         Self {
             recent_id_ratio_threshold: 0.92,
             old_user_message_threshold: 5,
+            review_threshold: 70,
+            risk_profile: "legacy".to_string(),
+            risk_profile_version: "legacy".to_string(),
+            telegram_id_model_version: None,
+        }
+    }
+}
+
+impl NewUserAnalysisConfig {
+    fn from_runtime(config: &Config) -> Self {
+        let Some(profile) = config.moderation_risk_profile() else {
+            return Self::default();
+        };
+        let profile_name = config.community.moderation.risk_profile.trim();
+        Self {
+            old_user_message_threshold: profile.old_user_message_threshold,
+            review_threshold: profile.review_threshold,
+            risk_profile: profile_name.to_string(),
+            risk_profile_version: if profile.version.trim().is_empty() {
+                profile_name.to_string()
+            } else {
+                profile.version.clone()
+            },
+            telegram_id_model_version: profile
+                .telegram_id
+                .as_ref()
+                .map(|model| model.version.clone()),
+            ..Self::default()
         }
     }
 }
@@ -253,10 +286,10 @@ impl RiskAccumulator {
         }
     }
 
-    fn finish(mut self) -> RiskAnalysis {
+    fn finish(mut self, review_threshold: i32) -> RiskAnalysis {
         self.score = self.score.min(100);
         let level = match self.score {
-            70.. => "high",
+            score if score >= review_threshold => "high",
             40..=69 => "medium",
             _ => "low",
         }
@@ -294,16 +327,17 @@ impl RiskAccumulator {
 /// несогласованное состояние.
 pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
     pool: &PgPool,
+    runtime_config: &Config,
     chat_id: i64,
     telegram_user_id: i64,
 ) -> anyhow::Result<()> {
     let Some(features) = load_features(pool, chat_id, telegram_user_id).await? else {
         return Ok(());
     };
-    let config = NewUserAnalysisConfig::default();
-    let is_old_active_user = features.message_count >= config.old_user_message_threshold;
-    let risk = analyze_risk(&features, &config, is_old_active_user);
-    let input_json = project_unified_user_audit_snapshot(&features, &risk);
+    let analysis_config = NewUserAnalysisConfig::from_runtime(runtime_config);
+    let is_old_active_user = features.message_count >= analysis_config.old_user_message_threshold;
+    let risk = analyze_risk(&features, &analysis_config, is_old_active_user);
+    let input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
     let material_revision = project_unified_user_audit_material_revision(&features);
     let snapshot_hash = format!(
         "{:x}",
@@ -322,7 +356,7 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
     let mut tx = pool.begin().await?;
     // Authoritative transactions consistently lock job, then audit, then review.
     enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
-    save_audit_in_transaction(&mut tx, &features, &risk, &config).await?;
+    save_audit_in_transaction(&mut tx, &features, &risk, &analysis_config).await?;
     record_new_user_audit_snapshot_in_transaction(&mut tx, params).await?;
     tx.commit().await?;
 
@@ -368,7 +402,11 @@ fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> V
     })
 }
 
-fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAnalysis) -> Value {
+fn project_unified_user_audit_snapshot(
+    features: &NewUserFeatures,
+    risk: &RiskAnalysis,
+    config: &NewUserAnalysisConfig,
+) -> Value {
     json!({
         "schema_version": 1,
         "subject": {
@@ -429,6 +467,9 @@ fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAn
             "via_chat_folder_invite_link": features.via_chat_folder_invite_link,
         },
         "risk": {
+            "risk_profile": config.risk_profile,
+            "risk_profile_version": config.risk_profile_version,
+            "telegram_id_model_version": config.telegram_id_model_version,
             "score": risk.score,
             "level": risk.level,
             "primary_class": risk.primary_class,
@@ -825,7 +866,7 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(explicit_adult_bio_signal(features));
     risk.add_optional(profile_bio_subscription_offer_signal(features));
     risk.add_optional(member_status_signal(features));
-    risk.finish()
+    risk.finish(config.review_threshold)
 }
 
 fn message_count_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1492,6 +1533,9 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "risk_labels",
         "risk_reasons",
         "risk_signal_breakdown",
+        "risk_profile",
+        "risk_profile_version",
+        "telegram_id_model_version",
         "raw_features",
     ]
 }
@@ -1524,7 +1568,11 @@ async fn save_audit_in_transaction(
         "thresholds": {
             "recent_id_ratio": config.recent_id_ratio_threshold,
             "old_user_message_threshold": config.old_user_message_threshold,
+            "review_threshold": config.review_threshold,
         },
+        "risk_profile": config.risk_profile,
+        "risk_profile_version": config.risk_profile_version,
+        "telegram_id_model_version": config.telegram_id_model_version,
         "known_risk_classes": SpamClass::all().map(SpamClass::as_str),
         "profile_photo_file_id_present": features.profile_photo_file_id.is_some(),
         "profile_photo_file_unique_id_present": features.profile_photo_file_unique_id.is_some(),
@@ -1681,6 +1729,9 @@ async fn save_audit_in_transaction(
         values.push_bind(json!(risk.labels));
         values.push_bind(json!(risk.reasons));
         values.push_bind(&risk.signals);
+        values.push_bind(&config.risk_profile);
+        values.push_bind(&config.risk_profile_version);
+        values.push_bind(&config.telegram_id_model_version);
         values.push_bind(raw_features);
     }
 
@@ -2352,7 +2403,7 @@ mod tests {
             label: "genuine_reply",
             reason: "test",
         });
-        let signals = risk.finish().signals;
+        let signals = risk.finish(70).signals;
 
         assert_eq!(signals[0]["warning_strength"], "weak");
         assert_eq!(signals[0]["coefficient"], 3);
@@ -2392,7 +2443,7 @@ mod tests {
             label: "test",
             reason: "test",
         });
-        assert_eq!(risk.finish().score, 100);
+        assert_eq!(risk.finish(70).score, 100);
     }
 
     #[test]

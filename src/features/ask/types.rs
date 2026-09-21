@@ -13,6 +13,7 @@ pub enum AskProgress {
 
 pub struct AskCommandInput {
     pub chat_id: i64,
+    pub scope_chat_id: i64,
     pub command_message_id: i32,
     pub requester_user_id: i64,
     pub requester_identity: String,

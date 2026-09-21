@@ -815,48 +815,50 @@ pub async fn refresh_known_member_snapshots(
 ) -> anyhow::Result<()> {
     // chat_member updates are sparse without admin rights, so startup refresh
     // improves reports for already-seen users without blocking the bot.
-    let users = sqlx::query_as::<_, (i64,)>(
-        r#"
-        select distinct user_id
-        from telegram_messages
-        where chat_id = $1 and user_id is not null
-        order by user_id
-        limit 250
-        "#,
-    )
-    .bind(config.discussion_chat_id)
-    .fetch_all(pool)
-    .await?;
+    for chat_id in config.managed_chat_ids() {
+        let users = sqlx::query_as::<_, (i64,)>(
+            r#"
+            select distinct user_id
+            from telegram_messages
+            where chat_id = $1 and user_id is not null
+            order by user_id
+            limit 250
+            "#,
+        )
+        .bind(chat_id)
+        .fetch_all(pool)
+        .await?;
 
-    for (user_id,) in users {
-        let Ok(user_id_u64) = u64::try_from(user_id) else {
-            tracing::debug!(user_id, "skip invalid negative Telegram user id");
-            continue;
-        };
+        for (user_id,) in users {
+            let Ok(user_id_u64) = u64::try_from(user_id) else {
+                tracing::debug!(user_id, chat_id, "skip invalid negative Telegram user id");
+                continue;
+            };
 
-        match bot
-            .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id_u64))
-            .await
-        {
-            Ok(member) => {
-                upsert_user_profile(pool, &member.user).await?;
-                let raw_json = serde_json::to_value(&member)?;
-                upsert_member_snapshot(
-                    pool,
-                    MemberSnapshot {
-                        chat_id: config.discussion_chat_id,
-                        user_id,
-                        status: chat_member_status(&member.kind),
-                        is_admin: member.kind.is_privileged(),
-                        is_present: member.kind.is_present(),
-                        raw_json,
-                        observed_at: Utc::now(),
-                    },
-                )
-                .await?;
-            }
-            Err(err) => {
-                tracing::debug!(%err, user_id, "failed to refresh chat member");
+            match bot
+                .get_chat_member(ChatId(chat_id), UserId(user_id_u64))
+                .await
+            {
+                Ok(member) => {
+                    upsert_user_profile(pool, &member.user).await?;
+                    let raw_json = serde_json::to_value(&member)?;
+                    upsert_member_snapshot(
+                        pool,
+                        MemberSnapshot {
+                            chat_id,
+                            user_id,
+                            status: chat_member_status(&member.kind),
+                            is_admin: member.kind.is_privileged(),
+                            is_present: member.kind.is_present(),
+                            raw_json,
+                            observed_at: Utc::now(),
+                        },
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    tracing::debug!(%err, user_id, chat_id, "failed to refresh chat member");
+                }
             }
         }
     }
@@ -867,19 +869,19 @@ pub async fn refresh_known_member_snapshots(
 pub async fn refresh_chat_member_snapshot(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     pool: &PgPool,
-    config: &Config,
+    chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<()> {
     let user_id_u64 = u64::try_from(user_id)?;
     let member = bot
-        .get_chat_member(ChatId(config.discussion_chat_id), UserId(user_id_u64))
+        .get_chat_member(ChatId(chat_id), UserId(user_id_u64))
         .await?;
 
     upsert_user_profile(pool, &member.user).await?;
     upsert_member_snapshot(
         pool,
         MemberSnapshot {
-            chat_id: config.discussion_chat_id,
+            chat_id,
             user_id,
             status: chat_member_status(&member.kind),
             is_admin: member.kind.is_privileged(),

@@ -12,9 +12,10 @@ use teloxide::{
 use tokio::io::AsyncWrite;
 
 use crate::config::Config;
-use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
-use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+use crate::features::first_comment::clean::{
+    clean_post_for_llm_with_marker, should_generate_comment_with_marker,
+};
 use crate::features::first_comment::draft::{
     FirstCommentDraft, first_comment_output_schema, parse_first_comment_draft,
     validate_first_comment_draft_with_search_policy_and_chat,
@@ -31,6 +32,7 @@ use crate::features::first_comment::repo::{
     mark_post_comment_delivery_unknown, mark_post_comment_pre_send_failed,
     mark_post_comment_send_rejected,
 };
+use crate::features::ingest::ingest_message;
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::service::load_relevant_memory_notes;
 use crate::features::search::repo::{
@@ -46,8 +48,9 @@ use crate::telegram::render::{send_html, send_html_reply};
 pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Result<()> {
     let pool = &state.pool;
     let config = &state.config;
-
-    save_telegram_message(pool, msg, config).await?;
+    if !config.community.first_comment.enabled {
+        return Ok(());
+    }
 
     // The bot should never react to random chat messages. A valid target is only
     // Telegram's automatic channel post copy in the linked discussion chat.
@@ -57,7 +60,7 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
 
     // Editorial posts carry the VK/MAX footer. Ads usually do not, so the marker
     // doubles as a cheap allowlist and keeps promotional posts out of the chat CTA.
-    if !should_generate_comment(candidate.post_text, config) {
+    if !should_generate_comment_with_marker(candidate.post_text, &candidate.post_signature_marker) {
         tracing::info!(
             discussion_message_id = msg.id.0,
             "skip post without signature marker"
@@ -65,14 +68,15 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
         return Ok(());
     }
 
-    let clean_post = clean_post_for_llm(candidate.post_text, config);
+    let clean_post =
+        clean_post_for_llm_with_marker(candidate.post_text, &candidate.post_signature_marker);
     let image = msg
         .photo()
         .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height));
     let job_id = create_post_comment_job(
         pool,
         CreatePostCommentJobParams {
-            discussion_chat_id: config.discussion_chat_id,
+            discussion_chat_id: msg.chat.id.0,
             discussion_message_id: msg.id.0,
             source_channel_id: candidate.source_channel_id,
             source_message_id: candidate.source_message_id.0,
@@ -191,7 +195,7 @@ async fn process_post_comment_job(
     let image_base64 = download_photo_base64(bot, job.image_file_id.as_deref(), config)
         .await
         .map_err(|_| CommentErrorKind::ImageUnavailable)?;
-    let chat_member_count = get_chat_member_count(bot, config).await;
+    let chat_member_count = get_chat_member_count(bot, job.discussion_chat_id).await;
     let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text)
         .await
         .map_err(|_| CommentErrorKind::Transient)?;
@@ -209,7 +213,7 @@ async fn process_post_comment_job(
         match crate::features::chat_retrieval::run_shadow_retrieval(
             pool,
             config,
-            config.discussion_chat_id,
+            job.discussion_chat_id,
             plan,
         )
         .await
@@ -221,7 +225,7 @@ async fn process_post_comment_job(
                 }
                 match crate::features::chat_retrieval::expand_shadow_contexts(
                     pool,
-                    config.discussion_chat_id,
+                    job.discussion_chat_id,
                     &candidates,
                 )
                 .await
@@ -253,7 +257,7 @@ async fn process_post_comment_job(
         .collect::<Vec<_>>();
     let chat_targets = crate::features::first_comment::repo::load_chat_link_targets(
         pool,
-        config.discussion_chat_id,
+        job.discussion_chat_id,
         &chat_candidate_ids,
     )
     .await
@@ -402,7 +406,7 @@ async fn deliver_prepared_post_comment(
         Err(error) => return handle_post_comment_send_error(state, job, &error).await,
     };
 
-    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await {
+    if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
         tracing::warn!(%err, message_id = sent.id.0, "failed to save bot comment message");
     }
 
@@ -634,12 +638,9 @@ impl AsyncWrite for LimitedBytesWriter {
 
 async fn get_chat_member_count(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
+    chat_id: i64,
 ) -> Option<u32> {
-    match bot
-        .get_chat_member_count(ChatId(config.discussion_chat_id))
-        .await
-    {
+    match bot.get_chat_member_count(ChatId(chat_id)).await {
         Ok(count) => Some(count),
         Err(err) => {
             tracing::warn!(%err, "failed to get chat member count");
