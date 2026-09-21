@@ -44,6 +44,7 @@ struct ExportMessage {
     actor: Option<String>,
     actor_id: Option<String>,
     reply_to_message_id: Option<i32>,
+    #[serde(default)]
     text: Value,
     text_entities: Option<Value>,
     photo: Option<String>,
@@ -779,6 +780,19 @@ mod tests {
     fn flattens_rich_text() {
         let text = serde_json::json!(["hello ", {"type": "link", "text": "https://t.me/x"}]);
         assert_eq!(message_text(&text), "hello https://t.me/x");
+    }
+
+    #[test]
+    fn accepts_service_messages_without_text() {
+        let message: ExportMessage = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "type": "service",
+            "date": "2026-07-03T00:00:00",
+            "date_unixtime": "1783036800"
+        }))
+        .expect("service exports may omit text");
+
+        assert_eq!(message_text(&message.text), "");
     }
 
     #[test]
