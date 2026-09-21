@@ -115,16 +115,13 @@ async fn claim_review_delivery(
     request_id: Option<i64>,
     config: Option<&crate::config::Config>,
 ) -> anyhow::Result<Option<SpamReview>> {
-    let review_threshold = config
-        .and_then(|config| config.moderation_risk_profile())
-        .map_or(70, |profile| profile.review_threshold);
     let row = sqlx::query(
         r#"
         with candidate as (
             select id
             from spam_review_requests
             where status = 'pending'
-              and risk_score >= $3
+              and risk_score >= review_threshold
               and ($1::bigint is null or id = $1)
               and (
                   (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
@@ -148,25 +145,22 @@ async fn claim_review_delivery(
         where request.id = candidate.id
         returning request.id, request.chat_id, request.telegram_user_id,
                   request.risk_score, request.risk_signals, request.notification_message_id,
-                  request.notification_attempts, request.notification_consecutive_failures
+                  request.notification_attempts, request.notification_consecutive_failures,
+                  request.review_threshold
         "#,
     )
     .bind(request_id)
     .bind(DELIVERY_LEASE_SECONDS)
-    .bind(review_threshold)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    review_from_row(pool, row, config, review_threshold)
-        .await
-        .map(Some)
+    review_from_row(pool, row, config).await.map(Some)
 }
 
 async fn review_from_row(
     pool: &PgPool,
     row: sqlx::postgres::PgRow,
     config: Option<&crate::config::Config>,
-    review_threshold: i32,
 ) -> anyhow::Result<SpamReview> {
     let id: i64 = row.get("id");
     let chat_id: i64 = row.get("chat_id");
@@ -176,6 +170,7 @@ async fn review_from_row(
     let notification_message_id: Option<i32> = row.get("notification_message_id");
     let notification_attempts: i32 = row.get("notification_attempts");
     let notification_consecutive_failures: i32 = row.get("notification_consecutive_failures");
+    let stored_review_threshold: i32 = row.get("review_threshold");
     let profile = sqlx::query(r#"
         select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
@@ -209,7 +204,7 @@ async fn review_from_row(
         notification_attempts,
         notification_consecutive_failures,
         risk_score: score,
-        review_threshold,
+        review_threshold: stored_review_threshold,
         risk_signals: signals,
         text,
     })

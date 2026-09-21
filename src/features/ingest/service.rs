@@ -23,7 +23,7 @@ pub fn managed_chat_allows(
 /// Neutral Telegram message persistence. Feature pipelines may consume the
 /// result, but no feature owns base message ingest anymore.
 pub async fn ingest_message(pool: &PgPool, msg: &Message, config: &Config) -> anyhow::Result<bool> {
-    if !is_managed_chat(config, msg.chat.id.0) {
+    if !managed_chat_allows(config, msg.chat.id.0, |chat| chat.ingest) {
         return Ok(false);
     }
     save_telegram_message(pool, msg, config).await?;

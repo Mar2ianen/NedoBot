@@ -1,22 +1,31 @@
+#[cfg(feature = "ask")]
 use std::future::Future;
-use teloxide::{
-    drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter},
-    prelude::*,
-    types::{
-        InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
-        InputRichBlockThinking, InputRichMessage, ReplyParameters, RichText,
-    },
-    utils::command::BotCommands,
+#[cfg(feature = "ask")]
+use teloxide::drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter};
+#[cfg(feature = "ask")]
+use teloxide::types::{
+    InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
+    InputRichBlockThinking, InputRichMessage, ReplyParameters, RichText,
 };
+use teloxide::{prelude::*, utils::command::BotCommands};
+#[cfg(feature = "ask")]
 use tokio::sync::mpsc;
 
+#[cfg(feature = "ask")]
 use crate::features::ask::chat_search::message_url;
+#[cfg(feature = "ask")]
 use crate::features::ask::notes::{add_chat_note, add_user_note};
+#[cfg(feature = "ask")]
 use crate::features::ask::repo;
+#[cfg(feature = "ask")]
 use crate::features::ask::service::AskService;
+#[cfg(feature = "ask")]
 use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, AskRunStatus};
+#[cfg(feature = "auto-comment")]
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+#[cfg(feature = "auto-comment")]
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
+#[cfg(feature = "auto-comment")]
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 use crate::features::memory::report::send_memory_notes;
@@ -24,11 +33,14 @@ use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
 use crate::features::stats::types::{StatsPeriod, StatsRender};
+#[cfg(feature = "voice")]
 use crate::features::voice::pipeline::transcribe_reply;
 use crate::state::AppState;
+#[cfg(feature = "ask")]
 use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
+#[cfg(feature = "ask")]
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 use crate::telegram::render::{escape_html, send_html};
 
@@ -95,6 +107,7 @@ pub async fn handle_command(
         Command::EmojiIds => {
             send_custom_emoji_ids(&bot, &msg).await?;
         }
+        #[cfg(feature = "auto-comment")]
         Command::FormatTest(post_text) => {
             if !should_generate_comment(&post_text, config) {
                 bot.send_message(
@@ -112,6 +125,7 @@ pub async fn handle_command(
         Command::Memory => {
             send_memory_notes(&bot, msg.chat.id, pool).await?;
         }
+        #[cfg(feature = "voice")]
         Command::Transcribe => {
             transcribe_reply(&bot, &msg, &state).await.map_err(|err| {
                 tracing::error!(%err, "manual voice transcription command failed");
@@ -120,12 +134,15 @@ pub async fn handle_command(
                 )
             })?;
         }
+        #[cfg(feature = "ask")]
         Command::Ask(question) => {
             handle_ask_command(&bot, &msg, &state, &question).await?;
         }
+        #[cfg(feature = "ask")]
         Command::ChatNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, None).await?;
         }
+        #[cfg(feature = "ask")]
         Command::UserNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, reply_user_id(&msg)).await?;
         }
@@ -225,6 +242,7 @@ pub async fn handle_command(
     Ok(())
 }
 
+#[cfg(feature = "ask")]
 async fn handle_note_command(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
@@ -275,6 +293,7 @@ async fn handle_note_command(
     }
 }
 
+#[cfg(feature = "ask")]
 async fn handle_ask_command(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
@@ -462,6 +481,7 @@ async fn handle_ask_command(
     }
 }
 
+#[cfg(feature = "ask")]
 fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
     matches!(
         certainty,
@@ -469,6 +489,7 @@ fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
     )
 }
 
+#[cfg(feature = "ask")]
 fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     match error {
         DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
@@ -479,6 +500,7 @@ fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     }
 }
 
+#[cfg(feature = "ask")]
 async fn fallback_after_finish_error(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
@@ -511,6 +533,7 @@ async fn fallback_after_finish_error(
     .await
 }
 
+#[cfg(feature = "ask")]
 async fn apply_finish_error_policy<SendFallback, SendFuture, RecordDelivery, RecordFuture>(
     certainty: DeliveryCertainty,
     fallback_status: AskRunStatus,
@@ -545,6 +568,7 @@ where
     result
 }
 
+#[cfg(feature = "ask")]
 async fn record_ask_delivery(
     state: &AppState,
     ask_run_id: Option<i64>,
@@ -562,6 +586,7 @@ async fn record_ask_delivery(
     }
 }
 
+#[cfg(feature = "ask")]
 async fn send_ask_fallback(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
@@ -581,6 +606,7 @@ async fn send_ask_fallback(
     .map(|_| ())
 }
 
+#[cfg(feature = "ask")]
 fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<String> {
     msg.reply_to_message().map(|reply| {
         let author = reply
@@ -632,6 +658,7 @@ fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<Str
     })
 }
 
+#[cfg(feature = "ask")]
 fn ask_progress_message(progress: AskProgress) -> &'static str {
     match progress {
         AskProgress::Preparing => "⏳ Подготавливаю ответ…",
@@ -643,6 +670,7 @@ fn ask_progress_message(progress: AskProgress) -> &'static str {
     }
 }
 
+#[cfg(feature = "ask")]
 fn ask_progress_preview(progress: AskProgress, use_native_draft: bool) -> InputRichMessage {
     let message = ask_progress_message(progress);
     if !use_native_draft {
@@ -665,6 +693,7 @@ fn ask_progress_preview(progress: AskProgress, use_native_draft: bool) -> InputR
     ])
 }
 
+#[cfg(feature = "ask")]
 fn requester_identity(user: &teloxide::types::User) -> String {
     let mut identity = user.first_name.clone();
     if let Some(last_name) = user.last_name.as_deref().filter(|value| !value.is_empty()) {
@@ -679,6 +708,7 @@ fn requester_identity(user: &teloxide::types::User) -> String {
     identity.chars().take(120).collect()
 }
 
+#[cfg(feature = "ask")]
 fn ask_failure_message(kind: AskFailureKind) -> &'static str {
     match kind {
         AskFailureKind::Timeout => {
@@ -892,6 +922,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "ask")]
     #[test]
     fn ask_progress_uses_thinking_only_for_native_drafts() {
         let native = serde_json::to_value(ask_progress_preview(AskProgress::Preparing, true))
@@ -909,6 +940,7 @@ mod tests {
         assert!(edit["blocks"].is_null());
     }
 
+    #[cfg(feature = "ask")]
     #[test]
     fn fallback_policy_allows_only_confirmed_non_delivery() {
         assert!(may_send_fallback(DeliveryCertainty::NotAttempted));
@@ -916,6 +948,7 @@ mod tests {
         assert!(!may_send_fallback(DeliveryCertainty::Unknown));
     }
 
+    #[cfg(feature = "ask")]
     #[test]
     fn finish_error_certainty_is_preserved_for_fallback_policy() {
         let before = DraftFinishError::<teloxide::RequestError>::WorkerStoppedBeforeCommand;
@@ -940,6 +973,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ask")]
     #[tokio::test]
     async fn unknown_backend_delivery_suppresses_fallback_in_real_finish_path() {
         use std::sync::{

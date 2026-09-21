@@ -101,6 +101,8 @@ mod tests {
                 voice: false,
                 ask: false,
                 review_destination: false,
+                invite_url_env: None,
+                invite_label: None,
             },
         )]);
         let community = community(chats);
@@ -134,6 +136,8 @@ mod tests {
                     voice: false,
                     ask: false,
                     review_destination: false,
+                    invite_url_env: None,
+                    invite_label: None,
                 },
             ),
             (
@@ -146,6 +150,8 @@ mod tests {
                     voice: false,
                     ask: false,
                     review_destination: false,
+                    invite_url_env: None,
+                    invite_label: None,
                 },
             ),
         ]);

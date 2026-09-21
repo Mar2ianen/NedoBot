@@ -5,6 +5,7 @@ pub mod db;
 pub mod features;
 pub mod http;
 pub mod llm;
+#[cfg(feature = "public-mcp")]
 pub mod mcp;
 pub mod state;
 pub mod telegram;

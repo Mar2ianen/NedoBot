@@ -1,3 +1,4 @@
+#[cfg(feature = "ask")]
 pub mod ask_drafter;
 pub mod command_handler;
 pub mod commands;

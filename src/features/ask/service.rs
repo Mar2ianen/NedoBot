@@ -311,7 +311,11 @@ impl<'a> AskService<'a> {
         observed_source_urls: &[String],
     ) -> anyhow::Result<RichTextBindings> {
         let mut bindings = RichTextBindings::new();
-        bindings.insert_link("chat", Url::parse(&self.config.chat_invite_url)?)?;
+        let chat_invite_url = self
+            .config
+            .chat_invite_url_for_chat(self.scope_chat_id)
+            .ok_or_else(|| anyhow::anyhow!("ask scope has no configured invite URL"))?;
+        bindings.insert_link("chat", Url::parse(&chat_invite_url)?)?;
         for message_id in observed_message_ids {
             let Some(url) =
                 crate::features::ask::chat_search::message_url(self.scope_chat_id, *message_id)
@@ -368,7 +372,9 @@ impl<'a> AskService<'a> {
             .parse(markdown)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut allowed = HashSet::new();
-        add_allowed_url(&mut allowed, &self.config.chat_invite_url);
+        if let Some(chat_invite_url) = self.config.chat_invite_url_for_chat(self.scope_chat_id) {
+            add_allowed_url(&mut allowed, &chat_invite_url);
+        }
         for url in observed_source_urls {
             add_allowed_url(&mut allowed, url);
         }

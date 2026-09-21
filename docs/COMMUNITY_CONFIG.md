@@ -23,6 +23,8 @@ moderation = true
 stats = true
 voice = false
 ask = false
+invite_url_env = "CHAT_INVITE_URL"
+invite_label = "чате"
 
 [chats.review]
 id = -1004444444444
@@ -39,6 +41,11 @@ risk_profile = "ru_general_v1"
 review_chat = "review"
 reviewer_user_ids = [5939287960]
 ```
+
+Chat invite configuration belongs to the chat entry, so `/ask` remains
+independent from first-comment routes. `first_comment.routes[*].invite_url_env`
+is retained as a per-route override for communities that use different public
+links.
 
 `[instance]`, `[telegram]` and at least one `[chats.*]` entry are required at
 startup. Chat IDs must be unique. The bot ignores unknown group chats before

@@ -13,6 +13,7 @@ impl Html {
         Self(escape(value.as_ref()))
     }
 
+    #[cfg(feature = "ask")]
     pub(crate) fn raw_trusted(value: impl Into<String>) -> Self {
         Self(value.into())
     }

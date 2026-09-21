@@ -875,7 +875,7 @@ pub async fn load_chat_link_targets(
     Ok(rows
         .into_iter()
         .filter_map(|(message_id, author_name, author_username)| {
-            crate::features::ask::chat_search::message_url(chat_id, message_id).map(|message_url| {
+            crate::features::chat_search::message_url(chat_id, message_id).map(|message_url| {
                 ChatLinkTarget {
                     message_id,
                     author_name,

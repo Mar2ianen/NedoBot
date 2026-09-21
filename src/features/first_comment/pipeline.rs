@@ -192,6 +192,8 @@ async fn process_post_comment_job(
 ) -> Result<JobOutcome, CommentErrorKind> {
     let pool = &state.pool;
     let config = &state.config;
+    let render_config =
+        config.first_comment_render_config(job.discussion_chat_id, job.source_channel_id);
     let image_base64 = download_photo_base64(bot, job.image_file_id.as_deref(), config)
         .await
         .map_err(|_| CommentErrorKind::ImageUnavailable)?;
@@ -296,7 +298,7 @@ async fn process_post_comment_job(
     });
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
-    let source_policy = config.clone();
+    let source_policy = render_config.clone();
     let allowed_chat_message_ids = if config.chat_retrieval_evidence_enabled {
         chat_candidate_ids.clone()
     } else {
@@ -368,7 +370,7 @@ async fn process_post_comment_job(
     let prompt_for_log = prompt.compact_for_log();
     let final_html = crate::features::first_comment::render::build_comment_html_with_context(
         &draft.comment,
-        config,
+        &render_config,
         &search_context.results,
         &chat_targets,
     );

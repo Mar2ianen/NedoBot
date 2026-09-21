@@ -6,6 +6,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
 use crate::{
     config::Config,
+    config_file::TelegramIdRiskModel,
     features::new_user_audit::{
         prompt::PROMPT_VERSION,
         repo::{
@@ -24,6 +25,7 @@ pub struct NewUserAnalysisConfig {
     pub risk_profile: String,
     pub risk_profile_version: String,
     pub telegram_id_model_version: Option<String>,
+    pub telegram_id_model: Option<TelegramIdRiskModel>,
 }
 
 impl Default for NewUserAnalysisConfig {
@@ -35,6 +37,7 @@ impl Default for NewUserAnalysisConfig {
             risk_profile: "legacy".to_string(),
             risk_profile_version: "legacy".to_string(),
             telegram_id_model_version: None,
+            telegram_id_model: None,
         }
     }
 }
@@ -58,6 +61,7 @@ impl NewUserAnalysisConfig {
                 .telegram_id
                 .as_ref()
                 .map(|model| model.version.clone()),
+            telegram_id_model: profile.telegram_id.clone(),
             ..Self::default()
         }
     }
@@ -338,7 +342,8 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
     let is_old_active_user = features.message_count >= analysis_config.old_user_message_threshold;
     let risk = analyze_risk(&features, &analysis_config, is_old_active_user);
     let input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
-    let material_revision = project_unified_user_audit_material_revision(&features);
+    let material_revision =
+        project_unified_user_audit_material_revision(&features, &analysis_config);
     let snapshot_hash = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&material_revision)?)
@@ -352,6 +357,7 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
         input_json: &input_json,
         avatar_file_id: features.profile_photo_file_id.as_deref(),
         avatar_file_unique_id: features.profile_photo_file_unique_id.as_deref(),
+        review_threshold: analysis_config.review_threshold,
     };
     let mut tx = pool.begin().await?;
     // Authoritative transactions consistently lock job, then audit, then review.
@@ -373,12 +379,18 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
 const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
 const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
 
-fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> Value {
+fn project_unified_user_audit_material_revision(
+    features: &NewUserFeatures,
+    config: &NewUserAnalysisConfig,
+) -> Value {
     // Только факты, заметно меняющие вход LLM. Временные поля, live-счётчики и
     // последние сообщения исключены, чтобы transient refresh не создавал job на
     // каждое новое сообщение.
     json!({
         "schema_version": 1,
+        "risk_profile_version": config.risk_profile_version,
+        "telegram_id_model_version": config.telegram_id_model_version,
+        "review_threshold": config.review_threshold,
         "subject": {
             "chat_id": features.chat_id,
             "telegram_user_id": features.telegram_user_id,
@@ -470,6 +482,11 @@ fn project_unified_user_audit_snapshot(
             "risk_profile": config.risk_profile,
             "risk_profile_version": config.risk_profile_version,
             "telegram_id_model_version": config.telegram_id_model_version,
+            "review_threshold": config.review_threshold,
+            "telegram_id_risk_ratio": config
+                .telegram_id_model
+                .as_ref()
+                .map(|model| telegram_id_risk_ratio(features.telegram_user_id, model)),
             "score": risk.score,
             "level": risk.level,
             "primary_class": risk.primary_class,
@@ -926,10 +943,12 @@ fn recent_id_signal(
     features: &NewUserFeatures,
     config: &NewUserAnalysisConfig,
 ) -> Option<RiskSignal> {
-    match features
-        .id_rank_ratio
-        .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold)
-    {
+    let ratio = config
+        .telegram_id_model
+        .as_ref()
+        .map(|model| telegram_id_risk_ratio(features.telegram_user_id, model))
+        .or(features.id_rank_ratio);
+    match ratio.is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold) {
         true => Some(RiskSignal {
             class: SpamClass::FreshAccount,
             coefficient: 15,
@@ -938,6 +957,13 @@ fn recent_id_signal(
         }),
         false => None,
     }
+}
+
+fn telegram_id_risk_ratio(user_id: i64, model: &TelegramIdRiskModel) -> f64 {
+    let id_billion = (user_id.max(0) as f64) / 1_000_000_000.0;
+    let exponent = (model.k * (id_billion - model.midpoint_billion)).clamp(-60.0, 60.0);
+    let sigmoid = 1.0 / (1.0 + (-exponent).exp());
+    model.floor + (model.ceil - model.floor) * sigmoid
 }
 
 fn username_signal(features: &NewUserFeatures, stats: &UsernameStats) -> Option<RiskSignal> {
@@ -1559,6 +1585,10 @@ async fn save_audit_in_transaction(
         .personal_channel_last_text
         .as_deref()
         .map(char_count_i32);
+    let telegram_id_risk_ratio = config
+        .telegram_id_model
+        .as_ref()
+        .map(|model| telegram_id_risk_ratio(features.telegram_user_id, model));
     let raw_features = json!({
         "dc": {
             "available": profile_photo_dc.dc_id.is_some(),
@@ -1573,6 +1603,14 @@ async fn save_audit_in_transaction(
         "risk_profile": config.risk_profile,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
+        "telegram_id_model": config.telegram_id_model.as_ref().map(|model| json!({
+            "floor": model.floor,
+            "ceil": model.ceil,
+            "k": model.k,
+            "midpoint_billion": model.midpoint_billion,
+            "version": model.version,
+        })),
+        "telegram_id_risk_ratio": telegram_id_risk_ratio,
         "known_risk_classes": SpamClass::all().map(SpamClass::as_str),
         "profile_photo_file_id_present": features.profile_photo_file_id.is_some(),
         "profile_photo_file_unique_id_present": features.profile_photo_file_unique_id.is_some(),
@@ -1662,9 +1700,7 @@ async fn save_audit_in_transaction(
         values.push_bind(id_bucket(features.telegram_user_id));
         values.push_bind(features.id_rank_ratio);
         values.push_bind(
-            features
-                .id_rank_ratio
-                .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold),
+            telegram_id_risk_ratio.is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold),
         );
         values.push_bind(&features.username);
         values.push_bind(features.username.as_deref().map(char_count_i32));
@@ -2268,6 +2304,23 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_id_risk_ratio_uses_configured_four_pl_model() {
+        let model = TelegramIdRiskModel {
+            floor: 0.1,
+            ceil: 0.9,
+            k: 4.0,
+            midpoint_billion: 8.0,
+            version: "test-4pl".to_string(),
+        };
+        let lower = telegram_id_risk_ratio(7_000_000_000, &model);
+        let middle = telegram_id_risk_ratio(8_000_000_000, &model);
+        let upper = telegram_id_risk_ratio(9_000_000_000, &model);
+
+        assert!(lower < middle && middle < upper);
+        assert!((middle - 0.5).abs() < 1e-9);
+    }
 
     #[test]
     fn username_random_suffix_detects_yasnyy_variant() {
