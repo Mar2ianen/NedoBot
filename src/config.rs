@@ -163,6 +163,87 @@ impl Config {
         &self.community.moderation.reviewer_user_ids
     }
 
+    pub fn chat_invite_url_for_chat(&self, chat_id: i64) -> Option<String> {
+        let chat = self.chat_by_id(chat_id)?;
+        chat.config
+            .invite_url_env
+            .as_deref()
+            .and_then(env_optional)
+            .or_else(|| {
+                (chat.config.id == self.discussion_chat_id)
+                    .then(|| self.chat_invite_url.clone())
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
+
+    pub fn chat_invite_label_for_chat(&self, chat_id: i64) -> Option<String> {
+        let chat = self.chat_by_id(chat_id)?;
+        chat.config
+            .invite_label
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                (chat.config.id == self.discussion_chat_id)
+                    .then(|| self.chat_invite_label.clone())
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
+
+    pub fn first_comment_invite_url(
+        &self,
+        discussion_chat_id: i64,
+        source_channel_id: i64,
+    ) -> Option<String> {
+        self.first_comment_route(discussion_chat_id, source_channel_id)
+            .and_then(|route| route.invite_url_env.as_deref().and_then(env_optional))
+            .or_else(|| self.chat_invite_url_for_chat(discussion_chat_id))
+            .or_else(|| env_optional("CHAT_INVITE_URL"))
+    }
+
+    pub fn first_comment_route(
+        &self,
+        discussion_chat_id: i64,
+        source_channel_id: i64,
+    ) -> Option<&crate::config_file::FirstCommentRoute> {
+        self.first_comment_route_for_chat(discussion_chat_id)
+            .find(|route| route.source_channel_id == source_channel_id)
+    }
+
+    pub fn first_comment_render_config(
+        &self,
+        discussion_chat_id: i64,
+        source_channel_id: i64,
+    ) -> Self {
+        let mut scoped = self.clone();
+        if let Some(url) = self.first_comment_invite_url(discussion_chat_id, source_channel_id) {
+            scoped.chat_invite_url = url;
+        }
+        if let Some(route) = self.first_comment_route(discussion_chat_id, source_channel_id) {
+            if !route.invite_label.trim().is_empty() {
+                scoped.chat_invite_label = route.invite_label.clone();
+            }
+            scoped.post_signature_marker = route.post_signature_marker.clone();
+        } else if let Some(label) = self.chat_invite_label_for_chat(discussion_chat_id) {
+            scoped.chat_invite_label = label;
+        }
+        scoped
+    }
+
+    fn first_comment_invite_url_for_route(
+        &self,
+        route: &crate::config_file::FirstCommentRoute,
+    ) -> Option<String> {
+        route
+            .invite_url_env
+            .as_deref()
+            .and_then(env_optional)
+            .or_else(|| {
+                self.chat_by_key(&route.discussion_chat)
+                    .and_then(|chat| self.chat_invite_url_for_chat(chat.config.id))
+            })
+            .or_else(|| env_optional("CHAT_INVITE_URL"))
+    }
+
     pub fn first_comment_route_for_chat(
         &self,
         chat_id: i64,
@@ -207,10 +288,25 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
             .or(runtime.post_signature_marker)
             .unwrap_or_default();
-        let invite_url_env = first_comment_route
-            .and_then(|route| route.invite_url_env.as_deref())
-            .unwrap_or("CHAT_INVITE_URL");
-        let chat_invite_url = env_optional(invite_url_env).unwrap_or_default();
+        let primary_chat = chat_registry
+            .chat_by_id(&community, primary_chat_id)
+            .ok_or_else(|| anyhow::anyhow!("primary community chat is not registered"))?;
+        let chat_invite_url = primary_chat
+            .config
+            .invite_url_env
+            .as_deref()
+            .and_then(env_optional)
+            .or_else(|| {
+                first_comment_route
+                    .and_then(|route| route.invite_url_env.as_deref())
+                    .and_then(env_optional)
+            })
+            .or_else(|| env_optional("CHAT_INVITE_URL"))
+            .unwrap_or_default();
+        let moderation_section_present = profiles.moderation.is_some();
+        let ask_section_present = profiles.ask.is_some();
+        let voice_section_present = profiles.voice.is_some();
+        let telegram_section_present = profiles.telegram.is_some();
         let community_voice_enabled = community.voice.enabled;
         let community_ask_enabled = community.ask.enabled;
         let community_timezone = community.instance.timezone.clone();
@@ -284,12 +380,24 @@ impl Config {
             search_github_mcp_env: runtime.search_github_mcp_env,
             search_github_mcp_tools: runtime.search_github_mcp_tools,
             groq_api_key: env_or("GROQ_API_KEY", ""),
-            new_user_audit_enabled: runtime.new_user_audit_enabled || community_moderation_enabled,
+            new_user_audit_enabled: if moderation_section_present {
+                community_moderation_enabled
+            } else {
+                runtime.new_user_audit_enabled
+            },
             new_user_audit_max_tokens: runtime.new_user_audit_max_tokens,
             gemini_thinking_budget: runtime.gemini_thinking_budget,
-            owner_telegram_id: runtime.owner_telegram_id.or(community_owner_id),
+            owner_telegram_id: if telegram_section_present {
+                community_owner_id
+            } else {
+                runtime.owner_telegram_id
+            },
             send_owner_preview: runtime.send_owner_preview,
-            ask_enabled: runtime.ask_enabled || community_ask_enabled,
+            ask_enabled: if ask_section_present {
+                community_ask_enabled
+            } else {
+                runtime.ask_enabled
+            },
             ask_allow_chat_admins: runtime.ask_allow_chat_admins,
             ask_private_user_ids: runtime.ask_private_user_ids,
             ask_llm_temperature: runtime.ask_llm_temperature,
@@ -309,8 +417,11 @@ impl Config {
             amd_custom_emoji_id: runtime.amd_custom_emoji_id,
             radeon_custom_emoji_id: runtime.radeon_custom_emoji_id,
             ryzen_custom_emoji_id: runtime.ryzen_custom_emoji_id,
-            voice_transcription_enabled: runtime.voice_transcription_enabled
-                || community_voice_enabled,
+            voice_transcription_enabled: if voice_section_present {
+                community_voice_enabled
+            } else {
+                runtime.voice_transcription_enabled
+            },
             voice_auto_transcribe: runtime.voice_auto_transcribe,
             voice_max_duration_sec: runtime.voice_max_duration_sec,
             voice_max_file_mb: runtime.voice_max_file_mb,
@@ -335,11 +446,30 @@ impl Config {
             errors.push(error.to_string());
         }
 
-        if self.community.first_comment.enabled && self.chat_invite_url.trim().is_empty() {
+        if self.community.first_comment.enabled
+            && self
+                .community
+                .first_comment
+                .routes
+                .iter()
+                .any(|route| self.first_comment_invite_url_for_route(route).is_none())
+        {
             errors.push(
-                "first_comment.enabled=true requires CHAT_INVITE_URL or the configured invite URL environment variable"
+                "first_comment.enabled=true requires an invite URL environment variable on every route/chat"
                     .to_string(),
             );
+        }
+        if self.ask_enabled
+            && self
+                .community
+                .ask
+                .default_chat
+                .as_deref()
+                .and_then(|key| self.chat_by_key(key))
+                .and_then(|chat| self.chat_invite_url_for_chat(chat.config.id))
+                .is_none()
+        {
+            errors.push("ask.enabled=true requires an invite URL for ask.default_chat".to_string());
         }
         if self.ask_enabled && !cfg!(feature = "ask") {
             errors.push("ASK_ENABLED=true but binary lacks cargo feature ask".to_string());
@@ -429,25 +559,28 @@ impl Config {
         let Some(profiles) = self.llm_profiles.as_ref() else {
             return;
         };
-        let mut routes = vec![
-            (
-                "first_comment",
-                RouteRequirements {
-                    requires_system_prompt: true,
-                    num_predict: Some(self.llm_max_tokens),
-                    ..RouteRequirements::default()
-                },
-            ),
-            (
-                "first_comment",
-                RouteRequirements {
-                    requires_images: true,
-                    requires_system_prompt: true,
-                    num_predict: Some(self.llm_max_tokens),
-                    ..RouteRequirements::default()
-                },
-            ),
-        ];
+        let mut routes = Vec::new();
+        if self.community.first_comment.enabled {
+            routes.extend([
+                (
+                    "first_comment",
+                    RouteRequirements {
+                        requires_system_prompt: true,
+                        num_predict: Some(self.llm_max_tokens),
+                        ..RouteRequirements::default()
+                    },
+                ),
+                (
+                    "first_comment",
+                    RouteRequirements {
+                        requires_images: true,
+                        requires_system_prompt: true,
+                        num_predict: Some(self.llm_max_tokens),
+                        ..RouteRequirements::default()
+                    },
+                ),
+            ]);
+        }
         if self.rag_enabled {
             routes.push((
                 "memory",
@@ -982,6 +1115,8 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
                 voice: true,
                 ask: true,
                 review_destination: true,
+                invite_url_env: Some("CHAT_INVITE_URL".to_string()),
+                invite_label: Some("чате".to_string()),
             },
         )]),
         moderation: ModerationConfig::default(),
@@ -1253,6 +1388,19 @@ mod tests {
         let primary = EnvVarGuard::unset("PROFILE_PRIMARY_TEST_KEY");
         let fallback = EnvVarGuard::unset("PROFILE_FALLBACK_TEST_KEY");
         let mut config = config();
+        config.community.first_comment.enabled = true;
+        config
+            .community
+            .first_comment
+            .routes
+            .push(crate::config_file::FirstCommentRoute {
+                source_channel_id: -1001,
+                discussion_chat: "main".to_string(),
+                post_signature_marker: "marker".to_string(),
+                invite_label: "чате".to_string(),
+                invite_url_env: None,
+                prompt_profile: None,
+            });
         config.llm_profiles = Some(
             LlmProfiles::from_toml(
                 r#"

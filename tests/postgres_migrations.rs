@@ -1160,6 +1160,7 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
         input_json: &input,
         avatar_file_id: None,
         avatar_file_unique_id: None,
+        review_threshold: 70,
     };
     enqueue_new_user_audit_job(pool, params)
         .await
@@ -1174,6 +1175,7 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1269,6 +1271,7 @@ async fn assert_new_user_audit_generation_cas_requires_live_lease_and_current_ve
         input_json: &input,
         avatar_file_id: None,
         avatar_file_unique_id: None,
+        review_threshold: 70,
     };
     let assessment = serde_json::json!({"fixture": "assessment"});
 
@@ -1386,6 +1389,7 @@ async fn assert_new_user_audit_enqueue_version_bump_reopens_completed_materializ
         input_json: &input,
         avatar_file_id: None,
         avatar_file_unique_id: None,
+        review_threshold: 70,
     };
 
     enqueue_new_user_audit_job(pool, params)
@@ -1457,6 +1461,7 @@ async fn assert_new_user_audit_generation_finalizer_retries_real_transient_sqlst
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1649,6 +1654,7 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1705,6 +1711,7 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
                 first_message_signals: serde_json::json!([]),
                 avatar_score: 0,
                 avatar_signals: serde_json::json!([]),
+                review_threshold: 70,
             },
         )
         .await
@@ -1743,6 +1750,7 @@ async fn assert_audit_generation_is_durable_before_materialization(pool: &PgPool
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1891,6 +1899,7 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await

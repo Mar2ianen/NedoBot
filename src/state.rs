@@ -5,7 +5,7 @@ use teloxide::utils::{rich_text::LlmMarkdownFormatter, time::TimeContext};
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::features::ask::metrics::AskDeliveryMetrics;
+use crate::features::ask_metrics::AskDeliveryMetrics;
 
 #[derive(Clone)]
 pub struct AppState {

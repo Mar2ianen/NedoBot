@@ -34,7 +34,7 @@ pub struct RetrievalCandidate {
 pub struct ExpandedChatContext {
     pub anchor_message_id: i32,
     pub kind: &'static str,
-    pub messages: Vec<crate::features::ask::chat_search::ChatMessage>,
+    pub messages: Vec<crate::features::chat_search::ChatMessage>,
 }
 
 pub async fn expand_shadow_contexts(
@@ -54,17 +54,13 @@ pub async fn expand_shadow_contexts(
         let (kind, messages) = if belongs_to_thread {
             (
                 "reply_thread",
-                crate::features::ask::chat_search::reply_thread(
-                    pool,
-                    chat_id,
-                    candidate.message_id,
-                )
-                .await?,
+                crate::features::chat_search::reply_thread(pool, chat_id, candidate.message_id)
+                    .await?,
             )
         } else {
             (
                 "neighbor_context",
-                crate::features::ask::chat_search::message_context(
+                crate::features::chat_search::message_context(
                     pool,
                     chat_id,
                     candidate.message_id,

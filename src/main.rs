@@ -2,10 +2,13 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
     types::{
-        CallbackQuery, ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
+        ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
         MessageReactionUpdated, ParseMode,
     },
 };
+
+#[cfg(feature = "moderation")]
+use teloxide::types::CallbackQuery;
 
 mod community;
 mod config;
@@ -25,15 +28,23 @@ use db::telegram::{
 };
 use db::{build_pool, migrate};
 use features::chat_retrieval::process_next_embedding_batch;
+#[cfg(feature = "auto-comment")]
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
 use features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
-use features::jobs::policy::{EXTERNAL_ANALYSIS_POLL, POST_HISTORY_POLL, VOICE_TRANSCRIPTION_POLL};
+#[cfg(feature = "moderation")]
+use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
+use features::jobs::policy::POST_HISTORY_POLL;
+#[cfg(feature = "voice")]
+use features::jobs::policy::VOICE_TRANSCRIPTION_POLL;
 use features::memory::service::process_next_history_entry;
+#[cfg(feature = "moderation")]
 use features::new_user_audit::service::process_next_new_user_audit_job;
+#[cfg(feature = "moderation")]
 use features::spam_review::{apply_callback, parse_callback, process_next_review_delivery};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
+#[cfg(feature = "voice")]
 use features::voice::pipeline::{maybe_transcribe_voice, process_next_voice_job};
 use llm::genai_transport::GenAiTransport;
 use state::AppState;
@@ -87,20 +98,24 @@ async fn main() -> anyhow::Result<()> {
         state.pool.clone(),
         state.config.clone(),
     );
+    #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled {
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
+    #[cfg(feature = "moderation")]
     if state.config.community.moderation.enabled {
         spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
     }
+    #[cfg(feature = "auto-comment")]
     if state.config.community.first_comment.enabled {
         spawn_post_comment_worker(bot.clone(), state.clone());
     }
     spawn_post_history_worker(state.clone());
     spawn_chat_retrieval_embedding_worker(state.clone());
+    #[cfg(feature = "voice")]
     spawn_voice_transcription_worker(bot.clone(), state.clone());
 
-    let handler = dptree::entry()
+    let mut handler = dptree::entry()
         .branch(
             Update::filter_message()
                 .branch(
@@ -114,9 +129,12 @@ async fn main() -> anyhow::Result<()> {
         .branch(
             Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
         )
-        .branch(Update::filter_edited_message().endpoint(handle_edited_message))
-        .branch(Update::filter_callback_query().endpoint(handle_callback_query))
-        .branch(Update::filter_chat_member().endpoint(handle_chat_member));
+        .branch(Update::filter_edited_message().endpoint(handle_edited_message));
+    #[cfg(feature = "moderation")]
+    {
+        handler = handler.branch(Update::filter_callback_query().endpoint(handle_callback_query));
+    }
+    let handler = handler.branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state, profile_refresh_queue])
@@ -128,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "auto-comment")]
 fn spawn_post_comment_worker(bot: teloxide::adaptors::DefaultParseMode<Bot>, state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -195,6 +214,7 @@ fn spawn_chat_retrieval_embedding_worker(state: AppState) {
     });
 }
 
+#[cfg(feature = "voice")]
 fn spawn_voice_transcription_worker(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     state: AppState,
@@ -234,9 +254,13 @@ async fn handle_message(
         tracing::debug!(chat_id = msg.chat.id.0, "ignored message from unknown chat");
         return Ok(());
     }
-    if let Err(err) = ingest_message(&state.pool, &msg, &state.config).await {
-        tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
-        return Ok(());
+    match ingest_message(&state.pool, &msg, &state.config).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(err) => {
+            tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
+            return Ok(());
+        }
     }
     enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
 
@@ -244,12 +268,14 @@ async fn handle_message(
         return Ok(());
     }
 
+    #[cfg(feature = "voice")]
     match maybe_transcribe_voice(&bot, &msg, &state).await {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(err) => tracing::error!(%err, "failed to process voice transcription"),
     }
 
+    #[cfg(feature = "auto-comment")]
     if let Err(err) = maybe_comment_post(&msg, &state).await {
         tracing::error!(%err, "failed to process message");
     }
@@ -293,6 +319,7 @@ fn enqueue_message_author_profile_refresh(
     }
 }
 
+#[cfg(feature = "moderation")]
 async fn handle_callback_query(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     query: CallbackQuery,
@@ -332,6 +359,7 @@ async fn handle_callback_query(
     Ok(())
 }
 
+#[cfg(feature = "moderation")]
 fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -355,6 +383,7 @@ fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
     });
 }
 
+#[cfg(feature = "moderation")]
 fn spawn_spam_review_delivery_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -382,7 +411,7 @@ async fn handle_message_reaction(
     reaction: MessageReactionUpdated,
     state: AppState,
 ) -> ResponseResult<()> {
-    if !is_managed_chat(&state.config, reaction.chat.id.0) {
+    if !managed_chat_allows(&state.config, reaction.chat.id.0, |chat| chat.ingest) {
         return Ok(());
     }
     if let Err(err) = save_message_reaction(&state.pool, &reaction).await {
@@ -396,7 +425,7 @@ async fn handle_message_reaction_count(
     reaction_count: MessageReactionCountUpdated,
     state: AppState,
 ) -> ResponseResult<()> {
-    if !is_managed_chat(&state.config, reaction_count.chat.id.0) {
+    if !managed_chat_allows(&state.config, reaction_count.chat.id.0, |chat| chat.ingest) {
         return Ok(());
     }
     if let Err(err) = save_message_reaction_count(&state.pool, &reaction_count).await {
@@ -407,7 +436,7 @@ async fn handle_message_reaction_count(
 }
 
 async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<()> {
-    if !is_managed_chat(&state.config, msg.chat.id.0) {
+    if !managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ingest) {
         return Ok(());
     }
     if let Err(err) = save_edited_telegram_message(&state.pool, &msg, &state.config).await {
@@ -418,7 +447,7 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
 }
 
 async fn handle_chat_member(member: ChatMemberUpdated, state: AppState) -> ResponseResult<()> {
-    if !is_managed_chat(&state.config, member.chat.id.0) {
+    if !managed_chat_allows(&state.config, member.chat.id.0, |chat| chat.ingest) {
         return Ok(());
     }
     if let Err(err) = save_chat_member_event(&state.pool, &member).await {

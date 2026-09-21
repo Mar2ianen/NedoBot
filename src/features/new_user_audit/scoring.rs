@@ -30,6 +30,7 @@ pub struct ScoreComponents {
     pub first_message_signals: Value,
     pub avatar_score: i32,
     pub avatar_signals: Value,
+    pub review_threshold: i32,
 }
 
 #[allow(dead_code)]
@@ -39,8 +40,9 @@ impl ScoreComponents {
     }
 
     pub fn final_level(&self) -> &'static str {
+        let threshold = self.review_threshold.clamp(0, 100);
         match self.final_score() {
-            REVIEW_RISK_THRESHOLD.. => "high",
+            score if score >= threshold => "high",
             40.. => "medium",
             _ => "low",
         }
@@ -67,6 +69,7 @@ pub fn score_assessment(
     baseline_signals: Value,
     assessment: &NewUserAuditAssessment,
     first_message_context: FirstMessageScoreContext,
+    review_threshold: i32,
 ) -> ScoreComponents {
     let (first_message_score, first_message_signals) = assessment
         .first_message_assessment
@@ -86,6 +89,7 @@ pub fn score_assessment(
         first_message_signals,
         avatar_score,
         avatar_signals,
+        review_threshold,
     }
 }
 
@@ -290,6 +294,7 @@ mod tests {
                 spam_similarity: Some(0.9),
                 feminine_profile_name: false,
             },
+            REVIEW_RISK_THRESHOLD,
         );
         assert_eq!(components.first_message_score, 45);
         assert_eq!(components.final_score(), 65);
@@ -314,7 +319,13 @@ mod tests {
             .expect("test assessment must contain first message")
             .offtopic_promo = true;
 
-        let components = score_assessment(0, json!([]), &assessment, Default::default());
+        let components = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            Default::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
 
         assert_eq!(components.first_message_score, 0);
     }
@@ -329,9 +340,24 @@ mod tests {
                 "visual_motifs":["портрет"], "description":"Портрет.", "confidence":0.9
             }"#,
         );
-        let components = score_assessment(67, json!([]), &assessment, Default::default());
+        let components = score_assessment(
+            67,
+            json!([]),
+            &assessment,
+            Default::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
         assert_eq!(components.avatar_score, 3);
         assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(components.final_level(), "high");
+    }
+
+    #[test]
+    fn final_level_uses_the_job_review_threshold() {
+        let assessment = assessment("null", "null");
+        let components = score_assessment(65, json!([]), &assessment, Default::default(), 60);
+
+        assert_eq!(components.final_score(), 65);
         assert_eq!(components.final_level(), "high");
     }
 

@@ -316,6 +316,8 @@ moderation = true
 stats = true
 voice = false
 ask = false
+invite_url_env = "CHAT_INVITE_URL"
+invite_label = "чате"
 
 [moderation]
 enabled = false
@@ -333,6 +335,7 @@ private_enabled = false
 
 [ask]
 enabled = false
+default_chat = "main"
 
 [first_comment]
 enabled = true

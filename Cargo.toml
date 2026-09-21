@@ -9,12 +9,52 @@ license = "MIT"
 # community-only builds explicit and fail-fast when config requests a missing
 # application module.
 default = ["auto-comment", "ask", "voice", "public-mcp", "moderation"]
-auto-comment = []
+auto-comment = ["ask"]
 ask = []
 voice = []
 public-mcp = []
 moderation = []
 spam-sync = []
+
+[[bin]]
+name = "chat_db_mcp"
+path = "src/bin/chat_db_mcp.rs"
+required-features = ["public-mcp"]
+
+[[bin]]
+name = "nedonews_mcp_http"
+path = "src/bin/nedonews_mcp_http.rs"
+required-features = ["public-mcp"]
+
+[[bin]]
+name = "voice_smoke"
+path = "src/bin/voice_smoke.rs"
+required-features = ["voice"]
+
+[[bin]]
+name = "retry_pending_comments"
+path = "src/bin/retry_pending_comments.rs"
+required-features = ["auto-comment"]
+
+[[bin]]
+name = "reconcile_comment_delivery"
+path = "src/bin/reconcile_comment_delivery.rs"
+required-features = ["auto-comment"]
+
+[[test]]
+name = "chat_db_mcp"
+path = "tests/chat_db_mcp.rs"
+required-features = ["ask", "public-mcp"]
+
+[[test]]
+name = "postgres_migrations"
+path = "tests/postgres_migrations.rs"
+required-features = ["auto-comment", "voice", "moderation"]
+
+[[test]]
+name = "rmcp_transport"
+path = "tests/rmcp_transport.rs"
+required-features = ["public-mcp"]
 
 [dependencies]
 anyhow = "1"

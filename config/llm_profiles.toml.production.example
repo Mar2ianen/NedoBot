@@ -319,6 +319,8 @@ moderation = true
 stats = true
 voice = true
 ask = true
+invite_url_env = "CHAT_INVITE_URL"
+invite_label = "чате"
 
 [moderation]
 enabled = true
