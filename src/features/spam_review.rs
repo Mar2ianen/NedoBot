@@ -315,7 +315,8 @@ async fn confirm_review_delivery_payload(
           and status = 'pending'
           and notification_status = 'processing'
           and notification_lease_expires_at > now()
-          and risk_score >= $6
+          and review_threshold = $6
+          and risk_score >= review_threshold
           and (risk_score, risk_signals) is not distinct from ($3, $4::jsonb)
           and (
               notification_delivery_risk_score,
@@ -356,7 +357,10 @@ async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> an
               notification_delivery_risk_signals,
               notification_delivery_review_threshold
           ) is not distinct from ($3, $4::jsonb, $5)
-          and (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
+          and (
+              (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
+              or review_threshold is distinct from $5
+          )
         "#,
     )
     .bind(review.id)
@@ -631,6 +635,7 @@ fn human_marker(marker: &str) -> String {
 fn human_label(label: &str) -> &str {
     match label {
         "recent_high_telegram_id" => "очень свежий Telegram ID",
+        "telegram_id_spam_probability" => "свежий Telegram ID по модели",
         "single_message_account" => "первое и единственное сообщение",
         "very_new_to_chat" => "недавно появился в чате",
         "only_channel_post_comments" => "комментирует только посты канала",
@@ -692,6 +697,10 @@ mod tests {
         assert_eq!(
             human_label("recent_high_telegram_id"),
             "очень свежий Telegram ID"
+        );
+        assert_eq!(
+            human_label("telegram_id_spam_probability"),
+            "свежий Telegram ID по модели"
         );
     }
 }

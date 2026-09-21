@@ -9,7 +9,7 @@ license = "MIT"
 # community-only builds explicit and fail-fast when config requests a missing
 # application module.
 default = ["auto-comment", "ask", "voice", "public-mcp", "moderation"]
-auto-comment = ["ask"]
+auto-comment = []
 ask = []
 voice = []
 public-mcp = []
@@ -49,7 +49,7 @@ required-features = ["ask", "public-mcp"]
 [[test]]
 name = "postgres_migrations"
 path = "tests/postgres_migrations.rs"
-required-features = ["auto-comment", "voice", "moderation"]
+required-features = ["auto-comment", "ask", "voice", "moderation"]
 
 [[test]]
 name = "rmcp_transport"

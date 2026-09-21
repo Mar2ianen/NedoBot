@@ -2190,6 +2190,39 @@ async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(poo
             .kind(),
         ErrorKind::WouldBlock
     );
+
+    query("update spam_review_requests set notification_status = 'pending', notification_lease_expires_at = null, risk_score = 80 where id = $1")
+        .bind(lowered_claim.id)
+        .execute(pool)
+        .await
+        .expect("threshold CAS fixture must be returned to pending");
+    let threshold_claim = claim_next_review_delivery(pool)
+        .await
+        .expect("threshold-changed review must be claimable")
+        .expect("threshold-changed review must be claimed");
+    query("update spam_review_requests set review_threshold = 90 where id = $1")
+        .bind(threshold_claim.id)
+        .execute(pool)
+        .await
+        .expect("review threshold must be changeable while claimed");
+    send_review(&bot, pool, &threshold_claim)
+        .await
+        .expect("threshold-changed payload must be skipped before Telegram delivery");
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("threshold-changed payload must not open a Telegram connection")
+            .kind(),
+        ErrorKind::WouldBlock
+    );
+    let threshold_state: (String, bool, i32) = query_as(
+        "select notification_status, notification_lease_expires_at is null, review_threshold from spam_review_requests where id = $1",
+    )
+    .bind(threshold_claim.id)
+    .fetch_one(pool)
+    .await
+    .expect("threshold-changed review state must be readable");
+    assert_eq!(threshold_state, ("pending".into(), true, 90));
 }
 
 async fn assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(pool: &PgPool) {
