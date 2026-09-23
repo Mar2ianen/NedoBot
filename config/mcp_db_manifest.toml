@@ -1194,6 +1194,14 @@ nullable = true
 pg_type = "double precision"
 nullable = true
 
+[tables.telegram_new_user_profile_audits.columns.telegram_user_id_risk_model_version]
+pg_type = "text"
+nullable = true
+
+[tables.telegram_new_user_profile_audits.columns.telegram_user_id_spam_probability]
+pg_type = "double precision"
+nullable = true
+
 [tables.telegram_new_user_profile_audits.columns.top_level_message_count]
 pg_type = "bigint"
 nullable = true
