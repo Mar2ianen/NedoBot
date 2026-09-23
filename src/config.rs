@@ -1174,6 +1174,16 @@ mod tests {
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[test]
+    fn committed_production_profile_has_valid_community_config() {
+        let profiles = LlmProfiles::from_toml(include_str!(
+            "../config/llm_profiles.toml.production.example"
+        ))
+        .unwrap();
+
+        community_config_from_profiles(&profiles).unwrap();
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         original_value: Option<OsString>,
