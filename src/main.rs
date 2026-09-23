@@ -39,6 +39,8 @@ use features::jobs::policy::VOICE_TRANSCRIPTION_POLL;
 use features::memory::service::process_next_history_entry;
 #[cfg(feature = "moderation")]
 use features::new_user_audit::service::process_next_new_user_audit_job;
+#[cfg(feature = "spam-sync")]
+use features::spam_reputation::SpamReputationStore;
 #[cfg(feature = "moderation")]
 use features::spam_review::{apply_callback, parse_callback, process_next_review_delivery};
 use features::user_profiles::enrichment::{
@@ -92,7 +94,42 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = warn_if_reaction_updates_unavailable(&bot, &config).await {
         tracing::warn!(%err, "failed to check reaction update availability");
     }
+    #[cfg(feature = "spam-sync")]
+    let spam_reputation_store = if config.community.spam_reputation.enabled {
+        let path = config
+            .community
+            .spam_reputation
+            .sqlite_path
+            .as_deref()
+            .expect("enabled spam reputation config was validated");
+        let store = SpamReputationStore::connect(path).await?;
+        let chat_ids = community_reputation_chat_ids(&config);
+        match store
+            .synchronize_instance(&pool, &config.community.instance.id, &chat_ids)
+            .await
+        {
+            Ok(summary) => tracing::info!(
+                spammer_count = summary.spammer_count,
+                source_decision_count = summary.source_decision_count,
+                "synchronized shared spam reputation at startup"
+            ),
+            Err(err) => {
+                tracing::warn!(%err, "initial shared spam reputation sync failed; background worker will retry")
+            }
+        }
+        Some(store)
+    } else {
+        None
+    };
+
     let state = AppState::new(pool, config);
+    #[cfg(feature = "spam-sync")]
+    let state = match spam_reputation_store {
+        Some(store) => state.with_spam_reputation(store),
+        None => state,
+    };
+    #[cfg(feature = "spam-sync")]
+    spawn_spam_reputation_worker(state.clone());
     let profile_refresh_queue = spawn_profile_refresh_workers(
         bot.inner().clone(),
         state.pool.clone(),
@@ -144,6 +181,41 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+#[cfg(feature = "spam-sync")]
+fn community_reputation_chat_ids(config: &Config) -> Vec<i64> {
+    config
+        .community
+        .chats
+        .values()
+        .map(|chat| chat.id)
+        .collect()
+}
+
+#[cfg(feature = "spam-sync")]
+fn spawn_spam_reputation_worker(state: AppState) {
+    let Some(store) = state.spam_reputation.clone() else {
+        return;
+    };
+    let chat_ids = community_reputation_chat_ids(&state.config);
+    let instance_id = state.config.community.instance.id.clone();
+    tokio::spawn(async move {
+        loop {
+            match store
+                .synchronize_instance(&state.pool, &instance_id, &chat_ids)
+                .await
+            {
+                Ok(summary) => tracing::debug!(
+                    spammer_count = summary.spammer_count,
+                    source_decision_count = summary.source_decision_count,
+                    "shared spam reputation synchronized"
+                ),
+                Err(err) => tracing::warn!(%err, "shared spam reputation sync failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
 }
 
 #[cfg(feature = "auto-comment")]

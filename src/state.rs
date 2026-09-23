@@ -6,6 +6,8 @@ use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::features::ask_metrics::AskDeliveryMetrics;
+#[cfg(feature = "spam-sync")]
+use crate::features::spam_reputation::SpamReputationStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,6 +18,8 @@ pub struct AppState {
     pub ask_slots: Arc<Semaphore>,
     pub drafter_limiter: InProcessRateLimiter,
     pub ask_delivery_metrics: Arc<AskDeliveryMetrics>,
+    #[cfg(feature = "spam-sync")]
+    pub spam_reputation: Option<Arc<SpamReputationStore>>,
 }
 
 impl AppState {
@@ -32,6 +36,14 @@ impl AppState {
             ask_slots: Arc::new(Semaphore::new(ask_concurrency)),
             drafter_limiter: InProcessRateLimiter::default(),
             ask_delivery_metrics: Arc::new(AskDeliveryMetrics::default()),
+            #[cfg(feature = "spam-sync")]
+            spam_reputation: None,
         }
+    }
+
+    #[cfg(feature = "spam-sync")]
+    pub fn with_spam_reputation(mut self, store: SpamReputationStore) -> Self {
+        self.spam_reputation = Some(Arc::new(store));
+        self
     }
 }

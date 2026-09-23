@@ -98,6 +98,7 @@ struct NewUserFeatures {
     username: Option<String>,
     username_reuse_count: i64,
     username_reuse_spammer_count: i64,
+    shared_spammer_identity: bool,
     first_name: Option<String>,
     last_name: Option<String>,
     display_name: Option<String>,
@@ -211,6 +212,7 @@ impl WarningStrength {
 enum SpamClass {
     AdultPersonalChannel,
     ForeignInviteLink,
+    KnownSpammer,
     LlmProfileBait,
     PromoDmBait,
     LinkDropper,
@@ -218,10 +220,11 @@ enum SpamClass {
 }
 
 impl SpamClass {
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::AdultPersonalChannel,
             Self::ForeignInviteLink,
+            Self::KnownSpammer,
             Self::LlmProfileBait,
             Self::PromoDmBait,
             Self::LinkDropper,
@@ -233,6 +236,7 @@ impl SpamClass {
         match self {
             SpamClass::AdultPersonalChannel => "adult_personal_channel_promo",
             SpamClass::ForeignInviteLink => "foreign_invite_link_spam",
+            SpamClass::KnownSpammer => "known_spammer_identity",
             SpamClass::LlmProfileBait => "llm_profile_bait",
             SpamClass::PromoDmBait => "promo_dm_bait",
             SpamClass::LinkDropper => "link_dropper",
@@ -335,7 +339,14 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
     chat_id: i64,
     telegram_user_id: i64,
 ) -> anyhow::Result<()> {
-    let Some(features) = load_features(pool, chat_id, telegram_user_id).await? else {
+    let Some(features) = load_features(
+        pool,
+        chat_id,
+        telegram_user_id,
+        &runtime_config.community.instance.id,
+    )
+    .await?
+    else {
         return Ok(());
     };
     let analysis_config = NewUserAnalysisConfig::from_runtime(runtime_config);
@@ -400,6 +411,7 @@ fn project_unified_user_audit_material_revision(
             "display_name": bounded_audit_text(features.display_name.as_deref()),
             "bio_preview": bounded_audit_text(features.bio.as_deref()),
             "profile_photo_unique_id": features.profile_photo_file_unique_id,
+            "shared_spammer_identity": features.shared_spammer_identity,
         },
         "first_message": bounded_audit_text(features.first_message_text.as_deref()),
         "personal_channel": {
@@ -493,6 +505,7 @@ fn project_unified_user_audit_snapshot(
                     model,
                 ))
             }),
+            "shared_spammer_identity": features.shared_spammer_identity,
             "score": risk.score,
             "level": risk.level,
             "primary_class": risk.primary_class,
@@ -545,6 +558,7 @@ async fn load_features(
     pool: &PgPool,
     chat_id: i64,
     telegram_user_id: i64,
+    instance_id: &str,
 ) -> anyhow::Result<Option<NewUserFeatures>> {
     let row = sqlx::query(
         r#"
@@ -658,6 +672,12 @@ async fn load_features(
             p.username,
             coalesce(uns.reuse_count, 0)::bigint as username_reuse_count,
             coalesce(uns.reuse_spammer_count, 0)::bigint as username_reuse_spammer_count,
+            exists (
+                select 1
+                from shared_spam_reputation r
+                where r.telegram_user_id = cu.telegram_user_id
+                  and r.source_instance_id <> $3
+            ) as shared_spammer_identity,
             p.first_name,
             p.last_name,
             nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') as display_name,
@@ -707,7 +727,13 @@ async fn load_features(
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
-                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+                count(*) filter (
+                    where coalesce(cu2.is_spammer, false)
+                       or exists (
+                            select 1 from shared_spam_reputation r
+                            where r.telegram_user_id = p2.telegram_user_id
+                       )
+                )::bigint as reuse_spammer_count
             from telegram_user_profiles p2
             left join telegram_chat_users cu2
               on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
@@ -718,7 +744,13 @@ async fn load_features(
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
-                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+                count(*) filter (
+                    where coalesce(cu2.is_spammer, false)
+                       or exists (
+                            select 1 from shared_spam_reputation r
+                            where r.telegram_user_id = p2.telegram_user_id
+                       )
+                )::bigint as reuse_spammer_count
             from telegram_user_profiles p2
             left join telegram_chat_users cu2
               on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
@@ -738,6 +770,7 @@ async fn load_features(
     )
     .bind(chat_id)
     .bind(telegram_user_id)
+    .bind(instance_id)
     .fetch_optional(pool)
     .await?;
 
@@ -795,6 +828,7 @@ async fn load_features(
             username: row.get("username"),
             username_reuse_count: row.get("username_reuse_count"),
             username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
+            shared_spammer_identity: row.get("shared_spammer_identity"),
             first_name: row.get("first_name"),
             last_name: row.get("last_name"),
             display_name: row.get("display_name"),
@@ -864,6 +898,7 @@ fn analyze_new_or_low_activity_user(
     let username_stats = username_stats(features.username.as_deref());
     let mut risk = RiskAccumulator::default();
 
+    risk.add_optional(shared_spammer_signal(features.shared_spammer_identity));
     risk.add_optional(message_count_signal(features));
     risk.add_optional(link_signal(features));
     risk.add_optional(foreign_invite_link_signal(features));
@@ -908,6 +943,15 @@ fn message_count_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         }),
         _ => None,
     }
+}
+
+fn shared_spammer_signal(is_shared_spammer: bool) -> Option<RiskSignal> {
+    is_shared_spammer.then_some(RiskSignal {
+        class: SpamClass::KnownSpammer,
+        coefficient: 70,
+        label: "shared_spammer_identity",
+        reason: "Telegram user id was confirmed as spam in another bot instance",
+    })
 }
 
 fn link_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1646,6 +1690,7 @@ async fn save_audit_in_transaction(
         "profile_photo_reuse_count": features.profile_photo_reuse_count,
         "username_reuse_count": features.username_reuse_count,
         "username_reuse_spammer_count": features.username_reuse_spammer_count,
+        "shared_spammer_identity": features.shared_spammer_identity,
         "first_name_feminine_pattern": looks_like_feminine_first_name(features.first_name.as_deref()),
         "chat_context": {
             "only_replies_or_comments": only_replies_or_comments(features),
@@ -2331,6 +2376,15 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_spammer_identity_is_a_review_threshold_signal() {
+        let signal = shared_spammer_signal(true).expect("shared spammer must have a signal");
+        assert_eq!(signal.class, SpamClass::KnownSpammer);
+        assert_eq!(signal.coefficient, 70);
+        assert_eq!(signal.label, "shared_spammer_identity");
+        assert!(shared_spammer_signal(false).is_none());
+    }
 
     #[test]
     fn telegram_id_risk_signal_scales_configured_four_pl_probability() {

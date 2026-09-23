@@ -329,7 +329,7 @@ review_chat = "main"
 reviewer_user_ids = [5939287960]
 
 [spam_reputation]
-enabled = false
+enabled = true
 sqlite_path = "/var/lib/nedobot/spam-reputation.sqlite"
 
 [voice]

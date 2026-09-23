@@ -20,6 +20,8 @@ pub mod new_user_analysis;
 #[cfg(feature = "moderation")]
 pub mod new_user_audit;
 pub mod search;
+#[cfg(feature = "spam-sync")]
+pub mod spam_reputation;
 #[cfg(feature = "moderation")]
 pub mod spam_review;
 pub mod stats;
