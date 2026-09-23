@@ -361,8 +361,8 @@ fn strip_html_tags(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::ask::chat_search::ChatMessage;
     use crate::features::chat_retrieval::ExpandedChatContext;
+    use crate::features::chat_search::ChatMessage;
     use crate::features::search::types::SearchQuery;
     use serde_json::Value;
 

@@ -306,4 +306,25 @@ pg_type = "bigint"
         .unwrap();
         assert!(PublicCatalog::load(file.path().to_str().unwrap()).is_err());
     }
+
+    #[test]
+    fn committed_manifest_reviews_new_user_risk_columns() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/mcp_db_manifest.toml");
+        let catalog = PublicCatalog::load(path).unwrap();
+        let audit = catalog
+            .tables
+            .get("telegram_new_user_profile_audits")
+            .expect("new-user audit view must remain in the public MCP catalog");
+
+        for column in [
+            "telegram_user_id_is_recent",
+            "telegram_user_id_rank_ratio",
+            "risk_signal_breakdown",
+        ] {
+            assert!(
+                audit.columns.contains_key(column),
+                "MCP manifest must review {column}"
+            );
+        }
+    }
 }

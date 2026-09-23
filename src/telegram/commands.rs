@@ -11,16 +11,21 @@ pub enum Command {
     Db,
     #[command(description = "показать custom_emoji_id из сообщения")]
     EmojiIds,
+    #[cfg(feature = "auto-comment")]
     #[command(description = "проверить формат первого комментария")]
     FormatTest(String),
     #[command(description = "показать последние заметки памяти")]
     Memory,
+    #[cfg(feature = "voice")]
     #[command(description = "расшифровать voice, audio или кружок в reply")]
     Transcribe,
+    #[cfg(feature = "ask")]
     #[command(description = "спросить помощника по истории чата; /ask <вопрос>")]
     Ask(String),
+    #[cfg(feature = "ask")]
     #[command(description = "добавить общую заметку чата; /chat_note <текст>")]
     ChatNote(String),
+    #[cfg(feature = "ask")]
     #[command(description = "добавить заметку о пользователе reply; /user_note <текст>")]
     UserNote(String),
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]

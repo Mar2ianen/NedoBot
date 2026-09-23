@@ -10,11 +10,11 @@ use tokio::sync::mpsc;
 use crate::{
     config::Config,
     db::telegram::{mark_user_profile_refresh_error, user_profile_needs_refresh},
-    features::{
-        new_user_analysis::enqueue_new_user_audit_for_profile_refresh,
-        user_profiles::service::refresh_profile,
-    },
+    features::user_profiles::service::refresh_profile,
 };
+
+#[cfg(feature = "moderation")]
+use crate::features::new_user_analysis::enqueue_new_user_audit_for_profile_refresh;
 
 const PROFILE_REFRESH_QUEUE_CAPACITY: usize = 256;
 
@@ -29,7 +29,7 @@ pub enum ProfileRefreshEnqueueResult {
 #[derive(Clone)]
 pub struct ProfileRefreshQueue {
     sender: mpsc::Sender<ProfileRefreshJob>,
-    queued_user_ids: Arc<Mutex<HashSet<i64>>>,
+    queued_jobs: Arc<Mutex<HashSet<(i64, i64)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -48,17 +48,18 @@ impl ProfileRefreshQueue {
         let (sender, receiver) = mpsc::channel(capacity);
         let queue = Self {
             sender,
-            queued_user_ids: Arc::new(Mutex::new(HashSet::new())),
+            queued_jobs: Arc::new(Mutex::new(HashSet::new())),
         };
         (queue, Arc::new(tokio::sync::Mutex::new(receiver)))
     }
 
     pub fn try_enqueue(&self, chat_id: i64, user_id: i64) -> ProfileRefreshEnqueueResult {
-        let mut queued_user_ids = self
-            .queued_user_ids
+        let mut queued_jobs = self
+            .queued_jobs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !queued_user_ids.insert(user_id) {
+        let key = (chat_id, user_id);
+        if !queued_jobs.insert(key) {
             return ProfileRefreshEnqueueResult::Coalesced;
         }
 
@@ -66,21 +67,21 @@ impl ProfileRefreshQueue {
         match self.sender.try_send(job) {
             Ok(()) => ProfileRefreshEnqueueResult::Queued,
             Err(mpsc::error::TrySendError::Full(job)) => {
-                queued_user_ids.remove(&job.user_id);
+                queued_jobs.remove(&(job.chat_id, job.user_id));
                 ProfileRefreshEnqueueResult::Full
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
-                queued_user_ids.remove(&job.user_id);
+                queued_jobs.remove(&(job.chat_id, job.user_id));
                 ProfileRefreshEnqueueResult::Closed
             }
         }
     }
 
-    fn mark_completed(&self, user_id: i64) {
-        self.queued_user_ids
+    fn mark_completed(&self, job: ProfileRefreshJob) {
+        self.queued_jobs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&user_id);
+            .remove(&(job.chat_id, job.user_id));
     }
 }
 
@@ -100,7 +101,7 @@ pub fn spawn_profile_refresh_workers(
         tokio::spawn(async move {
             while let Some(job) = receiver.lock().await.recv().await {
                 process_profile_refresh_job(&bot, &pool, &config, job).await;
-                queue.mark_completed(job.user_id);
+                queue.mark_completed(job);
             }
             tracing::warn!(worker_index, "profile refresh queue worker stopped");
         });
@@ -115,35 +116,36 @@ async fn process_profile_refresh_job(
     config: &Config,
     job: ProfileRefreshJob,
 ) {
-    match user_profile_needs_refresh(pool, job.user_id).await {
-        Ok(true) => {}
-        Ok(false) => return,
+    let should_refresh = match user_profile_needs_refresh(pool, job.user_id).await {
+        Ok(should_refresh) => should_refresh,
         Err(err) => {
             tracing::warn!(%err, user_id = job.user_id, "failed to check user profile refresh state");
-            return;
+            false
         }
+    };
+
+    if should_refresh && let Err(err) = refresh_profile(bot, pool, job.user_id).await {
+        let message = err.to_string();
+        if let Err(save_err) = mark_user_profile_refresh_error(pool, job.user_id, &message).await {
+            tracing::warn!(%save_err, user_id = job.user_id, "failed to save profile refresh error");
+        }
+        tracing::warn!(%err, user_id = job.user_id, "failed to refresh message author profile");
     }
 
-    match refresh_profile(bot, pool, job.user_id).await {
-        Ok(()) => {
-            process_refreshed_profile(pool, config, job).await;
-        }
-        Err(err) => {
-            let message = err.to_string();
-            if let Err(save_err) =
-                mark_user_profile_refresh_error(pool, job.user_id, &message).await
-            {
-                tracing::warn!(%save_err, user_id = job.user_id, "failed to save profile refresh error");
-            }
-            tracing::warn!(%err, user_id = job.user_id, "failed to refresh message author profile");
-        }
-    }
+    // Profile freshness is global, while the audit is keyed by (chat, user).
+    // A fresh profile must not suppress the first audit in another community chat.
+    process_profile_audit(pool, config, job).await;
 }
 
-async fn process_refreshed_profile(pool: &PgPool, config: &Config, job: ProfileRefreshJob) {
+async fn process_profile_audit(pool: &PgPool, config: &Config, job: ProfileRefreshJob) {
+    #[cfg(not(feature = "moderation"))]
+    let _ = (pool, config, job);
+
+    #[cfg(feature = "moderation")]
     if config.new_user_audit_enabled
+        && config.chat_allows(job.chat_id, |chat| chat.moderation)
         && let Err(err) =
-            enqueue_new_user_audit_for_profile_refresh(pool, job.chat_id, job.user_id).await
+            enqueue_new_user_audit_for_profile_refresh(pool, config, job.chat_id, job.user_id).await
     {
         tracing::warn!(%err, user_id = job.user_id, "failed to save unified new user audit baseline and job");
     }
@@ -166,13 +168,17 @@ mod tests {
             ProfileRefreshEnqueueResult::Coalesced
         );
         assert_eq!(
+            queue.try_enqueue(-1002, 42),
+            ProfileRefreshEnqueueResult::Full
+        );
+        assert_eq!(
             queue.try_enqueue(-1001, 43),
             ProfileRefreshEnqueueResult::Full
         );
 
         let job = receiver.lock().await.recv().await.unwrap();
         assert_eq!(job.user_id, 42);
-        queue.mark_completed(job.user_id);
+        queue.mark_completed(job);
 
         assert_eq!(
             queue.try_enqueue(-1001, 42),

@@ -4,6 +4,58 @@ version = "0.12.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+# Keep the current Nedonews binary as the default release profile while making
+# community-only builds explicit and fail-fast when config requests a missing
+# application module.
+default = ["auto-comment", "ask", "voice", "public-mcp", "moderation", "spam-sync"]
+auto-comment = []
+ask = []
+voice = []
+public-mcp = []
+moderation = []
+spam-sync = []
+
+[[bin]]
+name = "chat_db_mcp"
+path = "src/bin/chat_db_mcp.rs"
+required-features = ["public-mcp"]
+
+[[bin]]
+name = "nedonews_mcp_http"
+path = "src/bin/nedonews_mcp_http.rs"
+required-features = ["public-mcp"]
+
+[[bin]]
+name = "voice_smoke"
+path = "src/bin/voice_smoke.rs"
+required-features = ["voice"]
+
+[[bin]]
+name = "retry_pending_comments"
+path = "src/bin/retry_pending_comments.rs"
+required-features = ["auto-comment"]
+
+[[bin]]
+name = "reconcile_comment_delivery"
+path = "src/bin/reconcile_comment_delivery.rs"
+required-features = ["auto-comment"]
+
+[[test]]
+name = "chat_db_mcp"
+path = "tests/chat_db_mcp.rs"
+required-features = ["ask", "public-mcp"]
+
+[[test]]
+name = "postgres_migrations"
+path = "tests/postgres_migrations.rs"
+required-features = ["auto-comment", "ask", "voice", "moderation"]
+
+[[test]]
+name = "rmcp_transport"
+path = "tests/rmcp_transport.rs"
+required-features = ["public-mcp"]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
@@ -18,7 +70,7 @@ rmcp = { version = "=3.0.0-beta.3", default-features = false, features = ["serve
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "postgres", "sqlite", "chrono", "uuid"] }
 teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "35bd93175a6dc7cc05ec100caa4b44cdd72530db", features = ["macros", "drafter", "rich-text"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-std", "io-util", "process", "sync", "time", "test-util"] }
