@@ -41,11 +41,15 @@ deploy-YYYY-MM-DD-scope.
 
 ## Выкладка
 
-Сначала сделать dry-run. --delete не должен затронуть секреты, persistent
-static-файлы, backups, дампы и локальный build cache:
+Сначала сделать dry-run. Не использовать `--delete`: production checkout может
+содержать SQLx migration-файлы, уже применённые к БД, но отсутствующие в текущем
+source snapshot. Удаление такого файла приведёт к `VersionMissing` при следующем
+старте. Устаревшие исходники удалять только отдельной проверенной процедурой
+после сверки `_sqlx_migrations` обеих production-БД. Секреты, persistent
+static-файлы, backups, дампы и локальный build cache исключаются явно:
 
 ```bash
-rsync -azn --delete \
+rsync -azn \
   --exclude target \
   --exclude .git \
   --exclude '.env*' \
@@ -60,7 +64,7 @@ rsync -azn --delete \
 machine-specific `docs/LOCAL_WORKFLOW.md`:
 
 ```bash
-rsync -az --delete \
+rsync -az \
   --exclude target \
   --exclude .git \
   --exclude '.env*' \
