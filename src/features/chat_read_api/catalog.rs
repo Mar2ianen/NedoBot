@@ -326,5 +326,14 @@ pg_type = "bigint"
                 "MCP manifest must review {column}"
             );
         }
+
+        assert_eq!(
+            audit.columns["telegram_user_id_risk_model_version"].pg_type,
+            "text"
+        );
+        assert_eq!(
+            audit.columns["telegram_user_id_spam_probability"].pg_type,
+            "double precision"
+        );
     }
 }
