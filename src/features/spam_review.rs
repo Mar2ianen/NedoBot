@@ -559,6 +559,19 @@ pub async fn apply_callback(
         sqlx::query("update telegram_chat_users set is_spammer = true, spam_score = greatest(spam_score, 100), spam_last_marked_at = now(), spam_reason = 'Owner-confirmed spammer', spam_type = 'llm_generic_comment', spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', '1'::jsonb, true), updated_at = now() where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = 'Owner-confirmed spammer', spam_source = 'manual_owner_confirmation', spam_type = coalesce(spam_type, 'llm_generic_comment') where chat_id = $1 and user_id = $2 and source_channel_id is null").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("update telegram_chat_users set spam_message_count = (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null), spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', to_jsonb((select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null)), true) where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
+    } else if decision == "normal" {
+        let chat_id: i64 = row.get("chat_id");
+        let user_id: i64 = row.get("telegram_user_id");
+        sqlx::query("update telegram_chat_users set is_spammer = false, spam_score = 0, spam_last_marked_at = null, spam_reason = null, spam_type = null, spam_types = coalesce(spam_types, '{}'::jsonb) - 'llm_generic_comment', updated_at = now() where chat_id = $1 and telegram_user_id = $2")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("update telegram_messages set spam_marked_at = null, spam_reason = null, spam_source = null where chat_id = $1 and user_id = $2 and source_channel_id is null and spam_source = 'manual_owner_confirmation'")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(Some(if decision == "spam" {
@@ -634,6 +647,7 @@ fn human_marker(marker: &str) -> String {
 
 fn human_label(label: &str) -> &str {
     match label {
+        "shared_spammer_identity" => "ID уже помечен спамером в другом инстансе",
         "recent_high_telegram_id" => "очень свежий Telegram ID",
         "telegram_id_spam_probability" => "свежий Telegram ID по модели",
         "single_message_account" => "первое и единственное сообщение",
@@ -694,6 +708,10 @@ mod tests {
 
     #[test]
     fn renders_human_signal() {
+        assert_eq!(
+            human_label("shared_spammer_identity"),
+            "ID уже помечен спамером в другом инстансе"
+        );
         assert_eq!(
             human_label("recent_high_telegram_id"),
             "очень свежий Telegram ID"

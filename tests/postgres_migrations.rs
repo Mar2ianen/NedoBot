@@ -2520,6 +2520,16 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         public_messages_view.as_deref(),
         Some("mcp_public.telegram_messages")
     );
+
+    let spam_reputation_table: Option<String> =
+        query_scalar("select to_regclass('public.shared_spam_reputation')::text")
+            .fetch_one(pool)
+            .await
+            .expect("shared spam reputation table lookup must succeed");
+    assert_eq!(
+        spam_reputation_table.as_deref(),
+        Some("shared_spam_reputation")
+    );
 }
 
 async fn assert_sent_comment_requires_sent_at(pool: &PgPool) {
