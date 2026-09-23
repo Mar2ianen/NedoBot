@@ -1,20 +1,10 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use std::{
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
-use teloxide::{
-    net::Download,
-    prelude::*,
-    types::{FileId, MessageId},
-};
-use tokio::io::AsyncWrite;
+use teloxide::{prelude::*, types::MessageId};
 
 use crate::config::Config;
-use crate::db::telegram::save_telegram_message;
 use crate::features::first_comment::candidate::comment_candidate;
-use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
+use crate::features::first_comment::clean::{
+    clean_post_for_llm_with_marker, should_generate_comment_with_marker,
+};
 use crate::features::first_comment::draft::{
     FirstCommentDraft, first_comment_output_schema, parse_first_comment_draft,
     validate_first_comment_draft_with_search_policy_and_chat,
@@ -31,6 +21,7 @@ use crate::features::first_comment::repo::{
     mark_post_comment_delivery_unknown, mark_post_comment_pre_send_failed,
     mark_post_comment_send_rejected,
 };
+use crate::features::ingest::ingest_message;
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::service::load_relevant_memory_notes;
 use crate::features::search::repo::{
@@ -41,13 +32,17 @@ use crate::features::search::service::run_search;
 use crate::features::search::types::SearchContext;
 use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::state::AppState;
-use crate::telegram::render::{send_html, send_html_reply};
+use crate::telegram::{
+    media::download_photo_base64,
+    render::{send_html, send_html_reply},
+};
 
 pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Result<()> {
     let pool = &state.pool;
     let config = &state.config;
-
-    save_telegram_message(pool, msg, config).await?;
+    if !config.community.first_comment.enabled {
+        return Ok(());
+    }
 
     // The bot should never react to random chat messages. A valid target is only
     // Telegram's automatic channel post copy in the linked discussion chat.
@@ -57,7 +52,7 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
 
     // Editorial posts carry the VK/MAX footer. Ads usually do not, so the marker
     // doubles as a cheap allowlist and keeps promotional posts out of the chat CTA.
-    if !should_generate_comment(candidate.post_text, config) {
+    if !should_generate_comment_with_marker(candidate.post_text, &candidate.post_signature_marker) {
         tracing::info!(
             discussion_message_id = msg.id.0,
             "skip post without signature marker"
@@ -65,14 +60,15 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
         return Ok(());
     }
 
-    let clean_post = clean_post_for_llm(candidate.post_text, config);
+    let clean_post =
+        clean_post_for_llm_with_marker(candidate.post_text, &candidate.post_signature_marker);
     let image = msg
         .photo()
         .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height));
     let job_id = create_post_comment_job(
         pool,
         CreatePostCommentJobParams {
-            discussion_chat_id: config.discussion_chat_id,
+            discussion_chat_id: msg.chat.id.0,
             discussion_message_id: msg.id.0,
             source_channel_id: candidate.source_channel_id,
             source_message_id: candidate.source_message_id.0,
@@ -188,10 +184,12 @@ async fn process_post_comment_job(
 ) -> Result<JobOutcome, CommentErrorKind> {
     let pool = &state.pool;
     let config = &state.config;
+    let render_config =
+        config.first_comment_render_config(job.discussion_chat_id, job.source_channel_id);
     let image_base64 = download_photo_base64(bot, job.image_file_id.as_deref(), config)
         .await
         .map_err(|_| CommentErrorKind::ImageUnavailable)?;
-    let chat_member_count = get_chat_member_count(bot, config).await;
+    let chat_member_count = get_chat_member_count(bot, job.discussion_chat_id).await;
     let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text)
         .await
         .map_err(|_| CommentErrorKind::Transient)?;
@@ -209,7 +207,7 @@ async fn process_post_comment_job(
         match crate::features::chat_retrieval::run_shadow_retrieval(
             pool,
             config,
-            config.discussion_chat_id,
+            job.discussion_chat_id,
             plan,
         )
         .await
@@ -221,7 +219,7 @@ async fn process_post_comment_job(
                 }
                 match crate::features::chat_retrieval::expand_shadow_contexts(
                     pool,
-                    config.discussion_chat_id,
+                    job.discussion_chat_id,
                     &candidates,
                 )
                 .await
@@ -253,7 +251,7 @@ async fn process_post_comment_job(
         .collect::<Vec<_>>();
     let chat_targets = crate::features::first_comment::repo::load_chat_link_targets(
         pool,
-        config.discussion_chat_id,
+        job.discussion_chat_id,
         &chat_candidate_ids,
     )
     .await
@@ -292,7 +290,7 @@ async fn process_post_comment_job(
     });
     let validation_results = search_context.results.clone();
     let source_link_available = directives.source_link_available();
-    let source_policy = config.clone();
+    let source_policy = render_config.clone();
     let allowed_chat_message_ids = if config.chat_retrieval_evidence_enabled {
         chat_candidate_ids.clone()
     } else {
@@ -364,7 +362,7 @@ async fn process_post_comment_job(
     let prompt_for_log = prompt.compact_for_log();
     let final_html = crate::features::first_comment::render::build_comment_html_with_context(
         &draft.comment,
-        config,
+        &render_config,
         &search_context.results,
         &chat_targets,
     );
@@ -402,7 +400,7 @@ async fn deliver_prepared_post_comment(
         Err(error) => return handle_post_comment_send_error(state, job, &error).await,
     };
 
-    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await {
+    if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
         tracing::warn!(%err, message_id = sent.id.0, "failed to save bot comment message");
     }
 
@@ -551,115 +549,15 @@ async fn send_owner_preview(
     }
 }
 
-pub(crate) async fn download_largest_photo_base64(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    msg: &Message,
-    config: &Config,
-) -> anyhow::Result<Option<String>> {
-    let image_file_id = msg
-        .photo()
-        .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height))
-        .map(|photo| photo.file.id.0.as_str());
-    download_photo_base64(bot, image_file_id, config).await
-}
-
-async fn download_photo_base64(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    image_file_id: Option<&str>,
-    config: &Config,
-) -> anyhow::Result<Option<String>> {
-    let Some(image_file_id) = image_file_id else {
-        return Ok(None);
-    };
-
-    let file = bot.get_file(FileId(image_file_id.to_owned())).await?;
-    let max_bytes = u64::from(config.first_comment_max_image_mb) * 1024 * 1024;
-    if u64::from(file.size) > max_bytes {
-        anyhow::bail!(
-            "post image exceeds configured limit of {} MB",
-            config.first_comment_max_image_mb
-        );
-    }
-    let max_bytes =
-        usize::try_from(max_bytes).map_err(|_| anyhow::anyhow!("image limit is too large"))?;
-    let mut bytes = LimitedBytesWriter::new(max_bytes);
-    bot.download_file(&file.path, &mut bytes).await?;
-
-    Ok(Some(BASE64.encode(bytes.into_inner())))
-}
-
-struct LimitedBytesWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-
-impl LimitedBytesWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(limit.min(1024 * 1024)),
-            limit,
-        }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-impl AsyncWrite for LimitedBytesWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if buf.len() > self.limit.saturating_sub(self.bytes.len()) {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "image exceeds configured download limit",
-            )));
-        }
-
-        self.bytes.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
 async fn get_chat_member_count(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
+    chat_id: i64,
 ) -> Option<u32> {
-    match bot
-        .get_chat_member_count(ChatId(config.discussion_chat_id))
-        .await
-    {
+    match bot.get_chat_member_count(ChatId(chat_id)).await {
         Ok(count) => Some(count),
         Err(err) => {
             tracing::warn!(%err, "failed to get chat member count");
             None
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncWriteExt;
-
-    #[tokio::test]
-    async fn limited_bytes_writer_rejects_overflow() {
-        let mut writer = LimitedBytesWriter::new(4);
-        writer.write_all(b"1234").await.unwrap();
-        let err = writer.write_all(b"5").await.unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(writer.into_inner(), b"1234");
     }
 }

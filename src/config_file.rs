@@ -1,4 +1,171 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub id: String,
+    pub display_name: String,
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub unknown_chat_policy: UnknownChatPolicy,
+    #[serde(default)]
+    pub owners: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownChatPolicy {
+    #[default]
+    Ignore,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatConfig {
+    pub id: i64,
+    #[serde(default)]
+    pub ingest: bool,
+    #[serde(default)]
+    pub moderation: bool,
+    #[serde(default)]
+    pub stats: bool,
+    #[serde(default)]
+    pub voice: bool,
+    #[serde(default)]
+    pub ask: bool,
+    #[serde(default)]
+    pub review_destination: bool,
+    #[serde(default)]
+    pub invite_url_env: Option<String>,
+    #[serde(default)]
+    pub invite_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModerationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub risk_profile: String,
+    #[serde(default)]
+    pub review_chat: Option<String>,
+    #[serde(default)]
+    pub reviewer_user_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpamReputationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub sqlite_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub private_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_chat: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstCommentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub routes: Vec<FirstCommentRoute>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstCommentRoute {
+    pub source_channel_id: i64,
+    pub discussion_chat: String,
+    #[serde(default)]
+    pub post_signature_marker: String,
+    #[serde(default)]
+    pub invite_label: String,
+    #[serde(default)]
+    pub invite_url_env: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub prompt_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicMcpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskProfile {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default = "default_old_user_message_threshold")]
+    pub old_user_message_threshold: i64,
+    #[serde(default = "default_review_threshold")]
+    pub review_threshold: i32,
+    #[serde(default)]
+    pub telegram_id: Option<TelegramIdRiskModel>,
+}
+
+fn default_old_user_message_threshold() -> i64 {
+    5
+}
+
+fn default_review_threshold() -> i32 {
+    70
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramIdRiskModel {
+    pub floor: f64,
+    pub ceil: f64,
+    pub k: f64,
+    pub midpoint_billion: f64,
+    pub version: String,
+}
+
+/// Набор instance/chat policy, общий для одного процесса и одного Telegram bot token.
+/// PostgreSQL и operational jobs остаются локальными для этого instance.
+#[derive(Debug, Clone)]
+pub struct CommunityConfig {
+    pub instance: InstanceConfig,
+    pub telegram: TelegramConfig,
+    pub chats: BTreeMap<String, ChatConfig>,
+    pub moderation: ModerationConfig,
+    pub spam_reputation: SpamReputationConfig,
+    pub voice: VoiceConfig,
+    pub ask: AskConfig,
+    pub first_comment: FirstCommentConfig,
+    pub public_mcp: PublicMcpConfig,
+    pub risk_profiles: BTreeMap<String, RiskProfile>,
+}
 
 /// Несекретные runtime-настройки, хранящиеся рядом с LLM profiles в TOML.
 ///
@@ -7,11 +174,19 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeSettings {
-    pub source_channel_id: i64,
-    pub discussion_chat_id: i64,
+    /// Deprecated compatibility fields. Community scope belongs to the
+    /// top-level instance/chat sections and these fields intentionally have no
+    /// production defaults.
+    #[serde(default)]
+    pub source_channel_id: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub discussion_chat_id: Option<i64>,
     pub render_timezone: String,
-    pub chat_invite_label: String,
-    pub post_signature_marker: String,
+    #[serde(default)]
+    pub chat_invite_label: Option<String>,
+    #[serde(default)]
+    pub post_signature_marker: Option<String>,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
     pub memory_llm_temperature: f32,
@@ -101,11 +276,11 @@ pub struct RuntimeSettings {
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
-            source_channel_id: -1001575496091,
-            discussion_chat_id: -1001932061163,
+            source_channel_id: None,
+            discussion_chat_id: None,
             render_timezone: "Europe/Moscow".to_string(),
-            chat_invite_label: "Присоединяйтесь к чату".to_string(),
-            post_signature_marker: "Не теряем связь".to_string(),
+            chat_invite_label: None,
+            post_signature_marker: None,
             llm_temperature: 0.45,
             llm_max_tokens: 180,
             memory_llm_temperature: 0.2,

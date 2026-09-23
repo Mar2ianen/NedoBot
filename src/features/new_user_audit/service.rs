@@ -120,6 +120,7 @@ async fn materialize_stored_assessment(
         baseline_signals,
         &assessment,
         first_message_context,
+        job.review_threshold,
     );
     let finalized = materialize_new_user_audit_job(pool, job, &components).await?;
     if finalized == CasResult::LeaseLost {
@@ -463,6 +464,7 @@ mod tests {
             input_json,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
             assessment_json: None,
             attempts: 1,
             materialization_attempts: 1,

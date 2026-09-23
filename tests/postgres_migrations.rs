@@ -1141,7 +1141,7 @@ async fn assert_low_risk_review_delivery_is_blocked_by_database(pool: &PgPool) {
     .expect_err("database must reject a low-risk delivery claim");
     assert!(
         error.to_string().contains(
-            "cannot transition spam review request into processing with risk_score below 70"
+            "cannot transition spam review request into processing below its review threshold"
         ),
         "unexpected database error: {error}"
     );
@@ -1160,6 +1160,7 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
         input_json: &input,
         avatar_file_id: None,
         avatar_file_unique_id: None,
+        review_threshold: 70,
     };
     enqueue_new_user_audit_job(pool, params)
         .await
@@ -1174,6 +1175,7 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1269,6 +1271,7 @@ async fn assert_new_user_audit_generation_cas_requires_live_lease_and_current_ve
         input_json: &input,
         avatar_file_id: None,
         avatar_file_unique_id: None,
+        review_threshold: 70,
     };
     let assessment = serde_json::json!({"fixture": "assessment"});
 
@@ -1386,6 +1389,7 @@ async fn assert_new_user_audit_enqueue_version_bump_reopens_completed_materializ
         input_json: &input,
         avatar_file_id: None,
         avatar_file_unique_id: None,
+        review_threshold: 70,
     };
 
     enqueue_new_user_audit_job(pool, params)
@@ -1457,6 +1461,7 @@ async fn assert_new_user_audit_generation_finalizer_retries_real_transient_sqlst
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1649,6 +1654,7 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1705,6 +1711,7 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
                 first_message_signals: serde_json::json!([]),
                 avatar_score: 0,
                 avatar_signals: serde_json::json!([]),
+                review_threshold: 70,
             },
         )
         .await
@@ -1743,6 +1750,7 @@ async fn assert_audit_generation_is_durable_before_materialization(pool: &PgPool
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -1891,6 +1899,7 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
             input_json: &input,
             avatar_file_id: None,
             avatar_file_unique_id: None,
+            review_threshold: 70,
         },
     )
     .await
@@ -2181,6 +2190,39 @@ async fn assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(poo
             .kind(),
         ErrorKind::WouldBlock
     );
+
+    query("update spam_review_requests set notification_status = 'pending', notification_lease_expires_at = null, risk_score = 80 where id = $1")
+        .bind(lowered_claim.id)
+        .execute(pool)
+        .await
+        .expect("threshold CAS fixture must be returned to pending");
+    let threshold_claim = claim_next_review_delivery(pool)
+        .await
+        .expect("threshold-changed review must be claimable")
+        .expect("threshold-changed review must be claimed");
+    query("update spam_review_requests set review_threshold = 90 where id = $1")
+        .bind(threshold_claim.id)
+        .execute(pool)
+        .await
+        .expect("review threshold must be changeable while claimed");
+    send_review(&bot, pool, &threshold_claim)
+        .await
+        .expect("threshold-changed payload must be skipped before Telegram delivery");
+    assert_eq!(
+        listener
+            .accept()
+            .expect_err("threshold-changed payload must not open a Telegram connection")
+            .kind(),
+        ErrorKind::WouldBlock
+    );
+    let threshold_state: (String, bool, i32) = query_as(
+        "select notification_status, notification_lease_expires_at is null, review_threshold from spam_review_requests where id = $1",
+    )
+    .bind(threshold_claim.id)
+    .fetch_one(pool)
+    .await
+    .expect("threshold-changed review state must be readable");
+    assert_eq!(threshold_state, ("pending".into(), true, 90));
 }
 
 async fn assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(pool: &PgPool) {
@@ -2477,6 +2519,16 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
     assert_eq!(
         public_messages_view.as_deref(),
         Some("mcp_public.telegram_messages")
+    );
+
+    let spam_reputation_table: Option<String> =
+        query_scalar("select to_regclass('public.shared_spam_reputation')::text")
+            .fetch_one(pool)
+            .await
+            .expect("shared spam reputation table lookup must succeed");
+    assert_eq!(
+        spam_reputation_table.as_deref(),
+        Some("shared_spam_reputation")
     );
 }
 

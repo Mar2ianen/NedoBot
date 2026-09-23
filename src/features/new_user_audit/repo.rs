@@ -31,6 +31,7 @@ pub struct NewUserAuditJob {
     pub avatar_file_id: Option<String>,
     pub avatar_file_unique_id: Option<String>,
     pub assessment_json: Option<Value>,
+    pub review_threshold: i32,
     /// Monotonic generation claim sequence, used only by generation finalizers.
     pub attempts: i32,
     /// Independent replay claim sequence, used only by materialization finalizers.
@@ -47,6 +48,7 @@ pub struct NewUserAuditJobParams<'a> {
     pub input_json: &'a Value,
     pub avatar_file_id: Option<&'a str>,
     pub avatar_file_unique_id: Option<&'a str>,
+    pub review_threshold: i32,
 }
 
 #[allow(dead_code)] // Используется PostgreSQL migration/integration harness.
@@ -74,41 +76,42 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
         insert into new_user_audit_jobs
             (
                 chat_id, telegram_user_id, snapshot_hash, prompt_version, input_json,
-                avatar_file_id, avatar_file_unique_id, materialization_version
+                avatar_file_id, avatar_file_unique_id, review_threshold, materialization_version
             )
-        values ($1, $2, $3, $4, $5, $6, $7, $8)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         on conflict (chat_id, telegram_user_id, snapshot_hash, prompt_version)
         do update set
             input_json = excluded.input_json,
             avatar_file_id = excluded.avatar_file_id,
             avatar_file_unique_id = excluded.avatar_file_unique_id,
-            materialization_version = $8,
+            review_threshold = excluded.review_threshold,
+            materialization_version = $9,
             materialization_status = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then 'pending'
+                when new_user_audit_jobs.materialization_version is distinct from $9 then 'pending'
                 else new_user_audit_jobs.materialization_status
             end,
             materialization_attempts = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then 0
+                when new_user_audit_jobs.materialization_version is distinct from $9 then 0
                 else new_user_audit_jobs.materialization_attempts
             end,
             materialization_next_attempt_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then now()
+                when new_user_audit_jobs.materialization_version is distinct from $9 then now()
                 else new_user_audit_jobs.materialization_next_attempt_at
             end,
             materialization_processing_started_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9 then null
                 else new_user_audit_jobs.materialization_processing_started_at
             end,
             materialization_lease_expires_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9 then null
                 else new_user_audit_jobs.materialization_lease_expires_at
             end,
             materialization_error_kind = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9 then null
                 else new_user_audit_jobs.materialization_error_kind
             end,
             materialized_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $8 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9 then null
                 else new_user_audit_jobs.materialized_at
             end,
             updated_at = now()
@@ -121,6 +124,7 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
     .bind(params.input_json)
     .bind(params.avatar_file_id)
     .bind(params.avatar_file_unique_id)
+    .bind(params.review_threshold)
     .bind(CURRENT_MATERIALIZATION_VERSION)
     .execute(&mut **tx)
     .await?;
@@ -191,7 +195,7 @@ pub async fn claim_next_new_user_audit_job(
         where job.id = candidate.id
         returning job.id, job.chat_id, job.telegram_user_id, job.snapshot_hash,
                   job.prompt_version, job.input_json, job.avatar_file_id,
-                  job.avatar_file_unique_id, job.assessment_json, job.attempts,
+                  job.avatar_file_unique_id, job.assessment_json, job.review_threshold, job.attempts,
                   job.materialization_attempts, candidate.is_materialization_replay
         "#,
     )
@@ -210,6 +214,7 @@ pub async fn claim_next_new_user_audit_job(
         avatar_file_id: row.get("avatar_file_id"),
         avatar_file_unique_id: row.get("avatar_file_unique_id"),
         assessment_json: row.get("assessment_json"),
+        review_threshold: row.get("review_threshold"),
         attempts: row.get("attempts"),
         materialization_attempts: row.get("materialization_attempts"),
         is_materialization_replay: row.get("is_materialization_replay"),
@@ -357,10 +362,13 @@ async fn materialize_new_user_audit_in_transaction(
 
     sqlx::query(
         r#"
-        insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals)
-        values ($1, $2, $3, $4)
+        insert into spam_review_requests
+            (chat_id, telegram_user_id, risk_score, review_threshold, risk_signals)
+        values ($1, $2, $3, $4, $5)
         on conflict (chat_id, telegram_user_id) do update
-        set risk_score = excluded.risk_score, risk_signals = excluded.risk_signals,
+        set risk_score = excluded.risk_score,
+            review_threshold = excluded.review_threshold,
+            risk_signals = excluded.risk_signals,
             notification_status = case when spam_review_requests.status = 'pending'
                 and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
                 and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
@@ -376,6 +384,7 @@ async fn materialize_new_user_audit_in_transaction(
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
     .bind(final_score)
+    .bind(job.review_threshold)
     .bind(&final_signals)
     .execute(&mut **tx)
     .await?;

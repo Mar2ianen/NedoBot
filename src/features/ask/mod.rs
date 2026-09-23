@@ -1,7 +1,9 @@
 pub mod agent;
-pub mod chat_search;
+#[allow(unused_imports)]
+pub use crate::features::ask_metrics as metrics;
+#[allow(unused_imports)]
+pub use crate::features::chat_search;
 pub mod mcp_client;
-pub mod metrics;
 pub mod notes;
 pub mod repo;
 pub mod rich_markdown;

@@ -1,7 +1,7 @@
 use teloxide::types::{InputFile, InputRichMessage, MessageId, ReplyParameters};
 use teloxide::{RequestError, prelude::*};
 
-use crate::db::telegram::save_telegram_message;
+use crate::features::ingest::managed_chat_allows;
 use crate::features::voice::asr::transcribe_audio;
 use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
@@ -103,7 +103,8 @@ pub async fn transcribe_reply(
 }
 
 fn voice_chat_is_supported(msg: &Message, state: &AppState) -> bool {
-    msg.chat.is_private() || msg.chat.id.0 == state.config.discussion_chat_id
+    (msg.chat.is_private() && state.config.community.voice.private_enabled)
+        || managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.voice)
 }
 
 async fn send_voice_command_message(
@@ -130,7 +131,6 @@ async fn transcribe_media_message(
         return Ok(false);
     };
 
-    save_telegram_message(&state.pool, msg, &state.config).await?;
     let recovered = recover_expired_voice_deliveries(&state.pool).await?;
     if recovered > 0 {
         tracing::warn!(count = recovered, "recovered expired voice delivery leases");

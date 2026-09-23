@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
 use crate::{
+    config::Config,
+    config_file::TelegramIdRiskModel,
     features::new_user_audit::{
         prompt::PROMPT_VERSION,
         repo::{
@@ -15,10 +17,15 @@ use crate::{
     text::{has_mixed_script_homoglyphs, normalize_cyrillic_homoglyphs},
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NewUserAnalysisConfig {
     pub recent_id_ratio_threshold: f64,
     pub old_user_message_threshold: i64,
+    pub review_threshold: i32,
+    pub risk_profile: String,
+    pub risk_profile_version: String,
+    pub telegram_id_model_version: Option<String>,
+    pub telegram_id_model: Option<TelegramIdRiskModel>,
 }
 
 impl Default for NewUserAnalysisConfig {
@@ -26,6 +33,36 @@ impl Default for NewUserAnalysisConfig {
         Self {
             recent_id_ratio_threshold: 0.92,
             old_user_message_threshold: 5,
+            review_threshold: 70,
+            risk_profile: "legacy".to_string(),
+            risk_profile_version: "legacy".to_string(),
+            telegram_id_model_version: None,
+            telegram_id_model: None,
+        }
+    }
+}
+
+impl NewUserAnalysisConfig {
+    fn from_runtime(config: &Config) -> Self {
+        let Some(profile) = config.moderation_risk_profile() else {
+            return Self::default();
+        };
+        let profile_name = config.community.moderation.risk_profile.trim();
+        Self {
+            old_user_message_threshold: profile.old_user_message_threshold,
+            review_threshold: profile.review_threshold,
+            risk_profile: profile_name.to_string(),
+            risk_profile_version: if profile.version.trim().is_empty() {
+                profile_name.to_string()
+            } else {
+                profile.version.clone()
+            },
+            telegram_id_model_version: profile
+                .telegram_id
+                .as_ref()
+                .map(|model| model.version.clone()),
+            telegram_id_model: profile.telegram_id.clone(),
+            ..Self::default()
         }
     }
 }
@@ -61,6 +98,7 @@ struct NewUserFeatures {
     username: Option<String>,
     username_reuse_count: i64,
     username_reuse_spammer_count: i64,
+    shared_spammer_identity: bool,
     first_name: Option<String>,
     last_name: Option<String>,
     display_name: Option<String>,
@@ -174,6 +212,7 @@ impl WarningStrength {
 enum SpamClass {
     AdultPersonalChannel,
     ForeignInviteLink,
+    KnownSpammer,
     LlmProfileBait,
     PromoDmBait,
     LinkDropper,
@@ -181,10 +220,11 @@ enum SpamClass {
 }
 
 impl SpamClass {
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::AdultPersonalChannel,
             Self::ForeignInviteLink,
+            Self::KnownSpammer,
             Self::LlmProfileBait,
             Self::PromoDmBait,
             Self::LinkDropper,
@@ -196,6 +236,7 @@ impl SpamClass {
         match self {
             SpamClass::AdultPersonalChannel => "adult_personal_channel_promo",
             SpamClass::ForeignInviteLink => "foreign_invite_link_spam",
+            SpamClass::KnownSpammer => "known_spammer_identity",
             SpamClass::LlmProfileBait => "llm_profile_bait",
             SpamClass::PromoDmBait => "promo_dm_bait",
             SpamClass::LinkDropper => "link_dropper",
@@ -253,10 +294,10 @@ impl RiskAccumulator {
         }
     }
 
-    fn finish(mut self) -> RiskAnalysis {
+    fn finish(mut self, review_threshold: i32) -> RiskAnalysis {
         self.score = self.score.min(100);
         let level = match self.score {
-            70.. => "high",
+            score if score >= review_threshold => "high",
             40..=69 => "medium",
             _ => "low",
         }
@@ -294,17 +335,26 @@ impl RiskAccumulator {
 /// несогласованное состояние.
 pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
     pool: &PgPool,
+    runtime_config: &Config,
     chat_id: i64,
     telegram_user_id: i64,
 ) -> anyhow::Result<()> {
-    let Some(features) = load_features(pool, chat_id, telegram_user_id).await? else {
+    let Some(features) = load_features(
+        pool,
+        chat_id,
+        telegram_user_id,
+        &runtime_config.community.instance.id,
+    )
+    .await?
+    else {
         return Ok(());
     };
-    let config = NewUserAnalysisConfig::default();
-    let is_old_active_user = features.message_count >= config.old_user_message_threshold;
-    let risk = analyze_risk(&features, &config, is_old_active_user);
-    let input_json = project_unified_user_audit_snapshot(&features, &risk);
-    let material_revision = project_unified_user_audit_material_revision(&features);
+    let analysis_config = NewUserAnalysisConfig::from_runtime(runtime_config);
+    let is_old_active_user = features.message_count >= analysis_config.old_user_message_threshold;
+    let risk = analyze_risk(&features, &analysis_config, is_old_active_user);
+    let input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
+    let material_revision =
+        project_unified_user_audit_material_revision(&features, &analysis_config);
     let snapshot_hash = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&material_revision)?)
@@ -318,11 +368,12 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
         input_json: &input_json,
         avatar_file_id: features.profile_photo_file_id.as_deref(),
         avatar_file_unique_id: features.profile_photo_file_unique_id.as_deref(),
+        review_threshold: analysis_config.review_threshold,
     };
     let mut tx = pool.begin().await?;
     // Authoritative transactions consistently lock job, then audit, then review.
     enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
-    save_audit_in_transaction(&mut tx, &features, &risk, &config).await?;
+    save_audit_in_transaction(&mut tx, &features, &risk, &analysis_config).await?;
     record_new_user_audit_snapshot_in_transaction(&mut tx, params).await?;
     tx.commit().await?;
 
@@ -339,12 +390,18 @@ pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
 const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
 const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
 
-fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> Value {
+fn project_unified_user_audit_material_revision(
+    features: &NewUserFeatures,
+    config: &NewUserAnalysisConfig,
+) -> Value {
     // Только факты, заметно меняющие вход LLM. Временные поля, live-счётчики и
     // последние сообщения исключены, чтобы transient refresh не создавал job на
     // каждое новое сообщение.
     json!({
         "schema_version": 1,
+        "risk_profile_version": config.risk_profile_version,
+        "telegram_id_model_version": config.telegram_id_model_version,
+        "review_threshold": config.review_threshold,
         "subject": {
             "chat_id": features.chat_id,
             "telegram_user_id": features.telegram_user_id,
@@ -354,6 +411,7 @@ fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> V
             "display_name": bounded_audit_text(features.display_name.as_deref()),
             "bio_preview": bounded_audit_text(features.bio.as_deref()),
             "profile_photo_unique_id": features.profile_photo_file_unique_id,
+            "shared_spammer_identity": features.shared_spammer_identity,
         },
         "first_message": bounded_audit_text(features.first_message_text.as_deref()),
         "personal_channel": {
@@ -368,7 +426,11 @@ fn project_unified_user_audit_material_revision(features: &NewUserFeatures) -> V
     })
 }
 
-fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAnalysis) -> Value {
+fn project_unified_user_audit_snapshot(
+    features: &NewUserFeatures,
+    risk: &RiskAnalysis,
+    config: &NewUserAnalysisConfig,
+) -> Value {
     json!({
         "schema_version": 1,
         "subject": {
@@ -429,6 +491,21 @@ fn project_unified_user_audit_snapshot(features: &NewUserFeatures, risk: &RiskAn
             "via_chat_folder_invite_link": features.via_chat_folder_invite_link,
         },
         "risk": {
+            "risk_profile": config.risk_profile,
+            "risk_profile_version": config.risk_profile_version,
+            "telegram_id_model_version": config.telegram_id_model_version,
+            "review_threshold": config.review_threshold,
+            "telegram_id_spam_probability": config
+                .telegram_id_model
+                .as_ref()
+                .map(|model| telegram_id_spam_probability(features.telegram_user_id, model)),
+            "telegram_id_risk_coefficient": config.telegram_id_model.as_ref().map(|model| {
+                telegram_id_risk_coefficient(telegram_id_spam_probability(
+                    features.telegram_user_id,
+                    model,
+                ))
+            }),
+            "shared_spammer_identity": features.shared_spammer_identity,
             "score": risk.score,
             "level": risk.level,
             "primary_class": risk.primary_class,
@@ -481,6 +558,7 @@ async fn load_features(
     pool: &PgPool,
     chat_id: i64,
     telegram_user_id: i64,
+    instance_id: &str,
 ) -> anyhow::Result<Option<NewUserFeatures>> {
     let row = sqlx::query(
         r#"
@@ -594,6 +672,12 @@ async fn load_features(
             p.username,
             coalesce(uns.reuse_count, 0)::bigint as username_reuse_count,
             coalesce(uns.reuse_spammer_count, 0)::bigint as username_reuse_spammer_count,
+            exists (
+                select 1
+                from shared_spam_reputation r
+                where r.telegram_user_id = cu.telegram_user_id
+                  and r.source_instance_id <> $3
+            ) as shared_spammer_identity,
             p.first_name,
             p.last_name,
             nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') as display_name,
@@ -643,7 +727,13 @@ async fn load_features(
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
-                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+                count(*) filter (
+                    where coalesce(cu2.is_spammer, false)
+                       or exists (
+                            select 1 from shared_spam_reputation r
+                            where r.telegram_user_id = p2.telegram_user_id
+                       )
+                )::bigint as reuse_spammer_count
             from telegram_user_profiles p2
             left join telegram_chat_users cu2
               on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
@@ -654,7 +744,13 @@ async fn load_features(
         left join lateral (
             select
                 count(*)::bigint as reuse_count,
-                count(*) filter (where coalesce(cu2.is_spammer, false))::bigint as reuse_spammer_count
+                count(*) filter (
+                    where coalesce(cu2.is_spammer, false)
+                       or exists (
+                            select 1 from shared_spam_reputation r
+                            where r.telegram_user_id = p2.telegram_user_id
+                       )
+                )::bigint as reuse_spammer_count
             from telegram_user_profiles p2
             left join telegram_chat_users cu2
               on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
@@ -674,6 +770,7 @@ async fn load_features(
     )
     .bind(chat_id)
     .bind(telegram_user_id)
+    .bind(instance_id)
     .fetch_optional(pool)
     .await?;
 
@@ -731,6 +828,7 @@ async fn load_features(
             username: row.get("username"),
             username_reuse_count: row.get("username_reuse_count"),
             username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
+            shared_spammer_identity: row.get("shared_spammer_identity"),
             first_name: row.get("first_name"),
             last_name: row.get("last_name"),
             display_name: row.get("display_name"),
@@ -800,6 +898,7 @@ fn analyze_new_or_low_activity_user(
     let username_stats = username_stats(features.username.as_deref());
     let mut risk = RiskAccumulator::default();
 
+    risk.add_optional(shared_spammer_signal(features.shared_spammer_identity));
     risk.add_optional(message_count_signal(features));
     risk.add_optional(link_signal(features));
     risk.add_optional(foreign_invite_link_signal(features));
@@ -825,7 +924,7 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(explicit_adult_bio_signal(features));
     risk.add_optional(profile_bio_subscription_offer_signal(features));
     risk.add_optional(member_status_signal(features));
-    risk.finish()
+    risk.finish(config.review_threshold)
 }
 
 fn message_count_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -844,6 +943,15 @@ fn message_count_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         }),
         _ => None,
     }
+}
+
+fn shared_spammer_signal(is_shared_spammer: bool) -> Option<RiskSignal> {
+    is_shared_spammer.then_some(RiskSignal {
+        class: SpamClass::KnownSpammer,
+        coefficient: 70,
+        label: "shared_spammer_identity",
+        reason: "Telegram user id was confirmed as spam in another bot instance",
+    })
 }
 
 fn link_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -885,18 +993,44 @@ fn recent_id_signal(
     features: &NewUserFeatures,
     config: &NewUserAnalysisConfig,
 ) -> Option<RiskSignal> {
-    match features
+    if let Some(model) = config.telegram_id_model.as_ref() {
+        let probability = telegram_id_spam_probability(features.telegram_user_id, model);
+        let coefficient = telegram_id_risk_coefficient(probability);
+        return (coefficient > 0).then_some(RiskSignal {
+            class: SpamClass::FreshAccount,
+            coefficient,
+            label: "telegram_id_spam_probability",
+            reason: "Configured 4PL model assigns spam probability to the Telegram user id",
+        });
+    }
+
+    features
         .id_rank_ratio
         .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold)
-    {
-        true => Some(RiskSignal {
+        .then_some(RiskSignal {
             class: SpamClass::FreshAccount,
             coefficient: 15,
             label: "recent_high_telegram_id",
             reason: "Telegram user id is in the recent high-id range observed by the bot",
-        }),
-        false => None,
-    }
+        })
+}
+
+const TELEGRAM_ID_PROBABILITY_SIGNAL_FLOOR: f64 = 0.10;
+const TELEGRAM_ID_PROBABILITY_SIGNAL_CEILING: f64 = 0.85;
+const TELEGRAM_ID_MAX_RISK_COEFFICIENT: f64 = 15.0;
+
+fn telegram_id_spam_probability(user_id: i64, model: &TelegramIdRiskModel) -> f64 {
+    let id_billion = (user_id.max(0) as f64) / 1_000_000_000.0;
+    let exponent = (model.k * (id_billion - model.midpoint_billion)).clamp(-60.0, 60.0);
+    let sigmoid = 1.0 / (1.0 + (-exponent).exp());
+    model.floor + (model.ceil - model.floor) * sigmoid
+}
+
+fn telegram_id_risk_coefficient(probability: f64) -> i32 {
+    let normalized = ((probability - TELEGRAM_ID_PROBABILITY_SIGNAL_FLOOR)
+        / (TELEGRAM_ID_PROBABILITY_SIGNAL_CEILING - TELEGRAM_ID_PROBABILITY_SIGNAL_FLOOR))
+        .clamp(0.0, 1.0);
+    (TELEGRAM_ID_MAX_RISK_COEFFICIENT * normalized).round() as i32
 }
 
 fn username_signal(features: &NewUserFeatures, stats: &UsernameStats) -> Option<RiskSignal> {
@@ -1492,6 +1626,9 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "risk_labels",
         "risk_reasons",
         "risk_signal_breakdown",
+        "risk_profile",
+        "risk_profile_version",
+        "telegram_id_model_version",
         "raw_features",
     ]
 }
@@ -1515,6 +1652,15 @@ async fn save_audit_in_transaction(
         .personal_channel_last_text
         .as_deref()
         .map(char_count_i32);
+    let telegram_id_spam_probability = config
+        .telegram_id_model
+        .as_ref()
+        .map(|model| telegram_id_spam_probability(features.telegram_user_id, model));
+    let telegram_id_risk_coefficient_value =
+        telegram_id_spam_probability.map(telegram_id_risk_coefficient);
+    let telegram_user_id_is_recent = features
+        .id_rank_ratio
+        .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold);
     let raw_features = json!({
         "dc": {
             "available": profile_photo_dc.dc_id.is_some(),
@@ -1524,13 +1670,27 @@ async fn save_audit_in_transaction(
         "thresholds": {
             "recent_id_ratio": config.recent_id_ratio_threshold,
             "old_user_message_threshold": config.old_user_message_threshold,
+            "review_threshold": config.review_threshold,
         },
+        "risk_profile": config.risk_profile,
+        "risk_profile_version": config.risk_profile_version,
+        "telegram_id_model_version": config.telegram_id_model_version,
+        "telegram_id_model": config.telegram_id_model.as_ref().map(|model| json!({
+            "floor": model.floor,
+            "ceil": model.ceil,
+            "k": model.k,
+            "midpoint_billion": model.midpoint_billion,
+            "version": model.version,
+        })),
+        "telegram_id_spam_probability": telegram_id_spam_probability,
+        "telegram_id_risk_coefficient": telegram_id_risk_coefficient_value,
         "known_risk_classes": SpamClass::all().map(SpamClass::as_str),
         "profile_photo_file_id_present": features.profile_photo_file_id.is_some(),
         "profile_photo_file_unique_id_present": features.profile_photo_file_unique_id.is_some(),
         "profile_photo_reuse_count": features.profile_photo_reuse_count,
         "username_reuse_count": features.username_reuse_count,
         "username_reuse_spammer_count": features.username_reuse_spammer_count,
+        "shared_spammer_identity": features.shared_spammer_identity,
         "first_name_feminine_pattern": looks_like_feminine_first_name(features.first_name.as_deref()),
         "chat_context": {
             "only_replies_or_comments": only_replies_or_comments(features),
@@ -1613,11 +1773,7 @@ async fn save_audit_in_transaction(
         values.push_bind(features.text_texture.repetitive_pattern);
         values.push_bind(id_bucket(features.telegram_user_id));
         values.push_bind(features.id_rank_ratio);
-        values.push_bind(
-            features
-                .id_rank_ratio
-                .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold),
-        );
+        values.push_bind(telegram_user_id_is_recent);
         values.push_bind(&features.username);
         values.push_bind(features.username.as_deref().map(char_count_i32));
         values.push_bind(username_stats.has_digits);
@@ -1681,6 +1837,9 @@ async fn save_audit_in_transaction(
         values.push_bind(json!(risk.labels));
         values.push_bind(json!(risk.reasons));
         values.push_bind(&risk.signals);
+        values.push_bind(&config.risk_profile);
+        values.push_bind(&config.risk_profile_version);
+        values.push_bind(&config.telegram_id_model_version);
         values.push_bind(raw_features);
     }
 
@@ -2219,6 +2378,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_spammer_identity_is_a_review_threshold_signal() {
+        let signal = shared_spammer_signal(true).expect("shared spammer must have a signal");
+        assert_eq!(signal.class, SpamClass::KnownSpammer);
+        assert_eq!(signal.coefficient, 70);
+        assert_eq!(signal.label, "shared_spammer_identity");
+        assert!(shared_spammer_signal(false).is_none());
+    }
+
+    #[test]
+    fn telegram_id_risk_signal_scales_configured_four_pl_probability() {
+        let model = TelegramIdRiskModel {
+            floor: 0.1,
+            ceil: 0.9,
+            k: 4.0,
+            midpoint_billion: 8.0,
+            version: "test-4pl".to_string(),
+        };
+        let lower = telegram_id_spam_probability(7_000_000_000, &model);
+        let middle = telegram_id_spam_probability(8_000_000_000, &model);
+        let upper_middle = telegram_id_spam_probability(8_500_000_000, &model);
+        let upper = telegram_id_spam_probability(9_000_000_000, &model);
+
+        assert!(lower < middle && middle < upper_middle && upper_middle < upper);
+        assert!((middle - 0.5).abs() < 1e-9);
+        assert_eq!(telegram_id_risk_coefficient(lower), 0);
+        assert_eq!(telegram_id_risk_coefficient(middle), 8);
+        assert_eq!(telegram_id_risk_coefficient(upper_middle), 14);
+        assert_eq!(telegram_id_risk_coefficient(upper), 15);
+        assert_eq!(telegram_id_risk_coefficient(0.09), 0);
+        assert_eq!(telegram_id_risk_coefficient(0.86), 15);
+    }
+
+    #[test]
     fn username_random_suffix_detects_yasnyy_variant() {
         let stats = username_stats(Some("dev_yasnyy_dcpc"));
         assert!(stats.has_random_suffix);
@@ -2352,7 +2544,7 @@ mod tests {
             label: "genuine_reply",
             reason: "test",
         });
-        let signals = risk.finish().signals;
+        let signals = risk.finish(70).signals;
 
         assert_eq!(signals[0]["warning_strength"], "weak");
         assert_eq!(signals[0]["coefficient"], 3);
@@ -2392,7 +2584,7 @@ mod tests {
             label: "test",
             reason: "test",
         });
-        assert_eq!(risk.finish().score, 100);
+        assert_eq!(risk.finish(70).score, 100);
     }
 
     #[test]

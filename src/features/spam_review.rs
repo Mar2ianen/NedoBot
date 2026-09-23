@@ -10,18 +10,18 @@ use crate::{
     telegram::html,
 };
 
-const OWNER_USERNAME: &str = "Chechulinm";
-const REVIEW_DELIVERY_RISK_THRESHOLD: i32 = 70;
 const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
 
 pub struct SpamReview {
     pub id: i64,
     pub chat_id: i64,
+    pub destination_chat_id: i64,
     pub first_message_id: Option<i32>,
     pub notification_message_id: Option<i32>,
     pub notification_attempts: i32,
     pub notification_consecutive_failures: i32,
     pub risk_score: i32,
+    pub review_threshold: i32,
     pub risk_signals: Value,
     pub text: String,
 }
@@ -83,15 +83,27 @@ pub async fn create_review(
     let Some(request_id) = request_id else {
         return Ok(None);
     };
-    claim_review_delivery(pool, Some(request_id)).await
+    claim_review_delivery(pool, Some(request_id), None).await
 }
 
+#[allow(dead_code)] // Compatibility API for callers that use the legacy source-chat destination.
 pub async fn claim_next_review_delivery(pool: &PgPool) -> anyhow::Result<Option<SpamReview>> {
-    claim_review_delivery(pool, None).await
+    claim_review_delivery(pool, None, None).await
 }
 
-pub async fn process_next_review_delivery(bot: &Bot, pool: &PgPool) -> anyhow::Result<bool> {
-    let Some(review) = claim_next_review_delivery(pool).await? else {
+pub async fn claim_next_review_delivery_with_config(
+    pool: &PgPool,
+    config: &crate::config::Config,
+) -> anyhow::Result<Option<SpamReview>> {
+    claim_review_delivery(pool, None, Some(config)).await
+}
+
+pub async fn process_next_review_delivery(
+    bot: &Bot,
+    pool: &PgPool,
+    config: &crate::config::Config,
+) -> anyhow::Result<bool> {
+    let Some(review) = claim_next_review_delivery_with_config(pool, config).await? else {
         return Ok(false);
     };
     send_review(bot, pool, &review).await?;
@@ -101,6 +113,7 @@ pub async fn process_next_review_delivery(bot: &Bot, pool: &PgPool) -> anyhow::R
 async fn claim_review_delivery(
     pool: &PgPool,
     request_id: Option<i64>,
+    config: Option<&crate::config::Config>,
 ) -> anyhow::Result<Option<SpamReview>> {
     let row = sqlx::query(
         r#"
@@ -108,7 +121,7 @@ async fn claim_review_delivery(
             select id
             from spam_review_requests
             where status = 'pending'
-              and risk_score >= $3
+              and risk_score >= review_threshold
               and ($1::bigint is null or id = $1)
               and (
                   (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
@@ -127,24 +140,29 @@ async fn claim_review_delivery(
             notification_lease_expires_at = now() + ($2 * interval '1 second'),
             notification_delivery_risk_score = request.risk_score,
             notification_delivery_risk_signals = request.risk_signals,
+            notification_delivery_review_threshold = request.review_threshold,
             notification_error_kind = null
         from candidate
         where request.id = candidate.id
         returning request.id, request.chat_id, request.telegram_user_id,
                   request.risk_score, request.risk_signals, request.notification_message_id,
-                  request.notification_attempts, request.notification_consecutive_failures
+                  request.notification_attempts, request.notification_consecutive_failures,
+                  request.review_threshold
         "#,
     )
     .bind(request_id)
     .bind(DELIVERY_LEASE_SECONDS)
-    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    review_from_row(pool, row).await.map(Some)
+    review_from_row(pool, row, config).await.map(Some)
 }
 
-async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::Result<SpamReview> {
+async fn review_from_row(
+    pool: &PgPool,
+    row: sqlx::postgres::PgRow,
+    config: Option<&crate::config::Config>,
+) -> anyhow::Result<SpamReview> {
     let id: i64 = row.get("id");
     let chat_id: i64 = row.get("chat_id");
     let user_id: i64 = row.get("telegram_user_id");
@@ -153,6 +171,7 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
     let notification_message_id: Option<i32> = row.get("notification_message_id");
     let notification_attempts: i32 = row.get("notification_attempts");
     let notification_consecutive_failures: i32 = row.get("notification_consecutive_failures");
+    let stored_review_threshold: i32 = row.get("review_threshold");
     let profile = sqlx::query(r#"
         select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
@@ -161,6 +180,10 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
     "#).bind(chat_id).bind(user_id).fetch_one(pool).await?;
     let name: String = profile.get("name");
     let username: Option<String> = profile.get("username");
+    let destination_chat_id = config
+        .and_then(|config| config.community.moderation.review_chat.as_deref())
+        .and_then(|key| config.and_then(|config| config.chat_by_key(key)))
+        .map_or(chat_id, |chat| chat.config.id);
     let reasons = human_signals(&signals);
     let profile_url = format!("tg://user?id={user_id}");
     let profile_link = html::link(&name, &profile_url).into_string();
@@ -170,17 +193,19 @@ async fn review_from_row(pool: &PgPool, row: sqlx::postgres::PgRow) -> anyhow::R
         .map(|value| html::link(format!("@{value}"), format!("https://t.me/{value}")).into_string())
         .unwrap_or_else(|| "без username".into());
     let text = format!(
-        "@{OWNER_USERNAME}, <b>проверка нового участника</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Сигналы:</b>\n{}",
+        "<b>Проверка нового участника</b>\n\n{}\n{} · {} · риск: <b>{}</b>\n\n<b>Сигналы:</b>\n{}",
         profile_link, username, id_link, score, reasons
     );
     Ok(SpamReview {
         id,
         chat_id,
+        destination_chat_id,
         first_message_id: profile.get("first_message_id"),
         notification_message_id,
         notification_attempts,
         notification_consecutive_failures,
         risk_score: score,
+        review_threshold: stored_review_threshold,
         risk_signals: signals,
         text,
     })
@@ -206,17 +231,23 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
     }
 
     let result = if let Some(message_id) = review.notification_message_id {
-        bot.edit_message_text(ChatId(review.chat_id), MessageId(message_id), &review.text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(review_keyboard(review.id))
-            .await
-            .map(|_| message_id)
+        bot.edit_message_text(
+            ChatId(review.destination_chat_id),
+            MessageId(message_id),
+            &review.text,
+        )
+        .parse_mode(ParseMode::Html)
+        .reply_markup(review_keyboard(review.id))
+        .await
+        .map(|_| message_id)
     } else {
         let mut request = bot
-            .send_message(ChatId(review.chat_id), &review.text)
+            .send_message(ChatId(review.destination_chat_id), &review.text)
             .parse_mode(ParseMode::Html)
             .reply_markup(review_keyboard(review.id));
-        if let Some(message_id) = review.first_message_id {
+        if review.destination_chat_id == review.chat_id
+            && let Some(message_id) = review.first_message_id
+        {
             request = request.reply_parameters(
                 ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
             );
@@ -284,10 +315,14 @@ async fn confirm_review_delivery_payload(
           and status = 'pending'
           and notification_status = 'processing'
           and notification_lease_expires_at > now()
-          and risk_score >= $6
+          and review_threshold = $6
+          and risk_score >= review_threshold
           and (risk_score, risk_signals) is not distinct from ($3, $4::jsonb)
-          and (notification_delivery_risk_score, notification_delivery_risk_signals)
-              is not distinct from ($3, $4::jsonb)
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($3, $4::jsonb, $6)
         "#,
     )
     .bind(review.id)
@@ -295,7 +330,7 @@ async fn confirm_review_delivery_payload(
     .bind(review.risk_score)
     .bind(&review.risk_signals)
     .bind(DELIVERY_LEASE_SECONDS)
-    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
@@ -306,7 +341,7 @@ async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> an
         r#"
         update spam_review_requests
         set notification_status = case
-                when risk_score >= $5 then 'retry_wait'
+                when risk_score >= review_threshold then 'retry_wait'
                 else 'pending'
             end,
             notification_next_attempt_at = now(),
@@ -317,16 +352,22 @@ async fn release_stale_review_delivery(pool: &PgPool, review: &SpamReview) -> an
           and notification_attempts = $2
           and status = 'pending'
           and notification_status = 'processing'
-          and (notification_delivery_risk_score, notification_delivery_risk_signals)
-              is not distinct from ($3, $4::jsonb)
-          and (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($3, $4::jsonb, $5)
+          and (
+              (risk_score, risk_signals) is distinct from ($3, $4::jsonb)
+              or review_threshold is distinct from $5
+          )
         "#,
     )
     .bind(review.id)
     .bind(review.notification_attempts)
     .bind(review.risk_score)
     .bind(&review.risk_signals)
-    .bind(REVIEW_DELIVERY_RISK_THRESHOLD)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     Ok(())
@@ -369,6 +410,11 @@ pub async fn mark_review_delivery_succeeded(
           and notification_attempts = $5
           and status = 'pending'
           and notification_status = 'processing'
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($3, $4::jsonb, $6)
         "#,
     )
     .bind(review.id)
@@ -376,6 +422,7 @@ pub async fn mark_review_delivery_succeeded(
     .bind(review.risk_score)
     .bind(&review.risk_signals)
     .bind(review.notification_attempts)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
@@ -466,8 +513,11 @@ async fn mark_review_delivery_failed(
           and status = 'pending'
           and notification_status = 'processing'
           and (risk_score, risk_signals) is not distinct from ($8, $9::jsonb)
-          and (notification_delivery_risk_score, notification_delivery_risk_signals)
-              is not distinct from ($8, $9::jsonb)
+          and (
+              notification_delivery_risk_score,
+              notification_delivery_risk_signals,
+              notification_delivery_review_threshold
+          ) is not distinct from ($8, $9::jsonb, $10)
         "#,
     )
     .bind(review.id)
@@ -479,6 +529,7 @@ async fn mark_review_delivery_failed(
     .bind(review.notification_attempts)
     .bind(review.risk_score)
     .bind(&review.risk_signals)
+    .bind(review.review_threshold)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(rows.rows_affected())
@@ -508,6 +559,19 @@ pub async fn apply_callback(
         sqlx::query("update telegram_chat_users set is_spammer = true, spam_score = greatest(spam_score, 100), spam_last_marked_at = now(), spam_reason = 'Owner-confirmed spammer', spam_type = 'llm_generic_comment', spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', '1'::jsonb, true), updated_at = now() where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = 'Owner-confirmed spammer', spam_source = 'manual_owner_confirmation', spam_type = coalesce(spam_type, 'llm_generic_comment') where chat_id = $1 and user_id = $2 and source_channel_id is null").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("update telegram_chat_users set spam_message_count = (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null), spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', to_jsonb((select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null)), true) where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
+    } else if decision == "normal" {
+        let chat_id: i64 = row.get("chat_id");
+        let user_id: i64 = row.get("telegram_user_id");
+        sqlx::query("update telegram_chat_users set is_spammer = false, spam_score = 0, spam_last_marked_at = null, spam_reason = null, spam_type = null, spam_types = coalesce(spam_types, '{}'::jsonb) - 'llm_generic_comment', updated_at = now() where chat_id = $1 and telegram_user_id = $2")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("update telegram_messages set spam_marked_at = null, spam_reason = null, spam_source = null where chat_id = $1 and user_id = $2 and source_channel_id is null and spam_source = 'manual_owner_confirmation'")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(Some(if decision == "spam" {
@@ -583,7 +647,9 @@ fn human_marker(marker: &str) -> String {
 
 fn human_label(label: &str) -> &str {
     match label {
+        "shared_spammer_identity" => "ID уже помечен спамером в другом инстансе",
         "recent_high_telegram_id" => "очень свежий Telegram ID",
+        "telegram_id_spam_probability" => "свежий Telegram ID по модели",
         "single_message_account" => "первое и единственное сообщение",
         "very_new_to_chat" => "недавно появился в чате",
         "only_channel_post_comments" => "комментирует только посты канала",
@@ -643,8 +709,16 @@ mod tests {
     #[test]
     fn renders_human_signal() {
         assert_eq!(
+            human_label("shared_spammer_identity"),
+            "ID уже помечен спамером в другом инстансе"
+        );
+        assert_eq!(
             human_label("recent_high_telegram_id"),
             "очень свежий Telegram ID"
+        );
+        assert_eq!(
+            human_label("telegram_id_spam_probability"),
+            "свежий Telegram ID по модели"
         );
     }
 }

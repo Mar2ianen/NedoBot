@@ -1,35 +1,47 @@
+#[cfg(feature = "ask")]
 use std::future::Future;
-use teloxide::{
-    drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter},
-    prelude::*,
-    types::{
-        InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
-        InputRichBlockThinking, InputRichMessage, ReplyParameters, RichText,
-    },
-    utils::command::BotCommands,
+#[cfg(feature = "ask")]
+use teloxide::drafter::{DeliveryCertainty, DraftConfig, DraftFinishError, Drafter};
+#[cfg(feature = "ask")]
+use teloxide::types::{
+    InputFile, InputRichBlock, InputRichBlockParagraph, InputRichBlockSectionHeading,
+    InputRichBlockThinking, InputRichMessage, ReplyParameters, RichText,
 };
+use teloxide::{prelude::*, utils::command::BotCommands};
+#[cfg(feature = "ask")]
 use tokio::sync::mpsc;
 
-use crate::db::telegram::save_telegram_message;
+#[cfg(feature = "ask")]
 use crate::features::ask::chat_search::message_url;
+#[cfg(feature = "ask")]
 use crate::features::ask::notes::{add_chat_note, add_user_note};
+#[cfg(feature = "ask")]
 use crate::features::ask::repo;
+#[cfg(feature = "ask")]
 use crate::features::ask::service::AskService;
+#[cfg(feature = "ask")]
 use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, AskRunStatus};
+#[cfg(feature = "auto-comment")]
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
-use crate::features::first_comment::pipeline::download_largest_photo_base64;
+#[cfg(feature = "auto-comment")]
 use crate::features::first_comment::render::build_comment_html;
+use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
 use crate::features::stats::types::{StatsPeriod, StatsRender};
+#[cfg(feature = "voice")]
 use crate::features::voice::pipeline::transcribe_reply;
 use crate::state::AppState;
+#[cfg(feature = "ask")]
 use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
+#[cfg(feature = "ask")]
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
+#[cfg(feature = "ask")]
+use crate::telegram::media::download_largest_photo_base64;
 use crate::telegram::render::{escape_html, send_html};
 
 pub async fn handle_command(
@@ -41,8 +53,29 @@ pub async fn handle_command(
     let pool = &state.pool;
     let config = &state.config;
 
-    if let Err(err) = save_telegram_message(pool, &msg, config).await {
-        tracing::error!(%err, "failed to save command message");
+    if !msg.chat.is_private() && !is_managed_chat(config, msg.chat.id.0) {
+        tracing::debug!(chat_id = msg.chat.id.0, "ignored command from unknown chat");
+        return Ok(());
+    }
+    if is_managed_chat(config, msg.chat.id.0)
+        && let Err(err) = ingest_message(pool, &msg, config).await
+    {
+        tracing::error!(%err, "failed to ingest command message");
+        return Ok(());
+    }
+    let is_stats_command = matches!(
+        &cmd,
+        Command::StatsDay(_)
+            | Command::StatsWeek(_)
+            | Command::StatsMonth(_)
+            | Command::Status(_)
+            | Command::TopMsg(_)
+            | Command::TopReact(_)
+            | Command::UserStats(_)
+            | Command::UserStatus(_)
+    );
+    if is_stats_command && !managed_chat_allows(config, msg.chat.id.0, |chat| chat.stats) {
+        return Ok(());
     }
 
     match cmd {
@@ -74,6 +107,7 @@ pub async fn handle_command(
         Command::EmojiIds => {
             send_custom_emoji_ids(&bot, &msg).await?;
         }
+        #[cfg(feature = "auto-comment")]
         Command::FormatTest(post_text) => {
             if !should_generate_comment(&post_text, config) {
                 bot.send_message(
@@ -91,6 +125,7 @@ pub async fn handle_command(
         Command::Memory => {
             send_memory_notes(&bot, msg.chat.id, pool).await?;
         }
+        #[cfg(feature = "voice")]
         Command::Transcribe => {
             transcribe_reply(&bot, &msg, &state).await.map_err(|err| {
                 tracing::error!(%err, "manual voice transcription command failed");
@@ -99,12 +134,15 @@ pub async fn handle_command(
                 )
             })?;
         }
+        #[cfg(feature = "ask")]
         Command::Ask(question) => {
             handle_ask_command(&bot, &msg, &state, &question).await?;
         }
+        #[cfg(feature = "ask")]
         Command::ChatNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, None).await?;
         }
+        #[cfg(feature = "ask")]
         Command::UserNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, reply_user_id(&msg)).await?;
         }
@@ -114,7 +152,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 StatsPeriod::Day,
                 render,
@@ -127,7 +165,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 StatsPeriod::Week,
                 render,
@@ -140,7 +178,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 StatsPeriod::Month,
                 render,
@@ -155,7 +193,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 &state.render_time,
                 period,
                 render,
@@ -167,7 +205,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
             )
             .await?;
@@ -177,7 +215,7 @@ pub async fn handle_command(
                 &bot,
                 msg.chat.id,
                 pool,
-                config,
+                msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
             )
             .await?;
@@ -192,6 +230,7 @@ pub async fn handle_command(
                 msg.chat.id,
                 pool,
                 config,
+                msg.chat.id.0,
                 args.target.as_deref(),
                 fallback_user_id,
                 args.render,
@@ -203,6 +242,7 @@ pub async fn handle_command(
     Ok(())
 }
 
+#[cfg(feature = "ask")]
 async fn handle_note_command(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
@@ -213,7 +253,7 @@ async fn handle_note_command(
     let Some(author) = msg.from.as_ref() else {
         return Ok(());
     };
-    if msg.chat.id.0 != state.config.discussion_chat_id {
+    if !managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ask) {
         return Ok(());
     }
     let allowed = state.config.owner_telegram_id == Some(author.id.0 as i64)
@@ -253,6 +293,7 @@ async fn handle_note_command(
     }
 }
 
+#[cfg(feature = "ask")]
 async fn handle_ask_command(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
@@ -263,16 +304,25 @@ async fn handle_ask_command(
     let Some(user) = msg.from.as_ref() else {
         return Ok(());
     };
-    let is_private_allowed =
-        msg.chat.is_private() && config.ask_private_user_ids.contains(&(user.id.0 as i64));
-    let is_discussion_chat = msg.chat.id.0 == config.discussion_chat_id;
-    if !config.ask_enabled || (!is_discussion_chat && !is_private_allowed) {
+    let private_scope_chat_id = config
+        .community
+        .ask
+        .default_chat
+        .as_deref()
+        .and_then(|key| config.chat_by_key(key))
+        .map(|chat| chat.config.id);
+    let is_private_allowed = msg.chat.is_private()
+        && private_scope_chat_id.is_some()
+        && config.ask_private_user_ids.contains(&(user.id.0 as i64));
+    let is_ask_chat = managed_chat_allows(config, msg.chat.id.0, |chat| chat.ask);
+    if !config.ask_enabled || (!is_ask_chat && !is_private_allowed) {
         return Ok(());
     }
     if question.trim().is_empty() {
         send_html(bot, msg.chat.id, "Напиши вопрос: /ask <вопрос>.").await?;
         return Ok(());
     }
+    let scope_chat_id = private_scope_chat_id.unwrap_or(msg.chat.id.0);
 
     let use_native_draft = msg.chat.is_private();
     let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
@@ -304,7 +354,7 @@ async fn handle_ask_command(
         tracing::debug!(%err, "failed to deliver initial /ask progress preview");
     }
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let reply_context = build_ask_reply_context(msg, config.discussion_chat_id);
+    let reply_context = build_ask_reply_context(msg, scope_chat_id);
     let reply_image_base64 = match msg.reply_to_message() {
         Some(reply) => match download_largest_photo_base64(bot, reply, config).await {
             Ok(image) => image,
@@ -317,6 +367,7 @@ async fn handle_ask_command(
     };
     let input = AskCommandInput {
         chat_id: msg.chat.id.0,
+        scope_chat_id,
         command_message_id: msg.id.0,
         requester_user_id: user.id.0 as i64,
         requester_identity: requester_identity(user),
@@ -329,6 +380,7 @@ async fn handle_ask_command(
     let ask_service = AskService::new(
         &state.pool,
         config,
+        scope_chat_id,
         &state.llm_formatter,
         &state.render_time,
     );
@@ -363,8 +415,7 @@ async fn handle_ask_command(
                 .await
             {
                 Ok(sent) => {
-                    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await
-                    {
+                    if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
                         tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask answer message");
                     }
                     record_ask_delivery(
@@ -400,8 +451,7 @@ async fn handle_ask_command(
                 .await
             {
                 Ok(sent) => {
-                    if let Err(err) = save_telegram_message(&state.pool, &sent, &state.config).await
-                    {
+                    if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
                         tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask failure message");
                     }
                     record_ask_delivery(
@@ -431,6 +481,7 @@ async fn handle_ask_command(
     }
 }
 
+#[cfg(feature = "ask")]
 fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
     matches!(
         certainty,
@@ -438,6 +489,7 @@ fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
     )
 }
 
+#[cfg(feature = "ask")]
 fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     match error {
         DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
@@ -448,6 +500,7 @@ fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     }
 }
 
+#[cfg(feature = "ask")]
 async fn fallback_after_finish_error(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
@@ -480,6 +533,7 @@ async fn fallback_after_finish_error(
     .await
 }
 
+#[cfg(feature = "ask")]
 async fn apply_finish_error_policy<SendFallback, SendFuture, RecordDelivery, RecordFuture>(
     certainty: DeliveryCertainty,
     fallback_status: AskRunStatus,
@@ -514,6 +568,7 @@ where
     result
 }
 
+#[cfg(feature = "ask")]
 async fn record_ask_delivery(
     state: &AppState,
     ask_run_id: Option<i64>,
@@ -531,6 +586,7 @@ async fn record_ask_delivery(
     }
 }
 
+#[cfg(feature = "ask")]
 async fn send_ask_fallback(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
@@ -550,6 +606,7 @@ async fn send_ask_fallback(
     .map(|_| ())
 }
 
+#[cfg(feature = "ask")]
 fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<String> {
     msg.reply_to_message().map(|reply| {
         let author = reply
@@ -601,6 +658,7 @@ fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<Str
     })
 }
 
+#[cfg(feature = "ask")]
 fn ask_progress_message(progress: AskProgress) -> &'static str {
     match progress {
         AskProgress::Preparing => "⏳ Подготавливаю ответ…",
@@ -612,6 +670,7 @@ fn ask_progress_message(progress: AskProgress) -> &'static str {
     }
 }
 
+#[cfg(feature = "ask")]
 fn ask_progress_preview(progress: AskProgress, use_native_draft: bool) -> InputRichMessage {
     let message = ask_progress_message(progress);
     if !use_native_draft {
@@ -634,6 +693,7 @@ fn ask_progress_preview(progress: AskProgress, use_native_draft: bool) -> InputR
     ])
 }
 
+#[cfg(feature = "ask")]
 fn requester_identity(user: &teloxide::types::User) -> String {
     let mut identity = user.first_name.clone();
     if let Some(last_name) = user.last_name.as_deref().filter(|value| !value.is_empty()) {
@@ -648,6 +708,7 @@ fn requester_identity(user: &teloxide::types::User) -> String {
     identity.chars().take(120).collect()
 }
 
+#[cfg(feature = "ask")]
 fn ask_failure_message(kind: AskFailureKind) -> &'static str {
     match kind {
         AskFailureKind::Timeout => {
@@ -677,8 +738,11 @@ pub async fn handle_reply_user_stats_command(
     let pool = &state.pool;
     let config = &state.config;
 
-    if let Err(err) = save_telegram_message(pool, &msg, config).await {
-        tracing::error!(%err, "failed to save command message");
+    if is_managed_chat(config, msg.chat.id.0)
+        && let Err(err) = ingest_message(pool, &msg, config).await
+    {
+        tracing::error!(%err, "failed to ingest command message");
+        return Ok(false);
     }
 
     let render = msg
@@ -692,6 +756,7 @@ pub async fn handle_reply_user_stats_command(
         msg.chat.id,
         pool,
         config,
+        msg.chat.id.0,
         None,
         reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
         render,
@@ -857,6 +922,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "ask")]
     #[test]
     fn ask_progress_uses_thinking_only_for_native_drafts() {
         let native = serde_json::to_value(ask_progress_preview(AskProgress::Preparing, true))
@@ -874,6 +940,7 @@ mod tests {
         assert!(edit["blocks"].is_null());
     }
 
+    #[cfg(feature = "ask")]
     #[test]
     fn fallback_policy_allows_only_confirmed_non_delivery() {
         assert!(may_send_fallback(DeliveryCertainty::NotAttempted));
@@ -881,6 +948,7 @@ mod tests {
         assert!(!may_send_fallback(DeliveryCertainty::Unknown));
     }
 
+    #[cfg(feature = "ask")]
     #[test]
     fn finish_error_certainty_is_preserved_for_fallback_policy() {
         let before = DraftFinishError::<teloxide::RequestError>::WorkerStoppedBeforeCommand;
@@ -905,6 +973,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ask")]
     #[tokio::test]
     async fn unknown_backend_delivery_suppresses_fallback_in_real_finish_path() {
         use std::sync::{
