@@ -308,7 +308,7 @@ pg_type = "bigint"
     }
 
     #[test]
-    fn committed_manifest_reviews_new_user_id_model_columns() {
+    fn committed_manifest_reviews_new_user_risk_columns() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/mcp_db_manifest.toml");
         let catalog = PublicCatalog::load(path).unwrap();
         let audit = catalog
@@ -317,8 +317,9 @@ pg_type = "bigint"
             .expect("new-user audit view must remain in the public MCP catalog");
 
         for column in [
-            "telegram_user_id_risk_model_version",
-            "telegram_user_id_spam_probability",
+            "telegram_user_id_is_recent",
+            "telegram_user_id_rank_ratio",
+            "risk_signal_breakdown",
         ] {
             assert!(
                 audit.columns.contains_key(column),
