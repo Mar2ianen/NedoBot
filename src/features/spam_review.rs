@@ -674,6 +674,9 @@ fn human_label(label: &str) -> &str {
         "known_spam_campaign_match" => "первое сообщение совпадает с известной спам-кампанией",
         "tree_personal_channel_adult_funnel" => "личный канал ведёт в adult-воронку",
         "tree_personal_channel_invite_funnel" => "личный канал ведёт по Telegram-инвайту",
+        "tree_fresh_money_work_contact_funnel" => {
+            "свежий участник предлагает заработок/работу с прямым CTA"
+        }
         "tree_fresh_channel_external_link" => "свежий участник ведёт во внешний канал/ссылку",
         "tree_channel_comments_with_recent_id" => "свежий ID пишет только ответы к постам канала",
         "tree_channel_comments_with_personal_channel" => {
