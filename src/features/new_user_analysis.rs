@@ -190,7 +190,7 @@ struct RiskAnalysis {
     signals: Value,
 }
 
-const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v1";
+const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v2";
 
 #[derive(Debug, Clone, Copy)]
 struct SharedSpamTreeLeaf {
@@ -984,6 +984,26 @@ fn shared_spam_decision_tree(
     }
 
     let is_fresh_in_chat = features.chat_age_sec.is_some_and(|age| age < 6 * 60 * 60);
+    if is_fresh_in_chat
+        && features.message_count <= 2
+        && features
+            .first_message_text
+            .as_deref()
+            .is_some_and(is_fresh_money_work_promotion)
+    {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::PromoDmBait,
+            label: "tree_fresh_money_work_contact_funnel",
+            reason: "A just-arrived low-activity user combines a money/work offer with a direct-contact call to action",
+            path: &[
+                "chat_age_under_six_hours",
+                "one_or_two_messages",
+                "money_or_work_offer",
+                "direct_contact_call_to_action",
+            ],
+        });
+    }
+
     if has_personal_channel
         && personal_channel_has_external_link(features)
         && (is_fresh_in_chat || only_channel_post_comments)
@@ -1028,6 +1048,96 @@ fn shared_spam_decision_tree(
     }
 
     None
+}
+
+fn is_fresh_money_work_promotion(message: &str) -> bool {
+    let normalized = normalize_cyrillic_homoglyphs(message).to_lowercase();
+    let has_contact_call_to_action = [
+        "пиши",
+        "напиши",
+        "пишите",
+        "напишите",
+        "жду",
+        "в лс",
+        "лс",
+        "личк",
+        "личные сообщения",
+        "свяжись",
+        "свяжитесь",
+        "@",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if !has_contact_call_to_action {
+        return false;
+    }
+
+    let has_crypto_topic = ["крипт", "биткоин", "bitcoin", "btc", "трейдинг"]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let has_work_or_income_offer = [
+        "заработ",
+        "подработ",
+        "доход",
+        "удаленк",
+        "удалёнк",
+        "ваканси",
+        "оплата",
+        "оплатим",
+        "оплат",
+        "без опыта",
+        "простые задач",
+        "простых задач",
+        "обучаем с нуля",
+        "разберется каждый",
+        "разберётся каждый",
+        "нужно три человека",
+        "нужно 3 человека",
+        "нужны три человека",
+        "нужны 3 человека",
+        "криптопроект",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let crypto_campaign = has_crypto_topic
+        && (has_work_or_income_offer
+            || ["работ", "проект", "обуч", "человек", "деньг", "задач"]
+                .iter()
+                .any(|marker| normalized.contains(marker)));
+
+    let has_explicit_amount = ["дам ", "отдам ", "плачу ", "оплата ", "оплачу "]
+        .iter()
+        .any(|marker| {
+            normalized.match_indices(marker).any(|(offset, _)| {
+                normalized[offset + marker.len()..]
+                    .trim_start()
+                    .chars()
+                    .take(5)
+                    .any(|character| character.is_ascii_digit())
+            })
+        })
+        || (normalized
+            .chars()
+            .any(|character| character.is_ascii_digit())
+            && ["руб", "₽"]
+                .iter()
+                .any(|marker| normalized.contains(marker)));
+    let has_easy_task_offer = [
+        "помощ",
+        "задач",
+        "движ",
+        "за пару",
+        "за смен",
+        "за час",
+        "несложн",
+        "небольш",
+        "легк",
+        "лёгк",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+
+    crypto_campaign || (has_explicit_amount && has_easy_task_offer)
 }
 
 fn apply_shared_spam_tree_leaf(
@@ -2621,6 +2731,73 @@ mod tests {
         let leaf = shared_spam_decision_tree(&adult_channel, &NewUserAnalysisConfig::default())
             .expect("adult channel funnel is a decisive path");
         assert_eq!(leaf.label, "tree_personal_channel_adult_funnel");
+    }
+
+    #[test]
+    fn fresh_money_work_offer_needs_a_contact_cta_and_fresh_low_activity_context() {
+        let crypto_recruitment = NewUserFeatures {
+            message_count: 1,
+            chat_age_sec: Some(1),
+            first_message_text: Some(
+                "Заработок на крипте на удалёнке. Простые задачи, обучаем с нуля, опыт не нужен. Пиши в лс @contact_name".to_string(),
+            ),
+            ..Default::default()
+        };
+        let leaf =
+            shared_spam_decision_tree(&crypto_recruitment, &NewUserAnalysisConfig::default())
+                .expect("fresh crypto recruitment with a direct CTA is a tree leaf");
+        assert_eq!(leaf.label, "tree_fresh_money_work_contact_funnel");
+        assert_eq!(
+            leaf.path,
+            &[
+                "chat_age_under_six_hours",
+                "one_or_two_messages",
+                "money_or_work_offer",
+                "direct_contact_call_to_action",
+            ]
+        );
+        let analysis = analyze_new_or_low_activity_user(
+            &crypto_recruitment,
+            &NewUserAnalysisConfig::default(),
+        );
+        assert_eq!(analysis.score, 70);
+        assert_eq!(analysis.level, "high");
+        assert!(analysis.labels.contains(&leaf.label.to_string()));
+
+        let paid_task = NewUserFeatures {
+            message_count: 1,
+            chat_age_sec: Some(1),
+            first_message_text: Some(
+                "Дам 5000 за пару легских движений, жду @contact_name".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(&paid_task, &NewUserAnalysisConfig::default())
+                .map(|leaf| leaf.label),
+            Some("tree_fresh_money_work_contact_funnel")
+        );
+
+        let stale_offer = NewUserFeatures {
+            chat_age_sec: Some(7 * 60 * 60),
+            first_message_text: crypto_recruitment.first_message_text.clone(),
+            ..Default::default()
+        };
+        assert!(
+            shared_spam_decision_tree(&stale_offer, &NewUserAnalysisConfig::default()).is_none()
+        );
+
+        let ordinary_course_share = NewUserFeatures {
+            chat_age_sec: Some(1),
+            first_message_text: Some(
+                "Прошёл курс по крипте, помогло на старте; пишите, скину бесплатно".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            shared_spam_decision_tree(&ordinary_course_share, &NewUserAnalysisConfig::default())
+                .is_none()
+        );
     }
 
     #[test]
