@@ -190,7 +190,7 @@ struct RiskAnalysis {
     signals: Value,
 }
 
-const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v2";
+const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v3";
 
 #[derive(Debug, Clone, Copy)]
 struct SharedSpamTreeLeaf {
@@ -989,6 +989,46 @@ fn shared_spam_decision_tree(
         && features
             .first_message_text
             .as_deref()
+            .is_some_and(is_fresh_contact_send_offer)
+    {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::PromoDmBait,
+            label: "tree_fresh_contact_send_offer",
+            reason: "A just-arrived low-activity user combines a direct-contact call to action with a promise to send something",
+            path: &[
+                "chat_age_under_six_hours",
+                "one_or_two_messages",
+                "direct_contact_call_to_action",
+                "promise_to_send_content",
+            ],
+        });
+    }
+
+    if is_fresh_in_chat
+        && features.message_count <= 2
+        && features
+            .first_message_text
+            .as_deref()
+            .is_some_and(is_fresh_paid_task_offer)
+    {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::PromoDmBait,
+            label: "tree_fresh_paid_task_offer",
+            reason: "A just-arrived low-activity user names a concrete payment amount for a small or easy task",
+            path: &[
+                "chat_age_under_six_hours",
+                "one_or_two_messages",
+                "explicit_payment_amount",
+                "small_or_easy_task",
+            ],
+        });
+    }
+
+    if is_fresh_in_chat
+        && features.message_count <= 2
+        && features
+            .first_message_text
+            .as_deref()
             .is_some_and(is_fresh_money_work_promotion)
     {
         return Some(SharedSpamTreeLeaf {
@@ -1000,6 +1040,24 @@ fn shared_spam_decision_tree(
                 "one_or_two_messages",
                 "money_or_work_offer",
                 "direct_contact_call_to_action",
+            ],
+        });
+    }
+
+    if features.chat_age_sec.is_some_and(|age| age < 24 * 60 * 60)
+        && features.message_count <= 3
+        && has_recent_id
+        && features.text_texture.duplicate_normalized_count > 0
+    {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::FreshAccount,
+            label: "tree_fresh_recent_id_repeated_message",
+            reason: "A recent-ID low-activity user repeats a normalized message shortly after joining",
+            path: &[
+                "chat_age_under_twenty_four_hours",
+                "up_to_three_messages",
+                "recent_telegram_id",
+                "repeated_normalized_message",
             ],
         });
     }
@@ -1052,23 +1110,7 @@ fn shared_spam_decision_tree(
 
 fn is_fresh_money_work_promotion(message: &str) -> bool {
     let normalized = normalize_cyrillic_homoglyphs(message).to_lowercase();
-    let has_contact_call_to_action = [
-        "пиши",
-        "напиши",
-        "пишите",
-        "напишите",
-        "жду",
-        "в лс",
-        "лс",
-        "личк",
-        "личные сообщения",
-        "свяжись",
-        "свяжитесь",
-        "@",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    if !has_contact_call_to_action {
+    if !has_contact_call_to_action(&normalized) {
         return false;
     }
 
@@ -1099,12 +1141,15 @@ fn is_fresh_money_work_promotion(message: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker));
-    let crypto_campaign = has_crypto_topic
+    has_crypto_topic
         && (has_work_or_income_offer
             || ["работ", "проект", "обуч", "человек", "деньг", "задач"]
                 .iter()
-                .any(|marker| normalized.contains(marker)));
+                .any(|marker| normalized.contains(marker)))
+}
 
+fn is_fresh_paid_task_offer(message: &str) -> bool {
+    let normalized = normalize_cyrillic_homoglyphs(message).to_lowercase();
     let has_explicit_amount = ["дам ", "отдам ", "плачу ", "оплата ", "оплачу "]
         .iter()
         .any(|marker| {
@@ -1137,7 +1182,52 @@ fn is_fresh_money_work_promotion(message: &str) -> bool {
     .iter()
     .any(|marker| normalized.contains(marker));
 
-    crypto_campaign || (has_explicit_amount && has_easy_task_offer)
+    has_explicit_amount && has_easy_task_offer
+}
+
+fn is_fresh_contact_send_offer(message: &str) -> bool {
+    let normalized = normalize_cyrillic_homoglyphs(message).to_lowercase();
+    has_contact_call_to_action(&normalized)
+        && [
+            "в лс",
+            "лс",
+            "личк",
+            "личные сообщения",
+            "в директ",
+            "директ",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        && [
+            "отправлю",
+            "пришлю",
+            "скину",
+            "перешлю",
+            "сброшу",
+            "поделюсь",
+            "вышлю",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn has_contact_call_to_action(normalized: &str) -> bool {
+    [
+        "пиши",
+        "напиши",
+        "пишите",
+        "напишите",
+        "жду",
+        "в лс",
+        "лс",
+        "личк",
+        "личные сообщения",
+        "свяжись",
+        "свяжитесь",
+        "@",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn apply_shared_spam_tree_leaf(
@@ -2775,7 +2865,22 @@ mod tests {
         assert_eq!(
             shared_spam_decision_tree(&paid_task, &NewUserAnalysisConfig::default())
                 .map(|leaf| leaf.label),
-            Some("tree_fresh_money_work_contact_funnel")
+            Some("tree_fresh_paid_task_offer")
+        );
+
+        let paid_task_without_contact_cta = NewUserFeatures {
+            message_count: 1,
+            chat_age_sec: Some(1),
+            first_message_text: Some("Дам 1800 за небольшую помощь".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(
+                &paid_task_without_contact_cta,
+                &NewUserAnalysisConfig::default()
+            )
+            .map(|leaf| leaf.label),
+            Some("tree_fresh_paid_task_offer")
         );
 
         let stale_offer = NewUserFeatures {
@@ -2797,6 +2902,90 @@ mod tests {
         assert!(
             shared_spam_decision_tree(&ordinary_course_share, &NewUserAnalysisConfig::default())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn fresh_direct_contact_send_offer_is_a_decisive_review_tree() {
+        let audio_book_offer = NewUserFeatures {
+            message_count: 1,
+            chat_age_sec: Some(1),
+            first_message_text: Some(
+                "Есть хорошая аудиоверсия, если интересно — пишите в личку, отправлю.".to_string(),
+            ),
+            ..Default::default()
+        };
+        let leaf = shared_spam_decision_tree(&audio_book_offer, &NewUserAnalysisConfig::default())
+            .expect("fresh direct-message content funnel is a decisive tree leaf");
+        assert_eq!(leaf.label, "tree_fresh_contact_send_offer");
+        assert_eq!(
+            leaf.path,
+            &[
+                "chat_age_under_six_hours",
+                "one_or_two_messages",
+                "direct_contact_call_to_action",
+                "promise_to_send_content",
+            ]
+        );
+        let analysis =
+            analyze_new_or_low_activity_user(&audio_book_offer, &NewUserAnalysisConfig::default());
+        assert_eq!(analysis.score, 70);
+        assert_eq!(analysis.level, "high");
+
+        let no_contact_cta = NewUserFeatures {
+            message_count: 1,
+            chat_age_sec: Some(1),
+            first_message_text: Some(
+                "Есть хорошая аудиоверсия, отправлю ссылку позже.".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(
+            shared_spam_decision_tree(&no_contact_cta, &NewUserAnalysisConfig::default()).is_none()
+        );
+
+        let stale_offer = NewUserFeatures {
+            chat_age_sec: Some(7 * 60 * 60),
+            ..audio_book_offer
+        };
+        assert!(
+            shared_spam_decision_tree(&stale_offer, &NewUserAnalysisConfig::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn fresh_recent_id_repeated_message_is_a_decisive_review_tree() {
+        let repeated_campaign = NewUserFeatures {
+            message_count: 3,
+            chat_age_sec: Some(31_932),
+            id_rank_ratio: Some(0.946),
+            text_texture: TextTexture {
+                duplicate_normalized_count: 1,
+                max_reuse_count: 2,
+                repetitive_pattern: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let leaf = shared_spam_decision_tree(&repeated_campaign, &NewUserAnalysisConfig::default())
+            .expect("fresh repeated campaign from a recent ID is a decisive tree leaf");
+        assert_eq!(leaf.label, "tree_fresh_recent_id_repeated_message");
+        assert_eq!(
+            leaf.path,
+            &[
+                "chat_age_under_twenty_four_hours",
+                "up_to_three_messages",
+                "recent_telegram_id",
+                "repeated_normalized_message",
+            ]
+        );
+
+        let stale_campaign = NewUserFeatures {
+            chat_age_sec: Some(25 * 60 * 60),
+            ..repeated_campaign
+        };
+        assert!(
+            shared_spam_decision_tree(&stale_campaign, &NewUserAnalysisConfig::default()).is_none()
         );
     }
 

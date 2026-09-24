@@ -677,6 +677,13 @@ fn human_label(label: &str) -> &str {
         "tree_fresh_money_work_contact_funnel" => {
             "свежий участник предлагает заработок/работу с прямым CTA"
         }
+        "tree_fresh_contact_send_offer" => "свежий участник по CTA обещает прислать материал",
+        "tree_fresh_paid_task_offer" => {
+            "свежий участник обещает конкретную оплату за простую задачу"
+        }
+        "tree_fresh_recent_id_repeated_message" => {
+            "свежий ID повторяет сообщение в короткой кампании"
+        }
         "tree_fresh_channel_external_link" => "свежий участник ведёт во внешний канал/ссылку",
         "tree_channel_comments_with_recent_id" => "свежий ID пишет только ответы к постам канала",
         "tree_channel_comments_with_personal_channel" => {
