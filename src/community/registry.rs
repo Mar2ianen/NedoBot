@@ -100,6 +100,7 @@ mod tests {
                 stats: true,
                 voice: false,
                 ask: false,
+                reports: true,
                 review_destination: false,
                 invite_url_env: None,
                 invite_label: None,
@@ -121,6 +122,13 @@ mod tests {
             -1001
         );
         assert_eq!(registry.managed_chat_ids().collect::<Vec<_>>(), vec![-1001]);
+        assert!(
+            registry
+                .chat_by_id(&community, -1001)
+                .unwrap()
+                .config
+                .reports
+        );
     }
 
     #[test]
@@ -135,6 +143,7 @@ mod tests {
                     stats: false,
                     voice: false,
                     ask: false,
+                    reports: false,
                     review_destination: false,
                     invite_url_env: None,
                     invite_label: None,
@@ -149,6 +158,7 @@ mod tests {
                     stats: false,
                     voice: false,
                     ask: false,
+                    reports: false,
                     review_destination: false,
                     invite_url_env: None,
                     invite_label: None,

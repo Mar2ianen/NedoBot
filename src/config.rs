@@ -1143,6 +1143,7 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
                 stats: true,
                 voice: true,
                 ask: true,
+                reports: false,
                 review_destination: true,
                 invite_url_env: Some("CHAT_INVITE_URL".to_string()),
                 invite_label: Some("чате".to_string()),
@@ -1181,7 +1182,17 @@ mod tests {
         ))
         .unwrap();
 
-        community_config_from_profiles(&profiles).unwrap();
+        let community = community_config_from_profiles(&profiles).unwrap();
+        assert!(
+            community.chats.get("main").unwrap().reports,
+            "the primary profile explicitly enables /report"
+        );
+    }
+
+    #[test]
+    fn reports_are_opt_in_for_other_community_profiles() {
+        let chat: crate::config_file::ChatConfig = toml::from_str("id = -1001748745317").unwrap();
+        assert!(!chat.reports);
     }
 
     struct EnvVarGuard {
@@ -1805,6 +1816,7 @@ models = ["primary", "fallback"]
                 stats: false,
                 voice: false,
                 ask: true,
+                reports: false,
                 review_destination: false,
                 invite_url_env: None,
                 invite_label: None,

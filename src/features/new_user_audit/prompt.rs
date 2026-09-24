@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/new_user_audit.md");
 
-pub const PROMPT_VERSION: &str = "new-user-audit-v2";
+pub const PROMPT_VERSION: &str = "new-user-audit-v3";
 
 static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
@@ -44,8 +44,8 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                             "template_campaign": { "type": "boolean" },
                             "self_reference_grammar": { "type": "string", "enum": ["masculine", "feminine", "none_or_unclear"] },
                             "profile_name_grammar_relation": { "type": "string", "enum": ["consistent", "conflicts", "not_applicable"] },
-                            "risk_markers": { "type": "array", "maxItems": 8, "items": { "type": "string", "enum": ["send_or_share_offer", "direct_messages", "self_help_or_finance_promo", "template_efficiency_narrative", "masked_call_to_action", "paid_easy_task_offer", "external_promo_funnel", "generic_campaign_reaction", "performative_feminine_persona"] } },
-                            "evidence": { "type": "array", "maxItems": 10, "items": { "type": "object", "additionalProperties": false, "properties": { "marker": { "type": "string", "enum": ["send_or_share_offer", "direct_messages", "self_help_or_finance_promo", "template_efficiency_narrative", "masked_call_to_action", "paid_easy_task_offer", "external_promo_funnel", "generic_campaign_reaction", "performative_feminine_persona"] }, "quote": { "type": "string", "minLength": 1, "maxLength": 600 } }, "required": ["marker", "quote"] } },
+                            "risk_markers": { "type": "array", "maxItems": 8, "items": { "type": "string", "enum": ["send_or_share_offer", "direct_messages", "self_help_or_finance_promo", "template_efficiency_narrative", "masked_call_to_action", "paid_easy_task_offer", "external_promo_funnel", "generic_campaign_reaction", "performative_feminine_persona", "rkn_related_vpn_promotion"] } },
+                            "evidence": { "type": "array", "maxItems": 10, "items": { "type": "object", "additionalProperties": false, "properties": { "marker": { "type": "string", "enum": ["send_or_share_offer", "direct_messages", "self_help_or_finance_promo", "template_efficiency_narrative", "masked_call_to_action", "paid_easy_task_offer", "external_promo_funnel", "generic_campaign_reaction", "performative_feminine_persona", "rkn_related_vpn_promotion"] }, "quote": { "type": "string", "minLength": 1, "maxLength": 600 } }, "required": ["marker", "quote"] } },
                             "summary": { "type": "string", "minLength": 1, "maxLength": 600 },
                             "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                         },

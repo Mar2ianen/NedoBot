@@ -28,6 +28,9 @@ pub enum Command {
     #[cfg(feature = "ask")]
     #[command(description = "добавить заметку о пользователе reply; /user_note <текст>")]
     UserNote(String),
+    #[cfg(feature = "moderation")]
+    #[command(description = "пожаловаться на сообщение reply; /report [причина]")]
+    Report(String),
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]
     StatsDay(String),
     #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p]")]
@@ -59,4 +62,18 @@ pub enum Command {
         description = "alias /userstats: /userstatus <id|username> [-r|-p], или reply"
     )]
     UserStatus(String),
+}
+
+#[cfg(all(test, feature = "moderation"))]
+mod tests {
+    use super::Command;
+    use teloxide::utils::command::BotCommands;
+
+    #[test]
+    fn report_command_parses_reply_reason() {
+        assert!(matches!(
+            Command::parse("/report рекламная ссылка", "nedobot"),
+            Ok(Command::Report(reason)) if reason == "рекламная ссылка"
+        ));
+    }
 }
