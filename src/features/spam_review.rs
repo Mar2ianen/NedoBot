@@ -667,6 +667,19 @@ fn human_label(label: &str) -> &str {
         "non_adjacent_emoji_message_ending" => "комментарий заканчивается emoji",
         "unified_first_message_analysis" => "первое сообщение похоже на известную спам-кампанию",
         "rkn_vpn_service_promotion" => "промо VPN в ответ на вопрос об ограничениях/РКН",
+        "offtopic_direct_dm_funnel" => "оффтопное предложение перейти в личку и прислать материал",
+        "evidence_backed_paid_task_offer" => {
+            "подтверждённое предложением сообщение о лёгком заработке"
+        }
+        "known_spam_campaign_match" => "первое сообщение совпадает с известной спам-кампанией",
+        "tree_personal_channel_adult_funnel" => "личный канал ведёт в adult-воронку",
+        "tree_personal_channel_invite_funnel" => "личный канал ведёт по Telegram-инвайту",
+        "tree_fresh_channel_external_link" => "свежий участник ведёт во внешний канал/ссылку",
+        "tree_channel_comments_with_recent_id" => "свежий ID пишет только ответы к постам канала",
+        "tree_channel_comments_with_personal_channel" => {
+            "ответы только к постам канала и привязанный личный канал"
+        }
+        "tree_recent_id_random_username" => "свежий ID и username со случайным суффиксом",
         _ => label,
     }
 }
@@ -721,6 +734,14 @@ mod tests {
         assert_eq!(
             human_label("telegram_id_spam_probability"),
             "свежий Telegram ID по модели"
+        );
+        assert_eq!(
+            human_label("tree_channel_comments_with_personal_channel"),
+            "ответы только к постам канала и привязанный личный канал"
+        );
+        assert_eq!(
+            human_label("offtopic_direct_dm_funnel"),
+            "оффтопное предложение перейти в личку и прислать материал"
         );
     }
 }

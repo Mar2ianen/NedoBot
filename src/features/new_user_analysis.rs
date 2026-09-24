@@ -67,7 +67,7 @@ impl NewUserAnalysisConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct NewUserFeatures {
     chat_id: i64,
     telegram_user_id: i64,
@@ -188,6 +188,16 @@ struct RiskAnalysis {
     labels: Vec<String>,
     reasons: Vec<String>,
     signals: Value,
+}
+
+const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v1";
+
+#[derive(Debug, Clone, Copy)]
+struct SharedSpamTreeLeaf {
+    class: SpamClass,
+    label: &'static str,
+    reason: &'static str,
+    path: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -931,7 +941,118 @@ fn analyze_new_or_low_activity_user(
     risk.add_optional(explicit_adult_bio_signal(features));
     risk.add_optional(profile_bio_subscription_offer_signal(features));
     risk.add_optional(member_status_signal(features));
-    risk.finish(config.review_threshold)
+    let mut analysis = risk.finish(config.review_threshold);
+    if let Some(leaf) = shared_spam_decision_tree(features, config) {
+        apply_shared_spam_tree_leaf(&mut analysis, leaf, config.review_threshold);
+    }
+    analysis
+}
+
+fn shared_spam_decision_tree(
+    features: &NewUserFeatures,
+    config: &NewUserAnalysisConfig,
+) -> Option<SharedSpamTreeLeaf> {
+    let has_personal_channel = features.personal_channel_chat_id.is_some();
+    let only_channel_post_comments = only_channel_post_comments(features);
+    let has_recent_id = features
+        .id_rank_ratio
+        .is_some_and(|ratio| ratio >= config.recent_id_ratio_threshold);
+    let has_random_username = username_stats(features.username.as_deref()).has_random_suffix;
+
+    if has_personal_channel && features.personal_channel_has_adult_links {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::AdultPersonalChannel,
+            label: "tree_personal_channel_adult_funnel",
+            reason: "Attached personal channel contains adult-promotion links",
+            path: &[
+                "personal_channel_attached",
+                "personal_channel_has_adult_links",
+            ],
+        });
+    }
+
+    if has_personal_channel && personal_channel_has_invite_link(features) {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::LinkDropper,
+            label: "tree_personal_channel_invite_funnel",
+            reason: "Attached personal channel contains a Telegram invite funnel",
+            path: &[
+                "personal_channel_attached",
+                "personal_channel_has_invite_link",
+            ],
+        });
+    }
+
+    let is_fresh_in_chat = features.chat_age_sec.is_some_and(|age| age < 6 * 60 * 60);
+    if has_personal_channel
+        && personal_channel_has_external_link(features)
+        && (is_fresh_in_chat || only_channel_post_comments)
+    {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::LinkDropper,
+            label: "tree_fresh_channel_external_link",
+            reason: "A fresh or channel-post-only participant routes traffic through an attached channel link",
+            path: &[
+                "personal_channel_attached",
+                "personal_channel_has_external_link",
+                "fresh_or_only_channel_post_comments",
+            ],
+        });
+    }
+
+    if only_channel_post_comments && has_recent_id {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::FreshAccount,
+            label: "tree_channel_comments_with_recent_id",
+            reason: "A recent Telegram ID only replies directly to channel posts",
+            path: &["only_channel_post_comments", "recent_telegram_id"],
+        });
+    }
+
+    if only_channel_post_comments && has_personal_channel {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::LlmProfileBait,
+            label: "tree_channel_comments_with_personal_channel",
+            reason: "A channel-post-only participant has an attached personal channel",
+            path: &["only_channel_post_comments", "personal_channel_attached"],
+        });
+    }
+
+    if has_recent_id && has_random_username {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::FreshAccount,
+            label: "tree_recent_id_random_username",
+            reason: "A recent Telegram ID is paired with a random-suffix username",
+            path: &["recent_telegram_id", "username_random_suffix"],
+        });
+    }
+
+    None
+}
+
+fn apply_shared_spam_tree_leaf(
+    analysis: &mut RiskAnalysis,
+    leaf: SharedSpamTreeLeaf,
+    review_threshold: i32,
+) {
+    analysis.score = analysis.score.max(review_threshold.clamp(0, 100)).min(100);
+    analysis.level = "high".to_string();
+    analysis.primary_class = Some(leaf.class.as_str().to_string());
+    analysis.labels.push(leaf.label.to_string());
+    analysis.labels.sort();
+    analysis.labels.dedup();
+    analysis.reasons.push(leaf.reason.to_string());
+    if let Some(signals) = analysis.signals.as_array_mut() {
+        signals.push(json!({
+            "class": leaf.class.as_str(),
+            "label": leaf.label,
+            "warning_strength": "strong",
+            "decision_tree_version": SHARED_SPAM_DECISION_TREE_VERSION,
+            "decision_tree_path": leaf.path,
+            "decision": "manual_review",
+            "reason": leaf.reason,
+        }));
+    }
 }
 
 fn message_count_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1184,16 +1305,6 @@ fn chat_position_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
                 coefficient: 12,
                 label: "only_channel_post_comments",
                 reason: "New user only comments under channel posts",
-            })
-        }
-        (count, 0, channel_comments, bot_replies, comment_replies)
-            if count > 0 && channel_comments + bot_replies + comment_replies >= count =>
-        {
-            Some(RiskSignal {
-                class: SpamClass::LlmProfileBait,
-                coefficient: 9,
-                label: "only_replies_or_comments",
-                reason: "New user appears only in comment/reply contexts, not as normal chat participant",
             })
         }
         (_, _, _, bot_replies, _) if bot_replies > 0 => Some(RiskSignal {
@@ -2383,6 +2494,161 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_channel_post_comments_are_a_high_lift_signal() {
+        let features = NewUserFeatures {
+            message_count: 2,
+            reply_to_channel_post_count: 2,
+            ..Default::default()
+        };
+
+        let signal = chat_position_signal(&features).expect("direct post comments are scored");
+        assert_eq!(signal.label, "only_channel_post_comments");
+        assert_eq!(signal.coefficient, 12);
+    }
+
+    #[test]
+    fn ordinary_comment_thread_participation_is_not_a_spam_signal() {
+        let features = NewUserFeatures {
+            message_count: 2,
+            reply_to_comment_count: 2,
+            ..Default::default()
+        };
+
+        assert!(chat_position_signal(&features).is_none());
+    }
+
+    #[test]
+    fn personal_channel_external_link_matches_only_a_multi_feature_tree_path() {
+        let features = NewUserFeatures {
+            message_count: 1,
+            reply_to_channel_post_count: 1,
+            chat_age_sec: Some(60),
+            personal_channel_chat_id: Some(-100_000_000_001),
+            personal_channel_last_text: Some("https://example.org".to_string()),
+            ..Default::default()
+        };
+
+        let signals = personal_channel_signals(&features);
+        assert_eq!(
+            signals
+                .iter()
+                .find(|signal| signal.label == "personal_channel_attached")
+                .map(|signal| signal.coefficient),
+            Some(12)
+        );
+        assert_eq!(
+            signals
+                .iter()
+                .find(|signal| signal.label == "personal_channel_external_link")
+                .map(|signal| signal.coefficient),
+            Some(8)
+        );
+        assert_eq!(
+            shared_spam_decision_tree(&features, &NewUserAnalysisConfig::default())
+                .map(|leaf| leaf.label),
+            Some("tree_fresh_channel_external_link")
+        );
+    }
+
+    #[test]
+    fn decision_tree_requires_combinations_for_generic_comment_and_id_signals() {
+        let comments_with_channel = NewUserFeatures {
+            message_count: 2,
+            reply_to_channel_post_count: 2,
+            personal_channel_chat_id: Some(-100_000_000_001),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(&comments_with_channel, &NewUserAnalysisConfig::default())
+                .map(|leaf| leaf.label),
+            Some("tree_channel_comments_with_personal_channel")
+        );
+
+        let comments_with_recent_id = NewUserFeatures {
+            message_count: 2,
+            reply_to_channel_post_count: 2,
+            id_rank_ratio: Some(0.99),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(&comments_with_recent_id, &NewUserAnalysisConfig::default())
+                .map(|leaf| leaf.label),
+            Some("tree_channel_comments_with_recent_id")
+        );
+
+        let recent_id_with_random_username = NewUserFeatures {
+            id_rank_ratio: Some(0.99),
+            username: Some("dev_yasnyy_dcpc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(
+                &recent_id_with_random_username,
+                &NewUserAnalysisConfig::default()
+            )
+            .map(|leaf| leaf.label),
+            Some("tree_recent_id_random_username")
+        );
+
+        let only_a_comment = NewUserFeatures {
+            message_count: 1,
+            reply_to_comment_count: 1,
+            ..Default::default()
+        };
+        assert!(
+            shared_spam_decision_tree(&only_a_comment, &NewUserAnalysisConfig::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn invite_or_adult_funnel_is_a_direct_tree_leaf() {
+        let invite_channel = NewUserFeatures {
+            personal_channel_chat_id: Some(-100_000_000_001),
+            personal_channel_last_text: Some("Подписывайтесь t.me/+invite".to_string()),
+            ..Default::default()
+        };
+        let leaf = shared_spam_decision_tree(&invite_channel, &NewUserAnalysisConfig::default())
+            .expect("attached-channel invite funnel is a decisive path");
+        assert_eq!(leaf.label, "tree_personal_channel_invite_funnel");
+
+        let adult_channel = NewUserFeatures {
+            personal_channel_chat_id: Some(-100_000_000_001),
+            personal_channel_has_adult_links: true,
+            ..Default::default()
+        };
+        let leaf = shared_spam_decision_tree(&adult_channel, &NewUserAnalysisConfig::default())
+            .expect("adult channel funnel is a decisive path");
+        assert_eq!(leaf.label, "tree_personal_channel_adult_funnel");
+    }
+
+    #[test]
+    fn decision_tree_review_is_not_the_sum_of_weak_signals() {
+        let features = NewUserFeatures {
+            message_count: 2,
+            reply_to_channel_post_count: 2,
+            personal_channel_chat_id: Some(-100_000_000_001),
+            ..Default::default()
+        };
+
+        let analysis =
+            analyze_new_or_low_activity_user(&features, &NewUserAnalysisConfig::default());
+
+        assert_eq!(analysis.score, 70);
+        assert_eq!(analysis.level, "high");
+        let tree_signal = analysis
+            .signals
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["decision_tree_version"] == SHARED_SPAM_DECISION_TREE_VERSION)
+            .expect("high-risk feature path is recorded");
+        assert_eq!(
+            tree_signal["decision_tree_path"],
+            json!(["only_channel_post_comments", "personal_channel_attached"])
+        );
+    }
 
     #[test]
     fn shared_spammer_identity_is_a_review_threshold_signal() {
