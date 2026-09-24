@@ -46,6 +46,7 @@ use tg_ai_bot_teloxide::features::{
         },
         scoring::ScoreComponents,
     },
+    reports::{ReportCreation, ReportTarget, create_report},
     spam_review::{
         claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
     },
@@ -73,6 +74,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_report_outbox_lifecycle(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
@@ -2530,6 +2532,51 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         spam_reputation_table.as_deref(),
         Some("shared_spam_reputation")
     );
+}
+
+async fn assert_report_outbox_lifecycle(pool: &PgPool) {
+    let now = Utc::now();
+    let message_id = now.timestamp() as i32;
+    let reporter_user_id = 5_000_000_000_i64 + now.timestamp();
+    let target = ReportTarget {
+        chat_id: -1001932061163,
+        message_id,
+        reporter_user_id,
+        reported_user_id: reporter_user_id + 1,
+        reason: "регрессионная проверка".to_owned(),
+        target_text: Some("fixture".to_owned()),
+        target_media: "текст".to_owned(),
+        target_reply_to_message_id: None,
+        target_created_at: now,
+        reporter_snapshot: serde_json::json!({"id": reporter_user_id}),
+        target_snapshot: serde_json::json!({"id": reporter_user_id + 1}),
+    };
+
+    let created = create_report(pool, &target, &[reporter_user_id + 2])
+        .await
+        .expect("/report must persist the report and queue its delivery");
+    let ReportCreation::Created(report_id) = created else {
+        panic!("first report attempt must create a report, got {created:?}");
+    };
+    let deliveries: i64 =
+        query_scalar("select count(*) from telegram_report_deliveries where report_id = $1")
+            .bind(report_id)
+            .fetch_one(pool)
+            .await
+            .expect("report delivery row must be stored");
+    assert_eq!(deliveries, 1);
+
+    assert_eq!(
+        create_report(pool, &target, &[reporter_user_id + 2])
+            .await
+            .expect("duplicate /report must be handled"),
+        ReportCreation::AlreadyExists(report_id)
+    );
+    query("delete from telegram_reports where id = $1")
+        .bind(report_id)
+        .execute(pool)
+        .await
+        .expect("regression fixture must be cleaned up");
 }
 
 async fn assert_sent_comment_requires_sent_at(pool: &PgPool) {

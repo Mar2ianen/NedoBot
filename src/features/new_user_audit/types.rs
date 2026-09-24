@@ -114,6 +114,7 @@ pub enum FirstMessageRiskMarker {
     ExternalPromoFunnel,
     GenericCampaignReaction,
     PerformativeFemininePersona,
+    RknRelatedVpnPromotion,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -19,6 +19,8 @@ pub mod memory;
 pub mod new_user_analysis;
 #[cfg(feature = "moderation")]
 pub mod new_user_audit;
+#[cfg(feature = "moderation")]
+pub mod reports;
 pub mod search;
 #[cfg(feature = "spam-sync")]
 pub mod spam_reputation;

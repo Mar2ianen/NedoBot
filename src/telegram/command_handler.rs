@@ -27,6 +27,8 @@ use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 use crate::features::memory::report::send_memory_notes;
+#[cfg(feature = "moderation")]
+use crate::features::reports::{self, ReportCreation};
 use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
@@ -42,7 +44,7 @@ use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 #[cfg(feature = "ask")]
 use crate::telegram::media::download_largest_photo_base64;
-use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::render::{escape_html, send_html, send_html_reply};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -75,6 +77,12 @@ pub async fn handle_command(
             | Command::UserStatus(_)
     );
     if is_stats_command && !managed_chat_allows(config, msg.chat.id.0, |chat| chat.stats) {
+        return Ok(());
+    }
+    #[cfg(feature = "moderation")]
+    if matches!(&cmd, Command::Report(_))
+        && !managed_chat_allows(config, msg.chat.id.0, |chat| chat.reports)
+    {
         return Ok(());
     }
 
@@ -145,6 +153,10 @@ pub async fn handle_command(
         #[cfg(feature = "ask")]
         Command::UserNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, reply_user_id(&msg)).await?;
+        }
+        #[cfg(feature = "moderation")]
+        Command::Report(reason) => {
+            handle_report_command(&bot, &msg, &state, &reason).await?;
         }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
@@ -239,6 +251,89 @@ pub async fn handle_command(
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn handle_report_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    reason: &str,
+) -> ResponseResult<()> {
+    if let Err(err) = reports::report_target_context(msg, &state.config) {
+        tracing::debug!(%err, "rejected /report command");
+        send_html_reply(
+            bot,
+            msg.chat.id,
+            msg.id,
+            "Репорт можно отправить только ответом на сообщение участника в этом чате.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let Some(target) = reports::target_from_reply(msg, reason) else {
+        send_html_reply(
+            bot,
+            msg.chat.id,
+            msg.id,
+            "Не удалось определить автора сообщения для репорта.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let admin_ids = match reports::resolve_admin_ids(bot.inner(), &state.pool, &state.config).await
+    {
+        Ok(admin_ids) => admin_ids,
+        Err(err) => {
+            tracing::error!(%err, "failed to resolve report admins");
+            send_html_reply(
+                bot,
+                msg.chat.id,
+                msg.id,
+                "Не удалось подготовить доставку репорта администраторам. Попробуй позже.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let creation = match reports::create_report(&state.pool, &target, &admin_ids).await {
+        Ok(ReportCreation::RateLimited) => {
+            send_html_reply(
+                bot,
+                msg.chat.id,
+                msg.id,
+                "Ты уже отправлял репорт в последние 10 минут. Повтори позже.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(creation) => creation,
+        Err(err) => {
+            tracing::error!(%err, "failed to save report");
+            send_html_reply(
+                bot,
+                msg.chat.id,
+                msg.id,
+                "Не удалось сохранить репорт. Попробуй позже.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let text = match creation {
+        ReportCreation::Created(_) if admin_ids.is_empty() => {
+            "Репорт сохранён, но администратор для доставки не найден."
+        }
+        ReportCreation::Created(_) => "Репорт принят и поставлен в очередь для администраторов.",
+        ReportCreation::AlreadyExists(_) => "Это сообщение уже отправляли на рассмотрение.",
+        ReportCreation::RateLimited => unreachable!("rate limit handled above"),
+    };
+    send_html_reply(bot, msg.chat.id, msg.id, text).await?;
     Ok(())
 }
 
