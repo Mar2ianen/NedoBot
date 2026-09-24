@@ -12,6 +12,7 @@ use super::types::{
 pub const REVIEW_RISK_THRESHOLD: i32 = 70;
 #[allow(dead_code)]
 const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
+const FIRST_MESSAGE_DECISION_TREE_VERSION: &str = "first-message-tree-v1";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -19,6 +20,7 @@ pub struct FirstMessageScoreContext {
     pub template_matches: i32,
     pub spam_similarity: Option<f64>,
     pub feminine_profile_name: bool,
+    pub rkn_vpn_restriction_context: bool,
 }
 
 #[allow(dead_code)]
@@ -71,15 +73,23 @@ pub fn score_assessment(
     first_message_context: FirstMessageScoreContext,
     review_threshold: i32,
 ) -> ScoreComponents {
-    let (first_message_score, first_message_signals) = assessment
-        .first_message_assessment
-        .as_ref()
-        .map(|assessment| score_first_message(assessment, first_message_context))
-        .unwrap_or_else(|| (0, Value::Array(Vec::new())));
     let (avatar_score, avatar_signals) = assessment
         .avatar_observation
         .as_ref()
         .map(score_avatar)
+        .unwrap_or_else(|| (0, Value::Array(Vec::new())));
+    let score_before_message = baseline_score.clamp(0, 100).saturating_add(avatar_score);
+    let (first_message_score, first_message_signals) = assessment
+        .first_message_assessment
+        .as_ref()
+        .map(|assessment| {
+            score_first_message(
+                assessment,
+                first_message_context,
+                score_before_message,
+                review_threshold,
+            )
+        })
         .unwrap_or_else(|| (0, Value::Array(Vec::new())));
 
     ScoreComponents {
@@ -96,8 +106,17 @@ pub fn score_assessment(
 fn score_first_message(
     assessment: &FirstMessageAssessment,
     context: FirstMessageScoreContext,
+    score_before_message: i32,
+    review_threshold: i32,
 ) -> (i32, Value) {
     let paid_easy_task = has_marker(assessment, FirstMessageRiskMarker::PaidEasyTaskOffer);
+    let rkn_vpn_promotion = context.rkn_vpn_restriction_context
+        && assessment.confidence >= 0.85
+        && has_marker(assessment, FirstMessageRiskMarker::RknRelatedVpnPromotion)
+        && assessment
+            .evidence
+            .iter()
+            .any(|evidence| evidence.marker == FirstMessageRiskMarker::RknRelatedVpnPromotion);
     let performative_feminine_persona = context.feminine_profile_name
         && has_marker(
             assessment,
@@ -108,6 +127,29 @@ fn score_first_message(
             assessment.relation_to_chat,
             MessageRelation::LooselyRelated | MessageRelation::OffTopic
         );
+    let has_evidence_for = |markers: &[FirstMessageRiskMarker]| {
+        assessment
+            .risk_markers
+            .iter()
+            .any(|marker| markers.contains(marker))
+            && assessment
+                .evidence
+                .iter()
+                .any(|evidence| markers.contains(&evidence.marker))
+    };
+    let decisive_direct_dm_funnel = assessment.direct_dm_offer
+        && off_topic_promo
+        && assessment.confidence >= 0.85
+        && has_evidence_for(&[
+            FirstMessageRiskMarker::SendOrShareOffer,
+            FirstMessageRiskMarker::DirectMessages,
+            FirstMessageRiskMarker::SelfHelpOrFinancePromo,
+            FirstMessageRiskMarker::ExternalPromoFunnel,
+            FirstMessageRiskMarker::PaidEasyTaskOffer,
+        ]);
+    let decisive_paid_offer = paid_easy_task
+        && assessment.confidence >= 0.85
+        && has_evidence_for(&[FirstMessageRiskMarker::PaidEasyTaskOffer]);
     let llm_score = if paid_easy_task || (assessment.direct_dm_offer && off_topic_promo) {
         30
     } else if assessment.direct_dm_offer && assessment.template_campaign {
@@ -128,21 +170,76 @@ fn score_first_message(
         && assessment.self_reference_grammar == SelfReferenceGrammar::Masculine
         && assessment.profile_name_grammar_relation == ProfileNameGrammarRelation::Conflicts;
     let grammar_score = i32::from(grammar_conflict) * 10;
-    let score = (llm_score + template_score + embedding_score + persona_score + grammar_score)
-        .min(FIRST_MESSAGE_SCORE_CAP);
+    let rkn_vpn_score = if rkn_vpn_promotion { 35 } else { 0 };
+    let known_campaign_match = context.template_matches > 0
+        || context
+            .spam_similarity
+            .is_some_and(|similarity| similarity >= 0.88);
+    let supporting_score =
+        llm_score + template_score + embedding_score + persona_score + grammar_score;
+    let decisive = rkn_vpn_promotion
+        || decisive_direct_dm_funnel
+        || decisive_paid_offer
+        || known_campaign_match;
+    let capped_score = (rkn_vpn_score + supporting_score).min(FIRST_MESSAGE_SCORE_CAP);
+    let review_floor = review_threshold
+        .clamp(0, 100)
+        .saturating_sub(score_before_message);
+    let available_score = 100_i32.saturating_sub(score_before_message);
+    let score = if decisive {
+        capped_score.max(review_floor).min(available_score)
+    } else {
+        capped_score.min(available_score)
+    };
 
-    let signals = (score > 0).then(|| {
-        json!([{
+    let label = if rkn_vpn_promotion {
+        "rkn_vpn_service_promotion"
+    } else if decisive_direct_dm_funnel {
+        "offtopic_direct_dm_funnel"
+    } else if decisive_paid_offer {
+        "evidence_backed_paid_task_offer"
+    } else if known_campaign_match {
+        "known_spam_campaign_match"
+    } else {
+        "unified_first_message_analysis"
+    };
+    let decision_tree_path = if rkn_vpn_promotion {
+        Some(json!([
+            "restriction_question_context",
+            "vpn_promotion_marker",
+            "evidence_quote"
+        ]))
+    } else if decisive_direct_dm_funnel {
+        Some(json!([
+            "offtopic_chat_context",
+            "direct_dm_offer",
+            "evidence_backed_campaign_marker"
+        ]))
+    } else if decisive_paid_offer {
+        Some(json!(["paid_easy_task_offer", "evidence_quote"]))
+    } else if known_campaign_match {
+        Some(json!(["known_template_or_spam_embedding_match"]))
+    } else {
+        None
+    };
+    let mut signals = Vec::new();
+    if score > 0 {
+        let mut signal = json!({
             "class": "first_message_content",
-            "label": "unified_first_message_analysis",
+            "label": label,
             "coefficient": score,
-            "warning_strength": if score >= 30 { "strong" } else { "supporting" },
+            "warning_strength": if decisive || score >= 30 { "strong" } else { "supporting" },
             "assessment": assessment,
             "template_matches": context.template_matches,
             "spam_similarity": context.spam_similarity,
-        }])
-    });
-    (score, signals.unwrap_or_else(|| Value::Array(Vec::new())))
+        });
+        if let Some(path) = decision_tree_path {
+            signal["decision_tree_version"] = json!(FIRST_MESSAGE_DECISION_TREE_VERSION);
+            signal["decision_tree_path"] = path;
+        }
+        signals.push(signal);
+    }
+    (score, Value::Array(signals))
 }
 
 fn score_avatar(avatar: &super::types::AvatarObservation) -> (i32, Value) {
@@ -166,6 +263,25 @@ fn score_avatar(avatar: &super::types::AvatarObservation) -> (i32, Value) {
 
 fn has_marker(assessment: &FirstMessageAssessment, marker: FirstMessageRiskMarker) -> bool {
     assessment.risk_markers.contains(&marker)
+}
+
+pub(crate) fn is_rkn_vpn_restriction_context(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "vpn",
+        "впн",
+        "ркн",
+        "роскомнадзор",
+        "блокиров",
+        "обход огранич",
+        "обход блок",
+        "не грузит",
+        "не загружается",
+        "не открывается",
+        "недоступ",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 pub(crate) async fn template_match_count(
@@ -197,19 +313,26 @@ pub(crate) async fn template_match_count(
         .min(10) as i32)
 }
 
-pub(crate) async fn spam_similarity(pool: &PgPool, embedding: &str) -> anyhow::Result<Option<f64>> {
-    let value = sqlx::query_scalar::<_, Option<f64>>(
-        r#"
-        select max(1.0 - (a.first_message_embedding <=> $1::vector))
-        from telegram_new_user_profile_audits a
-        join telegram_chat_users u
-          on u.chat_id = a.chat_id and u.telegram_user_id = a.telegram_user_id
-        where u.is_spammer and a.first_message_embedding is not null
-        "#,
-    )
-    .bind(embedding)
-    .fetch_one(pool)
-    .await?;
+const SPAM_SIMILARITY_SQL: &str = r#"
+    select max(1.0 - (a.first_message_embedding <=> $1::vector))
+    from telegram_new_user_profile_audits a
+    join telegram_chat_users u
+      on u.chat_id = a.chat_id and u.telegram_user_id = a.telegram_user_id
+    where u.is_spammer
+      and a.first_message_embedding is not null
+      and a.telegram_user_id <> $2
+    "#;
+
+pub(crate) async fn spam_similarity(
+    pool: &PgPool,
+    candidate_user_id: i64,
+    embedding: &str,
+) -> anyhow::Result<Option<f64>> {
+    let value = sqlx::query_scalar::<_, Option<f64>>(SPAM_SIMILARITY_SQL)
+        .bind(embedding)
+        .bind(candidate_user_id)
+        .fetch_one(pool)
+        .await?;
     Ok(value)
 }
 
@@ -278,9 +401,9 @@ mod tests {
             r#"{
                 "relation_to_chat":"off_topic", "direct_dm_offer":true,
                 "offtopic_promo":true, "template_campaign":true,
-                "self_reference_grammar":"none_or_unclear",
-                "profile_name_grammar_relation":"not_applicable",
-                "risk_markers":["paid_easy_task_offer"], "evidence":[],
+                "self_reference_grammar":"masculine",
+                "profile_name_grammar_relation":"conflicts",
+                "risk_markers":["paid_easy_task_offer","performative_feminine_persona"], "evidence":[],
                 "summary":"Реклама.", "confidence":0.9
             }"#,
             "null",
@@ -290,9 +413,10 @@ mod tests {
             json!([]),
             &assessment,
             FirstMessageScoreContext {
-                template_matches: 1,
-                spam_similarity: Some(0.9),
-                feminine_profile_name: false,
+                template_matches: 0,
+                spam_similarity: None,
+                feminine_profile_name: true,
+                rkn_vpn_restriction_context: false,
             },
             REVIEW_RISK_THRESHOLD,
         );
@@ -328,6 +452,147 @@ mod tests {
         );
 
         assert_eq!(components.first_message_score, 0);
+    }
+
+    #[test]
+    fn rkn_vpn_promotion_needs_matching_reply_context_and_confident_evidence() {
+        let assessment = assessment(
+            r#"{
+                "relation_to_chat":"on_topic", "direct_dm_offer":false,
+                "offtopic_promo":false, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":["rkn_related_vpn_promotion"],
+                "evidence":[{"marker":"rkn_related_vpn_promotion","quote":"Попробуйте мой VPN"}],
+                "summary":"Продвигает VPN-сервис.", "confidence":0.91
+            }"#,
+            "null",
+        );
+        let context = FirstMessageScoreContext {
+            rkn_vpn_restriction_context: true,
+            ..Default::default()
+        };
+        let components =
+            score_assessment(0, json!([]), &assessment, context, REVIEW_RISK_THRESHOLD);
+        assert_eq!(components.first_message_score, REVIEW_RISK_THRESHOLD);
+        assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "rkn_vpn_service_promotion"
+        );
+
+        let unrelated = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(unrelated.first_message_score, 0);
+
+        let mut low_confidence = assessment.clone();
+        low_confidence
+            .first_message_assessment
+            .as_mut()
+            .unwrap()
+            .confidence = 0.84;
+        let weak = score_assessment(
+            0,
+            json!([]),
+            &low_confidence,
+            context,
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(weak.first_message_score, 0);
+    }
+
+    #[test]
+    fn evidence_backed_offtopic_dm_funnel_reaches_review_threshold() {
+        let assessment = assessment(
+            r#"{
+                "relation_to_chat":"off_topic", "direct_dm_offer":true,
+                "offtopic_promo":true, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":["send_or_share_offer","direct_messages"],
+                "evidence":[{"marker":"send_or_share_offer","quote":"Есть аудиоверсия, пишите в личку, отправлю."}],
+                "summary":"Вне-тематическое предложение прислать материал в личку.",
+                "confidence":0.91
+            }"#,
+            "null",
+        );
+
+        let components = score_assessment(
+            29,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+
+        assert_eq!(components.first_message_score, 41);
+        assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "offtopic_direct_dm_funnel"
+        );
+        assert_eq!(
+            components.first_message_signals[0]["warning_strength"],
+            "strong"
+        );
+    }
+
+    #[test]
+    fn known_campaign_tree_match_reaches_review_threshold() {
+        let assessment = assessment(
+            r#"{
+                "relation_to_chat":"on_topic", "direct_dm_offer":false,
+                "offtopic_promo":false, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":[], "evidence":[],
+                "summary":"Обычное сообщение.", "confidence":0.5
+            }"#,
+            "null",
+        );
+        let components = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext {
+                template_matches: 1,
+                ..Default::default()
+            },
+            REVIEW_RISK_THRESHOLD,
+        );
+
+        assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "known_spam_campaign_match"
+        );
+        assert_eq!(
+            components.first_message_signals[0]["decision_tree_version"],
+            FIRST_MESSAGE_DECISION_TREE_VERSION
+        );
+    }
+
+    #[test]
+    fn spam_similarity_query_excludes_the_candidate_users_own_messages() {
+        assert!(SPAM_SIMILARITY_SQL.contains("a.telegram_user_id <> $2"));
+    }
+
+    #[test]
+    fn identifies_rkn_and_vpn_discussion_context_without_generic_failure_phrases() {
+        assert!(is_rkn_vpn_restriction_context(
+            "Какой ВПН работает после блокировки?"
+        ));
+        assert!(is_rkn_vpn_restriction_context(
+            "После действий Роскомнадзора сайт не грузит"
+        ));
+        assert!(!is_rkn_vpn_restriction_context(
+            "Приложение у меня сегодня не работает"
+        ));
     }
 
     #[test]

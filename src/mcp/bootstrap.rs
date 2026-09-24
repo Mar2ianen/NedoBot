@@ -15,6 +15,7 @@ use crate::{
         },
     },
     mcp::server::ChatMcpServer,
+    mcp::tools::youtube_subtitles::YoutubeSubtitlesConfig,
 };
 
 pub const DATABASE_URL_ENV: &str = "ASK_DATABASE_URL";
@@ -25,6 +26,7 @@ pub struct RmcpStdioConfig {
     database_url: String,
     manifest_path: String,
     semantic_search: Option<SemanticSearchConfig>,
+    youtube_subtitles: Option<YoutubeSubtitlesConfig>,
 }
 
 impl RmcpStdioConfig {
@@ -42,6 +44,7 @@ impl RmcpStdioConfig {
             database_url: required_value(DATABASE_URL_ENV, database_url)?,
             manifest_path: required_value(MANIFEST_PATH_ENV, manifest_path)?,
             semantic_search: semantic_search_from_env()?,
+            youtube_subtitles: YoutubeSubtitlesConfig::from_env()?,
         })
     }
 }
@@ -144,7 +147,7 @@ pub async fn build_chat_mcp_server(config: RmcpStdioConfig) -> anyhow::Result<Ch
         config.semantic_search,
     )?;
     api.validate().await?;
-    Ok(ChatMcpServer::new(Arc::new(api)))
+    Ok(ChatMcpServer::new(Arc::new(api)).with_youtube_subtitles(config.youtube_subtitles))
 }
 
 #[cfg(test)]

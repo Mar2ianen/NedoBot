@@ -41,6 +41,8 @@ pub struct ChatConfig {
     #[serde(default)]
     pub ask: bool,
     #[serde(default)]
+    pub reports: bool,
+    #[serde(default)]
     pub review_destination: bool,
     #[serde(default)]
     pub invite_url_env: Option<String>,

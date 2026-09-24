@@ -319,6 +319,7 @@ moderation = true
 stats = true
 voice = true
 ask = true
+reports = true
 review_destination = true
 invite_url_env = "CHAT_INVITE_URL"
 invite_label = "чате"

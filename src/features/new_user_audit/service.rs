@@ -14,7 +14,8 @@ use crate::features::new_user_audit::repo::{
     mark_new_user_audit_retry, materialize_new_user_audit_job,
 };
 use crate::features::new_user_audit::scoring::{
-    FirstMessageScoreContext, score_assessment, spam_similarity, template_match_count,
+    FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment, spam_similarity,
+    template_match_count,
 };
 use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::features::user_profiles::avatar::cache_profile_avatar;
@@ -267,7 +268,7 @@ async fn load_first_message_score_context(
         return Ok(FirstMessageScoreContext::default());
     }
     let row = sqlx::query(
-        "select first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+        "select first_message_text, first_name_feminine_pattern, input_json from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
@@ -281,11 +282,16 @@ async fn load_first_message_score_context(
     }
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
+    let input_json: Value = row.get("input_json");
+    let reply_context = input_json["text"]["first_message_reply_context_preview"]
+        .as_str()
+        .unwrap_or_default();
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
-        spam_similarity: spam_similarity(pool, &embedding).await?,
+        spam_similarity: spam_similarity(pool, job.telegram_user_id, &embedding).await?,
         feminine_profile_name: row.get("first_name_feminine_pattern"),
+        rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
     })
 }
 
