@@ -289,7 +289,7 @@ async fn load_first_message_score_context(
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
-        spam_similarity: spam_similarity(pool, &embedding).await?,
+        spam_similarity: spam_similarity(pool, job.telegram_user_id, &embedding).await?,
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
     })

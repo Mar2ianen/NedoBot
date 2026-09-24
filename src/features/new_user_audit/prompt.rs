@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/new_user_audit.md");
 
-pub const PROMPT_VERSION: &str = "new-user-audit-v3";
+pub const PROMPT_VERSION: &str = "new-user-audit-v4";
 
 static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
@@ -149,5 +149,14 @@ mod tests {
         let input: Value = serde_json::from_str(&build_input(&snapshot).unwrap()).unwrap();
         assert_eq!(input["untrusted_canonical_snapshot"], snapshot);
         assert_eq!(input["prompt_version"], PROMPT_VERSION);
+    }
+
+    #[test]
+    fn campaign_policy_covers_offtopic_dm_offers_and_vpn_channel_ctas() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("DM-воронкой"));
+        assert!(prompt.contains("конкретную рекомендацию «глянь там»"));
+        assert!(prompt.contains("без прямой ссылки"));
+        assert_eq!(PROMPT_VERSION, "new-user-audit-v4");
     }
 }
