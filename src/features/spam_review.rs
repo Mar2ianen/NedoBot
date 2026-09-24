@@ -641,6 +641,7 @@ fn human_marker(marker: &str) -> String {
             "LLM: шаблонная реакция без самостоятельного штрафа".to_string()
         }
         "performative_feminine_persona" => "LLM: нарочито женственный шаблонный образ".to_string(),
+        "rkn_related_vpn_promotion" => "LLM: VPN-промо в теме блокировок/РКН".to_string(),
         other => format!("LLM: {other}"),
     }
 }
@@ -665,6 +666,7 @@ fn human_label(label: &str) -> &str {
         "non_adjacent_emoji_message" => "нетипичный emoji в комментарии",
         "non_adjacent_emoji_message_ending" => "комментарий заканчивается emoji",
         "unified_first_message_analysis" => "первое сообщение похоже на известную спам-кампанию",
+        "rkn_vpn_service_promotion" => "промо VPN в ответ на вопрос об ограничениях/РКН",
         _ => label,
     }
 }

@@ -305,6 +305,8 @@ ssh vps-153 'podman ps'
 
 ## Публичный Read-only MCP
 
+Инструмент youtube.get_subtitles — отдельный read-only источник публичных YouTube-субтитров, вне SQL/view surface. Он запускает только абсолютный путь MCP_YOUTUBE_SUBTITLES_COMMAND без shell, принимает прямые HTTPS URL youtube.com/youtu.be, ограничивает число видео, общий объём текста и время выполнения; production-переменные описаны в deploy/nedonews-mcp/nedonews-mcp.env.example.
+
 `https://nedobot.chickenkiller.com/mcp/nedonews/v2` — намеренно публичный MCP Streamable HTTP endpoint с данными только `НедоNews Chat`. Версия в URL отделяет RMCP-контракт от удалённого legacy JSON-RPC API: внешний клиент обязан выполнить `tools/list`, а не переиспользовать старые input/output schemas. Endpoint не даёт ни SQL, ни shell, ни доступ к `public.*`: отдельная PostgreSQL-роль `nedobot_mcp_ro` читает лишь явно перечисленные views схемы `mcp_public`.
 
 - Миграция `20260717180000_mcp_public_views.sql` задаёт scope и explicit-колонки. Foreign/private chat scope и raw Telegram API JSON не выдаются как общий доступ; personal-channel поля, явно включённые в `mcp_public`, входят в фактический контракт ниже. Полный reviewed inventory опубликованных view и полей находится в [`MCP_PUBLIC_DATA.md`](MCP_PUBLIC_DATA.md).

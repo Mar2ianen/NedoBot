@@ -13,7 +13,10 @@ use serde_json::Value;
 
 use crate::features::chat_read_api::ChatReadApi;
 
-use super::tools::{catalog, chat, db, semantic};
+use super::tools::{
+    catalog, chat, db, semantic,
+    youtube_subtitles::{self, YoutubeSubtitlesConfig},
+};
 
 /// A tools-only RMCP server over the reviewed, scoped chat read-model.
 ///
@@ -22,11 +25,20 @@ use super::tools::{catalog, chat, db, semantic};
 #[derive(Clone)]
 pub struct ChatMcpServer {
     api: Arc<ChatReadApi>,
+    youtube_subtitles: Option<Arc<YoutubeSubtitlesConfig>>,
 }
 
 impl ChatMcpServer {
     pub fn new(api: Arc<ChatReadApi>) -> Self {
-        Self { api }
+        Self {
+            api,
+            youtube_subtitles: None,
+        }
+    }
+
+    pub fn with_youtube_subtitles(mut self, config: Option<YoutubeSubtitlesConfig>) -> Self {
+        self.youtube_subtitles = config.map(Arc::new);
+        self
     }
 
     pub fn api(&self) -> &Arc<ChatReadApi> {
@@ -122,6 +134,19 @@ impl ChatMcpServer {
         Parameters(input): Parameters<chat::SearchMessagesInput>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         chat::search_messages(&self.api, input).await.map(Json)
+    }
+
+    #[tool(
+        name = "youtube.get_subtitles",
+        description = "Извлекает ограниченный по длине текст субтитров из прямых YouTube-видео URL через локальный yt-dlp; плейлисты и произвольные URL не принимаются."
+    )]
+    async fn get_youtube_subtitles(
+        &self,
+        Parameters(input): Parameters<youtube_subtitles::GetSubtitlesInput>,
+    ) -> Result<Json<youtube_subtitles::GetSubtitlesOutput>, rmcp::ErrorData> {
+        youtube_subtitles::get_subtitles(self.youtube_subtitles.as_deref(), input)
+            .await
+            .map(Json)
     }
 
     #[tool(
@@ -441,6 +466,7 @@ mod tests {
                 "notes.list_user",
                 "search.list_runs",
                 "voice.list_transcripts",
+                "youtube.get_subtitles",
             ]
         );
     }

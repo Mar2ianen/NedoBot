@@ -90,6 +90,7 @@ struct NewUserFeatures {
     link_count_24h: i64,
     burst_messages_per_min: Option<f64>,
     first_message_text: Option<String>,
+    first_message_reply_context: Option<String>,
     last_message_text: Option<String>,
     recent_message_texts: Vec<String>,
     text_texture: TextTexture,
@@ -466,6 +467,7 @@ fn project_unified_user_audit_snapshot(
         },
         "text": {
             "first_message_preview": bounded_audit_text(features.first_message_text.as_deref()),
+            "first_message_reply_context_preview": bounded_audit_text(features.first_message_reply_context.as_deref()),
             "last_message_preview": bounded_audit_text(features.last_message_text.as_deref()),
             "recent_message_previews": features.recent_message_texts.iter()
                 .take(UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT)
@@ -569,7 +571,7 @@ async fn load_features(
               and user_id = $2
               and source_channel_id is null
         ), first_msg as (
-            select message_id, text
+            select message_id, text, reply_to_message_id
             from user_messages
             order by created_at asc
             limit 1
@@ -660,6 +662,7 @@ async fn load_features(
             end as burst_messages_per_min,
             fm.message_id as first_message_id_from_messages,
             fm.text as first_message_text,
+            reply_parent.text as first_message_reply_context,
             lm.message_id as last_message_id_from_messages,
             lm.text as last_message_text,
             coalesce(ms.recent_message_texts, array[]::text[]) as recent_message_texts,
@@ -720,6 +723,9 @@ async fn load_features(
         left join telegram_chat_member_snapshots s on s.chat_id = cu.chat_id and s.telegram_user_id = cu.telegram_user_id
         left join msg_stats ms on true
         left join first_msg fm on true
+        left join telegram_messages reply_parent
+          on reply_parent.chat_id = cu.chat_id
+         and reply_parent.message_id = fm.reply_to_message_id
         left join last_msg lm on true
         left join texture_stats ts on true
         left join id_rank ir on true
@@ -812,6 +818,7 @@ async fn load_features(
             link_count_24h: row.get("link_count_24h"),
             burst_messages_per_min: row.get("burst_messages_per_min"),
             first_message_text: row.get("first_message_text"),
+            first_message_reply_context: row.get("first_message_reply_context"),
             last_message_text: row.get("last_message_text"),
             recent_message_texts,
             text_texture: TextTexture {

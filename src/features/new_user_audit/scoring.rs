@@ -19,6 +19,7 @@ pub struct FirstMessageScoreContext {
     pub template_matches: i32,
     pub spam_similarity: Option<f64>,
     pub feminine_profile_name: bool,
+    pub rkn_vpn_restriction_context: bool,
 }
 
 #[allow(dead_code)]
@@ -98,6 +99,13 @@ fn score_first_message(
     context: FirstMessageScoreContext,
 ) -> (i32, Value) {
     let paid_easy_task = has_marker(assessment, FirstMessageRiskMarker::PaidEasyTaskOffer);
+    let rkn_vpn_promotion = context.rkn_vpn_restriction_context
+        && assessment.confidence >= 0.85
+        && has_marker(assessment, FirstMessageRiskMarker::RknRelatedVpnPromotion)
+        && assessment
+            .evidence
+            .iter()
+            .any(|evidence| evidence.marker == FirstMessageRiskMarker::RknRelatedVpnPromotion);
     let performative_feminine_persona = context.feminine_profile_name
         && has_marker(
             assessment,
@@ -128,21 +136,34 @@ fn score_first_message(
         && assessment.self_reference_grammar == SelfReferenceGrammar::Masculine
         && assessment.profile_name_grammar_relation == ProfileNameGrammarRelation::Conflicts;
     let grammar_score = i32::from(grammar_conflict) * 10;
-    let score = (llm_score + template_score + embedding_score + persona_score + grammar_score)
-        .min(FIRST_MESSAGE_SCORE_CAP);
+    let rkn_vpn_score = if rkn_vpn_promotion { 35 } else { 0 };
+    let supporting_score =
+        llm_score + template_score + embedding_score + persona_score + grammar_score;
+    let score = (rkn_vpn_score + supporting_score).min(FIRST_MESSAGE_SCORE_CAP);
 
-    let signals = (score > 0).then(|| {
-        json!([{
+    let mut signals = Vec::new();
+    if rkn_vpn_score > 0 {
+        signals.push(json!({
+            "class": "first_message_content",
+            "label": "rkn_vpn_service_promotion",
+            "coefficient": rkn_vpn_score,
+            "warning_strength": "strong",
+            "assessment": assessment,
+        }));
+    }
+    let remaining_score = score - rkn_vpn_score;
+    if remaining_score > 0 {
+        signals.push(json!({
             "class": "first_message_content",
             "label": "unified_first_message_analysis",
-            "coefficient": score,
-            "warning_strength": if score >= 30 { "strong" } else { "supporting" },
+            "coefficient": remaining_score,
+            "warning_strength": if remaining_score >= 30 { "strong" } else { "supporting" },
             "assessment": assessment,
             "template_matches": context.template_matches,
             "spam_similarity": context.spam_similarity,
-        }])
-    });
-    (score, signals.unwrap_or_else(|| Value::Array(Vec::new())))
+        }));
+    }
+    (score, Value::Array(signals))
 }
 
 fn score_avatar(avatar: &super::types::AvatarObservation) -> (i32, Value) {
@@ -166,6 +187,25 @@ fn score_avatar(avatar: &super::types::AvatarObservation) -> (i32, Value) {
 
 fn has_marker(assessment: &FirstMessageAssessment, marker: FirstMessageRiskMarker) -> bool {
     assessment.risk_markers.contains(&marker)
+}
+
+pub(crate) fn is_rkn_vpn_restriction_context(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "vpn",
+        "впн",
+        "ркн",
+        "роскомнадзор",
+        "блокиров",
+        "обход огранич",
+        "обход блок",
+        "не грузит",
+        "не загружается",
+        "не открывается",
+        "недоступ",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 pub(crate) async fn template_match_count(
@@ -293,6 +333,7 @@ mod tests {
                 template_matches: 1,
                 spam_similarity: Some(0.9),
                 feminine_profile_name: false,
+                rkn_vpn_restriction_context: false,
             },
             REVIEW_RISK_THRESHOLD,
         );
@@ -328,6 +369,70 @@ mod tests {
         );
 
         assert_eq!(components.first_message_score, 0);
+    }
+
+    #[test]
+    fn rkn_vpn_promotion_needs_matching_reply_context_and_confident_evidence() {
+        let assessment = assessment(
+            r#"{
+                "relation_to_chat":"on_topic", "direct_dm_offer":false,
+                "offtopic_promo":false, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":["rkn_related_vpn_promotion"],
+                "evidence":[{"marker":"rkn_related_vpn_promotion","quote":"Попробуйте мой VPN"}],
+                "summary":"Продвигает VPN-сервис.", "confidence":0.91
+            }"#,
+            "null",
+        );
+        let context = FirstMessageScoreContext {
+            rkn_vpn_restriction_context: true,
+            ..Default::default()
+        };
+        let components =
+            score_assessment(0, json!([]), &assessment, context, REVIEW_RISK_THRESHOLD);
+        assert_eq!(components.first_message_score, 35);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "rkn_vpn_service_promotion"
+        );
+
+        let unrelated = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(unrelated.first_message_score, 0);
+
+        let mut low_confidence = assessment.clone();
+        low_confidence
+            .first_message_assessment
+            .as_mut()
+            .unwrap()
+            .confidence = 0.84;
+        let weak = score_assessment(
+            0,
+            json!([]),
+            &low_confidence,
+            context,
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(weak.first_message_score, 0);
+    }
+
+    #[test]
+    fn identifies_rkn_and_vpn_discussion_context_without_generic_failure_phrases() {
+        assert!(is_rkn_vpn_restriction_context(
+            "Какой ВПН работает после блокировки?"
+        ));
+        assert!(is_rkn_vpn_restriction_context(
+            "После действий Роскомнадзора сайт не грузит"
+        ));
+        assert!(!is_rkn_vpn_restriction_context(
+            "Приложение у меня сегодня не работает"
+        ));
     }
 
     #[test]

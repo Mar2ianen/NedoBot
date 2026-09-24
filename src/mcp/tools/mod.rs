@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod chat;
 pub mod db;
 pub mod semantic;
+pub mod youtube_subtitles;
 
 use rmcp::ErrorData;
 
