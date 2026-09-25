@@ -103,6 +103,20 @@ max_output_tokens = 4096
 request_timeout_sec = 120
 thinking = "none"
 
+[models.ollama_audit]
+provider = "ollama_cloud"
+model = "gemma4:31b"
+
+[models.ollama_audit.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 32768
+max_output_tokens = 4096
+request_timeout_sec = 120
+thinking = "none"
+
 [models.ollama_minimax]
 provider = "ollama_cloud"
 model = "minimax-m3"
@@ -190,7 +204,7 @@ models = ["ollama_memory"]
 models = ["groq_cleanup", "ollama_memory"]
 
 [routes.new_user_audit]
-models = ["cerebras_audit"]
+models = ["ollama_audit"]
 
 [routes.search_extract]
 models = ["ollama_memory"]

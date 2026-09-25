@@ -1707,9 +1707,9 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             pool,
             &replay_claim,
             &ScoreComponents {
-                baseline_score: 0,
+                baseline_score: 96,
                 baseline_signals: serde_json::json!([]),
-                first_message_score: 0,
+                first_message_score: -6,
                 first_message_signals: serde_json::json!([]),
                 avatar_score: 0,
                 avatar_signals: serde_json::json!([]),
@@ -1727,6 +1727,33 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             .await
             .expect("materialized replay state must be stored");
     assert_eq!(state, ("succeeded".to_string(), "succeeded".to_string()));
+
+    let persisted_scores: (i32, i32, String) = query_as(
+        "select risk_baseline_score, risk_first_message_score, risk_level from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("bounded score components must persist without violating checks");
+    assert_eq!(persisted_scores, (96, 0, "high".to_string()));
+
+    let review_score: i32 = query_scalar(
+        "select risk_score from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("high-risk audit must create its review request");
+    assert_eq!(review_score, 96);
+
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("materialization review fixture must not affect later delivery claims");
 }
 
 async fn assert_audit_generation_is_durable_before_materialization(pool: &PgPool) {
@@ -2074,7 +2101,7 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
         .await
         .expect("review creation must succeed")
         .expect("high-risk review must be claimed");
-    query("update spam_review_requests set notification_lease_expires_at = now() - interval '1 second' where id = $1")
+    query("update spam_review_requests set notification_lease_expires_at = now() - interval '1 hour' where id = $1")
         .bind(first_claim.id)
         .execute(pool)
         .await

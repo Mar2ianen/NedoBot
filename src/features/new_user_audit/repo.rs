@@ -9,9 +9,9 @@ use crate::features::jobs::policy::{
 };
 use crate::features::new_user_audit::scoring::ScoreComponents;
 
-/// Версия правил записи unified score. Меняется только при несовместимом изменении
-/// materializer-а, чтобы сохранённые assessments не применялись молча.
-pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v1";
+/// Версия правил записи unified score. Меняется при изменении scoring/materializer,
+/// чтобы выбранные сохранённые assessments можно было безопасно переиграть.
+pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v2";
 
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
 /// generation boundary. Job остаётся под исходным generation lease.
@@ -292,6 +292,10 @@ fn should_retry_generation_finalization(retry: u32, is_transient_sql_error: bool
 }
 
 fn is_transient_generation_finalization_error(error: &sqlx::Error) -> bool {
+    is_transient_sqlx_error(error)
+}
+
+pub(super) fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolTimedOut => true,
         sqlx::Error::Database(database_error) => database_error
@@ -319,7 +323,29 @@ async fn materialize_new_user_audit_in_transaction(
     job: &NewUserAuditJob,
     components: &ScoreComponents,
 ) -> anyhow::Result<()> {
-    let final_score = components.final_score();
+    // Keep the database's non-negative score-component constraints authoritative,
+    // even if a future scorer accidentally emits a negative component.
+    let baseline_score = components.baseline_score.clamp(0, 100);
+    let first_message_score = components.first_message_score.clamp(0, 100);
+    let avatar_score = components.avatar_score.clamp(0, 100);
+    if baseline_score != components.baseline_score
+        || first_message_score != components.first_message_score
+        || avatar_score != components.avatar_score
+    {
+        tracing::warn!(
+            job_id = job.id,
+            chat_id = job.chat_id,
+            telegram_user_id = job.telegram_user_id,
+            baseline_score = components.baseline_score,
+            first_message_score = components.first_message_score,
+            avatar_score = components.avatar_score,
+            "clamping out-of-range new user audit score component before materialization"
+        );
+    }
+    let final_score = baseline_score
+        .saturating_add(first_message_score)
+        .saturating_add(avatar_score)
+        .clamp(0, 100);
     let final_signals = components.final_signals();
     let audit_update = sqlx::query(
         r#"
@@ -334,11 +360,11 @@ async fn materialize_new_user_audit_in_transaction(
     )
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
-    .bind(components.baseline_score)
+    .bind(baseline_score)
     .bind(&components.baseline_signals)
-    .bind(components.first_message_score)
+    .bind(first_message_score)
     .bind(&components.first_message_signals)
-    .bind(components.avatar_score)
+    .bind(avatar_score)
     .bind(&components.avatar_signals)
     .bind(final_score)
     .bind(components.final_level())
@@ -562,7 +588,7 @@ mod tests {
         ] {
             assert!(is_transient_postgres_sqlstate(code), "{code}");
         }
-        for code in ["23505", "42501", "42601", "08P01"] {
+        for code in ["23505", "23514", "42501", "42601", "08P01"] {
             assert!(!is_transient_postgres_sqlstate(code), "{code}");
         }
     }

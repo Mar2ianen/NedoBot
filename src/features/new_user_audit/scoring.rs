@@ -38,7 +38,11 @@ pub struct ScoreComponents {
 #[allow(dead_code)]
 impl ScoreComponents {
     pub fn final_score(&self) -> i32 {
-        (self.baseline_score + self.first_message_score + self.avatar_score).clamp(0, 100)
+        self.baseline_score
+            .clamp(0, 100)
+            .saturating_add(self.first_message_score.clamp(0, 100))
+            .saturating_add(self.avatar_score.clamp(0, 100))
+            .clamp(0, 100)
     }
 
     pub fn final_level(&self) -> &'static str {
@@ -147,6 +151,9 @@ fn score_first_message(
             FirstMessageRiskMarker::ExternalPromoFunnel,
             FirstMessageRiskMarker::PaidEasyTaskOffer,
         ]);
+    let decisive_external_promo_funnel = off_topic_promo
+        && assessment.confidence >= 0.85
+        && has_evidence_for(&[FirstMessageRiskMarker::ExternalPromoFunnel]);
     let decisive_paid_offer = paid_easy_task
         && assessment.confidence >= 0.85
         && has_evidence_for(&[FirstMessageRiskMarker::PaidEasyTaskOffer]);
@@ -179,6 +186,7 @@ fn score_first_message(
         llm_score + template_score + embedding_score + persona_score + grammar_score;
     let decisive = rkn_vpn_promotion
         || decisive_direct_dm_funnel
+        || decisive_external_promo_funnel
         || decisive_paid_offer
         || known_campaign_match;
     let capped_score = (rkn_vpn_score + supporting_score).min(FIRST_MESSAGE_SCORE_CAP);
@@ -196,6 +204,8 @@ fn score_first_message(
         "rkn_vpn_service_promotion"
     } else if decisive_direct_dm_funnel {
         "offtopic_direct_dm_funnel"
+    } else if decisive_external_promo_funnel {
+        "offtopic_external_promo_funnel"
     } else if decisive_paid_offer {
         "evidence_backed_paid_task_offer"
     } else if known_campaign_match {
@@ -214,6 +224,12 @@ fn score_first_message(
             "offtopic_chat_context",
             "direct_dm_offer",
             "evidence_backed_campaign_marker"
+        ]))
+    } else if decisive_external_promo_funnel {
+        Some(json!([
+            "offtopic_chat_context",
+            "external_promo_funnel_marker",
+            "evidence_quote"
         ]))
     } else if decisive_paid_offer {
         Some(json!(["paid_easy_task_offer", "evidence_quote"]))
@@ -425,6 +441,22 @@ mod tests {
     }
 
     #[test]
+    fn final_score_clamps_negative_components_before_adding_them() {
+        let components = ScoreComponents {
+            baseline_score: 96,
+            baseline_signals: json!([]),
+            first_message_score: -6,
+            first_message_signals: json!([]),
+            avatar_score: 0,
+            avatar_signals: json!([]),
+            review_threshold: REVIEW_RISK_THRESHOLD,
+        };
+
+        assert_eq!(components.final_score(), 96);
+        assert_eq!(components.final_level(), "high");
+    }
+
+    #[test]
     fn on_topic_offtopic_promo_does_not_add_direct_message_score() {
         let mut assessment = assessment(
             r#"{
@@ -504,6 +536,76 @@ mod tests {
             REVIEW_RISK_THRESHOLD,
         );
         assert_eq!(weak.first_message_score, 0);
+    }
+
+    #[test]
+    fn evidence_backed_offtopic_external_promo_reaches_review_threshold_without_dm_offer() {
+        let assessment = assessment(
+            r#"{
+                "relation_to_chat":"off_topic", "direct_dm_offer":false,
+                "offtopic_promo":true, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":["external_promo_funnel"],
+                "evidence":[{"marker":"external_promo_funnel","quote":"Bellmaster @xjoso2kzizbot bestarve 👍"}],
+                "summary":"Вне-тематическая реклама стороннего бота.",
+                "confidence":0.91
+            }"#,
+            "null",
+        );
+
+        let components = score_assessment(
+            45,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+
+        assert_eq!(components.first_message_score, 25);
+        assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "offtopic_external_promo_funnel"
+        );
+        assert_eq!(
+            components.first_message_signals[0]["decision_tree_path"],
+            json!([
+                "offtopic_chat_context",
+                "external_promo_funnel_marker",
+                "evidence_quote"
+            ])
+        );
+
+        let mut on_topic = assessment.clone();
+        let on_topic_message = on_topic.first_message_assessment.as_mut().unwrap();
+        on_topic_message.relation_to_chat = MessageRelation::OnTopic;
+        on_topic_message.offtopic_promo = false;
+        let topical = score_assessment(
+            45,
+            json!([]),
+            &on_topic,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(topical.first_message_score, 0);
+        assert_eq!(topical.final_score(), 45);
+
+        let mut low_confidence = assessment;
+        low_confidence
+            .first_message_assessment
+            .as_mut()
+            .unwrap()
+            .confidence = 0.84;
+        let weak = score_assessment(
+            45,
+            json!([]),
+            &low_confidence,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(weak.first_message_score, 0);
+        assert_eq!(weak.final_score(), 45);
     }
 
     #[test]
