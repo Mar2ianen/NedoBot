@@ -668,6 +668,7 @@ fn human_label(label: &str) -> &str {
         "unified_first_message_analysis" => "первое сообщение похоже на известную спам-кампанию",
         "rkn_vpn_service_promotion" => "промо VPN в ответ на вопрос об ограничениях/РКН",
         "offtopic_direct_dm_funnel" => "оффтопное предложение перейти в личку и прислать материал",
+        "offtopic_external_promo_funnel" => "оффтопная реклама стороннего сервиса или бота",
         "evidence_backed_paid_task_offer" => {
             "подтверждённое предложением сообщение о лёгком заработке"
         }
@@ -752,6 +753,10 @@ mod tests {
         assert_eq!(
             human_label("offtopic_direct_dm_funnel"),
             "оффтопное предложение перейти в личку и прислать материал"
+        );
+        assert_eq!(
+            human_label("offtopic_external_promo_funnel"),
+            "оффтопная реклама стороннего сервиса или бота"
         );
     }
 }

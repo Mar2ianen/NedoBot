@@ -104,8 +104,17 @@ impl GenAiTransport {
 
     pub async fn generate(&self, request: GenAiRequest<'_>) -> Result<String, LlmTransportError> {
         let structured = request.structured_output.is_some();
-        let chat_request =
-            build_chat_request(request.system_prompt, request.prompt, request.image, None);
+        let system_prompt = system_prompt_with_output_schema(
+            request.model.adapter,
+            request.system_prompt,
+            request.structured_output,
+        )?;
+        let chat_request = build_chat_request(
+            system_prompt.as_deref(),
+            request.prompt,
+            request.image,
+            None,
+        );
         let options = build_chat_options(
             request.temperature,
             request.max_tokens,
@@ -301,6 +310,28 @@ fn map_genai_error(error: genai::Error, structured_output: bool) -> LlmTransport
     }
 }
 
+fn system_prompt_with_output_schema(
+    adapter: GenAiAdapter,
+    system_prompt: Option<&str>,
+    structured_output: Option<StructuredOutput<'_>>,
+) -> Result<Option<String>, LlmTransportError> {
+    let Some(structured_output) =
+        structured_output.filter(|_| adapter == GenAiAdapter::OllamaCloud)
+    else {
+        return Ok(system_prompt.map(str::to_owned));
+    };
+
+    let schema = serde_json::to_string(structured_output.schema)
+        .map_err(|_| LlmTransportError::invalid_response())?;
+    let mut prompt = system_prompt.unwrap_or_default().to_owned();
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("Trusted output contract: return exactly one JSON value matching this schema; do not use Markdown fences or add prose:\n");
+    prompt.push_str(&schema);
+    Ok(Some(prompt))
+}
+
 fn map_web_error(error: &genai::webc::Error, structured_output: bool) -> LlmTransportError {
     match error {
         genai::webc::Error::ResponseFailedStatus { status, .. } => {
@@ -395,6 +426,33 @@ mod tests {
             None,
         );
         assert!(prompt_only.response_format.is_none());
+    }
+
+    #[test]
+    fn only_ollama_cloud_gets_the_schema_in_its_system_prompt() {
+        let schema = serde_json::json!({"type": "object", "required": ["ok"]});
+        let output = StructuredOutput {
+            name: "result",
+            schema: &schema,
+        };
+
+        let ollama = system_prompt_with_output_schema(
+            GenAiAdapter::OllamaCloud,
+            Some("audit system"),
+            Some(output),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ollama.starts_with("audit system\n\nTrusted output contract:"));
+        assert!(ollama.contains(r#""required":["ok"]"#));
+
+        let openai = system_prompt_with_output_schema(
+            GenAiAdapter::OpenAi,
+            Some("audit system"),
+            Some(output),
+        )
+        .unwrap();
+        assert_eq!(openai.as_deref(), Some("audit system"));
     }
 
     #[test]
@@ -511,6 +569,92 @@ mod tests {
         assert_eq!(captured.1["max_tokens"], 128);
         let temperature = captured.1["temperature"].as_f64().unwrap();
         assert!((temperature - 0.2).abs() < 1e-6);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_cloud_http_contract_includes_schema_in_system_prompt() {
+        async fn completion(
+            State(captured): State<CapturedRequest>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *captured.lock().unwrap() = Some((headers, body));
+            Json(serde_json::json!({
+                "model": "contract-model",
+                "message": {"role": "assistant", "content": r#"{"ok":true}"#},
+                "done": true
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let server_captured = std::sync::Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/chat", post(completion))
+                    .with_state(server_captured),
+            )
+            .await
+            .unwrap();
+        });
+
+        let schema = serde_json::json!({"type": "object", "required": ["ok"]});
+        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let endpoint = format!("http://{address}");
+        let response = transport
+            .generate(GenAiRequest {
+                model: ModelTarget {
+                    adapter: GenAiAdapter::OllamaCloud,
+                    endpoint: &endpoint,
+                    api_key: "contract-key",
+                    model: "contract-model",
+                },
+                system_prompt: Some("trusted audit instructions"),
+                prompt: "untrusted input",
+                image: None,
+                temperature: 0.0,
+                max_tokens: 64,
+                timeout: Duration::from_secs(5),
+                reasoning: ThinkingMode::None,
+                reasoning_budget: None,
+                structured_output_mode: StructuredOutputMode::JsonObject,
+                structured_output: Some(StructuredOutput {
+                    name: "result",
+                    schema: &schema,
+                }),
+                extra_body: None,
+                egress: Egress::Direct,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response, r#"{"ok":true}"#);
+        let captured = captured.lock().unwrap().take().unwrap();
+        assert_eq!(
+            captured
+                .0
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer contract-key")
+        );
+        assert_eq!(captured.1["format"], "json");
+        let system_message = captured.1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "system")
+            .unwrap();
+        assert!(
+            system_message["content"]
+                .as_str()
+                .unwrap()
+                .contains(r#""required":["ok"]"#)
+        );
 
         server.abort();
     }

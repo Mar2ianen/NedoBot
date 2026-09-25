@@ -1190,6 +1190,17 @@ mod tests {
     }
 
     #[test]
+    fn committed_production_profile_routes_multimodal_audits_to_ollama() {
+        let profiles = LlmProfiles::from_toml(include_str!(
+            "../config/llm_profiles.toml.production.example"
+        ))
+        .unwrap();
+
+        assert_eq!(profiles.routes["new_user_audit"].models, ["ollama_audit"]);
+        assert!(profiles.models["ollama_audit"].capabilities.supports_images);
+    }
+
+    #[test]
     fn reports_are_opt_in_for_other_community_profiles() {
         let chat: crate::config_file::ChatConfig = toml::from_str("id = -1001748745317").unwrap();
         assert!(!chat.reports);
