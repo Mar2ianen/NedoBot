@@ -155,7 +155,16 @@ async fn claim_review_delivery(
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    review_from_row(pool, row, config).await.map(Some)
+    let id: i64 = row.get("id");
+    let attempts: i32 = row.get("notification_attempts");
+    let consecutive_failures: i32 = row.get("notification_consecutive_failures");
+    match review_from_row(pool, row, config).await {
+        Ok(review) => Ok(Some(review)),
+        Err(error) => {
+            mark_review_payload_build_failed(pool, id, attempts, consecutive_failures).await?;
+            Err(error)
+        }
+    }
 }
 
 async fn review_from_row(
@@ -173,11 +182,18 @@ async fn review_from_row(
     let notification_consecutive_failures: i32 = row.get("notification_consecutive_failures");
     let stored_review_threshold: i32 = row.get("review_threshold");
     let profile = sqlx::query(r#"
-        select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
+        select cu.first_message_id,
+               coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
-        from telegram_chat_users cu left join telegram_user_profiles p on p.telegram_user_id = cu.telegram_user_id
-        where cu.chat_id = $1 and cu.telegram_user_id = $2
-    "#).bind(chat_id).bind(user_id).fetch_one(pool).await?;
+        from (select $1::bigint as chat_id, $2::bigint as telegram_user_id) target
+        left join telegram_chat_users cu
+          on cu.chat_id = target.chat_id and cu.telegram_user_id = target.telegram_user_id
+        left join telegram_user_profiles p on p.telegram_user_id = target.telegram_user_id
+    "#)
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
     let name: String = profile.get("name");
     let username: Option<String> = profile.get("username");
     let destination_chat_id = config
@@ -209,6 +225,42 @@ async fn review_from_row(
         risk_signals: signals,
         text,
     })
+}
+
+async fn mark_review_payload_build_failed(
+    pool: &PgPool,
+    request_id: i64,
+    attempts: i32,
+    consecutive_failures: i32,
+) -> anyhow::Result<()> {
+    let (status, delay_seconds, error_kind) =
+        match ANALYSIS_RETRY.delay_seconds(consecutive_failures.saturating_add(1), None) {
+            Some(delay_seconds) => ("retry_wait", delay_seconds, "review_payload_build_failed"),
+            None => ("failed", 0, "review_payload_build_retry_exhausted"),
+        };
+    sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_status = $3,
+            notification_next_attempt_at = now() + ($4 * interval '1 second'),
+            notification_processing_started_at = null,
+            notification_lease_expires_at = null,
+            notification_error_kind = $5,
+            notification_consecutive_failures = notification_consecutive_failures + 1
+        where id = $1
+          and notification_attempts = $2
+          and status = 'pending'
+          and notification_status = 'processing'
+        "#,
+    )
+    .bind(request_id)
+    .bind(attempts)
+    .bind(status)
+    .bind(delay_seconds)
+    .bind(error_kind)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn is_valid_telegram_username(value: &str) -> bool {
@@ -662,6 +714,9 @@ fn human_label(label: &str) -> &str {
         }
         "explicit_adult_promo_bio" => "bio рекламирует adult-сервис через ссылку или воронку",
         "personal_channel_attached" => "подключён личный канал",
+        "llm_personal_channel_content_promotion" => {
+            "LLM: рекламная воронка в содержимом личного канала"
+        }
         "personal_channel_external_link" => "в личном канале есть внешняя ссылка",
         "non_adjacent_emoji_message" => "нетипичный emoji в комментарии",
         "non_adjacent_emoji_message_ending" => "комментарий заканчивается emoji",

@@ -272,8 +272,15 @@ async fn load_first_message_score_context(
     job: &NewUserAuditJob,
     assessment: &NewUserAuditAssessment,
 ) -> anyhow::Result<FirstMessageScoreContext> {
+    let personal_channel_content = job.input_json["personal_channel"]["recent_content_preview"]
+        .as_str()
+        .filter(|content| !content.trim().is_empty())
+        .map(str::to_owned);
     if assessment.first_message_assessment.is_none() {
-        return Ok(FirstMessageScoreContext::default());
+        return Ok(FirstMessageScoreContext {
+            personal_channel_content,
+            ..Default::default()
+        });
     }
     let row = sqlx::query(
         "select first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
@@ -283,10 +290,16 @@ async fn load_first_message_score_context(
     .fetch_one(pool)
     .await?;
     let Some(text) = row.get::<Option<String>, _>("first_message_text") else {
-        return Ok(FirstMessageScoreContext::default());
+        return Ok(FirstMessageScoreContext {
+            personal_channel_content,
+            ..Default::default()
+        });
     };
     if text.trim().is_empty() {
-        return Ok(FirstMessageScoreContext::default());
+        return Ok(FirstMessageScoreContext {
+            personal_channel_content,
+            ..Default::default()
+        });
     }
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
@@ -297,6 +310,7 @@ async fn load_first_message_score_context(
         spam_similarity: spam_similarity(pool, job.telegram_user_id, &embedding).await?,
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
+        personal_channel_content,
     })
 }
 

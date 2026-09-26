@@ -11,7 +11,7 @@ use crate::features::new_user_audit::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется при изменении scoring/materializer,
 /// чтобы выбранные сохранённые assessments можно было безопасно переиграть.
-pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v2";
+pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v3";
 
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
 /// generation boundary. Job остаётся под исходным generation lease.
@@ -328,9 +328,11 @@ async fn materialize_new_user_audit_in_transaction(
     let baseline_score = components.baseline_score.clamp(0, 100);
     let first_message_score = components.first_message_score.clamp(0, 100);
     let avatar_score = components.avatar_score.clamp(0, 100);
+    let personal_channel_score = components.personal_channel_score.clamp(0, 100);
     if baseline_score != components.baseline_score
         || first_message_score != components.first_message_score
         || avatar_score != components.avatar_score
+        || personal_channel_score != components.personal_channel_score
     {
         tracing::warn!(
             job_id = job.id,
@@ -339,12 +341,14 @@ async fn materialize_new_user_audit_in_transaction(
             baseline_score = components.baseline_score,
             first_message_score = components.first_message_score,
             avatar_score = components.avatar_score,
+            personal_channel_score = components.personal_channel_score,
             "clamping out-of-range new user audit score component before materialization"
         );
     }
     let final_score = baseline_score
         .saturating_add(first_message_score)
         .saturating_add(avatar_score)
+        .saturating_add(personal_channel_score)
         .clamp(0, 100);
     let final_signals = components.final_signals();
     let audit_update = sqlx::query(
@@ -353,9 +357,10 @@ async fn materialize_new_user_audit_in_transaction(
         set risk_baseline_score = $3, risk_baseline_signals = $4,
             risk_first_message_score = $5, risk_first_message_signals = $6,
             risk_avatar_score = $7, risk_avatar_signals = $8,
-            risk_score = $9, risk_level = $10, risk_signal_breakdown = $11
+            risk_personal_channel_score = $9, risk_personal_channel_signals = $10,
+            risk_score = $11, risk_level = $12, risk_signal_breakdown = $13
         where chat_id = $1 and telegram_user_id = $2
-          and unified_audit_snapshot_hash = $12
+          and unified_audit_snapshot_hash = $14
         "#,
     )
     .bind(job.chat_id)
@@ -366,6 +371,8 @@ async fn materialize_new_user_audit_in_transaction(
     .bind(&components.first_message_signals)
     .bind(avatar_score)
     .bind(&components.avatar_signals)
+    .bind(personal_channel_score)
+    .bind(&components.personal_channel_signals)
     .bind(final_score)
     .bind(components.final_level())
     .bind(&final_signals)
