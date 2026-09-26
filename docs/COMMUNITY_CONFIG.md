@@ -42,6 +42,9 @@ review_chat = "review"
 reviewer_user_ids = [5939287960]
 ```
 
+Spam-review buttons are available to configured `reviewer_user_ids` and to
+current administrators/owners of the configured `review_chat`.
+
 Chat invite configuration belongs to the chat entry, so `/ask` remains
 independent from first-comment routes. `first_comment.routes[*].invite_url_env`
 is retained as a per-route override for communities that use different public
