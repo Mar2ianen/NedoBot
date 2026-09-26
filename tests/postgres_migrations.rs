@@ -1780,8 +1780,36 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
         let (mut stream, _) = listener
             .accept()
             .expect("materialization delivery listener must accept the card");
-        let mut request = [0; 4_096];
-        let _ = stream.read(&mut request);
+        let mut request = Vec::new();
+        let mut chunk = [0; 1_024];
+        let request_body = loop {
+            let bytes_read = stream
+                .read(&mut chunk)
+                .expect("materialization delivery request must be readable");
+            assert!(bytes_read > 0, "Telegram request must include a JSON body");
+            request.extend_from_slice(&chunk[..bytes_read]);
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .expect("Telegram request must declare its JSON body length");
+            let body_start = headers_end + 4;
+            if request.len() >= body_start + content_length {
+                break request[body_start..body_start + content_length].to_vec();
+            }
+        };
+        let telegram_payload: serde_json::Value = serde_json::from_slice(&request_body)
+            .expect("Telegram review request must contain valid JSON");
+        assert_eq!(
+            telegram_payload["link_preview_options"]["is_disabled"], true,
+            "review cards must not advertise links with a generated preview"
+        );
         let body = format!(
             r#"{{"ok":true,"result":{{"message_id":1004,"date":1700000000,"chat":{{"id":{CHAT_ID},"type":"supergroup"}},"text":"review"}}}}"#
         );

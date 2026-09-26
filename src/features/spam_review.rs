@@ -2,7 +2,10 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReplyParameters},
+    types::{
+        InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MessageId, ParseMode,
+        ReplyParameters,
+    },
 };
 
 use crate::{
@@ -289,6 +292,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
             &review.text,
         )
         .parse_mode(ParseMode::Html)
+        .link_preview_options(disabled_link_preview())
         .reply_markup(review_keyboard(review.id))
         .await
         .map(|_| message_id)
@@ -296,6 +300,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
         let mut request = bot
             .send_message(ChatId(review.destination_chat_id), &review.text)
             .parse_mode(ParseMode::Html)
+            .link_preview_options(disabled_link_preview())
             .reply_markup(review_keyboard(review.id));
         if review.destination_chat_id == review.chat_id
             && let Some(message_id) = review.first_message_id
@@ -351,6 +356,16 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
                 Err(err.into())
             }
         },
+    }
+}
+
+fn disabled_link_preview() -> LinkPreviewOptions {
+    LinkPreviewOptions {
+        is_disabled: true,
+        url: None,
+        prefer_small_media: false,
+        prefer_large_media: false,
+        show_above_text: false,
     }
 }
 
