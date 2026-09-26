@@ -656,6 +656,24 @@ pub fn parse_callback(data: &str) -> Option<(i64, &str)> {
     parts.next().is_none().then_some((id, decision))
 }
 
+pub async fn is_chat_admin(
+    bot: &Bot,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<bool, teloxide::RequestError> {
+    if user_id <= 0 {
+        return Ok(false);
+    }
+    let member = bot
+        .get_chat_member(ChatId(chat_id), teloxide::types::UserId(user_id as u64))
+        .await?;
+    Ok(matches!(
+        member.kind,
+        teloxide::types::ChatMemberKind::Administrator(_)
+            | teloxide::types::ChatMemberKind::Owner(_)
+    ))
+}
+
 fn human_signals(signals: &Value) -> String {
     let labels = signals
         .as_array()
@@ -771,10 +789,72 @@ fn human_label(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
     #[test]
     fn parses_callback() {
         assert_eq!(parse_callback("spam_review:42:spam"), Some((42, "spam")));
         assert_eq!(parse_callback("spam_review:42:spam:x"), None);
+    }
+
+    #[tokio::test]
+    async fn review_chat_admins_are_authorized_but_regular_members_are_not() {
+        assert!(mocked_chat_member_is_admin("administrator").await);
+        assert!(!mocked_chat_member_is_admin("member").await);
+        assert!(
+            !is_chat_admin(&Bot::new("test-token"), -1001, 0)
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn mocked_chat_member_is_admin(status: &'static str) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2_048];
+            let _ = stream.read(&mut request);
+            let member = match status {
+                "administrator" => serde_json::json!({
+                    "user": {"id": 42, "is_bot": false, "first_name": "Admin"},
+                    "status": "administrator",
+                    "can_be_edited": false,
+                    "is_anonymous": false,
+                    "can_manage_chat": true,
+                    "can_change_info": false,
+                    "can_delete_messages": false,
+                    "can_manage_video_chats": false,
+                    "can_invite_users": false,
+                    "can_restrict_members": false,
+                    "can_promote_members": false
+                }),
+                "member" => serde_json::json!({
+                    "user": {"id": 42, "is_bot": false, "first_name": "Member"},
+                    "status": "member"
+                }),
+                _ => unreachable!(),
+            };
+            let body = serde_json::json!({"ok": true, "result": member}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let bot = Bot::new("test-token").set_api_url(
+            format!("http://{address}/")
+                .parse()
+                .expect("mock Telegram API URL must parse"),
+        );
+        let result = is_chat_admin(&bot, -100123, 42).await.unwrap();
+        response_task.join().unwrap();
+        result
     }
 
     #[test]

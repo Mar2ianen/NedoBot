@@ -44,7 +44,9 @@ use features::reports::{self, ReportActionResult};
 #[cfg(feature = "spam-sync")]
 use features::spam_reputation::SpamReputationStore;
 #[cfg(feature = "moderation")]
-use features::spam_review::{apply_callback, parse_callback, process_next_review_delivery};
+use features::spam_review::{
+    apply_callback, is_chat_admin, parse_callback, process_next_review_delivery,
+};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
@@ -413,16 +415,35 @@ async fn handle_callback_query(
         return handle_report_callback(&bot, &query, &state, report_id, action).await;
     }
 
+    let Some((request_id, decision)) = query.data.as_deref().and_then(parse_callback) else {
+        return Ok(());
+    };
     let reviewer_id = query.from.id.0 as i64;
-    if !state.config.reviewer_user_ids().contains(&reviewer_id) {
+    let is_configured_reviewer = state.config.reviewer_user_ids().contains(&reviewer_id)
+        || state.config.owner_telegram_id == Some(reviewer_id);
+    let is_review_chat_admin = if is_configured_reviewer {
+        false
+    } else if let Some(message) = query.regular_message() {
+        let review_chat_id = message.chat.id.0;
+        match is_chat_admin(bot.inner(), review_chat_id, reviewer_id).await {
+            Ok(is_admin) => is_admin,
+            Err(error) => {
+                tracing::warn!(%error, review_chat_id, reviewer_id, "failed to verify spam review callback actor");
+                bot.answer_callback_query(query.id)
+                    .text("Не удалось проверить права администратора.")
+                    .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        false
+    };
+    if !is_configured_reviewer && !is_review_chat_admin {
         bot.answer_callback_query(query.id)
             .text("Недостаточно прав.")
             .await?;
         return Ok(());
     }
-    let Some((request_id, decision)) = query.data.as_deref().and_then(parse_callback) else {
-        return Ok(());
-    };
     match apply_callback(&state.pool, request_id, decision, reviewer_id).await {
         Ok(Some(text)) => {
             bot.answer_callback_query(query.id.clone())
