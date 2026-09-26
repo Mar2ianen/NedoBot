@@ -656,6 +656,10 @@ pub fn parse_callback(data: &str) -> Option<(i64, &str)> {
     parts.next().is_none().then_some((id, decision))
 }
 
+pub fn callback_message_chat_id(query: &teloxide::types::CallbackQuery) -> Option<i64> {
+    query.message.as_ref().map(|message| message.chat().id.0)
+}
+
 pub async fn is_chat_admin(
     bot: &Bot,
     chat_id: i64,
@@ -809,6 +813,25 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn callback_from_inaccessible_old_card_keeps_review_chat_context() {
+        let query: teloxide::types::CallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": "callback-id",
+            "from": {"id": 42, "is_bot": false, "first_name": "Admin"},
+            "message": {
+                "message_id": 7,
+                "date": 0,
+                "chat": {"id": -100123, "type": "supergroup", "title": "Review"}
+            },
+            "chat_instance": "review-chat-instance",
+            "data": "spam_review:42:spam"
+        }))
+        .expect("callback update with an old inaccessible message should deserialize");
+
+        assert!(query.regular_message().is_none());
+        assert_eq!(callback_message_chat_id(&query), Some(-100123));
     }
 
     async fn mocked_chat_member_is_admin(status: &'static str) -> bool {
