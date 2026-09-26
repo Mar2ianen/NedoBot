@@ -104,6 +104,8 @@ impl GenAiTransport {
 
     pub async fn generate(&self, request: GenAiRequest<'_>) -> Result<String, LlmTransportError> {
         let structured = request.structured_output.is_some();
+        let structured_output_mode =
+            effective_structured_output_mode(request.model.adapter, request.structured_output_mode);
         let system_prompt = system_prompt_with_output_schema(
             request.model.adapter,
             request.system_prompt,
@@ -120,7 +122,7 @@ impl GenAiTransport {
             request.max_tokens,
             request.reasoning,
             request.reasoning_budget,
-            request.structured_output_mode,
+            structured_output_mode,
             request.structured_output,
             request.extra_body,
         );
@@ -332,6 +334,17 @@ fn system_prompt_with_output_schema(
     Ok(Some(prompt))
 }
 
+fn effective_structured_output_mode(
+    adapter: GenAiAdapter,
+    requested: StructuredOutputMode,
+) -> StructuredOutputMode {
+    if adapter == GenAiAdapter::OllamaCloud {
+        StructuredOutputMode::PromptOnly
+    } else {
+        requested
+    }
+}
+
 fn map_web_error(error: &genai::webc::Error, structured_output: bool) -> LlmTransportError {
     match error {
         genai::webc::Error::ResponseFailedStatus { status, .. } => {
@@ -453,6 +466,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(openai.as_deref(), Some("audit system"));
+    }
+
+    #[test]
+    fn ollama_cloud_uses_prompt_only_for_structured_requests() {
+        assert_eq!(
+            effective_structured_output_mode(
+                GenAiAdapter::OllamaCloud,
+                StructuredOutputMode::JsonObject,
+            ),
+            StructuredOutputMode::PromptOnly
+        );
+        assert_eq!(
+            effective_structured_output_mode(
+                GenAiAdapter::OpenAi,
+                StructuredOutputMode::JsonSchema,
+            ),
+            StructuredOutputMode::JsonSchema
+        );
     }
 
     #[test]
@@ -642,7 +673,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer contract-key")
         );
-        assert_eq!(captured.1["format"], "json");
+        assert!(
+            captured.1.get("format").is_none(),
+            "Ollama Cloud does not support structured-output format parameters"
+        );
         let system_message = captured.1["messages"]
             .as_array()
             .unwrap()

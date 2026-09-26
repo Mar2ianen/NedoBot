@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_production_profile_routes_multimodal_audits_to_ollama() {
+    fn committed_production_profile_routes_multimodal_audits_to_ollama_prompt_only() {
         let profiles = LlmProfiles::from_toml(include_str!(
             "../config/llm_profiles.toml.production.example"
         ))
@@ -1198,6 +1198,12 @@ mod tests {
 
         assert_eq!(profiles.routes["new_user_audit"].models, ["ollama_audit"]);
         assert!(profiles.models["ollama_audit"].capabilities.supports_images);
+        assert_eq!(
+            profiles.models["ollama_audit"]
+                .capabilities
+                .structured_output,
+            crate::llm::profiles::StructuredOutputMode::PromptOnly
+        );
     }
 
     #[test]

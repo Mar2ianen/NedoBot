@@ -107,6 +107,72 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_post_history_entry_lease_lifecycle(&pool).await;
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
+    assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+}
+
+async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_120;
+    let input = serde_json::json!({"schema_version": "stale-requeue-fixture"});
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "stale-requeue-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("stale materialization fixture must be enqueued");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"fixture\": \"assessment\"}'::jsonb, materialization_version = 'unified-audit-materialization-v2', materialization_status = 'stale', materialization_attempts = 6, materialization_next_attempt_at = now() + interval '1 day', materialization_processing_started_at = null, materialization_lease_expires_at = null, materialization_error_kind = 'retry_exhausted', materialized_at = null where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("old exhausted materialization must be represented");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260926150000_new_user_channel_content_scoring.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("channel scoring migration must requeue exhausted materializations");
+
+    let state: (String, String, String, i32, bool, bool, Option<String>, bool) = query_as(
+        "select status, materialization_status, materialization_version, materialization_attempts, materialization_next_attempt_at <= now(), materialization_processing_started_at is null and materialization_lease_expires_at is null, materialization_error_kind, materialized_at is null from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("requeued materialization state must be queryable");
+    assert_eq!(
+        state,
+        (
+            "succeeded".into(),
+            "retry_wait".into(),
+            "unified-audit-materialization-v3".into(),
+            0,
+            true,
+            true,
+            None,
+            true
+        )
+    );
+
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale materialization fixture must be removed");
 }
 
 async fn assert_ask_time_render_audit(pool: &PgPool) {
