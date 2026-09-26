@@ -190,7 +190,7 @@ struct RiskAnalysis {
     signals: Value,
 }
 
-const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v3";
+const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v4";
 
 #[derive(Debug, Clone, Copy)]
 struct SharedSpamTreeLeaf {
@@ -1093,6 +1093,19 @@ fn shared_spam_decision_tree(
             label: "tree_channel_comments_with_personal_channel",
             reason: "A channel-post-only participant has an attached personal channel",
             path: &["only_channel_post_comments", "personal_channel_attached"],
+        });
+    }
+
+    if features.message_count == 1 && has_personal_channel && has_random_username {
+        return Some(SharedSpamTreeLeaf {
+            class: SpamClass::LlmProfileBait,
+            label: "tree_personal_channel_random_username_single_message",
+            reason: "A single-message participant combines an attached personal channel with a random-suffix username",
+            path: &[
+                "single_message_account",
+                "personal_channel_attached",
+                "username_random_suffix",
+            ],
         });
     }
 
@@ -2821,6 +2834,61 @@ mod tests {
         let leaf = shared_spam_decision_tree(&adult_channel, &NewUserAnalysisConfig::default())
             .expect("adult channel funnel is a decisive path");
         assert_eq!(leaf.label, "tree_personal_channel_adult_funnel");
+    }
+
+    #[test]
+    fn single_message_random_username_with_personal_channel_is_reviewed() {
+        let likely_profile_funnel = NewUserFeatures {
+            message_count: 1,
+            username: Some("roman_cedar_w6aepzfs".to_string()),
+            personal_channel_chat_id: Some(-100_000_000_001),
+            ..Default::default()
+        };
+
+        let analysis = analyze_new_or_low_activity_user(
+            &likely_profile_funnel,
+            &NewUserAnalysisConfig::default(),
+        );
+        assert_eq!(analysis.score, 70);
+        assert_eq!(analysis.level, "high");
+        assert_eq!(analysis.primary_class.as_deref(), Some("llm_profile_bait"));
+        assert!(
+            analysis
+                .labels
+                .contains(&"tree_personal_channel_random_username_single_message".to_string())
+        );
+        assert!(analysis.signals.as_array().is_some_and(|signals| {
+            signals.iter().any(|signal| {
+                signal["decision"] == "manual_review"
+                    && signal["label"] == "tree_personal_channel_random_username_single_message"
+            })
+        }));
+
+        for features in [
+            NewUserFeatures {
+                message_count: 1,
+                username: Some("roman_cedar_w6aepzfs".to_string()),
+                ..Default::default()
+            },
+            NewUserFeatures {
+                message_count: 1,
+                username: Some("roman_cedar".to_string()),
+                personal_channel_chat_id: Some(-100_000_000_001),
+                ..Default::default()
+            },
+            NewUserFeatures {
+                message_count: 2,
+                username: Some("roman_cedar_w6aepzfs".to_string()),
+                personal_channel_chat_id: Some(-100_000_000_001),
+                ..Default::default()
+            },
+        ] {
+            assert_ne!(
+                shared_spam_decision_tree(&features, &NewUserAnalysisConfig::default())
+                    .map(|leaf| leaf.label),
+                Some("tree_personal_channel_random_username_single_message"),
+            );
+        }
     }
 
     #[test]

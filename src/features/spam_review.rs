@@ -690,6 +690,9 @@ fn human_label(label: &str) -> &str {
         "tree_channel_comments_with_personal_channel" => {
             "ответы только к постам канала и привязанный личный канал"
         }
+        "tree_personal_channel_random_username_single_message" => {
+            "одно сообщение, случайный username и подключённый личный канал"
+        }
         "tree_recent_id_random_username" => "свежий ID и username со случайным суффиксом",
         _ => label,
     }
