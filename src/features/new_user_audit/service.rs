@@ -9,7 +9,7 @@ use crate::features::memory::embedding::{embed_text, pgvector_literal};
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
-    finalize_new_user_audit_job, mark_new_user_audit_failed,
+    finalize_new_user_audit_job, is_transient_sqlx_error, mark_new_user_audit_failed,
     mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
     mark_new_user_audit_retry, materialize_new_user_audit_job,
 };
@@ -48,6 +48,14 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAud
     let Err(error) = result else { return };
 
     if job.is_materialization_replay {
+        if let Some(sqlx::Error::Database(database_error)) = error.downcast_ref::<sqlx::Error>() {
+            tracing::warn!(
+                job_id = job.id,
+                sqlstate = ?database_error.code(),
+                constraint = ?database_error.constraint(),
+                "new user audit materialization hit a database error"
+            );
+        }
         let failure = classify_materialization_failure(&error);
         let (result, error_kind) = match failure {
             MaterializationFailure::Retry { error_kind } => (
@@ -264,35 +272,52 @@ async fn load_first_message_score_context(
     job: &NewUserAuditJob,
     assessment: &NewUserAuditAssessment,
 ) -> anyhow::Result<FirstMessageScoreContext> {
+    let personal_channel_content = job.input_json["personal_channel"]["recent_content_preview"]
+        .as_str()
+        .filter(|content| !content.trim().is_empty())
+        .map(str::to_owned);
     if assessment.first_message_assessment.is_none() {
-        return Ok(FirstMessageScoreContext::default());
+        return Ok(FirstMessageScoreContext {
+            personal_channel_content,
+            ..Default::default()
+        });
     }
     let row = sqlx::query(
-        "select first_message_text, first_name_feminine_pattern, input_json from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+        "select first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
     .fetch_one(pool)
     .await?;
     let Some(text) = row.get::<Option<String>, _>("first_message_text") else {
-        return Ok(FirstMessageScoreContext::default());
+        return Ok(FirstMessageScoreContext {
+            personal_channel_content,
+            ..Default::default()
+        });
     };
     if text.trim().is_empty() {
-        return Ok(FirstMessageScoreContext::default());
+        return Ok(FirstMessageScoreContext {
+            personal_channel_content,
+            ..Default::default()
+        });
     }
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
-    let input_json: Value = row.get("input_json");
-    let reply_context = input_json["text"]["first_message_reply_context_preview"]
-        .as_str()
-        .unwrap_or_default();
+    let reply_context = first_message_reply_context(&job.input_json);
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
         spam_similarity: spam_similarity(pool, job.telegram_user_id, &embedding).await?,
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
+        personal_channel_content,
     })
+}
+
+fn first_message_reply_context(input_json: &Value) -> &str {
+    input_json["text"]["first_message_reply_context_preview"]
+        .as_str()
+        .unwrap_or_default()
 }
 
 async fn load_baseline_component(
@@ -371,9 +396,15 @@ fn classify_materialization_failure(error: &anyhow::Error) -> MaterializationFai
             error_kind: "malformed_assessment",
         };
     }
-    if error.downcast_ref::<sqlx::Error>().is_some() {
-        return MaterializationFailure::Retry {
-            error_kind: "sql_transient",
+    if let Some(sql_error) = error.downcast_ref::<sqlx::Error>() {
+        return if is_transient_sqlx_error(sql_error) {
+            MaterializationFailure::Retry {
+                error_kind: "sql_transient",
+            }
+        } else {
+            MaterializationFailure::Stale {
+                error_kind: "sql_permanent",
+            }
         };
     }
     if error.downcast_ref::<reqwest::Error>().is_some() {
@@ -491,6 +522,21 @@ mod tests {
                 "summary": "Оснований для проверки нет."
             }
         })
+    }
+
+    #[test]
+    fn first_message_reply_context_comes_from_the_job_snapshot() {
+        let job = job_with_input(json!({
+            "text": {
+                "first_message_reply_context_preview":
+                    "Как настроить VPN для обхода блокировок?"
+            }
+        }));
+
+        let reply_context = first_message_reply_context(&job.input_json);
+
+        assert_eq!(reply_context, "Как настроить VPN для обхода блокировок?");
+        assert!(is_rkn_vpn_restriction_context(reply_context));
     }
 
     #[test]

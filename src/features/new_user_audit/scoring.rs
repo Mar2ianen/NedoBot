@@ -4,8 +4,9 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 use super::types::{
-    AvatarClass, FirstMessageAssessment, FirstMessageRiskMarker, MessageRelation,
-    NewUserAuditAssessment, ProfileNameGrammarRelation, SelfReferenceGrammar,
+    AvatarClass, EvidenceSource, EvidenceStrength, FirstMessageAssessment, FirstMessageRiskMarker,
+    MessageRelation, NewUserAuditAssessment, ProfileNameGrammarRelation, ProfileRiskPattern,
+    SelfReferenceGrammar,
 };
 
 #[allow(dead_code)]
@@ -15,12 +16,13 @@ const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
 const FIRST_MESSAGE_DECISION_TREE_VERSION: &str = "first-message-tree-v1";
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FirstMessageScoreContext {
     pub template_matches: i32,
     pub spam_similarity: Option<f64>,
     pub feminine_profile_name: bool,
     pub rkn_vpn_restriction_context: bool,
+    pub personal_channel_content: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -32,13 +34,20 @@ pub struct ScoreComponents {
     pub first_message_signals: Value,
     pub avatar_score: i32,
     pub avatar_signals: Value,
+    pub personal_channel_score: i32,
+    pub personal_channel_signals: Value,
     pub review_threshold: i32,
 }
 
 #[allow(dead_code)]
 impl ScoreComponents {
     pub fn final_score(&self) -> i32 {
-        (self.baseline_score + self.first_message_score + self.avatar_score).clamp(0, 100)
+        self.baseline_score
+            .clamp(0, 100)
+            .saturating_add(self.first_message_score.clamp(0, 100))
+            .saturating_add(self.avatar_score.clamp(0, 100))
+            .saturating_add(self.personal_channel_score.clamp(0, 100))
+            .clamp(0, 100)
     }
 
     pub fn final_level(&self) -> &'static str {
@@ -56,6 +65,7 @@ impl ScoreComponents {
             &self.baseline_signals,
             &self.first_message_signals,
             &self.avatar_signals,
+            &self.personal_channel_signals,
         ] {
             if let Some(items) = component.as_array() {
                 signals.extend(items.iter().cloned());
@@ -78,6 +88,10 @@ pub fn score_assessment(
         .as_ref()
         .map(score_avatar)
         .unwrap_or_else(|| (0, Value::Array(Vec::new())));
+    let (personal_channel_score, personal_channel_signals) = score_personal_channel_content(
+        &assessment.profile_assessment,
+        first_message_context.personal_channel_content.as_deref(),
+    );
     let score_before_message = baseline_score.clamp(0, 100).saturating_add(avatar_score);
     let (first_message_score, first_message_signals) = assessment
         .first_message_assessment
@@ -85,7 +99,7 @@ pub fn score_assessment(
         .map(|assessment| {
             score_first_message(
                 assessment,
-                first_message_context,
+                &first_message_context,
                 score_before_message,
                 review_threshold,
             )
@@ -99,13 +113,92 @@ pub fn score_assessment(
         first_message_signals,
         avatar_score,
         avatar_signals,
+        personal_channel_score,
+        personal_channel_signals,
         review_threshold,
     }
 }
 
+fn score_personal_channel_content(
+    assessment: &super::types::ProfileAssessment,
+    content: Option<&str>,
+) -> (i32, Value) {
+    let Some(content) = content.filter(|content| !content.trim().is_empty()) else {
+        return (0, Value::Array(Vec::new()));
+    };
+    if assessment.confidence < 0.65
+        || !assessment
+            .risk_patterns
+            .contains(&ProfileRiskPattern::PersonalChannelPromotion)
+    {
+        return (0, Value::Array(Vec::new()));
+    }
+
+    let normalized_content = normalize_channel_evidence(content);
+    let grounded_evidence = assessment
+        .evidence
+        .iter()
+        .filter(|evidence| evidence.source == EvidenceSource::PersonalChannel)
+        .filter(|evidence| {
+            let detail = normalize_channel_evidence(&evidence.detail);
+            !detail.is_empty() && normalized_content.contains(&detail)
+        })
+        .collect::<Vec<_>>();
+    let strongest_evidence = grounded_evidence
+        .iter()
+        .map(|evidence| evidence.strength)
+        .max_by_key(|strength| match strength {
+            EvidenceStrength::Weak => 0,
+            EvidenceStrength::Moderate => 1,
+            EvidenceStrength::Strong => 2,
+        });
+    let score = match (strongest_evidence, assessment.confidence) {
+        (Some(EvidenceStrength::Strong), confidence) if confidence >= 0.75 => 22,
+        (Some(EvidenceStrength::Strong | EvidenceStrength::Moderate), confidence)
+            if confidence >= 0.65 =>
+        {
+            12
+        }
+        _ => 0,
+    };
+    if score == 0 {
+        return (0, Value::Array(Vec::new()));
+    }
+
+    let signal = json!({
+        "class": "llm_profile_bait",
+        "label": "llm_personal_channel_content_promotion",
+        "coefficient": score,
+        "warning_strength": if score >= 20 { "strong" } else { "supporting" },
+        "decision": "manual_review",
+        "assessment": {
+            "confidence": assessment.confidence,
+            "risk_pattern": "personal_channel_promotion",
+            "evidence": grounded_evidence.iter().map(|evidence| &evidence.detail).collect::<Vec<_>>(),
+        },
+    });
+    (score, json!([signal]))
+}
+
+fn normalize_channel_evidence(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character.is_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn score_first_message(
     assessment: &FirstMessageAssessment,
-    context: FirstMessageScoreContext,
+    context: &FirstMessageScoreContext,
     score_before_message: i32,
     review_threshold: i32,
 ) -> (i32, Value) {
@@ -147,6 +240,9 @@ fn score_first_message(
             FirstMessageRiskMarker::ExternalPromoFunnel,
             FirstMessageRiskMarker::PaidEasyTaskOffer,
         ]);
+    let decisive_external_promo_funnel = off_topic_promo
+        && assessment.confidence >= 0.85
+        && has_evidence_for(&[FirstMessageRiskMarker::ExternalPromoFunnel]);
     let decisive_paid_offer = paid_easy_task
         && assessment.confidence >= 0.85
         && has_evidence_for(&[FirstMessageRiskMarker::PaidEasyTaskOffer]);
@@ -179,6 +275,7 @@ fn score_first_message(
         llm_score + template_score + embedding_score + persona_score + grammar_score;
     let decisive = rkn_vpn_promotion
         || decisive_direct_dm_funnel
+        || decisive_external_promo_funnel
         || decisive_paid_offer
         || known_campaign_match;
     let capped_score = (rkn_vpn_score + supporting_score).min(FIRST_MESSAGE_SCORE_CAP);
@@ -196,6 +293,8 @@ fn score_first_message(
         "rkn_vpn_service_promotion"
     } else if decisive_direct_dm_funnel {
         "offtopic_direct_dm_funnel"
+    } else if decisive_external_promo_funnel {
+        "offtopic_external_promo_funnel"
     } else if decisive_paid_offer {
         "evidence_backed_paid_task_offer"
     } else if known_campaign_match {
@@ -214,6 +313,12 @@ fn score_first_message(
             "offtopic_chat_context",
             "direct_dm_offer",
             "evidence_backed_campaign_marker"
+        ]))
+    } else if decisive_external_promo_funnel {
+        Some(json!([
+            "offtopic_chat_context",
+            "external_promo_funnel_marker",
+            "evidence_quote"
         ]))
     } else if decisive_paid_offer {
         Some(json!(["paid_easy_task_offer", "evidence_quote"]))
@@ -417,11 +522,108 @@ mod tests {
                 spam_similarity: None,
                 feminine_profile_name: true,
                 rkn_vpn_restriction_context: false,
+                ..Default::default()
             },
             REVIEW_RISK_THRESHOLD,
         );
         assert_eq!(components.first_message_score, 45);
         assert_eq!(components.final_score(), 65);
+    }
+
+    #[test]
+    fn final_score_clamps_negative_components_before_adding_them() {
+        let components = ScoreComponents {
+            baseline_score: 96,
+            baseline_signals: json!([]),
+            first_message_score: -6,
+            first_message_signals: json!([]),
+            avatar_score: 0,
+            avatar_signals: json!([]),
+            personal_channel_score: 0,
+            personal_channel_signals: json!([]),
+            review_threshold: REVIEW_RISK_THRESHOLD,
+        };
+
+        assert_eq!(components.final_score(), 96);
+        assert_eq!(components.final_level(), "high");
+    }
+
+    #[test]
+    fn personal_channel_attachment_without_content_evidence_scores_zero() {
+        let assessment = assessment("null", "null");
+        let components = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext {
+                personal_channel_content: Some("Личный дневник о книгах и прогулках".to_string()),
+                ..Default::default()
+            },
+            REVIEW_RISK_THRESHOLD,
+        );
+
+        assert_eq!(components.personal_channel_score, 0);
+        assert!(
+            components
+                .personal_channel_signals
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(components.final_score(), 0);
+    }
+
+    #[test]
+    fn channel_promotion_score_requires_a_grounded_quote_and_promotion_pattern() {
+        let mut assessment = assessment("null", "null");
+        assessment.profile_assessment.risk_patterns =
+            vec![ProfileRiskPattern::PersonalChannelPromotion];
+        assessment.profile_assessment.confidence = 0.9;
+        assessment.profile_assessment.evidence = vec![super::super::types::AuditEvidence {
+            source: EvidenceSource::PersonalChannel,
+            detail: "Пишите в личку, отправлю ссылку на VPN".to_string(),
+            strength: EvidenceStrength::Strong,
+        }];
+        let content = "Пишите в личку, отправлю ссылку на VPN";
+        let context = FirstMessageScoreContext {
+            personal_channel_content: Some(content.to_string()),
+            ..Default::default()
+        };
+
+        let components = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            context.clone(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(components.personal_channel_score, 22);
+        assert_eq!(components.final_score(), 22);
+        assert_eq!(
+            components.personal_channel_signals[0]["label"],
+            "llm_personal_channel_content_promotion"
+        );
+        assert_eq!(
+            components.personal_channel_signals[0]["decision"],
+            "manual_review"
+        );
+
+        let ungrounded = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext {
+                personal_channel_content: Some("Нейтральный пост о книгах".to_string()),
+                ..Default::default()
+            },
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(ungrounded.personal_channel_score, 0);
+
+        assessment.profile_assessment.risk_patterns.clear();
+        let no_pattern =
+            score_assessment(0, json!([]), &assessment, context, REVIEW_RISK_THRESHOLD);
+        assert_eq!(no_pattern.personal_channel_score, 0);
     }
 
     #[test]
@@ -472,8 +674,13 @@ mod tests {
             rkn_vpn_restriction_context: true,
             ..Default::default()
         };
-        let components =
-            score_assessment(0, json!([]), &assessment, context, REVIEW_RISK_THRESHOLD);
+        let components = score_assessment(
+            0,
+            json!([]),
+            &assessment,
+            context.clone(),
+            REVIEW_RISK_THRESHOLD,
+        );
         assert_eq!(components.first_message_score, REVIEW_RISK_THRESHOLD);
         assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
         assert_eq!(
@@ -504,6 +711,76 @@ mod tests {
             REVIEW_RISK_THRESHOLD,
         );
         assert_eq!(weak.first_message_score, 0);
+    }
+
+    #[test]
+    fn evidence_backed_offtopic_external_promo_reaches_review_threshold_without_dm_offer() {
+        let assessment = assessment(
+            r#"{
+                "relation_to_chat":"off_topic", "direct_dm_offer":false,
+                "offtopic_promo":true, "template_campaign":false,
+                "self_reference_grammar":"none_or_unclear",
+                "profile_name_grammar_relation":"not_applicable",
+                "risk_markers":["external_promo_funnel"],
+                "evidence":[{"marker":"external_promo_funnel","quote":"Bellmaster @xjoso2kzizbot bestarve 👍"}],
+                "summary":"Вне-тематическая реклама стороннего бота.",
+                "confidence":0.91
+            }"#,
+            "null",
+        );
+
+        let components = score_assessment(
+            45,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+
+        assert_eq!(components.first_message_score, 25);
+        assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "offtopic_external_promo_funnel"
+        );
+        assert_eq!(
+            components.first_message_signals[0]["decision_tree_path"],
+            json!([
+                "offtopic_chat_context",
+                "external_promo_funnel_marker",
+                "evidence_quote"
+            ])
+        );
+
+        let mut on_topic = assessment.clone();
+        let on_topic_message = on_topic.first_message_assessment.as_mut().unwrap();
+        on_topic_message.relation_to_chat = MessageRelation::OnTopic;
+        on_topic_message.offtopic_promo = false;
+        let topical = score_assessment(
+            45,
+            json!([]),
+            &on_topic,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(topical.first_message_score, 0);
+        assert_eq!(topical.final_score(), 45);
+
+        let mut low_confidence = assessment;
+        low_confidence
+            .first_message_assessment
+            .as_mut()
+            .unwrap()
+            .confidence = 0.84;
+        let weak = score_assessment(
+            45,
+            json!([]),
+            &low_confidence,
+            FirstMessageScoreContext::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(weak.first_message_score, 0);
+        assert_eq!(weak.final_score(), 45);
     }
 
     #[test]

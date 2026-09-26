@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/new_user_audit.md");
 
-pub const PROMPT_VERSION: &str = "new-user-audit-v4";
+pub const PROMPT_VERSION: &str = "new-user-audit-v5";
 
 static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
@@ -157,6 +157,8 @@ mod tests {
         assert!(prompt.contains("DM-воронкой"));
         assert!(prompt.contains("конкретную рекомендацию «глянь там»"));
         assert!(prompt.contains("без прямой ссылки"));
-        assert_eq!(PROMPT_VERSION, "new-user-audit-v4");
+        assert!(prompt.contains("сам по себе не является признаком риска"));
+        assert!(prompt.contains("короткой точной цитатой"));
+        assert_eq!(PROMPT_VERSION, "new-user-audit-v5");
     }
 }

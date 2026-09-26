@@ -320,6 +320,8 @@ pg_type = "bigint"
             "telegram_user_id_is_recent",
             "telegram_user_id_rank_ratio",
             "risk_signal_breakdown",
+            "risk_personal_channel_score",
+            "risk_personal_channel_signals",
         ] {
             assert!(
                 audit.columns.contains_key(column),
@@ -334,6 +336,10 @@ pg_type = "bigint"
         assert_eq!(
             audit.columns["telegram_user_id_spam_probability"].pg_type,
             "double precision"
+        );
+        assert_eq!(
+            audit.columns["risk_personal_channel_score"].pg_type,
+            "integer"
         );
     }
 }
