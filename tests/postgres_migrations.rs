@@ -85,6 +85,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_review_deduplication(&pool).await;
+    assert_review_delivery_tolerates_missing_profile_rows(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
     assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
@@ -1639,6 +1640,19 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
     const USER_ID: i64 = 9_000_097;
     let input = serde_json::json!({"schema_version": "fixture-v1"});
     query(
+        "insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, 301)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("materialization delivery chat user must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Replay Review')")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("materialization delivery profile must exist");
+    query(
         "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)",
     )
     .bind(CHAT_ID)
@@ -1707,12 +1721,14 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             pool,
             &replay_claim,
             &ScoreComponents {
-                baseline_score: 0,
+                baseline_score: 96,
                 baseline_signals: serde_json::json!([]),
-                first_message_score: 0,
+                first_message_score: -6,
                 first_message_signals: serde_json::json!([]),
                 avatar_score: 0,
                 avatar_signals: serde_json::json!([]),
+                personal_channel_score: 0,
+                personal_channel_signals: serde_json::json!([]),
                 review_threshold: 70,
             },
         )
@@ -1727,6 +1743,130 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
             .await
             .expect("materialized replay state must be stored");
     assert_eq!(state, ("succeeded".to_string(), "succeeded".to_string()));
+
+    let persisted_scores: (i32, i32, String) = query_as(
+        "select risk_baseline_score, risk_first_message_score, risk_level from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("bounded score components must persist without violating checks");
+    assert_eq!(persisted_scores, (96, 0, "high".to_string()));
+
+    let review_score: i32 = query_scalar(
+        "select risk_score from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("high-risk audit must create its review request");
+    assert_eq!(review_score, 96);
+
+    let claimable_review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("materialized high-risk review must be claimable for delivery")
+        .expect("materialized high-risk review must enter the delivery worker");
+    assert_eq!(claimable_review.risk_score, 96);
+    assert_eq!(claimable_review.first_message_id, Some(301));
+
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("materialization delivery listener must bind");
+    let address = listener
+        .local_addr()
+        .expect("materialization delivery listener must have an address");
+    let response_task = std::thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("materialization delivery listener must accept the card");
+        let mut request = Vec::new();
+        let mut chunk = [0; 1_024];
+        let request_body = loop {
+            let bytes_read = stream
+                .read(&mut chunk)
+                .expect("materialization delivery request must be readable");
+            assert!(bytes_read > 0, "Telegram request must include a JSON body");
+            request.extend_from_slice(&chunk[..bytes_read]);
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .expect("Telegram request must declare its JSON body length");
+            let body_start = headers_end + 4;
+            if request.len() >= body_start + content_length {
+                break request[body_start..body_start + content_length].to_vec();
+            }
+        };
+        let telegram_payload: serde_json::Value = serde_json::from_slice(&request_body)
+            .expect("Telegram review request must contain valid JSON");
+        assert_eq!(
+            telegram_payload["link_preview_options"]["is_disabled"], true,
+            "review cards must not advertise links with a generated preview"
+        );
+        let body = format!(
+            r#"{{"ok":true,"result":{{"message_id":1004,"date":1700000000,"chat":{{"id":{CHAT_ID},"type":"supergroup"}},"text":"review"}}}}"#
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("materialization delivery response must be written");
+    });
+    let bot = Bot::new("test-token").set_api_url(
+        format!("http://{address}/")
+            .parse()
+            .expect("materialization Telegram API URL must parse"),
+    );
+    send_review(&bot, pool, &claimable_review)
+        .await
+        .expect("materialized high-risk review must reach Telegram delivery");
+    response_task
+        .join()
+        .expect("materialization delivery response task must finish");
+    let delivery_state: (String, Option<i32>) = query_as(
+        "select notification_status, notification_message_id from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("completed review delivery state must be readable");
+    assert_eq!(delivery_state, ("sent".into(), Some(1004)));
+
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("materialization review fixture must not affect later delivery claims");
+    query(
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("materialization audit fixture must be cleaned up");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("materialization chat-user fixture must be cleaned up");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("materialization user profile fixture must be cleaned up");
 }
 
 async fn assert_audit_generation_is_durable_before_materialization(pool: &PgPool) {
@@ -2074,7 +2214,7 @@ async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPoo
         .await
         .expect("review creation must succeed")
         .expect("high-risk review must be claimed");
-    query("update spam_review_requests set notification_lease_expires_at = now() - interval '1 second' where id = $1")
+    query("update spam_review_requests set notification_lease_expires_at = now() - interval '1 hour' where id = $1")
         .bind(first_claim.id)
         .execute(pool)
         .await
@@ -3548,6 +3688,48 @@ async fn assert_review_deduplication(pool: &PgPool) {
     .await
     .expect("review count query must succeed");
     assert_eq!(review_count, 1);
+}
+
+async fn assert_review_delivery_tolerates_missing_profile_rows(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_098;
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 80, 'high', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("orphan review audit must exist");
+
+    let review = create_review(pool, CHAT_ID, USER_ID)
+        .await
+        .expect("review delivery must not require a current profile row")
+        .expect("high-risk orphan audit must still produce a card payload");
+    assert_eq!(review.first_message_id, None);
+    assert!(review.text.contains("Без имени"));
+    assert!(review.text.contains(&USER_ID.to_string()));
+    assert_eq!(
+        mark_review_delivery_succeeded(pool, &review, 1003)
+            .await
+            .expect("orphan review delivery finalization must succeed"),
+        CasResult::Applied
+    );
+
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("orphan review fixture must be removed");
+    query(
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("orphan audit fixture must be removed");
 }
 
 async fn assert_comment_job_lifecycle(pool: &PgPool) {

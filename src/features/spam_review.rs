@@ -2,7 +2,10 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReplyParameters},
+    types::{
+        InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MessageId, ParseMode,
+        ReplyParameters,
+    },
 };
 
 use crate::{
@@ -155,7 +158,16 @@ async fn claim_review_delivery(
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    review_from_row(pool, row, config).await.map(Some)
+    let id: i64 = row.get("id");
+    let attempts: i32 = row.get("notification_attempts");
+    let consecutive_failures: i32 = row.get("notification_consecutive_failures");
+    match review_from_row(pool, row, config).await {
+        Ok(review) => Ok(Some(review)),
+        Err(error) => {
+            mark_review_payload_build_failed(pool, id, attempts, consecutive_failures).await?;
+            Err(error)
+        }
+    }
 }
 
 async fn review_from_row(
@@ -173,11 +185,18 @@ async fn review_from_row(
     let notification_consecutive_failures: i32 = row.get("notification_consecutive_failures");
     let stored_review_threshold: i32 = row.get("review_threshold");
     let profile = sqlx::query(r#"
-        select cu.first_message_id, coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
+        select cu.first_message_id,
+               coalesce(nullif(trim(concat_ws(' ', p.first_name, p.last_name)), ''), 'Без имени') as name,
                p.username
-        from telegram_chat_users cu left join telegram_user_profiles p on p.telegram_user_id = cu.telegram_user_id
-        where cu.chat_id = $1 and cu.telegram_user_id = $2
-    "#).bind(chat_id).bind(user_id).fetch_one(pool).await?;
+        from (select $1::bigint as chat_id, $2::bigint as telegram_user_id) target
+        left join telegram_chat_users cu
+          on cu.chat_id = target.chat_id and cu.telegram_user_id = target.telegram_user_id
+        left join telegram_user_profiles p on p.telegram_user_id = target.telegram_user_id
+    "#)
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
     let name: String = profile.get("name");
     let username: Option<String> = profile.get("username");
     let destination_chat_id = config
@@ -211,6 +230,42 @@ async fn review_from_row(
     })
 }
 
+async fn mark_review_payload_build_failed(
+    pool: &PgPool,
+    request_id: i64,
+    attempts: i32,
+    consecutive_failures: i32,
+) -> anyhow::Result<()> {
+    let (status, delay_seconds, error_kind) =
+        match ANALYSIS_RETRY.delay_seconds(consecutive_failures.saturating_add(1), None) {
+            Some(delay_seconds) => ("retry_wait", delay_seconds, "review_payload_build_failed"),
+            None => ("failed", 0, "review_payload_build_retry_exhausted"),
+        };
+    sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_status = $3,
+            notification_next_attempt_at = now() + ($4 * interval '1 second'),
+            notification_processing_started_at = null,
+            notification_lease_expires_at = null,
+            notification_error_kind = $5,
+            notification_consecutive_failures = notification_consecutive_failures + 1
+        where id = $1
+          and notification_attempts = $2
+          and status = 'pending'
+          and notification_status = 'processing'
+        "#,
+    )
+    .bind(request_id)
+    .bind(attempts)
+    .bind(status)
+    .bind(delay_seconds)
+    .bind(error_kind)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn is_valid_telegram_username(value: &str) -> bool {
     let len = value.chars().count();
     (5..=32).contains(&len)
@@ -237,6 +292,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
             &review.text,
         )
         .parse_mode(ParseMode::Html)
+        .link_preview_options(disabled_link_preview())
         .reply_markup(review_keyboard(review.id))
         .await
         .map(|_| message_id)
@@ -244,6 +300,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
         let mut request = bot
             .send_message(ChatId(review.destination_chat_id), &review.text)
             .parse_mode(ParseMode::Html)
+            .link_preview_options(disabled_link_preview())
             .reply_markup(review_keyboard(review.id));
         if review.destination_chat_id == review.chat_id
             && let Some(message_id) = review.first_message_id
@@ -299,6 +356,16 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
                 Err(err.into())
             }
         },
+    }
+}
+
+fn disabled_link_preview() -> LinkPreviewOptions {
+    LinkPreviewOptions {
+        is_disabled: true,
+        url: None,
+        prefer_small_media: false,
+        prefer_large_media: false,
+        show_above_text: false,
     }
 }
 
@@ -589,6 +656,24 @@ pub fn parse_callback(data: &str) -> Option<(i64, &str)> {
     parts.next().is_none().then_some((id, decision))
 }
 
+pub async fn is_chat_admin(
+    bot: &Bot,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<bool, teloxide::RequestError> {
+    if user_id <= 0 {
+        return Ok(false);
+    }
+    let member = bot
+        .get_chat_member(ChatId(chat_id), teloxide::types::UserId(user_id as u64))
+        .await?;
+    Ok(matches!(
+        member.kind,
+        teloxide::types::ChatMemberKind::Administrator(_)
+            | teloxide::types::ChatMemberKind::Owner(_)
+    ))
+}
+
 fn human_signals(signals: &Value) -> String {
     let labels = signals
         .as_array()
@@ -662,12 +747,16 @@ fn human_label(label: &str) -> &str {
         }
         "explicit_adult_promo_bio" => "bio рекламирует adult-сервис через ссылку или воронку",
         "personal_channel_attached" => "подключён личный канал",
+        "llm_personal_channel_content_promotion" => {
+            "LLM: рекламная воронка в содержимом личного канала"
+        }
         "personal_channel_external_link" => "в личном канале есть внешняя ссылка",
         "non_adjacent_emoji_message" => "нетипичный emoji в комментарии",
         "non_adjacent_emoji_message_ending" => "комментарий заканчивается emoji",
         "unified_first_message_analysis" => "первое сообщение похоже на известную спам-кампанию",
         "rkn_vpn_service_promotion" => "промо VPN в ответ на вопрос об ограничениях/РКН",
         "offtopic_direct_dm_funnel" => "оффтопное предложение перейти в личку и прислать материал",
+        "offtopic_external_promo_funnel" => "оффтопная реклама стороннего сервиса или бота",
         "evidence_backed_paid_task_offer" => {
             "подтверждённое предложением сообщение о лёгком заработке"
         }
@@ -689,6 +778,9 @@ fn human_label(label: &str) -> &str {
         "tree_channel_comments_with_personal_channel" => {
             "ответы только к постам канала и привязанный личный канал"
         }
+        "tree_personal_channel_random_username_single_message" => {
+            "одно сообщение, случайный username и подключённый личный канал"
+        }
         "tree_recent_id_random_username" => "свежий ID и username со случайным суффиксом",
         _ => label,
     }
@@ -697,10 +789,72 @@ fn human_label(label: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
     #[test]
     fn parses_callback() {
         assert_eq!(parse_callback("spam_review:42:spam"), Some((42, "spam")));
         assert_eq!(parse_callback("spam_review:42:spam:x"), None);
+    }
+
+    #[tokio::test]
+    async fn review_chat_admins_are_authorized_but_regular_members_are_not() {
+        assert!(mocked_chat_member_is_admin("administrator").await);
+        assert!(!mocked_chat_member_is_admin("member").await);
+        assert!(
+            !is_chat_admin(&Bot::new("test-token"), -1001, 0)
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn mocked_chat_member_is_admin(status: &'static str) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2_048];
+            let _ = stream.read(&mut request);
+            let member = match status {
+                "administrator" => serde_json::json!({
+                    "user": {"id": 42, "is_bot": false, "first_name": "Admin"},
+                    "status": "administrator",
+                    "can_be_edited": false,
+                    "is_anonymous": false,
+                    "can_manage_chat": true,
+                    "can_change_info": false,
+                    "can_delete_messages": false,
+                    "can_manage_video_chats": false,
+                    "can_invite_users": false,
+                    "can_restrict_members": false,
+                    "can_promote_members": false
+                }),
+                "member" => serde_json::json!({
+                    "user": {"id": 42, "is_bot": false, "first_name": "Member"},
+                    "status": "member"
+                }),
+                _ => unreachable!(),
+            };
+            let body = serde_json::json!({"ok": true, "result": member}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let bot = Bot::new("test-token").set_api_url(
+            format!("http://{address}/")
+                .parse()
+                .expect("mock Telegram API URL must parse"),
+        );
+        let result = is_chat_admin(&bot, -100123, 42).await.unwrap();
+        response_task.join().unwrap();
+        result
     }
 
     #[test]
@@ -752,6 +906,10 @@ mod tests {
         assert_eq!(
             human_label("offtopic_direct_dm_funnel"),
             "оффтопное предложение перейти в личку и прислать материал"
+        );
+        assert_eq!(
+            human_label("offtopic_external_promo_funnel"),
+            "оффтопная реклама стороннего сервиса или бота"
         );
     }
 }
