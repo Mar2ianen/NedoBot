@@ -45,7 +45,8 @@ use features::reports::{self, ReportActionResult};
 use features::spam_reputation::SpamReputationStore;
 #[cfg(feature = "moderation")]
 use features::spam_review::{
-    apply_callback, is_chat_admin, parse_callback, process_next_review_delivery,
+    apply_callback, callback_message_chat_id, is_chat_admin, parse_callback,
+    process_next_review_delivery,
 };
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
@@ -423,8 +424,7 @@ async fn handle_callback_query(
         || state.config.owner_telegram_id == Some(reviewer_id);
     let is_review_chat_admin = if is_configured_reviewer {
         false
-    } else if let Some(message) = query.regular_message() {
-        let review_chat_id = message.chat.id.0;
+    } else if let Some(review_chat_id) = callback_message_chat_id(&query) {
         match is_chat_admin(bot.inner(), review_chat_id, reviewer_id).await {
             Ok(is_admin) => is_admin,
             Err(error) => {
