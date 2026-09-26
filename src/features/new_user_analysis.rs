@@ -190,7 +190,7 @@ struct RiskAnalysis {
     signals: Value,
 }
 
-const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v4";
+const SHARED_SPAM_DECISION_TREE_VERSION: &str = "shared-spam-tree-v5";
 
 #[derive(Debug, Clone, Copy)]
 struct SharedSpamTreeLeaf {
@@ -405,11 +405,10 @@ fn project_unified_user_audit_material_revision(
     features: &NewUserFeatures,
     config: &NewUserAnalysisConfig,
 ) -> Value {
-    // Только факты, заметно меняющие вход LLM. Временные поля, live-счётчики и
-    // последние сообщения исключены, чтобы transient refresh не создавал job на
-    // каждое новое сообщение.
+    // Только факты, заметно меняющие вход LLM. Временные поля и live-счётчики
+    // исключены; последний текст канала включён, так как он влияет на оценку.
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
         "review_threshold": config.review_threshold,
@@ -428,7 +427,11 @@ fn project_unified_user_audit_material_revision(
         "personal_channel": {
             "title_preview": bounded_audit_text(features.personal_channel_title.as_deref()),
             "username": bounded_audit_text(features.personal_channel_username.as_deref()),
+            "recent_content_preview": bounded_audit_text(features.personal_channel_last_text.as_deref()),
+            "message_count": features.personal_channel_message_count,
             "has_adult_links": features.personal_channel_has_adult_links,
+            "has_invite_link": personal_channel_has_invite_link(features),
+            "has_external_link": personal_channel_has_external_link(features),
         },
         "membership": {
             "status": bounded_audit_text(features.member_status.as_deref()),
@@ -490,6 +493,7 @@ fn project_unified_user_audit_snapshot(
             "present": features.personal_channel_chat_id.is_some(),
             "title_preview": bounded_audit_text(features.personal_channel_title.as_deref()),
             "username": bounded_audit_text(features.personal_channel_username.as_deref()),
+            "recent_content_preview": bounded_audit_text(features.personal_channel_last_text.as_deref()),
             "message_count": features.personal_channel_message_count,
             "has_adult_links": features.personal_channel_has_adult_links,
             "has_invite_link": personal_channel_has_invite_link(features),
@@ -1084,28 +1088,6 @@ fn shared_spam_decision_tree(
             label: "tree_channel_comments_with_recent_id",
             reason: "A recent Telegram ID only replies directly to channel posts",
             path: &["only_channel_post_comments", "recent_telegram_id"],
-        });
-    }
-
-    if only_channel_post_comments && has_personal_channel {
-        return Some(SharedSpamTreeLeaf {
-            class: SpamClass::LlmProfileBait,
-            label: "tree_channel_comments_with_personal_channel",
-            reason: "A channel-post-only participant has an attached personal channel",
-            path: &["only_channel_post_comments", "personal_channel_attached"],
-        });
-    }
-
-    if features.message_count == 1 && has_personal_channel && has_random_username {
-        return Some(SharedSpamTreeLeaf {
-            class: SpamClass::LlmProfileBait,
-            label: "tree_personal_channel_random_username_single_message",
-            reason: "A single-message participant combines an attached personal channel with a random-suffix username",
-            path: &[
-                "single_message_account",
-                "personal_channel_attached",
-                "username_random_suffix",
-            ],
         });
     }
 
@@ -1720,23 +1702,6 @@ fn only_channel_post_comments(features: &NewUserFeatures) -> bool {
 fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
     let mut signals = Vec::new();
 
-    if let Some(channel_id) = features.personal_channel_chat_id {
-        signals.push(RiskSignal {
-            class: SpamClass::LlmProfileBait,
-            coefficient: 12,
-            label: "personal_channel_attached",
-            reason: "User has an attached personal channel",
-        });
-        if channel_id.abs() > 4_000_000_000_000 {
-            signals.push(RiskSignal {
-                class: SpamClass::FreshAccount,
-                coefficient: 6,
-                label: "recent_personal_channel_id",
-                reason: "Attached personal channel id is in a very high range",
-            });
-        }
-    }
-
     if features.personal_channel_has_adult_links {
         signals.push(RiskSignal {
             class: SpamClass::AdultPersonalChannel,
@@ -1950,6 +1915,8 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "risk_first_message_signals",
         "risk_avatar_score",
         "risk_avatar_signals",
+        "risk_personal_channel_score",
+        "risk_personal_channel_signals",
         "risk_score",
         "risk_level",
         "primary_risk_class",
@@ -2161,6 +2128,8 @@ async fn save_audit_in_transaction(
         values.push_bind(json!([]));
         values.push_bind(0_i32);
         values.push_bind(json!([]));
+        values.push_bind(0_i32);
+        values.push_bind(json!([]));
         values.push_bind(risk.score);
         values.push_bind(&risk.level);
         values.push_bind(&risk.primary_class);
@@ -2188,6 +2157,8 @@ async fn save_audit_in_transaction(
                     | "risk_first_message_signals"
                     | "risk_avatar_score"
                     | "risk_avatar_signals"
+                    | "risk_personal_channel_score"
+                    | "risk_personal_channel_signals"
                     | "risk_score"
                     | "risk_level"
                     | "risk_signal_breakdown"
@@ -2197,6 +2168,8 @@ async fn save_audit_in_transaction(
         }
         updates.push("risk_baseline_score = excluded.risk_baseline_score");
         updates.push("risk_baseline_signals = excluded.risk_baseline_signals");
+        updates.push("risk_personal_channel_score = 0");
+        updates.push("risk_personal_channel_signals = '[]'::jsonb");
         updates.push("risk_score = least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score)");
         updates.push("risk_level = case when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score) >= 70 then 'high' when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score) >= 40 then 'medium' else 'low' end");
         updates.push("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || telegram_new_user_profile_audits.risk_avatar_signals");
@@ -2733,7 +2706,7 @@ mod tests {
     }
 
     #[test]
-    fn personal_channel_external_link_matches_only_a_multi_feature_tree_path() {
+    fn channel_content_is_scored_but_attachment_itself_is_not() {
         let features = NewUserFeatures {
             message_count: 1,
             reply_to_channel_post_count: 1,
@@ -2744,12 +2717,10 @@ mod tests {
         };
 
         let signals = personal_channel_signals(&features);
-        assert_eq!(
+        assert!(
             signals
                 .iter()
-                .find(|signal| signal.label == "personal_channel_attached")
-                .map(|signal| signal.coefficient),
-            Some(12)
+                .all(|signal| signal.label != "personal_channel_attached")
         );
         assert_eq!(
             signals
@@ -2773,10 +2744,9 @@ mod tests {
             personal_channel_chat_id: Some(-100_000_000_001),
             ..Default::default()
         };
-        assert_eq!(
+        assert!(
             shared_spam_decision_tree(&comments_with_channel, &NewUserAnalysisConfig::default())
-                .map(|leaf| leaf.label),
-            Some("tree_channel_comments_with_personal_channel")
+                .is_none()
         );
 
         let comments_with_recent_id = NewUserFeatures {
@@ -2837,58 +2807,59 @@ mod tests {
     }
 
     #[test]
-    fn single_message_random_username_with_personal_channel_is_reviewed() {
-        let likely_profile_funnel = NewUserFeatures {
+    fn personal_channel_presence_alone_does_not_raise_risk() {
+        let profile_without_channel = NewUserFeatures {
             message_count: 1,
             username: Some("roman_cedar_w6aepzfs".to_string()),
-            personal_channel_chat_id: Some(-100_000_000_001),
             ..Default::default()
         };
+        let mut profile_with_channel = profile_without_channel.clone();
+        profile_with_channel.personal_channel_chat_id = Some(-100_000_000_001);
 
-        let analysis = analyze_new_or_low_activity_user(
-            &likely_profile_funnel,
+        let without_channel = analyze_new_or_low_activity_user(
+            &profile_without_channel,
             &NewUserAnalysisConfig::default(),
         );
-        assert_eq!(analysis.score, 70);
-        assert_eq!(analysis.level, "high");
-        assert_eq!(analysis.primary_class.as_deref(), Some("llm_profile_bait"));
-        assert!(
-            analysis
-                .labels
-                .contains(&"tree_personal_channel_random_username_single_message".to_string())
+        let with_channel = analyze_new_or_low_activity_user(
+            &profile_with_channel,
+            &NewUserAnalysisConfig::default(),
         );
-        assert!(analysis.signals.as_array().is_some_and(|signals| {
-            signals.iter().any(|signal| {
-                signal["decision"] == "manual_review"
-                    && signal["label"] == "tree_personal_channel_random_username_single_message"
-            })
-        }));
+        assert_eq!(with_channel.score, without_channel.score);
+        assert_eq!(with_channel.signals, without_channel.signals);
+        assert!(personal_channel_signals(&profile_with_channel).is_empty());
+    }
 
-        for features in [
-            NewUserFeatures {
-                message_count: 1,
-                username: Some("roman_cedar_w6aepzfs".to_string()),
-                ..Default::default()
-            },
-            NewUserFeatures {
-                message_count: 1,
-                username: Some("roman_cedar".to_string()),
-                personal_channel_chat_id: Some(-100_000_000_001),
-                ..Default::default()
-            },
-            NewUserFeatures {
-                message_count: 2,
-                username: Some("roman_cedar_w6aepzfs".to_string()),
-                personal_channel_chat_id: Some(-100_000_000_001),
-                ..Default::default()
-            },
-        ] {
-            assert_ne!(
-                shared_spam_decision_tree(&features, &NewUserAnalysisConfig::default())
-                    .map(|leaf| leaf.label),
-                Some("tree_personal_channel_random_username_single_message"),
-            );
-        }
+    #[test]
+    fn latest_personal_channel_content_is_a_redacted_material_audit_input() {
+        let features = NewUserFeatures {
+            personal_channel_chat_id: Some(-100_000_000_001),
+            personal_channel_last_text: Some(
+                "Пишите в личку за VPN: https://example.org/promo".to_string(),
+            ),
+            ..Default::default()
+        };
+        let config = NewUserAnalysisConfig::default();
+        let risk = analyze_new_or_low_activity_user(&features, &config);
+        let snapshot = project_unified_user_audit_snapshot(&features, &risk, &config);
+        let revision = project_unified_user_audit_material_revision(&features, &config);
+
+        assert_eq!(
+            snapshot["personal_channel"]["recent_content_preview"],
+            "Пишите в личку за VPN: [link]"
+        );
+        assert_eq!(
+            revision["personal_channel"]["recent_content_preview"],
+            snapshot["personal_channel"]["recent_content_preview"]
+        );
+
+        let changed_features = NewUserFeatures {
+            personal_channel_last_text: Some("Обычный пост о книгах".to_string()),
+            ..features
+        };
+        assert_ne!(
+            revision,
+            project_unified_user_audit_material_revision(&changed_features, &config)
+        );
     }
 
     #[test]
@@ -3058,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_tree_review_is_not_the_sum_of_weak_signals() {
+    fn personal_channel_presence_does_not_trigger_a_decision_tree() {
         let features = NewUserFeatures {
             message_count: 2,
             reply_to_channel_post_count: 2,
@@ -3069,18 +3040,15 @@ mod tests {
         let analysis =
             analyze_new_or_low_activity_user(&features, &NewUserAnalysisConfig::default());
 
-        assert_eq!(analysis.score, 70);
-        assert_eq!(analysis.level, "high");
-        let tree_signal = analysis
-            .signals
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|signal| signal["decision_tree_version"] == SHARED_SPAM_DECISION_TREE_VERSION)
-            .expect("high-risk feature path is recorded");
-        assert_eq!(
-            tree_signal["decision_tree_path"],
-            json!(["only_channel_post_comments", "personal_channel_attached"])
+        assert!(analysis.score < NewUserAnalysisConfig::default().review_threshold);
+        assert_eq!(analysis.level, "low");
+        assert!(
+            analysis
+                .signals
+                .as_array()
+                .is_some_and(|signals| signals.iter().all(|signal| {
+                    signal["decision_tree_version"] != SHARED_SPAM_DECISION_TREE_VERSION
+                }))
         );
     }
 
