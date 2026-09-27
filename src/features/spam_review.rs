@@ -9,6 +9,7 @@ use teloxide::{
 };
 
 use crate::{
+    config_file::ModerationConfig,
     features::jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
     telegram::html,
 };
@@ -106,11 +107,40 @@ pub async fn process_next_review_delivery(
     pool: &PgPool,
     config: &crate::config::Config,
 ) -> anyhow::Result<bool> {
+    if !review_delivery_enabled(&config.community.moderation) {
+        return suppress_pending_review_deliveries(pool).await;
+    }
+
     let Some(review) = claim_next_review_delivery_with_config(pool, config).await? else {
         return Ok(false);
     };
     send_review(bot, pool, &review).await?;
     Ok(true)
+}
+
+pub fn review_delivery_enabled(moderation: &ModerationConfig) -> bool {
+    moderation.enabled && moderation.review_delivery_enabled
+}
+
+pub async fn suppress_pending_review_deliveries(pool: &PgPool) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"
+        update spam_review_requests
+        set notification_status = 'failed',
+            notification_error_kind = 'delivery_disabled',
+            notification_processing_started_at = null,
+            notification_lease_expires_at = null,
+            notification_delivery_risk_score = null,
+            notification_delivery_risk_signals = null,
+            notification_delivery_review_threshold = null
+        where status = 'pending'
+          and notification_message_id is null
+          and notification_status in ('pending', 'retry_wait', 'processing')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 async fn claim_review_delivery(
@@ -797,6 +827,19 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
     };
+
+    #[test]
+    fn review_delivery_can_be_paused_without_disabling_moderation() {
+        let paused: ModerationConfig = toml::from_str(
+            "enabled = true\nreview_delivery_enabled = false\nrisk_profile = 'ru_general_v1'",
+        )
+        .unwrap();
+        assert!(!review_delivery_enabled(&paused));
+
+        let legacy: ModerationConfig =
+            toml::from_str("enabled = true\nrisk_profile = 'ru_general_v1'").unwrap();
+        assert!(review_delivery_enabled(&legacy));
+    }
 
     #[test]
     fn parses_callback() {

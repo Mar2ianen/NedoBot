@@ -405,10 +405,10 @@ fn project_unified_user_audit_material_revision(
     features: &NewUserFeatures,
     config: &NewUserAnalysisConfig,
 ) -> Value {
-    // Только факты, заметно меняющие вход LLM. Временные поля и live-счётчики
-    // исключены; последний текст канала включён, так как он влияет на оценку.
+    // Изменение текстовых сообщений должно создавать новую генерацию, а не
+    // только перезаписывать input_json у уже завершённой оценки.
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
         "review_threshold": config.review_threshold,
@@ -424,6 +424,11 @@ fn project_unified_user_audit_material_revision(
             "shared_spammer_identity": features.shared_spammer_identity,
         },
         "first_message": bounded_audit_text(features.first_message_text.as_deref()),
+        "first_message_reply_context": bounded_audit_text(features.first_message_reply_context.as_deref()),
+        "recent_messages": features.recent_message_texts.iter()
+            .take(UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT)
+            .map(|text| bounded_audit_text(Some(text)))
+            .collect::<Vec<_>>(),
         "personal_channel": {
             "title_preview": bounded_audit_text(features.personal_channel_title.as_deref()),
             "username": bounded_audit_text(features.personal_channel_username.as_deref()),
@@ -587,6 +592,7 @@ async fn load_features(
         ), first_msg as (
             select message_id, text, reply_to_message_id
             from user_messages
+            where nullif(btrim(text), '') is not null
             order by created_at asc
             limit 1
         ), last_msg as (
@@ -988,6 +994,8 @@ fn shared_spam_decision_tree(
     }
 
     let is_fresh_in_chat = features.chat_age_sec.is_some_and(|age| age < 6 * 60 * 60);
+    let is_recent_low_activity =
+        features.chat_age_sec.is_some_and(|age| age < 24 * 60 * 60) && features.message_count <= 3;
     if is_fresh_in_chat
         && features.message_count <= 2
         && features
@@ -1008,28 +1016,25 @@ fn shared_spam_decision_tree(
         });
     }
 
-    if is_fresh_in_chat
-        && features.message_count <= 2
-        && features
-            .first_message_text
-            .as_deref()
-            .is_some_and(is_fresh_paid_task_offer)
+    if is_recent_low_activity
+        && features.first_message_text.as_deref().is_some_and(|text| {
+            is_fresh_paid_task_offer(text) && (is_fresh_in_chat || has_contact_call_to_action(text))
+        })
     {
         return Some(SharedSpamTreeLeaf {
             class: SpamClass::PromoDmBait,
             label: "tree_fresh_paid_task_offer",
             reason: "A just-arrived low-activity user names a concrete payment amount for a small or easy task",
             path: &[
-                "chat_age_under_six_hours",
-                "one_or_two_messages",
+                "chat_age_under_twenty_four_hours",
+                "up_to_three_messages",
                 "explicit_payment_amount",
                 "small_or_easy_task",
             ],
         });
     }
 
-    if is_fresh_in_chat
-        && features.message_count <= 2
+    if is_recent_low_activity
         && features
             .first_message_text
             .as_deref()
@@ -1040,8 +1045,8 @@ fn shared_spam_decision_tree(
             label: "tree_fresh_money_work_contact_funnel",
             reason: "A just-arrived low-activity user combines a money/work offer with a direct-contact call to action",
             path: &[
-                "chat_age_under_six_hours",
-                "one_or_two_messages",
+                "chat_age_under_twenty_four_hours",
+                "up_to_three_messages",
                 "money_or_work_offer",
                 "direct_contact_call_to_action",
             ],
@@ -1109,9 +1114,6 @@ fn is_fresh_money_work_promotion(message: &str) -> bool {
         return false;
     }
 
-    let has_crypto_topic = ["крипт", "биткоин", "bitcoin", "btc", "трейдинг"]
-        .iter()
-        .any(|marker| normalized.contains(marker));
     let has_work_or_income_offer = [
         "заработ",
         "подработ",
@@ -1133,14 +1135,36 @@ fn is_fresh_money_work_promotion(message: &str) -> bool {
         "нужны три человека",
         "нужны 3 человека",
         "криптопроект",
+        "подойдет любому",
+        "подойдёт любому",
+        "в день",
+        "за пару часов",
+        "без вложений",
     ]
     .iter()
     .any(|marker| normalized.contains(marker));
-    has_crypto_topic
-        && (has_work_or_income_offer
-            || ["работ", "проект", "обуч", "человек", "деньг", "задач"]
-                .iter()
-                .any(|marker| normalized.contains(marker)))
+    let has_crypto_topic = ["крипт", "биткоин", "bitcoin", "btc", "трейдинг"]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let has_generic_work_offer = [
+        "работ",
+        "ваканси",
+        "заработ",
+        "подработ",
+        "доход",
+        "оплата",
+        "оплат",
+        "опыт не нужен",
+        "простые задач",
+        "подойдет любому",
+        "подойдёт любому",
+        "в день",
+        "за пару часов",
+        "без вложений",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    has_work_or_income_offer && (has_crypto_topic || has_generic_work_offer)
 }
 
 fn is_fresh_paid_task_offer(message: &str) -> bool {
@@ -1159,7 +1183,7 @@ fn is_fresh_paid_task_offer(message: &str) -> bool {
         || (normalized
             .chars()
             .any(|character| character.is_ascii_digit())
-            && ["руб", "₽"]
+            && ["руб", "₽", "тыс", "к за", "k за", "р в день"]
                 .iter()
                 .any(|marker| normalized.contains(marker)));
     let has_easy_task_offer = [
@@ -2836,6 +2860,7 @@ mod tests {
             personal_channel_last_text: Some(
                 "Пишите в личку за VPN: https://example.org/promo".to_string(),
             ),
+            recent_message_texts: vec!["Пишите в личку за VPN".to_string()],
             ..Default::default()
         };
         let config = NewUserAnalysisConfig::default();
@@ -2854,11 +2879,20 @@ mod tests {
 
         let changed_features = NewUserFeatures {
             personal_channel_last_text: Some("Обычный пост о книгах".to_string()),
-            ..features
+            ..features.clone()
         };
         assert_ne!(
             revision,
             project_unified_user_audit_material_revision(&changed_features, &config)
+        );
+
+        let changed_message = NewUserFeatures {
+            recent_message_texts: vec!["Есть вариант заработать, пиши в лс".to_string()],
+            ..features.clone()
+        };
+        assert_ne!(
+            revision,
+            project_unified_user_audit_material_revision(&changed_message, &config)
         );
     }
 
@@ -2879,8 +2913,8 @@ mod tests {
         assert_eq!(
             leaf.path,
             &[
-                "chat_age_under_six_hours",
-                "one_or_two_messages",
+                "chat_age_under_twenty_four_hours",
+                "up_to_three_messages",
                 "money_or_work_offer",
                 "direct_contact_call_to_action",
             ]
@@ -2923,12 +2957,60 @@ mod tests {
         );
 
         let stale_offer = NewUserFeatures {
-            chat_age_sec: Some(7 * 60 * 60),
+            chat_age_sec: Some(25 * 60 * 60),
             first_message_text: crypto_recruitment.first_message_text.clone(),
             ..Default::default()
         };
         assert!(
             shared_spam_decision_tree(&stale_offer, &NewUserAnalysisConfig::default()).is_none()
+        );
+
+        let delayed_obvious_offer = NewUserFeatures {
+            message_count: 2,
+            chat_age_sec: Some(8 * 60 * 60),
+            first_message_text: Some(
+                "Есть вариант заработать! От 16 000р в день. Подойдёт любому — пиши @contact"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let delayed_analysis = analyze_new_or_low_activity_user(
+            &delayed_obvious_offer,
+            &NewUserAnalysisConfig::default(),
+        );
+        assert_eq!(delayed_analysis.score, 70);
+        assert!(
+            delayed_analysis
+                .labels
+                .contains(&"tree_fresh_money_work_contact_funnel".to_string())
+        );
+
+        let delayed_phone_work_offer = NewUserFeatures {
+            message_count: 2,
+            chat_age_sec: Some(8 * 60 * 60),
+            first_message_text: Some(
+                "Есть вариант заработать пару тысяч зеленых за месяц, нужно лишь телефон и твое время, пиши @contact".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(&delayed_phone_work_offer, &NewUserAnalysisConfig::default())
+                .map(|leaf| leaf.label),
+            Some("tree_fresh_money_work_contact_funnel")
+        );
+
+        let delayed_paid_task_offer = NewUserFeatures {
+            message_count: 2,
+            chat_age_sec: Some(8 * 60 * 60),
+            first_message_text: Some(
+                "50к за пару простых действий, черкани ему @contact".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            shared_spam_decision_tree(&delayed_paid_task_offer, &NewUserAnalysisConfig::default())
+                .map(|leaf| leaf.label),
+            Some("tree_fresh_paid_task_offer")
         );
 
         let ordinary_course_share = NewUserFeatures {
