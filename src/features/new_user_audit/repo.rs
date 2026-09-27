@@ -81,37 +81,84 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         on conflict (chat_id, telegram_user_id, snapshot_hash, prompt_version)
         do update set
+            status = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 'pending'
+                else new_user_audit_jobs.status
+            end,
+            attempts = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 0
+                else new_user_audit_jobs.attempts
+            end,
+            next_attempt_at = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then now()
+                else new_user_audit_jobs.next_attempt_at
+            end,
+            processing_started_at = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.processing_started_at
+            end,
+            lease_expires_at = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.lease_expires_at
+            end,
+            error_kind = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.error_kind
+            end,
+            assessment_json = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.assessment_json
+            end,
+            provider = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.provider
+            end,
+            model = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.model
+            end,
+            completed_at = case
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                else new_user_audit_jobs.completed_at
+            end,
             input_json = excluded.input_json,
             avatar_file_id = excluded.avatar_file_id,
             avatar_file_unique_id = excluded.avatar_file_unique_id,
             review_threshold = excluded.review_threshold,
             materialization_version = $9,
             materialization_status = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then 'pending'
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 'pending'
                 else new_user_audit_jobs.materialization_status
             end,
             materialization_attempts = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then 0
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 0
                 else new_user_audit_jobs.materialization_attempts
             end,
             materialization_next_attempt_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then now()
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then now()
                 else new_user_audit_jobs.materialization_next_attempt_at
             end,
             materialization_processing_started_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
                 else new_user_audit_jobs.materialization_processing_started_at
             end,
             materialization_lease_expires_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
                 else new_user_audit_jobs.materialization_lease_expires_at
             end,
             materialization_error_kind = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
                 else new_user_audit_jobs.materialization_error_kind
             end,
             materialized_at = case
-                when new_user_audit_jobs.materialization_version is distinct from $9 then null
+                when new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
                 else new_user_audit_jobs.materialized_at
             end,
             updated_at = now()
