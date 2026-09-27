@@ -55,12 +55,18 @@ pub struct ChatConfig {
 pub struct ModerationConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_review_delivery_enabled")]
+    pub review_delivery_enabled: bool,
     #[serde(default)]
     pub risk_profile: String,
     #[serde(default)]
     pub review_chat: Option<String>,
     #[serde(default)]
     pub reviewer_user_ids: Vec<i64>,
+}
+
+fn default_review_delivery_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
