@@ -46,7 +46,7 @@ use features::spam_reputation::SpamReputationStore;
 #[cfg(feature = "moderation")]
 use features::spam_review::{
     apply_callback, callback_message_chat_id, is_chat_admin, parse_callback,
-    process_next_review_delivery,
+    process_next_review_delivery, review_delivery_enabled,
 };
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
@@ -145,7 +145,9 @@ async fn main() -> anyhow::Result<()> {
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]
-    if state.config.community.moderation.enabled {
+    if state.config.new_user_audit_enabled
+        || review_delivery_enabled(&state.config.community.moderation)
+    {
         spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]

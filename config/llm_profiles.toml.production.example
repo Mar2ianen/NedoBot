@@ -340,6 +340,7 @@ invite_label = "чате"
 
 [moderation]
 enabled = true
+review_delivery_enabled = true
 risk_profile = "ru_general_v1"
 review_chat = "main"
 reviewer_user_ids = [5939287960]

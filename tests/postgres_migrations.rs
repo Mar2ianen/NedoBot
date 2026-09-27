@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
     ask::{
@@ -49,6 +50,7 @@ use tg_ai_bot_teloxide::features::{
     reports::{ReportCreation, ReportTarget, create_report},
     spam_review::{
         claim_next_review_delivery, create_review, mark_review_delivery_succeeded, send_review,
+        suppress_pending_review_deliveries,
     },
     stats::{
         render_html, render_rich, repo as stats_repo,
@@ -63,6 +65,8 @@ use tg_ai_bot_teloxide::features::{
         types::{VoiceMedia, VoiceMediaKind},
     },
 };
+
+type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
 
 #[tokio::test]
 #[ignore = "run with ./scripts/test.sh against the local test database"]
@@ -87,7 +91,9 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_deduplication(&pool).await;
     assert_review_delivery_tolerates_missing_profile_rows(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
+    assert_paused_review_delivery_suppresses_unsent_cards(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
+    assert_new_user_audit_text_change_reopens_completed_generation(&pool).await;
     assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
     assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
     assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(&database_url).await;
@@ -1216,6 +1222,67 @@ async fn assert_low_risk_review_delivery_is_blocked_by_database(pool: &PgPool) {
     );
 }
 
+async fn assert_paused_review_delivery_suppresses_unsent_cards(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_IDS: [i64; 4] = [9_100_001, 9_100_002, 9_100_003, 9_100_004];
+    let fixtures = [
+        ("pending", None),
+        ("retry_wait", None),
+        ("processing", None),
+        ("sent", Some(9_100_099)),
+    ];
+
+    for (user_id, (notification_status, message_id)) in USER_IDS.into_iter().zip(fixtures) {
+        query(
+            "insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals, notification_status, notification_message_id, notification_processing_started_at, notification_lease_expires_at) values ($1, $2, 85, '[]'::jsonb, $3, $4, case when $3 = 'processing' then now() else null end, case when $3 = 'processing' then now() + interval '10 minutes' else null end)",
+        )
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .bind(notification_status)
+        .bind(message_id)
+        .execute(pool)
+        .await
+        .expect("review delivery pause fixture must be inserted");
+    }
+
+    assert!(
+        suppress_pending_review_deliveries(pool)
+            .await
+            .expect("paused review deliveries must be suppressed")
+    );
+
+    let states: Vec<ReviewDeliveryPauseState> = query_as(
+        "select telegram_user_id, notification_status, notification_error_kind, notification_lease_expires_at is null, notification_message_id from spam_review_requests where chat_id = $1 and telegram_user_id = any($2) order by telegram_user_id",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_IDS.as_slice())
+    .fetch_all(pool)
+    .await
+    .expect("suppressed review delivery states must be queryable");
+
+    assert_eq!(states.len(), USER_IDS.len());
+    for (user_id, notification_status, error_kind, lease_cleared, message_id) in
+        states.iter().take(3)
+    {
+        assert!(USER_IDS[..3].contains(user_id));
+        assert_eq!(notification_status, "failed");
+        assert_eq!(error_kind.as_deref(), Some("delivery_disabled"));
+        assert!(*lease_cleared);
+        assert_eq!(*message_id, None);
+    }
+    assert_eq!(
+        states[3],
+        (USER_IDS[3], "sent".to_string(), None, true, Some(9_100_099))
+    );
+
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(USER_IDS.as_slice())
+        .execute(pool)
+        .await
+        .expect("review delivery pause fixtures must be removed");
+}
+
 async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_098;
@@ -1321,6 +1388,75 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
             .await
             .expect("terminal audit status must be stored");
     assert_eq!(terminal_status, "failed");
+}
+
+async fn assert_new_user_audit_text_change_reopens_completed_generation(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_100_020;
+    let first_input = serde_json::json!({
+        "text": {"first_message_preview": null, "recent_message_previews": ["Привет"]},
+        "risk": {"score": 12}
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "stable-fixture-hash",
+            prompt_version: "prompt-v1",
+            input_json: &first_input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("initial audit snapshot must enqueue");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', attempts = 1, assessment_json = '{\"first_message_assessment\":null}'::jsonb, provider = 'fixture', model = 'fixture', completed_at = now(), materialization_status = 'succeeded', materialized_at = now() where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("completed audit fixture must be stored");
+
+    let changed_input = serde_json::json!({
+        "text": {"first_message_preview": "Оплата за простые задания", "recent_message_previews": ["Оплата за простые задания"]},
+        "risk": {"score": 42}
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "stable-fixture-hash",
+            prompt_version: "prompt-v1",
+            input_json: &changed_input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("changed message input with a reused hash must be re-enqueued");
+
+    let state: (String, i32, Option<serde_json::Value>, Option<String>, bool, bool) = query_as(
+        "select status, attempts, assessment_json, error_kind, materialization_status = 'pending', materialized_at is null from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("changed text audit state must be queryable");
+    assert_eq!(state, ("pending".to_string(), 0, None, None, true, true));
+
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("audit text-change fixture must be removed");
 }
 
 /// Regression coverage for the authoritative `job → audit → review` lock order.
