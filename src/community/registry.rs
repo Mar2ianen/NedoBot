@@ -63,8 +63,8 @@ mod tests {
 
     use super::*;
     use crate::config_file::{
-        AskConfig, FirstCommentConfig, InstanceConfig, ModerationConfig, PublicMcpConfig,
-        SpamReputationConfig, TelegramConfig, UnknownChatPolicy, VoiceConfig,
+        AskConfig, FirstCommentConfig, InstanceConfig, ManualModerationConfig, ModerationConfig,
+        PublicMcpConfig, SpamReputationConfig, TelegramConfig, UnknownChatPolicy, VoiceConfig,
     };
 
     fn community(chats: BTreeMap<String, ChatConfig>) -> CommunityConfig {
@@ -80,6 +80,7 @@ mod tests {
             },
             chats,
             moderation: ModerationConfig::default(),
+            manual_moderation: ManualModerationConfig::default(),
             spam_reputation: SpamReputationConfig::default(),
             voice: VoiceConfig::default(),
             ask: AskConfig::default(),
@@ -97,6 +98,7 @@ mod tests {
                 id: -1001,
                 ingest: true,
                 moderation: true,
+                manual_moderation: false,
                 stats: true,
                 voice: false,
                 ask: false,
@@ -140,6 +142,7 @@ mod tests {
                     id: -1001,
                     ingest: true,
                     moderation: false,
+                    manual_moderation: false,
                     stats: false,
                     voice: false,
                     ask: false,
@@ -155,6 +158,7 @@ mod tests {
                     id: -1001,
                     ingest: true,
                     moderation: false,
+                    manual_moderation: false,
                     stats: false,
                     voice: false,
                     ask: false,

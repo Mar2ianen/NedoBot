@@ -35,6 +35,8 @@ pub struct ChatConfig {
     #[serde(default)]
     pub moderation: bool,
     #[serde(default)]
+    pub manual_moderation: bool,
+    #[serde(default)]
     pub stats: bool,
     #[serde(default)]
     pub voice: bool,
@@ -63,6 +65,13 @@ pub struct ModerationConfig {
     pub review_chat: Option<String>,
     #[serde(default)]
     pub reviewer_user_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualModerationConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_review_delivery_enabled() -> bool {
@@ -167,6 +176,7 @@ pub struct CommunityConfig {
     pub telegram: TelegramConfig,
     pub chats: BTreeMap<String, ChatConfig>,
     pub moderation: ModerationConfig,
+    pub manual_moderation: ManualModerationConfig,
     pub spam_reputation: SpamReputationConfig,
     pub voice: VoiceConfig,
     pub ask: AskConfig,
