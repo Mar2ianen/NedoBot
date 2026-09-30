@@ -1,8 +1,9 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
 
-use super::types::{WARNING_TTL, should_escalate_warning};
+use super::types::{BatchRequestSnapshot, WARNING_TTL, should_escalate_warning};
 
 const ACTION_LEASE: ChronoDuration = ChronoDuration::minutes(2);
 
@@ -42,7 +43,32 @@ pub struct WarningResult {
 #[derive(Debug, Clone)]
 pub struct BatchCreation {
     pub id: i64,
-    pub is_new: bool,
+    pub actor_user_id: i64,
+    pub command: String,
+    pub status: String,
+    pub request: Option<BatchRequestSnapshot>,
+    pub result_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchClaim {
+    Claimed,
+    Busy,
+    Finished(Option<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningSelection {
+    Latest,
+    All,
+    Id(i64),
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PreparedAction {
+    pub id: i64,
+    pub status: String,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +83,7 @@ pub struct ActionPreparation<'a> {
     pub automatic: bool,
 }
 
+#[allow(dead_code)] // Kept for existing integrations and moderation tooling.
 pub async fn create_batch(
     pool: &PgPool,
     chat_id: i64,
@@ -64,10 +91,208 @@ pub async fn create_batch(
     source_message_id: i32,
     command: &str,
 ) -> anyhow::Result<BatchCreation> {
-    if let Some((id,)) = sqlx::query_as::<_, (i64,)>(
+    create_batch_inner(
+        pool,
+        chat_id,
+        actor_user_id,
+        source_message_id,
+        command,
+        &Value::Object(Default::default()),
+    )
+    .await
+}
+
+pub async fn create_batch_with_request(
+    pool: &PgPool,
+    chat_id: i64,
+    actor_user_id: i64,
+    source_message_id: i32,
+    command: &str,
+    request: &BatchRequestSnapshot,
+) -> anyhow::Result<BatchCreation> {
+    create_batch_inner(
+        pool,
+        chat_id,
+        actor_user_id,
+        source_message_id,
+        command,
+        &serde_json::to_value(request)?,
+    )
+    .await
+}
+
+pub async fn find_batch(
+    pool: &PgPool,
+    chat_id: i64,
+    source_message_id: i32,
+) -> anyhow::Result<Option<BatchCreation>> {
+    let row = sqlx::query_as::<_, BatchRow>(
+        r#"select id, actor_user_id, command, status, request_json, result_text
+           from manual_moderation_batches
+           where chat_id = $1 and source_message_id = $2"#,
+    )
+    .bind(chat_id)
+    .bind(source_message_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(BatchRow::into_creation).transpose()
+}
+
+pub async fn claim_batch(pool: &PgPool, batch_id: i64) -> anyhow::Result<BatchClaim> {
+    let mut tx = pool.begin().await?;
+    let row: (String, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        r#"select status, result_text, processing_lease_expires_at
+           from manual_moderation_batches where id = $1 for update"#,
+    )
+    .bind(batch_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if row.0 == "completed" {
+        tx.commit().await?;
+        return Ok(BatchClaim::Finished(row.1));
+    }
+    if row.0 == "unknown" {
+        let resumable_work: bool = sqlx::query_scalar(
+            r#"select exists (
+                 select 1 from manual_moderation_actions where batch_id = $1 and status = 'pending'
+                 union all
+                 select 1 from manual_moderation_events e
+                 join manual_moderation_actions a on a.id = e.action_id
+                 where e.batch_id = $1 and a.status = 'pending'
+               )"#,
+        )
+        .bind(batch_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !resumable_work {
+            tx.commit().await?;
+            return Ok(BatchClaim::Finished(row.1));
+        }
+    }
+    if row.2.is_some_and(|expires| expires > Utc::now()) {
+        tx.commit().await?;
+        return Ok(BatchClaim::Busy);
+    }
+    sqlx::query(
+        r#"update manual_moderation_batches
+           set status = 'running', processing_lease_expires_at = now() + $2::interval,
+               updated_at = now()
+           where id = $1"#,
+    )
+    .bind(batch_id)
+    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(BatchClaim::Claimed)
+}
+
+pub async fn recover_expired_batch_actions(pool: &PgPool, batch_id: i64) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"update manual_moderation_actions a
+           set status = 'unknown', processing_lease_expires_at = null
+           where a.status = 'processing' and a.processing_lease_expires_at <= now()
+             and (
+               a.batch_id = $1
+               or exists (
+                 select 1 from manual_moderation_events e
+                 where e.batch_id = $1 and e.action_id = a.id
+               )
+             )"#,
+    )
+    .bind(batch_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn finish_batch(
+    pool: &PgPool,
+    batch_id: i64,
+    result_text: &str,
+) -> anyhow::Result<String> {
+    let mut tx = pool.begin().await?;
+    let (has_pending, has_unknown): (bool, bool) = sqlx::query_as(
+        r#"with relevant_actions as (
+               select id, status from manual_moderation_actions where batch_id = $1
+               union
+               select a.id, a.status
+               from manual_moderation_events e
+               join manual_moderation_actions a on a.id = e.action_id
+               where e.batch_id = $1
+           )
+           select
+               coalesce(bool_or(status = 'pending'), false),
+               coalesce(bool_or(status in ('unknown', 'processing')), false)
+           from relevant_actions"#,
+    )
+    .bind(batch_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let status = if has_pending {
+        "prepared"
+    } else if has_unknown {
+        "unknown"
+    } else {
+        "completed"
+    };
+    sqlx::query(
+        r#"update manual_moderation_batches
+           set status = $2, result_text = $3, processing_lease_expires_at = null,
+               updated_at = now()
+           where id = $1"#,
+    )
+    .bind(batch_id)
+    .bind(status)
+    .bind(result_text)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(status.to_string())
+}
+
+#[derive(sqlx::FromRow)]
+struct BatchRow {
+    id: i64,
+    actor_user_id: i64,
+    command: String,
+    status: String,
+    request_json: Value,
+    result_text: Option<String>,
+}
+
+impl BatchRow {
+    fn into_creation(self) -> anyhow::Result<BatchCreation> {
+        let request = if self.request_json == Value::Object(Default::default()) {
+            None
+        } else {
+            Some(serde_json::from_value(self.request_json)?)
+        };
+        Ok(BatchCreation {
+            id: self.id,
+            actor_user_id: self.actor_user_id,
+            command: self.command,
+            status: self.status,
+            request,
+            result_text: self.result_text,
+        })
+    }
+}
+
+async fn create_batch_inner(
+    pool: &PgPool,
+    chat_id: i64,
+    actor_user_id: i64,
+    source_message_id: i32,
+    command: &str,
+    request_json: &Value,
+) -> anyhow::Result<BatchCreation> {
+    let inserted: Option<(i64,)> = sqlx::query_as(
         r#"insert into manual_moderation_batches
-               (chat_id, actor_user_id, source_message_id, command)
-           values ($1, $2, $3, $4)
+               (chat_id, actor_user_id, source_message_id, command, request_json, status)
+           values ($1, $2, $3, $4, $5, 'accepted')
            on conflict (chat_id, source_message_id) do nothing
            returning id"#,
     )
@@ -75,26 +300,112 @@ pub async fn create_batch(
     .bind(actor_user_id)
     .bind(source_message_id)
     .bind(command)
+    .bind(request_json)
     .fetch_optional(pool)
-    .await?
-    {
-        return Ok(BatchCreation { id, is_new: true });
-    }
-
-    let (id,) = sqlx::query_as(
-        "select id from manual_moderation_batches where chat_id = $1 and source_message_id = $2",
-    )
-    .bind(chat_id)
-    .bind(source_message_id)
-    .fetch_one(pool)
     .await?;
-    Ok(BatchCreation { id, is_new: false })
+    let batch = if let Some((id,)) = inserted {
+        sqlx::query_as::<_, BatchRow>(
+            r#"select id, actor_user_id, command, status, request_json, result_text
+               from manual_moderation_batches where id = $1"#,
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await?
+        .into_creation()?
+    } else {
+        find_batch(pool, chat_id, source_message_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("idempotent moderation batch disappeared"))?
+    };
+    if batch.actor_user_id != actor_user_id {
+        anyhow::bail!("эта команда уже зарегистрирована от другого администратора");
+    }
+    Ok(batch)
 }
 
+#[allow(dead_code)] // Single-action API remains available to external feature consumers.
 pub async fn prepare_action(
     pool: &PgPool,
     request: ActionPreparation<'_>,
 ) -> anyhow::Result<Option<i64>> {
+    let mut tx = pool.begin().await?;
+    lock_target(&mut tx, request.chat_id, request.target_user_id).await?;
+    let action = prepare_action_locked(&mut tx, request, "processing", false).await?;
+    tx.commit().await?;
+    Ok(action.map(|action| action.id))
+}
+
+pub async fn prepare_actions_batch(
+    pool: &PgPool,
+    requests: &[ActionPreparation<'_>],
+) -> anyhow::Result<Vec<Option<PreparedAction>>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch_id = requests[0].batch_id;
+    let chat_id = requests[0].chat_id;
+    if requests
+        .iter()
+        .any(|request| request.batch_id != batch_id || request.chat_id != chat_id)
+    {
+        anyhow::bail!("batch preflight must contain one chat and one batch");
+    }
+    let mut target_ids = requests
+        .iter()
+        .map(|request| request.target_user_id)
+        .collect::<Vec<_>>();
+    target_ids.sort_unstable();
+    target_ids.dedup();
+    if target_ids.len() != requests.len() {
+        anyhow::bail!("batch preflight contains duplicate targets");
+    }
+
+    let mut tx = pool.begin().await?;
+    for target_user_id in target_ids {
+        lock_target(&mut tx, chat_id, target_user_id).await?;
+    }
+    let mut prepared = Vec::with_capacity(requests.len());
+    for request in requests {
+        prepared.push(prepare_action_locked(&mut tx, *request, "pending", true).await?);
+    }
+    tx.commit().await?;
+    Ok(prepared)
+}
+
+pub async fn start_prepared_action(pool: &PgPool, action_id: i64) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let action = load_action(&mut tx, action_id).await?;
+    lock_target(&mut tx, action.chat_id, action.target_user_id).await?;
+    let changed = sqlx::query(
+        r#"update manual_moderation_actions
+           set status = 'processing', processing_lease_expires_at = now() + $2::interval
+           where id = $1 and status = 'pending'"#,
+    )
+    .bind(action_id)
+    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed == 1 {
+        sqlx::query(
+            r#"update manual_moderation_batches
+               set processing_lease_expires_at = now() + interval '5 minutes', updated_at = now()
+               where id = $1"#,
+        )
+        .bind(action.batch_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(changed == 1)
+}
+
+async fn prepare_action_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    request: ActionPreparation<'_>,
+    initial_status: &str,
+    idempotent: bool,
+) -> anyhow::Result<Option<PreparedAction>> {
     let ActionPreparation {
         batch_id,
         chat_id,
@@ -105,16 +416,31 @@ pub async fn prepare_action(
         expires_at,
         automatic,
     } = request;
-    let mut tx = pool.begin().await?;
-    lock_target(&mut tx, chat_id, target_user_id).await?;
-    expire_target_actions(&mut tx, chat_id, target_user_id).await?;
+    expire_target_actions(tx, chat_id, target_user_id).await?;
+
+    if idempotent {
+        let existing = sqlx::query_as::<_, PreparedAction>(
+            r#"select id, status, expires_at
+               from manual_moderation_actions
+               where batch_id = $1 and target_user_id = $2 and action = $3
+               order by id desc limit 1"#,
+        )
+        .bind(batch_id)
+        .bind(target_user_id)
+        .bind(action)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if existing.is_some() {
+            return Ok(existing);
+        }
+    }
 
     let processing: Option<(i64,)> = sqlx::query_as(
-        "select id from manual_moderation_actions where chat_id = $1 and target_user_id = $2 and status = 'processing'",
+        "select id from manual_moderation_actions where chat_id = $1 and target_user_id = $2 and status in ('pending', 'processing')",
     )
     .bind(chat_id)
     .bind(target_user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if processing.is_some() {
         anyhow::bail!("у пользователя уже выполняется другая команда модерации");
@@ -130,7 +456,7 @@ pub async fn prepare_action(
     )
     .bind(chat_id)
     .bind(target_user_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if unknown_restriction {
         anyhow::bail!(
@@ -147,7 +473,7 @@ pub async fn prepare_action(
     )
     .bind(chat_id)
     .bind(target_user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     if action == "mute"
@@ -158,7 +484,6 @@ pub async fn prepare_action(
         anyhow::bail!("пользователь забанен; сначала сними бан командой /unban");
     }
     if action == "auto_mute" && active_restriction.is_some() {
-        tx.commit().await?;
         return Ok(None);
     }
 
@@ -168,7 +493,8 @@ pub async fn prepare_action(
                (batch_id, chat_id, target_user_id, actor_user_id, action, reason,
                 status, expires_at, processing_lease_expires_at,
                 supersedes_action_id, automatic)
-           values ($1, $2, $3, $4, $5, $6, 'processing', $7, now() + $8::interval, $9, $10)
+           values ($1, $2, $3, $4, $5, $6, $11, $7,
+                   case when $11 = 'processing' then now() + $8::interval else null end, $9, $10)
            returning id"#,
     )
     .bind(batch_id)
@@ -181,11 +507,12 @@ pub async fn prepare_action(
     .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
     .bind(active_restriction.map(|(id, _)| id))
     .bind(automatic)
-    .fetch_one(&mut *tx)
+    .bind(initial_status)
+    .fetch_one(&mut **tx)
     .await?;
 
     insert_event(
-        &mut tx,
+        tx,
         batch_id,
         Some(action_id),
         chat_id,
@@ -196,8 +523,14 @@ pub async fn prepare_action(
         None,
     )
     .await?;
-    tx.commit().await?;
-    Ok(Some(action_id))
+    let prepared = sqlx::query_as::<_, PreparedAction>(
+        r#"select id, status, expires_at
+           from manual_moderation_actions where id = $1"#,
+    )
+    .bind(action_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(Some(prepared))
 }
 
 pub async fn mark_action_succeeded(pool: &PgPool, action_id: i64) -> anyhow::Result<()> {
@@ -283,6 +616,7 @@ pub async fn mark_action_failed(
     Ok(())
 }
 
+#[allow(dead_code)] // Kept for existing integrations and moderation tooling.
 pub async fn add_warning(
     pool: &PgPool,
     batch_id: i64,
@@ -292,74 +626,147 @@ pub async fn add_warning(
     ttl: Duration,
     reason: Option<&str>,
 ) -> anyhow::Result<WarningResult> {
+    add_warnings_batch(
+        pool,
+        batch_id,
+        chat_id,
+        &[target_user_id],
+        actor_user_id,
+        ttl,
+        reason,
+    )
+    .await?
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow::anyhow!("warning batch returned no target outcome"))
+}
+
+pub async fn add_warnings_batch(
+    pool: &PgPool,
+    batch_id: i64,
+    chat_id: i64,
+    target_user_ids: &[i64],
+    actor_user_id: i64,
+    ttl: Duration,
+    reason: Option<&str>,
+) -> anyhow::Result<Vec<WarningResult>> {
+    let mut sorted_ids = target_user_ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    if sorted_ids.len() != target_user_ids.len() {
+        anyhow::bail!("warning batch contains duplicate targets");
+    }
     let mut tx = pool.begin().await?;
-    lock_target(&mut tx, chat_id, target_user_id).await?;
-    expire_target_actions(&mut tx, chat_id, target_user_id).await?;
-    let action_id: i64 = sqlx::query_scalar(
-        r#"insert into manual_moderation_actions
-               (batch_id, chat_id, target_user_id, actor_user_id, action, reason,
-                status, expires_at)
-           values ($1, $2, $3, $4, 'warn', $5, 'applied', now() + $6::interval)
-           returning id"#,
-    )
-    .bind(batch_id)
-    .bind(chat_id)
-    .bind(target_user_id)
-    .bind(actor_user_id)
-    .bind(reason)
-    .bind(format!("{} seconds", ttl.as_secs()))
-    .fetch_one(&mut *tx)
-    .await?;
-    insert_event(
-        &mut tx,
-        batch_id,
-        Some(action_id),
-        chat_id,
-        Some(target_user_id),
-        actor_user_id,
-        "requested",
-        reason,
-        None,
-    )
-    .await?;
-    insert_event(
-        &mut tx,
-        batch_id,
-        Some(action_id),
-        chat_id,
-        Some(target_user_id),
-        actor_user_id,
-        "applied",
-        reason,
-        None,
-    )
-    .await?;
-    let active_count: i64 = sqlx::query_scalar(
-        r#"select count(*) from manual_moderation_actions
-           where chat_id = $1 and target_user_id = $2 and action = 'warn'
-             and status = 'applied' and (expires_at is null or expires_at > now())"#,
-    )
-    .bind(chat_id)
-    .bind(target_user_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let has_restriction: bool = sqlx::query_scalar(
-        r#"select exists (
-             select 1 from manual_moderation_actions
-             where chat_id = $1 and target_user_id = $2 and action in ('mute', 'ban', 'auto_mute')
-               and status = 'applied' and (expires_at is null or expires_at > now())
-           )"#,
-    )
-    .bind(chat_id)
-    .bind(target_user_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    for target_user_id in &sorted_ids {
+        lock_target(&mut tx, chat_id, *target_user_id).await?;
+    }
+    let mut outcomes = Vec::with_capacity(target_user_ids.len());
+    for target_user_id in target_user_ids {
+        expire_target_actions(&mut tx, chat_id, *target_user_id).await?;
+        let existing_action_id: Option<i64> = sqlx::query_scalar(
+            r#"select id from manual_moderation_actions
+               where batch_id = $1 and target_user_id = $2 and action = 'warn'
+               order by id desc limit 1"#,
+        )
+        .bind(batch_id)
+        .bind(target_user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let action_id = if let Some(action_id) = existing_action_id {
+            action_id
+        } else {
+            let conflicting_action: bool = sqlx::query_scalar(
+                r#"select exists (
+                     select 1 from manual_moderation_actions
+                     where chat_id = $1 and target_user_id = $2
+                       and status in ('pending', 'processing')
+                   )"#,
+            )
+            .bind(chat_id)
+            .bind(target_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if conflicting_action {
+                anyhow::bail!(
+                    "у пользователя {target_user_id} уже выполняется другая команда модерации"
+                );
+            }
+            let unknown_restriction: bool = sqlx::query_scalar(
+                r#"select exists (
+                     select 1 from manual_moderation_actions
+                     where chat_id = $1 and target_user_id = $2 and status = 'unknown'
+                       and action in ('mute', 'ban', 'auto_mute')
+                       and (expires_at is null or expires_at > now())
+                   )"#,
+            )
+            .bind(chat_id)
+            .bind(target_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unknown_restriction {
+                anyhow::bail!(
+                    "у пользователя {target_user_id} есть действие с неопределённым исходом"
+                );
+            }
+            let action_id: i64 = sqlx::query_scalar(
+                r#"insert into manual_moderation_actions
+                       (batch_id, chat_id, target_user_id, actor_user_id, action, reason,
+                        status, expires_at)
+                   values ($1, $2, $3, $4, 'warn', $5, 'applied', now() + $6::interval)
+                   returning id"#,
+            )
+            .bind(batch_id)
+            .bind(chat_id)
+            .bind(target_user_id)
+            .bind(actor_user_id)
+            .bind(reason)
+            .bind(format!("{} seconds", ttl.as_secs()))
+            .fetch_one(&mut *tx)
+            .await?;
+            for event in ["requested", "applied"] {
+                insert_event(
+                    &mut tx,
+                    batch_id,
+                    Some(action_id),
+                    chat_id,
+                    Some(*target_user_id),
+                    actor_user_id,
+                    event,
+                    reason,
+                    None,
+                )
+                .await?;
+            }
+            action_id
+        };
+        let active_count: i64 = sqlx::query_scalar(
+            r#"select count(*) from manual_moderation_actions
+               where chat_id = $1 and target_user_id = $2 and action = 'warn'
+                 and status = 'applied' and (expires_at is null or expires_at > now())"#,
+        )
+        .bind(chat_id)
+        .bind(target_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let has_restriction: bool = sqlx::query_scalar(
+            r#"select exists (
+                 select 1 from manual_moderation_actions
+                 where chat_id = $1 and target_user_id = $2 and action in ('mute', 'ban', 'auto_mute')
+                   and status = 'applied' and (expires_at is null or expires_at > now())
+               )"#,
+        )
+        .bind(chat_id)
+        .bind(target_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        outcomes.push(WarningResult {
+            action_id,
+            active_count,
+            should_escalate: should_escalate_warning(active_count, has_restriction),
+        });
+    }
     tx.commit().await?;
-    Ok(WarningResult {
-        action_id,
-        active_count,
-        should_escalate: should_escalate_warning(active_count, has_restriction),
-    })
+    Ok(outcomes)
 }
 
 pub async fn active_warning_count(
@@ -429,9 +836,14 @@ pub async fn revoke_warnings(
     chat_id: i64,
     target_user_id: i64,
     actor_user_id: i64,
-    warn_id: Option<i64>,
+    selection: WarningSelection,
     revoke_reason: Option<&str>,
 ) -> anyhow::Result<Vec<i64>> {
+    let (warn_id, warn_all) = match selection {
+        WarningSelection::Latest => (None, false),
+        WarningSelection::All => (None, true),
+        WarningSelection::Id(warn_id) => (Some(warn_id), false),
+    };
     let mut tx = pool.begin().await?;
     lock_target(&mut tx, chat_id, target_user_id).await?;
     let revoked: Vec<(i64, Option<String>)> = sqlx::query_as(
@@ -439,12 +851,22 @@ pub async fn revoke_warnings(
            set status = 'revoked'
            where chat_id = $1 and target_user_id = $2 and action = 'warn'
              and status = 'applied' and (expires_at is null or expires_at > now())
-             and ($3::bigint is null or id = $3)
+             and (
+                 ($3::bigint is not null and id = $3)
+                 or ($3::bigint is null and $4 and true)
+                 or ($3::bigint is null and not $4 and id = (
+                     select id from manual_moderation_actions
+                     where chat_id = $1 and target_user_id = $2 and action = 'warn'
+                       and status = 'applied' and (expires_at is null or expires_at > now())
+                     order by created_at desc, id desc limit 1
+                 ))
+             )
            returning id, reason"#,
     )
     .bind(chat_id)
     .bind(target_user_id)
     .bind(warn_id)
+    .bind(warn_all)
     .fetch_all(&mut *tx)
     .await?;
     for (action_id, reason) in &revoked {
@@ -463,6 +885,25 @@ pub async fn revoke_warnings(
     }
     tx.commit().await?;
     Ok(revoked.into_iter().map(|(id, _)| id).collect())
+}
+
+pub async fn active_restriction_action(
+    pool: &PgPool,
+    chat_id: i64,
+    target_user_id: i64,
+) -> anyhow::Result<Option<String>> {
+    sqlx::query_scalar(
+        r#"select action from manual_moderation_actions
+           where chat_id = $1 and target_user_id = $2 and status = 'applied'
+             and action in ('mute', 'ban', 'auto_mute')
+             and (expires_at is null or expires_at > now())
+           order by created_at desc, id desc limit 1"#,
+    )
+    .bind(chat_id)
+    .bind(target_user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn latest_batch(
@@ -805,6 +1246,7 @@ pub async fn finish_undo(
     Ok(())
 }
 
+#[allow(dead_code)] // Single-target API remains for external feature consumers.
 pub async fn claim_restriction_revoke(
     pool: &PgPool,
     batch_id: i64,
@@ -857,6 +1299,109 @@ pub async fn claim_restriction_revoke(
     .await?;
     tx.commit().await?;
     Ok(Some(action))
+}
+
+pub async fn claim_restriction_revokes_batch(
+    pool: &PgPool,
+    batch_id: i64,
+    chat_id: i64,
+    target_user_ids: &[i64],
+    actor_user_id: i64,
+    expected_action: &str,
+) -> anyhow::Result<Vec<Option<ActionRecord>>> {
+    let mut sorted_ids = target_user_ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    if sorted_ids.len() != target_user_ids.len() {
+        anyhow::bail!("restriction revoke batch contains duplicate targets");
+    }
+    let mut tx = pool.begin().await?;
+    for target_user_id in &sorted_ids {
+        lock_target(&mut tx, chat_id, *target_user_id).await?;
+    }
+    let mut claimed = Vec::with_capacity(target_user_ids.len());
+    for target_user_id in target_user_ids {
+        expire_target_actions(&mut tx, chat_id, *target_user_id).await?;
+        let inflight: bool = sqlx::query_scalar(
+            r#"select exists (
+                 select 1 from manual_moderation_actions
+                 where chat_id = $1 and target_user_id = $2
+                   and status in ('pending', 'processing')
+               )"#,
+        )
+        .bind(chat_id)
+        .bind(target_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if inflight {
+            anyhow::bail!(
+                "у пользователя {target_user_id} уже выполняется другая команда модерации"
+            );
+        }
+        let unknown: bool = sqlx::query_scalar(
+            r#"select exists (
+                 select 1 from manual_moderation_actions
+                 where chat_id = $1 and target_user_id = $2 and status = 'unknown'
+                   and action in ('mute', 'ban', 'auto_mute')
+                   and (expires_at is null or expires_at > now())
+               )"#,
+        )
+        .bind(chat_id)
+        .bind(target_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if unknown {
+            anyhow::bail!(
+                "у пользователя {target_user_id} есть ограничение с неопределённым исходом"
+            );
+        }
+        let action = sqlx::query_as::<_, ActionRecord>(
+            r#"select id, batch_id, chat_id, target_user_id, actor_user_id, action, reason,
+                      status, created_at, expires_at, supersedes_action_id, automatic
+               from manual_moderation_actions
+               where chat_id = $1 and target_user_id = $2 and status = 'applied'
+                 and action in ('mute', 'ban', 'auto_mute')
+                 and (expires_at is null or expires_at > now())
+               order by created_at desc, id desc limit 1 for update"#,
+        )
+        .bind(chat_id)
+        .bind(target_user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .filter(|action| {
+            expected_action == "any"
+                || (expected_action == "mute" && action.action != "ban")
+                || action.action == expected_action
+        });
+        if let Some(action) = action {
+            sqlx::query(
+                r#"update manual_moderation_actions
+                   set status = 'processing', processing_lease_expires_at = now() + $2::interval
+                   where id = $1 and status = 'applied'"#,
+            )
+            .bind(action.id)
+            .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+            .execute(&mut *tx)
+            .await?;
+            insert_event(
+                &mut tx,
+                batch_id,
+                Some(action.id),
+                chat_id,
+                Some(*target_user_id),
+                actor_user_id,
+                "requested",
+                action.reason.as_deref(),
+                Some("restriction revoke requested"),
+            )
+            .await?;
+            claimed.push(Some(action));
+        } else {
+            claimed.push(None);
+        }
+    }
+    tx.commit().await?;
+    Ok(claimed)
 }
 
 pub async fn finish_restriction_revoke(

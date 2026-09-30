@@ -2,8 +2,12 @@ use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicI32, Ordering};
 use tg_ai_bot_teloxide::features::manual_moderation::{
-    ActionPreparation, UndoClaim, add_warning, claim_undo_action, create_batch, latest_batch,
-    list_actions, mark_action_failed, mark_action_succeeded, prepare_action, revoke_warnings,
+    ActionPreparation, BatchClaim, UndoClaim, WarningSelection, add_warning, add_warnings_batch,
+    claim_batch, claim_restriction_revokes_batch, claim_undo_action, create_batch,
+    create_batch_with_request, finish_batch, latest_batch, list_actions, mark_action_failed,
+    mark_action_succeeded, prepare_action, prepare_actions_batch, recover_expired_batch_actions,
+    revoke_warnings, start_prepared_action,
+    types::{BatchRequestSnapshot, CommandKind},
 };
 
 const CHAT_ID: i64 = -1001932061163;
@@ -223,7 +227,7 @@ async fn warning_threshold_escalates_once_and_failed_replacement_keeps_existing_
             CHAT_ID,
             undo_user_id,
             actor_id,
-            None,
+            WarningSelection::Latest,
             None,
         )
         .await
@@ -296,4 +300,346 @@ async fn cleanup(pool: &PgPool, user_ids: &[i64], batch_ids: &[i64]) {
         .await
         .expect("test batches must be removed");
     let _ = user_ids;
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_safely() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let user_id = Utc::now().timestamp_micros() + 3_000_000_000;
+    let actor_id = user_id + 1;
+    let first_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .unwrap();
+    let blocker_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .unwrap();
+    let warning_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "warn",
+    )
+    .await
+    .unwrap();
+    let recoverable_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "ban",
+    )
+    .await
+    .unwrap();
+    let mut batch_ids = vec![
+        first_batch.id,
+        blocker_batch.id,
+        warning_batch.id,
+        recoverable_batch.id,
+    ];
+
+    let blocker_id = prepare_action(
+        &pool,
+        ActionPreparation {
+            batch_id: blocker_batch.id,
+            chat_id: CHAT_ID,
+            target_user_id: user_id + 1,
+            actor_user_id: actor_id,
+            action: "mute",
+            reason: None,
+            expires_at: Some(Utc::now() + Duration::days(1)),
+            automatic: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let batch_preflight = prepare_actions_batch(
+        &pool,
+        &[
+            ActionPreparation {
+                batch_id: first_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id: user_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: None,
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            },
+            ActionPreparation {
+                batch_id: first_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id: user_id + 1,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: None,
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            },
+        ],
+    )
+    .await;
+    assert!(
+        batch_preflight.is_err(),
+        "the conflicting second target rejects the full DB preflight"
+    );
+    let first_target_action_count: i64 = sqlx::query_scalar(
+        "select count(*) from manual_moderation_actions where batch_id = $1 and target_user_id = $2",
+    )
+    .bind(first_batch.id)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        first_target_action_count, 0,
+        "transaction rollback must leave no first-target intent"
+    );
+    assert!(
+        add_warnings_batch(
+            &pool,
+            warning_batch.id,
+            CHAT_ID,
+            &[user_id, user_id + 1],
+            actor_id,
+            std::time::Duration::from_secs(30 * 24 * 60 * 60),
+            None,
+        )
+        .await
+        .is_err(),
+        "a warning batch must reject every target before committing any warning"
+    );
+    let first_target_warning_count: i64 = sqlx::query_scalar(
+        "select count(*) from manual_moderation_actions where batch_id = $1 and target_user_id = $2 and action = 'warn'",
+    )
+    .bind(warning_batch.id)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first_target_warning_count, 0);
+    assert!(
+        claim_restriction_revokes_batch(
+            &pool,
+            first_batch.id,
+            CHAT_ID,
+            &[user_id, user_id + 1],
+            actor_id,
+            "mute",
+        )
+        .await
+        .is_err(),
+        "unmute must claim every database target before any Telegram call"
+    );
+
+    mark_action_failed(&pool, blocker_id, false, "test cleanup")
+        .await
+        .unwrap();
+    let request = BatchRequestSnapshot {
+        kind: CommandKind::Ban,
+        target_user_ids: vec![user_id + 2],
+        duration_seconds: None,
+        reason: Some("retry snapshot".to_string()),
+        warn_id: None,
+        warn_all: false,
+        limit: 20,
+    };
+    let saved_message_id = MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
+    let saved =
+        create_batch_with_request(&pool, CHAT_ID, actor_id, saved_message_id, "ban", &request)
+            .await
+            .unwrap();
+    batch_ids.push(saved.id);
+    let retry =
+        create_batch_with_request(&pool, CHAT_ID, actor_id, saved_message_id, "ban", &request)
+            .await;
+    let retry = retry.unwrap();
+    assert_eq!(retry.id, saved.id);
+    assert_eq!(retry.request.as_ref(), Some(&request));
+
+    assert_eq!(
+        claim_batch(&pool, saved.id).await.unwrap(),
+        BatchClaim::Claimed
+    );
+    let prepared = prepare_actions_batch(
+        &pool,
+        &[ActionPreparation {
+            batch_id: saved.id,
+            chat_id: CHAT_ID,
+            target_user_id: user_id + 2,
+            actor_user_id: actor_id,
+            action: "ban",
+            reason: Some("retry snapshot"),
+            expires_at: None,
+            automatic: false,
+        }],
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap()
+    .unwrap();
+    assert_eq!(prepared.status, "pending");
+    assert!(start_prepared_action(&pool, prepared.id).await.unwrap());
+    sqlx::query("update manual_moderation_actions set processing_lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(prepared.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    recover_expired_batch_actions(&pool, saved.id)
+        .await
+        .unwrap();
+    let uncertain_status: String =
+        sqlx::query_scalar("select status from manual_moderation_actions where id = $1")
+            .bind(prepared.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(uncertain_status, "unknown");
+    assert!(
+        !start_prepared_action(&pool, prepared.id).await.unwrap(),
+        "unknown Telegram outcomes must never be replayed"
+    );
+    sqlx::query("update manual_moderation_batches set processing_lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(saved.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        claim_batch(&pool, saved.id).await.unwrap(),
+        BatchClaim::Claimed
+    );
+    assert_eq!(
+        finish_batch(&pool, saved.id, "manual reconciliation required")
+            .await
+            .unwrap(),
+        "unknown"
+    );
+    assert_eq!(
+        claim_batch(&pool, saved.id).await.unwrap(),
+        BatchClaim::Finished(Some("manual reconciliation required".to_string()))
+    );
+
+    assert_eq!(
+        claim_batch(&pool, recoverable_batch.id).await.unwrap(),
+        BatchClaim::Claimed
+    );
+    assert_eq!(
+        claim_batch(&pool, recoverable_batch.id).await.unwrap(),
+        BatchClaim::Busy
+    );
+    sqlx::query("update manual_moderation_batches set processing_lease_expires_at = now() - interval '1 second' where id = $1")
+        .bind(recoverable_batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        claim_batch(&pool, recoverable_batch.id).await.unwrap(),
+        BatchClaim::Claimed
+    );
+
+    cleanup(&pool, &[user_id, user_id + 1, user_id + 2], &batch_ids).await;
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn unwarn_defaults_to_latest_and_only_explicit_all_revokes_every_warning() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let user_id = Utc::now().timestamp_micros() + 4_000_000_000;
+    let actor_id = user_id + 1;
+    let mut batch_ids = Vec::new();
+    let mut warning_ids = Vec::new();
+    for _ in 0..3 {
+        let batch = create_batch(
+            &pool,
+            CHAT_ID,
+            actor_id,
+            MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+            "warn",
+        )
+        .await
+        .unwrap();
+        batch_ids.push(batch.id);
+        let warning = add_warning(
+            &pool,
+            batch.id,
+            CHAT_ID,
+            user_id,
+            actor_id,
+            std::time::Duration::from_secs(30 * 24 * 60 * 60),
+            None,
+        )
+        .await
+        .unwrap();
+        warning_ids.push(warning.action_id);
+    }
+    let unwarn_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "unwarn",
+    )
+    .await
+    .unwrap();
+    batch_ids.push(unwarn_batch.id);
+
+    assert_eq!(
+        revoke_warnings(
+            &pool,
+            unwarn_batch.id,
+            CHAT_ID,
+            user_id,
+            actor_id,
+            WarningSelection::Latest,
+            None
+        )
+        .await
+        .unwrap(),
+        [*warning_ids.last().unwrap()],
+        "plain /unwarn revokes only the latest active warning"
+    );
+    let mut revoked_all = revoke_warnings(
+        &pool,
+        unwarn_batch.id,
+        CHAT_ID,
+        user_id,
+        actor_id,
+        WarningSelection::All,
+        None,
+    )
+    .await
+    .unwrap();
+    revoked_all.sort_unstable();
+    let mut expected_remaining = warning_ids[..2].to_vec();
+    expected_remaining.sort_unstable();
+    assert_eq!(
+        revoked_all, expected_remaining,
+        "all must be explicit to revoke the remaining warnings"
+    );
+
+    cleanup(&pool, &[user_id], &batch_ids).await;
 }

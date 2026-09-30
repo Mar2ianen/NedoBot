@@ -1,14 +1,17 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 pub const DEFAULT_MUTE_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 pub const WARNING_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const WARNING_MUTE_DURATION: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 pub const WARNING_MUTE_THRESHOLD: i64 = 3;
 pub const MAX_TARGETS_PER_BATCH: usize = 20;
 pub const MAX_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-pub const MIN_DURATION: Duration = Duration::from_secs(30);
+pub const MIN_DURATION: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CommandKind {
     Mute,
     Ban,
@@ -61,6 +64,47 @@ pub struct ParsedCommand {
     pub warn_id: Option<i64>,
     pub warn_all: bool,
     pub limit: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchRequestSnapshot {
+    pub kind: CommandKind,
+    pub target_user_ids: Vec<i64>,
+    pub duration_seconds: Option<u64>,
+    pub reason: Option<String>,
+    pub warn_id: Option<i64>,
+    pub warn_all: bool,
+    pub limit: i64,
+}
+
+impl BatchRequestSnapshot {
+    pub fn from_parsed(parsed: &ParsedCommand, target_user_ids: Vec<i64>) -> Self {
+        Self {
+            kind: parsed.kind,
+            target_user_ids,
+            duration_seconds: parsed.duration.map(|duration| duration.as_secs()),
+            reason: parsed.reason.clone(),
+            warn_id: parsed.warn_id,
+            warn_all: parsed.warn_all,
+            limit: parsed.limit,
+        }
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration_seconds.map(Duration::from_secs)
+    }
+
+    pub fn parsed_command(&self) -> ParsedCommand {
+        ParsedCommand {
+            kind: self.kind,
+            targets: Vec::new(),
+            duration: self.duration(),
+            reason: self.reason.clone(),
+            warn_id: self.warn_id,
+            warn_all: self.warn_all,
+            limit: self.limit,
+        }
+    }
 }
 
 pub fn parse_command(kind: CommandKind, args: &str) -> Result<ParsedCommand, String> {
@@ -252,7 +296,7 @@ pub fn parse_compound_duration(value: &str) -> Option<Duration> {
 
 fn validate_finite_duration(duration: Duration) -> Result<(), String> {
     if duration < MIN_DURATION || duration > MAX_DURATION {
-        return Err("срок должен быть от 30 секунд до 365 дней".to_string());
+        return Err("срок должен быть от 60 секунд до 365 дней".to_string());
     }
     Ok(())
 }
@@ -292,9 +336,13 @@ mod tests {
 
     #[test]
     fn rejects_malformed_and_out_of_bounds_durations() {
-        for value in ["0h", "2x", "999999999999999999999d", "10s", "366d"] {
+        for value in ["0h", "2x", "999999999999999999999d", "30s", "366d"] {
             assert!(parse_command(CommandKind::Mute, value).is_err(), "{value}");
         }
+        assert_eq!(
+            parse_command(CommandKind::Mute, "60s").unwrap().duration,
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]
