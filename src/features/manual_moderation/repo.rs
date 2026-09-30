@@ -71,6 +71,13 @@ pub struct PreparedAction {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedRestrictionRevoke {
+    pub operation_id: i64,
+    pub operation_status: String,
+    pub action: ActionRecord,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ActionPreparation<'a> {
     pub batch_id: i64,
@@ -159,6 +166,9 @@ pub async fn claim_batch(pool: &PgPool, batch_id: i64) -> anyhow::Result<BatchCl
                  select 1 from manual_moderation_events e
                  join manual_moderation_actions a on a.id = e.action_id
                  where e.batch_id = $1 and a.status = 'pending'
+                 union all
+                 select 1 from manual_moderation_operations
+                 where batch_id = $1 and status = 'pending'
                )"#,
         )
         .bind(batch_id)
@@ -195,17 +205,82 @@ pub async fn recover_expired_batch_actions(pool: &PgPool, batch_id: i64) -> anyh
            where a.status = 'processing' and a.processing_lease_expires_at <= now()
              and (
                a.batch_id = $1
-               or exists (
-                 select 1 from manual_moderation_events e
-                 where e.batch_id = $1 and e.action_id = a.id
-               )
+             or exists (
+               select 1 from manual_moderation_events e
+               where e.batch_id = $1 and e.action_id = a.id
+             )
+             )
+             and not exists (
+               select 1 from manual_moderation_operations o
+               where o.action_id = a.id and o.status = 'processing'
              )"#,
+    )
+    .bind(batch_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"with expired as (
+               update manual_moderation_operations
+               set status = 'unknown', lease_expires_at = null,
+                   details = 'operation lease expired; Telegram outcome requires reconciliation',
+                   updated_at = now()
+               where status = 'processing'
+                 and (batch_id = $1 or exists (
+                     select 1 from manual_moderation_events e
+                     where e.batch_id = $1 and e.action_id = manual_moderation_operations.action_id
+                 ))
+                 and (lease_expires_at <= now() or exists (
+                     select 1 from manual_moderation_actions a
+                     where a.id = manual_moderation_operations.action_id
+                       and a.status = 'processing'
+                       and a.processing_lease_expires_at <= now()
+                 ))
+               returning id, batch_id, action_id, chat_id, target_user_id, actor_user_id
+           ), changed_actions as (
+               update manual_moderation_actions a
+               set status = 'unknown', processing_lease_expires_at = null
+               from expired o
+               where a.id = o.action_id
+                 and a.status in ('pending', 'processing', 'applied', 'revoked')
+               returning a.id, o.batch_id, o.chat_id, o.target_user_id, o.actor_user_id
+           )
+           insert into manual_moderation_events
+               (batch_id, action_id, chat_id, target_user_id, actor_user_id, event, details)
+           select batch_id, id, chat_id, target_user_id, actor_user_id, 'unknown',
+                  'operation lease expired; Telegram outcome requires reconciliation'
+           from changed_actions"#,
     )
     .bind(batch_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn batch_has_uncertain_target(
+    pool: &PgPool,
+    batch_id: i64,
+    target_user_id: i64,
+) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        r#"select exists (
+               select 1 from manual_moderation_actions a
+               where a.target_user_id = $2 and a.status in ('processing', 'unknown')
+                 and (a.batch_id = $1 or exists (
+                     select 1 from manual_moderation_events e
+                     where e.batch_id = $1 and e.action_id = a.id
+                 ))
+               union all
+               select 1 from manual_moderation_operations
+               where batch_id = $1 and target_user_id = $2
+                 and status in ('processing', 'unknown')
+           )"#,
+    )
+    .bind(batch_id)
+    .bind(target_user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn finish_batch(
@@ -224,9 +299,10 @@ pub async fn finish_batch(
                where e.batch_id = $1
            )
            select
-               coalesce(bool_or(status = 'pending'), false),
-               coalesce(bool_or(status in ('unknown', 'processing')), false)
-           from relevant_actions"#,
+               coalesce((select bool_or(status = 'pending') from relevant_actions), false)
+                 or coalesce((select bool_or(status = 'pending') from manual_moderation_operations where batch_id = $1), false),
+               coalesce((select bool_or(status in ('unknown', 'processing')) from relevant_actions), false)
+                 or coalesce((select bool_or(status in ('unknown', 'processing')) from manual_moderation_operations where batch_id = $1), false)"#,
     )
     .bind(batch_id)
     .fetch_one(&mut *tx)
@@ -377,9 +453,10 @@ pub async fn start_prepared_action(pool: &PgPool, action_id: i64) -> anyhow::Res
     let action = load_action(&mut tx, action_id).await?;
     lock_target(&mut tx, action.chat_id, action.target_user_id).await?;
     let changed = sqlx::query(
-        r#"update manual_moderation_actions
-           set status = 'processing', processing_lease_expires_at = now() + $2::interval
-           where id = $1 and status = 'pending'"#,
+        r#"update manual_moderation_operations
+           set status = 'processing', lease_expires_at = now() + $2::interval,
+               updated_at = now()
+           where action_id = $1 and operation_kind = 'apply' and status = 'pending'"#,
     )
     .bind(action_id)
     .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
@@ -387,6 +464,19 @@ pub async fn start_prepared_action(pool: &PgPool, action_id: i64) -> anyhow::Res
     .await?
     .rows_affected();
     if changed == 1 {
+        let action_changed = sqlx::query(
+            r#"update manual_moderation_actions
+               set status = 'processing', processing_lease_expires_at = now() + $2::interval
+               where id = $1 and status = 'pending'"#,
+        )
+        .bind(action_id)
+        .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if action_changed != 1 {
+            anyhow::bail!("prepared action left pending state before Telegram request");
+        }
         sqlx::query(
             r#"update manual_moderation_batches
                set processing_lease_expires_at = now() + interval '5 minutes', updated_at = now()
@@ -435,14 +525,20 @@ async fn prepare_action_locked(
         }
     }
 
-    let processing: Option<(i64,)> = sqlx::query_as(
-        "select id from manual_moderation_actions where chat_id = $1 and target_user_id = $2 and status in ('pending', 'processing')",
+    let processing: bool = sqlx::query_scalar(
+        r#"select exists (
+             select 1 from manual_moderation_actions
+             where chat_id = $1 and target_user_id = $2 and status in ('pending', 'processing')
+             union all
+             select 1 from manual_moderation_operations
+             where chat_id = $1 and target_user_id = $2 and status in ('pending', 'processing')
+           )"#,
     )
     .bind(chat_id)
     .bind(target_user_id)
-    .fetch_optional(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    if processing.is_some() {
+    if processing {
         anyhow::bail!("у пользователя уже выполняется другая команда модерации");
     }
 
@@ -452,6 +548,12 @@ async fn prepare_action_locked(
              where chat_id = $1 and target_user_id = $2 and status = 'unknown'
                and action in ('mute', 'ban', 'auto_mute')
                and (expires_at is null or expires_at > now())
+             union all
+             select 1 from manual_moderation_operations o
+             join manual_moderation_actions a on a.id = o.action_id
+             where o.chat_id = $1 and o.target_user_id = $2 and o.status = 'unknown'
+               and a.action in ('mute', 'ban', 'auto_mute')
+               and (a.expires_at is null or a.expires_at > now())
            )"#,
     )
     .bind(chat_id)
@@ -511,6 +613,28 @@ async fn prepare_action_locked(
     .fetch_one(&mut **tx)
     .await?;
 
+    let operation_status = if initial_status == "processing" {
+        "processing"
+    } else {
+        "pending"
+    };
+    sqlx::query(
+        r#"insert into manual_moderation_operations
+               (batch_id, action_id, chat_id, target_user_id, actor_user_id,
+                operation_kind, status, lease_expires_at)
+           values ($1, $2, $3, $4, $5, 'apply', $6,
+                   case when $6 = 'processing' then now() + $7::interval else null end)"#,
+    )
+    .bind(batch_id)
+    .bind(action_id)
+    .bind(chat_id)
+    .bind(target_user_id)
+    .bind(actor_user_id)
+    .bind(operation_status)
+    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+    .execute(&mut **tx)
+    .await?;
+
     insert_event(
         tx,
         batch_id,
@@ -536,6 +660,18 @@ async fn prepare_action_locked(
 pub async fn mark_action_succeeded(pool: &PgPool, action_id: i64) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     let action = load_action(&mut tx, action_id).await?;
+    let operation_changed = sqlx::query(
+        r#"update manual_moderation_operations
+           set status = 'succeeded', lease_expires_at = null, updated_at = now()
+           where action_id = $1 and operation_kind = 'apply' and status = 'processing'"#,
+    )
+    .bind(action_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if operation_changed != 1 {
+        anyhow::bail!("apply operation left processing state before Telegram confirmation");
+    }
     if let Some(previous_id) = action.supersedes_action_id {
         sqlx::query(
             "update manual_moderation_actions set status = 'superseded' where id = $1 and status = 'applied'",
@@ -559,7 +695,7 @@ pub async fn mark_action_succeeded(pool: &PgPool, action_id: i64) -> anyhow::Res
     let changed = sqlx::query(
         r#"update manual_moderation_actions
            set status = 'applied', processing_lease_expires_at = null
-           where id = $1 and status = 'processing'"#,
+           where id = $1 and status in ('pending', 'processing')"#,
     )
     .bind(action_id)
     .execute(&mut *tx)
@@ -593,8 +729,22 @@ pub async fn mark_action_failed(
     let status = if unknown { "unknown" } else { "failed" };
     let mut tx = pool.begin().await?;
     let action = load_action(&mut tx, action_id).await?;
+    let operation_changed = sqlx::query(
+        r#"update manual_moderation_operations
+           set status = $2, lease_expires_at = null, details = $3, updated_at = now()
+           where action_id = $1 and operation_kind = 'apply' and status = 'processing'"#,
+    )
+    .bind(action_id)
+    .bind(status)
+    .bind(details)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if operation_changed != 1 {
+        anyhow::bail!("apply operation left processing state before Telegram outcome");
+    }
     sqlx::query(
-        "update manual_moderation_actions set status = $2, processing_lease_expires_at = null where id = $1 and status = 'processing'",
+        "update manual_moderation_actions set status = $2, processing_lease_expires_at = null where id = $1 and status in ('pending', 'processing')",
     )
     .bind(action_id)
     .bind(status)
@@ -680,6 +830,10 @@ pub async fn add_warnings_batch(
                      select 1 from manual_moderation_actions
                      where chat_id = $1 and target_user_id = $2
                        and status in ('pending', 'processing')
+                     union all
+                     select 1 from manual_moderation_operations
+                     where chat_id = $1 and target_user_id = $2
+                       and status in ('pending', 'processing')
                    )"#,
             )
             .bind(chat_id)
@@ -697,6 +851,12 @@ pub async fn add_warnings_batch(
                      where chat_id = $1 and target_user_id = $2 and status = 'unknown'
                        and action in ('mute', 'ban', 'auto_mute')
                        and (expires_at is null or expires_at > now())
+                     union all
+                     select 1 from manual_moderation_operations o
+                     join manual_moderation_actions a on a.id = o.action_id
+                     where o.chat_id = $1 and o.target_user_id = $2 and o.status = 'unknown'
+                       and a.action in ('mute', 'ban', 'auto_mute')
+                       and (a.expires_at is null or a.expires_at > now())
                    )"#,
             )
             .bind(chat_id)
@@ -1053,6 +1213,49 @@ pub async fn claim_undo_action(
         return Ok(UndoClaim::WarningRevoked);
     }
 
+    let existing_operation: Option<(String, String)> = sqlx::query_as(
+        r#"select operation_kind, status from manual_moderation_operations
+           where batch_id = $1 and action_id = $2
+             and operation_kind in ('undo', 'restore')
+           order by id desc limit 1"#,
+    )
+    .bind(undo_batch_id)
+    .bind(action_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((operation_kind, status)) = existing_operation {
+        tx.commit().await?;
+        return Ok(if status == "pending" {
+            if operation_kind == "restore" {
+                UndoClaim::RestrictionReapplyClaimed
+            } else {
+                UndoClaim::RestrictionClaimed
+            }
+        } else {
+            UndoClaim::Conflict
+        });
+    }
+
+    let inflight_operation: bool = sqlx::query_scalar(
+        r#"select exists (
+             select 1 from manual_moderation_operations
+             where chat_id = $1 and target_user_id = $2
+               and status in ('pending', 'processing')
+             union all
+             select 1 from manual_moderation_actions
+             where chat_id = $1 and target_user_id = $2
+               and status in ('pending', 'processing')
+           )"#,
+    )
+    .bind(current.chat_id)
+    .bind(current.target_user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if inflight_operation {
+        tx.commit().await?;
+        return Ok(UndoClaim::Conflict);
+    }
+
     if current.status == "revoked" {
         let active_restriction: bool = sqlx::query_scalar(
             r#"select exists (
@@ -1071,10 +1274,16 @@ pub async fn claim_undo_action(
             return Ok(UndoClaim::Conflict);
         }
         sqlx::query(
-            "update manual_moderation_actions set status = 'processing', processing_lease_expires_at = now() + $2::interval where id = $1 and status = 'revoked'",
+            r#"insert into manual_moderation_operations
+                   (batch_id, action_id, chat_id, target_user_id, actor_user_id,
+                    operation_kind, status)
+               values ($1, $2, $3, $4, $5, 'restore', 'pending')"#,
         )
+        .bind(undo_batch_id)
         .bind(action_id)
-        .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+        .bind(current.chat_id)
+        .bind(current.target_user_id)
+        .bind(actor_user_id)
         .execute(&mut *tx)
         .await?;
         insert_event(
@@ -1109,21 +1318,17 @@ pub async fn claim_undo_action(
         return Ok(UndoClaim::Conflict);
     }
 
-    let previous = if let Some(previous_id) = current.supersedes_action_id {
-        let previous = load_action(&mut tx, previous_id).await?;
-        (previous.status == "superseded"
-            && previous
-                .expires_at
-                .is_none_or(|expires| expires > Utc::now()))
-        .then_some(previous)
-    } else {
-        None
-    };
     sqlx::query(
-        "update manual_moderation_actions set status = 'processing', processing_lease_expires_at = now() + $2::interval where id = $1 and status = 'applied'",
+        r#"insert into manual_moderation_operations
+               (batch_id, action_id, chat_id, target_user_id, actor_user_id,
+                operation_kind, status)
+           values ($1, $2, $3, $4, $5, 'undo', 'pending')"#,
     )
+    .bind(undo_batch_id)
     .bind(action_id)
-    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+    .bind(current.chat_id)
+    .bind(current.target_user_id)
+    .bind(actor_user_id)
     .execute(&mut *tx)
     .await?;
     insert_event(
@@ -1138,16 +1343,48 @@ pub async fn claim_undo_action(
         Some("undo requested"),
     )
     .await?;
-    if let Some(previous) = previous {
+    tx.commit().await?;
+    Ok(UndoClaim::RestrictionClaimed)
+}
+
+pub async fn start_undo_operation(
+    pool: &PgPool,
+    undo_batch_id: i64,
+    action_id: i64,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let (chat_id, target_user_id): (i64, i64) = sqlx::query_as(
+        "select chat_id, target_user_id from manual_moderation_actions where id = $1",
+    )
+    .bind(action_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    lock_target(&mut tx, chat_id, target_user_id).await?;
+    let changed = sqlx::query(
+        r#"update manual_moderation_operations
+           set status = 'processing', lease_expires_at = now() + $3::interval,
+               updated_at = now()
+           where batch_id = $1 and action_id = $2
+             and operation_kind in ('undo', 'restore') and status = 'pending'"#,
+    )
+    .bind(undo_batch_id)
+    .bind(action_id)
+    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed == 1 {
         sqlx::query(
-            "update manual_moderation_actions set status = 'pending' where id = $1 and status = 'superseded'",
+            r#"update manual_moderation_batches
+               set processing_lease_expires_at = now() + interval '5 minutes', updated_at = now()
+               where id = $1"#,
         )
-        .bind(previous.id)
+        .bind(undo_batch_id)
         .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
-    Ok(UndoClaim::RestrictionClaimed)
+    Ok(changed == 1)
 }
 
 pub async fn undo_previous_action(
@@ -1160,7 +1397,8 @@ pub async fn undo_previous_action(
                   old.supersedes_action_id, old.automatic
            from manual_moderation_actions current
            join manual_moderation_actions old on old.id = current.supersedes_action_id
-           where current.id = $1 and old.status = 'pending'"#,
+           where current.id = $1 and old.status = 'superseded'
+             and (old.expires_at is null or old.expires_at > now())"#,
     )
     .bind(current_action_id)
     .fetch_optional(pool)
@@ -1179,20 +1417,51 @@ pub async fn finish_undo(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     let action = load_action(&mut tx, action_id).await?;
-    let status = match (succeeded, unknown, reapply) {
-        (true, _, true) => "applied",
-        (true, _, false) => "revoked",
-        (false, true, _) => "unknown",
-        (false, false, true) => "revoked",
-        (false, false, false) => "applied",
+    let operation_status = if succeeded {
+        "succeeded"
+    } else if unknown {
+        "unknown"
+    } else {
+        "failed"
     };
-    sqlx::query(
-        "update manual_moderation_actions set status = $2, processing_lease_expires_at = null where id = $1 and status = 'processing'",
+    let operation_kind = if reapply { "restore" } else { "undo" };
+    let operation_changed = sqlx::query(
+        r#"update manual_moderation_operations
+           set status = $3, lease_expires_at = null, updated_at = now()
+           where batch_id = $1 and action_id = $2
+             and operation_kind = $4 and status = 'processing'"#,
     )
+    .bind(undo_batch_id)
     .bind(action_id)
-    .bind(status)
+    .bind(operation_status)
+    .bind(operation_kind)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if operation_changed != 1 {
+        anyhow::bail!("undo operation left processing state before Telegram outcome");
+    }
+    if succeeded || unknown {
+        let (expected_action_status, action_status) = if unknown {
+            (if reapply { "revoked" } else { "applied" }, "unknown")
+        } else if reapply {
+            ("revoked", "applied")
+        } else {
+            ("applied", "revoked")
+        };
+        let action_changed = sqlx::query(
+            "update manual_moderation_actions set status = $3, processing_lease_expires_at = null where id = $1 and status = $2",
+        )
+        .bind(action_id)
+        .bind(expected_action_status)
+        .bind(action_status)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if action_changed != 1 {
+            anyhow::bail!("moderation action changed before undo confirmation");
+        }
+    }
     if succeeded && !reapply {
         let previous_id: Option<i64> = sqlx::query_scalar(
             "select supersedes_action_id from manual_moderation_actions where id = $1",
@@ -1204,23 +1473,12 @@ pub async fn finish_undo(
             sqlx::query(
                 r#"update manual_moderation_actions
                    set status = case when expires_at is not null and expires_at <= now() then 'expired' else 'applied' end
-                   where id = $1 and status = 'pending'"#,
+                   where id = $1 and status = 'superseded'"#,
             )
             .bind(previous_id)
             .execute(&mut *tx)
             .await?;
         }
-    } else if !succeeded
-        && !reapply
-        && let Some(previous_id) = action.supersedes_action_id
-    {
-        sqlx::query(
-            "update manual_moderation_actions set status = $2 where id = $1 and status = 'pending'",
-        )
-        .bind(previous_id)
-        .bind(if unknown { "unknown" } else { "superseded" })
-        .execute(&mut *tx)
-        .await?;
     }
     insert_event(
         &mut tx,
@@ -1255,50 +1513,25 @@ pub async fn claim_restriction_revoke(
     actor_user_id: i64,
     expected_action: &str,
 ) -> anyhow::Result<Option<ActionRecord>> {
-    let mut tx = pool.begin().await?;
-    lock_target(&mut tx, chat_id, target_user_id).await?;
-    let action = sqlx::query_as::<_, ActionRecord>(
-        r#"select id, batch_id, chat_id, target_user_id, actor_user_id, action, reason,
-                  status, created_at, expires_at, supersedes_action_id, automatic
-           from manual_moderation_actions
-           where chat_id = $1 and target_user_id = $2 and status = 'applied'
-             and action in ('mute', 'ban', 'auto_mute')
-             and (expires_at is null or expires_at > now())
-           order by created_at desc, id desc limit 1 for update"#,
+    let prepared = claim_restriction_revokes_batch(
+        pool,
+        batch_id,
+        chat_id,
+        &[target_user_id],
+        actor_user_id,
+        expected_action,
     )
-    .bind(chat_id)
-    .bind(target_user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(action) = action.filter(|action| {
-        expected_action == "any"
-            || (expected_action == "mute" && action.action != "ban")
-            || action.action == expected_action
-    }) else {
-        tx.commit().await?;
+    .await?
+    .into_iter()
+    .next()
+    .flatten();
+    let Some(prepared) = prepared.filter(|prepared| prepared.operation_status == "pending") else {
         return Ok(None);
     };
-    sqlx::query(
-        "update manual_moderation_actions set status = 'processing', processing_lease_expires_at = now() + $2::interval where id = $1",
-    )
-    .bind(action.id)
-    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
-    .execute(&mut *tx)
-    .await?;
-    insert_event(
-        &mut tx,
-        batch_id,
-        Some(action.id),
-        chat_id,
-        Some(target_user_id),
-        actor_user_id,
-        "requested",
-        action.reason.as_deref(),
-        Some("restriction revoke requested"),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Some(action))
+    if !start_restriction_revoke(pool, prepared.operation_id).await? {
+        return Ok(None);
+    }
+    Ok(Some(prepared.action))
 }
 
 pub async fn claim_restriction_revokes_batch(
@@ -1308,7 +1541,7 @@ pub async fn claim_restriction_revokes_batch(
     target_user_ids: &[i64],
     actor_user_id: i64,
     expected_action: &str,
-) -> anyhow::Result<Vec<Option<ActionRecord>>> {
+) -> anyhow::Result<Vec<Option<PreparedRestrictionRevoke>>> {
     let mut sorted_ids = target_user_ids.to_vec();
     sorted_ids.sort_unstable();
     sorted_ids.dedup();
@@ -1319,12 +1552,35 @@ pub async fn claim_restriction_revokes_batch(
     for target_user_id in &sorted_ids {
         lock_target(&mut tx, chat_id, *target_user_id).await?;
     }
-    let mut claimed = Vec::with_capacity(target_user_ids.len());
+    let mut prepared = Vec::with_capacity(target_user_ids.len());
     for target_user_id in target_user_ids {
         expire_target_actions(&mut tx, chat_id, *target_user_id).await?;
+
+        let existing_operation: Option<(i64, String, i64)> = sqlx::query_as(
+            r#"select id, status, action_id from manual_moderation_operations
+               where batch_id = $1 and target_user_id = $2 and operation_kind = 'revoke'
+               order by id desc limit 1"#,
+        )
+        .bind(batch_id)
+        .bind(target_user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((operation_id, operation_status, action_id)) = existing_operation {
+            prepared.push(Some(PreparedRestrictionRevoke {
+                operation_id,
+                operation_status,
+                action: load_action(&mut tx, action_id).await?,
+            }));
+            continue;
+        }
+
         let inflight: bool = sqlx::query_scalar(
             r#"select exists (
                  select 1 from manual_moderation_actions
+                 where chat_id = $1 and target_user_id = $2
+                   and status in ('pending', 'processing')
+                 union all
+                 select 1 from manual_moderation_operations
                  where chat_id = $1 and target_user_id = $2
                    and status in ('pending', 'processing')
                )"#,
@@ -1344,6 +1600,12 @@ pub async fn claim_restriction_revokes_batch(
                  where chat_id = $1 and target_user_id = $2 and status = 'unknown'
                    and action in ('mute', 'ban', 'auto_mute')
                    and (expires_at is null or expires_at > now())
+                 union all
+                 select 1 from manual_moderation_operations o
+                 join manual_moderation_actions a on a.id = o.action_id
+                 where o.chat_id = $1 and o.target_user_id = $2 and o.status = 'unknown'
+                   and a.action in ('mute', 'ban', 'auto_mute')
+                   and (a.expires_at is null or a.expires_at > now())
                )"#,
         )
         .bind(chat_id)
@@ -1374,14 +1636,19 @@ pub async fn claim_restriction_revokes_batch(
                 || action.action == expected_action
         });
         if let Some(action) = action {
-            sqlx::query(
-                r#"update manual_moderation_actions
-                   set status = 'processing', processing_lease_expires_at = now() + $2::interval
-                   where id = $1 and status = 'applied'"#,
+            let operation_id: i64 = sqlx::query_scalar(
+                r#"insert into manual_moderation_operations
+                       (batch_id, action_id, chat_id, target_user_id, actor_user_id,
+                        operation_kind, status)
+                   values ($1, $2, $3, $4, $5, 'revoke', 'pending')
+                   returning id"#,
             )
+            .bind(batch_id)
             .bind(action.id)
-            .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
-            .execute(&mut *tx)
+            .bind(chat_id)
+            .bind(target_user_id)
+            .bind(actor_user_id)
+            .fetch_one(&mut *tx)
             .await?;
             insert_event(
                 &mut tx,
@@ -1395,13 +1662,51 @@ pub async fn claim_restriction_revokes_batch(
                 Some("restriction revoke requested"),
             )
             .await?;
-            claimed.push(Some(action));
+            prepared.push(Some(PreparedRestrictionRevoke {
+                operation_id,
+                operation_status: "pending".to_string(),
+                action,
+            }));
         } else {
-            claimed.push(None);
+            prepared.push(None);
         }
     }
     tx.commit().await?;
-    Ok(claimed)
+    Ok(prepared)
+}
+
+pub async fn start_restriction_revoke(pool: &PgPool, operation_id: i64) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let (batch_id, chat_id, target_user_id): (i64, i64, i64) = sqlx::query_as(
+        "select batch_id, chat_id, target_user_id from manual_moderation_operations where id = $1",
+    )
+    .bind(operation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    lock_target(&mut tx, chat_id, target_user_id).await?;
+    let changed = sqlx::query(
+        r#"update manual_moderation_operations
+           set status = 'processing', lease_expires_at = now() + $2::interval,
+               updated_at = now()
+           where id = $1 and operation_kind = 'revoke' and status = 'pending'"#,
+    )
+    .bind(operation_id)
+    .bind(format!("{} seconds", ACTION_LEASE.num_seconds()))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed == 1 {
+        sqlx::query(
+            r#"update manual_moderation_batches
+               set processing_lease_expires_at = now() + interval '5 minutes', updated_at = now()
+               where id = $1"#,
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(changed == 1)
 }
 
 pub async fn finish_restriction_revoke(
@@ -1416,19 +1721,44 @@ pub async fn finish_restriction_revoke(
     let mut tx = pool.begin().await?;
     let action = load_action(&mut tx, action_id).await?;
     let status = if succeeded {
-        "revoked"
+        "succeeded"
     } else if unknown {
         "unknown"
     } else {
-        "applied"
+        "failed"
     };
-    sqlx::query(
-        "update manual_moderation_actions set status = $2, processing_lease_expires_at = null where id = $1 and status = 'processing'",
+    let operation_changed = sqlx::query(
+        r#"update manual_moderation_operations
+           set status = $2, lease_expires_at = null, details = $3, updated_at = now()
+           where batch_id = $1 and action_id = $4
+             and operation_kind = 'revoke' and status = 'processing'"#,
     )
-    .bind(action_id)
+    .bind(batch_id)
     .bind(status)
+    .bind(revoke_reason)
+    .bind(action_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if operation_changed != 1 {
+        anyhow::bail!("revoke operation left processing state before Telegram outcome");
+    }
+    if succeeded || unknown {
+        let action_status = if succeeded { "revoked" } else { "unknown" };
+        let action_changed = sqlx::query(
+            r#"update manual_moderation_actions
+               set status = $2, processing_lease_expires_at = null
+               where id = $1 and status = 'applied'"#,
+        )
+        .bind(action_id)
+        .bind(action_status)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if action_changed != 1 {
+            anyhow::bail!("restriction action changed before revoke confirmation");
+        }
+    }
     insert_event(
         &mut tx,
         batch_id,
