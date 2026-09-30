@@ -149,6 +149,18 @@ pub async fn handle(
             .await?;
             return Ok(());
         }
+        if let Err(error) =
+            manual_moderation::recover_expired_batch_actions(&state.pool, batch.id).await
+        {
+            tracing::error!(%error, batch_id = batch.id, "failed to recover stale moderation operations");
+            send_reply(
+                bot,
+                msg,
+                "Не удалось восстановить состояние команды. Проверь Telegram и попробуй позже.",
+            )
+            .await?;
+            return Ok(());
+        }
         parsed = snapshot.parsed_command();
         let ids = snapshot
             .target_user_ids
@@ -156,13 +168,16 @@ pub async fn handle(
             .copied()
             .map(|user_id| Target { user_id })
             .collect::<Vec<_>>();
-        let targets = match maybe_check_targets(bot, &state.pool, msg.chat.id, kind, ids).await {
-            Ok(targets) => targets,
-            Err(error) => {
-                send_reply(bot, msg, &error.to_string()).await?;
-                return Ok(());
-            }
-        };
+        let targets =
+            match maybe_check_targets(bot, &state.pool, msg.chat.id, kind, ids, Some(batch.id))
+                .await
+            {
+                Ok(targets) => targets,
+                Err(error) => {
+                    send_reply(bot, msg, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
         (targets, batch)
     } else {
         let ids = match resolve_target_ids(&state.pool, msg, &parsed).await {
@@ -186,13 +201,14 @@ pub async fn handle(
             .await?;
             return Ok(());
         }
-        let targets = match maybe_check_targets(bot, &state.pool, msg.chat.id, kind, ids).await {
-            Ok(targets) => targets,
-            Err(error) => {
-                send_reply(bot, msg, &error.to_string()).await?;
-                return Ok(());
-            }
-        };
+        let targets =
+            match maybe_check_targets(bot, &state.pool, msg.chat.id, kind, ids, None).await {
+                Ok(targets) => targets,
+                Err(error) => {
+                    send_reply(bot, msg, &error.to_string()).await?;
+                    return Ok(());
+                }
+            };
         let request = BatchRequestSnapshot::from_parsed(
             &parsed,
             targets.iter().map(|target| target.user_id).collect(),
@@ -222,18 +238,6 @@ pub async fn handle(
         (targets, batch)
     };
 
-    if let Err(error) =
-        manual_moderation::recover_expired_batch_actions(&state.pool, batch.id).await
-    {
-        tracing::error!(%error, batch_id = batch.id, "failed to recover stale moderation action leases");
-        send_reply(
-            bot,
-            msg,
-            "Не удалось восстановить состояние команды. Проверь Telegram и попробуй позже.",
-        )
-        .await?;
-        return Ok(());
-    }
     match manual_moderation::claim_batch(&state.pool, batch.id).await {
         Ok(manual_moderation::BatchClaim::Claimed) => {}
         Ok(manual_moderation::BatchClaim::Busy) => {
@@ -438,6 +442,7 @@ async fn checked_targets(
     chat_id: ChatId,
     kind: CommandKind,
     target_ids: &[Target],
+    batch_id: Option<i64>,
 ) -> anyhow::Result<Vec<Target>> {
     let mut targets = Vec::with_capacity(target_ids.len());
     for candidate in target_ids {
@@ -457,11 +462,18 @@ async fn checked_targets(
             manual_moderation::active_restriction_action(pool, chat_id.0, candidate.user_id)
                 .await?;
         let observed_restriction = observed_restriction(&member.kind);
-        validate_observed_restriction(
-            observed_restriction,
-            local_restriction.as_deref(),
-            candidate.user_id,
-        )?;
+        let uncertain_for_this_batch = if let Some(batch_id) = batch_id {
+            manual_moderation::batch_has_uncertain_target(pool, batch_id, candidate.user_id).await?
+        } else {
+            false
+        };
+        if !uncertain_for_this_batch {
+            validate_observed_restriction(
+                observed_restriction,
+                local_restriction.as_deref(),
+                candidate.user_id,
+            )?;
+        }
         let is_member = member.kind.is_present();
         let is_banned = member.kind.is_banned();
         if matches!(kind, CommandKind::Mute | CommandKind::Warn) && (!is_member || is_banned) {
@@ -524,6 +536,7 @@ async fn maybe_check_targets(
     chat_id: ChatId,
     kind: CommandKind,
     targets: Vec<Target>,
+    batch_id: Option<i64>,
 ) -> anyhow::Result<Vec<Target>> {
     if matches!(
         kind,
@@ -533,7 +546,7 @@ async fn maybe_check_targets(
             | CommandKind::Unmute
             | CommandKind::Unban
     ) {
-        checked_targets(bot, pool, chat_id, kind, &targets).await
+        checked_targets(bot, pool, chat_id, kind, &targets, batch_id).await
     } else {
         Ok(targets)
     }
@@ -745,6 +758,19 @@ async fn revoke_restrictions(
         chat_id,
         actor_id,
     } = context;
+    let default_permissions = if expected_action == "mute" {
+        match default_chat_permissions(bot, chat_id).await {
+            Ok(permissions) => Some(permissions),
+            Err(_) => {
+                return Ok(
+                    "Снятие не выполнено: не удалось получить права чата; действий не изменено."
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let claimed = manual_moderation::claim_restriction_revokes_batch(
         pool,
         batch_id,
@@ -758,15 +784,56 @@ async fn revoke_restrictions(
     )
     .await?;
     let mut outcomes = Vec::new();
-    for (target, action) in targets.iter().zip(claimed) {
-        let Some(action) = action else {
+    for (target, prepared) in targets.iter().zip(claimed) {
+        let Some(prepared) = prepared else {
             outcomes.push(format!(
                 "{} — активная мера бота не найдена",
                 target.user_id
             ));
             continue;
         };
-        match clear_restriction(bot, chat_id, target.user_id, &action.action).await {
+        let action = prepared.action;
+        match prepared.operation_status.as_str() {
+            "succeeded" => {
+                outcomes.push(format!("{} — ограничение уже снято", target.user_id));
+                continue;
+            }
+            "failed" => {
+                outcomes.push(format!("{} — Telegram отклонил снятие", target.user_id));
+                continue;
+            }
+            "unknown" | "processing" => {
+                outcomes.push(format!(
+                    "{} — исход Telegram неизвестен; повтор запрещён",
+                    target.user_id
+                ));
+                continue;
+            }
+            "pending" => {}
+            status => {
+                outcomes.push(format!(
+                    "{} — неподдерживаемое состояние операции {status}",
+                    target.user_id
+                ));
+                continue;
+            }
+        }
+        if !manual_moderation::start_restriction_revoke(pool, prepared.operation_id).await? {
+            outcomes.push(format!(
+                "{} — снятие уже запущено другим обработчиком",
+                target.user_id
+            ));
+            continue;
+        }
+        match clear_restriction(
+            bot,
+            chat_id,
+            target.user_id,
+            &action.action,
+            default_permissions.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 manual_moderation::finish_restriction_revoke(
                     pool, batch_id, action.id, actor_id, true, false, reason,
@@ -887,6 +954,23 @@ async fn undo_latest_batch(
         return Ok("Нет ранее применённых команд модерации для отмены.".to_string());
     };
     let actions = manual_moderation::actions_in_batch(pool, batch_id).await?;
+    let needs_default_permissions = actions.iter().any(|action| {
+        matches!(action.action.as_str(), "mute" | "auto_mute")
+            && matches!(action.status.as_str(), "applied" | "revoked")
+    });
+    let default_permissions = if needs_default_permissions {
+        match default_chat_permissions(bot, chat_id).await {
+            Ok(permissions) => Some(permissions),
+            Err(_) => {
+                return Ok(
+                    "Отмена не выполнена: не удалось получить права чата; действий не изменено."
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut outcomes = Vec::new();
     let mut checked_targets = HashSet::new();
     for action in &actions {
@@ -951,13 +1035,31 @@ async fn undo_latest_batch(
             UndoClaim::Expired => outcomes.push(format!("{} — пропуск: мера уже истекла", action.target_user_id)),
             claim @ (UndoClaim::RestrictionClaimed | UndoClaim::RestrictionReapplyClaimed) => {
                 let reapply = claim == UndoClaim::RestrictionReapplyClaimed;
-                let previous = manual_moderation::undo_previous_action(pool, action.id).await?;
+                let previous = if reapply {
+                    None
+                } else {
+                    manual_moderation::undo_previous_action(pool, action.id).await?
+                };
+                if !manual_moderation::start_undo_operation(pool, undo_batch_id, action.id).await? {
+                    outcomes.push(format!(
+                        "{} — отмена уже запущена другим обработчиком",
+                        action.target_user_id
+                    ));
+                    continue;
+                }
                 let result = if reapply {
                     reapply_action(bot, chat_id, &action)
                         .await
                         .map_err(|error| telegram_outcome_unknown(&error))
                 } else {
-                    restore_action(bot, chat_id, &action, previous.as_ref()).await
+                    restore_action(
+                        bot,
+                        chat_id,
+                        &action,
+                        previous.as_ref(),
+                        default_permissions.clone(),
+                    )
+                    .await
                 };
                 let success = result.is_ok();
                 let unknown = result.as_ref().is_err_and(|unknown| *unknown);
@@ -1035,6 +1137,7 @@ async fn clear_restriction(
     chat_id: ChatId,
     user_id: i64,
     action: &str,
+    default_permissions: Option<ChatPermissions>,
 ) -> Result<(), teloxide::RequestError> {
     if action == "ban" {
         bot.unban_chat_member(chat_id, UserId(user_id as u64))
@@ -1042,7 +1145,11 @@ async fn clear_restriction(
             .await
             .map(|_| ())
     } else {
-        let permissions = default_chat_permissions(bot, chat_id).await?;
+        let permissions = default_permissions.ok_or_else(|| {
+            teloxide::RequestError::Io(
+                std::io::Error::other("chat permissions were not preflighted").into(),
+            )
+        })?;
         bot.restrict_chat_member(chat_id, UserId(user_id as u64), permissions)
             .use_independent_chat_permissions(true)
             .await
@@ -1067,11 +1174,18 @@ async fn restore_action(
     chat_id: ChatId,
     current: &ActionRecord,
     previous: Option<&ActionRecord>,
+    default_permissions: Option<ChatPermissions>,
 ) -> Result<(), bool> {
     let Some(previous) = previous else {
-        return clear_restriction(bot, chat_id, current.target_user_id, &current.action)
-            .await
-            .map_err(|error| telegram_outcome_unknown(&error));
+        return clear_restriction(
+            bot,
+            chat_id,
+            current.target_user_id,
+            &current.action,
+            default_permissions,
+        )
+        .await
+        .map_err(|error| telegram_outcome_unknown(&error));
     };
     if current.action == "ban" && previous.action != "ban" {
         bot.unban_chat_member(chat_id, UserId(current.target_user_id as u64))
