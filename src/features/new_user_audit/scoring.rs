@@ -5,8 +5,8 @@ use sqlx::{PgPool, Row};
 
 use super::types::{
     AvatarClass, EvidenceSource, EvidenceStrength, FirstMessageAssessment, FirstMessageRiskMarker,
-    MessageRelation, NewUserAuditAssessment, ProfileNameGrammarRelation, ProfileRiskPattern,
-    SelfReferenceGrammar,
+    ImagePromotionIntent, MessageImageAssessment, MessageRelation, NewUserAuditAssessment,
+    ProfileNameGrammarRelation, ProfileRiskPattern, SelfReferenceGrammar,
 };
 
 #[allow(dead_code)]
@@ -105,18 +105,98 @@ pub fn score_assessment(
             )
         })
         .unwrap_or_else(|| (0, Value::Array(Vec::new())));
+    let score_before_message_image = baseline_score
+        .clamp(0, 100)
+        .saturating_add(avatar_score)
+        .saturating_add(first_message_score)
+        .saturating_add(personal_channel_score);
+    let (message_image_score, message_image_signals) = assessment
+        .message_image_assessment
+        .as_ref()
+        .map(|assessment| {
+            score_message_image(assessment, score_before_message_image, review_threshold)
+        })
+        .unwrap_or_else(|| (0, Value::Array(Vec::new())));
+    let first_message_score = first_message_score
+        .saturating_add(message_image_score)
+        .min(100);
+    let mut first_message_signals = first_message_signals
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(image_signals) = message_image_signals.as_array() {
+        first_message_signals.extend(image_signals.iter().cloned());
+    }
 
     ScoreComponents {
         baseline_score: baseline_score.clamp(0, 100),
         baseline_signals,
         first_message_score,
-        first_message_signals,
+        first_message_signals: Value::Array(first_message_signals),
         avatar_score,
         avatar_signals,
         personal_channel_score,
         personal_channel_signals,
         review_threshold,
     }
+}
+
+fn score_message_image(
+    assessment: &MessageImageAssessment,
+    score_before_image: i32,
+    review_threshold: i32,
+) -> (i32, Value) {
+    let tornado_visible = assessment
+        .visible_product_brands
+        .iter()
+        .any(|brand| is_tornado_brand(brand));
+    let confidence_threshold = match assessment.promotional_intent {
+        ImagePromotionIntent::ClearPromotion => 0.80,
+        ImagePromotionIntent::LikelyPromotion => 0.90,
+        ImagePromotionIntent::NoneOrIncidental | ImagePromotionIntent::Unclear => 1.0,
+    };
+    let decisive_tornado_campaign = tornado_visible
+        && assessment.unusual_or_suggestive_staging
+        && matches!(
+            assessment.promotional_intent,
+            ImagePromotionIntent::ClearPromotion | ImagePromotionIntent::LikelyPromotion
+        )
+        && assessment.confidence >= confidence_threshold
+        && !assessment.visual_evidence.is_empty();
+    if !decisive_tornado_campaign {
+        return (0, Value::Array(Vec::new()));
+    }
+
+    let available_score = 100_i32.saturating_sub(score_before_image);
+    let review_floor = review_threshold
+        .clamp(0, 100)
+        .saturating_sub(score_before_image);
+    let score = review_floor.max(30).min(available_score).max(0);
+    let signal = json!({
+        "class": "first_message_image",
+        "label": "tornado_energy_drink_visual_campaign",
+        "coefficient": score,
+        "warning_strength": "strong",
+        "decision": "manual_review",
+        "decision_tree_version": "new-user-image-tree-v1",
+        "decision_tree_path": [
+            "readable_tornado_energy_drink_brand",
+            "unusual_or_suggestive_staging",
+            "promotion_intent_and_visual_evidence"
+        ],
+        "assessment": assessment,
+    });
+    (score, json!([signal]))
+}
+
+fn is_tornado_brand(value: &str) -> bool {
+    let normalized = value
+        .to_lowercase()
+        .replace('ё', "е")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    normalized.contains("tornado") || normalized.contains("торнадо")
 }
 
 fn score_personal_channel_content(
@@ -490,6 +570,7 @@ mod tests {
             r#"{{
                 "avatar_observation": {avatar},
                 "first_message_assessment": {first_message},
+                "message_image_assessment": null,
                 "profile_assessment": {{
                     "risk_patterns": ["no_material_risk_pattern"],
                     "evidence": [], "contradictions": ["Нет дополнительных признаков."],
@@ -892,6 +973,90 @@ mod tests {
         assert_eq!(components.avatar_score, 3);
         assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
         assert_eq!(components.final_level(), "high");
+    }
+
+    #[test]
+    fn staged_tornado_energy_drink_photo_reaches_manual_review_threshold() {
+        let mut assessment = assessment("null", "null");
+        assessment.message_image_assessment = Some(MessageImageAssessment {
+            visible_product_brands: vec!["Tornado Energy".to_string()],
+            unusual_or_suggestive_staging: true,
+            promotional_intent: ImagePromotionIntent::ClearPromotion,
+            visual_evidence: vec![
+                "На банке читается Tornado; она крупно показана в постановочной позе.".to_string(),
+            ],
+            confidence: 0.93,
+        });
+
+        let components = score_assessment(
+            12,
+            json!([]),
+            &assessment,
+            Default::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+
+        assert_eq!(components.final_score(), REVIEW_RISK_THRESHOLD);
+        assert_eq!(
+            components.first_message_signals[0]["label"],
+            "tornado_energy_drink_visual_campaign"
+        );
+        assert_eq!(
+            components.first_message_signals[0]["decision"],
+            "manual_review"
+        );
+    }
+
+    #[test]
+    fn tornado_brand_alone_or_a_different_product_does_not_add_visual_spam_score() {
+        let mut ordinary_tornado = assessment("null", "null");
+        ordinary_tornado.message_image_assessment = Some(MessageImageAssessment {
+            visible_product_brands: vec!["Торнадо".to_string()],
+            unusual_or_suggestive_staging: false,
+            promotional_intent: ImagePromotionIntent::NoneOrIncidental,
+            visual_evidence: vec!["Банка стоит на обычном столе.".to_string()],
+            confidence: 0.95,
+        });
+        let ordinary = score_assessment(
+            12,
+            json!([]),
+            &ordinary_tornado,
+            Default::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(ordinary.first_message_score, 0);
+        assert!(
+            ordinary
+                .first_message_signals
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut other_product = ordinary_tornado;
+        other_product
+            .message_image_assessment
+            .as_mut()
+            .unwrap()
+            .visible_product_brands = vec!["Другой напиток".to_string()];
+        other_product
+            .message_image_assessment
+            .as_mut()
+            .unwrap()
+            .unusual_or_suggestive_staging = true;
+        other_product
+            .message_image_assessment
+            .as_mut()
+            .unwrap()
+            .promotional_intent = ImagePromotionIntent::ClearPromotion;
+        let other = score_assessment(
+            12,
+            json!([]),
+            &other_product,
+            Default::default(),
+            REVIEW_RISK_THRESHOLD,
+        );
+        assert_eq!(other.first_message_score, 0);
     }
 
     #[test]

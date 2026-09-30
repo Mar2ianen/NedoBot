@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
                 system_prompt: Some("Ответь ровно одним словом: ok"),
                 prompt: "Smoke-проверка profile router. Ответь ровно: ok",
                 image_base64: None,
+                additional_images_base64: &[],
                 temperature: 0.0,
                 num_predict: 32,
                 output_validator: Some(&validator),

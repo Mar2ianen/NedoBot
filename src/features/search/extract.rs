@@ -70,6 +70,7 @@ pub async fn extract_research_plan(
             system_prompt: Some(SEARCH_EXTRACT_PROMPT),
             prompt: &prompt,
             image_base64: None,
+            additional_images_base64: &[],
             temperature: config.search_extract_temperature,
             num_predict: config.search_extract_max_tokens,
             output_validator: Some(&validator),

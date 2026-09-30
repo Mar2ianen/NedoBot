@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/new_user_audit.md");
 
-pub const PROMPT_VERSION: &str = "new-user-audit-v5";
+pub const PROMPT_VERSION: &str = "new-user-audit-v6";
 
 static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
@@ -53,12 +53,29 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     }
                 ]
             },
+            "message_image_assessment": {
+                "anyOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "visible_product_brands": { "type": "array", "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 120 } },
+                            "unusual_or_suggestive_staging": { "type": "boolean" },
+                            "promotional_intent": { "type": "string", "enum": ["clear_promotion", "likely_promotion", "none_or_incidental", "unclear"] },
+                            "visual_evidence": { "type": "array", "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 600 } },
+                            "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                        },
+                        "required": ["visible_product_brands", "unusual_or_suggestive_staging", "promotional_intent", "visual_evidence", "confidence"]
+                    }
+                ]
+            },
             "profile_assessment": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "risk_patterns": { "type": "array", "maxItems": 8, "items": { "type": "string", "enum": ["bio_or_username_promotion", "personal_channel_promotion", "commercial_or_scam_presentation", "cross_source_inconsistency", "repeated_spam_pattern", "no_material_risk_pattern"] } },
-                    "evidence": { "type": "array", "maxItems": 10, "items": { "type": "object", "additionalProperties": false, "properties": { "source": { "type": "string", "enum": ["avatar", "profile", "first_message", "personal_channel", "chat_history"] }, "detail": { "type": "string", "minLength": 1, "maxLength": 600 }, "strength": { "type": "string", "enum": ["weak", "moderate", "strong"] } }, "required": ["source", "detail", "strength"] } },
+                    "evidence": { "type": "array", "maxItems": 10, "items": { "type": "object", "additionalProperties": false, "properties": { "source": { "type": "string", "enum": ["avatar", "profile", "first_message", "message_image", "personal_channel", "chat_history"] }, "detail": { "type": "string", "minLength": 1, "maxLength": 600 }, "strength": { "type": "string", "enum": ["weak", "moderate", "strong"] } }, "required": ["source", "detail", "strength"] } },
                     "contradictions": { "type": "array", "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 600 } },
                     "review_priority": { "type": "string", "enum": ["low", "medium", "high"] },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
@@ -67,7 +84,7 @@ static OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "required": ["risk_patterns", "evidence", "contradictions", "review_priority", "confidence", "summary"]
             }
         },
-        "required": ["avatar_observation", "first_message_assessment", "profile_assessment"]
+        "required": ["avatar_observation", "first_message_assessment", "message_image_assessment", "profile_assessment"]
     })
 });
 
@@ -103,11 +120,16 @@ mod tests {
             json!([
                 "avatar_observation",
                 "first_message_assessment",
+                "message_image_assessment",
                 "profile_assessment"
             ])
         );
         assert_eq!(
             schema["properties"]["avatar_observation"]["anyOf"][1]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["message_image_assessment"]["anyOf"][1]["additionalProperties"],
             false
         );
         assert_eq!(
@@ -158,7 +180,11 @@ mod tests {
         assert!(prompt.contains("конкретную рекомендацию «глянь там»"));
         assert!(prompt.contains("без прямой ссылки"));
         assert!(prompt.contains("сам по себе не является признаком риска"));
+        assert!(prompt.contains("Tornado"));
+        assert!(prompt.contains(
+            "Обычная фотография банки энергетика сама по себе не является признаком спама"
+        ));
         assert!(prompt.contains("короткой точной цитатой"));
-        assert_eq!(PROMPT_VERSION, "new-user-audit-v5");
+        assert_eq!(PROMPT_VERSION, "new-user-audit-v6");
     }
 }

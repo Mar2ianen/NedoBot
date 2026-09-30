@@ -337,6 +337,7 @@ async fn build_history_entry(
             system_prompt: Some(MEMORY_SYSTEM_PROMPT),
             prompt: &prompt,
             image_base64: None,
+            additional_images_base64: &[],
             temperature: config.memory_llm_temperature,
             num_predict: config.memory_llm_max_tokens,
             output_validator: Some(&validator),
