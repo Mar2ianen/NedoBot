@@ -456,11 +456,7 @@ async fn checked_targets(
         let local_restriction =
             manual_moderation::active_restriction_action(pool, chat_id.0, candidate.user_id)
                 .await?;
-        let observed_restriction = match &member.kind {
-            ChatMemberKind::Restricted(_) => ObservedRestriction::Restricted,
-            ChatMemberKind::Banned(_) => ObservedRestriction::Banned,
-            _ => ObservedRestriction::None,
-        };
+        let observed_restriction = observed_restriction(&member.kind);
         validate_observed_restriction(
             observed_restriction,
             local_restriction.as_deref(),
@@ -512,6 +508,14 @@ fn validate_observed_restriction(
         _ => {}
     }
     Ok(())
+}
+
+fn observed_restriction(kind: &ChatMemberKind) -> ObservedRestriction {
+    match kind {
+        ChatMemberKind::Restricted(_) => ObservedRestriction::Restricted,
+        ChatMemberKind::Banned(_) => ObservedRestriction::Banned,
+        _ => ObservedRestriction::None,
+    }
 }
 
 async fn maybe_check_targets(
@@ -906,6 +910,29 @@ async fn undo_latest_batch(
                 "Отмена не выполнена: пользователь {} теперь бот или администратор; ни одно действие не изменено.",
                 action.target_user_id
             ));
+        }
+        // Сверяем все видимые ограничения до первого изменения Telegram.
+        let has_restriction_action = actions.iter().any(|candidate| {
+            candidate.target_user_id == action.target_user_id
+                && matches!(candidate.action.as_str(), "mute" | "ban" | "auto_mute")
+                && matches!(candidate.status.as_str(), "applied" | "revoked")
+        });
+        if has_restriction_action {
+            let local_restriction = manual_moderation::active_restriction_action(
+                pool,
+                chat_id.0,
+                action.target_user_id,
+            )
+            .await?;
+            if let Err(error) = validate_observed_restriction(
+                observed_restriction(&member.kind),
+                local_restriction.as_deref(),
+                action.target_user_id,
+            ) {
+                return Ok(format!(
+                    "Отмена не выполнена: {error}; ни одно действие не изменено."
+                ));
+            }
         }
     }
     for action in actions {
