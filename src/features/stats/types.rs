@@ -139,6 +139,7 @@ pub struct UserStatsReportData {
     pub(crate) profile_photo_file_id: Option<String>,
     pub(crate) profile_photo_file_unique_id: Option<String>,
     pub observed_at: Option<String>,
+    pub moderation: UserModerationSummary,
     pub written_tag: Option<String>,
     pub first_seen_at: String,
     pub last_seen_at: String,
@@ -150,6 +151,14 @@ pub struct UserStatsReportData {
     pub reactions_given: i64,
     pub reactions_received: i64,
     pub top_words: Vec<(String, i64)>,
+}
+
+#[derive(Clone, Default)]
+pub struct UserModerationSummary {
+    pub active_restriction: Option<String>,
+    pub restriction_expires_at: Option<DateTime<Utc>>,
+    pub active_warnings: i64,
+    pub unknown_restriction: bool,
 }
 
 #[derive(Clone)]

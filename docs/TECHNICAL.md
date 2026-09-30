@@ -461,6 +461,15 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /topreact [-r|-p]
 /userstats <id|username> [-r|-p]
 /userstatus <id|username> [-r|-p]
+/mute [duration] [reply|id|@username ...] [-- optional reason]
+/ban [duration] [reply|id|@username ...] [-- optional reason]
+/warn [duration] [reply|id|@username ...] [-- optional reason]
+/unmute [reply|id|@username ...]
+/unban [reply|id|@username ...]
+/unwarn [reply|id|@username ...] [#warning-id|all]
+/warns [reply|id|@username]
+/modlog [reply|id|@username] [limit]
+/undo
 ```
 
 В группах лучше писать с username:
@@ -472,6 +481,8 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 `/stats_day`, `/stats_week` и `/stats_month` показывают имена пользователей как скрытые ссылки на Telegram-профиль, без видимого ID. Рядом выводятся короткие бейджи: `админ`, `в чате`, `не в чате`, `бот` или `статус неизвестен`.
 
 `/userstats` принимает числовой Telegram ID, уже виденный ботом username или reply на сообщение пользователя. Без аргумента команда показывает отправителя. `UserStatsArgs` один раз нормализует command arguments: render-флаги `-r`/`--rich` и `-p`/`--plain` можно поставить до или после target, они не считаются частью username, а команда только с флагом сохраняет reply/sender fallback. Нормализованный target используется и для refresh профиля, и для построения отчёта. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
+
+Ручные команды модерации доступны только в отдельной Cargo feature `manual-moderation`, выключенной по умолчанию. Дополнительно нужны `[manual_moderation].enabled = true` и `chats.<name>.manual_moderation = true`; для Недобота все эти настройки остаются `false`. Причина необязательна и передаётся через `-- причина`. `/mute` по умолчанию действует сутки, `/ban` — бессрочно, предупреждение активно 30 дней; три активных предупреждения создают mute на пять дней. Команды требуют администратора чата; операции ограничения также проверяют право бота ограничивать участников. Цели — reply, Telegram ID или известный чату username. `/userstats` показывает активную санкцию и число активных предупреждений, а `/warns` и `/modlog` доступны только администраторам.
 
 
 ## Prompt
