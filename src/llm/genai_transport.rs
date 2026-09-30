@@ -41,7 +41,7 @@ pub struct GenAiRequest<'a> {
     pub model: ModelTarget<'a>,
     pub system_prompt: Option<&'a str>,
     pub prompt: &'a str,
-    pub image: Option<ImageInput<'a>>,
+    pub images: Vec<ImageInput<'a>>,
     pub temperature: f32,
     pub max_tokens: u32,
     pub timeout: Duration,
@@ -114,7 +114,7 @@ impl GenAiTransport {
         let chat_request = build_chat_request(
             system_prompt.as_deref(),
             request.prompt,
-            request.image,
+            &request.images,
             None,
         );
         let options = build_chat_options(
@@ -220,19 +220,22 @@ impl GenAiTransport {
 fn build_chat_request(
     system_prompt: Option<&str>,
     prompt: &str,
-    image: Option<ImageInput<'_>>,
+    images: &[ImageInput<'_>],
     tools: Option<Vec<Tool>>,
 ) -> ChatRequest {
-    let user_content = match image {
-        Some(image) => MessageContent::from_parts(vec![
-            ContentPart::from_text(prompt),
-            ContentPart::from_binary_base64(
+    let user_content = if images.is_empty() {
+        MessageContent::from(prompt)
+    } else {
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        parts.push(ContentPart::from_text(prompt));
+        for image in images {
+            parts.push(ContentPart::from_binary_base64(
                 image.mime_type,
                 Arc::<str>::from(image.base64),
                 image.file_name.map(str::to_owned),
-            ),
-        ]),
-        None => MessageContent::from(prompt),
+            ));
+        }
+        MessageContent::from_parts(parts)
     };
     ChatRequest {
         system: system_prompt.map(str::to_owned),
@@ -376,24 +379,26 @@ mod tests {
 
     #[test]
     fn image_request_preserves_mime_and_filename() {
-        let request = build_chat_request(
-            Some("system"),
-            "prompt",
-            Some(ImageInput {
+        let images = [
+            ImageInput {
                 mime_type: "image/png",
-                base64: "encoded",
+                base64: "avatar-encoded",
                 file_name: Some("avatar.png"),
-            }),
-            None,
-        );
+            },
+            ImageInput {
+                mime_type: "image/jpeg",
+                base64: "message-encoded",
+                file_name: Some("message.jpg"),
+            },
+        ];
+        let request = build_chat_request(Some("system"), "prompt", &images, None);
         assert_eq!(request.system.as_deref(), Some("system"));
-        let binary = request.messages[0]
-            .content
-            .clone()
-            .into_binaries()
-            .remove(0);
-        assert_eq!(binary.content_type, "image/png");
-        assert_eq!(binary.name.as_deref(), Some("avatar.png"));
+        let binaries = request.messages[0].content.clone().into_binaries();
+        assert_eq!(binaries.len(), 2);
+        assert_eq!(binaries[0].content_type, "image/png");
+        assert_eq!(binaries[0].name.as_deref(), Some("avatar.png"));
+        assert_eq!(binaries[1].content_type, "image/jpeg");
+        assert_eq!(binaries[1].name.as_deref(), Some("message.jpg"));
     }
 
     #[test]
@@ -563,11 +568,18 @@ mod tests {
                 },
                 system_prompt: Some("system"),
                 prompt: "prompt",
-                image: Some(ImageInput {
-                    mime_type: "image/png",
-                    base64: "encoded-image",
-                    file_name: Some("image.png"),
-                }),
+                images: vec![
+                    ImageInput {
+                        mime_type: "image/png",
+                        base64: "encoded-image",
+                        file_name: Some("image.png"),
+                    },
+                    ImageInput {
+                        mime_type: "image/jpeg",
+                        base64: "encoded-message-image",
+                        file_name: Some("message.jpg"),
+                    },
+                ],
                 temperature: 0.2,
                 max_tokens: 128,
                 timeout: Duration::from_secs(5),
@@ -596,6 +608,10 @@ mod tests {
         assert_eq!(
             captured.1["messages"][1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,encoded-image"
+        );
+        assert_eq!(
+            captured.1["messages"][1]["content"][2]["image_url"]["url"],
+            "data:image/jpeg;base64,encoded-message-image"
         );
         assert_eq!(captured.1["max_tokens"], 128);
         let temperature = captured.1["temperature"].as_f64().unwrap();
@@ -647,7 +663,7 @@ mod tests {
                 },
                 system_prompt: Some("trusted audit instructions"),
                 prompt: "untrusted input",
-                image: None,
+                images: vec![],
                 temperature: 0.0,
                 max_tokens: 64,
                 timeout: Duration::from_secs(5),
@@ -722,7 +738,7 @@ mod tests {
                 },
                 system_prompt: None,
                 prompt: "prompt",
-                image: None,
+                images: vec![],
                 temperature: 0.2,
                 max_tokens: 128,
                 timeout: Duration::from_secs(5),

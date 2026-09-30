@@ -78,6 +78,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_spam_classifier_user_groups(&pool).await;
     assert_report_outbox_lifecycle(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
@@ -114,6 +115,215 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+    assert_message_image_materialization_migration_requeues_stale_results(&pool).await;
+}
+
+async fn assert_spam_classifier_user_groups(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const EMPTY_USER_ID: i64 = 9_001_001;
+    const PROMO_PROFILE_USER_ID: i64 = 9_001_002;
+    const CHANNEL_USER_ID: i64 = 9_001_003;
+    const REVIEWED_SPAM_USER_ID: i64 = 9_001_004;
+    const EVENT_NOT_SPAM_USER_ID: i64 = 9_001_005;
+    const WHITESPACE_USER_ID: i64 = 9_001_006;
+    const TEXT_USER_ID: i64 = 9_001_007;
+    const REVIEW_SIGNAL_USER_ID: i64 = 9_001_008;
+    const GENERIC_AUDIT_USER_ID: i64 = 9_001_009;
+    const MEDIA_ONLY_USER_ID: i64 = 9_001_010;
+    const CHANNEL_PROMO_USER_ID: i64 = 9_001_011;
+
+    let user_ids = [
+        EMPTY_USER_ID,
+        PROMO_PROFILE_USER_ID,
+        CHANNEL_USER_ID,
+        REVIEWED_SPAM_USER_ID,
+        EVENT_NOT_SPAM_USER_ID,
+        WHITESPACE_USER_ID,
+        TEXT_USER_ID,
+        REVIEW_SIGNAL_USER_ID,
+        GENERIC_AUDIT_USER_ID,
+        MEDIA_ONLY_USER_ID,
+        CHANNEL_PROMO_USER_ID,
+    ];
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(user_ids.as_slice())
+        .execute(pool)
+        .await
+        .expect("classifier fixture review rows must be reset");
+    query("delete from spam_label_events where chat_id = $1 and telegram_user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(user_ids.as_slice())
+        .execute(pool)
+        .await
+        .expect("classifier fixture label events must be reset");
+    query("delete from telegram_messages where chat_id = $1 and user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(user_ids.as_slice())
+        .execute(pool)
+        .await
+        .expect("classifier fixture messages must be reset");
+    query("delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(user_ids.as_slice())
+        .execute(pool)
+        .await
+        .expect("classifier fixture audits must be reset");
+    query("delete from telegram_user_profiles where telegram_user_id = any($1)")
+        .bind(user_ids.as_slice())
+        .execute(pool)
+        .await
+        .expect("classifier fixture profiles must be reset");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(user_ids.as_slice())
+        .execute(pool)
+        .await
+        .expect("classifier fixture memberships must be reset");
+
+    for user_id in user_ids {
+        query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+            .bind(CHAT_ID)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("classifier fixture membership must be inserted");
+    }
+    query("insert into telegram_user_profiles (telegram_user_id, username, bio) values ($1, 'vpn_promo', 'VPN доступ, пиши в личку')")
+        .bind(PROMO_PROFILE_USER_ID)
+        .execute(pool)
+        .await
+        .expect("promotional profile fixture must be inserted");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name, personal_channel_chat_id) values ($1, 'Channel user', -1001234567890)")
+        .bind(CHANNEL_USER_ID)
+        .execute(pool)
+        .await
+        .expect("linked channel profile fixture must be inserted");
+    query("insert into telegram_user_profiles (telegram_user_id, first_name, personal_channel_chat_id, personal_channel_last_text) values ($1, 'Promotional channel user', -1001234567891, 'VPN доступ, пиши в личку')")
+        .bind(CHANNEL_PROMO_USER_ID)
+        .execute(pool)
+        .await
+        .expect("promotional linked channel fixture must be inserted");
+    query("insert into spam_review_requests (chat_id, telegram_user_id, risk_score, status, reviewed_at) values ($1, $2, 90, 'confirmed_spam', now())")
+        .bind(CHAT_ID)
+        .bind(REVIEWED_SPAM_USER_ID)
+        .execute(pool)
+        .await
+        .expect("confirmed spam fixture must be inserted");
+    query("insert into spam_review_requests (chat_id, telegram_user_id, risk_score, risk_signals, status) values ($1, $2, 55, '[{\"label\": \"profile signal\"}]'::jsonb, 'pending')")
+        .bind(CHAT_ID)
+        .bind(REVIEW_SIGNAL_USER_ID)
+        .execute(pool)
+        .await
+        .expect("pending review evidence fixture must be inserted");
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_signal_breakdown) values ($1, $2, 20, '[{\"label\": \"single_message_account\"}]'::jsonb)")
+        .bind(CHAT_ID)
+        .bind(GENERIC_AUDIT_USER_ID)
+        .execute(pool)
+        .await
+        .expect("weak generic audit evidence fixture must be inserted");
+    query("insert into spam_label_events (chat_id, telegram_user_id, label, source, reason, created_at) values ($1, $2, 'spam', 'owner_manual', 'old fixture', now() - interval '1 day'), ($1, $2, 'not_spam', 'owner_review', 'latest fixture', now())")
+        .bind(CHAT_ID)
+        .bind(EVENT_NOT_SPAM_USER_ID)
+        .execute(pool)
+        .await
+        .expect("explicit label history fixture must be inserted");
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, 9901006, $2, E' \\n\\t '), ($1, 9901007, $3, 'A normal message')")
+        .bind(CHAT_ID)
+        .bind(WHITESPACE_USER_ID)
+        .bind(TEXT_USER_ID)
+        .execute(pool)
+        .await
+        .expect("classifier fixture messages must be inserted");
+    query("insert into telegram_messages (chat_id, message_id, user_id, has_photo) values ($1, 9901008, $2, true)")
+        .bind(CHAT_ID)
+        .bind(MEDIA_ONLY_USER_ID)
+        .execute(pool)
+        .await
+        .expect("media-only message fixture must be inserted");
+
+    let groups: Vec<(i64, String, bool, bool, bool)> = query_as(
+        "select telegram_user_id, classification_group, has_nonempty_message_text, has_linked_personal_channel, has_profile_promotion_evidence from spam_classifier_user_groups where chat_id = $1 and telegram_user_id = any($2) order by telegram_user_id",
+    )
+    .bind(CHAT_ID)
+    .bind(user_ids.as_slice())
+    .fetch_all(pool)
+    .await
+    .expect("classifier groups must be queryable");
+    assert_eq!(groups.len(), user_ids.len());
+    assert_eq!(
+        groups[0],
+        (EMPTY_USER_ID, "undetermined".into(), false, false, false)
+    );
+    assert_eq!(
+        groups[1],
+        (
+            PROMO_PROFILE_USER_ID,
+            "needs_review".into(),
+            false,
+            false,
+            true
+        )
+    );
+    assert_eq!(
+        groups[2],
+        (CHANNEL_USER_ID, "undetermined".into(), false, true, false)
+    );
+    assert_eq!(groups[3].0, REVIEWED_SPAM_USER_ID);
+    assert_eq!(groups[3].1, "spam");
+    assert_eq!(groups[4].0, EVENT_NOT_SPAM_USER_ID);
+    assert_eq!(groups[4].1, "not_spam");
+    assert_eq!(
+        groups[5],
+        (
+            WHITESPACE_USER_ID,
+            "undetermined".into(),
+            false,
+            false,
+            false
+        )
+    );
+    assert_eq!(
+        groups[6],
+        (TEXT_USER_ID, "needs_review".into(), true, false, false)
+    );
+    assert_eq!(groups[7].0, REVIEW_SIGNAL_USER_ID);
+    assert_eq!(groups[7].1, "undetermined");
+    assert_eq!(groups[8].0, GENERIC_AUDIT_USER_ID);
+    assert_eq!(groups[8].1, "undetermined");
+    assert_eq!(groups[9].0, MEDIA_ONLY_USER_ID);
+    assert_eq!(groups[9].1, "undetermined");
+    assert_eq!(groups[10].0, CHANNEL_PROMO_USER_ID);
+    assert_eq!(groups[10].1, "needs_review");
+
+    let training_ids: Vec<i64> = query_scalar(
+        "select telegram_user_id from spam_classifier_training_labels where chat_id = $1 and telegram_user_id = any($2) order by telegram_user_id",
+    )
+    .bind(CHAT_ID)
+    .bind(user_ids.as_slice())
+    .fetch_all(pool)
+    .await
+    .expect("only explicit decisions must enter the training view");
+    assert_eq!(
+        training_ids,
+        vec![REVIEWED_SPAM_USER_ID, EVENT_NOT_SPAM_USER_ID]
+    );
+
+    query("insert into spam_label_events (chat_id, telegram_user_id, label, source, reason) values ($1, $2, 'spam', 'owner_manual', 'profile promotion manually confirmed')")
+        .bind(CHAT_ID)
+        .bind(PROMO_PROFILE_USER_ID)
+        .execute(pool)
+        .await
+        .expect("manually confirmed profile spam must be recorded");
+    let confirmed_promo_group: String = query_scalar(
+        "select classification_group from spam_classifier_user_groups where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(PROMO_PROFILE_USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("confirmed profile spam group must be queryable");
+    assert_eq!(confirmed_promo_group, "spam");
 }
 
 async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {
@@ -179,6 +389,77 @@ async fn assert_channel_scoring_migration_requeues_exhausted_materializations(po
         .execute(pool)
         .await
         .expect("stale materialization fixture must be removed");
+}
+
+async fn assert_message_image_materialization_migration_requeues_stale_results(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_121;
+    let input = serde_json::json!({"schema_version": "message-image-requeue-fixture"});
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale message-image materialization fixture must be removed");
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "message-image-requeue-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("message-image materialization fixture must be enqueued");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"fixture\": \"legacy assessment\"}'::jsonb, materialization_version = 'unified-audit-materialization-v3', materialization_status = 'stale', materialization_attempts = 4, materialization_next_attempt_at = now() + interval '1 day', materialization_processing_started_at = null, materialization_lease_expires_at = null, materialization_error_kind = 'retry_exhausted', materialized_at = null where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("legacy materialization failure must be represented");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/20260929120000_new_user_audit_message_image_scoring.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("image scoring migration must requeue stale materializations");
+
+    let state: (String, String, String, i32, bool, bool, Option<String>, bool) = query_as(
+        "select status, materialization_status, materialization_version, materialization_attempts, materialization_next_attempt_at <= now(), materialization_processing_started_at is null and materialization_lease_expires_at is null, materialization_error_kind, materialized_at is null from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("image scorer requeue state must be queryable");
+    assert_eq!(
+        state,
+        (
+            "succeeded".into(),
+            "retry_wait".into(),
+            "unified-audit-materialization-v4".into(),
+            0,
+            true,
+            true,
+            None,
+            true
+        )
+    );
+
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("image scorer materialization fixture must be removed");
 }
 
 async fn assert_ask_time_render_audit(pool: &PgPool) {

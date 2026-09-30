@@ -91,6 +91,7 @@ struct NewUserFeatures {
     burst_messages_per_min: Option<f64>,
     first_message_text: Option<String>,
     first_message_reply_context: Option<String>,
+    first_message_photo_file_ids: Vec<String>,
     last_message_text: Option<String>,
     recent_message_texts: Vec<String>,
     text_texture: TextTexture,
@@ -408,7 +409,7 @@ fn project_unified_user_audit_material_revision(
     // Изменение текстовых сообщений должно создавать новую генерацию, а не
     // только перезаписывать input_json у уже завершённой оценки.
     json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
         "review_threshold": config.review_threshold,
@@ -425,6 +426,7 @@ fn project_unified_user_audit_material_revision(
         },
         "first_message": bounded_audit_text(features.first_message_text.as_deref()),
         "first_message_reply_context": bounded_audit_text(features.first_message_reply_context.as_deref()),
+        "first_message_photo_file_ids": features.first_message_photo_file_ids,
         "recent_messages": features.recent_message_texts.iter()
             .take(UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT)
             .map(|text| bounded_audit_text(Some(text)))
@@ -493,6 +495,11 @@ fn project_unified_user_audit_snapshot(
                 .collect::<Vec<_>>(),
             "repetitive_pattern": features.text_texture.repetitive_pattern,
             "max_pairwise_similarity": features.text_texture.max_pairwise_similarity,
+        },
+        "message_media": {
+            "photo_count": features.first_message_photo_file_ids.len(),
+            "photo_file_ids": features.first_message_photo_file_ids,
+            "photo_images_available": false,
         },
         "personal_channel": {
             "present": features.personal_channel_chat_id.is_some(),
@@ -595,6 +602,33 @@ async fn load_features(
             where nullif(btrim(text), '') is not null
             order by created_at asc
             limit 1
+        ), first_photo_messages as (
+            select
+                m.created_at,
+                m.message_id,
+                (
+                    select photo_size->>'file_id'
+                    from jsonb_array_elements(
+                        case
+                            when jsonb_typeof(m.raw_json->'photo') = 'array' then m.raw_json->'photo'
+                            else '[]'::jsonb
+                        end
+                    ) as photo(photo_size)
+                    order by
+                        coalesce((photo_size->>'file_size')::bigint, 0) desc,
+                        coalesce((photo_size->>'width')::bigint, 0)
+                          * coalesce((photo_size->>'height')::bigint, 0) desc
+                    limit 1
+                ) as file_id
+            from user_messages m
+            where jsonb_typeof(m.raw_json->'photo') = 'array'
+            order by m.created_at asc, m.message_id asc
+            limit 3
+        ), first_photo_stats as (
+            select
+                coalesce(array_agg(file_id order by created_at, message_id)
+                    filter (where file_id is not null), array[]::text[]) as photo_file_ids
+            from first_photo_messages
         ), last_msg as (
             select message_id, text
             from user_messages
@@ -683,6 +717,7 @@ async fn load_features(
             fm.message_id as first_message_id_from_messages,
             fm.text as first_message_text,
             reply_parent.text as first_message_reply_context,
+            coalesce(first_photo_stats.photo_file_ids, array[]::text[]) as first_message_photo_file_ids,
             lm.message_id as last_message_id_from_messages,
             lm.text as last_message_text,
             coalesce(ms.recent_message_texts, array[]::text[]) as recent_message_texts,
@@ -743,6 +778,7 @@ async fn load_features(
         left join telegram_chat_member_snapshots s on s.chat_id = cu.chat_id and s.telegram_user_id = cu.telegram_user_id
         left join msg_stats ms on true
         left join first_msg fm on true
+        left join first_photo_stats on true
         left join telegram_messages reply_parent
           on reply_parent.chat_id = cu.chat_id
          and reply_parent.message_id = fm.reply_to_message_id
@@ -839,6 +875,7 @@ async fn load_features(
             burst_messages_per_min: row.get("burst_messages_per_min"),
             first_message_text: row.get("first_message_text"),
             first_message_reply_context: row.get("first_message_reply_context"),
+            first_message_photo_file_ids: row.get("first_message_photo_file_ids"),
             last_message_text: row.get("last_message_text"),
             recent_message_texts,
             text_texture: TextTexture {
@@ -2857,6 +2894,7 @@ mod tests {
     fn latest_personal_channel_content_is_a_redacted_material_audit_input() {
         let features = NewUserFeatures {
             personal_channel_chat_id: Some(-100_000_000_001),
+            first_message_photo_file_ids: vec!["photo-a".to_string()],
             personal_channel_last_text: Some(
                 "Пишите в личку за VPN: https://example.org/promo".to_string(),
             ),
@@ -2876,6 +2914,8 @@ mod tests {
             revision["personal_channel"]["recent_content_preview"],
             snapshot["personal_channel"]["recent_content_preview"]
         );
+        assert_eq!(snapshot["message_media"]["photo_count"], 1);
+        assert_eq!(snapshot["message_media"]["photo_file_ids"][0], "photo-a");
 
         let changed_features = NewUserFeatures {
             personal_channel_last_text: Some("Обычный пост о книгах".to_string()),
@@ -2893,6 +2933,15 @@ mod tests {
         assert_ne!(
             revision,
             project_unified_user_audit_material_revision(&changed_message, &config)
+        );
+
+        let changed_photo = NewUserFeatures {
+            first_message_photo_file_ids: vec!["photo-b".to_string()],
+            ..features.clone()
+        };
+        assert_ne!(
+            revision,
+            project_unified_user_audit_material_revision(&changed_photo, &config)
         );
     }
 

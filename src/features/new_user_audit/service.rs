@@ -1,7 +1,15 @@
-use anyhow::Context;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use anyhow::Context as AnyhowContext;
+use base64::Engine as _;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
-use teloxide::prelude::Bot;
+use teloxide::net::Download;
+use teloxide::prelude::{Bot, Requester};
+use teloxide::types::FileId;
+use tokio::io::AsyncWrite;
 
 use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
@@ -21,6 +29,9 @@ use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::{LlmTransportError, StructuredOutput};
+
+const MAX_MESSAGE_IMAGE_INPUTS: usize = 3;
+const MAX_AUDIT_IMAGE_BYTES: usize = 6 * 1024 * 1024;
 
 /// Обрабатывает одну готовую unified-audit job.
 ///
@@ -170,21 +181,24 @@ async fn generate_and_finalize(
     job: &NewUserAuditJob,
 ) -> anyhow::Result<()> {
     let image_base64 = load_avatar_input(bot, config, job).await?;
+    let message_photo_file_ids = first_message_photo_file_ids(&job.input_json);
+    let message_images_base64 = load_message_image_inputs(bot, job, &message_photo_file_ids).await;
     let has_avatar_input = image_base64.is_some();
-    let mut input_json = job.input_json.clone();
-    if let Some(profile) = input_json.get_mut("profile").and_then(Value::as_object_mut) {
-        profile.insert(
-            "avatar_image_available".to_string(),
-            Value::Bool(has_avatar_input),
-        );
-    }
-    let prompt = build_input(&input_json)?;
-    let has_first_message_input = has_first_message_input(&input_json);
+    let has_message_image_input = !message_images_base64.is_empty();
+    let model_input_json = prompt_snapshot(
+        &job.input_json,
+        has_avatar_input,
+        has_message_image_input,
+        message_images_base64.len(),
+    );
+    let prompt = build_input(&model_input_json)?;
+    let has_first_message_input = has_first_message_input(&job.input_json);
     let output_validator = move |output: &str| {
         NewUserAuditAssessment::parse_for_modalities(
             output,
             has_avatar_input,
             has_first_message_input,
+            has_message_image_input,
         )
         .map(|_| ())
     };
@@ -195,6 +209,7 @@ async fn generate_and_finalize(
             system_prompt: Some(system_prompt()),
             prompt: &prompt,
             image_base64: image_base64.as_deref(),
+            additional_images_base64: &message_images_base64,
             temperature: 0.0,
             num_predict: config.new_user_audit_max_tokens,
             output_validator: Some(&output_validator),
@@ -210,6 +225,7 @@ async fn generate_and_finalize(
         &generation.content,
         has_avatar_input,
         has_first_message_input,
+        has_message_image_input,
     )?;
     let assessment_json = serde_json::from_str(&generation.content)?;
     let outcome = NewUserAuditOutcome {
@@ -256,6 +272,11 @@ fn parse_stored_assessment(
     if !has_avatar_metadata && assessment.avatar_observation.is_some() {
         anyhow::bail!("stored avatar observation has no corresponding avatar metadata");
     }
+    if first_message_photo_file_ids(&job.input_json).is_empty()
+        && assessment.message_image_assessment.is_some()
+    {
+        anyhow::bail!("stored message image assessment has no corresponding photo metadata");
+    }
 
     Ok(assessment)
 }
@@ -264,6 +285,128 @@ fn has_first_message_input(input_json: &Value) -> bool {
     input_json["text"]["first_message_preview"]
         .as_str()
         .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn prompt_snapshot(
+    input_json: &Value,
+    has_avatar_input: bool,
+    has_message_image_input: bool,
+    message_images_sent: usize,
+) -> Value {
+    let mut input_json = input_json.clone();
+    if let Some(profile) = input_json.get_mut("profile").and_then(Value::as_object_mut) {
+        profile.insert(
+            "avatar_image_available".to_string(),
+            Value::Bool(has_avatar_input),
+        );
+    }
+    if let Some(message_media) = input_json
+        .get_mut("message_media")
+        .and_then(Value::as_object_mut)
+    {
+        message_media.remove("photo_file_ids");
+        message_media.insert(
+            "photo_images_available".to_string(),
+            Value::Bool(has_message_image_input),
+        );
+        message_media.insert(
+            "photo_images_sent_to_model".to_string(),
+            Value::from(message_images_sent),
+        );
+    }
+    input_json
+}
+
+fn first_message_photo_file_ids(input_json: &Value) -> Vec<String> {
+    let Some(file_ids) = input_json["message_media"]["photo_file_ids"].as_array() else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    file_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|file_id| !file_id.is_empty())
+        .filter(|file_id| seen.insert((*file_id).to_owned()))
+        .take(MAX_MESSAGE_IMAGE_INPUTS)
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn load_message_image_inputs(
+    bot: &Bot,
+    job: &NewUserAuditJob,
+    file_ids: &[String],
+) -> Vec<String> {
+    let mut images = Vec::with_capacity(file_ids.len());
+    for (index, file_id) in file_ids.iter().enumerate() {
+        match download_message_image(bot, file_id).await {
+            Ok(image) => images.push(image),
+            Err(_) => tracing::info!(
+                job_id = job.id,
+                photo_index = index + 1,
+                "new user audit message photo is unavailable; continuing without it"
+            ),
+        }
+    }
+    images
+}
+
+async fn download_message_image(bot: &Bot, file_id: &str) -> anyhow::Result<String> {
+    let file = bot.get_file(FileId(file_id.to_owned())).await?;
+    if usize::try_from(file.size).unwrap_or(usize::MAX) > MAX_AUDIT_IMAGE_BYTES {
+        anyhow::bail!("message photo exceeds the audit image size limit");
+    }
+    let mut bytes = LimitedImageWriter::new(MAX_AUDIT_IMAGE_BYTES);
+    bot.download_file(&file.path, &mut bytes).await?;
+    let bytes = bytes.into_inner();
+    if bytes.is_empty() {
+        anyhow::bail!("downloaded message photo is empty");
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+struct LimitedImageWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl LimitedImageWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(1024 * 1024)),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl AsyncWrite for LimitedImageWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "message photo exceeds the audit image size limit",
+            )));
+        }
+        self.bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 async fn load_first_message_score_context(
@@ -537,6 +680,48 @@ mod tests {
 
         assert_eq!(reply_context, "Как настроить VPN для обхода блокировок?");
         assert!(is_rkn_vpn_restriction_context(reply_context));
+    }
+
+    #[test]
+    fn message_photo_inputs_are_deduplicated_and_bounded() {
+        let input = json!({
+            "message_media": {
+                "photo_file_ids": ["photo-a", "photo-a", "", "photo-b", "photo-c", "photo-d"]
+            }
+        });
+
+        assert_eq!(
+            first_message_photo_file_ids(&input),
+            vec!["photo-a", "photo-b", "photo-c"]
+        );
+    }
+
+    #[test]
+    fn model_snapshot_reports_sent_photos_without_exposing_telegram_file_ids() {
+        let input = json!({
+            "profile": {"avatar_image_available": false},
+            "message_media": {
+                "photo_count": 2,
+                "photo_file_ids": ["private-file-id-1", "private-file-id-2"]
+            }
+        });
+
+        let prompt_input = prompt_snapshot(&input, true, true, 2);
+
+        assert_eq!(prompt_input["profile"]["avatar_image_available"], true);
+        assert_eq!(
+            prompt_input["message_media"]["photo_images_available"],
+            true
+        );
+        assert_eq!(
+            prompt_input["message_media"]["photo_images_sent_to_model"],
+            2
+        );
+        assert!(prompt_input["message_media"]["photo_file_ids"].is_null());
+        assert_eq!(
+            input["message_media"]["photo_file_ids"][0],
+            "private-file-id-1"
+        );
     }
 
     #[test]

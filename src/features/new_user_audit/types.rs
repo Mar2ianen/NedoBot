@@ -15,6 +15,7 @@ const MAX_EVIDENCE_ITEMS: usize = 10;
 pub struct NewUserAuditAssessment {
     pub avatar_observation: Option<AvatarObservation>,
     pub first_message_assessment: Option<FirstMessageAssessment>,
+    pub message_image_assessment: Option<MessageImageAssessment>,
     pub profile_assessment: ProfileAssessment,
 }
 
@@ -29,6 +30,25 @@ pub struct AvatarObservation {
     pub visual_motifs: Vec<String>,
     pub description: String,
     pub confidence: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageImageAssessment {
+    pub visible_product_brands: Vec<String>,
+    pub unusual_or_suggestive_staging: bool,
+    pub promotional_intent: ImagePromotionIntent,
+    pub visual_evidence: Vec<String>,
+    pub confidence: f64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePromotionIntent {
+    ClearPromotion,
+    LikelyPromotion,
+    NoneOrIncidental,
+    Unclear,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -160,6 +180,7 @@ pub enum EvidenceSource {
     Avatar,
     Profile,
     FirstMessage,
+    MessageImage,
     PersonalChannel,
     ChatHistory,
 }
@@ -188,6 +209,7 @@ impl NewUserAuditAssessment {
         let assessment = Self::parse_value(value)?;
         validate_avatar(assessment.avatar_observation.as_ref())?;
         validate_first_message(assessment.first_message_assessment.as_ref())?;
+        validate_message_image(assessment.message_image_assessment.as_ref())?;
         validate_profile(&assessment.profile_assessment)?;
         Ok(assessment)
     }
@@ -196,18 +218,33 @@ impl NewUserAuditAssessment {
         value: &str,
         has_avatar_input: bool,
         has_first_message_input: bool,
+        has_message_image_input: bool,
     ) -> anyhow::Result<Self> {
         let assessment = Self::parse_value(value)?;
-        assessment.validate_for_modalities(has_avatar_input, has_first_message_input)?;
+        assessment.validate_for_modalities(
+            has_avatar_input,
+            has_first_message_input,
+            has_message_image_input,
+        )?;
         Ok(assessment)
     }
 
     /// Разбирает результат, который уже прошёл modality validation на границе
     /// generation и был сохранён для materialization replay.
     pub(crate) fn parse_stored(value: &str) -> anyhow::Result<Self> {
-        let assessment = Self::parse_value(value)?;
+        // Older successful jobs predate message-image assessment. Keep their
+        // durable results replayable while requiring the field on new output.
+        let mut value: Value =
+            serde_json::from_str(value).context("stored LLM audit output is not valid JSON")?;
+        if let Some(object) = value.as_object_mut() {
+            object
+                .entry("message_image_assessment")
+                .or_insert(Value::Null);
+        }
+        let assessment = Self::parse_value(&serde_json::to_string(&value)?)?;
         validate_avatar(assessment.avatar_observation.as_ref())?;
         validate_first_message(assessment.first_message_assessment.as_ref())?;
+        validate_message_image(assessment.message_image_assessment.as_ref())?;
         validate_profile(&assessment.profile_assessment)?;
         Ok(assessment)
     }
@@ -221,6 +258,7 @@ impl NewUserAuditAssessment {
         for field in [
             "avatar_observation",
             "first_message_assessment",
+            "message_image_assessment",
             "profile_assessment",
         ] {
             if !object.contains_key(field) {
@@ -237,6 +275,7 @@ impl NewUserAuditAssessment {
         &self,
         has_avatar_input: bool,
         has_first_message_input: bool,
+        has_message_image_input: bool,
     ) -> anyhow::Result<()> {
         if !has_avatar_input && self.avatar_observation.is_some() {
             bail!("avatar_observation must be null when the audit input has no avatar");
@@ -254,8 +293,15 @@ impl NewUserAuditAssessment {
                 "first_message_assessment must be null when the audit input has no first message"
             );
         }
+        if !has_message_image_input && self.message_image_assessment.is_some() {
+            bail!("message_image_assessment must be null when no message images were supplied");
+        }
+        if has_message_image_input && self.message_image_assessment.is_none() {
+            bail!("message_image_assessment must be present when message images were supplied");
+        }
         validate_avatar(self.avatar_observation.as_ref())?;
         validate_first_message(self.first_message_assessment.as_ref())?;
+        validate_message_image(self.message_image_assessment.as_ref())?;
         validate_profile(&self.profile_assessment)
     }
 }
@@ -300,6 +346,21 @@ fn validate_first_message(assessment: Option<&FirstMessageAssessment>) -> anyhow
     }
     validate_text("first_message_assessment.summary", &assessment.summary)?;
     validate_probability("first_message_assessment.confidence", assessment.confidence)
+}
+
+fn validate_message_image(assessment: Option<&MessageImageAssessment>) -> anyhow::Result<()> {
+    let Some(assessment) = assessment else {
+        return Ok(());
+    };
+    validate_text_list(
+        "message_image_assessment.visible_product_brands",
+        &assessment.visible_product_brands,
+    )?;
+    validate_text_list(
+        "message_image_assessment.visual_evidence",
+        &assessment.visual_evidence,
+    )?;
+    validate_probability("message_image_assessment.confidence", assessment.confidence)
 }
 
 fn validate_profile(assessment: &ProfileAssessment) -> anyhow::Result<()> {
@@ -363,6 +424,7 @@ mod tests {
     const VALID_ASSESSMENT: &str = r#"{
         "avatar_observation": null,
         "first_message_assessment": null,
+        "message_image_assessment": null,
         "profile_assessment": {
             "risk_patterns": ["no_material_risk_pattern"],
             "evidence": [{"source": "profile", "detail": "Биография не содержит рекламы.", "strength": "weak"}],
@@ -385,12 +447,14 @@ mod tests {
 
     #[test]
     fn parse_requires_first_message_assessment_when_input_has_text() {
-        let error = NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, true)
-            .unwrap_err()
-            .to_string();
+        let error =
+            NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, true, false)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("first_message_assessment must be present"));
 
-        NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, false).unwrap();
+        NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, false, false)
+            .unwrap();
     }
 
     #[test]
@@ -410,7 +474,7 @@ mod tests {
                 "confidence": 0.8
             },"#,
         );
-        let error = NewUserAuditAssessment::parse_for_modalities(&value, false, false)
+        let error = NewUserAuditAssessment::parse_for_modalities(&value, false, false, false)
             .unwrap_err()
             .to_string();
 
@@ -419,11 +483,44 @@ mod tests {
 
     #[test]
     fn parse_requires_avatar_observation_when_input_has_avatar() {
-        let error = NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, true, false)
-            .unwrap_err()
-            .to_string();
+        let error =
+            NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, true, false, false)
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("avatar_observation must be present"));
+    }
+
+    #[test]
+    fn parse_requires_message_image_assessment_only_when_photos_were_sent_to_model() {
+        let without =
+            NewUserAuditAssessment::parse_for_modalities(VALID_ASSESSMENT, false, false, true)
+                .unwrap_err()
+                .to_string();
+        assert!(without.contains("message_image_assessment must be present"));
+
+        let with_unexpected = VALID_ASSESSMENT.replace(
+            "\"message_image_assessment\": null,",
+            r#""message_image_assessment": {
+                "visible_product_brands": [],
+                "unusual_or_suggestive_staging": false,
+                "promotional_intent": "none_or_incidental",
+                "visual_evidence": ["Обычный напиток без рекламной постановки."],
+                "confidence": 0.9
+            },"#,
+        );
+        let error =
+            NewUserAuditAssessment::parse_for_modalities(&with_unexpected, false, false, false)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("message_image_assessment must be null"));
+    }
+
+    #[test]
+    fn stored_results_from_before_image_assessment_remain_replayable() {
+        let legacy = VALID_ASSESSMENT.replace("\"message_image_assessment\": null,", "");
+        let stored = NewUserAuditAssessment::parse_stored(&legacy).unwrap();
+        assert_eq!(stored.message_image_assessment, None);
     }
 
     #[test]
@@ -443,7 +540,7 @@ mod tests {
                 "confidence": 0.8
             },"#,
         );
-        let error = NewUserAuditAssessment::parse_for_modalities(&value, false, true)
+        let error = NewUserAuditAssessment::parse_for_modalities(&value, false, true, false)
             .unwrap_err()
             .to_string();
 

@@ -66,6 +66,7 @@ async fn generate_cleanup_content(
             system_prompt: Some(CLEANUP_PROMPT),
             prompt,
             image_base64: None,
+            additional_images_base64: &[],
             temperature: config.voice_cleanup_temperature,
             num_predict: config.voice_cleanup_max_tokens,
             output_validator: None,

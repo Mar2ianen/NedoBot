@@ -312,6 +312,7 @@ async fn process_post_comment_job(
             system_prompt: Some(&prompt.system),
             prompt: &prompt.user,
             image_base64: image_base64.as_deref(),
+            additional_images_base64: &[],
             temperature: config.llm_temperature,
             num_predict: config.llm_max_tokens,
             output_validator: Some(&validator),

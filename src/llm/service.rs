@@ -15,6 +15,7 @@ pub struct GenerateTextOptions<'a> {
     pub system_prompt: Option<&'a str>,
     pub prompt: &'a str,
     pub image_base64: Option<&'a str>,
+    pub additional_images_base64: &'a [String],
     pub temperature: f32,
     pub num_predict: u32,
     pub output_validator: Option<&'a OutputValidator>,
@@ -40,6 +41,7 @@ struct GenerateOnceRequest<'a> {
     system_prompt: Option<&'a str>,
     prompt: &'a str,
     image_base64: Option<&'a str>,
+    additional_images_base64: &'a [String],
     temperature: f32,
     num_predict: u32,
     structured_output: Option<StructuredOutput<'a>>,
@@ -74,7 +76,8 @@ async fn generate_text_with_profile_checked(
 ) -> anyhow::Result<GeneratedText> {
     let route = options.route;
     let requirements = RouteRequirements {
-        requires_images: options.image_base64.is_some(),
+        requires_images: options.image_base64.is_some()
+            || !options.additional_images_base64.is_empty(),
         requires_system_prompt: options.system_prompt.is_some(),
         num_predict: Some(options.num_predict),
         // Любой из режимов профиля задаёт transport contract. PromptOnly намеренно
@@ -96,6 +99,7 @@ async fn generate_text_with_profile_checked(
                     system_prompt: options.system_prompt,
                     prompt: &attempt_prompt,
                     image_base64: options.image_base64,
+                    additional_images_base64: options.additional_images_base64,
                     temperature: options.temperature,
                     num_predict: options.num_predict,
                     structured_output: options.structured_output,
@@ -269,6 +273,7 @@ async fn generate_profile_once(
         system_prompt,
         prompt,
         image_base64,
+        additional_images_base64,
         temperature,
         num_predict,
         structured_output,
@@ -289,12 +294,35 @@ async fn generate_profile_once(
         );
     }
     let image_base64 = image_base64.filter(|_| selection.capabilities.supports_images);
+    let additional_images_base64 = if selection.capabilities.supports_images {
+        additional_images_base64
+    } else {
+        &[]
+    };
     let timeout = std::time::Duration::from_secs(selection.capabilities.request_timeout_sec);
-    let image = image_base64.map(|base64| ImageInput {
-        mime_type: "image/jpeg",
-        base64,
-        file_name: Some("image.jpg"),
-    });
+    let mut images =
+        Vec::with_capacity(usize::from(image_base64.is_some()) + additional_images_base64.len());
+    if let Some(base64) = image_base64 {
+        images.push(ImageInput {
+            mime_type: "image/jpeg",
+            base64,
+            file_name: Some("avatar.jpg"),
+        });
+    }
+    images.extend(
+        additional_images_base64
+            .iter()
+            .enumerate()
+            .map(|(index, base64)| ImageInput {
+                mime_type: "image/jpeg",
+                base64,
+                file_name: Some(if index == 0 {
+                    "message-image-1.jpg"
+                } else {
+                    "message-image.jpg"
+                }),
+            }),
+    );
     let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let response = transport
         .generate(GenAiRequest {
@@ -306,7 +334,7 @@ async fn generate_profile_once(
             },
             system_prompt,
             prompt,
-            image,
+            images,
             temperature,
             max_tokens: num_predict,
             timeout,
@@ -323,7 +351,7 @@ async fn generate_profile_once(
         provider: selection.provider_key.to_string(),
         model: selection.model.model.clone(),
         content: response,
-        image_used: image_base64.is_some(),
+        image_used: image_base64.is_some() || !additional_images_base64.is_empty(),
         attempts: vec![LlmAttempt {
             provider: selection.provider_key.to_string(),
             model: selection.model.model.clone(),
@@ -592,6 +620,7 @@ models = ["test"]
                 system_prompt: Some("return a JSON object"),
                 prompt: "{\"contract\":\"JSON only\"}",
                 image_base64: None,
+                additional_images_base64: &[],
                 temperature: 0.0,
                 num_predict: 64,
                 output_validator: Some(&validator),
@@ -673,6 +702,7 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
             system_prompt: Some("system"),
             prompt: "prompt",
             image_base64: None,
+            additional_images_base64: &[],
             temperature: 0.0,
             num_predict: 64,
             output_validator: validator,
