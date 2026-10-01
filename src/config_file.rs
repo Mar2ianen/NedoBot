@@ -33,6 +33,14 @@ pub struct ChatConfig {
     #[serde(default)]
     pub ingest: bool,
     #[serde(default)]
+    pub delete_join_leave_messages: bool,
+    #[serde(default)]
+    pub ephemeral_command_replies: bool,
+    #[serde(default)]
+    pub welcome_message: Option<String>,
+    #[serde(default)]
+    pub farewell_message: Option<String>,
+    #[serde(default)]
     pub moderation: bool,
     #[serde(default)]
     pub manual_moderation: bool,

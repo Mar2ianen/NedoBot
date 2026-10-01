@@ -1,10 +1,9 @@
 use teloxide::{
-    RequestError,
     adaptors::DefaultParseMode,
     drafter::{
         CleanupFailure, DraftId, DrafterBackend, DrafterCapabilities, DrafterErrorDisposition,
-        DrafterOperation, DrafterRateLimitKey, EditAbortPolicy, NativeRichBackend, PreviewAck,
-        RichEditInPlaceBackend,
+        DrafterOperation, DrafterRateLimitKey, DrafterRequestError, EditAbortPolicy,
+        NativeRichBackend, PreviewAck, RichEditInPlaceBackend,
     },
     prelude::{Bot, ChatId, UserId},
     types::{InputRichMessage, MessageId, ReplyParameters},
@@ -49,7 +48,7 @@ impl DrafterBackend for AskDrafterBackend {
     type Final = InputRichMessage;
     type SegmentOutput = teloxide::types::Message;
     type Output = teloxide::types::Message;
-    type Error = RequestError;
+    type Error = DrafterRequestError;
 
     fn capabilities(&self) -> DrafterCapabilities {
         match self {

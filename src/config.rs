@@ -1159,6 +1159,10 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
             ChatConfig {
                 id: -1002,
                 ingest: true,
+                delete_join_leave_messages: false,
+                ephemeral_command_replies: false,
+                welcome_message: None,
+                farewell_message: None,
                 moderation: true,
                 manual_moderation: false,
                 stats: true,
@@ -1874,6 +1878,10 @@ models = ["primary", "fallback"]
             crate::config_file::ChatConfig {
                 id: -1003,
                 ingest: true,
+                delete_join_leave_messages: false,
+                ephemeral_command_replies: false,
+                welcome_message: None,
+                farewell_message: None,
                 moderation: false,
                 manual_moderation: false,
                 stats: false,
