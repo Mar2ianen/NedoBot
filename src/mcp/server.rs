@@ -461,6 +461,7 @@ mod tests {
             [
                 "ask.list_runs",
                 "chat.count_messages",
+                "chat.get_media",
                 "chat.get_message",
                 "chat.get_message_context",
                 "chat.get_recent_messages",
