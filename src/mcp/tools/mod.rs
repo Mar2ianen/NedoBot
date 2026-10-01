@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod chat;
 pub mod db;
+pub mod media;
 pub mod semantic;
 pub mod youtube_subtitles;
 
