@@ -23,3 +23,13 @@ grant select on all tables in schema mcp_public to nedobot_mcp_ro;
 grant usage on schema public to nedobot_mcp_ro;
 grant select (chat_id, message_id, embedding, embedding_model, status)
     on table public.telegram_message_embeddings_gemma to nedobot_mcp_ro;
+
+-- The media lookup is a separate internal projection; it is not part of the
+-- manifest-backed mcp_public schema or any generic database tool.
+do $$
+begin
+    if to_regclass('mcp_private.telegram_media') is not null then
+        execute 'grant usage on schema mcp_private to nedobot_mcp_ro';
+        execute 'grant select on mcp_private.telegram_media to nedobot_mcp_ro';
+    end if;
+end $$;

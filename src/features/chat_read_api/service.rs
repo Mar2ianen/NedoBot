@@ -2,8 +2,8 @@ use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
 use super::types::{
-    ChatInteraction, ChatMessage, ChatUserProfile, MessageMatch, MessageSearchPage,
-    MessageSearchRequest, RecentMessagesRequest, SemanticSearchConfig,
+    ChatInteraction, ChatMediaAttachment, ChatMessage, ChatUserProfile, MessageMatch,
+    MessageSearchPage, MessageSearchRequest, RecentMessagesRequest, SemanticSearchConfig,
 };
 
 use crate::features::memory::embedding::{
@@ -20,6 +20,26 @@ const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
 const MAX_SEMANTIC_CANDIDATES: i64 = 1_000;
 const MIN_SEMANTIC_RELEVANCE: f32 = 0.60;
 const SEMANTIC_HNSW_EF_SEARCH: &str = "200";
+
+pub async fn message_media(
+    pool: &PgPool,
+    chat_id: i64,
+    message_id: i32,
+) -> anyhow::Result<Vec<ChatMediaAttachment>> {
+    Ok(sqlx::query_as::<_, ChatMediaAttachment>(
+        r#"
+        select message_id, media_kind, file_id, file_size, file_name
+        from mcp_private.telegram_media
+        where chat_id = $1 and message_id = $2
+        order by case media_kind when 'photo' then 0 else 1 end
+        limit 1
+        "#,
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_all(pool)
+    .await?)
+}
 
 #[derive(FromRow)]
 struct MessageRow {
