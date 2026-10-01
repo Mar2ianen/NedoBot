@@ -1,18 +1,26 @@
 use teloxide::prelude::*;
 
 use crate::telegram::entities::custom_emoji_ids;
-use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::{
+    render::escape_html,
+    service_messages::{self, MessageAudience},
+};
 
 pub async fn send_custom_emoji_ids(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     let ids = custom_emoji_ids(msg);
     if ids.is_empty() {
-        send_html(
+        service_messages::send_html(
             bot,
             msg.chat.id,
             "В этом сообщении нет premium/custom emoji entities.",
+            audience,
         )
         .await?;
         return Ok(());
@@ -24,10 +32,11 @@ pub async fn send_custom_emoji_ids(
         .collect::<Vec<_>>()
         .join("\n");
 
-    send_html(
+    service_messages::send_html(
         bot,
         msg.chat.id,
         format!("Нашёл custom_emoji_id:\n{}", lines),
+        audience,
     )
     .await?;
 

@@ -48,7 +48,8 @@ use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 use crate::telegram::manual_moderation as manual_moderation_frontend;
 #[cfg(feature = "ask")]
 use crate::telegram::media::download_largest_photo_base64;
-use crate::telegram::render::{escape_html, send_html, send_html_reply};
+use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::service_messages::{self, MessageAudience};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -99,10 +100,10 @@ pub async fn handle_command(
     match cmd {
         Command::Help => {
             let descriptions = command_descriptions(config, msg.chat.id.0);
-            send_html(&bot, msg.chat.id, escape_html(&descriptions)).await?;
+            send_command_html(&bot, &msg, &state, escape_html(&descriptions)).await?;
         }
         Command::Ping => {
-            bot.send_message(msg.chat.id, "pong").await?;
+            send_command_html(&bot, &msg, &state, "pong").await?;
         }
         Command::Db => {
             let row: (i64,) = sqlx::query_as("select 1::bigint")
@@ -115,17 +116,18 @@ pub async fn handle_command(
                     )
                 })?;
 
-            bot.send_message(msg.chat.id, format!("db ok: {}", row.0))
-                .await?;
+            send_command_html(&bot, &msg, &state, format!("db ok: {}", row.0)).await?;
         }
         Command::EmojiIds => {
-            send_custom_emoji_ids(&bot, &msg).await?;
+            send_custom_emoji_ids(&bot, &msg, command_audience(&msg, &state)).await?;
         }
         #[cfg(feature = "auto-comment")]
         Command::FormatTest(post_text) => {
             if !should_generate_comment(&post_text, config) {
-                bot.send_message(
-                    msg.chat.id,
+                send_command_html(
+                    &bot,
+                    &msg,
+                    &state,
                     "Пропускаю: в посте нет сигнатуры обычного поста, похоже на рекламу или служебный пост.",
                 )
                 .await?;
@@ -134,10 +136,10 @@ pub async fn handle_command(
 
             let clean_post = clean_post_for_llm(&post_text, config);
             let text = build_comment_html(&clean_post, config);
-            send_html(&bot, msg.chat.id, text).await?;
+            send_command_html(&bot, &msg, &state, text).await?;
         }
         Command::Memory => {
-            send_memory_notes(&bot, msg.chat.id, pool).await?;
+            send_memory_notes(&bot, msg.chat.id, pool, command_audience(&msg, &state)).await?;
         }
         #[cfg(feature = "voice")]
         Command::Transcribe => {
@@ -237,6 +239,7 @@ pub async fn handle_command(
                 &state.render_time,
                 StatsPeriod::Day,
                 render,
+                command_audience(&msg, &state),
             )
             .await?;
         }
@@ -250,6 +253,7 @@ pub async fn handle_command(
                 &state.render_time,
                 StatsPeriod::Week,
                 render,
+                command_audience(&msg, &state),
             )
             .await?;
         }
@@ -263,6 +267,7 @@ pub async fn handle_command(
                 &state.render_time,
                 StatsPeriod::Month,
                 render,
+                command_audience(&msg, &state),
             )
             .await?;
         }
@@ -278,6 +283,7 @@ pub async fn handle_command(
                 &state.render_time,
                 period,
                 render,
+                command_audience(&msg, &state),
             )
             .await?;
         }
@@ -288,6 +294,7 @@ pub async fn handle_command(
                 pool,
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
+                command_audience(&msg, &state),
             )
             .await?;
         }
@@ -298,6 +305,7 @@ pub async fn handle_command(
                 pool,
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
+                command_audience(&msg, &state),
             )
             .await?;
         }
@@ -315,12 +323,56 @@ pub async fn handle_command(
                 args.target.as_deref(),
                 fallback_user_id,
                 args.render,
+                command_audience(&msg, &state),
             )
             .await?;
         }
     }
 
     Ok(())
+}
+
+fn command_audience(msg: &Message, state: &AppState) -> Option<MessageAudience> {
+    let ephemeral_enabled = state
+        .config
+        .chat_allows(msg.chat.id.0, |chat| chat.ephemeral_command_replies);
+    let audience = service_messages::command_audience(msg, ephemeral_enabled);
+    if audience.is_none() {
+        tracing::warn!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "suppressed ephemeral command reply because the message has no eligible user sender"
+        );
+    }
+    audience
+}
+
+async fn send_command_html(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    text: impl Into<String>,
+) -> ResponseResult<Option<Message>> {
+    let Some(audience) = command_audience(msg, state) else {
+        return Ok(None);
+    };
+    service_messages::send_html(bot, msg.chat.id, text, audience)
+        .await
+        .map(Some)
+}
+
+async fn send_command_reply_html(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    text: impl Into<String>,
+) -> ResponseResult<Option<Message>> {
+    let Some(audience) = command_audience(msg, state) else {
+        return Ok(None);
+    };
+    service_messages::send_html_reply(bot, msg.chat.id, msg.id, text, audience)
+        .await
+        .map(Some)
 }
 
 fn command_descriptions(config: &crate::config::Config, chat_id: i64) -> String {
@@ -371,10 +423,10 @@ async fn handle_report_command(
 ) -> ResponseResult<()> {
     if let Err(err) = reports::report_target_context(msg, &state.config) {
         tracing::debug!(%err, "rejected /report command");
-        send_html_reply(
+        send_command_reply_html(
             bot,
-            msg.chat.id,
-            msg.id,
+            msg,
+            state,
             "Репорт можно отправить только ответом на сообщение участника в этом чате.",
         )
         .await?;
@@ -382,10 +434,10 @@ async fn handle_report_command(
     }
 
     let Some(target) = reports::target_from_reply(msg, reason) else {
-        send_html_reply(
+        send_command_reply_html(
             bot,
-            msg.chat.id,
-            msg.id,
+            msg,
+            state,
             "Не удалось определить автора сообщения для репорта.",
         )
         .await?;
@@ -397,10 +449,10 @@ async fn handle_report_command(
         Ok(admin_ids) => admin_ids,
         Err(err) => {
             tracing::error!(%err, "failed to resolve report admins");
-            send_html_reply(
+            send_command_reply_html(
                 bot,
-                msg.chat.id,
-                msg.id,
+                msg,
+                state,
                 "Не удалось подготовить доставку репорта администраторам. Попробуй позже.",
             )
             .await?;
@@ -410,10 +462,10 @@ async fn handle_report_command(
 
     let creation = match reports::create_report(&state.pool, &target, &admin_ids).await {
         Ok(ReportCreation::RateLimited) => {
-            send_html_reply(
+            send_command_reply_html(
                 bot,
-                msg.chat.id,
-                msg.id,
+                msg,
+                state,
                 "Ты уже отправлял репорт в последние 10 минут. Повтори позже.",
             )
             .await?;
@@ -422,10 +474,10 @@ async fn handle_report_command(
         Ok(creation) => creation,
         Err(err) => {
             tracing::error!(%err, "failed to save report");
-            send_html_reply(
+            send_command_reply_html(
                 bot,
-                msg.chat.id,
-                msg.id,
+                msg,
+                state,
                 "Не удалось сохранить репорт. Попробуй позже.",
             )
             .await?;
@@ -441,7 +493,7 @@ async fn handle_report_command(
         ReportCreation::AlreadyExists(_) => "Это сообщение уже отправляли на рассмотрение.",
         ReportCreation::RateLimited => unreachable!("rate limit handled above"),
     };
-    send_html_reply(bot, msg.chat.id, msg.id, text).await?;
+    send_command_reply_html(bot, msg, state, text).await?;
     Ok(())
 }
 
@@ -483,12 +535,13 @@ async fn handle_note_command(
         None => add_chat_note(&state.pool, msg.chat.id.0, author.id.0 as i64, note).await,
     };
     match result {
-        Ok(()) => send_html(bot, msg.chat.id, "Заметка сохранена.")
+        Ok(()) => send_command_html(bot, msg, state, "Заметка сохранена.")
             .await
             .map(|_| ()),
-        Err(_) => send_html(
+        Err(_) => send_command_html(
             bot,
-            msg.chat.id,
+            msg,
+            state,
             "Не удалось сохранить заметку: проверь текст и reply для /user_note.",
         )
         .await
@@ -522,7 +575,7 @@ async fn handle_ask_command(
         return Ok(());
     }
     if question.trim().is_empty() {
-        send_html(bot, msg.chat.id, "Напиши вопрос: /ask <вопрос>.").await?;
+        send_command_html(bot, msg, state, "Напиши вопрос: /ask &lt;вопрос&gt;.").await?;
         return Ok(());
     }
     let scope_chat_id = private_scope_chat_id.unwrap_or(msg.chat.id.0);
@@ -700,6 +753,7 @@ fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
         | DraftFinishError::RequestTimeout { delivery }
         | DraftFinishError::DeadlineExceeded { delivery }
         | DraftFinishError::Backend { delivery, .. } => *delivery,
+        _ => DeliveryCertainty::Unknown,
     }
 }
 
@@ -711,7 +765,7 @@ async fn fallback_after_finish_error(
     ask_run_id: Option<i64>,
     fallback_status: AskRunStatus,
     fallback_text: &str,
-    error: DraftFinishError<teloxide::RequestError>,
+    error: DraftFinishError<teloxide::drafter::DrafterRequestError>,
 ) -> ResponseResult<()> {
     let certainty = finish_error_certainty(&error);
     if may_send_fallback(certainty) {
@@ -963,6 +1017,7 @@ pub async fn handle_reply_user_stats_command(
         None,
         reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
         render,
+        command_audience(&msg, &state),
     )
     .await?;
 
@@ -1154,19 +1209,23 @@ mod tests {
     #[cfg(feature = "ask")]
     #[test]
     fn finish_error_certainty_is_preserved_for_fallback_policy() {
-        let before = DraftFinishError::<teloxide::RequestError>::WorkerStoppedBeforeCommand;
+        let before =
+            DraftFinishError::<teloxide::drafter::DrafterRequestError>::WorkerStoppedBeforeCommand;
         assert_eq!(
             finish_error_certainty(&before),
             DeliveryCertainty::NotAttempted
         );
 
-        let after = DraftFinishError::<teloxide::RequestError>::WorkerStoppedAfterCommand {
-            delivery: DeliveryCertainty::Unknown,
-        };
+        let after =
+            DraftFinishError::<teloxide::drafter::DrafterRequestError>::WorkerStoppedAfterCommand {
+                delivery: DeliveryCertainty::Unknown,
+            };
         assert_eq!(finish_error_certainty(&after), DeliveryCertainty::Unknown);
 
         let rejected = DraftFinishError::Backend {
-            source: teloxide::RequestError::MigrateToChatId(ChatId(42)),
+            source: teloxide::drafter::DrafterRequestError::Inner(
+                teloxide::RequestError::MigrateToChatId(ChatId(42)),
+            ),
             class: teloxide::drafter::DrafterErrorClass::Permanent,
             delivery: DeliveryCertainty::Rejected,
         };
@@ -1185,9 +1244,10 @@ mod tests {
         };
 
         use teloxide::drafter::{
-            DrafterBackend, DrafterCapabilities, DrafterErrorClass, DrafterErrorDisposition,
-            DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority, DrafterRateLimitKey,
-            DrafterRateLimitScope, DrafterRateLimiter, PreviewAck,
+            DrafterAcquireError, DrafterBackend, DrafterCapabilities, DrafterErrorClass,
+            DrafterErrorDisposition, DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority,
+            DrafterRateLimitKey, DrafterRateLimitScope, DrafterRateLimiter, DrafterRequestClass,
+            PreviewAck,
         };
 
         #[derive(Debug)]
@@ -1209,8 +1269,9 @@ mod tests {
                 &self,
                 _key: DrafterRateLimitKey,
                 _priority: DrafterPriority,
-            ) -> DrafterPermit {
-                DrafterPermit::new()
+                _request_class: DrafterRequestClass,
+            ) -> Result<DrafterPermit, DrafterAcquireError> {
+                Ok(DrafterPermit::new())
             }
 
             fn penalize(&self, _scope: DrafterRateLimitScope, _retry_after: std::time::Duration) {}

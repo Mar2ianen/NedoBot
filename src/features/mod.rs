@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod jobs;
 #[cfg(feature = "manual-moderation")]
 pub mod manual_moderation;
+pub mod member_greetings;
 pub mod memory;
 #[cfg(feature = "moderation")]
 pub mod new_user_analysis;
@@ -24,6 +25,7 @@ pub mod new_user_audit;
 #[cfg(feature = "moderation")]
 pub mod reports;
 pub mod search;
+pub mod service_message_cleanup;
 #[cfg(feature = "spam-sync")]
 pub mod spam_reputation;
 #[cfg(feature = "moderation")]

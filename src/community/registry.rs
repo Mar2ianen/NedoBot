@@ -97,6 +97,10 @@ mod tests {
             ChatConfig {
                 id: -1001,
                 ingest: true,
+                delete_join_leave_messages: false,
+                ephemeral_command_replies: false,
+                welcome_message: None,
+                farewell_message: None,
                 moderation: true,
                 manual_moderation: false,
                 stats: true,
@@ -141,6 +145,10 @@ mod tests {
                 ChatConfig {
                     id: -1001,
                     ingest: true,
+                    delete_join_leave_messages: false,
+                    ephemeral_command_replies: false,
+                    welcome_message: None,
+                    farewell_message: None,
                     moderation: false,
                     manual_moderation: false,
                     stats: false,
@@ -157,6 +165,10 @@ mod tests {
                 ChatConfig {
                     id: -1001,
                     ingest: true,
+                    delete_join_leave_messages: false,
+                    ephemeral_command_replies: false,
+                    welcome_message: None,
+                    farewell_message: None,
                     moderation: false,
                     manual_moderation: false,
                     stats: false,

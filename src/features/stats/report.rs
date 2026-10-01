@@ -8,9 +8,11 @@ use crate::features::stats::render_rich;
 use crate::features::stats::service::{self, HTML_TOP_LIMIT, RICH_TOP_LIMIT};
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::telegram::render::{send_html, send_rich_html};
+use crate::telegram::service_messages::{self, MessageAudience};
 
 /// Transport wiring for stats commands. Data is assembled in `service`; output is
 /// formatted in the selected renderer. Neither renderer has database access.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_chat_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
@@ -19,7 +21,11 @@ pub async fn send_chat_stats(
     render_time: &TimeContext,
     period: StatsPeriod,
     render: StatsRender,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     let data = service::chat_stats_report_data(pool, stats_scope_chat_id, period)
         .await
         .map_err(stats_error("failed to build chat stats"))?;
@@ -27,7 +33,7 @@ pub async fn send_chat_stats(
         StatsRender::Html => render_html::chat_stats(&data, render_time),
         StatsRender::Rich => render_rich::chat_stats(&data, stats_scope_chat_id, render_time),
     };
-    send_stats_report(bot, chat_id, report, render).await?;
+    send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
 }
 
@@ -37,7 +43,11 @@ pub async fn send_top_messages(
     pool: &PgPool,
     stats_scope_chat_id: i64,
     render: StatsRender,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     service::refresh_top_message_users(bot, pool, stats_scope_chat_id).await;
     let limit = match render {
         StatsRender::Html => HTML_TOP_LIMIT,
@@ -50,7 +60,7 @@ pub async fn send_top_messages(
         StatsRender::Html => render_html::top_messages(&data),
         StatsRender::Rich => render_rich::top_messages(&data),
     };
-    send_stats_report(bot, chat_id, report, render).await?;
+    send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
 }
 
@@ -60,7 +70,11 @@ pub async fn send_top_reacted(
     pool: &PgPool,
     stats_scope_chat_id: i64,
     render: StatsRender,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     service::refresh_top_reacted_users(bot, pool, stats_scope_chat_id).await;
     let limit = match render {
         StatsRender::Html => HTML_TOP_LIMIT,
@@ -73,7 +87,7 @@ pub async fn send_top_reacted(
         StatsRender::Html => render_html::top_reacted(&data, stats_scope_chat_id),
         StatsRender::Rich => render_rich::top_reacted(&data, stats_scope_chat_id),
     };
-    send_stats_report(bot, chat_id, report, render).await?;
+    send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
 }
 
@@ -87,7 +101,11 @@ pub async fn send_user_stats(
     target: Option<&str>,
     reply_user_id: Option<i64>,
     render: StatsRender,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
         service::refresh_user_profile(bot, pool, stats_scope_chat_id, user_id).await;
     }
@@ -102,7 +120,7 @@ pub async fn send_user_stats(
         StatsRender::Html => render_html::user_stats(data.as_ref(), target, stats_scope_chat_id),
         StatsRender::Rich => render_rich::user_stats(data.as_ref(), target, stats_scope_chat_id),
     };
-    send_stats_report(bot, chat_id, report, render).await?;
+    send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
 }
 
@@ -111,10 +129,17 @@ async fn send_stats_report(
     chat_id: ChatId,
     report: String,
     render: StatsRender,
+    audience: MessageAudience,
 ) -> ResponseResult<Message> {
-    match render {
-        StatsRender::Html => send_html(bot, chat_id, report).await,
-        StatsRender::Rich => send_rich_html(bot, chat_id, report).await,
+    match (audience, render) {
+        (MessageAudience::Public, StatsRender::Html) => send_html(bot, chat_id, report).await,
+        (MessageAudience::Public, StatsRender::Rich) => send_rich_html(bot, chat_id, report).await,
+        (audience, StatsRender::Html) => {
+            service_messages::send_html(bot, chat_id, report, audience).await
+        }
+        (audience, StatsRender::Rich) => {
+            service_messages::send_rich_html(bot, chat_id, report, audience).await
+        }
     }
 }
 
