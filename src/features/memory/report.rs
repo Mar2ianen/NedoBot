@@ -8,8 +8,11 @@ pub async fn send_memory_notes(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
-    audience: MessageAudience,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     let notes = sqlx::query_as::<_, (i32, Option<String>, Vec<String>, String)>(
         r#"
         select source_message_id, summary, entities, status
