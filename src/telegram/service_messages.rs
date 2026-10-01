@@ -19,15 +19,12 @@ pub enum MessageAudience {
 /// Selects a private command response only for managed group chats that enabled it.
 /// In private chats, Telegram's ordinary bot conversation already has one recipient.
 pub fn command_audience(message: &Message, ephemeral_enabled: bool) -> Option<MessageAudience> {
-    let sender = message
-        .from
-        .as_ref()
-        .filter(|user| !user.is_bot && message.sender_chat.is_none())
-        .map(|user| (user.id, user.is_bot));
+    let sender = message.from.as_ref();
     audience_for_command(
         ephemeral_enabled,
         message.chat.is_private(),
-        sender,
+        sender.map(|user| user.id),
+        sender.is_some_and(|user| user.is_bot),
         message.sender_chat.is_some(),
         message.thread_id,
     )
@@ -36,16 +33,15 @@ pub fn command_audience(message: &Message, ephemeral_enabled: bool) -> Option<Me
 fn audience_for_command(
     ephemeral_enabled: bool,
     is_private_chat: bool,
-    sender: Option<(UserId, bool)>,
+    sender: Option<UserId>,
+    sender_is_bot: bool,
     sender_chat_present: bool,
     message_thread_id: Option<ThreadId>,
 ) -> Option<MessageAudience> {
     if !ephemeral_enabled || is_private_chat {
         return Some(MessageAudience::Public);
     }
-    let Some((receiver_user_id, sender_is_bot)) = sender else {
-        return None;
-    };
+    let receiver_user_id = sender?;
     if sender_is_bot || sender_chat_present {
         return None;
     }
@@ -206,15 +202,15 @@ mod tests {
     fn enabled_ephemeral_replies_suppress_messages_without_a_real_user_sender() {
         let thread_id = Some(ThreadId(MessageId(22)));
         assert_eq!(
-            audience_for_command(true, false, None, false, thread_id),
+            audience_for_command(true, false, None, false, false, thread_id),
             None
         );
         assert_eq!(
-            audience_for_command(true, false, Some((UserId(42), true)), false, thread_id),
+            audience_for_command(true, false, Some(UserId(42)), true, false, thread_id),
             None
         );
         assert_eq!(
-            audience_for_command(true, false, Some((UserId(42), false)), true, thread_id),
+            audience_for_command(true, false, Some(UserId(42)), false, true, thread_id),
             None
         );
     }
@@ -223,13 +219,7 @@ mod tests {
     fn command_audience_retains_the_forum_topic_id() {
         let thread_id = ThreadId(MessageId(22));
         assert_eq!(
-            audience_for_command(
-                true,
-                false,
-                Some((UserId(42), false)),
-                false,
-                Some(thread_id),
-            ),
+            audience_for_command(true, false, Some(UserId(42)), false, false, Some(thread_id),),
             Some(MessageAudience::Ephemeral {
                 receiver_user_id: UserId(42),
                 message_thread_id: Some(thread_id),
@@ -240,11 +230,11 @@ mod tests {
     #[test]
     fn private_or_disabled_commands_keep_public_audience_without_sender_metadata() {
         assert_eq!(
-            audience_for_command(false, false, None, false, None),
+            audience_for_command(false, false, None, false, false, None),
             Some(MessageAudience::Public)
         );
         assert_eq!(
-            audience_for_command(true, true, None, false, None),
+            audience_for_command(true, true, None, false, false, None),
             Some(MessageAudience::Public)
         );
     }
