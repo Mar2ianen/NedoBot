@@ -15,6 +15,7 @@ voice = []
 public-mcp = []
 moderation = []
 spam-sync = []
+manual-moderation = []
 
 [[bin]]
 name = "chat_db_mcp"
@@ -50,6 +51,11 @@ required-features = ["ask", "public-mcp"]
 name = "postgres_migrations"
 path = "tests/postgres_migrations.rs"
 required-features = ["auto-comment", "ask", "voice", "moderation"]
+
+[[test]]
+name = "manual_moderation"
+path = "tests/manual_moderation.rs"
+required-features = ["manual-moderation"]
 
 [[test]]
 name = "rmcp_transport"

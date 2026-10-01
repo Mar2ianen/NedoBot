@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 
 use crate::config_file::{
-    AskConfig, ChatConfig, FirstCommentConfig, InstanceConfig, ModerationConfig, PublicMcpConfig,
-    RiskProfile, RuntimeSettings, SpamReputationConfig, TelegramConfig, VoiceConfig,
+    AskConfig, ChatConfig, FirstCommentConfig, InstanceConfig, ManualModerationConfig,
+    ModerationConfig, PublicMcpConfig, RiskProfile, RuntimeSettings, SpamReputationConfig,
+    TelegramConfig, VoiceConfig,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +27,8 @@ pub struct LlmProfiles {
     pub chats: Option<BTreeMap<String, ChatConfig>>,
     #[serde(default)]
     pub moderation: Option<ModerationConfig>,
+    #[serde(default)]
+    pub manual_moderation: Option<ManualModerationConfig>,
     #[serde(default)]
     pub spam_reputation: Option<SpamReputationConfig>,
     #[serde(default)]

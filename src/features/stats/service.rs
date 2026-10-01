@@ -143,6 +143,7 @@ pub async fn user_stats_report_data(
     };
     let profile = repo::user_profile(pool, user_id).await?;
     let member = repo::chat_member_snapshot(pool, chat_id, user_id).await?;
+    let moderation = repo::user_moderation_summary(pool, chat_id, user_id).await?;
     let cached = repo::chat_user_stats(pool, chat_id, user_id).await?;
     let mut totals = user_totals(repo::user_totals(pool, chat_id, user_id).await?);
     let reactions_given = repo::user_reactions_given(pool, chat_id, user_id).await?;
@@ -217,6 +218,7 @@ pub async fn user_stats_report_data(
             .as_ref()
             .and_then(|value| value.profile_photo_file_unique_id.clone()),
         observed_at: member.as_ref().and_then(|value| value.observed_at.clone()),
+        moderation,
         written_tag: member.as_ref().and_then(|value| value.written_tag.clone()),
         user,
         first_seen_at,

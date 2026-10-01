@@ -48,6 +48,12 @@ source snapshot. Удаление такого файла приведёт к `V
 после сверки `_sqlx_migrations` обеих production-БД. Секреты, persistent
 static-файлы, backups, дампы и локальный build cache исключаются явно:
 
+В production есть один известный legacy gap: применённая миграция
+`20260927120000` недоступна с исходным checksum. `db::migrate` разрешает
+пропустить только эту отсутствующую версию после сверки applied versions;
+любая другая отсутствующая версия остаётся startup error. Не добавляй файл с
+тем же номером и другим SQL и не меняй checksum в `_sqlx_migrations`.
+
 ```bash
 rsync -azn \
   --exclude target \

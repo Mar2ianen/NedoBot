@@ -143,10 +143,12 @@ pub fn user_stats(
             None => "Не понял, кого смотреть. Отправь команду обычным сообщением, ответь ей на сообщение пользователя или передай id/username.".to_string(),
         };
     };
+    let moderation = moderation_summary(&data.moderation);
     format!(
-        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nКомментарии: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
+        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\n{}\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nКомментарии: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
         data.user.linked_with_badges(),
         escape_html(data.observed_at.as_deref().unwrap_or("нет данных")),
+        moderation,
         linked_message(
             discussion_chat_id,
             &data.first_seen_at,
@@ -169,6 +171,25 @@ pub fn user_stats(
         data.totals.active_days,
         data.reactions_given,
         data.reactions_received,
+    )
+}
+
+fn moderation_summary(summary: &crate::features::stats::types::UserModerationSummary) -> String {
+    let restriction = if summary.unknown_restriction {
+        "неопределённая мера — нужна сверка".to_string()
+    } else if let Some(action) = summary.active_restriction.as_deref() {
+        let label = if action == "ban" { "бан" } else { "мут" };
+        match summary.restriction_expires_at {
+            Some(expires_at) => format!("{label} до {} UTC", expires_at.format("%d.%m.%Y %H:%M")),
+            None => format!("{label} навсегда"),
+        }
+    } else {
+        "активных ограничений нет".to_string()
+    };
+    format!(
+        "Модерация: {}; предупреждений: {}/3",
+        escape_html(&restriction),
+        summary.active_warnings
     )
 }
 

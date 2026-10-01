@@ -1,6 +1,8 @@
 use sqlx::PgPool;
 
-use crate::features::stats::types::{ChatStatsSummary, ReportWindow, StatsPeriod};
+use crate::features::stats::types::{
+    ChatStatsSummary, ReportWindow, StatsPeriod, UserModerationSummary,
+};
 
 /// Telegram's built-in service account. It is excluded from human activity rankings.
 pub const TELEGRAM_SERVICE_USER_ID: i64 = 777_000;
@@ -163,6 +165,53 @@ pub struct UserTotals {
     pub replies_to_bot: i64,
     pub active_days: i64,
     pub voices: i64,
+}
+
+pub async fn user_moderation_summary(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<UserModerationSummary> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        active_restriction: Option<String>,
+        restriction_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        active_warnings: i64,
+        unknown_restriction: bool,
+    }
+
+    let row: Row = sqlx::query_as(
+        r#"select restriction.action as active_restriction,
+                  restriction.expires_at as restriction_expires_at,
+                  (select count(*) from manual_moderation_actions warning
+                   where warning.chat_id = $1 and warning.target_user_id = $2
+                     and warning.action = 'warn' and warning.status = 'applied'
+                     and (warning.expires_at is null or warning.expires_at > now())) as active_warnings,
+                  exists (
+                    select 1 from manual_moderation_actions uncertain
+                    where uncertain.chat_id = $1 and uncertain.target_user_id = $2
+                      and uncertain.action in ('mute', 'ban', 'auto_mute')
+                      and uncertain.status = 'unknown'
+                      and (uncertain.expires_at is null or uncertain.expires_at > now())
+                  ) as unknown_restriction
+           from (select 1) seed
+           left join lateral (
+             select action, expires_at from manual_moderation_actions
+             where chat_id = $1 and target_user_id = $2 and action in ('mute', 'ban', 'auto_mute')
+               and status = 'applied' and (expires_at is null or expires_at > now())
+             order by created_at desc, id desc limit 1
+           ) restriction on true"#,
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(UserModerationSummary {
+        active_restriction: row.active_restriction,
+        restriction_expires_at: row.restriction_expires_at,
+        active_warnings: row.active_warnings,
+        unknown_restriction: row.unknown_restriction,
+    })
 }
 
 /// Resolves the editorial period once so all report queries use identical bounds.

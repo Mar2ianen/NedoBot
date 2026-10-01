@@ -16,7 +16,7 @@ pub const TIMEOUT_ENV: &str = "MCP_YOUTUBE_SUBTITLES_TIMEOUT_SEC";
 pub const MAX_CHARS_ENV: &str = "MCP_YOUTUBE_SUBTITLES_MAX_CHARS";
 pub const MAX_VIDEOS_ENV: &str = "MCP_YOUTUBE_SUBTITLES_MAX_VIDEOS";
 
-const DEFAULT_LANGUAGES: &str = "ru,ru.*,en,en.*";
+const DEFAULT_LANGUAGES: &str = "ru,en";
 const MAX_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -240,9 +240,8 @@ async fn fetch_one(
         .await
         .map_err(|_| read_error("subtitle provider timed out"))?
         .map_err(|_| read_error("subtitle provider could not be started"))?;
-    if !output.status.success() {
-        return Err(read_error("subtitle provider failed"));
-    }
+    let provider_failed = !output.status.success();
+    let provider_rate_limited = String::from_utf8_lossy(&output.stderr).contains("HTTP Error 429");
 
     let mut files = tokio::fs::read_dir(temp_dir.path())
         .await
@@ -276,6 +275,13 @@ async fn fetch_one(
         if !text.is_empty() {
             return Ok(Some(text));
         }
+    }
+    if provider_failed {
+        return Err(read_error(if provider_rate_limited {
+            "YouTube rate-limited subtitle requests; try again later"
+        } else {
+            "subtitle provider failed"
+        }));
     }
     Ok(None)
 }

@@ -5,5 +5,7 @@ pub mod commands;
 pub mod custom_emoji;
 pub mod entities;
 pub mod html;
+#[cfg(feature = "manual-moderation")]
+pub mod manual_moderation;
 pub mod media;
 pub mod render;

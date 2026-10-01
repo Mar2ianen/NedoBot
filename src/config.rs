@@ -153,6 +153,12 @@ impl Config {
             .is_some_and(|chat| feature(chat.config))
     }
 
+    #[cfg(feature = "manual-moderation")]
+    pub fn manual_moderation_enabled_for_chat(&self, chat_id: i64) -> bool {
+        self.community.manual_moderation.enabled
+            && self.chat_allows(chat_id, |chat| chat.manual_moderation)
+    }
+
     pub fn moderation_risk_profile(&self) -> Option<&RiskProfile> {
         self.community
             .risk_profiles
@@ -920,6 +926,7 @@ fn community_config_from_profiles(profiles: &LlmProfiles) -> anyhow::Result<Comm
         telegram,
         chats,
         moderation: profiles.moderation.clone().unwrap_or_default(),
+        manual_moderation: profiles.manual_moderation.clone().unwrap_or_default(),
         spam_reputation: profiles.spam_reputation.clone().unwrap_or_default(),
         voice: profiles.voice.clone().unwrap_or_default(),
         ask: profiles.ask.clone().unwrap_or_default(),
@@ -944,6 +951,18 @@ fn validate_community_config(
     }
     if community.instance.timezone.trim().is_empty() {
         anyhow::bail!("instance.timezone must not be empty");
+    }
+    let manual_moderation_chat_enabled =
+        community.chats.values().any(|chat| chat.manual_moderation);
+    if community.manual_moderation.enabled {
+        require_compiled_feature("manual-moderation", cfg!(feature = "manual-moderation"))?;
+        if !manual_moderation_chat_enabled {
+            anyhow::bail!(
+                "manual_moderation.enabled=true requires at least one chat with manual_moderation=true"
+            );
+        }
+    } else if manual_moderation_chat_enabled {
+        anyhow::bail!("chats.*.manual_moderation=true requires manual_moderation.enabled=true");
     }
     if community.moderation.enabled {
         require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
@@ -1120,8 +1139,9 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
     use std::collections::BTreeMap;
 
     use crate::config_file::{
-        AskConfig, ChatConfig, FirstCommentConfig, InstanceConfig, ModerationConfig,
-        PublicMcpConfig, SpamReputationConfig, TelegramConfig, UnknownChatPolicy, VoiceConfig,
+        AskConfig, ChatConfig, FirstCommentConfig, InstanceConfig, ManualModerationConfig,
+        ModerationConfig, PublicMcpConfig, SpamReputationConfig, TelegramConfig, UnknownChatPolicy,
+        VoiceConfig,
     };
 
     let community = CommunityConfig {
@@ -1140,6 +1160,7 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
                 id: -1002,
                 ingest: true,
                 moderation: true,
+                manual_moderation: false,
                 stats: true,
                 voice: true,
                 ask: true,
@@ -1150,6 +1171,7 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
             },
         )]),
         moderation: ModerationConfig::default(),
+        manual_moderation: ManualModerationConfig::default(),
         spam_reputation: SpamReputationConfig::default(),
         voice: VoiceConfig {
             enabled: false,
@@ -1187,6 +1209,29 @@ mod tests {
             community.chats.get("main").unwrap().reports,
             "the primary profile explicitly enables /report"
         );
+    }
+
+    #[test]
+    fn manual_moderation_requires_global_and_chat_gates_and_compiled_feature() {
+        let (mut community, registry) = test_community_config();
+        community.chats.get_mut("main").unwrap().manual_moderation = true;
+        let error = validate_community_config(&community, &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manual_moderation.enabled=true"));
+
+        community.manual_moderation.enabled = true;
+        let result = validate_community_config(&community, &registry);
+        if cfg!(feature = "manual-moderation") {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("missing from this binary")
+            );
+        }
     }
 
     #[test]
@@ -1830,6 +1875,7 @@ models = ["primary", "fallback"]
                 id: -1003,
                 ingest: true,
                 moderation: false,
+                manual_moderation: false,
                 stats: false,
                 voice: false,
                 ask: true,

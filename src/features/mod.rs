@@ -14,6 +14,8 @@ pub mod chat_retrieval;
 pub mod first_comment;
 pub mod ingest;
 pub mod jobs;
+#[cfg(feature = "manual-moderation")]
+pub mod manual_moderation;
 pub mod memory;
 #[cfg(feature = "moderation")]
 pub mod new_user_analysis;

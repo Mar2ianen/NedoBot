@@ -31,6 +31,39 @@ pub enum Command {
     #[cfg(feature = "moderation")]
     #[command(description = "пожаловаться на сообщение reply; /report [причина]")]
     Report(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(
+        description = "ограничить участника на 1 день или указанный срок; причина необязательна"
+    )]
+    Mute(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(
+        description = "забанить участника навсегда или на указанный срок; причина необязательна"
+    )]
+    Ban(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(
+        description = "выдать предупреждение; три активных предупреждения дают мут на 5 дней"
+    )]
+    Warn(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(description = "снять выданный ботом mute")]
+    Unmute(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(description = "снять выданный ботом ban")]
+    Unban(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(description = "отозвать предупреждения: /unwarn [цель] [#id|all]")]
+    Unwarn(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(description = "показать предупреждения участника: /warns <id|username> или reply")]
+    Warns(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(description = "показать журнал модерации: /modlog [цель] [лимит]")]
+    Modlog(String),
+    #[cfg(feature = "manual-moderation")]
+    #[command(description = "отменить последнюю свою команду модерации в этом чате")]
+    Undo,
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]
     StatsDay(String),
     #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p]")]
@@ -75,5 +108,25 @@ mod tests {
             Command::parse("/report рекламная ссылка", "nedobot"),
             Ok(Command::Report(reason)) if reason == "рекламная ссылка"
         ));
+    }
+}
+
+#[cfg(all(test, feature = "manual-moderation"))]
+mod manual_moderation_tests {
+    use super::Command;
+    use teloxide::utils::command::BotCommands;
+
+    #[test]
+    fn moderation_commands_allow_missing_reason_and_parameters() {
+        assert!(
+            matches!(Command::parse("/mute", "bot"), Ok(Command::Mute(args)) if args.is_empty())
+        );
+        assert!(
+            matches!(Command::parse("/ban @alice", "bot"), Ok(Command::Ban(args)) if args == "@alice")
+        );
+        assert!(
+            matches!(Command::parse("/warn", "bot"), Ok(Command::Warn(args)) if args.is_empty())
+        );
+        assert!(matches!(Command::parse("/undo", "bot"), Ok(Command::Undo)));
     }
 }
