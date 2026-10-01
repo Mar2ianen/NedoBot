@@ -1,7 +1,10 @@
 //! Transport-neutral DTOs and the reviewed read-model scope.
 
 use serde::{Deserialize, Serialize};
-use sqlx::types::chrono::{DateTime, Utc};
+use sqlx::{
+    FromRow,
+    types::chrono::{DateTime, Utc},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChatReadScope {
@@ -20,6 +23,17 @@ pub struct SemanticSearchConfig {
     pub embedding_model: String,
     pub timeout_sec: u64,
     pub query_prefix: String,
+}
+
+/// Telegram file metadata for a single public-chat photo or document.
+/// This DTO stays inside the MCP server and is never serialized to public tools.
+#[derive(Clone, Debug, FromRow)]
+pub struct ChatMediaAttachment {
+    pub message_id: i32,
+    pub media_kind: String,
+    pub file_id: String,
+    pub file_size: Option<i64>,
+    pub file_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
