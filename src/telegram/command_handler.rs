@@ -26,6 +26,8 @@ use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_
 #[cfg(feature = "auto-comment")]
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
+#[cfg(feature = "manual-moderation")]
+use crate::features::manual_moderation::types::CommandKind as ManualCommandKind;
 use crate::features::memory::report::send_memory_notes;
 #[cfg(feature = "moderation")]
 use crate::features::reports::{self, ReportCreation};
@@ -42,6 +44,8 @@ use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 #[cfg(feature = "ask")]
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
+#[cfg(feature = "manual-moderation")]
+use crate::telegram::manual_moderation as manual_moderation_frontend;
 #[cfg(feature = "ask")]
 use crate::telegram::media::download_largest_photo_base64;
 use crate::telegram::render::{escape_html, send_html, send_html_reply};
@@ -57,6 +61,12 @@ pub async fn handle_command(
 
     if !msg.chat.is_private() && !is_managed_chat(config, msg.chat.id.0) {
         tracing::debug!(chat_id = msg.chat.id.0, "ignored command from unknown chat");
+        return Ok(());
+    }
+    #[cfg(feature = "manual-moderation")]
+    if is_manual_moderation_command(&cmd)
+        && !config.manual_moderation_enabled_for_chat(msg.chat.id.0)
+    {
         return Ok(());
     }
     if is_managed_chat(config, msg.chat.id.0)
@@ -88,12 +98,8 @@ pub async fn handle_command(
 
     match cmd {
         Command::Help => {
-            send_html(
-                &bot,
-                msg.chat.id,
-                escape_html(&Command::descriptions().to_string()),
-            )
-            .await?;
+            let descriptions = command_descriptions(config, msg.chat.id.0);
+            send_html(&bot, msg.chat.id, escape_html(&descriptions)).await?;
         }
         Command::Ping => {
             bot.send_message(msg.chat.id, "pong").await?;
@@ -157,6 +163,69 @@ pub async fn handle_command(
         #[cfg(feature = "moderation")]
         Command::Report(reason) => {
             handle_report_command(&bot, &msg, &state, &reason).await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Mute(args) => {
+            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Mute, &args)
+                .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Ban(args) => {
+            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Ban, &args)
+                .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Warn(args) => {
+            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Warn, &args)
+                .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Unmute(args) => {
+            manual_moderation_frontend::handle(
+                &bot,
+                &msg,
+                &state,
+                ManualCommandKind::Unmute,
+                &args,
+            )
+            .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Unban(args) => {
+            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Unban, &args)
+                .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Unwarn(args) => {
+            manual_moderation_frontend::handle(
+                &bot,
+                &msg,
+                &state,
+                ManualCommandKind::Unwarn,
+                &args,
+            )
+            .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Warns(args) => {
+            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Warns, &args)
+                .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Modlog(args) => {
+            manual_moderation_frontend::handle(
+                &bot,
+                &msg,
+                &state,
+                ManualCommandKind::Modlog,
+                &args,
+            )
+            .await?;
+        }
+        #[cfg(feature = "manual-moderation")]
+        Command::Undo => {
+            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Undo, "")
+                .await?;
         }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
@@ -252,6 +321,45 @@ pub async fn handle_command(
     }
 
     Ok(())
+}
+
+fn command_descriptions(config: &crate::config::Config, chat_id: i64) -> String {
+    let descriptions = Command::descriptions().to_string();
+    #[cfg(not(feature = "manual-moderation"))]
+    let _ = config;
+    #[cfg(feature = "manual-moderation")]
+    if !config.manual_moderation_enabled_for_chat(chat_id) {
+        return descriptions
+            .lines()
+            .filter(|line| {
+                ![
+                    "/mute", "/ban", "/warn", "/unmute", "/unban", "/unwarn", "/warns", "/modlog",
+                    "/undo",
+                ]
+                .iter()
+                .any(|command| line.trim_start().starts_with(command))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let _ = chat_id;
+    descriptions
+}
+
+#[cfg(feature = "manual-moderation")]
+fn is_manual_moderation_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Mute(_)
+            | Command::Ban(_)
+            | Command::Warn(_)
+            | Command::Unmute(_)
+            | Command::Unban(_)
+            | Command::Unwarn(_)
+            | Command::Warns(_)
+            | Command::Modlog(_)
+            | Command::Undo
+    )
 }
 
 #[cfg(feature = "moderation")]

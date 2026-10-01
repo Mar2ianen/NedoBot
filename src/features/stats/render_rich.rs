@@ -221,6 +221,10 @@ pub fn user_stats(
         "имя".into(),
         user_link(&data.username, data.user.user_id, &data.user.display_name),
     ]];
+    profile_rows.push(vec![
+        "модерация".into(),
+        moderation_summary(&data.moderation),
+    ]);
     if let Some(tag) = data
         .written_tag
         .as_deref()
@@ -312,6 +316,25 @@ pub fn user_stats(
             ],
             vec!["частые слова".into(), top_words],
         ]),
+    )
+}
+
+fn moderation_summary(summary: &crate::features::stats::types::UserModerationSummary) -> String {
+    let restriction = if summary.unknown_restriction {
+        "неопределённая мера — нужна сверка".to_string()
+    } else if let Some(action) = summary.active_restriction.as_deref() {
+        let label = if action == "ban" { "бан" } else { "мут" };
+        match summary.restriction_expires_at {
+            Some(expires_at) => format!("{label} до {} UTC", expires_at.format("%d.%m.%Y %H:%M")),
+            None => format!("{label} навсегда"),
+        }
+    } else {
+        "активных ограничений нет".to_string()
+    };
+    format!(
+        "{}; предупреждений: {}/3",
+        escape_html(&restriction),
+        summary.active_warnings
     )
 }
 

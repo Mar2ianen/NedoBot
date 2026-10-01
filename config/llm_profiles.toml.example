@@ -327,6 +327,7 @@ owners = [5939287960]
 id = -1001932061163
 ingest = true
 moderation = true
+manual_moderation = false
 stats = true
 voice = false
 ask = false
@@ -339,6 +340,9 @@ review_delivery_enabled = true
 risk_profile = "ru_general_v1"
 review_chat = "main"
 reviewer_user_ids = [5939287960]
+
+[manual_moderation]
+enabled = false
 
 [spam_reputation]
 enabled = false
