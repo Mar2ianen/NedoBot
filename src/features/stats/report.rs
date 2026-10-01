@@ -20,8 +20,11 @@ pub async fn send_chat_stats(
     render_time: &TimeContext,
     period: StatsPeriod,
     render: StatsRender,
-    audience: MessageAudience,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     let data = service::chat_stats_report_data(pool, stats_scope_chat_id, period)
         .await
         .map_err(stats_error("failed to build chat stats"))?;
@@ -39,8 +42,11 @@ pub async fn send_top_messages(
     pool: &PgPool,
     stats_scope_chat_id: i64,
     render: StatsRender,
-    audience: MessageAudience,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     service::refresh_top_message_users(bot, pool, stats_scope_chat_id).await;
     let limit = match render {
         StatsRender::Html => HTML_TOP_LIMIT,
@@ -63,8 +69,11 @@ pub async fn send_top_reacted(
     pool: &PgPool,
     stats_scope_chat_id: i64,
     render: StatsRender,
-    audience: MessageAudience,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     service::refresh_top_reacted_users(bot, pool, stats_scope_chat_id).await;
     let limit = match render {
         StatsRender::Html => HTML_TOP_LIMIT,
@@ -91,8 +100,11 @@ pub async fn send_user_stats(
     target: Option<&str>,
     reply_user_id: Option<i64>,
     render: StatsRender,
-    audience: MessageAudience,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
         service::refresh_user_profile(bot, pool, stats_scope_chat_id, user_id).await;
     }

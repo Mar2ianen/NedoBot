@@ -332,11 +332,19 @@ pub async fn handle_command(
     Ok(())
 }
 
-fn command_audience(msg: &Message, state: &AppState) -> MessageAudience {
+fn command_audience(msg: &Message, state: &AppState) -> Option<MessageAudience> {
     let ephemeral_enabled = state
         .config
         .chat_allows(msg.chat.id.0, |chat| chat.ephemeral_command_replies);
-    service_messages::command_audience(msg, ephemeral_enabled)
+    let audience = service_messages::command_audience(msg, ephemeral_enabled);
+    if audience.is_none() {
+        tracing::warn!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "suppressed ephemeral command reply because the message has no eligible user sender"
+        );
+    }
+    audience
 }
 
 async fn send_command_html(
@@ -344,8 +352,13 @@ async fn send_command_html(
     msg: &Message,
     state: &AppState,
     text: impl Into<String>,
-) -> ResponseResult<Message> {
-    service_messages::send_html(bot, msg.chat.id, text, command_audience(msg, state)).await
+) -> ResponseResult<Option<Message>> {
+    let Some(audience) = command_audience(msg, state) else {
+        return Ok(None);
+    };
+    service_messages::send_html(bot, msg.chat.id, text, audience)
+        .await
+        .map(Some)
 }
 
 async fn send_command_reply_html(
@@ -353,9 +366,13 @@ async fn send_command_reply_html(
     msg: &Message,
     state: &AppState,
     text: impl Into<String>,
-) -> ResponseResult<Message> {
-    service_messages::send_html_reply(bot, msg.chat.id, msg.id, text, command_audience(msg, state))
+) -> ResponseResult<Option<Message>> {
+    let Some(audience) = command_audience(msg, state) else {
+        return Ok(None);
+    };
+    service_messages::send_html_reply(bot, msg.chat.id, msg.id, text, audience)
         .await
+        .map(Some)
 }
 
 fn command_descriptions(config: &crate::config::Config, chat_id: i64) -> String {
@@ -1227,9 +1244,10 @@ mod tests {
         };
 
         use teloxide::drafter::{
-            DrafterBackend, DrafterCapabilities, DrafterErrorClass, DrafterErrorDisposition,
-            DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority, DrafterRateLimitKey,
-            DrafterRateLimitScope, DrafterRateLimiter, PreviewAck,
+            DrafterAcquireError, DrafterBackend, DrafterCapabilities, DrafterErrorClass,
+            DrafterErrorDisposition, DrafterMode, DrafterOperation, DrafterPermit, DrafterPriority,
+            DrafterRateLimitKey, DrafterRateLimitScope, DrafterRateLimiter, DrafterRequestClass,
+            PreviewAck,
         };
 
         #[derive(Debug)]
@@ -1251,8 +1269,9 @@ mod tests {
                 &self,
                 _key: DrafterRateLimitKey,
                 _priority: DrafterPriority,
-            ) -> DrafterPermit {
-                DrafterPermit::new()
+                _request_class: DrafterRequestClass,
+            ) -> Result<DrafterPermit, DrafterAcquireError> {
+                Ok(DrafterPermit::new())
             }
 
             fn penalize(&self, _scope: DrafterRateLimitScope, _retry_after: std::time::Duration) {}

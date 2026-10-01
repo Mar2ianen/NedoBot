@@ -1327,11 +1327,18 @@ async fn send_reply(
     msg: &Message,
     state: &AppState,
     text: &str,
-) -> ResponseResult<Message> {
+) -> ResponseResult<()> {
     let ephemeral_enabled = state
         .config
         .chat_allows(msg.chat.id.0, |chat| chat.ephemeral_command_replies);
-    let audience = service_messages::command_audience(msg, ephemeral_enabled);
+    let Some(audience) = service_messages::command_audience(msg, ephemeral_enabled) else {
+        tracing::warn!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "suppressed manual moderation reply because the message has no eligible user sender"
+        );
+        return Ok(());
+    };
     service_messages::send_html_reply(
         bot,
         msg.chat.id,
@@ -1339,7 +1346,8 @@ async fn send_reply(
         Html::text(text).into_string(),
         audience,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

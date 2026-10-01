@@ -9,8 +9,11 @@ use crate::telegram::{
 pub async fn send_custom_emoji_ids(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
-    audience: MessageAudience,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     let ids = custom_emoji_ids(msg);
     if ids.is_empty() {
         service_messages::send_html(
