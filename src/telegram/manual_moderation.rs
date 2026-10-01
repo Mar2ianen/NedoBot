@@ -16,7 +16,7 @@ use crate::{
         },
     },
     state::AppState,
-    telegram::{html::Html, render::send_html_reply},
+    telegram::{html::Html, service_messages},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -50,7 +50,7 @@ pub async fn handle(
     let mut parsed = match parse_command(kind, args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            send_reply(bot, msg, &format!("{error}. Причина необязательна; используй `-- причина`, если нужно её записать.")).await?;
+            send_reply(bot, msg, state, &format!("{error}. Причина необязательна; используй `-- причина`, если нужно её записать.")).await?;
             return Ok(());
         }
     };
@@ -58,6 +58,7 @@ pub async fn handle(
         send_reply(
             bot,
             msg,
+            state,
             "Команда должна быть отправлена администратором от личного аккаунта.",
         )
         .await?;
@@ -65,7 +66,7 @@ pub async fn handle(
     };
     let actor_id = actor.id.0 as i64;
     if !authorize_actor(bot, msg.chat.id, actor.id, kind.requires_restrict_right()).await {
-        send_reply(bot, msg, "Недостаточно прав: проверь права администратора и разрешение бота ограничивать участников.").await?;
+        send_reply(bot, msg, state, "Недостаточно прав: проверь права администратора и разрешение бота ограничивать участников.").await?;
         return Ok(());
     }
 
@@ -73,7 +74,7 @@ pub async fn handle(
         let targets = match resolve_target_ids(&state.pool, msg, &parsed).await {
             Ok(targets) => targets,
             Err(error) => {
-                send_reply(bot, msg, &error.to_string()).await?;
+                send_reply(bot, msg, state, &error.to_string()).await?;
                 return Ok(());
             }
         };
@@ -84,11 +85,11 @@ pub async fn handle(
         };
         match result {
             Ok(text) => {
-                send_reply(bot, msg, &text).await?;
+                send_reply(bot, msg, state, &text).await?;
             }
             Err(error) => {
                 tracing::error!(%error, command = kind.as_str(), "failed to read moderation history");
-                send_reply(bot, msg, "Не удалось прочитать журнал модерации.").await?;
+                send_reply(bot, msg, state, "Не удалось прочитать журнал модерации.").await?;
             }
         }
         return Ok(());
@@ -101,6 +102,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 "Не удалось прочитать состояние команды модерации.",
             )
             .await?;
@@ -112,6 +114,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 "Эта команда уже зарегистрирована с другим автором или типом.",
             )
             .await?;
@@ -121,6 +124,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 batch
                     .result_text
                     .as_deref()
@@ -133,6 +137,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 batch.result_text.as_deref().unwrap_or(
                     "Старую команду нельзя безопасно продолжить; проверь /modlog и Telegram.",
                 ),
@@ -144,6 +149,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 "Сохранённый тип команды не совпадает; действие остановлено.",
             )
             .await?;
@@ -156,6 +162,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 "Не удалось восстановить состояние команды. Проверь Telegram и попробуй позже.",
             )
             .await?;
@@ -174,7 +181,7 @@ pub async fn handle(
             {
                 Ok(targets) => targets,
                 Err(error) => {
-                    send_reply(bot, msg, &error.to_string()).await?;
+                    send_reply(bot, msg, state, &error.to_string()).await?;
                     return Ok(());
                 }
             };
@@ -183,7 +190,7 @@ pub async fn handle(
         let ids = match resolve_target_ids(&state.pool, msg, &parsed).await {
             Ok(ids) => ids,
             Err(error) => {
-                send_reply(bot, msg, &error.to_string()).await?;
+                send_reply(bot, msg, state, &error.to_string()).await?;
                 return Ok(());
             }
         };
@@ -196,6 +203,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 "Укажи цель по reply, Telegram ID или известному @username.",
             )
             .await?;
@@ -205,7 +213,7 @@ pub async fn handle(
             match maybe_check_targets(bot, &state.pool, msg.chat.id, kind, ids, None).await {
                 Ok(targets) => targets,
                 Err(error) => {
-                    send_reply(bot, msg, &error.to_string()).await?;
+                    send_reply(bot, msg, state, &error.to_string()).await?;
                     return Ok(());
                 }
             };
@@ -229,6 +237,7 @@ pub async fn handle(
                 send_reply(
                     bot,
                     msg,
+                    state,
                     "Не удалось записать команду модерации. Попробуй позже.",
                 )
                 .await?;
@@ -244,6 +253,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 "Команда уже выполняется; повторно действие не запускалось.",
             )
             .await?;
@@ -253,6 +263,7 @@ pub async fn handle(
             send_reply(
                 bot,
                 msg,
+                state,
                 result
                     .as_deref()
                     .unwrap_or("Команда завершена; повторно действие не запускалось."),
@@ -262,7 +273,13 @@ pub async fn handle(
         }
         Err(error) => {
             tracing::error!(%error, batch_id = batch.id, "failed to claim moderation batch");
-            send_reply(bot, msg, "Не удалось получить команду для выполнения.").await?;
+            send_reply(
+                bot,
+                msg,
+                state,
+                "Не удалось получить команду для выполнения.",
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -342,16 +359,17 @@ pub async fn handle(
             if let Err(error) = manual_moderation::finish_batch(&state.pool, batch.id, &text).await
             {
                 tracing::error!(%error, batch_id = batch.id, "failed to save moderation batch result");
-                send_reply(bot, msg, "Команда выполнена частично, но результат не удалось сохранить; проверь /modlog и Telegram.").await?;
+                send_reply(bot, msg, state, "Команда выполнена частично, но результат не удалось сохранить; проверь /modlog и Telegram.").await?;
                 return Ok(());
             }
-            send_reply(bot, msg, &text).await?;
+            send_reply(bot, msg, state, &text).await?;
         }
         Err(error) => {
             tracing::error!(%error, command = kind.as_str(), "manual moderation command failed");
             send_reply(
                 bot,
                 msg,
+                state,
                 "Не удалось завершить команду модерации. Проверь /modlog и попробуй позже.",
             )
             .await?;
@@ -1307,9 +1325,21 @@ fn format_action(action: &ActionRecord) -> String {
 async fn send_reply(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
+    state: &AppState,
     text: &str,
 ) -> ResponseResult<Message> {
-    send_html_reply(bot, msg.chat.id, msg.id, Html::text(text).into_string()).await
+    let ephemeral_enabled = state
+        .config
+        .chat_allows(msg.chat.id.0, |chat| chat.ephemeral_command_replies);
+    let audience = service_messages::command_audience(msg, ephemeral_enabled);
+    service_messages::send_html_reply(
+        bot,
+        msg.chat.id,
+        msg.id,
+        Html::text(text).into_string(),
+        audience,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -12,11 +12,13 @@ pub async fn send_html(
     chat_id: ChatId,
     text: impl Into<String>,
 ) -> ResponseResult<Message> {
-    let text = normalize_send_text(text)?;
-
-    bot.send_message(chat_id, text)
-        .link_preview_options(disabled_link_preview())
-        .await
+    crate::telegram::service_messages::send_html(
+        bot,
+        chat_id,
+        text,
+        crate::telegram::service_messages::MessageAudience::Public,
+    )
+    .await
 }
 
 pub async fn send_html_reply(
@@ -25,12 +27,14 @@ pub async fn send_html_reply(
     reply_to_message_id: MessageId,
     text: impl Into<String>,
 ) -> ResponseResult<Message> {
-    let text = normalize_send_text(text)?;
-
-    bot.send_message(chat_id, text)
-        .reply_parameters(ReplyParameters::new(reply_to_message_id).allow_sending_without_reply())
-        .link_preview_options(disabled_link_preview())
-        .await
+    crate::telegram::service_messages::send_html_reply(
+        bot,
+        chat_id,
+        reply_to_message_id,
+        text,
+        crate::telegram::service_messages::MessageAudience::Public,
+    )
+    .await
 }
 
 pub async fn send_rich_html(
@@ -73,7 +77,7 @@ pub fn escape_html(text: &str) -> String {
     html::escape(text)
 }
 
-fn normalize_send_text(text: impl Into<String>) -> ResponseResult<String> {
+pub(crate) fn normalize_send_text(text: impl Into<String>) -> ResponseResult<String> {
     let text = normalize_non_empty_text(text);
 
     let char_count = text.chars().count();
@@ -94,7 +98,7 @@ fn normalize_send_text(text: impl Into<String>) -> ResponseResult<String> {
     Ok(text)
 }
 
-fn normalize_rich_text(text: impl Into<String>) -> ResponseResult<String> {
+pub(crate) fn normalize_rich_text(text: impl Into<String>) -> ResponseResult<String> {
     let text = normalize_non_empty_text(text);
     let char_count = text.chars().count();
 
@@ -120,7 +124,7 @@ fn io_request_error(error: impl std::fmt::Display) -> teloxide::RequestError {
     teloxide::RequestError::Io(std::io::Error::other(error.to_string()).into())
 }
 
-fn disabled_link_preview() -> LinkPreviewOptions {
+pub(crate) fn disabled_link_preview() -> LinkPreviewOptions {
     LinkPreviewOptions {
         is_disabled: true,
         url: None,
