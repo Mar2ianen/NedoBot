@@ -2,13 +2,17 @@ use sqlx::PgPool;
 use teloxide::prelude::*;
 
 use crate::telegram::html::{Html, bold, code, lines, paragraphs};
-use crate::telegram::render::send_html;
+use crate::telegram::service_messages::{self, MessageAudience};
 
 pub async fn send_memory_notes(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     pool: &PgPool,
+    audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
     let notes = sqlx::query_as::<_, (i32, Option<String>, Vec<String>, String)>(
         r#"
         select source_message_id, summary, entities, status
@@ -25,7 +29,7 @@ pub async fn send_memory_notes(
     })?;
 
     if notes.is_empty() {
-        bot.send_message(chat_id, "Память пока пустая.").await?;
+        service_messages::send_html(bot, chat_id, "Память пока пустая.", audience).await?;
         return Ok(());
     }
 
@@ -40,7 +44,7 @@ pub async fn send_memory_notes(
     ))
     .into_string();
 
-    send_html(bot, chat_id, text).await?;
+    service_messages::send_html(bot, chat_id, text, audience).await?;
 
     Ok(())
 }

@@ -36,11 +36,13 @@ use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
 use features::jobs::policy::POST_HISTORY_POLL;
 #[cfg(feature = "voice")]
 use features::jobs::policy::VOICE_TRANSCRIPTION_POLL;
+use features::member_greetings::handle_chat_member_update;
 use features::memory::service::process_next_history_entry;
 #[cfg(feature = "moderation")]
 use features::new_user_audit::service::process_next_new_user_audit_job;
 #[cfg(feature = "moderation")]
 use features::reports::{self, ReportActionResult};
+use features::service_message_cleanup::maybe_delete_join_leave_message;
 #[cfg(feature = "spam-sync")]
 use features::spam_reputation::SpamReputationStore;
 #[cfg(feature = "moderation")]
@@ -98,6 +100,12 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Err(err) = warn_if_reaction_updates_unavailable(&bot, &config).await {
         tracing::warn!(%err, "failed to check reaction update availability");
+    }
+    if let Err(err) = warn_if_join_leave_cleanup_unavailable(&bot, &config).await {
+        tracing::warn!(%err, "failed to check join/leave message cleanup availability");
+    }
+    if let Err(err) = warn_if_ephemeral_and_greetings_unavailable(&bot, &config).await {
+        tracing::warn!(%err, "failed to check ephemeral replies and welcome messages availability");
     }
     #[cfg(feature = "spam-sync")]
     let spam_reputation_store = if config.community.spam_reputation.enabled {
@@ -343,6 +351,7 @@ async fn handle_message(
         tracing::debug!(chat_id = msg.chat.id.0, "ignored message from unknown chat");
         return Ok(());
     }
+    maybe_delete_join_leave_message(&bot, &msg, &state.config).await;
     match ingest_message(&state.pool, &msg, &state.config).await {
         Ok(true) => {}
         Ok(false) => return Ok(()),
@@ -656,12 +665,21 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
     Ok(())
 }
 
-async fn handle_chat_member(member: ChatMemberUpdated, state: AppState) -> ResponseResult<()> {
-    if !managed_chat_allows(&state.config, member.chat.id.0, |chat| chat.ingest) {
+async fn handle_chat_member(
+    bot: teloxide::adaptors::DefaultParseMode<Bot>,
+    member: ChatMemberUpdated,
+    state: AppState,
+) -> ResponseResult<()> {
+    if !is_managed_chat(&state.config, member.chat.id.0) {
         return Ok(());
     }
-    if let Err(err) = save_chat_member_event(&state.pool, &member).await {
+    if managed_chat_allows(&state.config, member.chat.id.0, |chat| chat.ingest)
+        && let Err(err) = save_chat_member_event(&state.pool, &member).await
+    {
         tracing::error!(%err, "failed to save chat member event");
+    }
+    if let Err(err) = handle_chat_member_update(&bot, &member, &state.config).await {
+        tracing::warn!(%err, chat_id = member.chat.id.0, "failed to send configured welcome or farewell message");
     }
 
     Ok(())
@@ -683,6 +701,88 @@ async fn warn_if_reaction_updates_unavailable(
                 status = ?member.kind,
                 "bot is not chat administrator; Telegram will not send message_reaction updates"
             );
+        }
+    }
+
+    Ok(())
+}
+
+async fn warn_if_join_leave_cleanup_unavailable(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let chat_ids = config
+        .managed_chat_ids()
+        .filter(|chat_id| config.chat_allows(*chat_id, |chat| chat.delete_join_leave_messages))
+        .collect::<Vec<_>>();
+    if chat_ids.is_empty() {
+        return Ok(());
+    }
+
+    let me = bot.get_me().await?;
+    for chat_id in chat_ids {
+        match bot.get_chat_member(ChatId(chat_id), me.id).await {
+            Ok(member) if member.kind.can_delete_messages() => {}
+            Ok(member) => tracing::warn!(
+                chat_id,
+                status = ?member.kind,
+                "join/leave cleanup is enabled but bot lacks can_delete_messages"
+            ),
+            Err(err) => tracing::warn!(
+                %err,
+                chat_id,
+                "join/leave cleanup is enabled but bot permissions could not be checked"
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+async fn warn_if_ephemeral_and_greetings_unavailable(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let chat_ids = config
+        .managed_chat_ids()
+        .filter(|chat_id| {
+            config.chat_by_id(*chat_id).is_some_and(|chat| {
+                chat.config.ephemeral_command_replies
+                    || chat
+                        .config
+                        .welcome_message
+                        .as_deref()
+                        .is_some_and(|message| !message.trim().is_empty())
+                    || chat
+                        .config
+                        .farewell_message
+                        .as_deref()
+                        .is_some_and(|message| !message.trim().is_empty())
+            })
+        })
+        .collect::<Vec<_>>();
+    if chat_ids.is_empty() {
+        return Ok(());
+    }
+
+    let me = bot.get_me().await?;
+    for chat_id in chat_ids {
+        match bot.get_chat_member(ChatId(chat_id), me.id).await {
+            Ok(member)
+                if matches!(
+                    member.kind,
+                    ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
+                ) => {}
+            Ok(member) => tracing::warn!(
+                chat_id,
+                status = ?member.kind,
+                "ephemeral replies and member greetings require the bot to be a chat administrator"
+            ),
+            Err(err) => tracing::warn!(
+                %err,
+                chat_id,
+                "ephemeral replies and member greetings are enabled but bot permissions could not be checked"
+            ),
         }
     }
 

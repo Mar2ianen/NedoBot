@@ -326,6 +326,11 @@ owners = [5939287960]
 [chats.main]
 id = -1001932061163
 ingest = true
+delete_join_leave_messages = false
+ephemeral_command_replies = false
+# HTML-шаблоны приветствия и прощания; доступные поля описаны в docs/TECHNICAL.md.
+# welcome_message = "Добро пожаловать, <b>{first_name}</b>!"
+# farewell_message = "{full_name} покинул(а) чат."
 moderation = true
 manual_moderation = false
 stats = true
