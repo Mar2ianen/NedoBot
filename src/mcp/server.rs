@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::features::chat_read_api::ChatReadApi;
 
 use super::tools::{
-    catalog, chat, db, semantic,
+    catalog, chat, db, media, semantic,
     youtube_subtitles::{self, YoutubeSubtitlesConfig},
 };
 
@@ -26,6 +26,7 @@ use super::tools::{
 pub struct ChatMcpServer {
     api: Arc<ChatReadApi>,
     youtube_subtitles: Option<Arc<YoutubeSubtitlesConfig>>,
+    telegram_media: Option<media::TelegramMediaConfig>,
 }
 
 impl ChatMcpServer {
@@ -33,11 +34,17 @@ impl ChatMcpServer {
         Self {
             api,
             youtube_subtitles: None,
+            telegram_media: None,
         }
     }
 
     pub fn with_youtube_subtitles(mut self, config: Option<YoutubeSubtitlesConfig>) -> Self {
         self.youtube_subtitles = config.map(Arc::new);
+        self
+    }
+
+    pub fn with_telegram_media(mut self, config: Option<media::TelegramMediaConfig>) -> Self {
+        self.telegram_media = config;
         self
     }
 
@@ -147,6 +154,17 @@ impl ChatMcpServer {
         youtube_subtitles::get_subtitles(self.youtube_subtitles.as_deref(), input)
             .await
             .map(Json)
+    }
+
+    #[tool(
+        name = "chat.get_media",
+        description = "Возвращает фотографию или небольшой документ из сообщения публичного чата. Поддерживаются только фото и документы размером не больше 5 MiB; видео, аудио и произвольные файлы не выдаются."
+    )]
+    async fn get_media(
+        &self,
+        Parameters(input): Parameters<media::GetMediaInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        media::get_media(&self.api, self.telegram_media.as_ref(), input).await
     }
 
     #[tool(
