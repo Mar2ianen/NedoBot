@@ -12,6 +12,7 @@ use crate::telegram::service_messages::{self, MessageAudience};
 
 /// Transport wiring for stats commands. Data is assembled in `service`; output is
 /// formatted in the selected renderer. Neither renderer has database access.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_chat_stats(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
