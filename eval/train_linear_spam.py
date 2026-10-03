@@ -53,7 +53,13 @@ def main() -> None:
     vectorizer.fit(fit_texts)
     train_texts = alt_train_texts + ours_spam_train + ours_ham_train
     train_labels = alt_train_labels + [1] * len(ours_spam_train) + [0] * len(ours_ham_train)
-    weights = [1.0] * len(alt_train_texts) + [8.0] * (len(ours_spam_train) + len(ours_ham_train))
+    # Наш ham — лучший ham (точный домен), наш спам — золото: вес выше.
+    # ALT-часть даёт широту жанров и регуляризацию от переобучения на ~200 образцах.
+    weights = (
+        [1.0] * len(alt_train_texts)
+        + [8.0] * len(ours_spam_train)
+        + [2.0] * len(ours_ham_train)
+    )
     model = LogisticRegression(max_iter=1000, C=4.0)
     model.fit(vectorizer.transform(train_texts), train_labels, sample_weight=weights)
     print("== alt-gnome holdout ==", file=sys.stderr)
