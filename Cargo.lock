@@ -313,7 +313,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3184,14 +3184,19 @@ dependencies = [
 
 [[package]]
 name = "teloxide-antispam"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=1d8dcbc5738b8d77592bc75976aa01e06e1226cb#1d8dcbc5738b8d77592bc75976aa01e06e1226cb"
 dependencies = [
  "anyhow",
  "chrono",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
  "tracing",
+ "unicode-normalization",
+ "unicode-properties",
+ "unicode-script",
 ]
 
 [[package]]
@@ -3633,6 +3638,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3862,7 +3873,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

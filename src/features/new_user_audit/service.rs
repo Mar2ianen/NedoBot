@@ -350,6 +350,15 @@ async fn load_first_message_score_context(
         // в materialize через ScoreComponents.first_message_embedding.
         embedding: Some(embedding),
         linear_spam_probability,
+        linear_spam_model_version: config
+            .linear_spam_model
+            .as_ref()
+            .map(|model| model.version.clone()),
+        text_observations: Some(teloxide_antispam::preprocess::prepare_text(&text).flags),
+        linear_spam_calibration: config
+            .linear_spam_model
+            .as_ref()
+            .map(|model| model.calibration.clone()),
     })
 }
 

@@ -747,6 +747,10 @@ fn human_signals(signals: &Value) -> String {
                         .map(human_marker),
                 );
             }
+            if signal.get("label").and_then(Value::as_str) == Some("first_message_text_observation")
+            {
+                labels.extend(human_text_observations(signal));
+            }
             labels
         })
         .collect::<Vec<_>>();
@@ -759,6 +763,32 @@ fn human_signals(signals: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn human_text_observations(signal: &Value) -> Vec<String> {
+    let mut labels = Vec::new();
+    let flags = &signal["text_observations"];
+    if flags["nfkc_changed"].as_bool() == Some(true) {
+        labels.push("Unicode: совместимые формы/шрифты нормализованы".to_owned());
+    }
+    for (key, name) in [
+        ("mixed_script_words", "слова со смешанными алфавитами"),
+        ("homoglyph_chars", "замены похожих букв"),
+        ("removed_invisible_chars", "невидимые символы внутри текста"),
+        ("bidi_controls", "управление направлением текста"),
+        ("removed_word_variation_selectors", "селекторы внутри слов"),
+        ("removed_stacked_marks", "стэки диакритики"),
+        ("spaced_letter_sequences", "растянутые слова"),
+        ("long_repeated_letter_runs", "длинные повторы букв"),
+    ] {
+        if let Some(count) = flags[key].as_u64().filter(|&count| count > 0) {
+            labels.push(format!("Unicode: {name}: {count}"));
+        }
+    }
+    if let Some(probability) = signal["linear_spam_probability"].as_f64() {
+        labels.push(format!("Локальная модель: p={probability:.3}"));
+    }
+    labels
 }
 
 fn human_marker(marker: &str) -> String {
@@ -799,6 +829,7 @@ fn human_label(label: &str) -> &str {
         "mixed_script_profile_homoglyphs" => {
             "в имени смешаны похожие латинские и кириллические буквы"
         }
+        "first_message_text_observation" => "Разбор текста: наблюдения без самостоятельного штрафа",
         "explicit_adult_promo_bio" => "bio рекламирует adult-сервис через ссылку или воронку",
         "personal_channel_attached" => "подключён личный канал",
         "llm_personal_channel_content_promotion" => {
@@ -969,6 +1000,21 @@ mod tests {
 
         assert!(human_signals(&unified).contains("перевод разговора в личные сообщения"));
         assert!(human_signals(&additional).contains("обещание лёгкой оплачиваемой работы"));
+    }
+
+    #[test]
+    fn text_observations_render_facts_without_calling_them_spam() {
+        let signals = serde_json::json!([{
+            "label": "first_message_text_observation", "coefficient": 0,
+            "linear_spam_probability": 0.2,
+            "text_observations": {"nfkc_changed": true, "homoglyph_chars": 3, "bidi_controls": 1},
+        }]);
+        let rendered = human_signals(&signals);
+        assert!(rendered.contains("без самостоятельного штрафа"));
+        assert!(rendered.contains("замены похожих букв: 3"));
+        assert!(rendered.contains("управление направлением текста: 1"));
+        assert!(rendered.contains("p=0.200"));
+        assert!(!rendered.contains("растянутые слова"));
     }
 
     #[test]
