@@ -102,8 +102,7 @@ pub struct NewUserFeatures {
     pub personal_channel_username: Option<String>,
     pub personal_channel_message_count: Option<i32>,
     pub personal_channel_last_message_id: Option<i32>,
-    pub personal_channel_last_message_at:
-        Option<chrono::DateTime<chrono::Utc>>,
+    pub personal_channel_last_message_at: Option<chrono::DateTime<chrono::Utc>>,
     pub personal_channel_last_text: Option<String>,
     pub personal_channel_has_adult_links: bool,
     pub personal_channel_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1678,7 +1677,8 @@ pub fn id_bucket(user_id: i64) -> String {
         _ => "gte_10b",
     }
     .to_string()
-}#[cfg(test)]
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

@@ -46,25 +46,6 @@ fn analysis_config_from_runtime(config: &Config) -> NewUserAnalysisConfig {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Сохраняет baseline, ревизию снимка и unified-audit job одной транзакцией.
 /// Между baseline и job нет окна, в котором materializer может увидеть
 /// несогласованное состояние.
@@ -641,47 +622,6 @@ async fn load_features(
     }))
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn audit_insert_columns() -> &'static [&'static str] {
     &[
         "chat_id",
@@ -1044,34 +984,6 @@ async fn save_audit_in_transaction(
 
     Ok(())
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[derive(Debug, Clone)]
 struct DcParseResult {
