@@ -285,6 +285,10 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 Перед выкладкой прошли `cargo fmt -- --check`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` и `./scripts/test.sh` (чистые PostgreSQL migrations, manual moderation и Chat DB MCP integration tests). На VPS release build и restart прошли, все сервисы active, startup log не содержит ошибок profile/migration, MCP endpoints отвечают ожидаемыми `403` локально и `405` публично. Telegram `/ping` и `/ask` в отдельном тестовом чате не запускались: локальной конфигурации dev-бота/тестового чата нет. Порядок выкладки и rollback описан в [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
 
+### Dry-run автомодерации 2026-10-03
+
+Выкачен `feat/spam-moderation-backend-v2` (крейт `teloxide-antispam`, labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) прямым rsync в `/opt/tg-ai-bot-teloxide`, release build + restart. Включено: `enforce_enabled=true`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, `nn_spam_enabled=true`, CAS выкл. Таргет недели: FPR ≤ 0.0001%, детект ≥ 99.9% (см. New User Audit). LOLS-синк ежечасно в :17 (`sync_lols_banlist`, cron root), бэкфилл эмбеддингов спамеров выполнен.
+
 
 - код: `/opt/tg-ai-bot-teloxide`
 - Postgres: Podman container `tg-ai-bot-postgres`
