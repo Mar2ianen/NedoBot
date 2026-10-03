@@ -789,6 +789,11 @@ fn human_label(label: &str) -> &str {
         "only_channel_post_comments" => "комментирует только посты канала",
         "reply_to_channel_post_not_comment" => "ответил прямо на пост, не на обсуждение",
         "display_name_reused_by_spammers" => "имя уже встречалось у размеченных спамеров",
+        "personal_channel_title_reused_by_spammers" => {
+            "название личного канала уже встречалось у размеченных спамеров"
+        }
+        "identity_display_name_rotation" => "пользователь менял отображаемое имя",
+        "identity_username_rotation" => "пользователь менял username",
         "username_random_suffix" => "username похож на автоматически созданный",
         "mixed_script_profile_homoglyphs" => {
             "в имени смешаны похожие латинские и кириллические буквы"

@@ -428,6 +428,9 @@ async fn load_features(
             coalesce(pctr.reuse_count, 0)::bigint as personal_channel_title_reuse_count,
             coalesce(pctr.reuse_spammer_count, 0)::bigint
                 as personal_channel_title_reuse_spammer_count,
+            coalesce(ident.snapshot_count, 0)::bigint as identity_snapshot_count,
+            coalesce(ident.display_name_count, 0)::bigint as identity_display_name_count,
+            coalesce(ident.username_count, 0)::bigint as identity_username_count,
             p.personal_channel_username,
             p.personal_channel_message_count,
             p.personal_channel_last_message_id,
@@ -517,6 +520,14 @@ async fn load_features(
               and lower(trim(p2.personal_channel_title)) = lower(trim(p.personal_channel_title))
               and p2.telegram_user_id <> p.telegram_user_id
         ) pctr on true
+        left join lateral (
+            select
+                count(*)::bigint as snapshot_count,
+                count(distinct display_name_normalized)::bigint as display_name_count,
+                count(distinct username_normalized)::bigint as username_count
+            from telegram_profile_identity_observations o
+            where o.telegram_user_id = cu.telegram_user_id
+        ) ident on true
         where cu.chat_id = $1 and cu.telegram_user_id = $2
         "#,
     )
@@ -604,6 +615,9 @@ async fn load_features(
             personal_channel_title_reuse_count: row.get("personal_channel_title_reuse_count"),
             personal_channel_title_reuse_spammer_count: row
                 .get("personal_channel_title_reuse_spammer_count"),
+            identity_snapshot_count: row.get("identity_snapshot_count"),
+            identity_display_name_count: row.get("identity_display_name_count"),
+            identity_username_count: row.get("identity_username_count"),
             personal_channel_username: row.get("personal_channel_username"),
             personal_channel_message_count: row.get("personal_channel_message_count"),
             personal_channel_last_message_id: row.get("personal_channel_last_message_id"),
