@@ -750,6 +750,7 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "risk_profile",
         "risk_profile_version",
         "telegram_id_model_version",
+        "telegram_user_id_spam_probability",
         "raw_features",
     ]
 }
@@ -966,6 +967,7 @@ async fn save_audit_in_transaction(
         values.push_bind(&config.risk_profile);
         values.push_bind(&config.risk_profile_version);
         values.push_bind(&config.telegram_id_model_version);
+        values.push_bind(telegram_id_spam_probability);
         values.push_bind(raw_features);
     }
 

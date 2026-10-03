@@ -48,7 +48,11 @@ def main() -> None:
     export_dirs = sys.argv[1:] or sorted(glob.glob(EXPORT_GLOB))
     all_ham = []
     for export_dir in export_dirs:
-        result_path = os.path.join(export_dir, "result.json")
+        result_path = (
+            export_dir
+            if export_dir.endswith(".json")
+            else os.path.join(export_dir, "result.json")
+        )
         if not os.path.exists(result_path):
             print(f"skip {export_dir}: no result.json", file=sys.stderr)
             continue
@@ -66,7 +70,29 @@ def main() -> None:
 
 def process_export(path: str) -> list:
     with open(path, encoding="utf-8") as handle:
-        data = json.load(handle)
+        text = handle.read()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # Обрезанный экспорт: забираем все целые сообщения потоково.
+        start = text.index('"messages"')
+        start = text.index("[", start) + 1
+        decoder = json.JSONDecoder()
+        data_messages = []
+        index = start
+        while True:
+            while index < len(text) and text[index] in " \t\r\n,":
+                index += 1
+            if index >= len(text) or text[index] != "{":
+                break
+            try:
+                message, end = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                break
+            data_messages.append(message)
+            index = end
+        data = {"name": path, "messages": data_messages}
+        print(f"salvaged={len(data_messages)}", file=sys.stderr)
     print(f"chat={data.get('name')} type={data.get('type')}", file=sys.stderr)
     messages = data.get("messages", [])
     print(f"total={len(messages)}", file=sys.stderr)
