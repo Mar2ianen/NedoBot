@@ -281,13 +281,19 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий production release на `vps-153` зафиксирован immutable tag [`deploy-2026-10-01-service-messages`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-01-service-messages) на commit `7209160`. Он добавляет автоудаление join/leave уведомлений, шаблоны приветствия/прощания и Telegram Bot API 10.3 ephemeral-ответы с сохранением forum topic. В production profile `delete_join_leave_messages` и `ephemeral_command_replies` оставлены `false`; включение выполняется отдельно для чата.
+Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-03-antispam-v2`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-03-antispam-v2) на commit `e073f8ad9d5f4469465a3628eb20f8703b78c406` (merge PR #21). Проверенный deploy: **2026-10-03 21:00 UTC / 2026-10-04 00:00 МСК**. Предыдущий service-messages release остаётся в истории под `deploy-2026-10-01-service-messages` / `7209160`.
 
-Перед выкладкой прошли `cargo fmt -- --check`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` и `./scripts/test.sh` (чистые PostgreSQL migrations, manual moderation и Chat DB MCP integration tests). На VPS release build и restart прошли, все сервисы active, startup log не содержит ошибок profile/migration, MCP endpoints отвечают ожидаемыми `403` локально и `405` публично. Telegram `/ping` и `/ask` в отдельном тестовом чате не запускались: локальной конфигурации dev-бота/тестового чата нет. Порядок выкладки и rollback описан в [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
+Релиз подключает отдельный `teloxide-antispam v0.2.0` (`1d8dcbc`), Unicode word/char модель `alt-word-char-v2-2026-10-03` и пороги `alt-word-char-validation-2026-10-03-v1`. На VPS **`enforce_enabled=false`, `enforce_dry_run=true`**: расчёт риска/аудит продолжаются, автоматических банов и удалений сообщений этой лестницей нет. Настройки доставки ревью, reviewer/owner, LLM topology, `.env` и секреты сохранены. PVO и public MCP не перезапускались.
 
-### Dry-run автомодерации 2026-10-03
+Binary собран с `--locked --release` из `01a8fd2`; его Git tree `dad21de29726e119d5ef6add1ff90fc12196ca1e` точно совпадает с release commit. SHA256 running executable: `747c84ce6f41dc2df83c6e4336cd4842ea8de651248c0eb99035fb45b944b5d5`; модель: `b90d9ebae22abde31238269e595164e41025ddf4e0d1c40d5ba1810f387b2d63`. Metadata — `/opt/tg-ai-bot-teloxide/.release.json`; предыдущие binary/profile сохранены в `/opt/tg-ai-bot-teloxide/backups/deploy-2026-10-03-antispam-v2/`. Для rollback исполняемый файл заменять **атомарно через временный файл и rename**, не перезаписывать running executable (Linux ETXTBSY).
 
-Выкачен `feat/spam-moderation-backend-v2` (крейт `teloxide-antispam`, labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) прямым rsync в `/opt/tg-ai-bot-teloxide`, release build + restart. Включено: `enforce_enabled=true`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, `linear_spam_enabled=true`, CAS выкл. Таргет недели: FPR ≤ 0.0001%, детект ≥ 99.9% (см. New User Audit). LOLS-синк ежечасно в :17 (`sync_lols_banlist`, cron root), бэкфилл эмбеддингов спамеров выполнен.
+Перед выкладкой прошли feature matrix и CI отдельного крейта, CI PR #21, fmt, all-target tests, all-feature Clippy и PostgreSQL integration suite (миграции, audit materialization, manual moderation, MCP). После restart проверены active service, совпадение хеша `/proc/<pid>/exe` с release binary и startup-события загрузки новой модели/calibration. За 35-секундное окно наблюдения application ERROR отсутствовали. Telegram smoke-команды не отправлялись. Датасеты/экспорты/ChatKeeper/прототипы не публикуются; публичны код, методика обучения, aggregate metrics и веса модели. Дальнейшие изменения идут в `dev`, не выдаются за автоматически задеплоенный `HEAD`.
+
+При предыдущем service-messages release проверялись также MCP endpoints (`403` локально / `405` публично); эти проверки не выдаются за повторённые при текущем antispam-deploy. Порядок выкладки и rollback описан в [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
+
+### Предыдущая dry-run выкладка автомодерации 2026-10-03
+
+Ранее `feat/spam-moderation-backend-v2` (labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) выкатывался прямым rsync/build/restart с `enforce_enabled=true`, `enforce_dry_run=true`, ban threshold 90 и v1-моделью. Эта запись историческая: фактические текущие binary/model/flags указаны выше под deployment tag. Цели FPR ≤0.0001% и recall ≥99.9% пока не подтверждены. LOLS-синк настроен ежечасно в :17; отсутствие committed rows/locking остаётся отдельной нерешённой задачей, не гарантией работающего зеркала.
 
 
 - код: `/opt/tg-ai-bot-teloxide`
