@@ -15,7 +15,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
-ALT_DATASET = "alt-gnome/telegram-spam"
+ALT_DATASET = "alt-gnome/telegram-spam-20251030"
 MODEL_VERSION = "linear_spam_word12_v1"
 MODEL_PATH = "models/linear_spam_word12_v1.json"
 
