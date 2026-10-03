@@ -281,7 +281,13 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий production release на `vps-153` фиксируется immutable tag [`deploy-2026-08-05-forwarded-message-provenance`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-05-forwarded-message-provenance) после успешной сборки и post-deploy smoke. В него входят model-driven `/ask`, native tool orchestration, trusted author evidence из chat tools, короткая выдача только по релевантным совпадениям и provenance ручных/автоматических пересылок. Предыдущие `/ask` releases: [`deploy-2026-08-05-ask-focused-answers`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-05-ask-focused-answers), [`deploy-2026-08-05-ask-author-evidence`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-05-ask-author-evidence) и [`deploy-2026-08-05-ask-model-tools`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-05-ask-model-tools); более ранние releases: [`deploy-2026-08-02-semantic-rich-text`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-02-semantic-rich-text), [`deploy-2026-08-02-drafter-time-rendering`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-08-02-drafter-time-rendering), [`deploy-2026-07-31-teloxide-fork`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-teloxide-fork), [`deploy-2026-07-31-v0.12.0`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-v0.12.0), [`deploy-2026-07-31-voice-flow`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-31-voice-flow) и [`deploy-2026-07-30-unified-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-07-30-unified-audit). Полный порядок dry-run, выкладки, проверки, rollback и фиксации tag описан в [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
+Текущий production release на `vps-153` зафиксирован immutable tag [`deploy-2026-10-01-service-messages`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-01-service-messages) на commit `7209160`. Он добавляет автоудаление join/leave уведомлений, шаблоны приветствия/прощания и Telegram Bot API 10.3 ephemeral-ответы с сохранением forum topic. В production profile `delete_join_leave_messages` и `ephemeral_command_replies` оставлены `false`; включение выполняется отдельно для чата.
+
+Перед выкладкой прошли `cargo fmt -- --check`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` и `./scripts/test.sh` (чистые PostgreSQL migrations, manual moderation и Chat DB MCP integration tests). На VPS release build и restart прошли, все сервисы active, startup log не содержит ошибок profile/migration, MCP endpoints отвечают ожидаемыми `403` локально и `405` публично. Telegram `/ping` и `/ask` в отдельном тестовом чате не запускались: локальной конфигурации dev-бота/тестового чата нет. Порядок выкладки и rollback описан в [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
+
+### Dry-run автомодерации 2026-10-03
+
+Выкачен `feat/spam-moderation-backend-v2` (крейт `teloxide-antispam`, labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) прямым rsync в `/opt/tg-ai-bot-teloxide`, release build + restart. Включено: `enforce_enabled=true`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, `linear_spam_enabled=true`, CAS выкл. Таргет недели: FPR ≤ 0.0001%, детект ≥ 99.9% (см. New User Audit). LOLS-синк ежечасно в :17 (`sync_lols_banlist`, cron root), бэкфилл эмбеддингов спамеров выполнен.
 
 
 - код: `/opt/tg-ai-bot-teloxide`
@@ -410,16 +416,36 @@ ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 - `promo_dm_bait` - промо через “могу отправить/поделиться/пишите в личку”, тематика может быть разная, но механика одна.
 - `adult_personal_channel_promo` - личный/personal channel пользователя ведёт на adult-промо, инвайт-ссылки или схожий funnel.
 - Для первого текстового сообщения сохраняются LLM-маркеры кампании, RuBERT-вектор и сходство с вручную подтверждённым спамом. Эти сигналы лишь повышают review-риск; автоматической пометки спамером нет.
+- Эмбеддинг первого сообщения персистится в `telegram_new_user_profile_audits.first_message_embedding` при материализации аудита и пополняет корпус для будущих `spam_similarity`-проверок; история скоринга при этом не пересчитывается. Пустой корпус заполняется бинарём `backfill_audit_embeddings` (`DATABASE_URL` + `RAG_EMBEDDING_*`, флаги `--only-spammers`/`--all`, `--chat-id`, `--limit`).
+- Template-матчинг (`template_match_count`) сравнивает первое сообщение с текстами из `telegram_messages`, у которых выставлен `spam_marked_at`. Ручная разметка обязана штамповать сообщения (`spam_marked_at`, `spam_source='manual_owner_confirmation'`), иначе помеченные спамеры не попадают в корпус: `is_spammer` на пользователе недостаточно.
+- Повтор title личного канала на размеченных спамерах — сильный сигнал reuse (`personal_channel_title_reused_by_spammers`, +24): операторы клонируют фуннель-каналы под каждый аккаунт, chat_id различается, а нормализованный title совпадает. Реюз считается и через `shared_spam_reputation` соседнего инстанса.
+- Ротация identity (`identity_display_name_rotation` +12, `identity_username_rotation` +8): смена имён/юзернеймов между profile refresh фиксируется в `telegram_profile_identity_observations`, ротация — маркер операторов.
+- LOLS-зеркало (`lols_spam_users`, bin `sync_lols_banlist`, сигнал `lols_spammer_identity` +50): почасовой дамп `lols.bot/spam/banlist.txt` (~3.6M user_id) сворачивается локально через temp swap, lookup в baseline без сети. Замер: 11/11 подтверждённых спамеров в LOLS против 0/8 в CAS.
+- CAS (Combot Anti-Spam, `api.cas.chat`) подключён как слабый внешний сигнал за флагом `moderation.cas_enabled` (`cas_timeout_sec`, default 5, валидация 1..30): положительный вердикт даёт не более +12 (`EXTERNAL_SCORE_CAP`) и никогда сам не выводит в high; «Record not found» и любые ошибки трактуются как unknown/clean и ничего не добавляют. Замер на 8 подтверждённых спамерах НедоNews/PVO: покрытие CAS 0/8.
+- Лестница автомодерации (`moderation.enforce_enabled=false`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, валидация 50..100, требует `moderation.enabled`): свежий materialize-аудит моложе 24ч — review-порог удаляет первое сообщение (карточка идёт как обычно), ban-порог банит, удаляет до 10 недавних сообщений и пишет System-метку в корпус. Replay старых аудитов никогда не исполняется. Идемпотентность по `is_spammer` и System-метке; снятие бана — вручную `/unban` (решение видно в `moderation_decision_journal`).
+- Линейный скоринг первого сообщения (`moderation.linear_spam_enabled=false`, `linear_spam_model_path`, загрузка на старте): TF-IDF + LogReg, инференс в `teloxide_antispam::logreg`. Формат `analyzer="word_12_lower"` сохраняет legacy word 1–2, raw-текст и f32-веса `models/linear_spam_word12_v1.json`; новые правила нормализации к нему не применяются. Обучение v1 описано в `eval/train_linear_spam.py`; сырые локальные тексты не коммитятся. Вероятность — только supporting-вес (p≥0.9 → +18, p≥0.75 → +10), не самостоятельное основание наказания; метрики текстовой модели не равны метрикам всей модерации.
+- Новый явно версионированный формат `analyzer="unicode_word_char_v2"`, `preprocessing="unicode-spam-v2"`: NFKC, строгие токен-локальные Latin/Greek↔Cyrillic гомоглифы, обработка invisible/bidi/Zalgo с сохранением emoji ZWJ и обычных й/ё/акцентов, отдельный auxiliary view растянутых слов. Word 1–2 и char_wb 3–5 имеют собственные TF-IDF/L2-блоки; `word` и `character` содержат `vocab` (term→idf), `coef` в лексикографическом порядке терминов и явный `weight`; общий `intercept` и веса — f64. Неизвестные preprocessing/analyzer и лишние feature-блоки отклоняются при загрузке. Для использования v2 нужен отдельный проверенный артефакт и явное изменение deployment-пути; наличие поддержки в коде не переключает production с v1.
+- Наблюдения Unicode/форматирования, версия локальной модели и её calibration сохраняются в `risk_first_message_signals` как `first_message_text_observation` с `coefficient=0`, `decision="observation_only"`; они отображаются в карточке ревью **без самостоятельного штрафа**. Низкие вероятности также сохраняются, чтобы аудит не ограничивался положительными срабатываниями. Оригинальный текст, embedding и LLM input не подменяются model view. Материализация имеет версию `unified-audit-materialization-v4`.
+- `teloxide-antispam` теперь самостоятельный [репозиторий](https://github.com/Mar2ianen/teloxide-antispam), релиз `v0.2.0`; бот использует pinned Git revision `1d8dcbc5738b8d77592bc75976aa01e06e1226cb` и явно включает `scoring`, `classifier`, `cas`. Встроенного workspace-крейта больше нет. Библиотека не зависит от NedoBot/SQL/Telegram fork/LLM; собственные Cargo features позволяют отключить сеть или оставить только classifier. Harness `cargo run --example score_text -- <model.json>` запускается из отдельного репозитория, читает JSONL (`id`, `text`) и не обращается к Telegram/SQL.
+- Калибровка ALT v2 — **выбор operating points**, не калибровка posterior probability или полного антиспама: p≥0.9 → +10, p≥0.9747144300743944 → +18, иначе 0. Пороги выбраны на validation; 10/18 — прежние supporting-веса, не обученные веса полного пайплайна. Test: 93.87% recall / 2 FP для supporting; 84.50% / 0 FP для strong на 3180 spam / 3305 ham. Ноль FP означает лишь примерно 0.0906% верхнюю FPR при предположении независимости, а не достижение 0.0001%. Candidate selection уже видел test, поэтому нужен новый независимый локальный holdout. Полная [model card](https://github.com/Mar2ianen/teloxide-antispam/blob/v0.2.0/docs/ALT_MODEL_CARD.md) и optional ALT-only модель опубликованы в отдельном релизе; приватные экспорты/ChatKeeper/прототипы не публикуются.
+- Для оценки классификатора нужны отдельно проверенные метки сообщений: неразмеченный экспорт не равен ham, бан аккаунта не делает каждое его сообщение spam, а вердикт чужого детектора не является gold-разметкой. Split должен исключать пересечения по авторам/шаблонам и учитывать время; синтетическая устойчивость к гомоглифам не доказывает целевую FPR автомодерации. Нулевая ошибка на небольшой выборке также не подтверждает FPR ≤0.0001%.
 
-Для каждого нового пользователя бот сохраняет один audit-запрос в
-`spam_review_requests`, включая low и medium risk. Карточка для ревью с тегом
-`@Chechulinm` отправляется только когда актуальный `risk_score >= 70` (`high`):
-порог проверяется и перед Telegram API call, и DB constraint'ом при claim/delivery.
-Пользователь с меньшим score не может получить карточку даже при ошибочном caller-е.
+`spam_review_requests` — сохраняемый read-model ревью-аудита, а не гарантия
+отправки карточки каждому новому пользователю. Маршрут, включение доставки,
+reviewer/owner и risk profile задаются конфигурацией инстанса. В текущем
+delivery-path сравниваются актуальные `risk_score` и сохранённый `review_threshold`;
+фиксированные `70` и `@Chechulinm` не являются универсальным контрактом.
+Проверки выполняются при claim и финализации доставки; выключенная доставка
+подавляет pending-уведомления, не отключая сбор аудита.
 Поздние сигналы аватара или первого сообщения могут сделать уже сохранённый audit
 доставляемым. Кнопки «Верно: спамер» и «Неверно: не спамер» доступны только
-`runtime.owner_telegram_id`; первое решение атомарно закрывает запрос и убирает
-клавиатуру. Технические labels риска в карточке переводятся в понятные причины. Кнопки доступны только владельцу, заданному через `runtime.owner_telegram_id`.
+авторизованным reviewer/owner согласно moderation-конфигурации; решение закрывает запрос и убирает
+клавиатуру. Технические labels риска в карточке переводятся в понятные причины.
+Все решения пишутся через единый writer `features::labels`: событие в
+`spam_label_events` + флаги пользователя + штампы сообщений. Без события
+reuse-сигналы и template-корпус помеченного не видят. Команда `/notspam`
+reply (reviewer: configured reviewer, owner или админ чата) пишет `not_spam`
+и снимает пометку — так собираются confirmed-ham примеры для классификатора.
 
 Посмотреть последние сообщения:
 
@@ -599,6 +625,15 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 
 Ключевая таблица: `telegram_new_user_profile_audits`. В ней сохраняются классы риска, labels/reasons, возраст в чате, reply/comment context, текстовая повторяемость, профиль/персональный канал, наличие/метрики фото. `profile_photo_reuse_count` сейчас метрика only и не добавляет risk score.
 
+### Целевые метрики антиспама
+
+Таргет, к которому идём (зафиксирован 2026-10-03, неделя наблюдения в dry-run):
+
+- False positive rate ≤ 0.0001% — легитимный пользователь практически никогда не должен получать enforcement. Операционно: 0 подтверждённых ложных банов/удалений в неделю; каждый спорный кейс разбирается через `moderation_decision_journal` и `/notspam`.
+- Spam detection rate ≥ 99.9% — пропущенный спам измеряется по review-очереди (`risk_score < review_threshold`, но подтверждённый спам задним числом) плюс ручной досмотр выборки.
+
+Замер недели: dry-run решения (`enforce_dry_run=true`) логируются, review-карточки идут как обычно; в конце недели сверяем dry-run ban/delete против фактически подтверждённых (`spam_label_events`) и считаем precision/recall лестницы.
+
 ## Метрики И Отладка
 
 Отсечки периодов:
@@ -708,7 +743,7 @@ cargo run --bin job_lifecycle_report
 
 Команде требуется только `DATABASE_URL`; она не создаёт `Config`, не проверяет LLM/Telegram secrets и не запускает миграции. Все запросы определены в typed read-model `features::jobs::observability` и выполняются внутри `SET TRANSACTION READ ONLY`.
 
-Отчёт охватывает `first-comments`, `embeddings`, `post-history` и `reviews`: число jobs и суммарные attempts по статусу, `oldest_ready_age` для старейшей due initial/retry job, безопасные группы `error_kind` с attempts и terminal failures, а также суммарный `lease_reclaim_count`. Expired processing leases не входят в ready-age. Для reviews predicate совпадает с ready-частью production claim: `status = pending`, `risk_score >= 70`, notification `pending/retry_wait` и due time. Неизвестный persisted error kind не выводится: он агрегируется как `other`. Для embeddings отдельно показан текущий счётчик rows с `embedding_batch_cardinality`.
+Отчёт охватывает `first-comments`, `embeddings`, `post-history` и `reviews`: число jobs и суммарные attempts по статусу, `oldest_ready_age` для старейшей due initial/retry job, безопасные группы `error_kind` с attempts и terminal failures, а также суммарный `lease_reclaim_count`. Expired processing leases не входят в ready-age. Для reviews predicate совпадает с ready-частью production claim: `status = pending`, `risk_score >= review_threshold`, notification `pending/retry_wait` и due time. Неизвестный persisted error kind не выводится: он агрегируется как `other`. Для embeddings отдельно показан текущий счётчик rows с `embedding_batch_cardinality`.
 
 `lease_reclaim_count` сохраняется в доменной таблице и увеличивается только когда worker действительно забирает просроченную `processing` lease. Обычный claim из `pending`/`retry` и повторная попытка после явной failure-finalization его не увеличивают. Для reviews используется аналогичное поле `notification_lease_reclaim_count` её delivery lifecycle.
 
@@ -723,13 +758,13 @@ select
     count(*) as total_reviews,
     count(*) filter (
         where status = 'pending'
-          and risk_score >= 70
+          and risk_score >= review_threshold
           and notification_status = 'processing'
           and notification_lease_expires_at <= now()
     ) as expired_processing_ready,
     count(*) filter (
         where status = 'pending'
-          and risk_score >= 70
+          and risk_score >= review_threshold
           and notification_status in ('pending', 'retry_wait')
           and notification_next_attempt_at <= now()
     ) as due_initial_or_retry
@@ -743,7 +778,7 @@ explain (analyze, buffers)
 select id
 from spam_review_requests
 where status = 'pending'
-  and risk_score >= 70
+  and risk_score >= review_threshold
   and notification_status = 'processing'
   and notification_lease_expires_at <= now()
 order by notification_lease_expires_at, id
@@ -757,7 +792,7 @@ explain (analyze, buffers)
 select id
 from spam_review_requests
 where status = 'pending'
-  and risk_score >= 70
+  and risk_score >= review_threshold
   and (
     (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
     or (notification_status = 'processing' and notification_lease_expires_at <= now())

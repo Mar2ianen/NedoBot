@@ -31,6 +31,9 @@ pub enum Command {
     #[cfg(feature = "moderation")]
     #[command(description = "пожаловаться на сообщение reply; /report [причина]")]
     Report(String),
+    #[cfg(feature = "moderation")]
+    #[command(description = "пометить сообщение reply как не спам (reviewer)")]
+    Notspam(String),
     #[cfg(feature = "manual-moderation")]
     #[command(
         description = "ограничить участника на 1 день или указанный срок; причина необязательна"

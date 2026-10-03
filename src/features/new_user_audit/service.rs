@@ -13,14 +13,14 @@ use crate::features::new_user_audit::repo::{
     mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
     mark_new_user_audit_retry, materialize_new_user_audit_job,
 };
-use crate::features::new_user_audit::scoring::{
-    FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment, spam_similarity,
-    template_match_count,
-};
-use crate::features::new_user_audit::types::NewUserAuditAssessment;
+use crate::features::new_user_audit::scoring::{spam_similarity, template_match_count};
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::{LlmTransportError, StructuredOutput};
+use teloxide_antispam::assessment::NewUserAuditAssessment;
+use teloxide_antispam::scoring::{
+    FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment,
+};
 
 /// Обрабатывает одну готовую unified-audit job.
 ///
@@ -40,36 +40,52 @@ pub async fn process_next_new_user_audit_job(
 }
 
 async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
-    let result = if job.is_materialization_replay {
-        materialize_stored_assessment(pool, config, job).await
-    } else {
-        generate_and_finalize(bot, pool, config, job).await
-    };
-    let Err(error) = result else { return };
-
     if job.is_materialization_replay {
-        if let Some(sqlx::Error::Database(database_error)) = error.downcast_ref::<sqlx::Error>() {
-            tracing::warn!(
-                job_id = job.id,
-                sqlstate = ?database_error.code(),
-                constraint = ?database_error.constraint(),
-                "new user audit materialization hit a database error"
-            );
+        match materialize_stored_assessment(pool, config, job).await {
+            Ok(Some(score)) => {
+                if let Err(error) = crate::features::auto_moderation::maybe_enforce_audit(
+                    bot, pool, config, job, score,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        job_id = job.id,
+                        %error,
+                        "auto moderation enforcement failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(sqlx::Error::Database(database_error)) =
+                    error.downcast_ref::<sqlx::Error>()
+                {
+                    tracing::warn!(
+                        job_id = job.id,
+                        sqlstate = ?database_error.code(),
+                        constraint = ?database_error.constraint(),
+                        "new user audit materialization hit a database error"
+                    );
+                }
+                let failure = classify_materialization_failure(&error);
+                let (result, error_kind) = match failure {
+                    MaterializationFailure::Retry { error_kind } => (
+                        mark_new_user_audit_materialization_retry(pool, job, error_kind).await,
+                        error_kind,
+                    ),
+                    MaterializationFailure::Stale { error_kind } => (
+                        mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
+                        error_kind,
+                    ),
+                };
+                log_materialization_failure(result, job, error_kind);
+                return;
+            }
         }
-        let failure = classify_materialization_failure(&error);
-        let (result, error_kind) = match failure {
-            MaterializationFailure::Retry { error_kind } => (
-                mark_new_user_audit_materialization_retry(pool, job, error_kind).await,
-                error_kind,
-            ),
-            MaterializationFailure::Stale { error_kind } => (
-                mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
-                error_kind,
-            ),
-        };
-        log_materialization_failure(result, job, error_kind);
         return;
     }
+    let result = generate_and_finalize(bot, pool, config, job).await;
+    let Err(error) = result else { return };
 
     let failure = classify_audit_failure(&error);
     let result = match failure {
@@ -114,7 +130,7 @@ async fn materialize_stored_assessment(
     pool: &PgPool,
     config: &Config,
     job: &NewUserAuditJob,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<i32>> {
     let assessment_json = job
         .assessment_json
         .as_ref()
@@ -124,22 +140,37 @@ async fn materialize_stored_assessment(
     let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
     let first_message_context =
         load_first_message_score_context(pool, config, job, &assessment).await?;
-    let components = score_assessment(
+    let mut components = score_assessment(
         baseline_score,
         baseline_signals,
         &assessment,
         first_message_context,
         job.review_threshold,
     );
-    let finalized = materialize_new_user_audit_job(pool, job, &components).await?;
+    // CAS — слабый внешний сигнал: положительный вердикт добавляет не более
+    // EXTERNAL_SCORE_CAP, unknown/clean ничего не меняют. Проверка выполняется
+    // для каждого аудита, а не только при наличии первого сообщения: рецидивист
+    // из глобального banlist опознаётся и по пустому профилю.
+    if config.community.moderation.cas_enabled {
+        let verdict = teloxide_antispam::external::check_cas(
+            job.telegram_user_id,
+            std::time::Duration::from_secs(config.community.moderation.cas_timeout_sec),
+        )
+        .await;
+        let (score, signals) = teloxide_antispam::external::external_component(verdict);
+        components.apply_external(score, signals);
+    }
+    let finalized =
+        materialize_new_user_audit_job(pool, job, &components, &config.rag_embedding_model).await?;
     if finalized == CasResult::LeaseLost {
         tracing::warn!(
             job_id = job.id,
             attempts = job.attempts,
             "new user audit materialization lease was reclaimed"
         );
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(components.final_score()))
 }
 
 fn log_materialization_failure(
@@ -304,6 +335,10 @@ async fn load_first_message_score_context(
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
     let reply_context = first_message_reply_context(&job.input_json);
+    let linear_spam_probability = config
+        .linear_spam_model
+        .as_ref()
+        .map(|model| teloxide_antispam::logreg::spam_probability(model, &text));
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
@@ -311,6 +346,19 @@ async fn load_first_message_score_context(
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
         personal_channel_content,
+        // Персист корпуса для будущих similarity-проверок выполняется
+        // в materialize через ScoreComponents.first_message_embedding.
+        embedding: Some(embedding),
+        linear_spam_probability,
+        linear_spam_model_version: config
+            .linear_spam_model
+            .as_ref()
+            .map(|model| model.version.clone()),
+        text_observations: Some(teloxide_antispam::preprocess::prepare_text(&text).flags),
+        linear_spam_calibration: config
+            .linear_spam_model
+            .as_ref()
+            .map(|model| model.calibration.clone()),
     })
 }
 

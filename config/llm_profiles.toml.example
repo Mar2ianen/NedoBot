@@ -345,6 +345,13 @@ review_delivery_enabled = true
 risk_profile = "ru_general_v1"
 review_chat = "main"
 reviewer_user_ids = [5939287960]
+cas_enabled = false
+cas_timeout_sec = 5
+enforce_enabled = false
+enforce_dry_run = true
+enforce_ban_threshold = 90
+linear_spam_enabled = false
+linear_spam_model_path = "/opt/tg-ai-bot-teloxide/models/linear_spam_word12_v1.json"
 
 [manual_moderation]
 enabled = false

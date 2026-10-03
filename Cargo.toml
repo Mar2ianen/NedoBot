@@ -70,8 +70,9 @@ base64 = "0.22"
 chrono = "0.4"
 jiff = "0.2"
 dotenvy = "0.15"
+teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "1d8dcbc5738b8d77592bc75976aa01e06e1226cb", default-features = false, features = ["scoring", "classifier", "cas"] }
 genai = { version = "=0.6.5", default-features = false, features = ["native-tls"] }
-reqwest = { version = "0.13", features = ["json", "multipart", "socks"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "query", "socks"] }
 rmcp = { version = "=3.0.0-beta.3", default-features = false, features = ["server", "client", "macros", "schemars", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

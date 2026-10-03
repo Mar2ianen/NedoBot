@@ -7,11 +7,11 @@ use crate::features::jobs::claim::CasResult;
 use crate::features::jobs::policy::{
     ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE, MATERIALIZATION_RETRY,
 };
-use crate::features::new_user_audit::scoring::ScoreComponents;
+use teloxide_antispam::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется при изменении scoring/materializer,
 /// чтобы выбранные сохранённые assessments можно было безопасно переиграть.
-pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v3";
+pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v4";
 
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
 /// generation boundary. Job остаётся под исходным generation lease.
@@ -369,6 +369,7 @@ async fn materialize_new_user_audit_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     job: &NewUserAuditJob,
     components: &ScoreComponents,
+    embedding_model: &str,
 ) -> anyhow::Result<()> {
     // Keep the database's non-negative score-component constraints authoritative,
     // even if a future scorer accidentally emits a negative component.
@@ -376,10 +377,12 @@ async fn materialize_new_user_audit_in_transaction(
     let first_message_score = components.first_message_score.clamp(0, 100);
     let avatar_score = components.avatar_score.clamp(0, 100);
     let personal_channel_score = components.personal_channel_score.clamp(0, 100);
+    let external_score = components.external_score.clamp(0, 100);
     if baseline_score != components.baseline_score
         || first_message_score != components.first_message_score
         || avatar_score != components.avatar_score
         || personal_channel_score != components.personal_channel_score
+        || external_score != components.external_score
     {
         tracing::warn!(
             job_id = job.id,
@@ -389,6 +392,7 @@ async fn materialize_new_user_audit_in_transaction(
             first_message_score = components.first_message_score,
             avatar_score = components.avatar_score,
             personal_channel_score = components.personal_channel_score,
+            external_score = components.external_score,
             "clamping out-of-range new user audit score component before materialization"
         );
     }
@@ -396,6 +400,7 @@ async fn materialize_new_user_audit_in_transaction(
         .saturating_add(first_message_score)
         .saturating_add(avatar_score)
         .saturating_add(personal_channel_score)
+        .saturating_add(external_score)
         .clamp(0, 100);
     let final_signals = components.final_signals();
     let audit_update = sqlx::query(
@@ -405,7 +410,15 @@ async fn materialize_new_user_audit_in_transaction(
             risk_first_message_score = $5, risk_first_message_signals = $6,
             risk_avatar_score = $7, risk_avatar_signals = $8,
             risk_personal_channel_score = $9, risk_personal_channel_signals = $10,
-            risk_score = $11, risk_level = $12, risk_signal_breakdown = $13
+            risk_score = $11, risk_level = $12, risk_signal_breakdown = $13,
+            first_message_embedding = case
+                when $15 is null then first_message_embedding
+                else $15::vector
+            end,
+            first_message_embedding_model = case
+                when $15 is null then first_message_embedding_model
+                else $16
+            end
         where chat_id = $1 and telegram_user_id = $2
           and unified_audit_snapshot_hash = $14
         "#,
@@ -424,6 +437,8 @@ async fn materialize_new_user_audit_in_transaction(
     .bind(components.final_level())
     .bind(&final_signals)
     .bind(&job.snapshot_hash)
+    .bind(components.first_message_embedding.clone())
+    .bind(embedding_model)
     .execute(&mut **tx)
     .await?;
     if audit_update.rows_affected() == 0 {
@@ -487,6 +502,7 @@ pub async fn materialize_new_user_audit_job(
     pool: &PgPool,
     job: &NewUserAuditJob,
     components: &ScoreComponents,
+    embedding_model: &str,
 ) -> anyhow::Result<CasResult> {
     let mut tx = pool.begin().await?;
     let update = sqlx::query(
@@ -502,7 +518,7 @@ pub async fn materialize_new_user_audit_job(
         tx.rollback().await?;
         return Ok(result);
     }
-    materialize_new_user_audit_in_transaction(&mut tx, job, components).await?;
+    materialize_new_user_audit_in_transaction(&mut tx, job, components, embedding_model).await?;
     tx.commit().await?;
     Ok(result)
 }

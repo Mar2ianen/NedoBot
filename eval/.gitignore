@@ -1,0 +1,5 @@
+# Локальные артефакты eval: тексты корпуса и кэши НЕ коммитятся.
+our_spam.txt
+our_ham.txt
+inter_ham.txt
+__pycache__/
