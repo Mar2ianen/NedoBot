@@ -115,7 +115,7 @@ const REVIEW_READY_AGE_SQL: &str = r#"
     select extract(epoch from now() - min(notification_next_attempt_at))::double precision
     from spam_review_requests
     where status = 'pending'
-      and risk_score >= 70
+      and risk_score >= review_threshold
       and notification_status in ('pending', 'retry_wait')
       and notification_next_attempt_at <= now()
 "#;

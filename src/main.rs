@@ -19,7 +19,7 @@ mod http;
 mod llm;
 mod state;
 mod telegram;
-mod text;
+use tg_ai_bot_teloxide::text;
 
 use config::Config;
 use db::telegram::{

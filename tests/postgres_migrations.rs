@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+use teloxide_antispam::scoring::ScoreComponents;
 
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
@@ -34,18 +35,16 @@ use tg_ai_bot_teloxide::features::{
         mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
     jobs::{claim::CasResult, observability::load_job_lifecycle_report},
+    labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
     memory::service::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
     },
-    new_user_audit::{
-        repo::{
-            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_new_user_audit_job,
-        },
-        scoring::ScoreComponents,
+    new_user_audit::repo::{
+        NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
+        finalize_new_user_audit_job, mark_new_user_audit_failed,
+        mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+        mark_new_user_audit_retry, materialize_new_user_audit_job,
     },
     reports::{ReportCreation, ReportTarget, create_report},
     spam_review::{
@@ -101,6 +100,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_successful_audit_replays_for_materialization(&pool).await;
     assert_audit_generation_is_durable_before_materialization(&pool).await;
     assert_new_user_audit_materialization_lifecycle(&pool).await;
+    assert_text_observations_materialize_without_promoting_review_risk(&pool).await;
     assert_new_user_audit_generation_materialization_upgrade(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
@@ -108,6 +108,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
+    assert_label_writer_roundtrip(&pool).await;
     assert_comment_reconciliation_requires_operator_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
@@ -1932,7 +1933,11 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
                 personal_channel_score: 0,
                 personal_channel_signals: serde_json::json!([]),
                 review_threshold: 70,
+                first_message_embedding: None,
+                external_score: 0,
+                external_signals: serde_json::json!([]),
             },
+            "fixture-embedding-model",
         )
         .await
         .expect("stored assessment materialization must finalize"),
@@ -2390,6 +2395,128 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
             .is_none(),
         "authoritative replay must require the current materialization version"
     );
+}
+
+async fn assert_text_observations_materialize_without_promoting_review_risk(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_103;
+    let input = serde_json::json!({"schema_version": "fixture-v1"});
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)")
+        .bind(CHAT_ID).bind(USER_ID).execute(pool).await.unwrap();
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "text-observation-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .unwrap();
+    let claim = claim_next_new_user_audit_job(pool).await.unwrap().unwrap();
+    assert_eq!(claim.telegram_user_id, USER_ID);
+    let assessment_json = serde_json::json!({
+        "avatar_observation": null,
+        "first_message_assessment": {
+            "relation_to_chat": "on_topic", "direct_dm_offer": false,
+            "offtopic_promo": false, "template_campaign": false,
+            "self_reference_grammar": "none_or_unclear",
+            "profile_name_grammar_relation": "not_applicable",
+            "risk_markers": [], "evidence": [], "summary": "Обычный вопрос.", "confidence": 0.9,
+        },
+        "profile_assessment": {
+            "risk_patterns": ["no_material_risk_pattern"], "evidence": [],
+            "contradictions": [], "review_priority": "low", "confidence": 0.5, "summary": "Нейтрально.",
+        },
+    });
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment_json,
+                provider: "fixture",
+                model: "fixture",
+            }
+        )
+        .await
+        .unwrap(),
+        CasResult::Applied
+    );
+    let replay = claim_next_new_user_audit_job(pool).await.unwrap().unwrap();
+    assert_eq!(replay.id, claim.id);
+    let assessment =
+        teloxide_antispam::assessment::NewUserAuditAssessment::parse(&assessment_json.to_string())
+            .unwrap();
+    let components = teloxide_antispam::scoring::score_assessment(
+        69,
+        serde_json::json!([]),
+        &assessment,
+        teloxide_antispam::scoring::FirstMessageScoreContext {
+            linear_spam_probability: Some(0.2),
+            linear_spam_model_version: Some("synthetic-v2".into()),
+            linear_spam_calibration: Some(teloxide_antispam::calibration::LinearScoreCalibration {
+                version: "synthetic-calibration-v2".into(),
+                supporting_threshold: 0.9,
+                strong_threshold: 0.975,
+                supporting_score: 10,
+                strong_score: 18,
+            }),
+            text_observations: Some(teloxide_antispam::preprocess::prepare_text("#Тeлeфoны").flags),
+            ..Default::default()
+        },
+        70,
+    );
+    assert_eq!(
+        materialize_new_user_audit_job(pool, &replay, &components, "fixture-embedding")
+            .await
+            .unwrap(),
+        CasResult::Applied
+    );
+    let stored: (i32, String, i32, serde_json::Value) = query_as(
+        "select risk_score, risk_level, risk_first_message_score, risk_first_message_signals from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    ).bind(CHAT_ID).bind(USER_ID).fetch_one(pool).await.unwrap();
+    assert_eq!((stored.0, stored.1.as_str(), stored.2), (69, "medium", 0));
+    assert_eq!(stored.3[0]["decision"], "observation_only");
+    assert_eq!(stored.3[0]["linear_spam_probability"], 0.2);
+    assert_eq!(stored.3[0]["linear_spam_model_version"], "synthetic-v2");
+    assert_eq!(
+        stored.3[0]["linear_spam_calibration"]["version"],
+        "synthetic-calibration-v2"
+    );
+    assert_eq!(
+        stored.3[0]["linear_spam_calibration"]["strong_threshold"],
+        0.975
+    );
+    assert!(
+        stored.3[0]["text_observations"]["homoglyph_chars"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let review: (i32, serde_json::Value) = query_as(
+        "select risk_score, risk_signals from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    ).bind(CHAT_ID).bind(USER_ID).fetch_one(pool).await.unwrap();
+    assert_eq!(review.0, 69);
+    assert_eq!(review.1, stored.3);
+    assert!(claim_next_review_delivery(pool).await.unwrap().is_none());
+    for sql in [
+        "delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+        "delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    ] {
+        query(sql)
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {
@@ -4582,4 +4709,96 @@ async fn assert_job_state(
     assert_eq!(status, expected_status);
     assert_eq!(error_kind.as_deref(), expected_error_kind);
     assert_eq!(next_attempt_is_future, expected_next_attempt_is_future);
+}
+
+async fn assert_label_writer_roundtrip(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_013;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("label fixture user must exist");
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, 501, $2, 'fixture promo')")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("label fixture message must exist");
+    record_spam(
+        pool,
+        CHAT_ID,
+        USER_ID,
+        &SpamLabel {
+            subtype: "promo_dm_bait".to_string(),
+            source: LabelSource::OwnerReview,
+            reason: "fixture".to_string(),
+            evidence: serde_json::json!({"fixture": true}),
+            operator_id: Some(1),
+        },
+    )
+    .await
+    .expect("spam label must record");
+    let flagged: (bool, i32, Option<String>) = query_as(
+        "select is_spammer, spam_score, spam_type from telegram_chat_users where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("flagged user must exist");
+    assert_eq!(flagged, (true, 100, Some("promo_dm_bait".to_string())));
+    let stamped: i64 = query_scalar(
+        "select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("stamp count must exist");
+    assert_eq!(stamped, 1);
+    let events: i64 = query_scalar(
+        "select count(*) from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'spam'",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("spam events must exist");
+    assert_eq!(events, 1);
+    record_not_spam(
+        pool,
+        CHAT_ID,
+        USER_ID,
+        "fixture correction",
+        &serde_json::json!({"fixture": true}),
+        Some(1),
+    )
+    .await
+    .expect("not-spam label must record");
+    let cleared: (bool, i32) = query_as(
+        "select is_spammer, spam_score from telegram_chat_users where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("cleared user must exist");
+    assert_eq!(cleared, (false, 0));
+    let ham_events: i64 = query_scalar(
+        "select count(*) from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'not_spam'",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("ham events must exist");
+    assert_eq!(ham_events, 1);
+    let journal = read_journal(pool, CHAT_ID, Some(USER_ID), 10)
+        .await
+        .expect("journal must read");
+    assert_eq!(journal.len(), 2);
+    assert!(journal.iter().any(|entry| entry.kind == "label:spam"));
+    assert!(journal.iter().any(|entry| entry.kind == "label:not_spam"));
 }

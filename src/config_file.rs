@@ -73,6 +73,29 @@ pub struct ModerationConfig {
     pub review_chat: Option<String>,
     #[serde(default)]
     pub reviewer_user_ids: Vec<i64>,
+    /// Слабый внешний сигнал CAS: положительный вердикт даёт не более
+    /// +12 к score и никогда сам не выводит пользователя в high.
+    #[serde(default)]
+    pub cas_enabled: bool,
+    #[serde(default = "default_cas_timeout_sec")]
+    pub cas_timeout_sec: u64,
+    /// Автомодерация по score. Выключена по умолчанию; включается только
+    /// осознанно после калибровки порогов на журнале решений.
+    #[serde(default)]
+    pub enforce_enabled: bool,
+    /// Dry-run: решения пишутся в журнал, Telegram API не вызывается.
+    #[serde(default = "default_true")]
+    pub enforce_dry_run: bool,
+    /// Score для бана с удалением сообщений. Ниже — только удаление
+    /// сообщений с сохранением review-карточки.
+    #[serde(default = "default_enforce_ban_threshold")]
+    pub enforce_ban_threshold: i32,
+    /// Нейроскоринг первого сообщения (word TF-IDF + LogReg, экспорт
+    /// `eval/train_linear_spam.py`). Слабый supporting-сигнал поверх LLM.
+    #[serde(default)]
+    pub linear_spam_enabled: bool,
+    #[serde(default)]
+    pub linear_spam_model_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -84,6 +107,18 @@ pub struct ManualModerationConfig {
 
 fn default_review_delivery_enabled() -> bool {
     true
+}
+
+fn default_cas_timeout_sec() -> u64 {
+    5
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_enforce_ban_threshold() -> i32 {
+    90
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -166,15 +201,7 @@ fn default_review_threshold() -> i32 {
     70
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TelegramIdRiskModel {
-    pub floor: f64,
-    pub ceil: f64,
-    pub k: f64,
-    pub midpoint_billion: f64,
-    pub version: String,
-}
+pub use teloxide_antispam::signals::TelegramIdRiskModel;
 
 /// Набор instance/chat policy, общий для одного процесса и одного Telegram bot token.
 /// PostgreSQL и operational jobs остаются локальными для этого instance.

@@ -7,6 +7,8 @@ pub mod chat_search;
 pub mod ask;
 // The production bot binary does not start MCP transports; their entry-point binaries do.
 // Keep the shared catalog compiled there without masking diagnostics in its implementation.
+#[cfg(feature = "moderation")]
+pub mod auto_moderation;
 #[allow(dead_code)]
 pub mod chat_read_api;
 pub mod chat_retrieval;
@@ -14,6 +16,8 @@ pub mod chat_retrieval;
 pub mod first_comment;
 pub mod ingest;
 pub mod jobs;
+#[cfg(feature = "moderation")]
+pub mod labels;
 #[cfg(feature = "manual-moderation")]
 pub mod manual_moderation;
 pub mod member_greetings;

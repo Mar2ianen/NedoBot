@@ -10,7 +10,12 @@ use teloxide::{
 
 use crate::{
     config_file::ModerationConfig,
-    features::jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
+    features::{
+        jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
+        labels::{
+            LabelSource, SpamLabel, record_not_spam_in_transaction, record_spam_in_transaction,
+        },
+    },
     telegram::html,
 };
 
@@ -653,22 +658,31 @@ pub async fn apply_callback(
     if decision == "spam" {
         let chat_id: i64 = row.get("chat_id");
         let user_id: i64 = row.get("telegram_user_id");
-        sqlx::query("update telegram_chat_users set is_spammer = true, spam_score = greatest(spam_score, 100), spam_last_marked_at = now(), spam_reason = 'Owner-confirmed spammer', spam_type = 'llm_generic_comment', spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', '1'::jsonb, true), updated_at = now() where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
-        sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = 'Owner-confirmed spammer', spam_source = 'manual_owner_confirmation', spam_type = coalesce(spam_type, 'llm_generic_comment') where chat_id = $1 and user_id = $2 and source_channel_id is null").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
-        sqlx::query("update telegram_chat_users set spam_message_count = (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null), spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', to_jsonb((select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null)), true) where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
+        record_spam_in_transaction(
+            &mut tx,
+            chat_id,
+            user_id,
+            &SpamLabel {
+                subtype: "llm_generic_comment".to_string(),
+                source: LabelSource::OwnerReview,
+                reason: "Owner-confirmed spammer".to_string(),
+                evidence: serde_json::json!({"review_id": request_id}),
+                operator_id: Some(owner_id),
+            },
+        )
+        .await?;
     } else if decision == "normal" {
         let chat_id: i64 = row.get("chat_id");
         let user_id: i64 = row.get("telegram_user_id");
-        sqlx::query("update telegram_chat_users set is_spammer = false, spam_score = 0, spam_last_marked_at = null, spam_reason = null, spam_type = null, spam_types = coalesce(spam_types, '{}'::jsonb) - 'llm_generic_comment', updated_at = now() where chat_id = $1 and telegram_user_id = $2")
-            .bind(chat_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("update telegram_messages set spam_marked_at = null, spam_reason = null, spam_source = null where chat_id = $1 and user_id = $2 and source_channel_id is null and spam_source = 'manual_owner_confirmation'")
-            .bind(chat_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        record_not_spam_in_transaction(
+            &mut tx,
+            chat_id,
+            user_id,
+            "Owner rejected spam review",
+            &serde_json::json!({"review_id": request_id}),
+            Some(owner_id),
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(Some(if decision == "spam" {
@@ -733,6 +747,10 @@ fn human_signals(signals: &Value) -> String {
                         .map(human_marker),
                 );
             }
+            if signal.get("label").and_then(Value::as_str) == Some("first_message_text_observation")
+            {
+                labels.extend(human_text_observations(signal));
+            }
             labels
         })
         .collect::<Vec<_>>();
@@ -745,6 +763,32 @@ fn human_signals(signals: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn human_text_observations(signal: &Value) -> Vec<String> {
+    let mut labels = Vec::new();
+    let flags = &signal["text_observations"];
+    if flags["nfkc_changed"].as_bool() == Some(true) {
+        labels.push("Unicode: совместимые формы/шрифты нормализованы".to_owned());
+    }
+    for (key, name) in [
+        ("mixed_script_words", "слова со смешанными алфавитами"),
+        ("homoglyph_chars", "замены похожих букв"),
+        ("removed_invisible_chars", "невидимые символы внутри текста"),
+        ("bidi_controls", "управление направлением текста"),
+        ("removed_word_variation_selectors", "селекторы внутри слов"),
+        ("removed_stacked_marks", "стэки диакритики"),
+        ("spaced_letter_sequences", "растянутые слова"),
+        ("long_repeated_letter_runs", "длинные повторы букв"),
+    ] {
+        if let Some(count) = flags[key].as_u64().filter(|&count| count > 0) {
+            labels.push(format!("Unicode: {name}: {count}"));
+        }
+    }
+    if let Some(probability) = signal["linear_spam_probability"].as_f64() {
+        labels.push(format!("Локальная модель: p={probability:.3}"));
+    }
+    labels
 }
 
 fn human_marker(marker: &str) -> String {
@@ -768,6 +812,7 @@ fn human_marker(marker: &str) -> String {
 fn human_label(label: &str) -> &str {
     match label {
         "shared_spammer_identity" => "ID уже помечен спамером в другом инстансе",
+        "lols_spammer_identity" => "ID есть в LOLS banlist спамеров",
         "recent_high_telegram_id" => "очень свежий Telegram ID",
         "telegram_id_spam_probability" => "свежий Telegram ID по модели",
         "single_message_account" => "первое и единственное сообщение",
@@ -775,10 +820,16 @@ fn human_label(label: &str) -> &str {
         "only_channel_post_comments" => "комментирует только посты канала",
         "reply_to_channel_post_not_comment" => "ответил прямо на пост, не на обсуждение",
         "display_name_reused_by_spammers" => "имя уже встречалось у размеченных спамеров",
+        "personal_channel_title_reused_by_spammers" => {
+            "название личного канала уже встречалось у размеченных спамеров"
+        }
+        "identity_display_name_rotation" => "пользователь менял отображаемое имя",
+        "identity_username_rotation" => "пользователь менял username",
         "username_random_suffix" => "username похож на автоматически созданный",
         "mixed_script_profile_homoglyphs" => {
             "в имени смешаны похожие латинские и кириллические буквы"
         }
+        "first_message_text_observation" => "Разбор текста: наблюдения без самостоятельного штрафа",
         "explicit_adult_promo_bio" => "bio рекламирует adult-сервис через ссылку или воронку",
         "personal_channel_attached" => "подключён личный канал",
         "llm_personal_channel_content_promotion" => {
@@ -949,6 +1000,21 @@ mod tests {
 
         assert!(human_signals(&unified).contains("перевод разговора в личные сообщения"));
         assert!(human_signals(&additional).contains("обещание лёгкой оплачиваемой работы"));
+    }
+
+    #[test]
+    fn text_observations_render_facts_without_calling_them_spam() {
+        let signals = serde_json::json!([{
+            "label": "first_message_text_observation", "coefficient": 0,
+            "linear_spam_probability": 0.2,
+            "text_observations": {"nfkc_changed": true, "homoglyph_chars": 3, "bidi_controls": 1},
+        }]);
+        let rendered = human_signals(&signals);
+        assert!(rendered.contains("без самостоятельного штрафа"));
+        assert!(rendered.contains("замены похожих букв: 3"));
+        assert!(rendered.contains("управление направлением текста: 1"));
+        assert!(rendered.contains("p=0.200"));
+        assert!(!rendered.contains("растянутые слова"));
     }
 
     #[test]
