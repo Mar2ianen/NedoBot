@@ -78,6 +78,7 @@ pub struct NewUserFeatures {
     pub username_reuse_count: i64,
     pub username_reuse_spammer_count: i64,
     pub shared_spammer_identity: bool,
+    pub lols_spammer_identity: bool,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub display_name: Option<String>,
@@ -338,6 +339,7 @@ pub fn analyze_new_or_low_activity_user(
     let mut risk = RiskAccumulator::default();
 
     risk.add_optional(shared_spammer_signal(features.shared_spammer_identity));
+    risk.add_optional(lols_spammer_signal(features.lols_spammer_identity));
     risk.add_optional(message_count_signal(features));
     risk.add_optional(link_signal(features));
     risk.add_optional(foreign_invite_link_signal(features));
@@ -703,6 +705,18 @@ fn shared_spammer_signal(is_shared_spammer: bool) -> Option<RiskSignal> {
         coefficient: 70,
         label: "shared_spammer_identity",
         reason: "Telegram user id was confirmed as spam in another bot instance",
+    })
+}
+
+/// Внешний LOLS banlist (локальное почасовое зеркало): покрытие нашей формы
+/// спама 11/11 против 0/8 у CAS, поэтому вес выше слабого внешнего сигнала,
+/// но ниже собственной подтверждённой репутации.
+fn lols_spammer_signal(is_lols_spammer: bool) -> Option<RiskSignal> {
+    is_lols_spammer.then_some(RiskSignal {
+        class: SpamClass::KnownSpammer,
+        coefficient: 50,
+        label: "lols_spammer_identity",
+        reason: "Telegram user id is present in the LOLS spammer banlist mirror",
     })
 }
 fn link_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -2101,6 +2115,15 @@ mod tests {
         assert_eq!(signal.coefficient, 70);
         assert_eq!(signal.label, "shared_spammer_identity");
         assert!(shared_spammer_signal(false).is_none());
+    }
+
+    #[test]
+    fn lols_spammer_identity_scores_below_own_reputation() {
+        let signal = lols_spammer_signal(true).expect("lols spammer must have a signal");
+        assert_eq!(signal.class, SpamClass::KnownSpammer);
+        assert_eq!(signal.coefficient, 50);
+        assert_eq!(signal.label, "lols_spammer_identity");
+        assert!(lols_spammer_signal(false).is_none());
     }
 
     #[test]

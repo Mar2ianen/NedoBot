@@ -782,6 +782,7 @@ fn human_marker(marker: &str) -> String {
 fn human_label(label: &str) -> &str {
     match label {
         "shared_spammer_identity" => "ID уже помечен спамером в другом инстансе",
+        "lols_spammer_identity" => "ID есть в LOLS banlist спамеров",
         "recent_high_telegram_id" => "очень свежий Telegram ID",
         "telegram_id_spam_probability" => "свежий Telegram ID по модели",
         "single_message_account" => "первое и единственное сообщение",
