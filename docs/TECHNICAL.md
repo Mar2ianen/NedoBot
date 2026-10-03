@@ -412,6 +412,10 @@ ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 - `promo_dm_bait` - промо через “могу отправить/поделиться/пишите в личку”, тематика может быть разная, но механика одна.
 - `adult_personal_channel_promo` - личный/personal channel пользователя ведёт на adult-промо, инвайт-ссылки или схожий funnel.
 - Для первого текстового сообщения сохраняются LLM-маркеры кампании, RuBERT-вектор и сходство с вручную подтверждённым спамом. Эти сигналы лишь повышают review-риск; автоматической пометки спамером нет.
+- Эмбеддинг первого сообщения персистится в `telegram_new_user_profile_audits.first_message_embedding` при материализации аудита и пополняет корпус для будущих `spam_similarity`-проверок; история скоринга при этом не пересчитывается. Пустой корпус заполняется бинарём `backfill_audit_embeddings` (`DATABASE_URL` + `RAG_EMBEDDING_*`, флаги `--only-spammers`/`--all`, `--chat-id`, `--limit`).
+- Template-матчинг (`template_match_count`) сравнивает первое сообщение с текстами из `telegram_messages`, у которых выставлен `spam_marked_at`. Ручная разметка обязана штамповать сообщения (`spam_marked_at`, `spam_source='manual_owner_confirmation'`), иначе помеченные спамеры не попадают в корпус: `is_spammer` на пользователе недостаточно.
+- Повтор title личного канала на размеченных спамерах — сильный сигнал reuse (`personal_channel_title_reused_by_spammers`, +24): операторы клонируют фуннель-каналы под каждый аккаунт, chat_id различается, а нормализованный title совпадает. Реюз считается и через `shared_spam_reputation` соседнего инстанса.
+- CAS (Combot Anti-Spam, `api.cas.chat`) подключён как слабый внешний сигнал за флагом `moderation.cas_enabled` (`cas_timeout_sec`, default 5, валидация 1..30): положительный вердикт даёт не более +12 (`EXTERNAL_SCORE_CAP`) и никогда сам не выводит в high; «Record not found» и любые ошибки трактуются как unknown/clean и ничего не добавляют. Замер на 8 подтверждённых спамерах НедоNews/PVO: покрытие CAS 0/8.
 
 Для каждого нового пользователя бот сохраняет один audit-запрос в
 `spam_review_requests`, включая low и medium risk. Карточка для ревью с тегом
