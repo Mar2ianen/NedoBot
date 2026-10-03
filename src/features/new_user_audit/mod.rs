@@ -1,3 +1,4 @@
+pub mod cas;
 pub mod prompt;
 pub mod repo;
 pub mod scoring;

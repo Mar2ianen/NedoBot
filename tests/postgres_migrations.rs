@@ -1932,7 +1932,11 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
                 personal_channel_score: 0,
                 personal_channel_signals: serde_json::json!([]),
                 review_threshold: 70,
+                first_message_embedding: None,
+                external_score: 0,
+                external_signals: serde_json::json!([]),
             },
+            "fixture-embedding-model",
         )
         .await
         .expect("stored assessment materialization must finalize"),

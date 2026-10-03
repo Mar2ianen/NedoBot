@@ -6,6 +6,7 @@ use teloxide::prelude::Bot;
 use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
+use crate::features::new_user_audit::cas;
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
@@ -124,14 +125,28 @@ async fn materialize_stored_assessment(
     let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
     let first_message_context =
         load_first_message_score_context(pool, config, job, &assessment).await?;
-    let components = score_assessment(
+    let mut components = score_assessment(
         baseline_score,
         baseline_signals,
         &assessment,
         first_message_context,
         job.review_threshold,
     );
-    let finalized = materialize_new_user_audit_job(pool, job, &components).await?;
+    // CAS — слабый внешний сигнал: положительный вердикт добавляет не более
+    // EXTERNAL_SCORE_CAP, unknown/clean ничего не меняют. Проверка выполняется
+    // для каждого аудита, а не только при наличии первого сообщения: рецидивист
+    // из глобального banlist опознаётся и по пустому профилю.
+    if config.community.moderation.cas_enabled {
+        let verdict = cas::check_cas(
+            job.telegram_user_id,
+            std::time::Duration::from_secs(config.community.moderation.cas_timeout_sec),
+        )
+        .await;
+        let (score, signals) = cas::external_component(verdict);
+        components.apply_external(score, signals);
+    }
+    let finalized =
+        materialize_new_user_audit_job(pool, job, &components, &config.rag_embedding_model).await?;
     if finalized == CasResult::LeaseLost {
         tracing::warn!(
             job_id = job.id,
@@ -311,6 +326,9 @@ async fn load_first_message_score_context(
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
         personal_channel_content,
+        // Персист корпуса для будущих similarity-проверок выполняется
+        // в materialize через ScoreComponents.first_message_embedding.
+        embedding: Some(embedding),
     })
 }
 

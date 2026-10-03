@@ -73,6 +73,12 @@ pub struct ModerationConfig {
     pub review_chat: Option<String>,
     #[serde(default)]
     pub reviewer_user_ids: Vec<i64>,
+    /// Слабый внешний сигнал CAS: положительный вердикт даёт не более
+    /// +12 к score и никогда сам не выводит пользователя в high.
+    #[serde(default)]
+    pub cas_enabled: bool,
+    #[serde(default = "default_cas_timeout_sec")]
+    pub cas_timeout_sec: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -84,6 +90,10 @@ pub struct ManualModerationConfig {
 
 fn default_review_delivery_enabled() -> bool {
     true
+}
+
+fn default_cas_timeout_sec() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

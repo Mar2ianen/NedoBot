@@ -988,6 +988,10 @@ fn validate_community_config(
             anyhow::bail!("moderation.enabled=true requires reviewer_user_ids");
         }
     }
+    if community.moderation.cas_enabled && !(1..=30).contains(&community.moderation.cas_timeout_sec)
+    {
+        anyhow::bail!("moderation.cas_timeout_sec must be between 1 and 30");
+    }
 
     if community.spam_reputation.enabled
         && community

@@ -13,6 +13,11 @@ use super::types::{
 pub const REVIEW_RISK_THRESHOLD: i32 = 70;
 #[allow(dead_code)]
 const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
+
+/// Жёсткий cap внешнего репутационного сигнала (CAS): слабый сигнал,
+/// положительный вердикт не должен сам выводить пользователя в high.
+#[allow(dead_code)]
+pub const EXTERNAL_SCORE_CAP: i32 = 12;
 const FIRST_MESSAGE_DECISION_TREE_VERSION: &str = "first-message-tree-v1";
 
 #[allow(dead_code)]
@@ -23,6 +28,9 @@ pub struct FirstMessageScoreContext {
     pub feminine_profile_name: bool,
     pub rkn_vpn_restriction_context: bool,
     pub personal_channel_content: Option<String>,
+    /// Свежий pgvector-литерал первого сообщения для персиста в корпус.
+    /// `None`, когда assessment отсутствует или текст пуст.
+    pub embedding: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -37,6 +45,13 @@ pub struct ScoreComponents {
     pub personal_channel_score: i32,
     pub personal_channel_signals: Value,
     pub review_threshold: i32,
+    /// Свежий эмбеддинг первого сообщения для корпуса `spam_similarity`.
+    /// Хранится отдельно от скора: история скоринга не пересчитывается,
+    /// корпус обслуживает только будущие аудиты.
+    pub first_message_embedding: Option<String>,
+    /// Внешняя репутация (CAS): слабый capped-сигнал поверх локального скора.
+    pub external_score: i32,
+    pub external_signals: Value,
 }
 
 #[allow(dead_code)]
@@ -47,6 +62,7 @@ impl ScoreComponents {
             .saturating_add(self.first_message_score.clamp(0, 100))
             .saturating_add(self.avatar_score.clamp(0, 100))
             .saturating_add(self.personal_channel_score.clamp(0, 100))
+            .saturating_add(self.external_score.clamp(0, EXTERNAL_SCORE_CAP))
             .clamp(0, 100)
     }
 
@@ -66,12 +82,21 @@ impl ScoreComponents {
             &self.first_message_signals,
             &self.avatar_signals,
             &self.personal_channel_signals,
+            &self.external_signals,
         ] {
             if let Some(items) = component.as_array() {
                 signals.extend(items.iter().cloned());
             }
         }
         Value::Array(signals)
+    }
+
+    /// Применяет внешний репутационный сигнал с жёстким cap: положительный
+    /// вердикт добавляет очки, unknown/clean ничего не меняют, но unknown
+    /// фиксируется меткой для наблюдаемости.
+    pub fn apply_external(&mut self, score: i32, signals: Value) {
+        self.external_score = score.clamp(0, EXTERNAL_SCORE_CAP);
+        self.external_signals = signals;
     }
 }
 
@@ -116,6 +141,9 @@ pub fn score_assessment(
         personal_channel_score,
         personal_channel_signals,
         review_threshold,
+        first_message_embedding: first_message_context.embedding,
+        external_score: 0,
+        external_signals: Value::Array(Vec::new()),
     }
 }
 
@@ -542,6 +570,9 @@ mod tests {
             personal_channel_score: 0,
             personal_channel_signals: json!([]),
             review_threshold: REVIEW_RISK_THRESHOLD,
+            first_message_embedding: None,
+            external_score: 0,
+            external_signals: json!([]),
         };
 
         assert_eq!(components.final_score(), 96);

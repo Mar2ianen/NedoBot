@@ -119,6 +119,8 @@ struct NewUserFeatures {
     profile_accent_color_id: Option<i16>,
     personal_channel_chat_id: Option<i64>,
     personal_channel_title: Option<String>,
+    personal_channel_title_reuse_count: i64,
+    personal_channel_title_reuse_spammer_count: i64,
     personal_channel_username: Option<String>,
     personal_channel_message_count: Option<i32>,
     personal_channel_last_message_id: Option<i32>,
@@ -720,6 +722,9 @@ async fn load_features(
             p.profile_accent_color_id,
             p.personal_channel_chat_id,
             p.personal_channel_title,
+            coalesce(pctr.reuse_count, 0)::bigint as personal_channel_title_reuse_count,
+            coalesce(pctr.reuse_spammer_count, 0)::bigint
+                as personal_channel_title_reuse_spammer_count,
             p.personal_channel_username,
             p.personal_channel_message_count,
             p.personal_channel_last_message_id,
@@ -791,6 +796,24 @@ async fn load_features(
               and p2.profile_photo_file_unique_id = p.profile_photo_file_unique_id
               and p2.telegram_user_id <> p.telegram_user_id
         ) pr on true
+        left join lateral (
+            select
+                count(*)::bigint as reuse_count,
+                count(*) filter (
+                    where coalesce(cu2.is_spammer, false)
+                       or exists (
+                            select 1 from shared_spam_reputation r
+                            where r.telegram_user_id = p2.telegram_user_id
+                       )
+                )::bigint as reuse_spammer_count
+            from telegram_user_profiles p2
+            left join telegram_chat_users cu2
+              on cu2.chat_id = $1 and cu2.telegram_user_id = p2.telegram_user_id
+            where nullif(lower(trim(p.personal_channel_title)), '') is not null
+              and char_length(trim(p.personal_channel_title)) >= 4
+              and lower(trim(p2.personal_channel_title)) = lower(trim(p.personal_channel_title))
+              and p2.telegram_user_id <> p.telegram_user_id
+        ) pctr on true
         where cu.chat_id = $1 and cu.telegram_user_id = $2
         "#,
     )
@@ -875,6 +898,9 @@ async fn load_features(
             profile_accent_color_id: row.get("profile_accent_color_id"),
             personal_channel_chat_id: row.get("personal_channel_chat_id"),
             personal_channel_title: row.get("personal_channel_title"),
+            personal_channel_title_reuse_count: row.get("personal_channel_title_reuse_count"),
+            personal_channel_title_reuse_spammer_count: row
+                .get("personal_channel_title_reuse_spammer_count"),
             personal_channel_username: row.get("personal_channel_username"),
             personal_channel_message_count: row.get("personal_channel_message_count"),
             personal_channel_last_message_id: row.get("personal_channel_last_message_id"),
@@ -1753,7 +1779,39 @@ fn personal_channel_signals(features: &NewUserFeatures) -> Vec<RiskSignal> {
         });
     }
 
+    if let Some(signal) = personal_channel_title_reuse_signal(
+        features.personal_channel_title_reuse_spammer_count,
+        features.personal_channel_title_reuse_count,
+        features.message_count,
+    ) {
+        signals.push(signal);
+    }
+
     signals
+}
+
+fn personal_channel_title_reuse_signal(
+    spammer_count: i64,
+    reuse_count: i64,
+    message_count: i64,
+) -> Option<RiskSignal> {
+    match (spammer_count, reuse_count, message_count) {
+        (spammer_count, _, _) if spammer_count > 0 => Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 24,
+            label: "personal_channel_title_reused_by_spammers",
+            reason: "Personal channel title has already appeared on manually marked spammers",
+        }),
+        (0, reuse_count, message_count) if reuse_count > 0 && message_count <= 3 => {
+            Some(RiskSignal {
+                class: SpamClass::LlmProfileBait,
+                coefficient: 10,
+                label: "personal_channel_title_reused_by_new_accounts",
+                reason: "Personal channel title is reused by other seen accounts",
+            })
+        }
+        _ => None,
+    }
 }
 
 fn short_bio_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
@@ -1915,6 +1973,9 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "profile_accent_color_id",
         "personal_channel_chat_id",
         "personal_channel_title",
+        "personal_channel_title_reuse_count",
+        "personal_channel_title_reuse_spammer_count",
+        "personal_channel_title_reused_by_spammers",
         "personal_channel_username",
         "personal_channel_message_count",
         "personal_channel_last_message_id",
@@ -2128,6 +2189,9 @@ async fn save_audit_in_transaction(
         values.push_bind(features.profile_accent_color_id);
         values.push_bind(features.personal_channel_chat_id);
         values.push_bind(&features.personal_channel_title);
+        values.push_bind(features.personal_channel_title_reuse_count);
+        values.push_bind(features.personal_channel_title_reuse_spammer_count);
+        values.push_bind(features.personal_channel_title_reuse_spammer_count > 0);
         values.push_bind(&features.personal_channel_username);
         values.push_bind(features.personal_channel_message_count);
         values.push_bind(features.personal_channel_last_message_id);
@@ -3363,5 +3427,26 @@ mod tests {
 
         assert_eq!(preview.chars().count(), UNIFIED_AUDIT_TEXT_LIMIT + 1);
         assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn personal_channel_title_reused_by_spammers_is_strong() {
+        let signal = personal_channel_title_reuse_signal(2, 2, 1)
+            .expect("spammer reuse must produce a signal");
+        assert_eq!(signal.coefficient, 24);
+        assert_eq!(signal.label, "personal_channel_title_reused_by_spammers");
+    }
+
+    #[test]
+    fn personal_channel_title_reused_by_new_accounts_is_supporting() {
+        let signal = personal_channel_title_reuse_signal(0, 1, 1)
+            .expect("new-account reuse must produce a signal");
+        assert_eq!(signal.coefficient, 10);
+    }
+
+    #[test]
+    fn personal_channel_title_without_reuse_is_silent() {
+        assert!(personal_channel_title_reuse_signal(0, 0, 1).is_none());
+        assert!(personal_channel_title_reuse_signal(0, 3, 10).is_none());
     }
 }
