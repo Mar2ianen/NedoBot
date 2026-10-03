@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+use teloxide_antispam::scoring::ScoreComponents;
 
 use tg_ai_bot_teloxide::features::{
     ask::notes::add_user_note_from_search,
@@ -45,7 +46,6 @@ use tg_ai_bot_teloxide::features::{
             mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
             mark_new_user_audit_retry, materialize_new_user_audit_job,
         },
-        scoring::ScoreComponents,
     },
     reports::{ReportCreation, ReportTarget, create_report},
     spam_review::{

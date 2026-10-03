@@ -13,11 +13,11 @@ use crate::features::new_user_audit::repo::{
     mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
     mark_new_user_audit_retry, materialize_new_user_audit_job,
 };
-use crate::features::new_user_audit::scoring::{
-    FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment, spam_similarity,
-    template_match_count,
+use crate::features::new_user_audit::scoring::{spam_similarity, template_match_count};
+use teloxide_antispam::assessment::NewUserAuditAssessment;
+use teloxide_antispam::scoring::{
+    FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment,
 };
-use crate::features::new_user_audit::types::NewUserAuditAssessment;
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::{LlmTransportError, StructuredOutput};
