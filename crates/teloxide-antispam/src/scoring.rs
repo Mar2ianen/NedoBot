@@ -25,6 +25,9 @@ pub struct FirstMessageScoreContext {
     /// Свежий pgvector-литерал первого сообщения для персиста в корпус.
     /// `None`, когда assessment отсутствует или текст пуст.
     pub embedding: Option<String>,
+    /// Вероятность спама от локальной TF-IDF/LogReg модели (`nn` модуль).
+    /// `None`, когда модель выключена в конфиге.
+    pub nn_spam_probability: Option<f64>,
 }
 
 #[allow(dead_code)]
@@ -268,6 +271,14 @@ fn score_first_message(
         _ => 0,
     };
     let persona_score = i32::from(performative_feminine_persona) * 12;
+    // Локальная TF-IDF/LogReg модель: калибрована на alt-gnome + нашем корпусе
+    // (held-out spam recall 0.50 при precision ~0.98 вверху), поэтому только
+    // supporting-вес и никогда не решает в одиночку.
+    let nn_score = match context.nn_spam_probability {
+        Some(probability) if probability >= 0.9 => 18,
+        Some(probability) if probability >= 0.75 => 10,
+        _ => 0,
+    };
     let grammar_conflict = context.feminine_profile_name
         && assessment.self_reference_grammar == SelfReferenceGrammar::Masculine
         && assessment.profile_name_grammar_relation == ProfileNameGrammarRelation::Conflicts;
@@ -278,7 +289,7 @@ fn score_first_message(
             .spam_similarity
             .is_some_and(|similarity| similarity >= 0.88);
     let supporting_score =
-        llm_score + template_score + embedding_score + persona_score + grammar_score;
+        llm_score + template_score + embedding_score + persona_score + nn_score + grammar_score;
     let decisive = rkn_vpn_promotion
         || decisive_direct_dm_funnel
         || decisive_external_promo_funnel
@@ -343,6 +354,7 @@ fn score_first_message(
             "assessment": assessment,
             "template_matches": context.template_matches,
             "spam_similarity": context.spam_similarity,
+            "nn_spam_probability": context.nn_spam_probability,
         });
         if let Some(path) = decision_tree_path {
             signal["decision_tree_version"] = json!(FIRST_MESSAGE_DECISION_TREE_VERSION);

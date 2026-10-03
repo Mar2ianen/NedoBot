@@ -335,6 +335,10 @@ async fn load_first_message_score_context(
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
     let reply_context = first_message_reply_context(&job.input_json);
+    let nn_spam_probability = config
+        .nn_spam_model
+        .as_ref()
+        .map(|model| teloxide_antispam::nn::spam_probability(model, &text));
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
@@ -345,6 +349,7 @@ async fn load_first_message_score_context(
         // Персист корпуса для будущих similarity-проверок выполняется
         // в materialize через ScoreComponents.first_message_embedding.
         embedding: Some(embedding),
+        nn_spam_probability,
     })
 }
 
