@@ -1,12 +1,18 @@
-"""Разбор смежного экспорта (Inter Чат, ПК и железо) для антиспама.
+"""Разбор смежных экспортов (AyuGram Desktop ChatExport_*) для антиспама.
 
 НЕ коммитит данные: читает result.json из ~/Downloads, пишет только
 агрегаты/списки текстов в eval/ (gitignored) и отчёт в stdout.
+Запуск: python eval/inter_export.py [ChatExport_...] — без аргументов
+обрабатываются все ChatExport_* каталоги, ham объединяется.
 """
 
+import glob
 import json
+import os
+import random
 import sys
 
+EXPORT_GLOB = "/home/chechulin/Downloads/AyuGram Desktop/ChatExport_*"
 EXPORT = "/home/chechulin/Downloads/AyuGram Desktop/ChatExport_2026-10-03/result.json"
 
 # Наши подтверждённые спамеры (оба чата) для проверки пересечений.
@@ -39,8 +45,29 @@ def message_text(message):
 
 
 def main() -> None:
-    with open(EXPORT, encoding="utf-8") as handle:
+    export_dirs = sys.argv[1:] or sorted(glob.glob(EXPORT_GLOB))
+    all_ham = []
+    for export_dir in export_dirs:
+        result_path = os.path.join(export_dir, "result.json")
+        if not os.path.exists(result_path):
+            print(f"skip {export_dir}: no result.json", file=sys.stderr)
+            continue
+        print(f"== {export_dir} ==", file=sys.stderr)
+        try:
+            all_ham.extend(process_export(result_path))
+        except Exception as error:
+            print(f"skip {export_dir}: broken export ({error})", file=sys.stderr)
+    random.seed(42)
+    sample = random.sample(all_ham, min(15000, len(all_ham)))
+    with open("eval/inter_ham.txt", "w", encoding="utf-8") as handle:
+        handle.write("\x1f".join(sample))
+    print(f"ham sample written: {len(sample)} from {len(export_dirs)} exports", file=sys.stderr)
+
+
+def process_export(path: str) -> list:
+    with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
+    print(f"chat={data.get('name')} type={data.get('type')}", file=sys.stderr)
     messages = data.get("messages", [])
     print(f"total={len(messages)}", file=sys.stderr)
 
@@ -78,8 +105,6 @@ def main() -> None:
         print(f"FUNNEL user={row[0]} msg={row[1]} :: {row[2]}", file=sys.stderr)
 
     # Эвристический майнинг их спама: adult/money/invite-ссылки.
-    import random
-
     adult_hits = []
     money_hits = []
     invite_users = {}
@@ -105,13 +130,7 @@ def main() -> None:
         print(f"MONEY user={row[0]} msg={row[1]} :: {row[2]}", file=sys.stderr)
     multi_invite = sorted(invite_users.items(), key=lambda kv: kv[1], reverse=True)[:15]
     print(f"top invite-link posters={multi_invite}", file=sys.stderr)
-
-    # Ham-сэмпл того же домена для обучения (gitignored).
-    random.seed(42)
-    sample = random.sample(ham_sample, min(10000, len(ham_sample)))
-    with open("eval/inter_ham.txt", "w", encoding="utf-8") as handle:
-        handle.write("\x1f".join(sample))
-    print(f"ham sample written: {len(sample)}", file=sys.stderr)
+    return ham_sample
 
 
 if __name__ == "__main__":
