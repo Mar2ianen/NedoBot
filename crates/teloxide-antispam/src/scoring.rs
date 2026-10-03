@@ -27,7 +27,7 @@ pub struct FirstMessageScoreContext {
     pub embedding: Option<String>,
     /// Вероятность спама от локальной TF-IDF/LogReg модели (`nn` модуль).
     /// `None`, когда модель выключена в конфиге.
-    pub nn_spam_probability: Option<f64>,
+    pub linear_spam_probability: Option<f64>,
 }
 
 #[allow(dead_code)]
@@ -274,7 +274,7 @@ fn score_first_message(
     // Локальная TF-IDF/LogReg модель: калибрована на alt-gnome + нашем корпусе
     // (held-out spam recall 0.50 при precision ~0.98 вверху), поэтому только
     // supporting-вес и никогда не решает в одиночку.
-    let nn_score = match context.nn_spam_probability {
+    let nn_score = match context.linear_spam_probability {
         Some(probability) if probability >= 0.9 => 18,
         Some(probability) if probability >= 0.75 => 10,
         _ => 0,
@@ -354,7 +354,7 @@ fn score_first_message(
             "assessment": assessment,
             "template_matches": context.template_matches,
             "spam_similarity": context.spam_similarity,
-            "nn_spam_probability": context.nn_spam_probability,
+            "linear_spam_probability": context.linear_spam_probability,
         });
         if let Some(path) = decision_tree_path {
             signal["decision_tree_version"] = json!(FIRST_MESSAGE_DECISION_TREE_VERSION);

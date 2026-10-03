@@ -91,11 +91,11 @@ pub struct ModerationConfig {
     #[serde(default = "default_enforce_ban_threshold")]
     pub enforce_ban_threshold: i32,
     /// Нейроскоринг первого сообщения (word TF-IDF + LogReg, экспорт
-    /// `eval/train_nn_spam.py`). Слабый supporting-сигнал поверх LLM.
+    /// `eval/train_linear_spam.py`). Слабый supporting-сигнал поверх LLM.
     #[serde(default)]
-    pub nn_spam_enabled: bool,
+    pub linear_spam_enabled: bool,
     #[serde(default)]
-    pub nn_spam_model_path: Option<String>,
+    pub linear_spam_model_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

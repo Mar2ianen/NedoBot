@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-/// Линейная TF-IDF модель поверх word 1-2-грам (экспорт `eval/train_nn_spam.py`).
+/// Линейная TF-IDF модель поверх word 1-2-грам (экспорт `eval/train_linear_spam.py`).
 ///
 /// Токенизация обязана побайтово совпадать со sklearn: lowercase,
 /// `(?u)\w+`, ngram 1-2 через пробел, tf — сырой count, idf из экспорта,
 /// l2-норма, sigmoid(dot + intercept). Паритет проверяется тестом ниже
 /// на реальном сообщении и числе из обучающего скрипта.
 #[derive(Debug, Clone)]
-pub struct NnSpamModel {
+pub struct LinearSpamModel {
     pub version: String,
     terms: HashMap<String, usize>,
     idf: Vec<f32>,
@@ -18,7 +18,7 @@ pub struct NnSpamModel {
 }
 
 #[derive(Debug, Deserialize)]
-struct NnSpamExport {
+struct LinearSpamExport {
     version: String,
     analyzer: String,
     vocab: HashMap<String, f32>,
@@ -26,8 +26,8 @@ struct NnSpamExport {
     intercept: f32,
 }
 
-pub fn load_model(json: &str) -> anyhow::Result<NnSpamModel> {
-    let export: NnSpamExport = serde_json::from_str(json)?;
+pub fn load_model(json: &str) -> anyhow::Result<LinearSpamModel> {
+    let export: LinearSpamExport = serde_json::from_str(json)?;
     if export.analyzer != "word_12_lower" {
         anyhow::bail!("unsupported nn spam analyzer {:?}", export.analyzer);
     }
@@ -55,7 +55,7 @@ pub fn load_model(json: &str) -> anyhow::Result<NnSpamModel> {
         terms.insert((*name).clone(), idf.len());
         idf.push(weight);
     }
-    Ok(NnSpamModel {
+    Ok(LinearSpamModel {
         version: export.version,
         terms,
         idf,
@@ -81,7 +81,7 @@ fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-pub fn spam_probability(model: &NnSpamModel, text: &str) -> f64 {
+pub fn spam_probability(model: &LinearSpamModel, text: &str) -> f64 {
     let mut counts: HashMap<usize, f64> = HashMap::new();
     for token in tokenize(text) {
         if let Some(index) = model.terms.get(&token) {
@@ -146,16 +146,16 @@ mod tests {
 
     #[test]
     fn production_model_matches_python_probability() {
-        let json = include_str!("../../../models/nn_spam_word12_v1.json");
+        let json = include_str!("../../../models/linear_spam_word12_v1.json");
         let model = load_model(json).expect("production nn model must load");
         let probability = spam_probability(&model, PARITY_TEXT);
         assert!(
-            (probability - 0.977_445).abs() < 1e-4,
+            (probability - 0.972_441).abs() < 1e-4,
             "parity drift: {probability}"
         );
     }
 
-    fn tiny_model() -> NnSpamModel {
+    fn tiny_model() -> LinearSpamModel {
         // coef идёт в порядке sorted vocab (как get_feature_names_out):
         // ["мир", "привет"] -> [-1.0, 1.0].
         load_model(

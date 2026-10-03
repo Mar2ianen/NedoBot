@@ -29,7 +29,27 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=False)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL, trust_remote_code=False)
     model.eval()
-    print(f"id2label={model.config.id2label}", file=sys.stderr)
+    id2label = {int(key): value for key, value in model.config.id2label.items()}
+    print(f"id2label={id2label}", file=sys.stderr)
+    spam_label_ids = [
+        index for index, name in id2label.items() if "spam" in name.lower()
+    ]
+    if len(spam_label_ids) == 1:
+        spam_index = spam_label_ids[0]
+    elif sorted(id2label.values()) == ["LABEL_0", "LABEL_1"]:
+        # Binary LABEL_0/LABEL_1 convention: 1 is the positive class. Loud
+        # on purpose: a checkpoint with flipped semantics would silently
+        # invert the whole benchmark.
+        print(
+            "WARNING: id2label carries no spam semantics, assuming LABEL_1 is spam",
+            file=sys.stderr,
+        )
+        spam_index = 1
+    else:
+        raise SystemExit(
+            f"cannot resolve the spam class index from id2label={id2label}; "
+            "refusing to benchmark with a flipped mapping"
+        )
 
     probabilities = []
     import time
@@ -42,7 +62,7 @@ def main() -> None:
                 batch, padding=True, truncation=True, max_length=256, return_tensors="pt"
             )
             logits = model(**encoded).logits
-            probabilities.extend(torch.softmax(logits, dim=-1)[:, 1].tolist())
+            probabilities.extend(torch.softmax(logits, dim=-1)[:, spam_index].tolist())
     elapsed = time.time() - started
     print(f"inference: {elapsed:.1f}s total, {elapsed / len(texts) * 1000:.0f}ms per message (CPU)", file=sys.stderr)
     print(classification_report(labels, [int(p >= THRESHOLD) for p in probabilities], digits=4))

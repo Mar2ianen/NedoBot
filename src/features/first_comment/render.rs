@@ -325,7 +325,7 @@ mod tests {
             groq_api_key: String::new(),
             new_user_audit_enabled: false,
             new_user_audit_max_tokens: 900,
-            nn_spam_model: None,
+            linear_spam_model: None,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,
             send_owner_preview: false,

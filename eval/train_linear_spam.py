@@ -1,6 +1,6 @@
 """Обучение word-TF-IDF + LogReg на alt-gnome + нашем корпусе и экспорт весов.
 
-Выход: models/nn_spam_word12_v1.json — единственный артефакт, идущий в репо.
+Выход: models/linear_spam_word12_v1.json — единственный артефакт, идущий в репо.
 Сырые тексты нашего корпуса НЕ коммитятся. Токенизация обязана совпадать
 с teloxide_antispam::nn: lowercase, (?u)\\w+, ngram 1-2, tf raw count,
 idf ln((1+n)/(1+df))+1, l2-norm, sigmoid(dot + intercept).
@@ -16,8 +16,8 @@ from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
 ALT_DATASET = "alt-gnome/telegram-spam"
-MODEL_VERSION = "nn_spam_word12_v1"
-MODEL_PATH = "models/nn_spam_word12_v1.json"
+MODEL_VERSION = "linear_spam_word12_v1"
+MODEL_PATH = "models/linear_spam_word12_v1.json"
 
 
 def load_local(path):
@@ -33,11 +33,15 @@ def main() -> None:
     our_ham = load_local("eval/our_ham.txt")
     print(f"alt={len(alt_texts)} ours_spam={len(our_spam)} ours_ham={len(our_ham)}", file=sys.stderr)
 
-    # Честный сплит нашего корпуса пополам: половина в обучение, половина в тест.
+    # Честный сплит обеих частей: ALT тоже делится на train/test, иначе
+    # метрика holdout невоспроизводима из скрипта.
+    alt_train_texts, alt_test_texts, alt_train_labels, alt_test_labels = train_test_split(
+        alt_texts, alt_labels, test_size=0.2, random_state=42, stratify=alt_labels
+    )
     ours_spam_train, ours_spam_test = train_test_split(our_spam, test_size=0.5, random_state=42)
     ours_ham_train, ours_ham_test = train_test_split(our_ham, test_size=0.5, random_state=42)
 
-    fit_texts = alt_texts + ours_spam_train + ours_ham_train
+    fit_texts = alt_train_texts + ours_spam_train + ours_ham_train
     vectorizer = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
@@ -47,11 +51,17 @@ def main() -> None:
         token_pattern=r"(?u)\w+",
     )
     vectorizer.fit(fit_texts)
-    train_texts = alt_texts + ours_spam_train + ours_ham_train
-    train_labels = alt_labels + [1] * len(ours_spam_train) + [0] * len(ours_ham_train)
-    weights = [1.0] * len(alt_texts) + [8.0] * (len(ours_spam_train) + len(ours_ham_train))
+    train_texts = alt_train_texts + ours_spam_train + ours_ham_train
+    train_labels = alt_train_labels + [1] * len(ours_spam_train) + [0] * len(ours_ham_train)
+    weights = [1.0] * len(alt_train_texts) + [8.0] * (len(ours_spam_train) + len(ours_ham_train))
     model = LogisticRegression(max_iter=1000, C=4.0)
     model.fit(vectorizer.transform(train_texts), train_labels, sample_weight=weights)
+    print("== alt-gnome holdout ==", file=sys.stderr)
+    print(
+        classification_report(
+            alt_test_labels, model.predict(vectorizer.transform(alt_test_texts)), digits=4
+        )
+    )
 
     held_spam = vectorizer.transform(ours_spam_test)
     held_ham = vectorizer.transform(ours_ham_test)
