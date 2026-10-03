@@ -176,15 +176,7 @@ fn default_review_threshold() -> i32 {
     70
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TelegramIdRiskModel {
-    pub floor: f64,
-    pub ceil: f64,
-    pub k: f64,
-    pub midpoint_billion: f64,
-    pub version: String,
-}
+pub use teloxide_antispam::signals::TelegramIdRiskModel;
 
 /// Набор instance/chat policy, общий для одного процесса и одного Telegram bot token.
 /// PostgreSQL и operational jobs остаются локальными для этого instance.

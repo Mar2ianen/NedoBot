@@ -8,4 +8,5 @@
 pub mod assessment;
 pub mod external;
 pub mod scoring;
+pub mod signals;
 pub mod text;
