@@ -559,6 +559,37 @@ pub async fn apply_action(
             ReportActionResult::Missing
         });
     }
+    // Подтверждённые решения уходят в корпус: accepted штампует спам,
+    // rejected пишет confirmed-ham для reuse-сигналов.
+    let card = repo::load_report(pool, report_id).await?;
+    match action {
+        ReportAction::Accept => {
+            crate::features::labels::record_spam(
+                pool,
+                card.chat_id,
+                card.reported_user_id,
+                &crate::features::labels::SpamLabel {
+                    subtype: "manual_owner_report".to_string(),
+                    source: crate::features::labels::LabelSource::OwnerReview,
+                    reason: format!("Owner-confirmed report: {}", card.reason),
+                    evidence: serde_json::json!({"report_id": report_id}),
+                    operator_id: Some(actor_id),
+                },
+            )
+            .await?;
+        }
+        ReportAction::Reject => {
+            crate::features::labels::record_not_spam(
+                pool,
+                card.chat_id,
+                card.reported_user_id,
+                "Owner rejected report",
+                &serde_json::json!({"report_id": report_id}),
+                Some(actor_id),
+            )
+            .await?;
+        }
+    }
     Ok(ReportActionResult::Applied(resolution))
 }
 
