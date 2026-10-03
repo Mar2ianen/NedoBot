@@ -426,6 +426,11 @@ ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 доставляемым. Кнопки «Верно: спамер» и «Неверно: не спамер» доступны только
 `runtime.owner_telegram_id`; первое решение атомарно закрывает запрос и убирает
 клавиатуру. Технические labels риска в карточке переводятся в понятные причины. Кнопки доступны только владельцу, заданному через `runtime.owner_telegram_id`.
+Все решения пишутся через единый writer `features::labels`: событие в
+`spam_label_events` + флаги пользователя + штампы сообщений. Без события
+reuse-сигналы и template-корпус помеченного не видят. Команда `/notspam`
+reply (reviewer: configured reviewer, owner или админ чата) пишет `not_spam`
+и снимает пометку — так собираются confirmed-ham примеры для классификатора.
 
 Посмотреть последние сообщения:
 

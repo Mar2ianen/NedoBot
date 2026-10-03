@@ -35,17 +35,16 @@ use tg_ai_bot_teloxide::features::{
         mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
     jobs::{claim::CasResult, observability::load_job_lifecycle_report},
+    labels::{LabelSource, SpamLabel, record_not_spam, record_spam},
     memory::service::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
     },
-    new_user_audit::{
-        repo::{
-            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_new_user_audit_job,
-        },
+    new_user_audit::repo::{
+        NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
+        finalize_new_user_audit_job, mark_new_user_audit_failed,
+        mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+        mark_new_user_audit_retry, materialize_new_user_audit_job,
     },
     reports::{ReportCreation, ReportTarget, create_report},
     spam_review::{
@@ -108,6 +107,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
+    assert_label_writer_roundtrip(&pool).await;
     assert_comment_reconciliation_requires_operator_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
@@ -4586,4 +4586,90 @@ async fn assert_job_state(
     assert_eq!(status, expected_status);
     assert_eq!(error_kind.as_deref(), expected_error_kind);
     assert_eq!(next_attempt_is_future, expected_next_attempt_is_future);
+}
+
+async fn assert_label_writer_roundtrip(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_013;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("label fixture user must exist");
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, 501, $2, 'fixture promo')")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("label fixture message must exist");
+    record_spam(
+        pool,
+        CHAT_ID,
+        USER_ID,
+        &SpamLabel {
+            subtype: "promo_dm_bait".to_string(),
+            source: LabelSource::OwnerReview,
+            reason: "fixture".to_string(),
+            evidence: serde_json::json!({"fixture": true}),
+            operator_id: Some(1),
+        },
+    )
+    .await
+    .expect("spam label must record");
+    let flagged: (bool, i32, Option<String>) = query_as(
+        "select is_spammer, spam_score, spam_type from telegram_chat_users where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("flagged user must exist");
+    assert_eq!(flagged, (true, 100, Some("promo_dm_bait".to_string())));
+    let stamped: i64 = query_scalar(
+        "select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("stamp count must exist");
+    assert_eq!(stamped, 1);
+    let events: i64 = query_scalar(
+        "select count(*) from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'spam'",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("spam events must exist");
+    assert_eq!(events, 1);
+    record_not_spam(
+        pool,
+        CHAT_ID,
+        USER_ID,
+        "fixture correction",
+        &serde_json::json!({"fixture": true}),
+        Some(1),
+    )
+    .await
+    .expect("not-spam label must record");
+    let cleared: (bool, i32) = query_as(
+        "select is_spammer, spam_score from telegram_chat_users where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("cleared user must exist");
+    assert_eq!(cleared, (false, 0));
+    let ham_events: i64 = query_scalar(
+        "select count(*) from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'not_spam'",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("ham events must exist");
+    assert_eq!(ham_events, 1);
 }
