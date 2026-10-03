@@ -127,6 +127,7 @@ fn project_unified_user_audit_material_revision(
             "bio_preview": bounded_audit_text(features.bio.as_deref()),
             "profile_photo_unique_id": features.profile_photo_file_unique_id,
             "shared_spammer_identity": features.shared_spammer_identity,
+            "lols_spammer_identity": features.lols_spammer_identity,
         },
         "first_message": bounded_audit_text(features.first_message_text.as_deref()),
         "first_message_reply_context": bounded_audit_text(features.first_message_reply_context.as_deref()),
@@ -406,6 +407,11 @@ async fn load_features(
                 where r.telegram_user_id = cu.telegram_user_id
                   and r.source_instance_id <> $3
             ) as shared_spammer_identity,
+            exists (
+                select 1
+                from lols_spam_users l
+                where l.telegram_user_id = cu.telegram_user_id
+            ) as lols_spammer_identity,
             p.first_name,
             p.last_name,
             nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') as display_name,
@@ -593,6 +599,7 @@ async fn load_features(
             username_reuse_count: row.get("username_reuse_count"),
             username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
             shared_spammer_identity: row.get("shared_spammer_identity"),
+            lols_spammer_identity: row.get("lols_spammer_identity"),
             first_name: row.get("first_name"),
             last_name: row.get("last_name"),
             display_name: row.get("display_name"),
