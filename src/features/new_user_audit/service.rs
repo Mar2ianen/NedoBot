@@ -40,36 +40,52 @@ pub async fn process_next_new_user_audit_job(
 }
 
 async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
-    let result = if job.is_materialization_replay {
-        materialize_stored_assessment(pool, config, job).await
-    } else {
-        generate_and_finalize(bot, pool, config, job).await
-    };
-    let Err(error) = result else { return };
-
     if job.is_materialization_replay {
-        if let Some(sqlx::Error::Database(database_error)) = error.downcast_ref::<sqlx::Error>() {
-            tracing::warn!(
-                job_id = job.id,
-                sqlstate = ?database_error.code(),
-                constraint = ?database_error.constraint(),
-                "new user audit materialization hit a database error"
-            );
+        match materialize_stored_assessment(pool, config, job).await {
+            Ok(Some(score)) => {
+                if let Err(error) = crate::features::auto_moderation::maybe_enforce_audit(
+                    bot, pool, config, job, score,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        job_id = job.id,
+                        %error,
+                        "auto moderation enforcement failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(sqlx::Error::Database(database_error)) =
+                    error.downcast_ref::<sqlx::Error>()
+                {
+                    tracing::warn!(
+                        job_id = job.id,
+                        sqlstate = ?database_error.code(),
+                        constraint = ?database_error.constraint(),
+                        "new user audit materialization hit a database error"
+                    );
+                }
+                let failure = classify_materialization_failure(&error);
+                let (result, error_kind) = match failure {
+                    MaterializationFailure::Retry { error_kind } => (
+                        mark_new_user_audit_materialization_retry(pool, job, error_kind).await,
+                        error_kind,
+                    ),
+                    MaterializationFailure::Stale { error_kind } => (
+                        mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
+                        error_kind,
+                    ),
+                };
+                log_materialization_failure(result, job, error_kind);
+                return;
+            }
         }
-        let failure = classify_materialization_failure(&error);
-        let (result, error_kind) = match failure {
-            MaterializationFailure::Retry { error_kind } => (
-                mark_new_user_audit_materialization_retry(pool, job, error_kind).await,
-                error_kind,
-            ),
-            MaterializationFailure::Stale { error_kind } => (
-                mark_new_user_audit_materialization_stale(pool, job, error_kind).await,
-                error_kind,
-            ),
-        };
-        log_materialization_failure(result, job, error_kind);
         return;
     }
+    let result = generate_and_finalize(bot, pool, config, job).await;
+    let Err(error) = result else { return };
 
     let failure = classify_audit_failure(&error);
     let result = match failure {
@@ -114,7 +130,7 @@ async fn materialize_stored_assessment(
     pool: &PgPool,
     config: &Config,
     job: &NewUserAuditJob,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<i32>> {
     let assessment_json = job
         .assessment_json
         .as_ref()
@@ -152,8 +168,9 @@ async fn materialize_stored_assessment(
             attempts = job.attempts,
             "new user audit materialization lease was reclaimed"
         );
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(components.final_score()))
 }
 
 fn log_materialization_failure(
