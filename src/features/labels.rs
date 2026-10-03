@@ -1,5 +1,5 @@
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 /// Единая точка записи durable-разметки спамеров.
 ///
@@ -142,4 +142,46 @@ pub async fn record_not_spam_in_transaction(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Журнальная запись решения. Читается tuning-инструментами и будущим
+/// объединённым /modlog; прямых читателей в этом слайсе ещё нет.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub kind: String,
+    pub target_user_id: i64,
+    pub actor_user_id: Option<i64>,
+    pub detail: String,
+    pub source: String,
+}
+
+/// Читает единый журнал решений (`moderation_decision_journal`): свежие
+/// первыми, опционально по цели. Для настройки порогов и проверки, что
+/// каждое enforcement имеет записанное решение.
+#[allow(dead_code)]
+pub async fn read_journal(
+    pool: &PgPool,
+    chat_id: i64,
+    target_user_id: Option<i64>,
+    limit: i64,
+) -> anyhow::Result<Vec<JournalEntry>> {
+    let rows = sqlx::query(
+        "select kind, target_user_id, actor_user_id, detail, source from moderation_decision_journal where chat_id = $1 and ($2::bigint is null or target_user_id = $2) order by decided_at desc limit $3",
+    )
+    .bind(chat_id)
+    .bind(target_user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| JournalEntry {
+            kind: row.get("kind"),
+            target_user_id: row.get("target_user_id"),
+            actor_user_id: row.get("actor_user_id"),
+            detail: row.get("detail"),
+            source: row.get("source"),
+        })
+        .collect())
 }

@@ -35,7 +35,7 @@ use tg_ai_bot_teloxide::features::{
         mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
     },
     jobs::{claim::CasResult, observability::load_job_lifecycle_report},
-    labels::{LabelSource, SpamLabel, record_not_spam, record_spam},
+    labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
     memory::service::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
@@ -4672,4 +4672,10 @@ async fn assert_label_writer_roundtrip(pool: &PgPool) {
     .await
     .expect("ham events must exist");
     assert_eq!(ham_events, 1);
+    let journal = read_journal(pool, CHAT_ID, Some(USER_ID), 10)
+        .await
+        .expect("journal must read");
+    assert_eq!(journal.len(), 2);
+    assert!(journal.iter().any(|entry| entry.kind == "label:spam"));
+    assert!(journal.iter().any(|entry| entry.kind == "label:not_spam"));
 }
