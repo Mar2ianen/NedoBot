@@ -29,14 +29,18 @@ use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allo
 #[cfg(feature = "manual-moderation")]
 use crate::features::manual_moderation::types::CommandKind as ManualCommandKind;
 use crate::features::memory::report::send_memory_notes;
-#[cfg(feature = "moderation")]
-use crate::features::reports::{self, ReportCreation};
 use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 #[cfg(feature = "voice")]
 use crate::features::voice::pipeline::transcribe_reply;
+#[cfg(feature = "moderation")]
+use crate::features::{
+    labels,
+    reports::{self, ReportCreation},
+    spam_review::is_chat_admin,
+};
 use crate::state::AppState;
 #[cfg(feature = "ask")]
 use crate::telegram::ask_drafter::AskDrafterBackend;
@@ -165,6 +169,10 @@ pub async fn handle_command(
         #[cfg(feature = "moderation")]
         Command::Report(reason) => {
             handle_report_command(&bot, &msg, &state, &reason).await?;
+        }
+        #[cfg(feature = "moderation")]
+        Command::Notspam(reason) => {
+            handle_notspam_command(&bot, &msg, &state, &reason).await?;
         }
         #[cfg(feature = "manual-moderation")]
         Command::Mute(args) => {
@@ -494,6 +502,70 @@ async fn handle_report_command(
         ReportCreation::RateLimited => unreachable!("rate limit handled above"),
     };
     send_command_reply_html(bot, msg, state, text).await?;
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn handle_notspam_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    reason: &str,
+) -> ResponseResult<()> {
+    let Some(author) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let author_id = author.id.0 as i64;
+    let is_reviewer = state.config.reviewer_user_ids().contains(&author_id)
+        || state.config.owner_telegram_id == Some(author_id);
+    if !is_reviewer {
+        match is_chat_admin(bot.inner(), msg.chat.id.0, author_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                send_command_reply_html(bot, msg, state, "Недостаточно прав.").await?;
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::error!(%err, "failed to verify /notspam actor");
+                send_command_reply_html(bot, msg, state, "Не удалось проверить права.").await?;
+                return Ok(());
+            }
+        }
+    }
+    if reports::report_target_context(msg, &state.config).is_err() {
+        send_command_reply_html(
+            bot,
+            msg,
+            state,
+            "Пометить можно только ответом на сообщение участника в этом чате.",
+        )
+        .await?;
+        return Ok(());
+    }
+    let Some(target) = reports::target_from_reply(msg, reason) else {
+        send_command_reply_html(bot, msg, state, "Не удалось определить автора сообщения.").await?;
+        return Ok(());
+    };
+    let note = if reason.trim().is_empty() {
+        "Reviewer rejected spam suspicion".to_string()
+    } else {
+        format!("Reviewer rejected spam suspicion: {}", reason.trim())
+    };
+    if let Err(err) = labels::record_not_spam(
+        &state.pool,
+        target.chat_id,
+        target.reported_user_id,
+        &note,
+        &serde_json::json!({"command": "notspam", "reporter_user_id": author_id}),
+        Some(author_id),
+    )
+    .await
+    {
+        tracing::error!(%err, "failed to record /notspam label");
+        send_command_reply_html(bot, msg, state, "Не удалось сохранить пометку.").await?;
+        return Ok(());
+    }
+    send_command_reply_html(bot, msg, state, "Помечено как не спам.").await?;
     Ok(())
 }
 

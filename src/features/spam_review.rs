@@ -10,7 +10,12 @@ use teloxide::{
 
 use crate::{
     config_file::ModerationConfig,
-    features::jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
+    features::{
+        jobs::{claim::CasResult, policy::ANALYSIS_RETRY},
+        labels::{
+            LabelSource, SpamLabel, record_not_spam_in_transaction, record_spam_in_transaction,
+        },
+    },
     telegram::html,
 };
 
@@ -653,22 +658,31 @@ pub async fn apply_callback(
     if decision == "spam" {
         let chat_id: i64 = row.get("chat_id");
         let user_id: i64 = row.get("telegram_user_id");
-        sqlx::query("update telegram_chat_users set is_spammer = true, spam_score = greatest(spam_score, 100), spam_last_marked_at = now(), spam_reason = 'Owner-confirmed spammer', spam_type = 'llm_generic_comment', spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', '1'::jsonb, true), updated_at = now() where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
-        sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = 'Owner-confirmed spammer', spam_source = 'manual_owner_confirmation', spam_type = coalesce(spam_type, 'llm_generic_comment') where chat_id = $1 and user_id = $2 and source_channel_id is null").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
-        sqlx::query("update telegram_chat_users set spam_message_count = (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null), spam_types = jsonb_set(coalesce(spam_types, '{}'::jsonb), '{llm_generic_comment}', to_jsonb((select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null)), true) where chat_id = $1 and telegram_user_id = $2").bind(chat_id).bind(user_id).execute(&mut *tx).await?;
+        record_spam_in_transaction(
+            &mut tx,
+            chat_id,
+            user_id,
+            &SpamLabel {
+                subtype: "llm_generic_comment".to_string(),
+                source: LabelSource::OwnerReview,
+                reason: "Owner-confirmed spammer".to_string(),
+                evidence: serde_json::json!({"review_id": request_id}),
+                operator_id: Some(owner_id),
+            },
+        )
+        .await?;
     } else if decision == "normal" {
         let chat_id: i64 = row.get("chat_id");
         let user_id: i64 = row.get("telegram_user_id");
-        sqlx::query("update telegram_chat_users set is_spammer = false, spam_score = 0, spam_last_marked_at = null, spam_reason = null, spam_type = null, spam_types = coalesce(spam_types, '{}'::jsonb) - 'llm_generic_comment', updated_at = now() where chat_id = $1 and telegram_user_id = $2")
-            .bind(chat_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("update telegram_messages set spam_marked_at = null, spam_reason = null, spam_source = null where chat_id = $1 and user_id = $2 and source_channel_id is null and spam_source = 'manual_owner_confirmation'")
-            .bind(chat_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        record_not_spam_in_transaction(
+            &mut tx,
+            chat_id,
+            user_id,
+            "Owner rejected spam review",
+            &serde_json::json!({"review_id": request_id}),
+            Some(owner_id),
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(Some(if decision == "spam" {
