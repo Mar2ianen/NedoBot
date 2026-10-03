@@ -992,6 +992,14 @@ fn validate_community_config(
     {
         anyhow::bail!("moderation.cas_timeout_sec must be between 1 and 30");
     }
+    if community.moderation.enforce_enabled {
+        if !community.moderation.enabled {
+            anyhow::bail!("moderation.enforce_enabled=true requires moderation.enabled=true");
+        }
+        if !(50..=100).contains(&community.moderation.enforce_ban_threshold) {
+            anyhow::bail!("moderation.enforce_ban_threshold must be between 50 and 100");
+        }
+    }
 
     if community.spam_reputation.enabled
         && community

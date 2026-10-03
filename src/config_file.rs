@@ -79,6 +79,17 @@ pub struct ModerationConfig {
     pub cas_enabled: bool,
     #[serde(default = "default_cas_timeout_sec")]
     pub cas_timeout_sec: u64,
+    /// Автомодерация по score. Выключена по умолчанию; включается только
+    /// осознанно после калибровки порогов на журнале решений.
+    #[serde(default)]
+    pub enforce_enabled: bool,
+    /// Dry-run: решения пишутся в журнал, Telegram API не вызывается.
+    #[serde(default = "default_true")]
+    pub enforce_dry_run: bool,
+    /// Score для бана с удалением сообщений. Ниже — только удаление
+    /// сообщений с сохранением review-карточки.
+    #[serde(default = "default_enforce_ban_threshold")]
+    pub enforce_ban_threshold: i32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -94,6 +105,14 @@ fn default_review_delivery_enabled() -> bool {
 
 fn default_cas_timeout_sec() -> u64 {
     5
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_enforce_ban_threshold() -> i32 {
+    90
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
