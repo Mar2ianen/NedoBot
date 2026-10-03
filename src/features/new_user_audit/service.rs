@@ -14,13 +14,13 @@ use crate::features::new_user_audit::repo::{
     mark_new_user_audit_retry, materialize_new_user_audit_job,
 };
 use crate::features::new_user_audit::scoring::{spam_similarity, template_match_count};
+use crate::features::user_profiles::avatar::cache_profile_avatar;
+use crate::llm::service::{GenerateTextOptions, generate_text_checked};
+use crate::llm::types::{LlmTransportError, StructuredOutput};
 use teloxide_antispam::assessment::NewUserAuditAssessment;
 use teloxide_antispam::scoring::{
     FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment,
 };
-use crate::features::user_profiles::avatar::cache_profile_avatar;
-use crate::llm::service::{GenerateTextOptions, generate_text_checked};
-use crate::llm::types::{LlmTransportError, StructuredOutput};
 
 /// Обрабатывает одну готовую unified-audit job.
 ///
