@@ -25,6 +25,14 @@ def load_local(path):
         return [text for text in handle.read().split("\x1f") if text.strip()]
 
 
+def load_optional(path):
+    import os
+
+    if not os.path.exists(path):
+        return []
+    return load_local(path)
+
+
 def main() -> None:
     dataset = load_dataset(ALT_DATASET, split="train")
     alt_texts = [row["text"] for row in dataset]
@@ -40,25 +48,32 @@ def main() -> None:
     )
     ours_spam_train, ours_spam_test = train_test_split(our_spam, test_size=0.5, random_state=42)
     ours_ham_train, ours_ham_test = train_test_split(our_ham, test_size=0.5, random_state=42)
+    # Смежный чат того же домена: только ham (там чисто), целиком в обучение.
+    inter_ham_train = load_optional("eval/inter_ham.txt")
 
-    fit_texts = alt_train_texts + ours_spam_train + ours_ham_train
+    fit_texts = alt_train_texts + ours_spam_train + ours_ham_train + inter_ham_train
     vectorizer = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
         lowercase=True,
         min_df=3,
-        max_features=30000,
+        max_features=60000,
         token_pattern=r"(?u)\w+",
     )
     vectorizer.fit(fit_texts)
-    train_texts = alt_train_texts + ours_spam_train + ours_ham_train
-    train_labels = alt_train_labels + [1] * len(ours_spam_train) + [0] * len(ours_ham_train)
+    train_texts = alt_train_texts + ours_spam_train + ours_ham_train + inter_ham_train
+    train_labels = (
+        alt_train_labels
+        + [1] * len(ours_spam_train)
+        + [0] * (len(ours_ham_train) + len(inter_ham_train))
+    )
     # Наш ham — лучший ham (точный домен), наш спам — золото: вес выше.
     # ALT-часть даёт широту жанров и регуляризацию от переобучения на ~200 образцах.
     weights = (
         [1.0] * len(alt_train_texts)
         + [8.0] * len(ours_spam_train)
         + [2.0] * len(ours_ham_train)
+        + [2.0] * len(inter_ham_train)
     )
     model = LogisticRegression(max_iter=1000, C=4.0)
     model.fit(vectorizer.transform(train_texts), train_labels, sample_weight=weights)
