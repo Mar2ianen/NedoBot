@@ -287,7 +287,7 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ### Dry-run автомодерации 2026-10-03
 
-Выкачен `feat/spam-moderation-backend-v2` (крейт `teloxide-antispam`, labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) прямым rsync в `/opt/tg-ai-bot-teloxide`, release build + restart. Включено: `enforce_enabled=true`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, `nn_spam_enabled=true`, CAS выкл. Таргет недели: FPR ≤ 0.0001%, детект ≥ 99.9% (см. New User Audit). LOLS-синк ежечасно в :17 (`sync_lols_banlist`, cron root), бэкфилл эмбеддингов спамеров выполнен.
+Выкачен `feat/spam-moderation-backend-v2` (крейт `teloxide-antispam`, labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) прямым rsync в `/opt/tg-ai-bot-teloxide`, release build + restart. Включено: `enforce_enabled=true`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, `linear_spam_enabled=true`, CAS выкл. Таргет недели: FPR ≤ 0.0001%, детект ≥ 99.9% (см. New User Audit). LOLS-синк ежечасно в :17 (`sync_lols_banlist`, cron root), бэкфилл эмбеддингов спамеров выполнен.
 
 
 - код: `/opt/tg-ai-bot-teloxide`
@@ -423,7 +423,7 @@ ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 - LOLS-зеркало (`lols_spam_users`, bin `sync_lols_banlist`, сигнал `lols_spammer_identity` +50): почасовой дамп `lols.bot/spam/banlist.txt` (~3.6M user_id) сворачивается локально через temp swap, lookup в baseline без сети. Замер: 11/11 подтверждённых спамеров в LOLS против 0/8 в CAS.
 - CAS (Combot Anti-Spam, `api.cas.chat`) подключён как слабый внешний сигнал за флагом `moderation.cas_enabled` (`cas_timeout_sec`, default 5, валидация 1..30): положительный вердикт даёт не более +12 (`EXTERNAL_SCORE_CAP`) и никогда сам не выводит в high; «Record not found» и любые ошибки трактуются как unknown/clean и ничего не добавляют. Замер на 8 подтверждённых спамерах НедоNews/PVO: покрытие CAS 0/8.
 - Лестница автомодерации (`moderation.enforce_enabled=false`, `enforce_dry_run=true`, `enforce_ban_threshold=90`, валидация 50..100, требует `moderation.enabled`): свежий materialize-аудит моложе 24ч — review-порог удаляет первое сообщение (карточка идёт как обычно), ban-порог банит, удаляет до 10 недавних сообщений и пишет System-метку в корпус. Replay старых аудитов никогда не исполняется. Идемпотентность по `is_spammer` и System-метке; снятие бана — вручную `/unban` (решение видно в `moderation_decision_journal`).
-- Нейроскоринг первого сообщения (`moderation.nn_spam_enabled=false`, `nn_spam_model_path`, загрузка на старте): word TF-IDF 1-2gram + LogReg, обучение `eval/train_nn_spam.py` на alt-gnome (21k, CC0) + нашем корпусе, веса `models/nn_spam_word12_v1.json`, инференс в `teloxide_antispam::nn` с паритетным тестом против Python. Held-out: spam recall 0.50 при высокой precision вверху, поэтому только supporting-вес (p≥0.9 → +18, p≥0.75 → +10). Сырые тексты корпуса не коммитятся.
+- Линейный скоринг первого сообщения (`moderation.linear_spam_enabled=false`, `linear_spam_model_path`, загрузка на старте): word TF-IDF 1-2gram + LogReg, обучение `eval/train_linear_spam.py` на alt-gnome (21k, CC0) + нашем корпусе, веса `models/linear_spam_word12_v1.json`, инференс в `teloxide_antispam::logreg` с паритетным тестом против Python. Held-out: spam recall 0.50 при высокой precision вверху, поэтому только supporting-вес (p≥0.9 → +18, p≥0.75 → +10). Сырые тексты корпуса не коммитятся.
 
 Для каждого нового пользователя бот сохраняет один audit-запрос в
 `spam_review_requests`, включая low и medium risk. Карточка для ревью с тегом

@@ -91,7 +91,7 @@ pub struct Config {
     pub groq_api_key: String,
     pub new_user_audit_enabled: bool,
     pub new_user_audit_max_tokens: u32,
-    pub nn_spam_model: Option<std::sync::Arc<teloxide_antispam::nn::NnSpamModel>>,
+    pub linear_spam_model: Option<std::sync::Arc<teloxide_antispam::logreg::LinearSpamModel>>,
     pub gemini_thinking_budget: u32,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
@@ -443,27 +443,29 @@ impl Config {
             voice_send_full_file: runtime.voice_send_full_file,
             public_base_url: runtime.public_base_url,
             static_files_dir: runtime.static_files_dir,
-            nn_spam_model: None,
+            linear_spam_model: None,
         };
-        if config.community.moderation.nn_spam_enabled {
+        if config.community.moderation.linear_spam_enabled {
             let path = config
                 .community
                 .moderation
-                .nn_spam_model_path
+                .linear_spam_model_path
                 .as_deref()
                 .ok_or_else(|| {
-                    anyhow::anyhow!("moderation.nn_spam_enabled=true requires nn_spam_model_path")
+                    anyhow::anyhow!(
+                        "moderation.linear_spam_enabled=true requires linear_spam_model_path"
+                    )
                 })?;
             let json = std::fs::read_to_string(path)
                 .map_err(|error| anyhow::anyhow!("cannot read nn spam model {path:?}: {error}"))?;
-            let model = teloxide_antispam::nn::load_model(&json)
+            let model = teloxide_antispam::logreg::load_model(&json)
                 .map_err(|error| anyhow::anyhow!("cannot parse nn spam model {path:?}: {error}"))?;
             tracing::info!(
                 version = model.version.as_str(),
                 path,
                 "loaded nn spam model"
             );
-            config.nn_spam_model = Some(std::sync::Arc::new(model));
+            config.linear_spam_model = Some(std::sync::Arc::new(model));
         }
         Ok(config)
     }
@@ -1023,16 +1025,18 @@ fn validate_community_config(
             anyhow::bail!("moderation.enforce_ban_threshold must be between 50 and 100");
         }
     }
-    if community.moderation.nn_spam_enabled {
+    if community.moderation.linear_spam_enabled {
         let path = community
             .moderation
-            .nn_spam_model_path
+            .linear_spam_model_path
             .as_deref()
             .ok_or_else(|| {
-                anyhow::anyhow!("moderation.nn_spam_enabled=true requires nn_spam_model_path")
+                anyhow::anyhow!(
+                    "moderation.linear_spam_enabled=true requires linear_spam_model_path"
+                )
             })?;
         if !std::path::Path::new(path).is_absolute() {
-            anyhow::bail!("moderation.nn_spam_model_path must be an absolute path");
+            anyhow::bail!("moderation.linear_spam_model_path must be an absolute path");
         }
     }
 
@@ -1402,7 +1406,7 @@ mod tests {
             groq_api_key: String::new(),
             new_user_audit_enabled: false,
             new_user_audit_max_tokens: 900,
-            nn_spam_model: None,
+            linear_spam_model: None,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,
             send_owner_preview: false,

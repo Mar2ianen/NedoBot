@@ -24,7 +24,8 @@ const MAX_DELETE_MESSAGES: i64 = 10;
 /// Ступени: review-порог — удалить первое сообщение (карточка идёт обычным
 /// путём, улики уже в аудите); ban-порог — бан плюс удаление недавних
 /// сообщений плюс System-метка в корпус. Всё идемпотентно: повторный прогон
-/// пропускается по `is_spammer` и существующей System-метке.
+/// пропускается по `is_spammer` и существующей System-метке, повторное
+/// удаление — по `deleted_by_bot_at`.
 ///
 /// При `enforce_dry_run` только пишется warn-лог, Telegram API и записи
 /// не трогаются.
@@ -109,17 +110,19 @@ async fn delete_first_message(
     pool: &sqlx::PgPool,
     job: &NewUserAuditJob,
 ) -> anyhow::Result<()> {
-    let message_id: Option<i32> = sqlx::query_scalar(
-        "select first_message_id from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    let row: Option<(i32, bool)> = sqlx::query_as(
+        "select m.message_id, m.deleted_by_bot_at is not null as deleted from telegram_messages m join telegram_new_user_profile_audits a on a.chat_id = m.chat_id and a.first_message_id = m.message_id and a.telegram_user_id = m.user_id where a.chat_id = $1 and a.telegram_user_id = $2",
     )
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
     .fetch_optional(pool)
-    .await?
-    .flatten();
-    let Some(message_id) = message_id else {
+    .await?;
+    let Some((message_id, already_deleted)) = row else {
         return Ok(());
     };
+    if already_deleted {
+        return Ok(());
+    }
     if let Err(error) = bot
         .delete_message(ChatId(job.chat_id), MessageId(message_id))
         .await
@@ -131,7 +134,16 @@ async fn delete_first_message(
             %error,
             "auto moderation failed to delete first message"
         );
+        return Ok(());
     }
+    crate::db::telegram::mark_message_deleted_by_bot(
+        pool,
+        job.chat_id,
+        message_id,
+        None,
+        Some("auto_moderation_delete"),
+    )
+    .await?;
     Ok(())
 }
 
