@@ -7,6 +7,7 @@
 
 pub mod assessment;
 pub mod external;
+pub mod nn;
 pub mod policy;
 pub mod scoring;
 pub mod signals;

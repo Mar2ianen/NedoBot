@@ -350,6 +350,8 @@ cas_timeout_sec = 5
 enforce_enabled = false
 enforce_dry_run = true
 enforce_ban_threshold = 90
+nn_spam_enabled = false
+nn_spam_model_path = "/opt/tg-ai-bot-teloxide/models/nn_spam_word12_v1.json"
 
 [manual_moderation]
 enabled = false
