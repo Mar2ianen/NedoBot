@@ -462,8 +462,11 @@ impl Config {
                 .map_err(|error| anyhow::anyhow!("cannot parse nn spam model {path:?}: {error}"))?;
             tracing::info!(
                 version = model.version.as_str(),
+                calibration_version = model.calibration.version.as_str(),
+                supporting_threshold = model.calibration.supporting_threshold,
+                strong_threshold = model.calibration.strong_threshold,
                 path,
-                "loaded nn spam model"
+                "loaded linear spam model"
             );
             config.linear_spam_model = Some(std::sync::Arc::new(model));
         }

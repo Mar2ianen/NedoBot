@@ -100,6 +100,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_successful_audit_replays_for_materialization(&pool).await;
     assert_audit_generation_is_durable_before_materialization(&pool).await;
     assert_new_user_audit_materialization_lifecycle(&pool).await;
+    assert_text_observations_materialize_without_promoting_review_risk(&pool).await;
     assert_new_user_audit_generation_materialization_upgrade(&pool).await;
     assert_review_delivery_finalization_requires_current_claim(&pool).await;
     assert_review_delivery_payload_cas_blocks_replaced_and_lowered_risk(&pool).await;
@@ -2394,6 +2395,128 @@ async fn assert_new_user_audit_materialization_lifecycle(pool: &PgPool) {
             .is_none(),
         "authoritative replay must require the current materialization version"
     );
+}
+
+async fn assert_text_observations_materialize_without_promoting_review_risk(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_103;
+    let input = serde_json::json!({"schema_version": "fixture-v1"});
+    query("insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)")
+        .bind(CHAT_ID).bind(USER_ID).execute(pool).await.unwrap();
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "text-observation-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .unwrap();
+    let claim = claim_next_new_user_audit_job(pool).await.unwrap().unwrap();
+    assert_eq!(claim.telegram_user_id, USER_ID);
+    let assessment_json = serde_json::json!({
+        "avatar_observation": null,
+        "first_message_assessment": {
+            "relation_to_chat": "on_topic", "direct_dm_offer": false,
+            "offtopic_promo": false, "template_campaign": false,
+            "self_reference_grammar": "none_or_unclear",
+            "profile_name_grammar_relation": "not_applicable",
+            "risk_markers": [], "evidence": [], "summary": "Обычный вопрос.", "confidence": 0.9,
+        },
+        "profile_assessment": {
+            "risk_patterns": ["no_material_risk_pattern"], "evidence": [],
+            "contradictions": [], "review_priority": "low", "confidence": 0.5, "summary": "Нейтрально.",
+        },
+    });
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &claim,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &assessment_json,
+                provider: "fixture",
+                model: "fixture",
+            }
+        )
+        .await
+        .unwrap(),
+        CasResult::Applied
+    );
+    let replay = claim_next_new_user_audit_job(pool).await.unwrap().unwrap();
+    assert_eq!(replay.id, claim.id);
+    let assessment =
+        teloxide_antispam::assessment::NewUserAuditAssessment::parse(&assessment_json.to_string())
+            .unwrap();
+    let components = teloxide_antispam::scoring::score_assessment(
+        69,
+        serde_json::json!([]),
+        &assessment,
+        teloxide_antispam::scoring::FirstMessageScoreContext {
+            linear_spam_probability: Some(0.2),
+            linear_spam_model_version: Some("synthetic-v2".into()),
+            linear_spam_calibration: Some(teloxide_antispam::calibration::LinearScoreCalibration {
+                version: "synthetic-calibration-v2".into(),
+                supporting_threshold: 0.9,
+                strong_threshold: 0.975,
+                supporting_score: 10,
+                strong_score: 18,
+            }),
+            text_observations: Some(teloxide_antispam::preprocess::prepare_text("#Тeлeфoны").flags),
+            ..Default::default()
+        },
+        70,
+    );
+    assert_eq!(
+        materialize_new_user_audit_job(pool, &replay, &components, "fixture-embedding")
+            .await
+            .unwrap(),
+        CasResult::Applied
+    );
+    let stored: (i32, String, i32, serde_json::Value) = query_as(
+        "select risk_score, risk_level, risk_first_message_score, risk_first_message_signals from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    ).bind(CHAT_ID).bind(USER_ID).fetch_one(pool).await.unwrap();
+    assert_eq!((stored.0, stored.1.as_str(), stored.2), (69, "medium", 0));
+    assert_eq!(stored.3[0]["decision"], "observation_only");
+    assert_eq!(stored.3[0]["linear_spam_probability"], 0.2);
+    assert_eq!(stored.3[0]["linear_spam_model_version"], "synthetic-v2");
+    assert_eq!(
+        stored.3[0]["linear_spam_calibration"]["version"],
+        "synthetic-calibration-v2"
+    );
+    assert_eq!(
+        stored.3[0]["linear_spam_calibration"]["strong_threshold"],
+        0.975
+    );
+    assert!(
+        stored.3[0]["text_observations"]["homoglyph_chars"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let review: (i32, serde_json::Value) = query_as(
+        "select risk_score, risk_signals from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    ).bind(CHAT_ID).bind(USER_ID).fetch_one(pool).await.unwrap();
+    assert_eq!(review.0, 69);
+    assert_eq!(review.1, stored.3);
+    assert!(claim_next_review_delivery(pool).await.unwrap().is_none());
+    for sql in [
+        "delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+        "delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    ] {
+        query(sql)
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn assert_review_delivery_finalization_requires_current_claim(pool: &PgPool) {

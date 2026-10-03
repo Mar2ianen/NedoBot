@@ -7,7 +7,7 @@
 2. bounded snapshot профиля, поведения, первого сообщения и аватара;
 3. один LLM audit на route `new_user_audit`;
 4. атомарная materialization score/signals и review request;
-5. отдельная bounded Telegram delivery только при `risk_score >= 70`.
+5. отдельная bounded Telegram delivery при включённых moderation/review-delivery flags и `risk_score >= review_threshold` для сохранённого запроса; маршрут и reviewer задаёт инстанс.
 
 Avatar и first-message являются секциями единого assessment. Отдельных
 очередей, LLM routes и workers для них нет. Старые таблицы и миграции остаются
