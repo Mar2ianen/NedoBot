@@ -53,8 +53,10 @@ async fn main() -> anyhow::Result<()> {
     if user_ids.is_empty() {
         anyhow::bail!("lols banlist is empty, refusing to swap the mirror");
     }
+    // Temp-таблица живёт в сессии, поэтому строго одно соединение:
+    // пул на два может разнести create/insert по разным бэкендам.
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(1)
         .connect(&database_url)
         .await
         .context("lols mirror database connection")?;
