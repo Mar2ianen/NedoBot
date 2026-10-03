@@ -5,5 +5,7 @@
 //! (загрузка snapshots, Bot API, LLM, персист) остаётся в боте, который
 //! маппит свои DB-строки на типы этого крейта.
 
+pub mod assessment;
 pub mod external;
+pub mod scoring;
 pub mod text;

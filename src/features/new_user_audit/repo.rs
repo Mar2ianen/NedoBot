@@ -7,7 +7,7 @@ use crate::features::jobs::claim::CasResult;
 use crate::features::jobs::policy::{
     ANALYSIS_RETRY, EXTERNAL_REQUEST_LEASE, MATERIALIZATION_RETRY,
 };
-use crate::features::new_user_audit::scoring::ScoreComponents;
+use teloxide_antispam::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется при изменении scoring/materializer,
 /// чтобы выбранные сохранённые assessments можно было безопасно переиграть.

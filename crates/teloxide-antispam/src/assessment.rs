@@ -183,7 +183,6 @@ pub enum ReviewPriority {
 impl NewUserAuditAssessment {
     /// Десериализует ответ модели и отвергает формально допустимые, но опасные
     /// для хранения или модерации значения.
-    #[cfg(test)]
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         let assessment = Self::parse_value(value)?;
         validate_avatar(assessment.avatar_observation.as_ref())?;
@@ -204,7 +203,7 @@ impl NewUserAuditAssessment {
 
     /// Разбирает результат, который уже прошёл modality validation на границе
     /// generation и был сохранён для materialization replay.
-    pub(crate) fn parse_stored(value: &str) -> anyhow::Result<Self> {
+    pub fn parse_stored(value: &str) -> anyhow::Result<Self> {
         let assessment = Self::parse_value(value)?;
         validate_avatar(assessment.avatar_observation.as_ref())?;
         validate_first_message(assessment.first_message_assessment.as_ref())?;
