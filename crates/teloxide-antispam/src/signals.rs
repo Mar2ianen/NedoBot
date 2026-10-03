@@ -99,6 +99,9 @@ pub struct NewUserFeatures {
     pub personal_channel_title: Option<String>,
     pub personal_channel_title_reuse_count: i64,
     pub personal_channel_title_reuse_spammer_count: i64,
+    pub identity_snapshot_count: i64,
+    pub identity_display_name_count: i64,
+    pub identity_username_count: i64,
     pub personal_channel_username: Option<String>,
     pub personal_channel_message_count: Option<i32>,
     pub personal_channel_last_message_id: Option<i32>,
@@ -341,6 +344,7 @@ pub fn analyze_new_or_low_activity_user(
     risk.add_optional(recent_id_signal(features, config));
     risk.add_optional(username_signal(features, &username_stats));
     risk.add_optional(display_name_signal(features));
+    risk.add_optional(identity_rotation_signal(features));
     risk.add_optional(profile_photo_signal(features));
     risk.add_optional(feminine_name_signal(features));
     risk.add_optional(homoglyph_profile_signal(features));
@@ -830,6 +834,29 @@ fn display_name_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
         _ => None,
     }
 }
+/// Ротация identity: операторы меняют имена/юзернеймы между заходами
+/// (LOLS-трекинг #namechange). Фото в счёт не идёт — аватарки меняют и живые.
+fn identity_rotation_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
+    match (
+        features.identity_display_name_count,
+        features.identity_username_count,
+    ) {
+        (names, _) if names >= 2 => Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 12,
+            label: "identity_display_name_rotation",
+            reason: "User rotated public display names across profile refreshes",
+        }),
+        (_, usernames) if usernames >= 2 => Some(RiskSignal {
+            class: SpamClass::LlmProfileBait,
+            coefficient: 8,
+            label: "identity_username_rotation",
+            reason: "User rotated usernames across profile refreshes",
+        }),
+        _ => None,
+    }
+}
+
 fn profile_photo_signal(features: &NewUserFeatures) -> Option<RiskSignal> {
     match has_profile_photo(features) {
         false => Some(RiskSignal {
@@ -2289,5 +2316,34 @@ mod tests {
     fn personal_channel_title_without_reuse_is_silent() {
         assert!(personal_channel_title_reuse_signal(0, 0, 1).is_none());
         assert!(personal_channel_title_reuse_signal(0, 3, 10).is_none());
+    }
+
+    fn rotation_features(names: i64, usernames: i64) -> NewUserFeatures {
+        NewUserFeatures {
+            identity_display_name_count: names,
+            identity_username_count: usernames,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identity_display_name_rotation_scores() {
+        let signal = identity_rotation_signal(&rotation_features(2, 1))
+            .expect("name rotation must produce a signal");
+        assert_eq!(signal.coefficient, 12);
+        assert_eq!(signal.label, "identity_display_name_rotation");
+    }
+
+    #[test]
+    fn identity_username_rotation_scores_lower() {
+        let signal = identity_rotation_signal(&rotation_features(1, 2))
+            .expect("username rotation must produce a signal");
+        assert_eq!(signal.coefficient, 8);
+    }
+
+    #[test]
+    fn stable_identity_is_silent() {
+        assert!(identity_rotation_signal(&rotation_features(1, 1)).is_none());
+        assert!(identity_rotation_signal(&rotation_features(0, 0)).is_none());
     }
 }
