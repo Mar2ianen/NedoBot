@@ -1,0 +1,16 @@
+[package]
+name = "teloxide-antispam"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared anti-spam core for teloxide-based community bots: text utils, profile/message scoring signals, external reputation clients"
+
+[lib]
+name = "teloxide_antispam"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", features = ["json", "query"] }
+tracing = "0.1"

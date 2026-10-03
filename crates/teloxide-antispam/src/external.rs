@@ -3,7 +3,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::scoring::EXTERNAL_SCORE_CAP;
+/// Жёсткий cap внешнего репутационного сигнала (CAS): слабый сигнал,
+/// положительный вердикт не должен сам выводить пользователя в high.
+pub const EXTERNAL_SCORE_CAP: i32 = 12;
 
 /// Слабый внешний репутационный сигнал через Combot Anti-Spam.
 ///
