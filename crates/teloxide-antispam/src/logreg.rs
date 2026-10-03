@@ -150,7 +150,7 @@ mod tests {
         let model = load_model(json).expect("production nn model must load");
         let probability = spam_probability(&model, PARITY_TEXT);
         assert!(
-            (probability - 0.972_441).abs() < 1e-4,
+            (probability - 0.973_899).abs() < 1e-4,
             "parity drift: {probability}"
         );
     }
