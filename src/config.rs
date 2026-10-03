@@ -73,6 +73,12 @@ pub struct Config {
     pub search_mcp_fetch_tool: Option<String>,
     pub search_fetch_top_n: usize,
     pub search_fetch_max_chars: usize,
+    pub youtube_subtitles_enabled: bool,
+    pub youtube_subtitles_command: Option<String>,
+    pub youtube_subtitles_languages: Vec<String>,
+    pub youtube_subtitles_timeout_sec: u64,
+    pub youtube_subtitles_max_chars: usize,
+    pub youtube_subtitles_max_videos: usize,
     pub comment_blocked_source_domains: Vec<String>,
     pub comment_blocked_terms: Vec<String>,
     pub search_github_mcp_command: Option<String>,
@@ -82,6 +88,8 @@ pub struct Config {
     pub groq_api_key: String,
     pub new_user_audit_enabled: bool,
     pub new_user_audit_max_tokens: u32,
+    pub cas_enabled: bool,
+    pub cas_timeout_sec: u64,
     pub gemini_thinking_budget: u32,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
@@ -182,6 +190,12 @@ impl Config {
             search_mcp_fetch_tool: runtime.search_mcp_tool_fetch,
             search_fetch_top_n: runtime.search_fetch_top_n,
             search_fetch_max_chars: runtime.search_fetch_max_chars,
+            youtube_subtitles_enabled: runtime.youtube_subtitles_enabled,
+            youtube_subtitles_command: runtime.youtube_subtitles_command,
+            youtube_subtitles_languages: runtime.youtube_subtitles_languages,
+            youtube_subtitles_timeout_sec: runtime.youtube_subtitles_timeout_sec,
+            youtube_subtitles_max_chars: runtime.youtube_subtitles_max_chars,
+            youtube_subtitles_max_videos: runtime.youtube_subtitles_max_videos,
             comment_blocked_source_domains: if runtime.comment_blocked_source_domains.is_empty() {
                 DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS
                     .iter()
@@ -198,6 +212,8 @@ impl Config {
             groq_api_key: env_or("GROQ_API_KEY", ""),
             new_user_audit_enabled: runtime.new_user_audit_enabled,
             new_user_audit_max_tokens: runtime.new_user_audit_max_tokens,
+            cas_enabled: runtime.cas_enabled,
+            cas_timeout_sec: runtime.cas_timeout_sec,
             gemini_thinking_budget: runtime.gemini_thinking_budget,
             owner_telegram_id: runtime.owner_telegram_id,
             send_owner_preview: runtime.send_owner_preview,
@@ -257,6 +273,9 @@ impl Config {
         if self.search_enabled {
             validate_search_config(&mut errors, self);
         }
+        if self.youtube_subtitles_enabled {
+            validate_youtube_subtitles_config(&mut errors, self);
+        }
 
         if self.voice_transcription_enabled {
             validate_voice_asr_secret(&mut errors, self);
@@ -277,6 +296,9 @@ impl Config {
                 self.new_user_audit_max_tokens,
             );
             self.validate_embedding_config(&mut errors);
+        }
+        if self.cas_enabled && !(1..=30).contains(&self.cas_timeout_sec) {
+            errors.push("CAS_TIMEOUT_SEC must be between 1 and 30".to_string());
         }
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
@@ -554,6 +576,55 @@ fn validate_search_config(errors: &mut Vec<String>, config: &Config) {
     }
 }
 
+fn validate_youtube_subtitles_config(errors: &mut Vec<String>, config: &Config) {
+    match config.youtube_subtitles_command.as_deref() {
+        None | Some("") => errors.push(
+            "YOUTUBE_SUBTITLES_ENABLED=true requires non-empty YOUTUBE_SUBTITLES_COMMAND"
+                .to_string(),
+        ),
+        Some(command) if command.trim().is_empty() => errors.push(
+            "YOUTUBE_SUBTITLES_ENABLED=true requires non-empty YOUTUBE_SUBTITLES_COMMAND"
+                .to_string(),
+        ),
+        Some(command) if !command_is_available(command) => errors.push(format!(
+            "YOUTUBE_SUBTITLES_COMMAND={command} was not found on PATH"
+        )),
+        Some(_) => {}
+    }
+    if config.youtube_subtitles_languages.is_empty()
+        || config
+            .youtube_subtitles_languages
+            .iter()
+            .any(|language| language.trim().is_empty())
+    {
+        errors.push(
+            "YOUTUBE_SUBTITLES_LANGUAGES must contain at least one non-empty language selector"
+                .to_string(),
+        );
+    }
+    if config.youtube_subtitles_timeout_sec == 0 {
+        errors.push("YOUTUBE_SUBTITLES_TIMEOUT_SEC must be greater than 0".to_string());
+    }
+    if config.youtube_subtitles_max_chars == 0 {
+        errors.push("YOUTUBE_SUBTITLES_MAX_CHARS must be greater than 0".to_string());
+    }
+    if config.youtube_subtitles_max_videos == 0 {
+        errors.push("YOUTUBE_SUBTITLES_MAX_VIDEOS must be greater than 0".to_string());
+    }
+}
+
+fn command_is_available(command: &str) -> bool {
+    let path = std::path::Path::new(command);
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return path.is_file();
+    }
+
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|directory| directory.join(command).is_file())
+}
+
 fn validate_voice_asr_secret(errors: &mut Vec<String>, config: &Config) {
     match config.voice_asr_provider.trim().to_lowercase().as_str() {
         "groq" => require_secret(
@@ -743,6 +814,17 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            youtube_subtitles_enabled: false,
+            youtube_subtitles_command: Some("yt-dlp".to_string()),
+            youtube_subtitles_languages: vec![
+                "ru".to_string(),
+                "ru.*".to_string(),
+                "en".to_string(),
+                "en.*".to_string(),
+            ],
+            youtube_subtitles_timeout_sec: 15,
+            youtube_subtitles_max_chars: 12_000,
+            youtube_subtitles_max_videos: 2,
             comment_blocked_source_domains: vec!["meduza.io".to_string()],
             comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
@@ -756,6 +838,8 @@ mod tests {
             groq_api_key: String::new(),
             new_user_audit_enabled: false,
             new_user_audit_max_tokens: 900,
+            cas_enabled: false,
+            cas_timeout_sec: 5,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,
             send_owner_preview: false,
@@ -1259,6 +1343,25 @@ models = ["primary", "fallback"]
 
         assert!(err.contains("SEARCH_ENABLED=true requires non-empty SEARCH_MCP_COMMAND"));
         assert!(err.contains("SEARCH_MCP_TIMEOUT_SEC must be greater than 0"));
+    }
+
+    #[test]
+    fn enabled_youtube_subtitles_requires_usable_runtime_settings() {
+        let mut config = config();
+        config.youtube_subtitles_enabled = true;
+        config.youtube_subtitles_command = None;
+        config.youtube_subtitles_languages.clear();
+        config.youtube_subtitles_timeout_sec = 0;
+        config.youtube_subtitles_max_chars = 0;
+        config.youtube_subtitles_max_videos = 0;
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("YOUTUBE_SUBTITLES_ENABLED=true requires"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_LANGUAGES"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_TIMEOUT_SEC must be greater than 0"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_MAX_CHARS must be greater than 0"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_MAX_VIDEOS must be greater than 0"));
     }
 
     #[test]
