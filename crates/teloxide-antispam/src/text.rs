@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 pub fn first_text_chars(text: &str, limit: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= limit {
@@ -69,6 +71,67 @@ pub fn strip_links(text: &str) -> String {
         .join(" ")
 }
 
+/// Нормализация evidence личного канала для grounded-сравнения:
+/// нижний регистр, только буквы/цифры/пробелы, схлопнутые пробелы.
+pub fn normalize_channel_evidence(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character.is_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Токены первого сообщения для template-матчинга кампаний: слова от 4
+/// символов со свёрткой DM/funnel-синонимов в канонические маркеры.
+pub fn token_set(text: &str) -> BTreeSet<String> {
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 4)
+        .map(campaign_token)
+        .collect()
+}
+
+fn campaign_token(word: &str) -> String {
+    match word {
+        "отправить"
+        | "отправлю"
+        | "переслать"
+        | "перешлю"
+        | "скинуть"
+        | "скину"
+        | "поделиться"
+        | "поделюсь"
+        | "закинуть"
+        | "закину" => "send_offer".to_string(),
+        "личку" | "личные" | "сообщения" | "стучитесь" => {
+            "direct_messages".to_string()
+        }
+        "аудиокнигу" | "аудиокнига" | "аудиоверсия" | "текстовая" => {
+            "promoted_material".to_string()
+        }
+        _ => word.to_owned(),
+    }
+}
+
+/// Жаккард для template-матчинга: пустое объединение даёт 0.0, чтобы
+/// бессодержательные сообщения не матчились друг с другом.
+pub fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
+    let union = left.union(right).count();
+    if union == 0 {
+        0.0
+    } else {
+        left.intersection(right).count() as f64 / union as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +153,19 @@ mod tests {
         assert_eq!(normalize_cyrillic_homoglyphs("Tанюша"), "Танюша");
         assert!(has_mixed_script_homoglyphs("Tанюша"));
         assert_eq!(normalize_cyrillic_homoglyphs("Alice"), "Alice");
+    }
+
+    #[test]
+    fn campaign_tokens_fold_dm_funnel_synonyms() {
+        let tokens = token_set("Напишите в личку, скину аудиокнигу бесплатно");
+        assert!(tokens.contains("send_offer"));
+        assert!(tokens.contains("direct_messages"));
+        assert!(tokens.contains("promoted_material"));
+    }
+
+    #[test]
+    fn jaccard_ignores_empty_sets() {
+        let empty = BTreeSet::new();
+        assert_eq!(jaccard(&empty, &empty), 0.0);
     }
 }

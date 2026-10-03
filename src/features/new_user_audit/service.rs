@@ -6,7 +6,6 @@ use teloxide::prelude::Bot;
 use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_text, pgvector_literal};
-use crate::features::new_user_audit::cas;
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
@@ -137,12 +136,12 @@ async fn materialize_stored_assessment(
     // для каждого аудита, а не только при наличии первого сообщения: рецидивист
     // из глобального banlist опознаётся и по пустому профилю.
     if config.community.moderation.cas_enabled {
-        let verdict = cas::check_cas(
+        let verdict = teloxide_antispam::external::check_cas(
             job.telegram_user_id,
             std::time::Duration::from_secs(config.community.moderation.cas_timeout_sec),
         )
         .await;
-        let (score, signals) = cas::external_component(verdict);
+        let (score, signals) = teloxide_antispam::external::external_component(verdict);
         components.apply_external(score, signals);
     }
     let finalized =

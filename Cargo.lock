@@ -3183,6 +3183,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "teloxide-antispam"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "teloxide-core"
 version = "0.16.0"
 source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=26d80f5f88de5e9ea97be22490766cdeb3925265#26d80f5f88de5e9ea97be22490766cdeb3925265"
@@ -3257,6 +3267,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "teloxide",
+ "teloxide-antispam",
  "tempfile",
  "tokio",
  "toml",

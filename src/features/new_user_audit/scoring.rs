@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
-
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
+
+use teloxide_antispam::external::EXTERNAL_SCORE_CAP;
+use teloxide_antispam::text::{jaccard, normalize_channel_evidence, token_set};
 
 use super::types::{
     AvatarClass, EvidenceSource, EvidenceStrength, FirstMessageAssessment, FirstMessageRiskMarker,
@@ -13,11 +14,6 @@ use super::types::{
 pub const REVIEW_RISK_THRESHOLD: i32 = 70;
 #[allow(dead_code)]
 const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
-
-/// Жёсткий cap внешнего репутационного сигнала (CAS): слабый сигнал,
-/// положительный вердикт не должен сам выводить пользователя в high.
-#[allow(dead_code)]
-pub const EXTERNAL_SCORE_CAP: i32 = 12;
 const FIRST_MESSAGE_DECISION_TREE_VERSION: &str = "first-message-tree-v1";
 
 #[allow(dead_code)]
@@ -206,22 +202,6 @@ fn score_personal_channel_content(
         },
     });
     (score, json!([signal]))
-}
-
-fn normalize_channel_evidence(text: &str) -> String {
-    text.to_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || character.is_whitespace() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn score_first_message(
@@ -467,45 +447,6 @@ pub(crate) async fn spam_similarity(
         .fetch_one(pool)
         .await?;
     Ok(value)
-}
-
-fn token_set(text: &str) -> BTreeSet<String> {
-    text.to_lowercase()
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 4)
-        .map(campaign_token)
-        .collect()
-}
-
-fn campaign_token(word: &str) -> String {
-    match word {
-        "отправить"
-        | "отправлю"
-        | "переслать"
-        | "перешлю"
-        | "скинуть"
-        | "скину"
-        | "поделиться"
-        | "поделюсь"
-        | "закинуть"
-        | "закину" => "send_offer".to_string(),
-        "личку" | "личные" | "сообщения" | "стучитесь" => {
-            "direct_messages".to_string()
-        }
-        "аудиокнигу" | "аудиокнига" | "аудиоверсия" | "текстовая" => {
-            "promoted_material".to_string()
-        }
-        _ => word.to_owned(),
-    }
-}
-
-fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
-    let union = left.union(right).count();
-    if union == 0 {
-        0.0
-    } else {
-        left.intersection(right).count() as f64 / union as f64
-    }
 }
 
 #[cfg(test)]
