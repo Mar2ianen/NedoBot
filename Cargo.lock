@@ -3184,8 +3184,8 @@ dependencies = [
 
 [[package]]
 name = "teloxide-antispam"
-version = "0.3.2"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=270b6d3f8ca404b9c78834752d90528b581cbf31#270b6d3f8ca404b9c78834752d90528b581cbf31"
+version = "0.3.3"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=dc42988726da1954513f98460b4246aef1ffc9a5#dc42988726da1954513f98460b4246aef1ffc9a5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3193,6 +3193,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "teloxide-statistics",
  "tracing",
  "unicode-normalization",
  "unicode-properties",
@@ -3244,10 +3245,12 @@ dependencies = [
 
 [[package]]
 name = "teloxide-statistics"
-version = "0.1.1"
-source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=8e83f59c63c71bf6cdd4f6644b33b960df348ba5#8e83f59c63c71bf6cdd4f6644b33b960df348ba5"
+version = "0.2.0"
+source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=7e2a5859849044121b9e693bc1ed36e7440db139#7e2a5859849044121b9e693bc1ed36e7440db139"
 dependencies = [
+ "anyhow",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

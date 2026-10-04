@@ -138,8 +138,29 @@ async fn materialize_stored_assessment(
     let assessment = parse_stored_assessment(job, assessment_json)
         .map_err(|error| MalformedStoredAssessment(error.to_string()))?;
     let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
-    let first_message_context =
+    let (mut first_message_context, reputation_inputs) =
         load_first_message_score_context(pool, config, job, &assessment).await?;
+    let provisional = score_assessment(
+        baseline_score,
+        baseline_signals.clone(),
+        &assessment,
+        first_message_context.clone(),
+        job.review_threshold,
+    );
+    // Second pass folds the reputation head in: its audit_risk feature is the
+    // pre-reputation total, exactly the quantity training snapshots hold.
+    // Reputation is a small supporting slot, never decisive.
+    if let Some((probability, version, calibration)) = score_reputation(
+        config,
+        job,
+        &first_message_context,
+        &reputation_inputs,
+        provisional.final_score(),
+    ) {
+        first_message_context.reputation_probability = Some(probability);
+        first_message_context.reputation_model_version = Some(version);
+        first_message_context.reputation_calibration = Some(calibration);
+    }
     let mut components = score_assessment(
         baseline_score,
         baseline_signals,
@@ -302,36 +323,58 @@ async fn load_first_message_score_context(
     config: &Config,
     job: &NewUserAuditJob,
     assessment: &NewUserAuditAssessment,
-) -> anyhow::Result<FirstMessageScoreContext> {
+) -> anyhow::Result<(FirstMessageScoreContext, ReputationInputs)> {
     let personal_channel_content = job.input_json["personal_channel"]["recent_content_preview"]
         .as_str()
         .filter(|content| !content.trim().is_empty())
         .map(str::to_owned);
     if assessment.first_message_assessment.is_none() {
-        return Ok(FirstMessageScoreContext {
-            personal_channel_content,
-            ..Default::default()
-        });
+        return Ok((
+            FirstMessageScoreContext {
+                personal_channel_content,
+                ..Default::default()
+            },
+            ReputationInputs::default(),
+        ));
     }
     let row = sqlx::query(
-        "select first_message_id, first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+        "select first_message_id, first_message_text, first_name_feminine_pattern, message_count, link_count, max_normalized_message_reuse_count, account_seen_age_sec from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
     .fetch_one(pool)
     .await?;
+    let reputation_inputs = ReputationInputs {
+        message_count: row.get::<i64, _>("message_count"),
+        link_count: row.get::<i64, _>("link_count"),
+        dup_reuse: row
+            .get::<Option<i64>, _>("max_normalized_message_reuse_count")
+            .unwrap_or(0),
+        account_age_sec: row
+            .get::<Option<i64>, _>("account_seen_age_sec")
+            .unwrap_or(0),
+        ..Default::default()
+    };
     let Some(text) = row.get::<Option<String>, _>("first_message_text") else {
-        return Ok(FirstMessageScoreContext {
-            personal_channel_content,
-            ..Default::default()
-        });
+        return Ok((
+            FirstMessageScoreContext {
+                personal_channel_content,
+                ..Default::default()
+            },
+            reputation_inputs,
+        ));
     };
     if text.trim().is_empty() {
-        return Ok(FirstMessageScoreContext {
-            personal_channel_content,
-            ..Default::default()
-        });
+        return Ok((
+            FirstMessageScoreContext {
+                personal_channel_content,
+                ..Default::default()
+            },
+            reputation_inputs,
+        ));
     }
+    let mut reputation_inputs = reputation_inputs;
+    reputation_inputs.is_command = text.trim_start().starts_with('/');
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
     let reply_context = first_message_reply_context(&job.input_json);
@@ -351,7 +394,7 @@ async fn load_first_message_score_context(
         row.get::<Option<i32>, _>("first_message_id"),
     )
     .await;
-    Ok(FirstMessageScoreContext {
+    let context = FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
         spam_similarity: spam_similarity(pool, job.telegram_user_id, &embedding).await?,
@@ -378,7 +421,119 @@ async fn load_first_message_score_context(
         // Category heads have no trained weights yet; the embedding head is
         // configured explicitly and stays a supporting signal.
         ..Default::default()
+    };
+    let behavior = load_behavior_signals(pool, job.chat_id, job.telegram_user_id).await;
+    if let Some(behavior) = behavior {
+        reputation_inputs.active_days = behavior.active_days;
+        reputation_inputs.received = behavior.received;
+    }
+    Ok((context, reputation_inputs))
+}
+
+/// Point-in-time behavior for the reputation head. Best-effort: any failure
+/// disables reputation for this audit instead of failing it.
+#[derive(Debug, Clone, Default)]
+struct ReputationInputs {
+    message_count: i64,
+    link_count: i64,
+    dup_reuse: i64,
+    account_age_sec: i64,
+    active_days: i64,
+    received: Vec<(String, i64)>,
+    /// Bot commands (`/cmd`) carry no spam evidence; training drops them.
+    is_command: bool,
+}
+
+struct BehaviorSignals {
+    active_days: i64,
+    received: Vec<(String, i64)>,
+}
+
+async fn load_behavior_signals(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> Option<BehaviorSignals> {
+    let active_days: Option<i64> = sqlx::query_scalar(
+        "select count(distinct date_trunc('day', created_at)) from telegram_messages where chat_id = $1 and user_id = $2",
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        select je.emoji, count(*)::bigint
+        from telegram_message_reactions r
+        join telegram_messages m on m.chat_id = r.chat_id and m.message_id = r.message_id
+        join jsonb_to_recordset(r.new_reactions) as je(emoji text) on true
+        where m.chat_id = $1 and m.user_id = $2 and je.emoji is not null
+        group by je.emoji
+        "#,
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .ok()?;
+    Some(BehaviorSignals {
+        active_days: active_days.unwrap_or(0),
+        received: rows,
     })
+}
+
+/// Builds the 12 reputation features in artifact order and scores the head.
+/// Commands (`/cmd`) and missing heads/models are silent `None`: no evidence,
+/// never an audit failure.
+fn score_reputation(
+    config: &Config,
+    job: &NewUserAuditJob,
+    context: &FirstMessageScoreContext,
+    inputs: &ReputationInputs,
+    provisional_score: i32,
+) -> Option<(f64, String, teloxide_statistics::reputation::Calibration)> {
+    let head = config.reputation_model.as_ref()?;
+    if inputs.is_command {
+        return None;
+    }
+    let id_model = config.moderation_risk_profile()?.telegram_id.as_ref()?;
+    let id_prior =
+        teloxide_antispam::signals::telegram_id_spam_probability(job.telegram_user_id, id_model);
+    let mut pos = 0u64;
+    let mut neg = 0u64;
+    let mut total = 0u64;
+    for (emoji, count) in &inputs.received {
+        let count = (*count).max(0) as u64;
+        total += count;
+        match teloxide_statistics::sentiment::classify(emoji) {
+            teloxide_statistics::sentiment::ReactionSentiment::Positive => pos += count,
+            teloxide_statistics::sentiment::ReactionSentiment::Negative => neg += count,
+            _ => {}
+        }
+    }
+    let decisive = pos + neg;
+    let positivity = if decisive > 0 {
+        pos as f64 / decisive as f64
+    } else {
+        0.5
+    };
+    let values = [
+        id_prior,
+        f64::from(provisional_score.clamp(0, 100)) / 100.0,
+        (inputs.message_count.max(0) as f64 + 1.0).ln(),
+        (inputs.active_days.max(0) as f64 + 1.0).ln(),
+        inputs.link_count.max(0) as f64 / inputs.message_count.max(1) as f64,
+        (inputs.dup_reuse.max(0) as f64 + 1.0).ln(),
+        positivity,
+        neg as f64 / total.max(1) as f64,
+        (inputs.account_age_sec.max(0) as f64 / 86_400.0 + 1.0).ln(),
+        context.linear_spam_probability.unwrap_or(0.5),
+        context.embedding_spam_probability.unwrap_or(0.5),
+        1.0,
+    ];
+    let probability = head.score(&values)?;
+    Some((probability, head.version.clone(), head.calibration.clone()))
 }
 
 /// Scores the stored Gemma retrieval vector when the embedding head is
