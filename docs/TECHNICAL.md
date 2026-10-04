@@ -281,9 +281,11 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-04-footer-alias`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-04-footer-alias) на commit `7934ec9bab20758be571ed58f6d35a4d412e6de0` (merge PR #24). Проверенный deploy: **2026-10-04 11:38 UTC / 14:38 МСК**. Предыдущие релизы остаются в истории под `deploy-2026-10-04-gemma-head` / `9bc1a54`, `deploy-2026-10-04-antispam-v03` / `3a2ebca`, `deploy-2026-10-03-antispam-v2` / `e073f8a` и `deploy-2026-10-01-service-messages` / `7209160`.
+Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-04-stats-render`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-04-stats-render) на commit `98350a5f80d3fd51ca28d8e71abc0b8ebedfad88` (merge PR #25). Проверенный deploy: **2026-10-04 12:20 UTC / 15:20 МСК**. Предыдущие релизы остаются в истории под `deploy-2026-10-04-footer-alias` / `7934ec9`, `deploy-2026-10-04-gemma-head` / `9bc1a54` и ранее.
 
-Релиз чинит автокомментарии после смены футера канала (`Не теряем связь` → `😎НедоNews` с 2026-09-28): роуты принимают `post_signature_aliases`, чистка режет по раннему маркеру, `blocked_post_terms` (`#реклама`, `о рекламодателе`) ветируют промо даже с футером. Футер-гейт остаётся allowlist: реклама без футера и медиа-посты по-прежнему пропускаются. В прод-профиле алиас и denylist включены.
+Релиз привозит типизированный рендер статистики (`Section`/`Kv`, строки в `StatsStrings` ru/en по `stats_locale`), сентимент реакций, `/bottommsg`, долю реплаев и сообщений на активного. В прод-профиле локаль не задана — действует `ru` по умолчанию.
+
+Вместе с ним задеплоены алиасы футера канала (`Не теряем связь` + `😎НедоNews`) и `blocked_post_terms` (`#реклама`, `о рекламодателе`): футер-гейт остаётся allowlist, реклама без футера и медиа-посты пропускаются. В прод-профиле алиас и denylist включены.
 
 Релиз включает Gemma-голову `gemma-768-fx-2026-10-04` (`embedding_spam_enabled=true`): бот читает готовые `ready`-векторы из `telegram_message_embeddings_gemma` с проверкой `embedding_model`, новых inference-запросов ноль. В сигналах раздельно хранятся id энкодера (`embedding_model_version`) и версия головы (`embedding_head_version`). На VPS **`enforce_enabled=false`, `enforce_dry_run=true`**: расчёт риска/аудит продолжаются, автоматических банов и удалений сообщений этой лестницей нет.
 
