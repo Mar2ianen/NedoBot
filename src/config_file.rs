@@ -172,6 +172,15 @@ pub struct FirstCommentRoute {
     pub discussion_chat: String,
     #[serde(default)]
     pub post_signature_marker: String,
+    /// Retired footers stay here so old-format reposts still match while the
+    /// primary marker follows the current editorial format.
+    #[serde(default)]
+    pub post_signature_aliases: Vec<String>,
+    /// Case-insensitive substrings that veto auto-comments for this route
+    /// even when the footer matches (e.g. legally required ad labels).
+    /// Checked against the cleaned post text.
+    #[serde(default)]
+    pub blocked_post_terms: Vec<String>,
     #[serde(default)]
     pub invite_label: String,
     #[serde(default)]
