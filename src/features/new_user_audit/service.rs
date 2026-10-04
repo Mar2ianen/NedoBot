@@ -359,6 +359,9 @@ async fn load_first_message_score_context(
             .linear_spam_model
             .as_ref()
             .map(|model| model.calibration.clone()),
+        // Embedding/category heads stay disabled until a trained,
+        // calibrated head is reviewed and explicitly configured.
+        ..Default::default()
     })
 }
 

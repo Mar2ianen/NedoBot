@@ -788,6 +788,33 @@ fn human_text_observations(signal: &Value) -> Vec<String> {
     if let Some(probability) = signal["linear_spam_probability"].as_f64() {
         labels.push(format!("Локальная модель: p={probability:.3}"));
     }
+    if let Some(probability) = signal["embedding_spam_probability"].as_f64() {
+        labels.push(format!("Эмбеддинг-модель: p={probability:.3}"));
+    }
+    if let Some(top) = signal["category_scores"]["scores"]
+        .as_array()
+        .and_then(|scores| {
+            scores
+                .iter()
+                .filter_map(|score| {
+                    let probability = score["probability"].as_f64()?;
+                    let category = score["category"].as_str()?;
+                    (probability.is_finite()
+                        && (0.0..=1.0).contains(&probability)
+                        && probability >= 0.5)
+                        .then_some((category, probability))
+                })
+                .max_by(|left, right| left.1.total_cmp(&right.1).then_with(|| left.0.cmp(right.0)))
+        })
+    {
+        labels.push(format!("Категория: {} (p={:.2})", top.0, top.1));
+    }
+    if let Some(suspected) = signal["suspected_categories"].as_array() {
+        let names: Vec<&str> = suspected.iter().filter_map(Value::as_str).collect();
+        if !names.is_empty() {
+            labels.push(format!("Маркеры указывают на: {}", names.join(", ")));
+        }
+    }
     labels
 }
 
@@ -1007,6 +1034,12 @@ mod tests {
         let signals = serde_json::json!([{
             "label": "first_message_text_observation", "coefficient": 0,
             "linear_spam_probability": 0.2,
+            "embedding_spam_probability": 0.85,
+            "category_scores": {"version": "test-v1", "scores": [
+                {"category": "job_scam", "probability": 0.9},
+                {"category": "vpn_promo", "probability": 0.1},
+            ]},
+            "suspected_categories": ["job_scam"],
             "text_observations": {"nfkc_changed": true, "homoglyph_chars": 3, "bidi_controls": 1},
         }]);
         let rendered = human_signals(&signals);
@@ -1014,6 +1047,9 @@ mod tests {
         assert!(rendered.contains("замены похожих букв: 3"));
         assert!(rendered.contains("управление направлением текста: 1"));
         assert!(rendered.contains("p=0.200"));
+        assert!(rendered.contains("Эмбеддинг-модель: p=0.850"));
+        assert!(rendered.contains("job_scam (p=0.90)"));
+        assert!(rendered.contains("Маркеры указывают на: job_scam"));
         assert!(!rendered.contains("растянутые слова"));
     }
 
