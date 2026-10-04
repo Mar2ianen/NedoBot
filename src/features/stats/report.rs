@@ -28,9 +28,10 @@ pub async fn send_chat_stats(
     let Some(audience) = audience else {
         return Ok(());
     };
-    let data = service::chat_stats_report_data(pool, stats_scope_chat_id, period)
+    let mut data = service::chat_stats_report_data(pool, stats_scope_chat_id, period)
         .await
         .map_err(stats_error("failed to build chat stats"))?;
+    data.member_count = chat_member_count(bot, stats_scope_chat_id).await;
     let report = match render {
         StatsRender::Html => render_html::chat_stats(&data, render_time, strings),
         StatsRender::Rich => {
@@ -191,6 +192,25 @@ fn stats_error(message: &'static str) -> impl FnOnce(anyhow::Error) -> teloxide:
 
 fn numeric_target_user_id(target: Option<&str>) -> Option<i64> {
     target?.parse().ok()
+}
+
+/// Best-effort live member count for the engagement denominator. Failures
+/// stay silent in the report (a dash) and loud in logs.
+async fn chat_member_count(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: i64,
+) -> Option<i64> {
+    use teloxide::prelude::Requester;
+    match bot
+        .get_chat_member_count(teloxide::types::ChatId(chat_id))
+        .await
+    {
+        Ok(count) => Some(count as i64),
+        Err(err) => {
+            tracing::warn!(%err, chat_id, "failed to get chat member count");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

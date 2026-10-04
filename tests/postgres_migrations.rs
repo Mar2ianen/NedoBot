@@ -3730,6 +3730,9 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
             undefined: 0,
             unknown: 0,
         },
+        daily_active: Vec::new(),
+        retention: Default::default(),
+        member_count: Some(100),
     };
 
     let time = TimeContext::from_name("Europe/Moscow").expect("test time zone must be valid");
