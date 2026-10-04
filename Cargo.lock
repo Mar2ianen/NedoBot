@@ -3243,6 +3243,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "teloxide-statistics"
+version = "0.1.1"
+source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=8e83f59c63c71bf6cdd4f6644b33b960df348ba5#8e83f59c63c71bf6cdd4f6644b33b960df348ba5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3275,6 +3283,7 @@ dependencies = [
  "sqlx",
  "teloxide",
  "teloxide-antispam",
+ "teloxide-statistics",
  "tempfile",
  "tokio",
  "toml",
