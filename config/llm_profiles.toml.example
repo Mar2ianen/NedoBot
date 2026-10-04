@@ -352,6 +352,8 @@ enforce_dry_run = true
 enforce_ban_threshold = 90
 linear_spam_enabled = false
 linear_spam_model_path = "/opt/tg-ai-bot-teloxide/models/linear_spam_word12_v1.json"
+embedding_spam_enabled = false
+embedding_spam_model_path = "/opt/tg-ai-bot-teloxide/models/gemma_768_fx_2026-10-04.json"
 
 [manual_moderation]
 enabled = false
