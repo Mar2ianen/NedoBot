@@ -392,6 +392,7 @@ mod tests {
             chat_invite_url: "https://t.me/example".to_string(),
             chat_invite_label: "чат".to_string(),
             post_signature_marker: "marker".to_string(),
+            post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
             llm_temperature: 0.35,

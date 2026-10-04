@@ -7,7 +7,8 @@ pub struct CommentCandidate<'a> {
     pub source_channel_id: i64,
     pub source_message_id: MessageId,
     pub post_text: &'a str,
-    pub post_signature_marker: String,
+    pub post_signature_markers: Vec<String>,
+    pub blocked_post_terms: Vec<String>,
 }
 
 pub fn comment_candidate<'a>(msg: &'a Message, config: &Config) -> Option<CommentCandidate<'a>> {
@@ -23,6 +24,24 @@ pub fn comment_candidate<'a>(msg: &'a Message, config: &Config) -> Option<Commen
         source_channel_id,
         source_message_id,
         post_text,
-        post_signature_marker: route.post_signature_marker.clone(),
+        post_signature_markers: marker_list(route),
+        blocked_post_terms: route
+            .blocked_post_terms
+            .iter()
+            .filter(|term| !term.trim().is_empty())
+            .cloned()
+            .collect(),
     })
+}
+
+fn marker_list(route: &crate::config_file::FirstCommentRoute) -> Vec<String> {
+    let mut markers = Vec::with_capacity(1 + route.post_signature_aliases.len());
+    for marker in
+        std::iter::once(&route.post_signature_marker).chain(route.post_signature_aliases.iter())
+    {
+        if !marker.trim().is_empty() && !markers.contains(marker) {
+            markers.push(marker.clone());
+        }
+    }
+    markers
 }

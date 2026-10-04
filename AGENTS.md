@@ -142,7 +142,7 @@ migrations/                            — sqlx compile-time миграции
 
 ### Первый комментарий
 1. Telegram auto-forward из канала → `handle_message` → `spawn_message_author_profile_refresh`
-2. `maybe_comment_post`: check `discussion_chat_id` + `source_channel_id` → check `post_signature_marker` → create job (dedup)
+2. `maybe_comment_post`: check `discussion_chat_id` + `source_channel_id` → check `post_signature_markers` (primary + retired aliases) → create job (dedup)
 3. Download largest photo → base64
 4. `build_llm_prompt`: system prompt + tech_rag + memory notes + recent comments + post text
 5. `generate_text_checked`: task route → model fallback chain → output validator (`validate_comment_output`)
