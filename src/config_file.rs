@@ -96,6 +96,14 @@ pub struct ModerationConfig {
     pub linear_spam_enabled: bool,
     #[serde(default)]
     pub linear_spam_model_path: Option<String>,
+    /// Gemma-голова поверх готовых retrieval-векторов
+    /// (`telegram_message_embeddings_gemma`, префикс документа). Читает
+    /// только `ready`-векторы с совпадающим `embedding_model`; иначе —
+    /// отсутствие сигнала. Слабый supporting-сигнал поверх LLM.
+    #[serde(default)]
+    pub embedding_spam_enabled: bool,
+    #[serde(default)]
+    pub embedding_spam_model_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

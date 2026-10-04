@@ -92,6 +92,8 @@ pub struct Config {
     pub new_user_audit_enabled: bool,
     pub new_user_audit_max_tokens: u32,
     pub linear_spam_model: Option<std::sync::Arc<teloxide_antispam::logreg::LinearSpamModel>>,
+    pub embedding_spam_model:
+        Option<std::sync::Arc<teloxide_antispam::embedding::EmbeddingSpamModel>>,
     pub gemini_thinking_budget: u32,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
@@ -444,6 +446,7 @@ impl Config {
             public_base_url: runtime.public_base_url,
             static_files_dir: runtime.static_files_dir,
             linear_spam_model: None,
+            embedding_spam_model: None,
         };
         if config.community.moderation.linear_spam_enabled {
             let path = config
@@ -469,6 +472,36 @@ impl Config {
                 "loaded linear spam model"
             );
             config.linear_spam_model = Some(std::sync::Arc::new(model));
+        }
+        if config.community.moderation.embedding_spam_enabled {
+            let path = config
+                .community
+                .moderation
+                .embedding_spam_model_path
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "moderation.embedding_spam_enabled=true requires embedding_spam_model_path"
+                    )
+                })?;
+            let json = std::fs::read_to_string(path).map_err(|error| {
+                anyhow::anyhow!("cannot read embedding spam model {path:?}: {error}")
+            })?;
+            let model =
+                teloxide_antispam::embedding::EmbeddingSpamModel::load(&json).map_err(|error| {
+                    anyhow::anyhow!("cannot parse embedding spam model {path:?}: {error}")
+                })?;
+            tracing::info!(
+                version = model.version.as_str(),
+                embedding_model = model.embedding_model.as_str(),
+                dim = model.dim,
+                calibration_version = model.calibration.version.as_str(),
+                supporting_threshold = model.calibration.supporting_threshold,
+                strong_threshold = model.calibration.strong_threshold,
+                path,
+                "loaded embedding spam model"
+            );
+            config.embedding_spam_model = Some(std::sync::Arc::new(model));
         }
         Ok(config)
     }
@@ -1042,6 +1075,20 @@ fn validate_community_config(
             anyhow::bail!("moderation.linear_spam_model_path must be an absolute path");
         }
     }
+    if community.moderation.embedding_spam_enabled {
+        let path = community
+            .moderation
+            .embedding_spam_model_path
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "moderation.embedding_spam_enabled=true requires embedding_spam_model_path"
+                )
+            })?;
+        if !std::path::Path::new(path).is_absolute() {
+            anyhow::bail!("moderation.embedding_spam_model_path must be an absolute path");
+        }
+    }
 
     if community.spam_reputation.enabled
         && community
@@ -1410,6 +1457,7 @@ mod tests {
             new_user_audit_enabled: false,
             new_user_audit_max_tokens: 900,
             linear_spam_model: None,
+            embedding_spam_model: None,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,
             send_owner_preview: false,
