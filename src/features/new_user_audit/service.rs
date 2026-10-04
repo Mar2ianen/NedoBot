@@ -314,7 +314,7 @@ async fn load_first_message_score_context(
         });
     }
     let row = sqlx::query(
-        "select first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+        "select first_message_id, first_message_text, first_name_feminine_pattern from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
@@ -339,6 +339,14 @@ async fn load_first_message_score_context(
         .linear_spam_model
         .as_ref()
         .map(|model| teloxide_antispam::logreg::spam_probability(model, &text));
+    let (embedding_spam_probability, embedding_model_version, embedding_calibration) =
+        load_embedding_spam_signal(
+            pool,
+            config,
+            job.chat_id,
+            row.get::<Option<i32>, _>("first_message_id"),
+        )
+        .await;
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
@@ -359,10 +367,95 @@ async fn load_first_message_score_context(
             .linear_spam_model
             .as_ref()
             .map(|model| model.calibration.clone()),
+        embedding_spam_probability,
+        embedding_model_version,
+        embedding_calibration,
         // Embedding/category heads stay disabled until a trained,
         // calibrated head is reviewed and explicitly configured.
         ..Default::default()
     })
+}
+
+/// Scores the stored Gemma retrieval vector when the embedding head is
+/// configured. Reads only `ready` vectors with a matching `embedding_model`;
+/// a missing, mismatched or unreadable vector is no evidence (`None`), never
+/// a failure of the whole audit.
+async fn load_embedding_spam_signal(
+    pool: &PgPool,
+    config: &Config,
+    chat_id: i64,
+    message_id: Option<i32>,
+) -> (
+    Option<f64>,
+    Option<String>,
+    Option<teloxide_antispam::calibration::LinearScoreCalibration>,
+) {
+    let Some(head) = config.embedding_spam_model.as_ref() else {
+        return (None, None, None);
+    };
+    let Some(message_id) = message_id else {
+        return (None, None, None);
+    };
+    let stored: Option<(String, String)> = match sqlx::query_as(
+        "select embedding::text, embedding_model from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2 and status = 'ready'",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, message_id, "embedding spam lookup failed");
+            return (None, None, None);
+        }
+    };
+    let Some((literal, stored_model)) = stored else {
+        return (None, None, None);
+    };
+    if stored_model != head.embedding_model {
+        return (None, None, None);
+    }
+    let vector = parse_halfvec_literal(&literal);
+    let Some(vector) = vector else {
+        tracing::warn!(chat_id, message_id, "embedding spam vector unparsable");
+        return (None, None, None);
+    };
+    let probability = head.spam_probability(&vector);
+    if probability.is_none() {
+        tracing::warn!(
+            chat_id,
+            message_id,
+            "embedding spam vector rejected by head"
+        );
+    }
+    (
+        probability,
+        Some(head.version.clone()),
+        Some(head.calibration.clone()),
+    )
+}
+
+/// Parses a pgvector `halfvec`/`vector` text literal (`[0.1,0.2,...]`) into
+/// floats. Rejects empty input, missing brackets and non-finite values so a
+/// corrupt stored row can never become model evidence.
+fn parse_halfvec_literal(literal: &str) -> Option<Vec<f32>> {
+    let values: Option<Vec<f32>> = literal
+        .trim()
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .and_then(|inner| {
+            inner
+                .split(',')
+                .map(|part| part.trim().parse::<f32>().ok())
+                .collect::<Option<Vec<_>>>()
+        });
+    match values {
+        Some(values) if !values.is_empty() && values.iter().all(|value| value.is_finite()) => {
+            Some(values)
+        }
+        _ => None,
+    }
 }
 
 fn first_message_reply_context(input_json: &Value) -> &str {
@@ -541,6 +634,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn halfvec_literal_parsing_rejects_corrupt_rows() {
+        assert_eq!(
+            parse_halfvec_literal("[0.5, -1.25, 3]"),
+            Some(vec![0.5, -1.25, 3.0])
+        );
+        for bad in ["", "[]", "[0.1", "0.1]", "[NaN]", "[inf]", "[0.1, oops]"] {
+            assert_eq!(parse_halfvec_literal(bad), None, "must reject {bad:?}");
+        }
+    }
 
     fn job_with_input(input_json: Value) -> NewUserAuditJob {
         NewUserAuditJob {
