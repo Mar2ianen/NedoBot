@@ -281,7 +281,9 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-04-stats-render`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-04-stats-render) на commit `98350a5f80d3fd51ca28d8e71abc0b8ebedfad88` (merge PR #25). Проверенный deploy: **2026-10-04 12:20 UTC / 15:20 МСК**. Предыдущие релизы остаются в истории под `deploy-2026-10-04-footer-alias` / `7934ec9`, `deploy-2026-10-04-gemma-head` / `9bc1a54` и ранее.
+Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-04-rep-v2`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-04-rep-v2) на commit `f85b688dfb019164fdbb98751a9dd4932cb37009` (merge PR #26). Предыдущие релизы остаются в истории под `deploy-2026-10-04-stats-render` / `98350a5`, `deploy-2026-10-04-footer-alias` / `7934ec9`, `deploy-2026-10-04-gemma-head` / `9bc1a54` и ранее.
+
+Релиз включает репутационную голову `rep-v2-2026-10-04` (`reputation_enabled=true`): 12 point-in-time фичей, двухпроходной скоринг, слот +4/+8, команды исключены. Проверенный deploy: **2026-10-04 14:05 UTC / 17:05 МСК**, binary `45170162da8bdf562badb99f215f35e0c9b41bce783c03495745c01750a50ec8`. На VPS **`enforce_enabled=false`, `enforce_dry_run=true`**: автоматических банов и удалений нет.
 
 Релиз привозит типизированный рендер статистики (`Section`/`Kv`, строки в `StatsStrings` ru/en по `stats_locale`), сентимент реакций, `/bottommsg`, долю реплаев и сообщений на активного. В прод-профиле локаль не задана — действует `ru` по умолчанию.
 
