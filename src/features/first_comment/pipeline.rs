@@ -3,7 +3,7 @@ use teloxide::{prelude::*, types::MessageId};
 use crate::config::Config;
 use crate::features::first_comment::candidate::comment_candidate;
 use crate::features::first_comment::clean::{
-    clean_post_for_llm_with_marker, should_generate_comment_with_marker,
+    blocked_post_term, clean_post_for_llm_with_markers, should_generate_comment_with_markers,
 };
 use crate::features::first_comment::draft::{
     FirstCommentDraft, first_comment_output_schema, parse_first_comment_draft,
@@ -50,9 +50,11 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
         return Ok(());
     };
 
-    // Editorial posts carry the VK/MAX footer. Ads usually do not, so the marker
-    // doubles as a cheap allowlist and keeps promotional posts out of the chat CTA.
-    if !should_generate_comment_with_marker(candidate.post_text, &candidate.post_signature_marker) {
+    // Editorial posts carry the channel footer. Ads usually do not, so the
+    // marker list doubles as a cheap allowlist and keeps promotional posts
+    // out of the chat CTA. Retired footers stay configured as aliases.
+    if !should_generate_comment_with_markers(candidate.post_text, &candidate.post_signature_markers)
+    {
         tracing::info!(
             discussion_message_id = msg.id.0,
             "skip post without signature marker"
@@ -61,7 +63,15 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
     }
 
     let clean_post =
-        clean_post_for_llm_with_marker(candidate.post_text, &candidate.post_signature_marker);
+        clean_post_for_llm_with_markers(candidate.post_text, &candidate.post_signature_markers);
+    if let Some(term) = blocked_post_term(&clean_post, &candidate.blocked_post_terms) {
+        tracing::info!(
+            discussion_message_id = msg.id.0,
+            blocked_term = term.as_str(),
+            "skip post matching blocked terms"
+        );
+        return Ok(());
+    }
     let image = msg
         .photo()
         .and_then(|photos| photos.iter().max_by_key(|photo| photo.width * photo.height));

@@ -43,6 +43,7 @@ pub struct Config {
     pub chat_invite_url: String,
     pub chat_invite_label: String,
     pub post_signature_marker: String,
+    pub post_signature_aliases: Vec<String>,
     pub llm_profiles_path: Option<String>,
     pub llm_profiles: Option<LlmProfiles>,
     pub llm_temperature: f32,
@@ -232,6 +233,12 @@ impl Config {
                 scoped.chat_invite_label = route.invite_label.clone();
             }
             scoped.post_signature_marker = route.post_signature_marker.clone();
+            scoped.post_signature_aliases = route
+                .post_signature_aliases
+                .iter()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .collect();
         } else if let Some(label) = self.chat_invite_label_for_chat(discussion_chat_id) {
             scoped.chat_invite_label = label;
         }
@@ -297,6 +304,16 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
             .or(runtime.post_signature_marker)
             .unwrap_or_default();
+        let post_signature_aliases = first_comment_route
+            .map(|route| {
+                route
+                    .post_signature_aliases
+                    .iter()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let primary_chat = chat_registry
             .chat_by_id(&community, primary_chat_id)
             .ok_or_else(|| anyhow::anyhow!("primary community chat is not registered"))?;
@@ -331,6 +348,7 @@ impl Config {
             chat_invite_url,
             chat_invite_label,
             post_signature_marker,
+            post_signature_aliases,
             llm_profiles_path,
             llm_profiles,
             llm_temperature: runtime.llm_temperature,
@@ -1399,6 +1417,7 @@ mod tests {
             chat_invite_url: "https://t.me/example".to_string(),
             chat_invite_label: "чат".to_string(),
             post_signature_marker: "marker".to_string(),
+            post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
             llm_temperature: 0.35,
@@ -1616,6 +1635,8 @@ mod tests {
                 source_channel_id: -1001,
                 discussion_chat: "main".to_string(),
                 post_signature_marker: "marker".to_string(),
+                post_signature_aliases: Vec::new(),
+                blocked_post_terms: Vec::new(),
                 invite_label: "чате".to_string(),
                 invite_url_env: None,
                 prompt_profile: None,

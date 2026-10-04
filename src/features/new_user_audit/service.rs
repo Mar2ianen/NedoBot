@@ -339,14 +339,18 @@ async fn load_first_message_score_context(
         .linear_spam_model
         .as_ref()
         .map(|model| teloxide_antispam::logreg::spam_probability(model, &text));
-    let (embedding_spam_probability, embedding_model_version, embedding_calibration) =
-        load_embedding_spam_signal(
-            pool,
-            config,
-            job.chat_id,
-            row.get::<Option<i32>, _>("first_message_id"),
-        )
-        .await;
+    let (
+        embedding_spam_probability,
+        embedding_model_version,
+        embedding_head_version,
+        embedding_calibration,
+    ) = load_embedding_spam_signal(
+        pool,
+        config,
+        job.chat_id,
+        row.get::<Option<i32>, _>("first_message_id"),
+    )
+    .await;
     Ok(FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
@@ -369,9 +373,10 @@ async fn load_first_message_score_context(
             .map(|model| model.calibration.clone()),
         embedding_spam_probability,
         embedding_model_version,
+        embedding_head_version,
         embedding_calibration,
-        // Embedding/category heads stay disabled until a trained,
-        // calibrated head is reviewed and explicitly configured.
+        // Category heads have no trained weights yet; the embedding head is
+        // configured explicitly and stays a supporting signal.
         ..Default::default()
     })
 }
@@ -388,13 +393,14 @@ async fn load_embedding_spam_signal(
 ) -> (
     Option<f64>,
     Option<String>,
+    Option<String>,
     Option<teloxide_antispam::calibration::LinearScoreCalibration>,
 ) {
     let Some(head) = config.embedding_spam_model.as_ref() else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let Some(message_id) = message_id else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let stored: Option<(String, String)> = match sqlx::query_as(
         "select embedding::text, embedding_model from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2 and status = 'ready'",
@@ -407,19 +413,19 @@ async fn load_embedding_spam_signal(
         Ok(stored) => stored,
         Err(error) => {
             tracing::warn!(%error, chat_id, message_id, "embedding spam lookup failed");
-            return (None, None, None);
+            return (None, None, None, None);
         }
     };
     let Some((literal, stored_model)) = stored else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     if stored_model != head.embedding_model {
-        return (None, None, None);
+        return (None, None, None, None);
     }
     let vector = parse_halfvec_literal(&literal);
     let Some(vector) = vector else {
         tracing::warn!(chat_id, message_id, "embedding spam vector unparsable");
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let probability = head.spam_probability(&vector);
     if probability.is_none() {
@@ -431,6 +437,7 @@ async fn load_embedding_spam_signal(
     }
     (
         probability,
+        Some(head.embedding_model.clone()),
         Some(head.version.clone()),
         Some(head.calibration.clone()),
     )

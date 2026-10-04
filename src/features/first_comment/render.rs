@@ -268,6 +268,7 @@ mod tests {
             chat_invite_url: "https://t.me/+test".to_string(),
             chat_invite_label: "чате".to_string(),
             post_signature_marker: "Не теряем связь".to_string(),
+            post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
             llm_temperature: 0.45,
