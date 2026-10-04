@@ -138,6 +138,11 @@ pub struct StatsStrings {
     pub per_30m_unit: &'static str,
     pub reactions_dash: &'static str,
     pub row_reply: &'static str,
+    pub active_by_day: &'static str,
+    pub avg_word: &'static str,
+    pub max_word: &'static str,
+    pub returns: &'static str,
+    pub engagement: &'static str,
 }
 
 use crate::features::stats::types::StatsPeriod;
@@ -266,6 +271,11 @@ impl StatsStrings {
             per_30m_unit: "соо за 30м",
             reactions_dash: "реакций -",
             row_reply: "reply",
+            active_by_day: "Активность по дням",
+            avg_word: "сред",
+            max_word: "макс",
+            returns: "Возвраты",
+            engagement: "Вовлечённость",
         }
     }
     /// Period name for report titles. Kept here (not on the enum) so a
@@ -411,6 +421,11 @@ impl StatsStrings {
             received_verb: "received",
             per_30m_unit: "msgs per 30m",
             reactions_dash: "reactions -",
+            active_by_day: "Daily activity",
+            avg_word: "avg",
+            max_word: "max",
+            returns: "Returns",
+            engagement: "Engagement",
         }
     }
 }

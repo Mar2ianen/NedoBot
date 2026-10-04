@@ -791,6 +791,9 @@ fn human_text_observations(signal: &Value) -> Vec<String> {
     if let Some(probability) = signal["embedding_spam_probability"].as_f64() {
         labels.push(format!("Эмбеддинг-модель: p={probability:.3}"));
     }
+    if let Some(probability) = signal["reputation_probability"].as_f64() {
+        labels.push(format!("Репутация: p={probability:.3}"));
+    }
     if let Some(top) = signal["category_scores"]["scores"]
         .as_array()
         .and_then(|scores| {
@@ -1035,6 +1038,7 @@ mod tests {
             "label": "first_message_text_observation", "coefficient": 0,
             "linear_spam_probability": 0.2,
             "embedding_spam_probability": 0.85,
+            "reputation_probability": 0.92,
             "category_scores": {"version": "test-v1", "scores": [
                 {"category": "job_scam", "probability": 0.9},
                 {"category": "vpn_promo", "probability": 0.1},
@@ -1048,6 +1052,7 @@ mod tests {
         assert!(rendered.contains("управление направлением текста: 1"));
         assert!(rendered.contains("p=0.200"));
         assert!(rendered.contains("Эмбеддинг-модель: p=0.850"));
+        assert!(rendered.contains("Репутация: p=0.920"));
         assert!(rendered.contains("job_scam (p=0.90)"));
         assert!(rendered.contains("Маркеры указывают на: job_scam"));
         assert!(!rendered.contains("растянутые слова"));

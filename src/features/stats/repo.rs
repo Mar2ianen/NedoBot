@@ -465,6 +465,71 @@ async fn ranked_message_users(
         .map_err(Into::into)
 }
 
+/// Daily active users for a chat window: `(day, users)` ordered by day.
+/// Days count in the render timezone is the caller's job; this groups by UTC
+/// date and the renderer labels it accordingly.
+pub async fn daily_active_users(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    window: ReportWindow,
+) -> anyhow::Result<Vec<(chrono::NaiveDate, i64)>> {
+    #[derive(sqlx::FromRow)]
+    struct DayRow {
+        day: chrono::NaiveDate,
+        users: i64,
+    }
+
+    let rows: Vec<DayRow> = sqlx::query_as(
+        r#"
+        with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at)
+        select date_trunc('day', m.created_at)::date as day, count(distinct m.user_id)::bigint as users
+        from telegram_messages m, bounds b
+        where m.chat_id = $1 and m.user_id is not null and m.source_channel_id is null
+          and m.user_id <> $4
+          and m.created_at >= b.start_at and m.created_at < b.end_at
+        group by 1 order by 1
+        "#,
+    )
+    .bind(discussion_chat_id)
+    .bind(window.start_at)
+    .bind(window.end_at)
+    .bind(TELEGRAM_SERVICE_USER_ID)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.day, row.users)).collect())
+}
+
+/// First-seen day plus active days per user over the trailing lookback window.
+/// Feeds `teloxide_statistics::engagement::retention_table`; day indices are
+/// days since epoch (UTC) and the renderer presents offsets only.
+pub async fn cohort_activity(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    since: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Vec<(i64, i64)>> {
+    #[derive(sqlx::FromRow)]
+    struct ActivityRow {
+        user_id: i64,
+        day: i64,
+    }
+
+    let rows: Vec<ActivityRow> = sqlx::query_as(
+        r#"
+        select m.user_id, (extract(epoch from date_trunc('day', m.created_at)) / 86400)::bigint as day
+        from telegram_messages m
+        where m.chat_id = $1 and m.user_id is not null and m.source_channel_id is null
+          and m.user_id <> $2 and m.created_at >= $3
+        group by m.user_id, 2
+        "#,
+    )
+    .bind(discussion_chat_id)
+    .bind(TELEGRAM_SERVICE_USER_ID)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.user_id, row.day)).collect())
+}
+
 /// Raw emoji counts for reaction events in the window. Callers classify with
 /// `teloxide_statistics::sentiment`; custom reactions without glyphs are
 /// skipped here because JSON object keys cannot be null.
