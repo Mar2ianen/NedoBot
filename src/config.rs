@@ -40,6 +40,7 @@ pub struct Config {
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
     pub render_timezone: String,
+    pub stats_locale: String,
     pub chat_invite_url: String,
     pub chat_invite_label: String,
     pub post_signature_marker: String,
@@ -345,6 +346,7 @@ impl Config {
             source_channel_id,
             discussion_chat_id: primary_chat_id,
             render_timezone: community_timezone,
+            stats_locale: runtime.stats_locale.clone(),
             chat_invite_url,
             chat_invite_label,
             post_signature_marker,
@@ -594,6 +596,9 @@ impl Config {
 
         if let Err(error) = teloxide::utils::time::TimeContext::from_name(&self.render_timezone) {
             errors.push(format!("invalid RENDER_TIMEZONE: {error}"));
+        }
+        if self.stats_locale != "ru" && self.stats_locale != "en" {
+            errors.push("stats_locale must be \"ru\" or \"en\"".to_string());
         }
 
         if self.llm_profiles.is_some() {
@@ -1414,6 +1419,7 @@ mod tests {
             source_channel_id: -1001,
             discussion_chat_id: -1002,
             render_timezone: "Europe/Moscow".to_string(),
+            stats_locale: "ru".to_string(),
             chat_invite_url: "https://t.me/example".to_string(),
             chat_invite_label: "чат".to_string(),
             post_signature_marker: "marker".to_string(),
@@ -1579,6 +1585,15 @@ mod tests {
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
         assert!(error.contains("invalid RENDER_TIMEZONE"));
+    }
+
+    #[test]
+    fn unknown_stats_locale_is_rejected_at_startup_validation() {
+        let mut config = config();
+        config.stats_locale = "de".to_string();
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+        assert!(error.contains("stats_locale"));
     }
 
     #[test]

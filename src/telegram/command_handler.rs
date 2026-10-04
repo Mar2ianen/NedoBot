@@ -30,8 +30,9 @@ use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allo
 use crate::features::manual_moderation::types::CommandKind as ManualCommandKind;
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
-    send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
+    send_bottom_messages, send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
+use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 #[cfg(feature = "voice")]
 use crate::features::voice::pipeline::transcribe_reply;
@@ -63,6 +64,7 @@ pub async fn handle_command(
 ) -> ResponseResult<()> {
     let pool = &state.pool;
     let config = &state.config;
+    let strings = StatsStrings::for_locale(&config.stats_locale);
 
     if !msg.chat.is_private() && !is_managed_chat(config, msg.chat.id.0) {
         tracing::debug!(chat_id = msg.chat.id.0, "ignored command from unknown chat");
@@ -88,6 +90,7 @@ pub async fn handle_command(
             | Command::Status(_)
             | Command::TopMsg(_)
             | Command::TopReact(_)
+            | Command::BottomMsg(_)
             | Command::UserStats(_)
             | Command::UserStatus(_)
     );
@@ -247,6 +250,7 @@ pub async fn handle_command(
                 &state.render_time,
                 StatsPeriod::Day,
                 render,
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -261,6 +265,7 @@ pub async fn handle_command(
                 &state.render_time,
                 StatsPeriod::Week,
                 render,
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -275,6 +280,7 @@ pub async fn handle_command(
                 &state.render_time,
                 StatsPeriod::Month,
                 render,
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -291,6 +297,7 @@ pub async fn handle_command(
                 &state.render_time,
                 period,
                 render,
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -302,6 +309,7 @@ pub async fn handle_command(
                 pool,
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -313,6 +321,19 @@ pub async fn handle_command(
                 pool,
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
+                &strings,
+                command_audience(&msg, &state),
+            )
+            .await?;
+        }
+        Command::BottomMsg(args) => {
+            send_bottom_messages(
+                &bot,
+                msg.chat.id,
+                pool,
+                msg.chat.id.0,
+                render_from_message_or_args(&msg, &args),
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -331,6 +352,7 @@ pub async fn handle_command(
                 args.target.as_deref(),
                 fallback_user_id,
                 args.render,
+                &strings,
                 command_audience(&msg, &state),
             )
             .await?;
@@ -1066,6 +1088,7 @@ pub async fn handle_reply_user_stats_command(
 
     let pool = &state.pool;
     let config = &state.config;
+    let strings = StatsStrings::for_locale(&config.stats_locale);
 
     if is_managed_chat(config, msg.chat.id.0)
         && let Err(err) = ingest_message(pool, &msg, config).await
@@ -1089,6 +1112,7 @@ pub async fn handle_reply_user_stats_command(
         None,
         reply_user_id(&msg).or_else(|| sender_user_id(&msg)),
         render,
+        &strings,
         command_audience(&msg, &state),
     )
     .await?;

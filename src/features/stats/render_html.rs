@@ -1,3 +1,5 @@
+use crate::features::stats::document::{Kv, Section};
+use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{
     ChatStatsReportData, MessageMediaPreview, TopMessagesReportData, TopReactedReportData,
     UserStatsReportData,
@@ -7,7 +9,58 @@ use crate::telegram::render::escape_html;
 use crate::text::normalize_ai_markers;
 use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
-pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
+use teloxide_statistics::sentiment::SentimentCounts;
+
+fn bold_num(value: i64) -> String {
+    format!("<b>{value}</b>")
+}
+
+fn sentiment_value(counts: &SentimentCounts, strings: &StatsStrings) -> String {
+    let mut value = format!(
+        "👍 {}, 👎 {}, 🤔 {}",
+        bold_num(counts.positive as i64),
+        bold_num(counts.negative as i64),
+        bold_num(counts.undefined as i64),
+    );
+    if counts.unknown > 0 {
+        value.push_str(&format!(
+            ", {} {}",
+            strings.sentiment_unknown,
+            bold_num(counts.unknown as i64)
+        ));
+    }
+    if let Some(positivity) = counts.positivity() {
+        value.push_str(&format!(
+            ", {} <b>{:.0}%</b>",
+            strings.sentiment_positive,
+            positivity * 100.0
+        ));
+    }
+    value
+}
+
+fn per_active_value(messages: i64, active_users: i64, strings: &StatsStrings) -> String {
+    match (messages, active_users) {
+        (_, 0) => strings.not_available.to_string(),
+        (messages, active) => format!("<b>{:.1}</b>", messages as f64 / active as f64),
+    }
+}
+
+fn reply_share_value(replies: i64, messages: i64, strings: &StatsStrings) -> String {
+    match teloxide_statistics::engagement::reply_share(
+        replies.max(0) as u64,
+        messages.max(0) as u64,
+    ) {
+        Some(share) => format!("<b>{:.0}%</b>", share * 100.0),
+        None => strings.not_available.to_string(),
+    }
+}
+
+pub fn chat_stats(
+    data: &ChatStatsReportData,
+    time: &TimeContext,
+    strings: &StatsStrings,
+) -> String {
     let summary = &data.summary;
     let attraction = &data.attraction;
     let period_start = DateTimeToken::instant_in_unix(
@@ -18,41 +71,114 @@ pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
     .expect("Postgres timestamptz must fit into a Telegram timestamp")
     .to_html();
     let mut report = format!(
-        "<b>Статистика за {}</b>\nПериод с {}\n\nСообщения: <b>{}</b>\nАктивных пользователей: <b>{}</b>\nРеплаи: <b>{}</b>, ссылки: <b>{}</b>, медиа: <b>{}</b>\nПосты канала: <b>{}</b>, комменты бота: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nРеакции events: <b>{}</b>, count updates: <b>{}</b>\nРеакции на комменты бота: <b>{}</b>\nВходы: <b>{}</b>, выходы: <b>{}</b>\n\nЗавлечение после коммента: 5м <b>{}</b>, 30м <b>{}</b>, 24ч <b>{}</b>, людей 30м <b>{}</b>",
-        data.period.title(),
+        "<b>{} {}</b>\n{} {}",
+        strings.report_title,
+        strings.period_title(data.period),
+        strings.period_since,
         period_start,
-        summary.messages,
-        summary.active_users,
-        summary.replies,
-        summary.links,
-        summary.media,
-        summary.channel_posts,
-        summary.bot_comments,
-        summary.replies_to_bot,
-        summary.reaction_events,
-        summary.reaction_count_updates,
-        summary.bot_comment_reactions,
-        summary.joins,
-        summary.leaves,
-        attraction.messages_5m,
-        attraction.messages_30m,
-        attraction.messages_24h,
-        attraction.users_30m,
     );
+    let summary_section = Section {
+        title: None,
+        rows: vec![
+            Kv {
+                label: strings.messages,
+                value: bold_num(summary.messages),
+            },
+            Kv {
+                label: strings.active_users,
+                value: bold_num(summary.active_users),
+            },
+            Kv {
+                label: strings.replies,
+                value: format!(
+                    "{}, {}: {}, {}: {}",
+                    bold_num(summary.replies),
+                    strings.links,
+                    bold_num(summary.links),
+                    strings.media,
+                    bold_num(summary.media),
+                ),
+            },
+            Kv {
+                label: strings.channel_posts,
+                value: format!(
+                    "{}, {}: {}",
+                    bold_num(summary.channel_posts),
+                    strings.bot_comments,
+                    bold_num(summary.bot_comments),
+                ),
+            },
+            Kv {
+                label: strings.bot_replies,
+                value: bold_num(summary.replies_to_bot),
+            },
+            Kv {
+                label: strings.reaction_events,
+                value: format!(
+                    "{}, {}: {}",
+                    bold_num(summary.reaction_events),
+                    strings.reaction_count_updates,
+                    bold_num(summary.reaction_count_updates),
+                ),
+            },
+            Kv {
+                label: strings.bot_comment_reactions,
+                value: bold_num(summary.bot_comment_reactions),
+            },
+            Kv {
+                label: strings.joins,
+                value: format!(
+                    "{}, {}: {}",
+                    bold_num(summary.joins),
+                    strings.leaves,
+                    bold_num(summary.leaves),
+                ),
+            },
+            Kv {
+                label: strings.sentiment_mood,
+                value: sentiment_value(&data.reaction_sentiment, strings),
+            },
+            Kv {
+                label: strings.per_active,
+                value: per_active_value(summary.messages, summary.active_users, strings),
+            },
+            Kv {
+                label: strings.reply_share,
+                value: reply_share_value(summary.replies, summary.messages, strings),
+            },
+        ],
+    };
+    report.push_str(&format!("\n\n{}", summary_section.emit_html()));
+    report.push_str(&format!(
+        "\n\n{}: {} <b>{}</b>, {} <b>{}</b>, {} <b>{}</b>, {} <b>{}</b>",
+        strings.attraction,
+        strings.window_5m,
+        escape_html(&attraction.messages_5m),
+        strings.window_30m,
+        escape_html(&attraction.messages_30m),
+        strings.window_24h,
+        escape_html(&attraction.messages_24h),
+        strings.people_30m,
+        escape_html(&attraction.users_30m),
+    ));
     if !data.top_users.is_empty() {
-        report.push_str("\n\n<b>Топ пользователей</b>\n");
+        report.push_str(&format!("\n\n<b>{}</b>\n", strings.top_users));
         report.push_str(
             &data
                 .top_users
                 .iter()
                 .map(|row| {
                     format!(
-                        "{}: <b>{}</b> соо, {} реплаев, {} ссылок, {} медиа",
+                        "{}: <b>{}</b> {}, {} {}, {} {}, {} {}",
                         row.user.linked_with_known_badges(),
                         row.messages,
+                        strings.messages_unit_short,
                         row.replies,
+                        strings.replies_unit_short,
                         row.links,
-                        row.media
+                        strings.links_unit_short,
+                        row.media,
+                        strings.media_unit_short,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -60,20 +186,26 @@ pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
         );
     }
     if !data.bot_comments.is_empty() {
-        report.push_str("\n\n<b>Комменты бота</b>\n");
+        report.push_str(&format!("\n\n<b>{}</b>\n", strings.bot_comments_title));
         report.push_str(
             &data
                 .bot_comments
                 .iter()
                 .map(|row| {
                     format!(
-                        "#{}: {} соо за 30м, {} реплаев, {} реакций - {}",
-                        row.source_message_id,
-                        row.messages_30m,
-                        row.direct_replies,
-                        row.reactions,
-                        Html::text(truncate_text(&human_comment_preview(&row.response), 110))
-                            .into_string(),
+                        "#{id}: {m30} {u30}, {d} {ru}, {r} {rd}{preview}",
+                        id = row.source_message_id,
+                        m30 = row.messages_30m,
+                        u30 = strings.per_30m_unit,
+                        d = row.direct_replies,
+                        ru = strings.replies_unit_short,
+                        r = row.reactions,
+                        rd = strings.reactions_dash,
+                        preview = Html::text(truncate_text(
+                            &human_comment_preview(&row.response, strings),
+                            110
+                        ))
+                        .into_string(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -83,8 +215,16 @@ pub fn chat_stats(data: &ChatStatsReportData, time: &TimeContext) -> String {
     report
 }
 
-pub fn top_messages(data: &TopMessagesReportData) -> String {
-    let mut report = String::from("<b>Топ пишущих</b>\nЗа всё время\n");
+pub fn top_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> String {
+    ranked_users(data, strings.top_writers, strings)
+}
+
+pub fn bottom_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> String {
+    ranked_users(data, strings.quiet_ones, strings)
+}
+
+fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsStrings) -> String {
+    let mut report = format!("<b>{title}</b>\n{}\n", strings.all_time);
     if data.users.is_empty() {
         report.push_str("\nНет данных.");
         return report;
@@ -105,10 +245,17 @@ pub fn top_messages(data: &TopMessagesReportData) -> String {
     report
 }
 
-pub fn top_reacted(data: &TopReactedReportData, discussion_chat_id: i64) -> String {
-    let mut report = String::from("<b>Топ сообщений по реакциям</b>\nЗа всё время\n");
+pub fn top_reacted(
+    data: &TopReactedReportData,
+    discussion_chat_id: i64,
+    strings: &StatsStrings,
+) -> String {
+    let mut report = format!(
+        "<b>{}</b>\n{}\n",
+        strings.top_reacted_messages, strings.all_time
+    );
     if data.messages.is_empty() {
-        report.push_str("\nНет данных.");
+        report.push_str(&format!("\n{}", strings.no_data));
         return report;
     }
     for (index, row) in data.messages.iter().enumerate() {
@@ -123,7 +270,7 @@ pub fn top_reacted(data: &TopReactedReportData, discussion_chat_id: i64) -> Stri
             row.total_count,
             author_link,
             Html::text(truncate_text(
-                &message_preview(row.text.as_deref(), row.media),
+                &message_preview(row.text.as_deref(), row.media, strings),
                 64
             ))
             .into_string(),
@@ -136,89 +283,170 @@ pub fn user_stats(
     data: Option<&UserStatsReportData>,
     requested_target: Option<&str>,
     discussion_chat_id: i64,
+    strings: &StatsStrings,
 ) -> String {
     let Some(data) = data else {
-        return match requested_target.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(_) => "Не нашёл пользователя. Используй id, username из уже виденных ботом пользователей или reply на сообщение.".to_string(),
-            None => "Не понял, кого смотреть. Отправь команду обычным сообщением, ответь ей на сообщение пользователя или передай id/username.".to_string(),
+        return match requested_target
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(_) => strings.user_not_found_hint.to_string(),
+            None => strings.user_target_hint.to_string(),
         };
     };
-    let moderation = moderation_summary(&data.moderation);
-    format!(
-        "<b>Статистика пользователя</b>\n{}\nСтатус обновлён: <code>{}</code>\n{}\nПервое сообщение: {}\nПоследнее сообщение: {}\n\nСообщения: <b>{}</b>\nРеплаи: <b>{}</b>\nКомментарии: <b>{}</b>\nРеплаи на бота: <b>{}</b>\nСсылки: <b>{}</b>, медиа: <b>{}</b>, голосовые: <b>{}</b>\nАктивных дней: <b>{}</b>\nРеакций поставил: <b>{}</b>\nРеакций получил: <b>{}</b>",
-        data.user.linked_with_badges(),
-        escape_html(data.observed_at.as_deref().unwrap_or("нет данных")),
-        moderation,
-        linked_message(
-            discussion_chat_id,
-            &data.first_seen_at,
-            &data.first_message_id,
-            data.first_seen_days_ago
-        ),
-        linked_message(
-            discussion_chat_id,
-            &data.last_seen_at,
-            &data.last_message_id,
-            data.last_seen_days_ago
-        ),
-        data.totals.messages,
-        data.totals.replies,
-        data.totals.post_comments,
-        data.totals.replies_to_bot,
-        data.totals.links,
-        data.totals.media,
-        data.totals.voices,
-        data.totals.active_days,
-        data.reactions_given,
-        data.reactions_received,
-    )
+    let head = Section {
+        title: Some(strings.user_stats_title),
+        rows: vec![
+            Kv {
+                label: strings.status_updated,
+                value: format!(
+                    "<code>{}</code>",
+                    escape_html(data.observed_at.as_deref().unwrap_or(strings.no_timestamp))
+                ),
+            },
+            Kv {
+                label: strings.moderation_row,
+                value: moderation_summary(&data.moderation, strings),
+            },
+            Kv {
+                label: strings.first_message,
+                value: linked_message(
+                    discussion_chat_id,
+                    &data.first_seen_at,
+                    &data.first_message_id,
+                    data.first_seen_days_ago,
+                    strings,
+                ),
+            },
+            Kv {
+                label: strings.last_message,
+                value: linked_message(
+                    discussion_chat_id,
+                    &data.last_seen_at,
+                    &data.last_message_id,
+                    data.last_seen_days_ago,
+                    strings,
+                ),
+            },
+        ],
+    };
+    let activity = Section {
+        title: None,
+        rows: vec![
+            Kv {
+                label: strings.messages,
+                value: bold_num(data.totals.messages),
+            },
+            Kv {
+                label: strings.replies,
+                value: bold_num(data.totals.replies),
+            },
+            Kv {
+                label: strings.comments,
+                value: bold_num(data.totals.post_comments),
+            },
+            Kv {
+                label: strings.bot_replies,
+                value: bold_num(data.totals.replies_to_bot),
+            },
+            Kv {
+                label: strings.links,
+                value: format!(
+                    "{}, {}: {}, {}: {}",
+                    bold_num(data.totals.links),
+                    strings.media,
+                    bold_num(data.totals.media),
+                    strings.voices,
+                    bold_num(data.totals.voices),
+                ),
+            },
+            Kv {
+                label: strings.active_days,
+                value: bold_num(data.totals.active_days),
+            },
+            Kv {
+                label: strings.reactions_given,
+                value: bold_num(data.reactions_given),
+            },
+            Kv {
+                label: strings.reactions_received,
+                value: bold_num(data.reactions_received),
+            },
+        ],
+    };
+    let mut report = format!(
+        "<b>{}</b>\n{}\n",
+        strings.user_stats_title,
+        data.user.linked_with_badges()
+    );
+    report.push_str(&head.emit_html());
+    report.push_str("\n\n");
+    report.push_str(&activity.emit_html());
+    report
 }
 
-fn moderation_summary(summary: &crate::features::stats::types::UserModerationSummary) -> String {
+fn moderation_summary(
+    summary: &crate::features::stats::types::UserModerationSummary,
+    strings: &StatsStrings,
+) -> String {
     let restriction = if summary.unknown_restriction {
-        "неопределённая мера — нужна сверка".to_string()
+        strings.unknown_measure.to_string()
     } else if let Some(action) = summary.active_restriction.as_deref() {
-        let label = if action == "ban" { "бан" } else { "мут" };
+        let label = if action == "ban" {
+            strings.ban_label
+        } else {
+            strings.mute_label
+        };
         match summary.restriction_expires_at {
-            Some(expires_at) => format!("{label} до {} UTC", expires_at.format("%d.%m.%Y %H:%M")),
-            None => format!("{label} навсегда"),
+            Some(expires_at) => format!(
+                "{label} {} {} UTC",
+                strings.until_utc,
+                expires_at.format("%d.%m.%Y %H:%M")
+            ),
+            None => format!("{label} {}", strings.forever),
         }
     } else {
-        "активных ограничений нет".to_string()
+        strings.no_active_restrictions.to_string()
     };
     format!(
-        "Модерация: {}; предупреждений: {}/3",
+        "{}: {}; {}: {}/3",
+        strings.moderation_line,
         escape_html(&restriction),
+        strings.warnings,
         summary.active_warnings
     )
 }
 
-pub fn message_preview(text: Option<&str>, media: MessageMediaPreview) -> String {
+pub fn message_preview(
+    text: Option<&str>,
+    media: MessageMediaPreview,
+    strings: &StatsStrings,
+) -> String {
     if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
         return normalize_ai_markers(text);
     }
     let media = [
-        (media.has_photo, "фото"),
-        (media.has_video, "видео"),
-        (media.has_document, "файл"),
-        (media.has_audio, "аудио"),
-        (media.has_voice, "голосовое"),
-        (media.has_sticker, "стикер"),
-        (media.has_animation, "GIF"),
+        (media.has_photo, strings.media_photo),
+        (media.has_video, strings.media_video),
+        (media.has_document, strings.media_file),
+        (media.has_audio, strings.media_audio),
+        (media.has_voice, strings.media_voice),
+        (media.has_sticker, strings.media_sticker),
+        (media.has_animation, strings.media_gif),
     ]
     .into_iter()
     .filter_map(|(enabled, label)| enabled.then_some(label))
     .collect::<Vec<_>>();
     if media.is_empty() {
-        "сообщение без текста".to_string()
+        strings.message_without_text.to_string()
     } else {
-        format!("медиа: {}", media.join(", "))
+        format!("{}: {}", strings.media_prefix, media.join(", "))
     }
 }
 
-pub fn human_comment_preview(text: &str) -> String {
+pub fn human_comment_preview(text: &str, strings: &StatsStrings) -> String {
     normalize_ai_markers(text)
-        .replace("{CHAT_LINK}", "чат")
+        .replace("{CHAT_LINK}", strings.chat_fallback_label)
         .replace("  ", " ")
         .trim()
         .to_string()
@@ -238,10 +466,11 @@ fn linked_message(
     date_label: &str,
     message_id: &str,
     days_ago: Option<i64>,
+    strings: &StatsStrings,
 ) -> String {
     let label = days_ago.map_or_else(
         || date_label.to_string(),
-        |days| format!("{date_label} ({days} дн. назад)"),
+        |days| format!("{date_label} ({days} {})", strings.days_ago),
     );
     match message_id.parse::<i32>() {
         Ok(message_id) => format!(
@@ -254,5 +483,46 @@ fn linked_message(
             escape_html(date_label),
             escape_html(message_id)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::stats::strings::StatsStrings;
+    use crate::features::stats::types::{TopMessageUser, UserPresentation};
+
+    fn ranked_fixture() -> TopMessagesReportData {
+        TopMessagesReportData {
+            users: vec![TopMessageUser {
+                user: UserPresentation {
+                    user_id: 7,
+                    display_name: "Тихий".to_string(),
+                    is_bot: false,
+                    status: None,
+                    is_admin: false,
+                    is_present: None,
+                },
+                username: None,
+                messages: 1,
+                replies: 0,
+                media: 0,
+                voices: 0,
+                links: 0,
+                reactions_received: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn bottom_ranking_uses_quiet_title() {
+        let report = bottom_messages(&ranked_fixture(), &StatsStrings::russian());
+        assert!(report.contains("Тихони чата"));
+        assert!(!report.contains("Топ пишущих"));
+    }
+
+    #[test]
+    fn top_ranking_keeps_loud_title() {
+        assert!(top_messages(&ranked_fixture(), &StatsStrings::russian()).contains("Топ пишущих"));
     }
 }

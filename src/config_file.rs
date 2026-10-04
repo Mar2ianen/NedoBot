@@ -210,6 +210,10 @@ pub struct RiskProfile {
     pub telegram_id: Option<TelegramIdRiskModel>,
 }
 
+fn default_stats_locale() -> String {
+    "ru".to_string()
+}
+
 fn default_old_user_message_threshold() -> i64 {
     5
 }
@@ -253,6 +257,8 @@ pub struct RuntimeSettings {
     #[allow(dead_code)]
     pub discussion_chat_id: Option<i64>,
     pub render_timezone: String,
+    #[serde(default = "default_stats_locale")]
+    pub stats_locale: String,
     #[serde(default)]
     pub chat_invite_label: Option<String>,
     #[serde(default)]
@@ -349,6 +355,7 @@ impl Default for RuntimeSettings {
             source_channel_id: None,
             discussion_chat_id: None,
             render_timezone: "Europe/Moscow".to_string(),
+            stats_locale: "ru".to_string(),
             chat_invite_label: None,
             post_signature_marker: None,
             llm_temperature: 0.45,
