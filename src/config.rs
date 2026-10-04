@@ -96,6 +96,7 @@ pub struct Config {
     pub linear_spam_model: Option<std::sync::Arc<teloxide_antispam::logreg::LinearSpamModel>>,
     pub embedding_spam_model:
         Option<std::sync::Arc<teloxide_antispam::embedding::EmbeddingSpamModel>>,
+    pub reputation_model: Option<std::sync::Arc<teloxide_statistics::reputation::ReputationModel>>,
     pub gemini_thinking_budget: u32,
     pub owner_telegram_id: Option<i64>,
     pub send_owner_preview: bool,
@@ -467,6 +468,7 @@ impl Config {
             static_files_dir: runtime.static_files_dir,
             linear_spam_model: None,
             embedding_spam_model: None,
+            reputation_model: None,
         };
         if config.community.moderation.linear_spam_enabled {
             let path = config
@@ -522,6 +524,35 @@ impl Config {
                 "loaded embedding spam model"
             );
             config.embedding_spam_model = Some(std::sync::Arc::new(model));
+        }
+        if config.community.moderation.reputation_enabled {
+            let path = config
+                .community
+                .moderation
+                .reputation_model_path
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "moderation.reputation_enabled=true requires reputation_model_path"
+                    )
+                })?;
+            let json = std::fs::read_to_string(path).map_err(|error| {
+                anyhow::anyhow!("cannot read reputation model {path:?}: {error}")
+            })?;
+            let model =
+                teloxide_statistics::reputation::ReputationModel::load(&json).map_err(|error| {
+                    anyhow::anyhow!("cannot parse reputation model {path:?}: {error}")
+                })?;
+            tracing::info!(
+                version = model.version.as_str(),
+                features = ?model.features,
+                calibration_version = model.calibration.version.as_str(),
+                supporting_threshold = model.calibration.supporting_threshold,
+                strong_threshold = model.calibration.strong_threshold,
+                path,
+                "loaded reputation model"
+            );
+            config.reputation_model = Some(std::sync::Arc::new(model));
         }
         Ok(config)
     }
@@ -1112,6 +1143,18 @@ fn validate_community_config(
             anyhow::bail!("moderation.embedding_spam_model_path must be an absolute path");
         }
     }
+    if community.moderation.reputation_enabled {
+        let path = community
+            .moderation
+            .reputation_model_path
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("moderation.reputation_enabled=true requires reputation_model_path")
+            })?;
+        if !std::path::Path::new(path).is_absolute() {
+            anyhow::bail!("moderation.reputation_model_path must be an absolute path");
+        }
+    }
 
     if community.spam_reputation.enabled
         && community
@@ -1483,6 +1526,7 @@ mod tests {
             new_user_audit_max_tokens: 900,
             linear_spam_model: None,
             embedding_spam_model: None,
+            reputation_model: None,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,
             send_owner_preview: false,
@@ -1594,6 +1638,18 @@ mod tests {
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
         assert!(error.contains("stats_locale"));
+    }
+
+    #[test]
+    fn reputation_enabled_without_model_path_is_rejected() {
+        let (mut community, registry) = test_community_config();
+        community.moderation.reputation_enabled = true;
+        community.moderation.reputation_model_path = None;
+
+        let error = validate_community_config(&community, &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reputation_model_path"));
     }
 
     #[test]
