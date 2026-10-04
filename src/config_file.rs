@@ -104,6 +104,13 @@ pub struct ModerationConfig {
     pub embedding_spam_enabled: bool,
     #[serde(default)]
     pub embedding_spam_model_path: Option<String>,
+    /// Лёгкая репутационная голова поверх point-in-time фичей
+    /// (`teloxide-statistics`, обучена на разметке ревьюеров). Маленький
+    /// supporting-слот, никогда не решает в одиночку.
+    #[serde(default)]
+    pub reputation_enabled: bool,
+    #[serde(default)]
+    pub reputation_model_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

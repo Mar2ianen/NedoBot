@@ -6,9 +6,9 @@ use crate::db::telegram::refresh_chat_member_snapshot;
 use crate::features::stats::repo;
 use crate::features::stats::stop_words::USER_TOP_WORD_STOP_WORDS;
 use crate::features::stats::types::{
-    AttractionMetrics, BotCommentStats, ChatStatsReportData, MessageMediaPreview, PeriodTopUser,
-    TopMessageUser, TopMessagesReportData, TopReactedMessage, TopReactedReportData,
-    UserPresentation, UserStatsReportData, UserTotals, display_name,
+    AttractionMetrics, BotCommentStats, ChatStatsReportData, DailyActive, MessageMediaPreview,
+    PeriodTopUser, RetentionSummary, TopMessageUser, TopMessagesReportData, TopReactedMessage,
+    TopReactedReportData, UserPresentation, UserStatsReportData, UserTotals, display_name,
 };
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
@@ -69,7 +69,40 @@ pub async fn chat_stats_report_data(
         top_users,
         bot_comments,
         reaction_sentiment,
+        daily_active: repo::daily_active_users(pool, chat_id, window)
+            .await?
+            .into_iter()
+            .map(|(day, users)| DailyActive { day, users })
+            .collect(),
+        retention: retention_summary(
+            &repo::cohort_activity(pool, chat_id, window.start_at - chrono::Duration::days(60))
+                .await?,
+        ),
+        member_count: None,
     })
+}
+
+fn retention_summary(activity: &[(i64, i64)]) -> RetentionSummary {
+    // Day indices are days since epoch, matching `cohort_activity`.
+    let today = chrono::Utc::now().timestamp() / 86_400;
+    let table = teloxide_statistics::engagement::retention_table(activity, 30);
+    let rate = |offset: i64| {
+        let mut weighted = 0.0;
+        let mut cohorts = 0u64;
+        for (cohort, row) in &table {
+            if cohort + offset > today || row[0] == 0 {
+                continue;
+            }
+            weighted += row[offset as usize] as f64 / row[0] as f64;
+            cohorts += 1;
+        }
+        (cohorts > 0).then_some(weighted / cohorts as f64)
+    };
+    RetentionSummary {
+        d1: rate(1),
+        d7: rate(7),
+        d30: rate(30),
+    }
 }
 
 pub async fn top_messages_report_data(
