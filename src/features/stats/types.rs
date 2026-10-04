@@ -59,6 +59,26 @@ pub struct ChatStatsReportData {
     pub top_users: Vec<PeriodTopUser>,
     pub bot_comments: Vec<BotCommentStats>,
     pub reaction_sentiment: teloxide_statistics::sentiment::SentimentCounts,
+    pub daily_active: Vec<DailyActive>,
+    pub retention: RetentionSummary,
+    /// Live member count at report time for the engagement denominator.
+    /// `None` when the Bot API lookup fails; renderers show a dash.
+    pub member_count: Option<i64>,
+}
+
+#[derive(Clone)]
+pub struct DailyActive {
+    pub day: chrono::NaiveDate,
+    pub users: i64,
+}
+
+/// Cohort return rates: share of each first-day cohort active again after
+/// the offset, averaged over complete cohorts. `None` without cohorts.
+#[derive(Clone, Default)]
+pub struct RetentionSummary {
+    pub d1: Option<f64>,
+    pub d7: Option<f64>,
+    pub d30: Option<f64>,
 }
 
 #[derive(Clone)]

@@ -56,6 +56,66 @@ fn reply_share_value(replies: i64, messages: i64, strings: &StatsStrings) -> Str
     }
 }
 
+fn daily_active_value(
+    daily: &[crate::features::stats::types::DailyActive],
+    strings: &StatsStrings,
+) -> String {
+    if daily.is_empty() {
+        return strings.not_available.to_string();
+    }
+    let users: Vec<i64> = daily.iter().map(|day| day.users).collect();
+    let avg = users.iter().sum::<i64>() as f64 / users.len() as f64;
+    let max = users.into_iter().max().unwrap_or(0);
+    let mut value = format!(
+        "{} <b>{:.0}</b>, {} <b>{}</b>",
+        strings.avg_word, avg, strings.max_word, max
+    );
+    let recent: Vec<String> = daily
+        .iter()
+        .rev()
+        .take(7)
+        .rev()
+        .map(|day| format!("{}:{}", day.day.format("%d.%m"), day.users))
+        .collect();
+    if !recent.is_empty() {
+        value.push_str(&format!(" ({})", recent.join(", ")));
+    }
+    value
+}
+
+fn retention_value(
+    retention: &crate::features::stats::types::RetentionSummary,
+    strings: &StatsStrings,
+) -> String {
+    let part = |value: Option<f64>| match value {
+        Some(rate) => format!("<b>{:.0}%</b>", rate * 100.0),
+        None => strings.not_available.to_string(),
+    };
+    format!(
+        "D+1 {}, D+7 {}, D+30 {}",
+        part(retention.d1),
+        part(retention.d7),
+        part(retention.d30)
+    )
+}
+
+fn engagement_value(
+    active_users: i64,
+    member_count: Option<i64>,
+    strings: &StatsStrings,
+) -> String {
+    match member_count.filter(|&total| total > 0) {
+        Some(total) => match teloxide_statistics::engagement::engagement_rate(
+            active_users.max(0) as u64,
+            total as u64,
+        ) {
+            Some(rate) => format!("<b>{:.1}%</b>", rate * 100.0),
+            None => strings.not_available.to_string(),
+        },
+        None => strings.not_available.to_string(),
+    }
+}
+
 pub fn chat_stats(
     data: &ChatStatsReportData,
     time: &TimeContext,
@@ -145,6 +205,18 @@ pub fn chat_stats(
             Kv {
                 label: strings.reply_share,
                 value: reply_share_value(summary.replies, summary.messages, strings),
+            },
+            Kv {
+                label: strings.active_by_day,
+                value: daily_active_value(&data.daily_active, strings),
+            },
+            Kv {
+                label: strings.returns,
+                value: retention_value(&data.retention, strings),
+            },
+            Kv {
+                label: strings.engagement,
+                value: engagement_value(summary.active_users, data.member_count, strings),
             },
         ],
     };

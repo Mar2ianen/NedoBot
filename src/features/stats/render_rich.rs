@@ -120,6 +120,51 @@ pub fn chat_stats(
                     None => strings.not_available.to_string(),
                 },
             },
+            crate::features::stats::document::Kv {
+                label: strings.active_by_day,
+                value: if data.daily_active.is_empty() {
+                    strings.not_available.to_string()
+                } else {
+                    let users: Vec<i64> = data.daily_active.iter().map(|day| day.users).collect();
+                    format!(
+                        "{} {:.0}, {} {}",
+                        strings.avg_word,
+                        users.iter().sum::<i64>() as f64 / users.len() as f64,
+                        strings.max_word,
+                        users.into_iter().max().unwrap_or(0)
+                    )
+                },
+            },
+            crate::features::stats::document::Kv {
+                label: strings.returns,
+                value: {
+                    let part = |value: Option<f64>| match value {
+                        Some(rate) => format!("{:.0}%", rate * 100.0),
+                        None => strings.not_available.to_string(),
+                    };
+                    format!(
+                        "D+1 {}, D+7 {}, D+30 {}",
+                        part(data.retention.d1),
+                        part(data.retention.d7),
+                        part(data.retention.d30)
+                    )
+                },
+            },
+            crate::features::stats::document::Kv {
+                label: strings.engagement,
+                value: match data.member_count.filter(|&total| total > 0) {
+                    Some(total) => {
+                        match teloxide_statistics::engagement::engagement_rate(
+                            summary.active_users.max(0) as u64,
+                            total as u64,
+                        ) {
+                            Some(rate) => format!("{:.1}%", rate * 100.0),
+                            None => strings.not_available.to_string(),
+                        }
+                    }
+                    None => strings.not_available.to_string(),
+                },
+            },
         ],
     };
     let summary_table = table_no_header(
