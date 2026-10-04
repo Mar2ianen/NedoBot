@@ -450,6 +450,7 @@ mod tests {
             new_user_audit_enabled: false,
             new_user_audit_max_tokens: 900,
             linear_spam_model: None,
+            embedding_spam_model: None,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,
             send_owner_preview: false,
