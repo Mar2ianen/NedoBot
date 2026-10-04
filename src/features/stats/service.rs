@@ -43,6 +43,19 @@ pub async fn chat_stats_report_data(
             reactions: row.reactions,
         })
         .collect();
+    let mut reaction_sentiment = teloxide_statistics::sentiment::SentimentCounts::default();
+    {
+        use teloxide_statistics::sentiment::ReactionSentiment;
+        for (emoji, count) in repo::period_reaction_emoji_counts(pool, chat_id, window).await? {
+            let count = count as u64;
+            match teloxide_statistics::sentiment::classify(&emoji) {
+                ReactionSentiment::Positive => reaction_sentiment.positive += count,
+                ReactionSentiment::Negative => reaction_sentiment.negative += count,
+                ReactionSentiment::Undefined => reaction_sentiment.undefined += count,
+                ReactionSentiment::Unknown => reaction_sentiment.unknown += count,
+            }
+        }
+    }
 
     Ok(ChatStatsReportData {
         period,
@@ -55,6 +68,7 @@ pub async fn chat_stats_report_data(
         },
         top_users,
         bot_comments,
+        reaction_sentiment,
     })
 }
 
@@ -66,30 +80,47 @@ pub async fn top_messages_report_data(
     let users = repo::top_message_users(pool, chat_id, limit)
         .await?
         .into_iter()
-        .map(|row| TopMessageUser {
-            user: UserPresentation {
-                user_id: row.user_id,
-                display_name: display_name(
-                    row.username.as_deref(),
-                    row.first_name.as_deref(),
-                    row.last_name.as_deref(),
-                    row.user_id,
-                ),
-                is_bot: row.is_bot,
-                status: Some(row.status),
-                is_admin: row.is_admin,
-                is_present: Some(row.is_present),
-            },
-            username: row.username,
-            messages: row.messages,
-            replies: row.replies,
-            media: row.media,
-            voices: row.voices,
-            links: row.links,
-            reactions_received: row.reactions_received,
-        })
+        .map(top_message_user)
         .collect();
     Ok(TopMessagesReportData { users })
+}
+
+pub async fn bottom_messages_report_data(
+    pool: &PgPool,
+    chat_id: i64,
+    limit: i64,
+) -> anyhow::Result<TopMessagesReportData> {
+    let users = repo::bottom_message_users(pool, chat_id, limit)
+        .await?
+        .into_iter()
+        .map(top_message_user)
+        .collect();
+    Ok(TopMessagesReportData { users })
+}
+
+fn top_message_user(row: repo::TopMessage) -> TopMessageUser {
+    TopMessageUser {
+        user: UserPresentation {
+            user_id: row.user_id,
+            display_name: display_name(
+                row.username.as_deref(),
+                row.first_name.as_deref(),
+                row.last_name.as_deref(),
+                row.user_id,
+            ),
+            is_bot: row.is_bot,
+            status: Some(row.status),
+            is_admin: row.is_admin,
+            is_present: Some(row.is_present),
+        },
+        username: row.username,
+        messages: row.messages,
+        replies: row.replies,
+        media: row.media,
+        voices: row.voices,
+        links: row.links,
+        reactions_received: row.reactions_received,
+    }
 }
 
 pub async fn top_reacted_report_data(

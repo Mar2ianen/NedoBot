@@ -44,7 +44,7 @@ src/features/first_comment/repo.rs     — post_comment_jobs, llm_generations CR
 src/features/memory/service.rs         — atomic post history jobs, RAG retrieval, bounded retry and lease-safe finalization
 src/features/memory/report.rs          — /memory command
 src/features/stats/types.rs            — StatsPeriod (Day/Week/Month), StatsRender (Html/Rich), UserPresentation
-src/features/stats/report.rs           — /stats_day, /stats_week, /stats_month, /topmsg, /topreact, /userstats, /userstatus
+src/features/stats/report.rs           — /stats_day, /stats_week, /stats_month, /topmsg, /bottommsg, /topreact, /userstats, /userstatus
 src/features/voice/pipeline.rs         — maybe_transcribe_voice → download → ASR → cleanup → render → send
 src/features/voice/download.rs          — validate_media (duration/filesize), download_voice_file (tempfile)
 src/features/voice/asr.rs               — Groq /audio/transcriptions multipart
@@ -94,6 +94,7 @@ migrations/                            — sqlx compile-time миграции
 | `/status day\|week\|month [-r\|-p]` | Alias для статистики |
 | `/topmsg [-r\|-p]` | Топ 20 по сообщениям |
 | `/topreact [-r\|-p]` | Топ 20 по реакциям |
+| `/bottommsg [-r\|-p]` | 20 самых молчаливых |
 | `/userstats <id\|username> [-r\|-p]` | Карточка пользователя |
 | `/userstatus <id\|username> [-r\|-p]` | Alias /userstats |
 

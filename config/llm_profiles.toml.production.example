@@ -216,6 +216,7 @@ models = ["ollama_minimax", "ollama_memory"]
 # API keys stay in the process environment and are not stored in this file.
 [runtime]
 render_timezone = "Europe/Moscow"
+stats_locale = "ru"
 
 llm_temperature = 0.35
 llm_max_tokens = 140

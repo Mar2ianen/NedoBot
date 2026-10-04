@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::features::stats::render_html;
 use crate::features::stats::render_rich;
 use crate::features::stats::service::{self, HTML_TOP_LIMIT, RICH_TOP_LIMIT};
+use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::telegram::render::{send_html, send_rich_html};
 use crate::telegram::service_messages::{self, MessageAudience};
@@ -21,6 +22,7 @@ pub async fn send_chat_stats(
     render_time: &TimeContext,
     period: StatsPeriod,
     render: StatsRender,
+    strings: &StatsStrings,
     audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
     let Some(audience) = audience else {
@@ -30,8 +32,10 @@ pub async fn send_chat_stats(
         .await
         .map_err(stats_error("failed to build chat stats"))?;
     let report = match render {
-        StatsRender::Html => render_html::chat_stats(&data, render_time),
-        StatsRender::Rich => render_rich::chat_stats(&data, stats_scope_chat_id, render_time),
+        StatsRender::Html => render_html::chat_stats(&data, render_time, strings),
+        StatsRender::Rich => {
+            render_rich::chat_stats(&data, stats_scope_chat_id, render_time, strings)
+        }
     };
     send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
@@ -43,6 +47,7 @@ pub async fn send_top_messages(
     pool: &PgPool,
     stats_scope_chat_id: i64,
     render: StatsRender,
+    strings: &StatsStrings,
     audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
     let Some(audience) = audience else {
@@ -57,8 +62,36 @@ pub async fn send_top_messages(
         .await
         .map_err(stats_error("failed to build top messages report"))?;
     let report = match render {
-        StatsRender::Html => render_html::top_messages(&data),
-        StatsRender::Rich => render_rich::top_messages(&data),
+        StatsRender::Html => render_html::top_messages(&data, strings),
+        StatsRender::Rich => render_rich::top_messages(&data, strings),
+    };
+    send_stats_report(bot, chat_id, report, render, audience).await?;
+    Ok(())
+}
+
+pub async fn send_bottom_messages(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+    stats_scope_chat_id: i64,
+    render: StatsRender,
+    strings: &StatsStrings,
+    audience: Option<MessageAudience>,
+) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
+    service::refresh_top_message_users(bot, pool, stats_scope_chat_id).await;
+    let limit = match render {
+        StatsRender::Html => HTML_TOP_LIMIT,
+        StatsRender::Rich => RICH_TOP_LIMIT,
+    };
+    let data = service::bottom_messages_report_data(pool, stats_scope_chat_id, limit)
+        .await
+        .map_err(stats_error("failed to build bottom messages report"))?;
+    let report = match render {
+        StatsRender::Html => render_html::bottom_messages(&data, strings),
+        StatsRender::Rich => render_rich::bottom_messages(&data, strings),
     };
     send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
@@ -70,6 +103,7 @@ pub async fn send_top_reacted(
     pool: &PgPool,
     stats_scope_chat_id: i64,
     render: StatsRender,
+    strings: &StatsStrings,
     audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
     let Some(audience) = audience else {
@@ -84,8 +118,8 @@ pub async fn send_top_reacted(
         .await
         .map_err(stats_error("failed to build top reacted report"))?;
     let report = match render {
-        StatsRender::Html => render_html::top_reacted(&data, stats_scope_chat_id),
-        StatsRender::Rich => render_rich::top_reacted(&data, stats_scope_chat_id),
+        StatsRender::Html => render_html::top_reacted(&data, stats_scope_chat_id, strings),
+        StatsRender::Rich => render_rich::top_reacted(&data, stats_scope_chat_id, strings),
     };
     send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
@@ -101,6 +135,7 @@ pub async fn send_user_stats(
     target: Option<&str>,
     reply_user_id: Option<i64>,
     render: StatsRender,
+    strings: &StatsStrings,
     audience: Option<MessageAudience>,
 ) -> ResponseResult<()> {
     let Some(audience) = audience else {
@@ -117,8 +152,12 @@ pub async fn send_user_stats(
         service::enrich_user_stats_avatar(bot, config, data).await;
     }
     let report = match render {
-        StatsRender::Html => render_html::user_stats(data.as_ref(), target, stats_scope_chat_id),
-        StatsRender::Rich => render_rich::user_stats(data.as_ref(), target, stats_scope_chat_id),
+        StatsRender::Html => {
+            render_html::user_stats(data.as_ref(), target, stats_scope_chat_id, strings)
+        }
+        StatsRender::Rich => {
+            render_rich::user_stats(data.as_ref(), target, stats_scope_chat_id, strings)
+        }
     };
     send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())
@@ -157,6 +196,7 @@ fn numeric_target_user_id(target: Option<&str>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use crate::features::stats::render_html::message_preview;
+    use crate::features::stats::strings::StatsStrings;
     use crate::features::stats::types::MessageMediaPreview;
 
     #[test]
@@ -167,7 +207,8 @@ mod tests {
                 MessageMediaPreview {
                     has_voice: true,
                     ..Default::default()
-                }
+                },
+                &StatsStrings::russian(),
             ),
             "медиа: голосовое"
         );

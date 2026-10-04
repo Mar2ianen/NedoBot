@@ -405,7 +405,29 @@ pub async fn top_message_users(
     discussion_chat_id: i64,
     limit: i64,
 ) -> anyhow::Result<Vec<TopMessage>> {
-    sqlx::query_as(
+    ranked_message_users(pool, discussion_chat_id, limit, false).await
+}
+
+pub async fn bottom_message_users(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<TopMessage>> {
+    ranked_message_users(pool, discussion_chat_id, limit, true).await
+}
+
+async fn ranked_message_users(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    limit: i64,
+    ascending: bool,
+) -> anyhow::Result<Vec<TopMessage>> {
+    let order = if ascending {
+        "messages asc, reactions_received asc"
+    } else {
+        "messages desc, reactions_received desc"
+    };
+    let sql = format!(
         r#"
         select m.user_id, p.username,
                coalesce(nullif(case when p.first_name = 'пользователь' then '' else p.first_name end, ''), raw_name.display_name, 'скрытый пользователь') as first_name,
@@ -420,25 +442,60 @@ pub async fn top_message_users(
         left join telegram_chat_member_snapshots s on s.chat_id = m.chat_id and s.telegram_user_id = m.user_id
         left join telegram_message_reaction_counts rc on rc.chat_id = m.chat_id and rc.message_id = m.message_id
         left join lateral (
-            select coalesce(nullif(tm.raw_json #>> '{from,first_name}', ''), nullif(tm.raw_json ->> 'from', '')) as display_name
+            select coalesce(nullif(tm.raw_json #>> '{{from,first_name}}', ''), nullif(tm.raw_json ->> 'from', '')) as display_name
             from telegram_messages tm
             where tm.chat_id = m.chat_id and tm.user_id = m.user_id
-              and coalesce(nullif(tm.raw_json #>> '{from,first_name}', ''), nullif(tm.raw_json ->> 'from', '')) is not null
+              and coalesce(nullif(tm.raw_json #>> '{{from,first_name}}', ''), nullif(tm.raw_json ->> 'from', '')) is not null
             order by tm.created_at desc limit 1
         ) raw_name on true
         where m.chat_id = $1 and m.user_id is not null and m.source_channel_id is null
           and m.user_id <> $2 and coalesce(p.is_bot, false) = false
         group by m.user_id, p.username, p.first_name, p.last_name, p.is_bot, s.status, s.is_admin, s.is_present, raw_name.display_name
-        order by messages desc, reactions_received desc
+        order by {order}
         limit $3
+        "#,
+    );
+
+    sqlx::query_as(&sql)
+        .bind(discussion_chat_id)
+        .bind(TELEGRAM_SERVICE_USER_ID)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+}
+
+/// Raw emoji counts for reaction events in the window. Callers classify with
+/// `teloxide_statistics::sentiment`; custom reactions without glyphs are
+/// skipped here because JSON object keys cannot be null.
+pub async fn period_reaction_emoji_counts(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    window: ReportWindow,
+) -> anyhow::Result<Vec<(String, i64)>> {
+    #[derive(sqlx::FromRow)]
+    struct EmojiCountRow {
+        emoji: String,
+        count: i64,
+    }
+
+    let rows: Vec<EmojiCountRow> = sqlx::query_as(
+        r#"
+        with bounds as (select $2::timestamptz as start_at, $3::timestamptz as end_at)
+        select je.emoji, count(*)::bigint as count
+        from telegram_message_reactions r, bounds b,
+             jsonb_to_recordset(r.new_reactions) as je(emoji text)
+        where r.chat_id = $1 and r.event_at >= b.start_at and r.event_at < b.end_at
+          and je.emoji is not null
+        group by je.emoji
         "#,
     )
     .bind(discussion_chat_id)
-    .bind(TELEGRAM_SERVICE_USER_ID)
-    .bind(limit)
+    .bind(window.start_at)
+    .bind(window.end_at)
     .fetch_all(pool)
-    .await
-    .map_err(Into::into)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.emoji, row.count)).collect())
 }
 
 pub async fn top_reacted_messages(

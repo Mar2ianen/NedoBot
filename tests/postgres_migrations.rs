@@ -3724,17 +3724,27 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         },
         top_users: Vec::new(),
         bot_comments: Vec::new(),
+        reaction_sentiment: teloxide_statistics::sentiment::SentimentCounts {
+            positive: 3,
+            negative: 1,
+            undefined: 0,
+            unknown: 0,
+        },
     };
 
     let time = TimeContext::from_name("Europe/Moscow").expect("test time zone must be valid");
-    let html = render_html::chat_stats(&data, &time);
-    let rich = render_rich::chat_stats(&data, CHAT_ID, &time);
+    let strings = tg_ai_bot_teloxide::features::stats::strings::StatsStrings::russian();
+    let html = render_html::chat_stats(&data, &time, &strings);
+    let rich = render_rich::chat_stats(&data, CHAT_ID, &time, &strings);
     let messages = format!("{}", summary.messages);
     let active_users = format!("{}", summary.active_users);
     assert!(html.contains(&messages));
     assert!(rich.contains(&messages));
     assert!(html.contains(&active_users));
     assert!(rich.contains(&active_users));
+    assert!(html.contains("Настроение реакций"));
+    assert!(rich.contains("Настроение реакций"));
+    assert!(html.contains("позитив"));
 }
 
 async fn assert_feature_gated_jobs(pool: &PgPool) {
