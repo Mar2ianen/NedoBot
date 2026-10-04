@@ -58,6 +58,7 @@ pub struct ChatStatsReportData {
     pub attraction: AttractionMetrics,
     pub top_users: Vec<PeriodTopUser>,
     pub bot_comments: Vec<BotCommentStats>,
+    pub reaction_sentiment: teloxide_statistics::sentiment::SentimentCounts,
 }
 
 #[derive(Clone)]
@@ -256,16 +257,6 @@ pub fn display_name(
         username.trim_start_matches('@').to_string()
     } else {
         fallback_user_id.to_string()
-    }
-}
-
-impl StatsPeriod {
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Day => "день",
-            Self::Week => "неделю",
-            Self::Month => "месяц",
-        }
     }
 }
 

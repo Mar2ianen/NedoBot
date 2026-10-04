@@ -89,6 +89,11 @@ pub enum Command {
     )]
     TopReact(String),
     #[command(
+        rename = "bottommsg",
+        description = "20 самых молчаливых пользователей; [-r|-p]"
+    )]
+    BottomMsg(String),
+    #[command(
         rename = "userstats",
         description = "статистика пользователя: /userstats <id|username> [-r|-p], или reply на сообщение"
     )]
