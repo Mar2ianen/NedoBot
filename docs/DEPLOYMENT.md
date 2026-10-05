@@ -67,9 +67,9 @@ Deployment tag ставить только после фактического �
 2. Прогнать локальные проверки:
 
    ```bash
-   cargo fmt -- --check
-   cargo test --all-targets
-   cargo clippy --all-targets -- -D warnings
+   cargo fmt --all -- --check
+   cargo test --workspace --all-targets --locked
+   cargo clippy --workspace --all-targets --locked -- -D warnings
    ./scripts/test.sh
    ```
 
@@ -167,29 +167,35 @@ rsync -az \
 удалял `alt_word_char_v2_2026-10-03.json` 2026-10-05 с crash-loop НедоNews до
 восстановления из снапшота (хеш сверен с задокументированным в релизе).
 
-После rsync отдельно проверить доступ сервисного пользователя к checkout:
+При использовании запасного пути повторить source sync для
+`/opt/nedobot-pvo/`, сохранив его собственные `.env`, profile и persistent
+файлы. Затем отдельно проверить доступ сервисного пользователя к обоим
+checkout:
 
 ```bash
 ssh vps-153 'chmod 755 /opt/tg-ai-bot-teloxide && runuser -u tg-ai-bot -- test -x /opt/tg-ai-bot-teloxide'
+ssh vps-153 'chmod 755 /opt/nedobot-pvo && runuser -u tg-ai-bot -- test -x /opt/nedobot-pvo'
 ```
 
 Не выполнять рекурсивный `chmod`: MCP нужен только проход по каталогу и
-доступ к release binary. Затем установить non-secret profile отдельно и
-проверить его наличие до рестарта:
+доступ к release binary. Изменения non-secret profiles внести вручную после
+бэкапа, сохранив настройки каждого инстанса. Example целиком поверх
+существующего profile не копировать. До рестарта проверить оба файла:
 
 ```bash
-rsync -az config/llm_profiles.toml.production.example \
-  vps-153:/etc/tg-ai-bot/llm_profiles.toml
-ssh vps-153 'test -s /etc/tg-ai-bot/llm_profiles.toml'
+ssh vps-153 'test -s /etc/tg-ai-bot/llm_profiles.toml && test -s /etc/tg-ai-bot/pvo-llm_profiles.toml'
 ```
 
-Сборка и restart выполняются на сервере, чтобы release binary использовал
-production toolchain и локальный cargo cache:
+В запасном пути собрать один release на сервере с production toolchain и
+локальным cargo cache. Подготовить stage из семи бинарей и installer, как в
+workflow `release`, затем установить его через `install_release_binaries.sh`
+сразу в оба checkout. Простого rebuild первого инстанса недостаточно:
 
 ```bash
-ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release'
-ssh vps-153 'systemctl restart tg-ai-bot-teloxide'
-ssh vps-153 'systemctl is-active tg-ai-bot-teloxide'
+ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --locked --release'
+# После установки проверенного stage через installer:
+ssh vps-153 'systemctl restart tg-ai-bot-teloxide nedobot-pvo'
+ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedobot-pvo'
 ssh vps-153 'systemctl restart nedonews-mcp'
 ssh vps-153 'systemctl is-active nedonews-mcp'
 ```
