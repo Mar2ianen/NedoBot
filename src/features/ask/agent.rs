@@ -1210,6 +1210,9 @@ mod tests {
         assert!(prompt.contains("UNTRUSTED"));
         assert!(prompt.contains("Native tools"));
         assert!(SYSTEM_PROMPT.contains("chat.count_messages"));
+        assert!(SYSTEM_PROMPT.contains("chat.count_word_occurrences"));
+        assert!(SYSTEM_PROMPT.contains("повторы внутри одного сообщения"));
+        assert!(!SYSTEM_PROMPT.contains("события или вхождения"));
         assert!(SYSTEM_PROMPT.contains("include_forwards=true"));
         assert!(SYSTEM_PROMPT.contains("сначала вызывай `chat.search_messages`"));
         assert!(SYSTEM_PROMPT.contains("потом `chat.count_messages`"));
