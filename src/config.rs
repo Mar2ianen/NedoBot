@@ -559,6 +559,14 @@ impl Config {
                 teloxide_statistics::reputation::ReputationModel::load(&json).map_err(|error| {
                     anyhow::anyhow!("cannot parse reputation model {path:?}: {error}")
                 })?;
+            let supported = crate::features::new_user_audit::service::REPUTATION_FEATURE_NAMES;
+            anyhow::ensure!(
+                model
+                    .features
+                    .iter()
+                    .all(|feature| supported.contains(&feature.as_str())),
+                "reputation model contains unsupported features"
+            );
             tracing::info!(
                 version = model.version.as_str(),
                 features = ?model.features,

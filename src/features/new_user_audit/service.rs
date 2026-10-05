@@ -375,6 +375,7 @@ async fn load_first_message_score_context(
     }
     let mut reputation_inputs = reputation_inputs;
     reputation_inputs.is_command = text.trim_start().starts_with('/');
+    reputation_inputs.has_text = true;
     let embedding = embed_text(config, &text).await?;
     let embedding = pgvector_literal(&embedding)?;
     let reply_context = first_message_reply_context(&job.input_json);
@@ -426,6 +427,7 @@ async fn load_first_message_score_context(
     if let Some(behavior) = behavior {
         reputation_inputs.active_days = behavior.active_days;
         reputation_inputs.received = behavior.received;
+        reputation_inputs.behavior_available = true;
     }
     Ok((context, reputation_inputs))
 }
@@ -434,6 +436,8 @@ async fn load_first_message_score_context(
 /// disables reputation for this audit instead of failing it.
 #[derive(Debug, Clone, Default)]
 struct ReputationInputs {
+    has_text: bool,
+    behavior_available: bool,
     message_count: i64,
     link_count: i64,
     dup_reuse: i64,
@@ -494,12 +498,33 @@ fn score_reputation(
     provisional_score: i32,
 ) -> Option<(f64, String, teloxide_statistics::reputation::Calibration)> {
     let head = config.reputation_model.as_ref()?;
-    if inputs.is_command {
+    if inputs.is_command || !inputs.behavior_available {
         return None;
     }
     let id_model = config.moderation_risk_profile()?.telegram_id.as_ref()?;
     let id_prior =
         teloxide_antispam::signals::telegram_id_spam_probability(job.telegram_user_id, id_model);
+    let values = reputation_feature_values(context, inputs, id_prior, provisional_score);
+    let values = head
+        .features
+        .iter()
+        .map(|feature| {
+            REPUTATION_FEATURE_NAMES
+                .iter()
+                .position(|name| name == feature)
+                .map(|index| values[index])
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let probability = head.score(&values)?;
+    Some((probability, head.version.clone(), head.calibration.clone()))
+}
+
+fn reputation_feature_values(
+    context: &FirstMessageScoreContext,
+    inputs: &ReputationInputs,
+    id_prior: f64,
+    provisional_score: i32,
+) -> [f64; 12] {
     let mut pos = 0u64;
     let mut neg = 0u64;
     let mut total = 0u64;
@@ -518,7 +543,7 @@ fn score_reputation(
     } else {
         0.5
     };
-    let values = [
+    [
         id_prior,
         f64::from(provisional_score.clamp(0, 100)) / 100.0,
         (inputs.message_count.max(0) as f64 + 1.0).ln(),
@@ -528,13 +553,26 @@ fn score_reputation(
         positivity,
         neg as f64 / total.max(1) as f64,
         (inputs.account_age_sec.max(0) as f64 / 86_400.0 + 1.0).ln(),
-        context.linear_spam_probability.unwrap_or(0.5),
         context.embedding_spam_probability.unwrap_or(0.5),
-        1.0,
-    ];
-    let probability = head.score(&values)?;
-    Some((probability, head.version.clone(), head.calibration.clone()))
+        context.linear_spam_probability.unwrap_or(0.5),
+        f64::from(inputs.has_text),
+    ]
 }
+
+pub(crate) const REPUTATION_FEATURE_NAMES: [&str; 12] = [
+    "id_prior",
+    "audit_risk",
+    "message_count_log",
+    "active_days_log",
+    "link_ratio",
+    "dup_reuse_log",
+    "positivity",
+    "negativity_received",
+    "account_age_days_log",
+    "text_gemma_prob",
+    "text_tfidf_prob",
+    "has_text",
+];
 
 /// Scores the stored Gemma retrieval vector when the embedding head is
 /// configured. Reads only `ready` vectors with a matching `embedding_model`;
@@ -793,6 +831,29 @@ fn classify_audit_failure(error: &anyhow::Error) -> AuditFailure {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reputation_gemma_tfidf_and_has_text_follow_the_artifact_contract() {
+        let context = FirstMessageScoreContext {
+            embedding_spam_probability: Some(0.1),
+            linear_spam_probability: Some(0.95),
+            ..Default::default()
+        };
+        let inputs = ReputationInputs {
+            has_text: true,
+            behavior_available: true,
+            ..Default::default()
+        };
+        let values = reputation_feature_values(&context, &inputs, 0.7, 40);
+        assert_eq!(REPUTATION_FEATURE_NAMES[9], "text_gemma_prob");
+        assert_eq!(values[9], 0.1);
+        assert_eq!(REPUTATION_FEATURE_NAMES[10], "text_tfidf_prob");
+        assert_eq!(values[10], 0.95);
+        assert_eq!(values[11], 1.0);
+        assert_eq!(
+            reputation_feature_values(&context, &ReputationInputs::default(), 0.7, 40)[11],
+            0.0
+        );
+    }
     use serde_json::json;
 
     use super::*;

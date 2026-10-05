@@ -11,7 +11,7 @@ use teloxide_antispam::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется при изменении scoring/materializer,
 /// чтобы выбранные сохранённые assessments можно было безопасно переиграть.
-pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v7";
+pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v8";
 
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
 /// generation boundary. Job остаётся под исходным generation lease.
