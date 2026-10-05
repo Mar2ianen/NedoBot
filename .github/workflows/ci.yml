@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "agent/**", "migration/teloxide-0.18"]
+    branches: [main, dev, "agent/**", "codex/**", "migration/teloxide-0.18"]
   pull_request:
 
 concurrency:
@@ -39,11 +39,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check release installer isolation and concurrency
+        run: python3 tests/release_install.py
+
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets --locked
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Apply PostgreSQL migrations
         env:

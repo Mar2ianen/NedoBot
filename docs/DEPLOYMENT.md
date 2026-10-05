@@ -7,6 +7,55 @@ deploy-YYYY-MM-DD-scope.
 
 ## Перед выкладкой
 
+### Релиз исправлений /ask от 6 октября
+
+Аудит и границы проверки: [ASK_AUDIT_2026-10-06.md](ASK_AUDIT_2026-10-06.md).
+Сначала review `dev → main`, затем сборка release с `deploy=false` на точном
+SHA и проверка `BUILD_INFO.txt`/`SHA256SUMS`. Деплой обоих ботов и MCP остаётся
+отдельным действием.
+
+В production profile нужна одна ручная правка после бэкапа: добавить
+существующий `gemini_flash_comment` в конец `routes.ask.models`. Это
+независимый vision fallback: текстовые OpenRouter/Ollama profiles при
+приложенной фотографии исключаются capability-фильтром. Секрет
+`GEMINI_API_KEY` уже используется текущими Gemini routes; profile целиком
+из example не копировать. Второй community profile проверяется отдельно.
+
+До рестарта можно проверить staged release CLI из каталога инстанса:
+
+```bash
+./probe_ask_route
+./probe_ask_route --image
+```
+
+CLI загружает выбранный через `LLM_PROFILES_PATH` profile и secrets env;
+вызывается только диагностический LLM tool, без Telegram, БД и заметок.
+Для проверки ещё не изменённой production topology использовать отдельную
+копию profile с добавленным fallback. Возвращаются identity выбранного
+profile и `native_tool_verified`, содержимое ответа не печатается.
+
+При старте встроенная миграция `20261006000000` переочередит materialization
+успешных v7 assessments в v8. LLM-аудит не повторяется. Контролировать
+очередь и CAS/retry метрики обоих инстансов.
+
+После миграций восстановить старые rich-тексты отдельно в каждой БД.
+Выполнять из каталога инстанса с его env; CLI не требует Telegram token:
+
+```bash
+./target/release/backfill_rich_messages -1001932061163
+./target/release/backfill_rich_messages -1001932061163 --apply
+```
+
+Для второго инстанса подставить его chat ID и DSN. Сначала проверить dry
+run, затем `--apply`; повторный запуск идемпотентен. Payload и старый audit
+не меняются, user activity не увеличивается, новые Telegram сообщения
+и LLM jobs не создаются. Бэкап БД перед выкладкой обязателен.
+
+Smoke после выкладки: reply на старый rich-ответ, вопрос о родительском
+посте, точный word count с повтором слова в одной строке, групповой scope
+при включённом private default chat, оба service PID/hash и journal.
+Deployment tag ставить только после фактического успешного deploy.
+
 1. Проверить, что PR слит в main, worktree чистый, а remote head известен:
 
    ```bash
