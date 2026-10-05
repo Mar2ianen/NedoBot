@@ -1845,7 +1845,6 @@ async fn assert_unified_enqueue_and_finalizer_share_lock_order(pool: &PgPool) {
 async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 9_000_097;
-    const FIRST_MESSAGE_ID: i32 = 9_000_097;
     let input = serde_json::json!({"schema_version": "fixture-v1"});
     query(
         "insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, 301)",

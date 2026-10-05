@@ -782,7 +782,8 @@ fn owner_review_spam_subtype(signals: &Value) -> &'static str {
     "llm_generic_comment"
 }
 
-pub fn parse_callback(data: &str) -> Option<(i64, &str)> {    let mut parts = data.split(':');
+pub fn parse_callback(data: &str) -> Option<(i64, &str)> {
+    let mut parts = data.split(':');
     (parts.next()? == "spam_review").then_some(())?;
     let id = parts.next()?.parse().ok()?;
     let decision = parts.next()?;
