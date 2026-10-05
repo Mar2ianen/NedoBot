@@ -108,7 +108,7 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
 enum JobOutcome {
     Prepared(Box<CompletedComment>),
     Completed,
-    Failed(CommentErrorKind),
+    Failed(CommentFailure),
     LeaseLost,
 }
 
@@ -134,6 +134,35 @@ pub async fn process_next_post_comment_job(
     Ok(true)
 }
 
+struct CommentFailure {
+    error_kind: CommentErrorKind,
+    stage: &'static str,
+    detail: String,
+}
+
+impl CommentFailure {
+    fn new(
+        error_kind: CommentErrorKind,
+        stage: &'static str,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            error_kind,
+            stage,
+            detail: truncate_failure_detail(&detail.to_string()),
+        }
+    }
+}
+
+fn truncate_failure_detail(detail: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    if detail.chars().count() <= MAX_CHARS {
+        detail.to_string()
+    } else {
+        detail.chars().take(MAX_CHARS).collect()
+    }
+}
+
 pub async fn process_claimed_post_comment_job(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     state: &AppState,
@@ -141,7 +170,7 @@ pub async fn process_claimed_post_comment_job(
 ) -> anyhow::Result<()> {
     let outcome = match process_post_comment_job(bot, state, job).await {
         Ok(outcome) => outcome,
-        Err(error_kind) => JobOutcome::Failed(error_kind),
+        Err(failure) => JobOutcome::Failed(failure),
     };
     match outcome {
         JobOutcome::Prepared(completed) => {
@@ -150,10 +179,14 @@ pub async fn process_claimed_post_comment_job(
                     job_id = job.id,
                     "post comment worker lost its current delivery attempt"
                 ),
-                JobOutcome::Failed(error_kind) => tracing::warn!(
+                JobOutcome::Failed(failure) => tracing::warn!(
                     job_id = job.id,
+                    discussion_message_id = job.discussion_message_id,
+                    source_message_id = job.source_message_id,
                     attempts = job.attempts,
-                    ?error_kind,
+                    ?failure.error_kind,
+                    stage = failure.stage,
+                    detail = failure.detail.as_str(),
                     "post comment delivery was rejected"
                 ),
                 JobOutcome::Completed => {}
@@ -161,18 +194,26 @@ pub async fn process_claimed_post_comment_job(
             }
         }
         JobOutcome::Completed => {}
-        JobOutcome::Failed(error_kind) => {
+        JobOutcome::Failed(failure) => {
             let result = if job.operator_retry_only {
-                mark_operator_retry_post_comment_terminal_failed(&state.pool, job, error_kind)
-                    .await?
+                mark_operator_retry_post_comment_terminal_failed(
+                    &state.pool,
+                    job,
+                    failure.error_kind,
+                )
+                .await?
             } else {
-                mark_post_comment_pre_send_failed(&state.pool, job, error_kind).await?
+                mark_post_comment_pre_send_failed(&state.pool, job, failure.error_kind).await?
             };
             if result == CasResult::Applied {
                 tracing::warn!(
                     job_id = job.id,
+                    discussion_message_id = job.discussion_message_id,
+                    source_message_id = job.source_message_id,
                     attempts = job.attempts,
-                    ?error_kind,
+                    ?failure.error_kind,
+                    stage = failure.stage,
+                    detail = failure.detail.as_str(),
                     "post comment job failed before Telegram delivery"
                 );
             } else {
@@ -191,21 +232,37 @@ async fn process_post_comment_job(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     state: &AppState,
     job: &PostCommentJob,
-) -> Result<JobOutcome, CommentErrorKind> {
+) -> Result<JobOutcome, CommentFailure> {
     let pool = &state.pool;
     let config = &state.config;
     let render_config =
         config.first_comment_render_config(job.discussion_chat_id, job.source_channel_id);
     let image_base64 = download_photo_base64(bot, job.image_file_id.as_deref(), config)
         .await
-        .map_err(|_| CommentErrorKind::ImageUnavailable)?;
+        .map_err(|err| {
+            CommentFailure::new(
+                CommentErrorKind::ImageUnavailable,
+                "image_download",
+                format!("{err:#}"),
+            )
+        })?;
     let chat_member_count = get_chat_member_count(bot, job.discussion_chat_id).await;
     let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text)
         .await
-        .map_err(|_| CommentErrorKind::Transient)?;
-    let recent_comments = load_recent_bot_comments(pool)
-        .await
-        .map_err(|_| CommentErrorKind::Transient)?;
+        .map_err(|err| {
+            CommentFailure::new(
+                CommentErrorKind::Transient,
+                "memory_notes",
+                format!("{err:#}"),
+            )
+        })?;
+    let recent_comments = load_recent_bot_comments(pool).await.map_err(|err| {
+        CommentFailure::new(
+            CommentErrorKind::Transient,
+            "recent_comments",
+            format!("{err:#}"),
+        )
+    })?;
     let topic_comments = Vec::new();
     let search_context = run_search(config, &job.cleaned_post_text, &memory_notes).await;
     if let Err(err) = insert_search_run(pool, job.id, &search_context).await {
@@ -265,7 +322,13 @@ async fn process_post_comment_job(
         &chat_candidate_ids,
     )
     .await
-    .map_err(|_| CommentErrorKind::Transient)?;
+    .map_err(|err| {
+        CommentFailure::new(
+            CommentErrorKind::Transient,
+            "chat_link_targets",
+            format!("{err:#}"),
+        )
+    })?;
     let chat_evidence = if config.chat_retrieval_evidence_enabled {
         evidence_candidates
             .iter()
@@ -332,15 +395,29 @@ async fn process_post_comment_job(
         },
     )
     .await
-    .map_err(|error| CommentErrorKind::from_llm_error(&error))?;
-    let draft = parse_first_comment_draft(&generation.content)
-        .map_err(|_| CommentErrorKind::InvalidInput)?;
+    .map_err(|error| {
+        let error_kind = CommentErrorKind::from_llm_error(&error);
+        // Безопасно: транспорт уже смаппен в LlmTransportError без тел
+        // ответов и секретов, validator отдаёт только причину проверки.
+        CommentFailure::new(error_kind, "llm_generation", format!("{error:#}"))
+    })?;
+    let draft = parse_first_comment_draft(&generation.content).map_err(|err| {
+        CommentFailure::new(
+            CommentErrorKind::InvalidInput,
+            "draft_parse",
+            format!("{err:#}"),
+        )
+    })?;
     if draft
         .used_chat_message_ids
         .iter()
         .any(|id| !chat_candidate_ids.contains(id))
     {
-        return Err(CommentErrorKind::InvalidInput);
+        return Err(CommentFailure::new(
+            CommentErrorKind::InvalidInput,
+            "chat_evidence_ids",
+            "used_chat_message_ids do not match confirmed retrieval context",
+        ));
     }
     let chat_targets = chat_targets
         .into_iter()
@@ -376,7 +453,9 @@ async fn process_post_comment_job(
         &search_context.results,
         &chat_targets,
     );
-    ensure_comment_html(&final_html, &draft.comment).map_err(|_| CommentErrorKind::InvalidInput)?;
+    ensure_comment_html(&final_html, &draft.comment).map_err(|err| {
+        CommentFailure::new(CommentErrorKind::InvalidInput, "render", format!("{err:#}"))
+    })?;
 
     Ok(JobOutcome::Prepared(Box::new(CompletedComment {
         generation,
@@ -435,7 +514,11 @@ async fn handle_post_comment_send_error(
                     .await?
             };
             if result == CasResult::Applied {
-                Ok(JobOutcome::Failed(error_kind))
+                Ok(JobOutcome::Failed(CommentFailure::new(
+                    error_kind,
+                    "telegram_delivery",
+                    format!("{error_kind:?} retry_after_seconds={retry_after_seconds:?}"),
+                )))
             } else {
                 Ok(JobOutcome::LeaseLost)
             }

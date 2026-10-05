@@ -112,6 +112,18 @@ async fn generate_text_with_profile_checked(
                             outcome: "validation_failed".to_string(),
                             ..llm_attempt
                         });
+                        // Безопасно: validator возвращает только причину
+                        // проверки, без промпта и текста ответа.
+                        tracing::warn!(
+                            route,
+                            fallback_index,
+                            attempt,
+                            provider = selection.provider_key,
+                            model = selection.model.model,
+                            outcome = "validation_failed",
+                            error = format!("{err:#}"),
+                            "LLM profile attempt failed validation"
+                        );
                         last_error = Some(err);
                         if attempt < VALIDATION_RETRY_ATTEMPTS {
                             attempt_prompt = validation_retry_prompt(
@@ -140,10 +152,23 @@ async fn generate_text_with_profile_checked(
                 }
                 Err(err) => {
                     let empty_response = is_empty_response(&err);
+                    let outcome = classify_attempt_error(&err);
+                    // Безопасно: generate_profile_once маппит транспорт в
+                    // LlmTransportError без тел ответов, URL и ключей.
+                    tracing::warn!(
+                        route,
+                        fallback_index,
+                        attempt,
+                        provider = selection.provider_key,
+                        model = selection.model.model,
+                        outcome = outcome.as_str(),
+                        error = format!("{err:#}"),
+                        "LLM profile attempt failed"
+                    );
                     attempts.push(LlmAttempt {
                         provider: selection.provider_key.to_string(),
                         model: selection.model.model.clone(),
-                        outcome: classify_attempt_error(&err),
+                        outcome,
                     });
                     last_error = Some(err);
                     if empty_response && attempt < VALIDATION_RETRY_ATTEMPTS {
