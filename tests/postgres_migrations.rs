@@ -2236,6 +2236,24 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         "sent comment timestamp migration must be applied"
     );
 
+    let voice_alternatives_column: bool = query_scalar(
+        r#"
+        select exists (
+            select 1 from information_schema.columns
+            where table_schema = 'public'
+              and table_name = 'voice_transcription_jobs'
+              and column_name = 'asr_alternatives_json'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("voice ASR alternatives column lookup must succeed");
+    assert!(
+        voice_alternatives_column,
+        "voice ASR alternatives migration must be applied"
+    );
+
     let public_messages_view: Option<String> =
         query_scalar("select to_regclass('mcp_public.telegram_messages')::text")
             .fetch_one(pool)

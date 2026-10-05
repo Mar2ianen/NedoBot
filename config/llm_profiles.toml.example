@@ -145,19 +145,61 @@ max_output_tokens = 8192
 request_timeout_sec = 120
 thinking = "none"
 
-[models.groq_cleanup]
+[models.groq_qwen_cleanup]
 provider = "groq"
-model = "llama-3.3-70b-versatile"
+model = "qwen/qwen3.8-27b"
 
-[models.groq_cleanup.capabilities]
+[models.groq_qwen_cleanup.capabilities]
 supports_images = false
 supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 131072
-max_output_tokens = 32768
-request_timeout_sec = 45
+max_output_tokens = 16384
+request_timeout_sec = 60
 thinking = "none"
+
+[models.groq_qwen_cleanup_fallback]
+provider = "groq"
+model = "qwen/qwen3.6-27b"
+
+[models.groq_qwen_cleanup_fallback.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "none"
+
+[models.groq_qwen_ask]
+provider = "groq"
+model = "qwen/qwen3.8-27b"
+
+[models.groq_qwen_ask.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "default"
+
+[models.groq_qwen_ask_fallback]
+provider = "groq"
+model = "qwen/qwen3.6-27b"
+
+[models.groq_qwen_ask_fallback.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "default"
 
 [models.cerebras_audit]
 provider = "cerebras"
@@ -219,7 +261,8 @@ fallback_on_validation_failure = true
 models = ["ollama_memory"]
 
 [routes.voice_cleanup]
-models = ["groq_cleanup", "ollama_memory"]
+models = ["groq_qwen_cleanup", "groq_qwen_cleanup_fallback", "ollama_memory"]
+fallback_on_validation_failure = true
 
 [routes.new_user_audit]
 models = ["cerebras_audit"]
@@ -228,7 +271,7 @@ models = ["cerebras_audit"]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["ollama_minimax", "ollama_memory"]
+models = ["groq_qwen_ask", "groq_qwen_ask_fallback", "ollama_memory"]
 
 # Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
 # API keys stay in the process environment and are not stored in this file.
@@ -319,8 +362,10 @@ voice_max_duration_sec = 600
 voice_max_file_mb = 20
 voice_short_text_max_chars = 400
 voice_language = "ru"
-voice_asr_provider = "groq"
-voice_asr_model = "whisper-large-v3"
+voice_asr_provider = "gemini"
+voice_asr_model = "gemini-3.5-transcribe"
+voice_asr_shadow_enabled = true
+voice_asr_shadow_model = "whisper-large-v3-turbo"
 voice_asr_temperature = 0.0
 voice_cleanup_temperature = 0.2
 voice_cleanup_max_tokens = 1800

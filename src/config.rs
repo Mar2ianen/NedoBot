@@ -113,6 +113,8 @@ pub struct Config {
     pub voice_language: String,
     pub voice_asr_provider: String,
     pub voice_asr_model: String,
+    pub voice_asr_shadow_enabled: bool,
+    pub voice_asr_shadow_model: String,
     pub voice_asr_temperature: f32,
     pub voice_cleanup_temperature: f32,
     pub voice_cleanup_max_tokens: u32,
@@ -227,6 +229,8 @@ impl Config {
             voice_language: runtime.voice_language,
             voice_asr_provider: runtime.voice_asr_provider,
             voice_asr_model: runtime.voice_asr_model,
+            voice_asr_shadow_enabled: runtime.voice_asr_shadow_enabled,
+            voice_asr_shadow_model: runtime.voice_asr_shadow_model,
             voice_asr_temperature: runtime.voice_asr_temperature,
             voice_cleanup_temperature: runtime.voice_cleanup_temperature,
             voice_cleanup_max_tokens: runtime.voice_cleanup_max_tokens,
@@ -256,6 +260,9 @@ impl Config {
 
         if self.voice_transcription_enabled {
             validate_voice_asr_secret(&mut errors, self);
+            if self.voice_asr_shadow_enabled {
+                validate_voice_asr_shadow_secret(&mut errors, self);
+            }
         }
 
         if self.rag_enabled {
@@ -555,14 +562,51 @@ fn validate_voice_asr_secret(errors: &mut Vec<String>, config: &Config) {
             &config.groq_api_key,
             "VOICE_ASR_PROVIDER=groq",
         ),
+        "gemini" => {
+            require_secret_from_environment(errors, "GEMINI_API_KEY", "VOICE_ASR_PROVIDER=gemini")
+        }
         provider => errors.push(format!(
-            "VOICE_ASR_PROVIDER={provider} is unsupported; supported provider: groq"
+            "VOICE_ASR_PROVIDER={provider} is unsupported; supported providers: groq, gemini"
         )),
+    }
+    if config.voice_asr_model.trim().is_empty() {
+        errors.push("VOICE_ASR_MODEL must not be empty".to_string());
+    }
+}
+
+fn validate_voice_asr_shadow_secret(errors: &mut Vec<String>, config: &Config) {
+    let shadow_provider = match config.voice_asr_provider.trim().to_lowercase().as_str() {
+        "groq" => "gemini",
+        "gemini" => "groq",
+        _ => return,
+    };
+    match shadow_provider {
+        "groq" => require_secret(
+            errors,
+            "GROQ_API_KEY",
+            &config.groq_api_key,
+            "VOICE_ASR_SHADOW_PROVIDER=groq",
+        ),
+        "gemini" => require_secret_from_environment(
+            errors,
+            "GEMINI_API_KEY",
+            "VOICE_ASR_SHADOW_PROVIDER=gemini",
+        ),
+        _ => unreachable!("shadow provider is derived from the supported primary providers"),
+    }
+    if config.voice_asr_shadow_model.trim().is_empty() {
+        errors.push("VOICE_ASR_SHADOW_MODEL must not be empty".to_string());
     }
 }
 
 fn require_secret(errors: &mut Vec<String>, key: &str, value: &str, context: &str) {
     if value.trim().is_empty() {
+        errors.push(format!("{context} requires non-empty {key}"));
+    }
+}
+
+fn require_secret_from_environment(errors: &mut Vec<String>, key: &str, context: &str) {
+    if !std::env::var(key).is_ok_and(|value| !value.trim().is_empty()) {
         errors.push(format!("{context} requires non-empty {key}"));
     }
 }
@@ -741,8 +785,10 @@ mod tests {
             voice_max_file_mb: 20,
             voice_short_text_max_chars: 400,
             voice_language: "ru".to_string(),
-            voice_asr_provider: "groq".to_string(),
-            voice_asr_model: "whisper-large-v3-turbo".to_string(),
+            voice_asr_provider: "gemini".to_string(),
+            voice_asr_model: "gemini-3.5-transcribe".to_string(),
+            voice_asr_shadow_enabled: true,
+            voice_asr_shadow_model: "whisper-large-v3-turbo".to_string(),
             voice_asr_temperature: 0.0,
             voice_cleanup_temperature: 0.2,
             voice_cleanup_max_tokens: 1800,
@@ -908,9 +954,10 @@ models = ["primary", "fallback"]
         let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
         let ollama = EnvVarGuard::unset("OLLAMA_API_KEY");
         let groq = EnvVarGuard::unset("GROQ_API_KEY");
+        let cerebras = EnvVarGuard::unset("CEREBRAS_API_KEY");
         unsafe {
-            std::env::set_var("GEMINI_API_KEY", "test-key");
             std::env::set_var("OLLAMA_API_KEY", "test-key");
+            std::env::set_var("CEREBRAS_API_KEY", "test-key");
         }
         let mut config = config();
         config.llm_profiles = Some(
@@ -921,10 +968,11 @@ models = ["primary", "fallback"]
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
-        assert!(error.contains("VOICE_ASR_PROVIDER=groq requires non-empty GROQ_API_KEY"));
+        assert!(error.contains("VOICE_ASR_PROVIDER=gemini requires non-empty GEMINI_API_KEY"));
         drop(gemini);
         drop(ollama);
         drop(groq);
+        drop(cerebras);
     }
 
     #[test]
@@ -950,13 +998,54 @@ models = ["primary", "fallback"]
 
     #[test]
     fn enabled_voice_pipeline_requires_asr_key() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
         let mut config = config();
         config.voice_transcription_enabled = true;
         config.voice_auto_transcribe = true;
 
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 
-        assert!(err.contains("VOICE_ASR_PROVIDER=groq requires non-empty GROQ_API_KEY"));
+        assert!(err.contains("VOICE_ASR_PROVIDER=gemini requires non-empty GEMINI_API_KEY"));
+        drop(gemini);
+    }
+
+    #[test]
+    fn enabled_gemini_voice_shadow_requires_groq_key() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
+        let groq = EnvVarGuard::unset("GROQ_API_KEY");
+        unsafe { std::env::set_var("GEMINI_API_KEY", "test-key") };
+        let mut config = config();
+        config.voice_transcription_enabled = true;
+        config.voice_asr_shadow_enabled = true;
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("VOICE_ASR_SHADOW_PROVIDER=groq requires non-empty GROQ_API_KEY"));
+        drop(gemini);
+        drop(groq);
+    }
+
+    #[test]
+    fn enabled_groq_voice_shadow_requires_gemini_key() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
+        let groq = EnvVarGuard::unset("GROQ_API_KEY");
+        unsafe {
+            std::env::set_var("GROQ_API_KEY", "test-key");
+        }
+        let mut config = config();
+        config.voice_transcription_enabled = true;
+        config.voice_asr_provider = "groq".to_string();
+        config.voice_asr_model = "whisper-large-v3-turbo".to_string();
+        config.voice_asr_shadow_model = "gemini-3.5-transcribe".to_string();
+
+        let err = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(err.contains("VOICE_ASR_SHADOW_PROVIDER=gemini requires non-empty GEMINI_API_KEY"));
+        drop(gemini);
+        drop(groq);
     }
 
     #[test]

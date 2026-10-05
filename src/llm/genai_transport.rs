@@ -246,12 +246,24 @@ fn build_chat_options(
         options = options.with_temperature(f64::from(temperature));
     }
     options = match reasoning {
-        ThinkingMode::None => options,
+        ThinkingMode::None | ThinkingMode::Default => options,
         ThinkingMode::Budget => options.with_reasoning_effort(ReasoningEffort::Budget(
             reasoning_budget.unwrap_or_default(),
         )),
         ThinkingMode::LevelLow => options.with_reasoning_effort(ReasoningEffort::Low),
         ThinkingMode::LevelHigh => options.with_reasoning_effort(ReasoningEffort::High),
+    };
+    let extra_body = match reasoning {
+        ThinkingMode::Default => {
+            let mut body = extra_body.unwrap_or_else(|| serde_json::json!({}));
+            if let Some(object) = body.as_object_mut() {
+                object.insert("reasoning_effort".to_string(), serde_json::json!("default"));
+                Some(body)
+            } else {
+                Some(serde_json::json!({"reasoning_effort": "default"}))
+            }
+        }
+        _ => extra_body,
     };
     if let Some(structured_output) = structured_output {
         options = match structured_output_mode {
@@ -432,6 +444,26 @@ mod tests {
             options.reasoning_effort,
             Some(ReasoningEffort::High)
         ));
+    }
+
+    #[test]
+    fn reasoning_mapping_uses_provider_specific_default_mode() {
+        let options = build_chat_options(
+            0.2,
+            100,
+            ThinkingMode::Default,
+            None,
+            StructuredOutputMode::PromptOnly,
+            None,
+            None,
+        );
+
+        assert_eq!(options.temperature, None);
+        assert!(options.reasoning_effort.is_none());
+        assert_eq!(
+            options.extra_body,
+            Some(serde_json::json!({"reasoning_effort": "default"}))
+        );
     }
 
     #[test]

@@ -115,7 +115,7 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 Civil date/time и bare clock нормализуются через эту зону с compatible DST disambiguation: пропущенное локальное время сдвигается вперёд, неоднозначное выбирается детерминированно. Для точного автоматического события нужно передавать `Instant`; `CivilDateTime` остаётся локальным временем с deterministic compatible resolution, а bare clock — best-effort представлением.
 
-Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
+Целевая топология без Gemini вне комментариев: `/ask` использует цепочку Groq `qwen/qwen3.8-27b` с reasoning mode `default`, затем `qwen/qwen3.6-27b` с тем же reasoning mode и затем Ollama Cloud `gemma4:31b`; voice cleanup использует аналогичную цепочку с отдельными Qwen-профилями без reasoning и тем же Ollama fallback. Unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. При отказе output validator LLM service пишет в journal только route, fallback index, provider, model, номер попытки, размер ответа и безопасный `validation_reason`; полный prompt и ответ модели не логируются. Для `first_comment` причины типизированы (`missing_chat_link`, `raw_link`, `generic_cta`, `invalid_json`, `chat_evidence`, `source_link`, `blocked_term` и другие), а тот же код сохраняется в `llm_generations.attempts` при успешном fallback. Полная topology приведена в `config/llm_profiles.toml.example`.
 
@@ -126,7 +126,7 @@ Civil date/time и bare clock нормализуются через эту зо�
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 
 - Загруженный profile TOML должен быть валидным; секреты проверяются по `api_key_env` всех включённых route selections.
-- Если включены `runtime.voice_transcription_enabled=true` и `runtime.voice_auto_transcribe=true`, `runtime.voice_asr_provider=groq` требует `GROQ_API_KEY`.
+- Если включён voice pipeline, `runtime.voice_asr_provider=gemini` требует `GEMINI_API_KEY`; в двойном режиме второй Groq-текст требует `GROQ_API_KEY`.
 - Voice cleanup использует profile route `voice_cleanup` и его fallback chain.
 - `runtime.new_user_audit_enabled=true` запускает единственный unified worker через route `new_user_audit`. `runtime.new_user_audit_max_tokens` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `runtime.rag_embedding_url`, `runtime.rag_embedding_model` и `runtime.rag_embedding_timeout_sec`.
 
@@ -211,8 +211,10 @@ voice_max_duration_sec = 600
 voice_max_file_mb = 20
 voice_short_text_max_chars = 400
 voice_language = "ru"
-voice_asr_provider = "groq"
-voice_asr_model = "whisper-large-v3"
+voice_asr_provider = "gemini"
+voice_asr_model = "gemini-3.5-transcribe"
+voice_asr_shadow_enabled = true
+voice_asr_shadow_model = "whisper-large-v3-turbo"
 voice_asr_temperature = 0.0
 voice_cleanup_temperature = 0.2
 voice_cleanup_max_tokens = 1800
@@ -233,8 +235,9 @@ first_comment_max_image_mb = 10
 
 - `runtime.voice_transcription_enabled=false` полностью выключает voice pipeline, включая `/transcribe`.
 - `runtime.voice_auto_transcribe=false` выключает обработку обычных сообщений, но оставляет доступной ручную `/transcribe` reply-команду.
-- `runtime.voice_asr_provider=groq` - сейчас единственный поддержанный ASR provider.
-- `runtime.voice_asr_model=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
+- `runtime.voice_asr_provider=gemini` и `runtime.voice_asr_model=gemini-3.5-transcribe` задают основной ASR; по результатам сравнения на реальных голосовых Gemini лучше разбирает длинную техническую речь.
+- При `runtime.voice_asr_shadow_enabled=true` второй текст строится Groq-моделью из `runtime.voice_asr_shadow_model=whisper-large-v3-turbo`. Если основной ASR недоступен, pipeline использует успешный второй результат.
+- Gemini принимает только аудио; для `video_note` MP4 pipeline использует Groq как совместимый fallback.
 - Voice cleanup всегда использует profile route `voice_cleanup` и его fallback chain.
 - `runtime.voice_short_text_max_chars=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
 - `runtime.voice_max_file_mb=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
@@ -501,27 +504,33 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 7. Скачать файл через Telegram `getFile` во временный файл.
 8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
 9. Сразу после preflight отправить reply `Расшифровка…`; для обычного результата заменить его через `editMessageText`, а для Rich/file варианта обновить его статусом и отправить полный payload отдельным сообщением.
-10. Сохранить raw ASR text, segments и raw JSON.
-10. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
-11. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
-12. Собрать Telegram HTML через `telegram::html`.
-13. Отправить reply: одно сообщение или preview + `voice-transcript.txt`.
-14. Сохранить cleaned text, chapters JSON, final HTML и file id.
+10. Сохранить raw ASR text, segments и raw JSON; при включённом shadow-ASR
+    дополнительно сохранить независимые альтернативные транскрипты.
+11. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
+12. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
+13. Собрать Telegram HTML через `telegram::html`.
+14. Отправить reply: одно сообщение или preview + `voice-transcript.txt`.
+15. Сохранить cleaned text, chapters JSON, final HTML и file id.
 
 ASR request:
 
 ```text
-POST https://api.groq.com/openai/v1/audio/transcriptions
+primary: Gemini Files API + Interactions API
 model = runtime.voice_asr_model
+language_codes = runtime.voice_language as BCP-47
+mode = verbatim
+
+secondary: Groq OpenAI-compatible audio transcriptions
+model = runtime.voice_asr_shadow_model
 response_format = verbose_json
-language = runtime.voice_language
-temperature = runtime.voice_asr_temperature
-timestamp_granularities[] = segment
 ```
 
 Cleanup request:
 
 - сначала используется profile route `voice_cleanup` и его fallback chain;
+- при включённом shadow-ASR cleanup получает основной Gemini-текст и отдельный
+  альтернативный Groq-текст; альтернативы используются только для сверки
+  спорных слов и не становятся самостоятельным источником новых фактов;
 - если все cleanup selections падают, используется raw ASR transcript;
 - если JSON от модели не парсится или cleanup меняет объём/числа сверх безопасных границ, используется raw ASR transcript.
 
