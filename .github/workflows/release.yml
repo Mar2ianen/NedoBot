@@ -96,21 +96,23 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
             "bash /opt/tg-ai-bot-teloxide/scripts/install_release_binaries.sh '$STAGE_DIR' \
             && rm -rf '$STAGE_DIR' \
-            && systemctl restart tg-ai-bot-teloxide \
-            && systemctl is-active tg-ai-bot-teloxide \
+            && systemctl restart tg-ai-bot-teloxide nedobot-pvo \
+            && systemctl is-active tg-ai-bot-teloxide nedobot-pvo \
             && systemctl restart nedonews-mcp \
             && systemctl is-active nedonews-mcp"
-      - name: Confirm running binary matches artifact
+      - name: Confirm running binaries match artifact
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           expected="$(awk '$2 == "tg_ai_bot_teloxide" {print $1}' dist/SHA256SUMS)"
-          actual="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
-            'pid=$(systemctl show tg-ai-bot-teloxide -p MainPID --value) && sha256sum "/proc/$pid/exe"' \
-            | awk '{print $1}')"
-          echo "expected: $expected"
-          echo "actual:   $actual"
-          test -n "$expected" && test "$expected" = "$actual"
+          for unit in tg-ai-bot-teloxide nedobot-pvo; do
+            actual="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
+              "pid=\$(systemctl show $unit -p MainPID --value) && sha256sum \"/proc/\$pid/exe\"" \
+              | awk '{print $1}')"
+            echo "$unit expected: $expected"
+            echo "$unit actual:   $actual"
+            test -n "$expected" && test "$expected" = "$actual"
+          done
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
-            "journalctl -u tg-ai-bot-teloxide --since '-2 min' -p err --no-pager -o cat"
+            "journalctl -u tg-ai-bot-teloxide -u nedobot-pvo --since '-2 min' -p err --no-pager -o cat"

@@ -39,6 +39,24 @@ deploy-YYYY-MM-DD-scope.
    Значение LLM_PROFILES_PATH должно быть абсолютным:
    /etc/tg-ai-bot/llm_profiles.toml.
 
+## Инстансы
+
+На vps-153 два community-инстанса одного бинаря, у каждого своя БД, env и
+профиль. Общий только SQLite спам-репутации (один путь, разные `instance.id`).
+
+| Инстанс | Unit | Checkout / binary | Profile | Database |
+|---|---|---|---|---|
+| НедоNews (`nedonews`) | `tg-ai-bot-teloxide.service` | `/opt/tg-ai-bot-teloxide/target/release/` | `/etc/tg-ai-bot/llm_profiles.toml` | `tg_ai_bot` |
+| ПВО (`pvo`) | `nedobot-pvo.service` | `/opt/nedobot-pvo/target/release/` | `/etc/tg-ai-bot/pvo-llm_profiles.toml` | `tg_ai_bot_pvo` |
+
+Оба бинаря ставятся из одного артефакта (`scripts/install_release_binaries.sh`
+пишет в оба checkout). Рестарт и проверка всегда охватывают оба юнита:
+`systemctl restart tg-ai-bot-teloxide nedobot-pvo`. Профили правятся вручную с
+бэкапом и автоматикой не перезаписываются; шаблона pvo-профиля в репозитории
+нет. Миграции встроены в бинарь (`sqlx::migrate!`), поэтому рассинхрон чекаута
+и БД (как остановка `nedobot-pvo` 2026-10-01 из-за отсутствующей в его сборке
+миграции) лечится выкладкой свежего бинаря, а не правкой `_sqlx_migrations`.
+
 ## Выкладка
 
 Основной путь — GitHub Actions (`release`, раннер `ubuntu-24.04`, glibc 2.39
@@ -151,8 +169,8 @@ journal нет ошибки profile validation или migration и что кон
 ## Проверка после restart
 
 ```bash
-ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedonews-mcp container-tg-ai-bot-postgres nedobot-rag-embedding nedobot-chat-embedding'
-ssh vps-153 'journalctl -u tg-ai-bot-teloxide -n 120 --no-pager'
+ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedobot-pvo nedonews-mcp container-tg-ai-bot-postgres nedobot-rag-embedding nedobot-chat-embedding'
+ssh vps-153 'journalctl -u tg-ai-bot-teloxide -u nedobot-pvo -n 120 --no-pager'
 ssh vps-153 'journalctl -u nedonews-mcp -n 80 --no-pager'
 ssh vps-153 'podman ps'
 ssh vps-153 'curl -sS -o /dev/null -w "local=%{http_code} %{time_total}\n" http://127.0.0.1:8787/mcp/nedonews/v2'
