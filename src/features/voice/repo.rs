@@ -381,6 +381,7 @@ pub async fn save_asr_result(
     pool: &PgPool,
     job: &VoiceJob,
     transcript: &AsrTranscript,
+    alternatives: &[AsrTranscript],
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         r#"
@@ -391,8 +392,9 @@ pub async fn save_asr_result(
             raw_transcript = $5,
             segments_json = $6,
             raw_asr_json = $7,
+            asr_alternatives_json = $8,
             updated_at = now()
-        where id = $1 and attempts = $8 and status in ('transcribing', 'cleaning')
+        where id = $1 and attempts = $9 and status in ('transcribing', 'cleaning')
           and lease_expires_at > now()
         "#,
     )
@@ -403,6 +405,7 @@ pub async fn save_asr_result(
     .bind(&transcript.text)
     .bind(serde_json::to_value(&transcript.segments)?)
     .bind(&transcript.raw_json)
+    .bind(serde_json::to_value(alternatives)?)
     .bind(job.attempts)
     .execute(pool)
     .await?;

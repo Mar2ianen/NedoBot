@@ -35,6 +35,11 @@ pub struct ReportCard {
     pub target_snapshot: Value,
     pub resolution: ReportResolution,
     pub profile_username: Option<String>,
+    // Kept in the report projection for a future media-mode card. The current
+    // typed-block card cannot safely embed InputMediaPhoto with this teloxide
+    // fork because Telegram rejects its nested payload without `type`.
+    #[allow(dead_code)]
+    pub profile_photo_file_id: Option<String>,
     pub profile_first_name: Option<String>,
     pub profile_last_name: Option<String>,
     pub profile_is_bot: Option<bool>,
@@ -78,6 +83,7 @@ pub async fn load_report(pool: &PgPool, report_id: i64) -> anyhow::Result<Report
             report.target_reply_to_message_id, report.target_created_at,
             report.reporter_snapshot, report.target_snapshot, report.resolution,
             profile.username as profile_username,
+            profile.profile_photo_file_id,
             profile.first_name as profile_first_name,
             profile.last_name as profile_last_name,
             profile.is_bot as profile_is_bot,
@@ -151,6 +157,7 @@ pub async fn load_report(pool: &PgPool, report_id: i64) -> anyhow::Result<Report
         target_snapshot: row.get("target_snapshot"),
         resolution,
         profile_username: row.get("profile_username"),
+        profile_photo_file_id: row.get("profile_photo_file_id"),
         profile_first_name: row.get("profile_first_name"),
         profile_last_name: row.get("profile_last_name"),
         profile_is_bot: row.get("profile_is_bot"),

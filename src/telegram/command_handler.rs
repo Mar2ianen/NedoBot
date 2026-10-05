@@ -842,7 +842,9 @@ fn may_send_fallback(certainty: DeliveryCertainty) -> bool {
 #[cfg(feature = "ask")]
 fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
     match error {
-        DraftFinishError::WorkerStoppedBeforeCommand => DeliveryCertainty::NotAttempted,
+        DraftFinishError::WorkerStoppedBeforeCommand | DraftFinishError::RateLimiter(_) => {
+            DeliveryCertainty::NotAttempted
+        }
         DraftFinishError::WorkerStoppedAfterCommand { delivery }
         | DraftFinishError::RequestTimeout { delivery }
         | DraftFinishError::DeadlineExceeded { delivery }

@@ -47,6 +47,34 @@ egress = "direct"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_COMPAT_API_KEY"
 
+[models.gemini_38_comment]
+provider = "gemini"
+model = "gemini-3.8-flash"
+
+[models.gemini_38_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_low"
+
+[models.gemini_37_comment]
+provider = "gemini"
+model = "gemini-3.7-flash"
+
+[models.gemini_37_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_high"
+
 [models.gemini_comment]
 provider = "gemini"
 model = "gemini-3.6-flash"
@@ -131,19 +159,61 @@ max_output_tokens = 8192
 request_timeout_sec = 120
 thinking = "none"
 
-[models.groq_cleanup]
+[models.groq_qwen_cleanup]
 provider = "groq"
-model = "llama-3.3-70b-versatile"
+model = "qwen/qwen3.8-27b"
 
-[models.groq_cleanup.capabilities]
+[models.groq_qwen_cleanup.capabilities]
 supports_images = false
 supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 131072
-max_output_tokens = 32768
-request_timeout_sec = 45
+max_output_tokens = 16384
+request_timeout_sec = 60
 thinking = "none"
+
+[models.groq_qwen_cleanup_fallback]
+provider = "groq"
+model = "qwen/qwen3.6-27b"
+
+[models.groq_qwen_cleanup_fallback.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "none"
+
+[models.groq_qwen_ask]
+provider = "groq"
+model = "qwen/qwen3.8-27b"
+
+[models.groq_qwen_ask.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "default"
+
+[models.groq_qwen_ask_fallback]
+provider = "groq"
+model = "qwen/qwen3.6-27b"
+
+[models.groq_qwen_ask_fallback.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 60
+thinking = "default"
 
 [models.cerebras_audit]
 provider = "cerebras"
@@ -153,7 +223,7 @@ model = "gemma-4-31b"
 supports_images = true
 supports_tools = true
 supports_system_prompt = true
-structured_output = "json_schema"
+structured_output = "json_object"
 context_window_tokens = 131072
 max_output_tokens = 8192
 request_timeout_sec = 45
@@ -190,18 +260,23 @@ thinking = "none"
 
 [routes.first_comment]
 models = [
+  "gemini_38_comment",
+  "gemini_37_comment",
   "gemini_comment",
   "gemini_flash_comment",
   "gemini_flash_lite_comment",
   "ollama_memory",
 ]
-fallback_on_validation_failure = false
+# Для комментария действует строгий product-validator; при нарушении
+# контракта одной моделью нужно перейти к следующей модели route.
+fallback_on_validation_failure = true
 
 [routes.memory]
 models = ["ollama_memory"]
 
 [routes.voice_cleanup]
-models = ["groq_cleanup", "ollama_memory"]
+models = ["groq_qwen_cleanup", "groq_qwen_cleanup_fallback", "ollama_memory"]
+fallback_on_validation_failure = true
 
 [routes.new_user_audit]
 models = ["ollama_audit"]
@@ -210,7 +285,7 @@ models = ["ollama_audit"]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["ollama_minimax", "ollama_memory"]
+models = ["groq_qwen_ask", "groq_qwen_ask_fallback", "ollama_memory"]
 
 # Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
 # API keys stay in the process environment and are not stored in this file.
@@ -258,6 +333,12 @@ search_mcp_tool_reddit = "reddit_search"
 search_mcp_tool_fetch = "web_fetch_exa"
 search_fetch_top_n = 4
 search_fetch_max_chars = 16000
+youtube_subtitles_enabled = true
+youtube_subtitles_command = "yt-dlp"
+youtube_subtitles_languages = ["ru", "ru.*", "en", "en.*"]
+youtube_subtitles_timeout_sec = 15
+youtube_subtitles_max_chars = 12000
+youtube_subtitles_max_videos = 2
 comment_blocked_source_domains = [
   "meduza.io", "theins.ru", "tvrain.tv", "novayagazeta.eu",
   "zona.media", "istories.media", "holod.media", "verstka.media",
@@ -303,8 +384,10 @@ voice_max_duration_sec = 600
 voice_max_file_mb = 20
 voice_short_text_max_chars = 400
 voice_language = "ru"
-voice_asr_provider = "groq"
-voice_asr_model = "whisper-large-v3"
+voice_asr_provider = "gemini"
+voice_asr_model = "gemini-3.5-transcribe"
+voice_asr_shadow_enabled = true
+voice_asr_shadow_model = "whisper-large-v3-turbo"
 voice_asr_temperature = 0.0
 voice_cleanup_temperature = 0.2
 voice_cleanup_max_tokens = 1800

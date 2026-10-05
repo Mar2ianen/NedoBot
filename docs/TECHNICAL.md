@@ -83,7 +83,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN=
 Environment=LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml
 ```
 
-Не использовать под systemd относительный `config/llm_profiles.toml.example` и не заменять production profile простым копированием example: provider topology и значения `[runtime]` должны быть перенесены из фактического deployment-конфига.
+Не использовать под systemd относительный `config/llm_profiles.toml.example` и не заменять production profile простым копированием example: provider topology и значения `[runtime]` должны быть перенесены из фактического deployment-конфига. При изменении route policy (например, `fallback_on_validation_failure`) нужно синхронно обновить deployment-копию, проверить её до запуска и перезапустить сервис; правка example-файла сама по себе production не меняет.
 
 `config/llm_profiles.toml.example` содержит provider/model profiles, task routes и все статические лимиты, флаги, идентификаторы чатов, пути и tool allowlists. API keys, DSN, invite URL и proxy URL туда не переносятся.
 
@@ -115,18 +115,18 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 Civil date/time и bare clock нормализуются через эту зону с compatible DST disambiguation: пропущенное локальное время сдвигается вперёд, неоднозначное выбирается детерминированно. Для точного автоматического события нужно передавать `Instant`; `CivilDateTime` остаётся локальным временем с deterministic compatible resolution, а bare clock — best-effort представлением.
 
-Целевая топология без Gemini вне комментариев: `/ask` использует Ollama Cloud `minimax-m3`, unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
+Целевая топология без Gemini вне комментариев: `/ask` использует цепочку Groq `qwen/qwen3.8-27b` с reasoning mode `default`, затем `qwen/qwen3.6-27b` с тем же reasoning mode и затем Ollama Cloud `gemma4:31b`; voice cleanup использует аналогичную цепочку с отдельными Qwen-профилями без reasoning и тем же Ollama fallback. Unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
-На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. Полная topology приведена в `config/llm_profiles.toml.example`.
+На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. При отказе output validator LLM service пишет в journal только route, fallback index, provider, model, номер попытки, размер ответа и безопасный `validation_reason`; полный prompt и ответ модели не логируются. Для `first_comment` причины типизированы (`missing_chat_link`, `raw_link`, `generic_cta`, `invalid_json`, `chat_evidence`, `source_link`, `blocked_term` и другие), а тот же код сохраняется в `llm_generations.attempts` при успешном fallback. Полная topology приведена в `config/llm_profiles.toml.example`.
 
-Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
+`LLM_PROXY_URL` остаётся опциональной настройкой для явно проксируемых LLM routes. На текущем `vps-153` все активные routes и Gemini ASR используют прямой egress; Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят.
 
 Для Gemini 3.x бот использует актуальный `thinkingLevel=low` и не передаёт устаревшие `temperature` и числовой `thinkingBudget`. `runtime.llm_max_tokens` задаёт полный лимит вывода; для JSON-комментария нужен запас, поэтому значение по умолчанию — 180. Для старых Gemini-моделей сохраняется `runtime.gemini_thinking_budget`: бот отправляет `maxOutputTokens = runtime.llm_max_tokens + runtime.gemini_thinking_budget`.
 
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 
 - Загруженный profile TOML должен быть валидным; секреты проверяются по `api_key_env` всех включённых route selections.
-- Если включены `runtime.voice_transcription_enabled=true` и `runtime.voice_auto_transcribe=true`, `runtime.voice_asr_provider=groq` требует `GROQ_API_KEY`.
+- Если включён voice pipeline, `runtime.voice_asr_provider=gemini` требует `GEMINI_API_KEY`; в двойном режиме второй Groq-текст требует `GROQ_API_KEY`.
 - Voice cleanup использует profile route `voice_cleanup` и его fallback chain.
 - `runtime.new_user_audit_enabled=true` запускает единственный unified worker через route `new_user_audit`. `runtime.new_user_audit_max_tokens` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `runtime.rag_embedding_url`, `runtime.rag_embedding_model` и `runtime.rag_embedding_timeout_sec`.
 
@@ -162,6 +162,11 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `runtime.search_github_mcp_tools` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
 - Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
+- `runtime.youtube_subtitles_enabled` добавляет к найденным YouTube URL локальное чтение ручных и auto-субтитров через `runtime.youtube_subtitles_command` (обычно `yt-dlp`). Обогащение выполняется после внешнего MCP search/fetch и доступно одинаково первому комментарию и `/ask`; новый MCP transport для этого не создаётся.
+- `runtime.youtube_subtitles_languages` задаёт приоритетные селекторы языков yt-dlp (`ru`, `ru.*`, `en`, `en.*`), `runtime.youtube_subtitles_max_videos` ограничивает число роликов на один source query, а `runtime.youtube_subtitles_max_chars` — объём добавляемого текста. Таймаут subprocess задаётся `runtime.youtube_subtitles_timeout_sec`.
+- При включённой функции отсутствие команды/бинарника или некорректные limits — startup error; при отсутствии субтитров, timeout или ошибке конкретного ролика исходный search result сохраняется без transcript.
+- Внешний RMCP дополнительно предоставляет `youtube.get_subtitles`: он принимает только public URL конкретного YouTube-видео и возвращает найденный язык и очищенный текст субтитров. Настройки отдельного RMCP-сервиса задаются через `MCP_YOUTUBE_SUBTITLES_*`; по умолчанию инструмент выключен, а включение требует установленного `yt-dlp`.
+- RMCP вызывает `yt-dlp` без shell, с `--skip-download` и `--no-playlist`, ограничивает один вызов timeout/размером текста и удаляет временные VTT-файлы после чтения. Плейлисты, credentials в URL и произвольные домены отклоняются до запуска subprocess.
 - Ошибка extract превращается в skipped `SearchContext`; ошибка или таймаут отдельного MCP source оставляет успешные результаты других источников доступными для комментария.
 - Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. В промпт помещается до 24 результатов, до 16 000 символов на результат и до 160 000 символов суммарно; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
@@ -211,8 +216,10 @@ voice_max_duration_sec = 600
 voice_max_file_mb = 20
 voice_short_text_max_chars = 400
 voice_language = "ru"
-voice_asr_provider = "groq"
-voice_asr_model = "whisper-large-v3"
+voice_asr_provider = "gemini"
+voice_asr_model = "gemini-3.5-transcribe"
+voice_asr_shadow_enabled = true
+voice_asr_shadow_model = "whisper-large-v3-turbo"
 voice_asr_temperature = 0.0
 voice_cleanup_temperature = 0.2
 voice_cleanup_max_tokens = 1800
@@ -233,8 +240,9 @@ first_comment_max_image_mb = 10
 
 - `runtime.voice_transcription_enabled=false` полностью выключает voice pipeline, включая `/transcribe`.
 - `runtime.voice_auto_transcribe=false` выключает обработку обычных сообщений, но оставляет доступной ручную `/transcribe` reply-команду.
-- `runtime.voice_asr_provider=groq` - сейчас единственный поддержанный ASR provider.
-- `runtime.voice_asr_model=whisper-large-v3` - дефолт для точной мультиязычной расшифровки в пределах Free Plan лимитов Groq.
+- `runtime.voice_asr_provider=gemini` и `runtime.voice_asr_model=gemini-3.5-transcribe` задают основной ASR; по результатам сравнения на реальных голосовых Gemini лучше разбирает длинную техническую речь.
+- При `runtime.voice_asr_shadow_enabled=true` второй текст строится Groq-моделью из `runtime.voice_asr_shadow_model=whisper-large-v3-turbo`. Если основной ASR недоступен, pipeline использует успешный второй результат.
+- Gemini принимает только аудио; для `video_note` MP4 pipeline использует Groq как совместимый fallback.
 - Voice cleanup всегда использует profile route `voice_cleanup` и его fallback chain.
 - `runtime.voice_short_text_max_chars=400` значит короткая расшифровка после cleanup отправляется как простой текст без глав и времени.
 - `runtime.voice_max_file_mb=20` выбран под cloud Bot API `getFile`; для больших файлов нужен local Bot API server.
@@ -302,6 +310,7 @@ Binary собран с `--locked --release` из `160f241`; его Git tree то
 ### Предыдущая dry-run выкладка автомодерации 2026-10-03
 
 Ранее `feat/spam-moderation-backend-v2` (labels writer, `/notspam`, журнал, лестница, LOLS-зеркало, NN-скоринг) выкатывался прямым rsync/build/restart с `enforce_enabled=true`, `enforce_dry_run=true`, ban threshold 90 и v1-моделью. Эта запись историческая: фактические текущие binary/model/flags указаны выше под deployment tag. Цели FPR ≤0.0001% и recall ≥99.9% пока не подтверждены. LOLS-синк настроен ежечасно в :17; отсутствие committed rows/locking остаётся отдельной нерешённой задачей, не гарантией работающего зеркала.
+
 
 
 - код: `/opt/tg-ai-bot-teloxide`
@@ -462,6 +471,15 @@ delivery-path сравниваются актуальные `risk_score` и со
 reuse-сигналы и template-корпус помеченного не видят. Команда `/notspam`
 reply (reviewer: configured reviewer, owner или админ чата) пишет `not_spam`
 и снимает пометку — так собираются confirmed-ham примеры для классификатора.
+Репорты пользователей:
+
+- `/report [причина]` принимается только как reply на сообщение человека в основном чате. Сообщения ботов, автоматические пересылки, личные чаты и команды без reply отклоняются до записи в БД.
+- `telegram_reports` имеет уникальность `(chat_id, message_id)`: одно сообщение можно отправить на review только один раз, даже если его пытаются репортить разные пользователи.
+- Для защиты от флуда один репортёр может создать не более одного нового репорта за 10 минут. Повтор того же сообщения возвращает существующий репорт и не расходует лимит.
+- Репорт хранит snapshot автора и сообщения, причину, media/reply-контекст и подтягивает к rich-карточке текущие профильные, activity и антиспам-сигналы. Сырые данные репортов не добавляются в `mcp_public` и не публикуются через внешний MCP.
+- Карточка отправляется отдельным durable delivery-воркером в личные сообщения текущих администраторов чата и owner fallback. Telegram не позволяет боту написать администратору, который ни разу не открыл личку с ботом: такие доставки помечаются `unreachable`, остальные ретраятся с lease и backoff.
+- В карточке используются typed Rich Message blocks, ссылка на исходное сообщение и inline-клавиатура: `Спам` и `Не спам`. Callback повторно проверяет актуальное админство; решение атомарно фиксируется в `telegram_reports`, после чего кнопки действий убираются. Кнопки не банят и не удаляют сообщения автоматически; подтверждённые решения штампуются в корпус меток (`manual_owner_report` / confirmed-ham).
+
 
 Посмотреть последние сообщения:
 
@@ -514,6 +532,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /warns [reply|id|@username]
 /modlog [reply|id|@username] [limit]
 /undo
+/report [причина]  (reply на сообщение человека)
 ```
 
 В группах лучше писать с username:
@@ -593,7 +612,7 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 7. Скачать файл через Telegram `getFile` во временный файл.
 8. Для `video_note` задать multipart MIME `video/mp4` и отправить исходный MP4 в Groq `/audio/transcriptions`.
 9. Сразу после preflight отправить reply `Расшифровка…`; для обычного результата заменить его через `editMessageText`, а для Rich/file варианта обновить его статусом и отправить полный payload отдельным сообщением.
-10. Сохранить raw ASR text, segments и raw JSON.
+10. Сохранить raw ASR text, segments и raw JSON; при включённом shadow-ASR дополнительно сохранить независимые альтернативные транскрипты.
 11. Запустить LLM cleanup по `prompts/voice_cleanup.md`.
 12. Нормализовать clean result: короткий текст остаётся short, пустые/битые главы отбрасываются.
 13. Собрать Telegram HTML через `telegram::html`.
@@ -606,17 +625,22 @@ match maybe_transcribe_voice(&bot, &msg, &state).await {
 ASR request:
 
 ```text
-POST https://api.groq.com/openai/v1/audio/transcriptions
+primary: Gemini Files API + Interactions API
 model = runtime.voice_asr_model
+language_codes = runtime.voice_language as BCP-47
+mode = verbatim
+
+secondary: Groq OpenAI-compatible audio transcriptions
+model = runtime.voice_asr_shadow_model
 response_format = verbose_json
-language = runtime.voice_language
-temperature = runtime.voice_asr_temperature
-timestamp_granularities[] = segment
 ```
 
 Cleanup request:
 
 - сначала используется profile route `voice_cleanup` и его fallback chain;
+- при включённом shadow-ASR cleanup получает основной Gemini-текст и отдельный
+  альтернативный Groq-текст; альтернативы используются только для сверки
+  спорных слов и не становятся самостоятельным источником новых фактов;
 - если все cleanup selections падают, используется raw ASR transcript;
 - если JSON от модели не парсится или cleanup меняет объём/числа сверх безопасных границ, используется raw ASR transcript.
 
@@ -845,7 +869,7 @@ ryzen_custom_emoji_id = "5444875271163364561"
 - Реакции считаются только с момента включения reaction updates; старые реакции Telegram Bot API задним числом не отдаёт.
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
-- Voice ASR сейчас только через Groq; local Whisper/Ollama audio не подключены.
+- Voice ASR работает в двойном режиме Gemini primary + Groq shadow; local Whisper/Ollama audio не подключены.
 - Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; статические настройки меняются в `[runtime]` profile TOML и требуют рестарта сервиса. DB-backed dynamic policy — отдельный следующий этап.

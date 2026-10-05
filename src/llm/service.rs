@@ -5,7 +5,9 @@ use crate::llm::genai_transport::{
     GenAiChatRequest, GenAiRequest, GenAiTransport, ImageInput, ModelTarget,
 };
 use crate::llm::profiles::{RouteRequirements, RouteSelection};
-use crate::llm::types::{GeneratedText, LlmAttempt, LlmTransportError, StructuredOutput};
+use crate::llm::types::{
+    GeneratedText, LlmAttempt, LlmTransportError, StructuredOutput, ValidationFailure,
+};
 
 pub type OutputValidator = dyn Fn(&str) -> anyhow::Result<()> + Send + Sync;
 
@@ -108,8 +110,13 @@ async fn generate_text_with_profile_checked(
                     if let Some(validate) = options.output_validator
                         && let Err(err) = validate(&generation.content)
                     {
+                        let validation_reason = err.downcast_ref::<ValidationFailure>().map_or(
+                            crate::llm::types::ValidationFailureReason::Unknown,
+                            |failure| failure.reason,
+                        );
                         attempts.push(LlmAttempt {
                             outcome: "validation_failed".to_string(),
+                            validation_reason: Some(validation_reason),
                             ..llm_attempt
                         });
                         // Безопасно: validator возвращает только причину
@@ -169,6 +176,7 @@ async fn generate_text_with_profile_checked(
                         provider: selection.provider_key.to_string(),
                         model: selection.model.model.clone(),
                         outcome,
+                        validation_reason: None,
                     });
                     last_error = Some(err);
                     if empty_response && attempt < VALIDATION_RETRY_ATTEMPTS {
@@ -353,6 +361,7 @@ async fn generate_profile_once(
             provider: selection.provider_key.to_string(),
             model: selection.model.model.clone(),
             outcome: "success".to_string(),
+            validation_reason: None,
         }],
     })
 }
@@ -463,6 +472,17 @@ mod tests {
             search_mcp_fetch_tool: Some("web_fetch_exa".to_string()),
             search_fetch_top_n: 2,
             search_fetch_max_chars: 6000,
+            youtube_subtitles_enabled: false,
+            youtube_subtitles_command: Some("yt-dlp".to_string()),
+            youtube_subtitles_languages: vec![
+                "ru".to_string(),
+                "ru.*".to_string(),
+                "en".to_string(),
+                "en.*".to_string(),
+            ],
+            youtube_subtitles_timeout_sec: 15,
+            youtube_subtitles_max_chars: 12_000,
+            youtube_subtitles_max_videos: 2,
             comment_blocked_source_domains: vec!["meduza.io".to_string()],
             comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
@@ -510,6 +530,8 @@ mod tests {
             voice_language: "ru".to_string(),
             voice_asr_provider: "groq".to_string(),
             voice_asr_model: "whisper-large-v3-turbo".to_string(),
+            voice_asr_shadow_enabled: false,
+            voice_asr_shadow_model: "gemini-3.5-transcribe".to_string(),
             voice_asr_temperature: 0.0,
             voice_cleanup_temperature: 0.2,
             voice_cleanup_max_tokens: 1800,
@@ -540,8 +562,9 @@ mod tests {
             .resolve_route("ask", &chat_route_requirements(&options))
             .unwrap();
 
-        assert_eq!(resolved.selections.len(), 1);
-        assert_eq!(resolved.selections[0].model.model, "minimax-m3");
+        assert_eq!(resolved.selections.len(), 2);
+        assert_eq!(resolved.selections[0].model.model, "qwen/qwen3.8-27b");
+        assert_eq!(resolved.selections[1].model.model, "qwen/qwen3.6-27b");
     }
 
     #[tokio::test]
@@ -797,8 +820,13 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
             std::env::set_var("PROFILE_SWITCH_FALLBACK_KEY", "test-key");
         }
         let validator = |content: &str| -> anyhow::Result<()> {
-            anyhow::ensure!(content == "valid", "invalid output");
-            Ok(())
+            if content == "valid" {
+                Ok(())
+            } else {
+                Err(crate::llm::types::validation_error(
+                    crate::llm::types::ValidationFailureReason::TooShort,
+                ))
+            }
         };
         let mut config = config();
         config.llm_profiles = Some(switching_profiles(address, "invalid", "valid", false));
@@ -815,8 +843,17 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
         assert_eq!(generated.content, "valid");
         assert_eq!(generated.attempts.len(), 3);
         assert_eq!(generated.attempts[0].outcome, "validation_failed");
+        assert_eq!(
+            generated.attempts[0].validation_reason,
+            Some(crate::llm::types::ValidationFailureReason::TooShort)
+        );
         assert_eq!(generated.attempts[1].outcome, "validation_failed");
+        assert_eq!(
+            generated.attempts[1].validation_reason,
+            Some(crate::llm::types::ValidationFailureReason::TooShort)
+        );
         assert_eq!(generated.attempts[2].provider, "fallback");
+        assert_eq!(generated.attempts[2].validation_reason, None);
         unsafe {
             std::env::remove_var("PROFILE_SWITCH_PRIMARY_KEY");
             std::env::remove_var("PROFILE_SWITCH_FALLBACK_KEY");

@@ -1,6 +1,8 @@
 use teloxide::{
     prelude::*,
-    types::{InputRichMessage, LinkPreviewOptions, MessageId, ReplyParameters},
+    types::{
+        InputRichMessage, LinkPreviewOptions, MessageId, ReplyParameters,
+    },
 };
 
 use crate::telegram::html::{self, TELEGRAM_TEXT_LIMIT, is_safe_len};

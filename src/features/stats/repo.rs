@@ -648,7 +648,8 @@ pub async fn top_reacted_user_ids(
 pub async fn user_profile(pool: &PgPool, user_id: i64) -> anyhow::Result<Option<UserProfile>> {
     sqlx::query_as(
         r#"
-        select username, first_name, last_name, is_bot, bio, profile_photo_file_id, profile_photo_file_unique_id
+        select username, first_name, last_name, is_bot, bio, profile_photo_file_id,
+            profile_photo_file_unique_id
         from telegram_user_profiles where telegram_user_id = $1
         "#,
     )

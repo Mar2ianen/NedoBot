@@ -20,6 +20,10 @@ use crate::{
 };
 
 const DELIVERY_LEASE_SECONDS: i64 = 10 * 60;
+/// Максимальный возраст первого сообщения для Telegram-доставки ревью.
+/// Просроченный first message остаётся в аудите, но карточка не claim-ится:
+/// администраторов не стоит будить ради давно остывшего контекста.
+pub(crate) const FIRST_MESSAGE_REVIEW_MAX_AGE_SECONDS: i64 = 5 * 60;
 
 pub struct SpamReview {
     pub id: i64,
@@ -165,6 +169,26 @@ async fn claim_review_delivery(
                   (notification_status in ('pending', 'retry_wait') and notification_next_attempt_at <= now())
                   or (notification_status = 'processing' and notification_lease_expires_at <= now())
               )
+              and (
+                  not exists (
+                      select 1 from telegram_new_user_profile_audits audit
+                      where audit.chat_id = spam_review_requests.chat_id
+                        and audit.telegram_user_id = spam_review_requests.telegram_user_id
+                        and audit.first_message_id is not null
+                  )
+                  or exists (
+                      select 1
+                      from telegram_new_user_profile_audits audit
+                      join telegram_messages first_message
+                        on first_message.chat_id = audit.chat_id
+                       and first_message.message_id = audit.first_message_id
+                      where audit.chat_id = spam_review_requests.chat_id
+                        and audit.telegram_user_id = spam_review_requests.telegram_user_id
+                        and first_message.user_id = audit.telegram_user_id
+                        and first_message.source_channel_id is null
+                        and first_message.created_at >= now() - ($3 * interval '1 second')
+                  )
+              )
             order by notification_next_attempt_at, id
             for update skip locked
             limit 1
@@ -190,6 +214,7 @@ async fn claim_review_delivery(
     )
     .bind(request_id)
     .bind(DELIVERY_LEASE_SECONDS)
+    .bind(FIRST_MESSAGE_REVIEW_MAX_AGE_SECONDS)
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else { return Ok(None) };
@@ -649,7 +674,7 @@ pub async fn apply_callback(
         _ => return Ok(None),
     };
     let mut tx = pool.begin().await?;
-    let row = sqlx::query("update spam_review_requests set status = $2, reviewed_at = now(), reviewed_by_user_id = $3 where id = $1 and status = 'pending' returning chat_id, telegram_user_id")
+    let row = sqlx::query("update spam_review_requests set status = $2, reviewed_at = now(), reviewed_by_user_id = $3 where id = $1 and status = 'pending' returning chat_id, telegram_user_id, risk_signals")
         .bind(request_id).bind(status).bind(owner_id).fetch_optional(&mut *tx).await?;
     let Some(row) = row else {
         tx.commit().await?;
@@ -658,12 +683,13 @@ pub async fn apply_callback(
     if decision == "spam" {
         let chat_id: i64 = row.get("chat_id");
         let user_id: i64 = row.get("telegram_user_id");
+        let risk_signals: Value = row.get("risk_signals");
         record_spam_in_transaction(
             &mut tx,
             chat_id,
             user_id,
             &SpamLabel {
-                subtype: "llm_generic_comment".to_string(),
+                subtype: owner_review_spam_subtype(&risk_signals).to_string(),
                 source: LabelSource::OwnerReview,
                 reason: "Owner-confirmed spammer".to_string(),
                 evidence: serde_json::json!({"review_id": request_id}),
@@ -692,8 +718,71 @@ pub async fn apply_callback(
     }))
 }
 
-pub fn parse_callback(data: &str) -> Option<(i64, &str)> {
-    let mut parts = data.split(':');
+/// Derives the corpus subtype for an owner-confirmed spammer from the stored
+/// risk signals. Falls back to a generic comment subtype when no known
+/// campaign marker is present.
+fn owner_review_spam_subtype(signals: &Value) -> &'static str {
+    let labels = signals
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|signal| signal.get("label").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+
+    if labels.iter().any(|label| {
+        matches!(
+            *label,
+            "explicit_adult_promo_bio" | "personal_channel_adult_links"
+        )
+    }) {
+        return "adult_personal_channel_promo";
+    }
+    if labels.iter().any(|label| {
+        matches!(
+            *label,
+            "foreign_invite_link_message" | "invite_link_from_new_user"
+        )
+    }) {
+        return "foreign_invite_link_spam";
+    }
+    if labels.iter().any(|label| {
+        matches!(
+            *label,
+            "profile_bio_subscription_invite_offer"
+                | "personal_channel_invite_link"
+                | "personal_channel_external_link"
+        )
+    }) {
+        return "profile_channel_bait";
+    }
+
+    let has_unified_campaign = signals
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|signal| {
+            signal.get("label").and_then(Value::as_str) == Some("unified_first_message_analysis")
+        })
+        .any(|signal| {
+            signal
+                .get("assessment")
+                .and_then(|assessment| assessment.get("template_campaign"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || signal
+                    .get("assessment")
+                    .and_then(|assessment| assessment.get("direct_dm_offer"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        });
+    if has_unified_campaign {
+        return "promo_dm_bait";
+    }
+
+    "llm_generic_comment"
+}
+
+pub fn parse_callback(data: &str) -> Option<(i64, &str)> {    let mut parts = data.split(':');
     (parts.next()? == "spam_review").then_some(())?;
     let id = parts.next()?.parse().ok()?;
     let decision = parts.next()?;
@@ -855,6 +944,19 @@ fn human_label(label: &str) -> &str {
         }
         "identity_display_name_rotation" => "пользователь менял отображаемое имя",
         "identity_username_rotation" => "пользователь менял username",
+        "display_name_reused_by_mixed_labels" => {
+            "имя встречалось и у спамеров, и у подтверждённых нормальных пользователей"
+        }
+        "display_name_reused_by_confirmed_normal" => {
+            "имя встречалось только у подтверждённых нормальных пользователей"
+        }
+        "username_reused_by_spammers" => "username уже встречался у размеченных спамеров",
+        "username_reused_by_mixed_labels" => {
+            "username встречался и у спамеров, и у подтверждённых нормальных пользователей"
+        }
+        "username_reused_by_confirmed_normal" => {
+            "username встречался только у подтверждённых нормальных пользователей"
+        }
         "username_random_suffix" => "username похож на автоматически созданный",
         "mixed_script_profile_homoglyphs" => {
             "в имени смешаны похожие латинские и кириллические буквы"

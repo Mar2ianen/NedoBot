@@ -57,6 +57,7 @@ src/features/user_profiles/enrichment.rs — bounded queue: profile refresh → 
 src/features/new_user_analysis.rs       — unified new-user audit snapshot and baseline risk scoring
 src/features/new_user_audit/             — unified profile, avatar and first-message assessment
 src/features/spam_review.rs             — idempotent review-карточки для новых пользователей
+src/features/reports/                   — пользовательские репорты, durable PM delivery и rich-карточки
 src/features/ask/                       — /ask agent, audit и RMCP child client
 src/features/chat_read_api/             — transport-agnostic public read-model и manifest catalog
 src/mcp/                                — ChatMcpServer и RMCP stdio/Streamable HTTP adapters
@@ -88,6 +89,7 @@ migrations/                            — sqlx compile-time миграции
 | `/ask <вопрос>` | Агентный поиск по истории чата и публичному read-model |
 | `/chat_note <текст>` | Добавить общую заметку чата |
 | `/user_note <текст>` | Добавить заметку о пользователе reply |
+| `/report [причина]` | Пожаловаться на человеческое сообщение reply; карточка уходит администраторам в личку |
 | `/stats_day [-r\|-p]` | Статистика дня (05:00 МСК) |
 | `/stats_week [-r\|-p]` | Статистика недели |
 | `/stats_month [-r\|-p]` | Статистика месяца |

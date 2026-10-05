@@ -18,6 +18,7 @@ use crate::features::search::provider::SearchProvider;
 use crate::features::search::types::{
     MAX_RESULT_SNIPPET_CHARS, MAX_RESULT_TITLE_CHARS, SearchQuery, SearchResult, SearchSource,
 };
+use crate::features::search::youtube::enrich_results_with_youtube_subtitles;
 
 const FETCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -255,6 +256,8 @@ async fn run_mcp_flow(
     if query.source == SearchSource::Github && process_config.fetch_tool.is_none() {
         enrich_github_results(service, &mut results, config.search_fetch_top_n).await;
     }
+
+    enrich_results_with_youtube_subtitles(config, &mut results).await;
 
     results.retain(|result| is_allowed_search_result(config, result));
 

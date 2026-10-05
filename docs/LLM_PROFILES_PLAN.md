@@ -25,7 +25,8 @@ provider transport -> model profile -> task route
 - `context_window_tokens`;
 - `max_output_tokens`;
 - `request_timeout_sec`;
-- `thinking`: `none`, `budget` или `level_low`.
+- `thinking`: `none`, provider-default reasoning (`default` для Groq Qwen), `budget`,
+  `level_low` или `level_high`.
 
 Новые capabilities добавляются только когда их использует pipeline. Нельзя выводить возможности из model ID.
 
@@ -44,6 +45,7 @@ provider transport -> model profile -> task route
 - Порядок моделей определяется только соответствующим route.
 - Fallback по transport error, timeout, rate limit и provider unavailable разрешён по умолчанию.
 - Fallback после output validation выключен по умолчанию и включается явным `fallback_on_validation_failure` конкретного route.
+- Route `first_comment` явно включает validation fallback: его product-контракт проверяет placeholder, длину, язык и CTA, поэтому отказ одной модели не должен отменять весь комментарий.
 - Несовместимость structured output должна обрабатываться capability contract, а не распознаванием текста HTTP ошибки.
 - Effective output limit — минимум из product limit и `max_output_tokens` модели; prompt builder обязан учитывать `context_window_tokens`.
 

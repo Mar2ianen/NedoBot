@@ -2,7 +2,7 @@ use teloxide::types::{InputFile, InputRichMessage, MessageId, ReplyParameters};
 use teloxide::{RequestError, prelude::*};
 
 use crate::features::ingest::managed_chat_allows;
-use crate::features::voice::asr::transcribe_audio;
+use crate::features::voice::asr::transcribe_audio_with_shadow;
 use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
@@ -354,7 +354,7 @@ async fn process_voice_job(
         .map_err(|_| VoiceProcessingFailure::Download)?
         .then_some(())
         .ok_or(VoiceProcessingFailure::LeaseLost)?;
-    let transcript = {
+    let (transcript, alternatives) = {
         let downloaded = download_media_file(bot, media)
             .await
             .map_err(|_| VoiceProcessingFailure::Download)?;
@@ -370,7 +370,7 @@ async fn process_voice_job(
             .map_err(|_| VoiceProcessingFailure::Asr)?
             .then_some(())
             .ok_or(VoiceProcessingFailure::LeaseLost)?;
-        transcribe_audio(
+        transcribe_audio_with_shadow(
             &state.config,
             &downloaded.path,
             &downloaded.filename,
@@ -379,7 +379,7 @@ async fn process_voice_job(
         .await
         .map_err(|_| VoiceProcessingFailure::Asr)?
     };
-    save_asr_result(&state.pool, job, &transcript)
+    save_asr_result(&state.pool, job, &transcript, &alternatives)
         .await
         .map_err(|_| VoiceProcessingFailure::Asr)?
         .then_some(())
@@ -406,7 +406,7 @@ async fn process_voice_job(
         .map_err(|_| VoiceProcessingFailure::Cleanup)?
         .then_some(())
         .ok_or(VoiceProcessingFailure::LeaseLost)?;
-    let cleanup = cleanup_transcript(&state.config, &transcript)
+    let cleanup = cleanup_transcript(&state.config, &transcript, &alternatives)
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
     let rendered = render_transcript(&cleanup.transcript, &state.config);
