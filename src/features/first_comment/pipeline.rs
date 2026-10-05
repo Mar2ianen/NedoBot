@@ -66,7 +66,7 @@ pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Resu
 
     let clean_post =
         clean_post_for_llm_with_markers(&candidate.post_text, &candidate.post_signature_markers);
-    if let Some(term) = blocked_post_term(&clean_post, &candidate.blocked_post_terms) {
+    if let Some(term) = blocked_post_term(&candidate.post_text, &candidate.blocked_post_terms) {
         tracing::info!(
             discussion_message_id = msg.id.0,
             blocked_term = term.as_str(),
