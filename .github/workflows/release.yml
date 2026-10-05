@@ -82,11 +82,13 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
-          stage="$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'mktemp -d')"
-          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+          stage="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" 'mktemp -d')"
+          scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
             dist/retry_pending_comments dist/reconcile_comment_delivery \
+            scripts/install_release_binaries.sh \
             "$VPS_USER@$VPS_HOST:$stage/"
+          test -x dist/tg_ai_bot_teloxide
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
       - name: Atomic install, restart, verify
         env:
@@ -94,7 +96,7 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
-            "bash /opt/tg-ai-bot-teloxide/scripts/install_release_binaries.sh '$STAGE_DIR' \
+            "bash '$STAGE_DIR/install_release_binaries.sh' '$STAGE_DIR' \
             && rm -rf '$STAGE_DIR' \
             && systemctl restart tg-ai-bot-teloxide nedobot-pvo \
             && systemctl is-active tg-ai-bot-teloxide nedobot-pvo \
