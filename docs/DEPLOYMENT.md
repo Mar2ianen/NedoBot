@@ -91,6 +91,7 @@ rsync -azn \
   --exclude '.env*' \
   --exclude static/ \
   --exclude backups/ \
+  --exclude models/ \
   --exclude '*.dump' \
   --exclude docs/LOCAL_WORKFLOW.md \
   ./ vps-153:/opt/tg-ai-bot-teloxide/
@@ -106,10 +107,16 @@ rsync -az \
   --exclude '.env*' \
   --exclude static/ \
   --exclude backups/ \
+  --exclude models/ \
   --exclude '*.dump' \
   --exclude docs/LOCAL_WORKFLOW.md \
   ./ vps-153:/opt/tg-ai-bot-teloxide/
 ```
+
+`models/` исключён намеренно: весовые JSON лежат только на сервере (плюс
+снапшоты в `/opt/tg-ai-bot-releases/`), а `--delete` без этого exclude уже
+удалял `alt_word_char_v2_2026-10-03.json` 2026-10-05 с crash-loop НедоNews до
+восстановления из снапшота (хеш сверен с задокументированным в релизе).
 
 После rsync отдельно проверить доступ сервисного пользователя к checkout:
 
