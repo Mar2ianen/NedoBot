@@ -15,6 +15,8 @@ const GEMINI_FILES_UPLOAD_URL: &str =
 const GEMINI_INTERACTIONS_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const GEMINI_TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(180);
+const GEMINI_TOTAL_ASR_TIMEOUT: Duration = Duration::from_secs(420);
+const GEMINI_FILE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn transcribe_audio_with_shadow(
     config: &Config,
@@ -25,6 +27,20 @@ pub async fn transcribe_audio_with_shadow(
     let primary_provider = config.voice_asr_provider.trim().to_ascii_lowercase();
     let shadow_provider = shadow_provider_for(&primary_provider);
     let shadow_mime_type = shadow_audio_mime_type(filename, mime_type);
+    if primary_provider == "gemini" && shadow_mime_type.is_none() {
+        // Видео-кружки Whisper принимает напрямую. Shadow flag управляет
+        // сравнением расшифровок, а не доступностью этого media route.
+        let transcript = transcribe_configured_audio(
+            config,
+            path,
+            filename,
+            mime_type,
+            "groq",
+            &config.voice_asr_shadow_model,
+        )
+        .await?;
+        return Ok((transcript, Vec::new()));
+    }
     let shadow_enabled = config.voice_asr_shadow_enabled && shadow_provider.is_some();
     let primary = transcribe_audio(config, path, filename, mime_type);
     let shadow = async {
@@ -137,7 +153,12 @@ async fn transcribe_configured_audio(
         "gemini" => {
             let mime_type = shadow_audio_mime_type(filename, mime_type)
                 .ok_or_else(|| anyhow::anyhow!("Gemini ASR requires an audio MIME type"))?;
-            transcribe_gemini_audio(config, path, &mime_type, model).await
+            tokio::time::timeout(
+                GEMINI_TOTAL_ASR_TIMEOUT,
+                transcribe_gemini_audio(config, path, &mime_type, model),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Gemini ASR total deadline exceeded"))?
         }
         provider => anyhow::bail!("unsupported VOICE_ASR_PROVIDER: {provider}"),
     }
@@ -184,10 +205,13 @@ async fn transcribe_groq_audio(
         .bearer_auth(request.api_key)
         .multipart(form)
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?
         .json::<GroqTranscriptionResponse>()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
 
     let raw_json = serde_json::to_value(&response)?;
     let text = response.text.trim().to_string();
@@ -285,8 +309,10 @@ async fn start_gemini_upload(
             "file": {"display_name": "nedobot-shadow-asr"}
         }))
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
     response
         .headers()
         .get("x-goog-upload-url")
@@ -310,10 +336,13 @@ async fn finalize_gemini_upload(
         .header("Content-Type", mime_type)
         .body(bytes)
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?
         .json::<GeminiFileUploadResponse>()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     Ok(response.file)
 }
 
@@ -344,22 +373,27 @@ async fn create_gemini_transcription(
             }
         }))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?
         .json::<Value>()
-        .await?;
+        .await
+        .map_err(reqwest::Error::without_url)?;
     Ok(response)
 }
 
 async fn delete_gemini_file(client: &reqwest::Client, api_key: &str, name: &str) {
-    if let Err(error) = client
+    let cleanup = client
         .delete(format!("{GEMINI_FILES_UPLOAD_URL_BASE}/{name}"))
         .header("x-goog-api-key", api_key)
+        .timeout(GEMINI_FILE_CLEANUP_TIMEOUT)
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
-    {
-        tracing::debug!(%error, file = %name, "failed to delete shadow ASR upload");
+        .and_then(reqwest::Response::error_for_status);
+    if let Err(error) = cleanup {
+        let error = error.without_url();
+        tracing::debug!(%error, "failed to delete ASR upload");
     }
 }
 
@@ -396,9 +430,13 @@ fn extract_gemini_transcription_text(value: &Value) -> Option<String> {
     }
 
     let mut parts = Vec::new();
-    collect_text(value.get("steps")?, &mut parts);
-    if parts.is_empty() {
-        collect_text(value.get("outputs")?, &mut parts);
+    if let Some(steps) = value.get("steps") {
+        collect_text(steps, &mut parts);
+    }
+    if parts.is_empty()
+        && let Some(outputs) = value.get("outputs")
+    {
+        collect_text(outputs, &mut parts);
     }
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
@@ -474,6 +512,39 @@ struct GroqRequestMeta {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gemini_outputs_without_steps_are_supported() {
+        assert_eq!(
+            extract_gemini_transcription_text(
+                &json!({"outputs":[{"type":"text","text":" Привет "}]})
+            ),
+            Some("Привет".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_errors_do_not_disclose_the_session_url() {
+        let app = Router::new().route(
+            "/upload",
+            post(|| async { axum::http::StatusCode::FORBIDDEN }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{address}/upload?upload_id=private-session");
+        let Err(error) =
+            finalize_gemini_upload(&reqwest::Client::new(), &url, vec![1], "audio/ogg").await
+        else {
+            panic!("mock upload must fail")
+        };
+        server.abort();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("private-session"));
+        assert!(!rendered.contains("upload_id"));
+        assert!(!rendered.contains("http://"));
+    }
     use std::sync::{Arc, Mutex};
 
     use axum::{Json, Router, body::Bytes, extract::State, http::HeaderMap, routing::post};

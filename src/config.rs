@@ -671,7 +671,14 @@ impl Config {
 
         if self.voice_transcription_enabled {
             validate_voice_asr_secret(&mut errors, self);
-            if self.voice_asr_shadow_enabled {
+            // Gemini audio ASR не принимает video notes; для них используется
+            // настроенный Groq media fallback даже без сравнительного shadow.
+            if self.voice_asr_shadow_enabled
+                || self
+                    .voice_asr_provider
+                    .trim()
+                    .eq_ignore_ascii_case("gemini")
+            {
                 validate_voice_asr_shadow_secret(&mut errors, self);
             }
         }
