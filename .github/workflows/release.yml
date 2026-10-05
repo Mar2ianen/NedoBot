@@ -67,7 +67,13 @@ jobs:
           name: nedobot-release-${{ github.sha }}
           path: dist/
       - name: Verify artifact checksums
-        run: ( cd dist && sha256sum -c SHA256SUMS )
+        run: |
+          ( cd dist && sha256sum -c SHA256SUMS )
+          # Скачанные из artifact файлы теряют exec-бит — возвращаем явно.
+          chmod +x dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
+            dist/retry_pending_comments dist/reconcile_comment_delivery \
+            dist/install_release_binaries.sh
+          test -x dist/tg_ai_bot_teloxide
       - name: Configure SSH
         env:
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
@@ -89,7 +95,6 @@ jobs:
             dist/retry_pending_comments dist/reconcile_comment_delivery \
             dist/install_release_binaries.sh \
             "$VPS_USER@$VPS_HOST:$stage/"
-          test -x dist/tg_ai_bot_teloxide
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
       - name: Atomic install, restart, verify
         env:
