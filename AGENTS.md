@@ -184,7 +184,29 @@ Test fixtures: каждая тестовая модуль определяет `
 
 ## Деплой
 
-VPS `vps-153`, systemd service `tg-ai-bot-teloxide`, Postgres в Podman `tg-ai-bot-postgres`. Проверенные общие команды и ограничения деплоя описаны в `docs/TECHNICAL.md`; `docs/LOCAL_WORKFLOW.md` остаётся локальным, некоммитящимся файлом для machine-specific заметок.
+VPS `vps-153`, Postgres в Podman `tg-ai-bot-postgres`. Два community-инстанса
+одного release binary (default features): systemd `tg-ai-bot-teloxide`
+(НедоNews, БД `tg_ai_bot`, профиль `/etc/tg-ai-bot/llm_profiles.toml`) и
+`nedobot-pvo` (ПВО, БД `tg_ai_bot_pvo`, профиль
+`/etc/tg-ai-bot/pvo-llm_profiles.toml`); общий SQLite спам-репутации
+`/var/lib/nedobot/spam-reputation.sqlite` при разных `instance.id`.
+Проверенные общие команды и ограничения деплоя описаны в `docs/TECHNICAL.md`;
+`docs/LOCAL_WORKFLOW.md` остаётся локальным, некоммитящимся файлом для machine-specific заметок.
+
+### Живость обоих инстансов
+
+- Проверять оба юнита, а не только `tg-ai-bot-teloxide`: `systemctl is-active
+  tg-ai-bot-teloxide nedobot-pvo`, exe-хеш обоих PID против release binary,
+  отсутствие `migration ... was previously applied but is missing` и `ERROR`
+  в обоих journal за окно наблюдения.
+- `inactive (dead)` любого из инстансов — инцидент: смотреть `journalctl -u
+  <unit>`, чинить причину, не маскировать рестартом. Отсутствие апдейтов из
+  Telegram дольше ~суток не наверстывается polling-ом (сервер отбрасывает
+  неподтверждённые updates); историю дотягивать экспортом через
+  `import_telegram_export`, а не задним числом.
+- Deploy, restart и smoke всегда охватывают оба инстанса (см.
+  `docs/DEPLOYMENT.md` и workflow `release`). Конфиги правятся вручную с
+  бэкапом и автоматикой не перезаписываются.
 
 ### Ветки между deploy
 
