@@ -39,9 +39,39 @@ deploy-YYYY-MM-DD-scope.
    Значение LLM_PROFILES_PATH должно быть абсолютным:
    /etc/tg-ai-bot/llm_profiles.toml.
 
+## Инстансы
+
+На vps-153 два community-инстанса одного бинаря, у каждого своя БД, env и
+профиль. Общий только SQLite спам-репутации (один путь, разные `instance.id`).
+
+| Инстанс | Unit | Checkout / binary | Profile | Database |
+|---|---|---|---|---|
+| НедоNews (`nedonews`) | `tg-ai-bot-teloxide.service` | `/opt/tg-ai-bot-teloxide/target/release/` | `/etc/tg-ai-bot/llm_profiles.toml` | `tg_ai_bot` |
+| ПВО (`pvo`) | `nedobot-pvo.service` | `/opt/nedobot-pvo/target/release/` | `/etc/tg-ai-bot/pvo-llm_profiles.toml` | `tg_ai_bot_pvo` |
+
+Оба бинаря ставятся из одного артефакта (`scripts/install_release_binaries.sh`
+пишет в оба checkout). Рестарт и проверка всегда охватывают оба юнита:
+`systemctl restart tg-ai-bot-teloxide nedobot-pvo`. Профили правятся вручную с
+бэкапом и автоматикой не перезаписываются; шаблона pvo-профиля в репозитории
+нет. Миграции встроены в бинарь (`sqlx::migrate!`), поэтому рассинхрон чекаута
+и БД (как остановка `nedobot-pvo` 2026-10-01 из-за отсутствующей в его сборке
+миграции) лечится выкладкой свежего бинаря, а не правкой `_sqlx_migrations`.
+
 ## Выкладка
 
-Сначала сделать dry-run. Не использовать `--delete`: production checkout может
+Основной путь — GitHub Actions (`release`, раннер `ubuntu-24.04`, glibc 2.39
+совпадает с production): сборка `--locked --release` с default features
+(единый бинарь на все инстансы), проверка glibc-совместимости, публикация
+артефакта и опциональный deploy на vps-153 с атомарной заменой бинарей,
+restart и сверкой хеша `/proc/<pid>/exe`. Сборка на сервере больше не
+используется: на 4 ГБ RAM `rustc` убивает OOM-killer. Для deploy из CI нужны
+секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_KNOWN_HOSTS`.
+Конфиг `/etc/tg-ai-bot/llm_profiles.toml` автоматика не трогает: он правится
+вручную с бэкапом, шаблон — `config/llm_profiles.toml.production.example`.
+
+Запасной путь при недоступности CI — сборка на сервере (нужен свободный swap,
+иначе OOM), затем restart и те же проверки. Сначала сделать dry-run. Не
+использовать `--delete`: production checkout может
 содержать SQLx migration-файлы, уже применённые к БД, но отсутствующие в текущем
 source snapshot. Удаление такого файла приведёт к `VersionMissing` при следующем
 старте. Устаревшие исходники удалять только отдельной проверенной процедурой
@@ -61,6 +91,7 @@ rsync -azn \
   --exclude '.env*' \
   --exclude static/ \
   --exclude backups/ \
+  --exclude models/ \
   --exclude '*.dump' \
   --exclude docs/LOCAL_WORKFLOW.md \
   ./ vps-153:/opt/tg-ai-bot-teloxide/
@@ -76,10 +107,16 @@ rsync -az \
   --exclude '.env*' \
   --exclude static/ \
   --exclude backups/ \
+  --exclude models/ \
   --exclude '*.dump' \
   --exclude docs/LOCAL_WORKFLOW.md \
   ./ vps-153:/opt/tg-ai-bot-teloxide/
 ```
+
+`models/` исключён намеренно: весовые JSON лежат только на сервере (плюс
+снапшоты в `/opt/tg-ai-bot-releases/`), а `--delete` без этого exclude уже
+удалял `alt_word_char_v2_2026-10-03.json` 2026-10-05 с crash-loop НедоNews до
+восстановления из снапшота (хеш сверен с задокументированным в релизе).
 
 После rsync отдельно проверить доступ сервисного пользователя к checkout:
 
@@ -139,8 +176,8 @@ journal нет ошибки profile validation или migration и что кон
 ## Проверка после restart
 
 ```bash
-ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedonews-mcp container-tg-ai-bot-postgres nedobot-rag-embedding nedobot-chat-embedding'
-ssh vps-153 'journalctl -u tg-ai-bot-teloxide -n 120 --no-pager'
+ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedobot-pvo nedonews-mcp container-tg-ai-bot-postgres nedobot-rag-embedding nedobot-chat-embedding'
+ssh vps-153 'journalctl -u tg-ai-bot-teloxide -u nedobot-pvo -n 120 --no-pager'
 ssh vps-153 'journalctl -u nedonews-mcp -n 80 --no-pager'
 ssh vps-153 'podman ps'
 ssh vps-153 'curl -sS -o /dev/null -w "local=%{http_code} %{time_total}\n" http://127.0.0.1:8787/mcp/nedonews/v2'
