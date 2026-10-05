@@ -41,7 +41,19 @@ deploy-YYYY-MM-DD-scope.
 
 ## Выкладка
 
-Сначала сделать dry-run. Не использовать `--delete`: production checkout может
+Основной путь — GitHub Actions (`release`, раннер `ubuntu-24.04`, glibc 2.39
+совпадает с production): сборка `--locked --release` с default features
+(единый бинарь на все инстансы), проверка glibc-совместимости, публикация
+артефакта и опциональный deploy на vps-153 с атомарной заменой бинарей,
+restart и сверкой хеша `/proc/<pid>/exe`. Сборка на сервере больше не
+используется: на 4 ГБ RAM `rustc` убивает OOM-killer. Для deploy из CI нужны
+секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_KNOWN_HOSTS`.
+Конфиг `/etc/tg-ai-bot/llm_profiles.toml` автоматика не трогает: он правится
+вручную с бэкапом, шаблон — `config/llm_profiles.toml.production.example`.
+
+Запасной путь при недоступности CI — сборка на сервере (нужен свободный swap,
+иначе OOM), затем restart и те же проверки. Сначала сделать dry-run. Не
+использовать `--delete`: production checkout может
 содержать SQLx migration-файлы, уже применённые к БД, но отсутствующие в текущем
 source snapshot. Удаление такого файла приведёт к `VersionMissing` при следующем
 старте. Устаревшие исходники удалять только отдельной проверенной процедурой
