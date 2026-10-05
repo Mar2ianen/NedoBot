@@ -6,7 +6,11 @@
 set -euo pipefail
 
 STAGE_DIR="${1:?usage: install_release_binaries.sh <staged-artifact-dir>}"
-DEST_DIR="/opt/tg-ai-bot-teloxide/target/release"
+# Both community instances run the same binaries from their own checkouts.
+DEST_DIRS=(
+    "/opt/tg-ai-bot-teloxide/target/release"
+    "/opt/nedobot-pvo/target/release"
+)
 BINARIES=(
     tg_ai_bot_teloxide
     nedonews_mcp_http
@@ -15,15 +19,17 @@ BINARIES=(
     reconcile_comment_delivery
 )
 
-for binary in "${BINARIES[@]}"; do
-    if [[ ! -x "${STAGE_DIR}/${binary}" ]]; then
-        echo "missing executable in stage dir: ${binary}" >&2
-        exit 1
-    fi
-    cp -f "${STAGE_DIR}/${binary}" "${DEST_DIR}/.${binary}.new"
-    chmod 0755 "${DEST_DIR}/.${binary}.new"
-    mv -f "${DEST_DIR}/.${binary}.new" "${DEST_DIR}/${binary}"
+for dest_dir in "${DEST_DIRS[@]}"; do
+    for binary in "${BINARIES[@]}"; do
+        if [[ ! -x "${STAGE_DIR}/${binary}" ]]; then
+            echo "missing executable in stage dir: ${binary}" >&2
+            exit 1
+        fi
+        cp -f "${STAGE_DIR}/${binary}" "${dest_dir}/.${binary}.new"
+        chmod 0755 "${dest_dir}/.${binary}.new"
+        mv -f "${dest_dir}/.${binary}.new" "${dest_dir}/${binary}"
+    done
 done
 
-runuser -u tg-ai-bot -- test -x "${DEST_DIR}/tg_ai_bot_teloxide"
-echo "installed: ${BINARIES[*]}"
+runuser -u tg-ai-bot -- test -x "/opt/tg-ai-bot-teloxide/target/release/tg_ai_bot_teloxide"
+echo "installed to: ${DEST_DIRS[*]}: ${BINARIES[*]}"
