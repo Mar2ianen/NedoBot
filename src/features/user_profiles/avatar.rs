@@ -11,17 +11,12 @@ use tokio::io::AsyncWrite;
 const MAX_PROFILE_AVATAR_BYTES: usize = 10 * 1024 * 1024;
 
 pub struct CachedProfileAvatar {
-    filename: String,
     // The next classifier slice reads the cached image through `base64()`.
     #[allow(dead_code)]
     path: PathBuf,
 }
 
 impl CachedProfileAvatar {
-    pub fn filename(&self) -> &str {
-        &self.filename
-    }
-
     #[allow(dead_code)] // Public for the avatar classifier added in the next slice.
     pub async fn base64(&self) -> anyhow::Result<String> {
         let bytes = tokio::fs::read(&self.path).await?;
@@ -55,7 +50,7 @@ pub async fn cache_profile_avatar(
         download_profile_avatar(bot, file_id, &avatars_dir, &path).await?;
     }
 
-    Ok(Some(CachedProfileAvatar { filename, path }))
+    Ok(Some(CachedProfileAvatar { path }))
 }
 
 async fn download_profile_avatar(

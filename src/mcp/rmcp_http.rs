@@ -21,7 +21,10 @@ use rmcp::transport::streamable_http_server::{
 use tracing::info;
 
 use super::{
-    bootstrap::{DATABASE_URL_ENV, MANIFEST_PATH_ENV, RmcpStdioConfig, build_chat_mcp_server},
+    bootstrap::{
+        DATABASE_URL_ENV, MANIFEST_PATH_ENV, RmcpStdioConfig, build_chat_mcp_server,
+        youtube_subtitles_from_env,
+    },
     server::ChatMcpServer,
 };
 
@@ -57,7 +60,8 @@ impl RmcpHttpConfig {
             parse_allowed_origins(env::var("MCP_ALLOWED_ORIGINS").ok().as_deref())?;
 
         Ok(Self {
-            bootstrap: RmcpStdioConfig::new(database_url, manifest_path)?,
+            bootstrap: RmcpStdioConfig::new(database_url, manifest_path)?
+                .with_youtube_subtitles(youtube_subtitles_from_env()?),
             bind,
             path,
             allowed_hosts,

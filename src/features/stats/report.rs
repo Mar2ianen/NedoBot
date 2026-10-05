@@ -1,5 +1,8 @@
 use sqlx::PgPool;
 use teloxide::prelude::*;
+use teloxide::types::{
+    FileId, InputFile, InputMediaPhoto, InputRichMessageMedia, InputRichMessageMediaContent,
+};
 use teloxide::utils::time::TimeContext;
 
 use crate::config::Config;
@@ -7,7 +10,7 @@ use crate::features::stats::render_html;
 use crate::features::stats::render_rich;
 use crate::features::stats::service::{self, HTML_TOP_LIMIT, RICH_TOP_LIMIT};
 use crate::features::stats::types::{StatsPeriod, StatsRender};
-use crate::telegram::render::{send_html, send_rich_html};
+use crate::telegram::render::{send_html, send_rich_html, send_rich_html_with_media};
 
 /// Transport wiring for stats commands. Data is assembled in `service`; output is
 /// formatted in the selected renderer. Neither renderer has database access.
@@ -91,21 +94,33 @@ pub async fn send_user_stats(
     if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
         service::refresh_user_profile(bot, pool, config, user_id).await;
     }
-    let mut data = service::user_stats_report_data(pool, config, target, reply_user_id)
+    let data = service::user_stats_report_data(pool, config, target, reply_user_id)
         .await
         .map_err(stats_error("failed to build user stats"))?;
-    if let (StatsRender::Rich, Some(data)) = (render, data.as_mut()) {
-        service::enrich_user_stats_avatar(bot, config, data).await;
-    }
+    let avatar_file_id = (render == StatsRender::Rich)
+        .then(|| {
+            data.as_ref()
+                .and_then(|data| data.profile_photo_file_id.clone())
+        })
+        .flatten();
     let report = match render {
         StatsRender::Html => {
             render_html::user_stats(data.as_ref(), target, config.discussion_chat_id)
         }
-        StatsRender::Rich => {
-            render_rich::user_stats(data.as_ref(), target, config.discussion_chat_id)
-        }
+        StatsRender::Rich => render_rich::user_stats(
+            data.as_ref(),
+            target,
+            config.discussion_chat_id,
+            avatar_file_id
+                .as_ref()
+                .map(|_| render_rich::USER_STATS_AVATAR_MEDIA_ID),
+        ),
     };
-    send_stats_report(bot, chat_id, report, render).await?;
+    if let Some(file_id) = avatar_file_id {
+        send_rich_html_with_media(bot, chat_id, report, [user_stats_avatar_media(file_id)]).await?;
+    } else {
+        send_stats_report(bot, chat_id, report, render).await?;
+    }
     Ok(())
 }
 
@@ -132,8 +147,18 @@ fn numeric_target_user_id(target: Option<&str>) -> Option<i64> {
     target?.parse().ok()
 }
 
+fn user_stats_avatar_media(file_id: String) -> InputRichMessageMedia {
+    InputRichMessageMedia::new(
+        render_rich::USER_STATS_AVATAR_MEDIA_ID,
+        InputRichMessageMediaContent::Photo(InputMediaPhoto::new(InputFile::file_id(FileId(
+            file_id,
+        )))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::features::stats::render_html::message_preview;
     use crate::features::stats::types::MessageMediaPreview;
 
@@ -149,5 +174,30 @@ mod tests {
             ),
             "медиа: голосовое"
         );
+    }
+
+    #[test]
+    fn user_stats_avatar_media_matches_the_html_reference() {
+        let media = user_stats_avatar_media("avatar-file-id".to_owned());
+        let message = teloxide::types::InputRichMessage::html(format!(
+            "<img src=\"tg://photo?id={}\">",
+            render_rich::USER_STATS_AVATAR_MEDIA_ID
+        ))
+        .media([media]);
+        let value = serde_json::to_value(message).expect("serialize rich user stats message");
+
+        assert_eq!(
+            value["html"],
+            format!(
+                "<img src=\"tg://photo?id={}\">",
+                render_rich::USER_STATS_AVATAR_MEDIA_ID
+            )
+        );
+        assert_eq!(
+            value["media"][0]["id"],
+            render_rich::USER_STATS_AVATAR_MEDIA_ID
+        );
+        assert_eq!(value["media"][0]["media"]["type"], "photo");
+        assert_eq!(value["media"][0]["media"]["media"], "avatar-file-id");
     }
 }

@@ -10,7 +10,6 @@ use crate::features::stats::types::{
     TopMessageUser, TopMessagesReportData, TopReactedMessage, TopReactedReportData,
     UserPresentation, UserStatsReportData, UserTotals, display_name,
 };
-use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
 
 const PERIOD_TOP_USERS_LIMIT: i64 = 8;
@@ -211,13 +210,9 @@ pub async fn user_stats_report_data(
     Ok(Some(UserStatsReportData {
         username: profile.as_ref().and_then(|value| value.username.clone()),
         bio: profile.as_ref().and_then(|value| value.bio.clone()),
-        avatar_url: None,
         profile_photo_file_id: profile
             .as_ref()
             .and_then(|value| value.profile_photo_file_id.clone()),
-        profile_photo_file_unique_id: profile
-            .as_ref()
-            .and_then(|value| value.profile_photo_file_unique_id.clone()),
         observed_at: member.as_ref().and_then(|value| value.observed_at.clone()),
         written_tag: member.as_ref().and_then(|value| value.written_tag.clone()),
         user,
@@ -232,23 +227,6 @@ pub async fn user_stats_report_data(
         reactions_received,
         top_words,
     }))
-}
-
-/// Rich reports may show an avatar. Keep this network and file-cache work out of
-/// the plain HTML path, where the result would be discarded.
-pub async fn enrich_user_stats_avatar(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-    data: &mut UserStatsReportData,
-) {
-    data.avatar_url = cached_profile_photo_url(
-        bot,
-        config,
-        data.user.user_id,
-        data.profile_photo_file_id.as_deref(),
-        data.profile_photo_file_unique_id.as_deref(),
-    )
-    .await;
 }
 
 pub async fn refresh_user_profile(
@@ -311,40 +289,6 @@ async fn refresh_ranked_users(
             tracing::debug!(%err, user_id, "failed to refresh ranked user from Telegram");
         }
     }
-}
-
-async fn cached_profile_photo_url(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-    user_id: i64,
-    file_id: Option<&str>,
-    unique_id: Option<&str>,
-) -> Option<String> {
-    let public_base_url = config
-        .public_base_url
-        .as_deref()?
-        .trim()
-        .trim_end_matches('/');
-    let avatar = match cache_profile_avatar(
-        bot.inner(),
-        &config.static_files_dir,
-        user_id,
-        file_id,
-        unique_id,
-    )
-    .await
-    {
-        Ok(Some(avatar)) => avatar,
-        Ok(None) => return None,
-        Err(err) => {
-            tracing::debug!(%err, user_id, "failed to cache profile photo");
-            return None;
-        }
-    };
-    Some(format!(
-        "{public_base_url}/tg-ai-bot-static/avatars/{}",
-        avatar.filename()
-    ))
 }
 
 fn period_top_user(row: repo::PeriodTopUserRow) -> PeriodTopUser {

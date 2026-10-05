@@ -6,6 +6,8 @@ use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
 use teloxide::utils::time::{DateTimeFormat, DateTimeToken, TimeContext};
 
+pub const USER_STATS_AVATAR_MEDIA_ID: &str = "user_stats_avatar";
+
 pub fn chat_stats(
     data: &ChatStatsReportData,
     discussion_chat_id: i64,
@@ -213,6 +215,7 @@ pub fn user_stats(
     data: Option<&UserStatsReportData>,
     requested_target: Option<&str>,
     discussion_chat_id: i64,
+    avatar_media_id: Option<&str>,
 ) -> String {
     let Some(data) = data else {
         return match requested_target.map(str::trim).filter(|value| !value.is_empty()) { Some(_) => "<h1>Профиль не найден</h1><p>Не нашёл пользователя. Используй id, username из уже виденных ботом пользователей или reply на сообщение.</p>".to_string(), None => "<h1>Профиль не найден</h1><p>Не понял, кого смотреть. Передай id, username или reply на сообщение.</p>".to_string() };
@@ -250,11 +253,7 @@ pub fn user_stats(
             )
         })
         .unwrap_or_default();
-    let avatar = data
-        .avatar_url
-        .as_deref()
-        .map(|url| format!("<img src=\"{}\"/>", escape_html(url)))
-        .unwrap_or_default();
+    let avatar = avatar_media_id.map(avatar_html).unwrap_or_default();
     format!(
         "<h1>{}</h1>{}<details open><summary>Основное</summary>{}</details>{}<details open><summary>Активность</summary>{}</details><details><summary>Дополнительно</summary>{}</details>",
         escape_html(&data.user.display_name),
@@ -313,6 +312,12 @@ pub fn user_stats(
             vec!["частые слова".into(), top_words],
         ]),
     )
+}
+
+fn avatar_html(media_id: &str) -> String {
+    // Keep this as an explicit HTML media element. Telegram resolves the
+    // `tg://photo` reference against InputRichMessage.media by this id.
+    format!("<img src=\"tg://photo?id={}\">", escape_html(media_id))
 }
 
 fn table(headers: &[&str], rows: &[Vec<String>]) -> String {

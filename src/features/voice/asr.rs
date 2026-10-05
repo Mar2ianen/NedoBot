@@ -225,8 +225,10 @@ async fn transcribe_gemini_audio(
     }
 
     let bytes = tokio::fs::read(path).await?;
-    let client =
-        crate::http::client_with_proxy(GEMINI_TRANSCRIBE_TIMEOUT, config.llm_proxy_url.as_deref())?;
+    // Gemini ASR uses the direct API path. `LLM_PROXY_URL` is reserved for
+    // explicitly proxied LLM routes and must not silently move audio uploads
+    // to an unsupported egress region.
+    let client = crate::http::client_with_proxy(GEMINI_TRANSCRIBE_TIMEOUT, None)?;
     let upload_url = start_gemini_upload(&client, api_key, bytes.len(), mime_type).await?;
     let file = finalize_gemini_upload(&client, &upload_url, bytes, mime_type).await?;
     let interaction = match create_gemini_transcription(

@@ -1,9 +1,8 @@
 use serde_json::Value;
 use teloxide::types::{
-    FileId, InputFile, InputMediaPhoto, InputRichBlock, InputRichBlockButtons,
-    InputRichBlockExpandableBlockQuotation, InputRichBlockParagraph, InputRichBlockPhoto,
-    InputRichBlockSectionHeading, InputRichMessage, RichMessageButton, RichText, RichTextBold,
-    RichTextUrl,
+    InputRichBlock, InputRichBlockButtons, InputRichBlockExpandableBlockQuotation,
+    InputRichBlockParagraph, InputRichBlockSectionHeading, InputRichMessage, RichMessageButton,
+    RichText, RichTextBold, RichTextUrl,
 };
 
 use super::repo::{ReportCard, ReportResolution};
@@ -22,11 +21,19 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
         .map(|url| linked(target_name.clone(), url))
         .unwrap_or_else(|| plain(target_name.clone()));
     let message_link = message_url(card.chat_id, card.message_id);
-    let mut blocks = vec![
-        InputRichBlock::Heading(InputRichBlockSectionHeading {
-            text: RichText::from("🚨 Новый репорт"),
-            size: 2,
-        }),
+    let mut blocks = vec![InputRichBlock::Heading(InputRichBlockSectionHeading {
+        text: RichText::from("🚨 Новый репорт"),
+        size: 2,
+    })];
+
+    if let Some(message_link) = message_link.as_deref() {
+        blocks.push(InputRichBlock::Paragraph(paragraph([linked(
+            "↗ Оригинал сообщения",
+            message_link.to_owned(),
+        )])));
+    }
+
+    blocks.extend([
         InputRichBlock::Paragraph(paragraph([
             bold("Цель: "),
             target_link,
@@ -45,22 +52,12 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
                 format_time(card.target_created_at)
             )),
         ])),
-    ];
-
-    if let Some(file_id) = card.profile_photo_file_id.as_deref() {
-        blocks.insert(
-            1,
-            InputRichBlock::Photo(InputRichBlockPhoto {
-                photo: InputMediaPhoto::new(InputFile::file_id(FileId(file_id.to_owned()))),
-                caption: None,
-            }),
-        );
-    }
+    ]);
 
     if let Some(reply_to_message_id) = card.target_reply_to_message_id {
         blocks.push(InputRichBlock::Paragraph(paragraph([
             bold("Ветка: "),
-            plain(format!("reply на сообщение #{reply_to_message_id}")),
+            plain(format!("ответ на сообщение #{reply_to_message_id}")),
         ])));
     }
 
@@ -214,28 +211,28 @@ fn profile_summary(card: &ReportCard) -> String {
         values.push("бот".to_owned());
     }
     if card.profile_is_premium == Some(true) {
-        values.push("premium".to_owned());
+        values.push("премиум".to_owned());
     }
     if let Some(language) = card.profile_language_code.as_deref() {
-        values.push(format!("язык {language}"));
+        values.push(format!("язык: {language}"));
     }
     if let Some(status) = card.member_status.as_deref() {
-        values.push(format!("статус {status}"));
+        values.push(format!("статус: {}", human_member_status(status)));
     }
     if card.is_admin == Some(true) {
         values.push("админ".to_owned());
     }
     if let Some(bio) = card.profile_bio.as_deref() {
-        values.push(format!("bio: {}", truncate(bio, 180)));
+        values.push(format!("описание: {}", truncate(bio, 180)));
     }
     if card.personal_channel_has_adult_links == Some(true) {
-        values.push("adult-ссылки в личном канале".to_owned());
+        values.push("ссылки 18+ в личном канале".to_owned());
     }
     if let Some(title) = card.personal_channel_title.as_deref() {
         values.push(format!("канал: {}", truncate(title, 100)));
     }
     if let Some(username) = card.personal_channel_username.as_deref() {
-        values.push(format!("канал username: @{username}"));
+        values.push(format!("имя канала: @{username}"));
     }
     if let Some(is_present) = card.is_present {
         values.push(if is_present {
@@ -257,7 +254,7 @@ fn activity_summary(card: &ReportCard) -> String {
     let links = card.link_count.unwrap_or(0);
     let media = card.media_count.unwrap_or(0);
     format!(
-        "сообщений {messages}, reply {replies}, ссылок {links}, медиа {media}; первое появление: {}; последнее: {}; статус наблюдали: {}",
+        "сообщений: {messages}, ответов: {replies}, ссылок: {links}, медиа: {media}; первое появление: {}; последнее сообщение: {}; статус наблюдался: {}",
         card.first_seen_at
             .map(format_time)
             .unwrap_or_else(|| "нет".to_owned()),
@@ -276,10 +273,10 @@ fn spam_summary(card: &ReportCard) -> String {
         values.push("уже отмечен как спамер".to_owned());
     }
     if let Some(score) = card.spam_score {
-        values.push(format!("score {score}"));
+        values.push(format!("оценка спама: {score}"));
     }
     if let Some(kind) = card.spam_type.as_deref() {
-        values.push(format!("type {kind}"));
+        values.push(format!("тип: {}", human_spam_type(kind)));
     }
     if let Some(reason) = card.spam_reason.as_deref() {
         values.push(format!("причина {}", truncate(reason, 160)));
@@ -288,7 +285,7 @@ fn spam_summary(card: &ReportCard) -> String {
         values.push(format!("типы {types}"));
     }
     if let Some(labels) = compact_json(card.spam_profile_labels.as_ref(), 180) {
-        values.push(format!("profile labels {labels}"));
+        values.push(format!("метки профиля: {labels}"));
     }
     if let Some(score) = card.audit_risk_score {
         let analyzed_at = card
@@ -296,19 +293,26 @@ fn spam_summary(card: &ReportCard) -> String {
             .map(|value| format!(" @{}", format_time(value)))
             .unwrap_or_default();
         values.push(format!(
-            "audit {score}/{}{}",
-            card.audit_risk_level.as_deref().unwrap_or("?"),
+            "аудит: {score}/100, риск {}{}",
+            card.audit_risk_level
+                .as_deref()
+                .map(human_risk_level)
+                .unwrap_or("неизвестен"),
             analyzed_at
         ));
     }
     if let Some(class) = card.audit_primary_risk_class.as_deref() {
-        values.push(format!("class {class}"));
+        values.push(format!("класс риска: {}", human_risk_class(class)));
     }
-    if let Some(labels) = compact_json(card.audit_risk_labels.as_ref(), 180) {
-        values.push(format!("audit labels {labels}"));
+    if let Some(labels) =
+        compact_humanized_array(card.audit_risk_labels.as_ref(), 240, human_audit_label)
+    {
+        values.push(format!("сигналы: {labels}"));
     }
-    if let Some(reasons) = compact_json(card.audit_risk_reasons.as_ref(), 220) {
-        values.push(format!("audit reasons {reasons}"));
+    if let Some(reasons) =
+        compact_humanized_array(card.audit_risk_reasons.as_ref(), 320, human_audit_reason)
+    {
+        values.push(format!("основания: {reasons}"));
     }
     if values.is_empty() {
         "сохранённых антиспам-сигналов нет".to_owned()
@@ -319,6 +323,12 @@ fn spam_summary(card: &ReportCard) -> String {
 
 fn compact_json(value: Option<&Value>, max_chars: usize) -> Option<String> {
     let value = value?;
+    if value.is_null()
+        || matches!(value, Value::Array(items) if items.is_empty())
+        || matches!(value, Value::Object(items) if items.is_empty())
+    {
+        return None;
+    }
     let rendered = match value {
         Value::Array(items) => items
             .iter()
@@ -333,8 +343,194 @@ fn compact_json(value: Option<&Value>, max_chars: usize) -> Option<String> {
     (!rendered.is_empty()).then(|| truncate(&rendered, max_chars))
 }
 
+fn compact_humanized_array(
+    value: Option<&Value>,
+    max_chars: usize,
+    humanize: fn(&str) -> String,
+) -> Option<String> {
+    let items = value?.as_array()?;
+    let rendered = items
+        .iter()
+        .filter_map(Value::as_str)
+        .take(8)
+        .map(humanize)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    (!rendered.is_empty()).then(|| truncate(&rendered, max_chars))
+}
+
+fn human_member_status(status: &str) -> &str {
+    match status {
+        "creator" => "создатель",
+        "administrator" => "администратор",
+        "member" => "участник",
+        "restricted" => "ограничен",
+        "left" => "вышел",
+        "kicked" => "заблокирован",
+        _ => status,
+    }
+}
+
+fn human_spam_type(kind: &str) -> String {
+    match kind {
+        "adult_personal_channel_promo" => "реклама 18+ в личном канале".to_owned(),
+        "foreign_invite_link_spam" => "спам через ссылку-приглашение".to_owned(),
+        "llm_profile_bait" => "подозрительный профиль".to_owned(),
+        "promo_dm_bait" => "приманка в личные сообщения".to_owned(),
+        "link_dropper" => "распространение ссылок".to_owned(),
+        "fresh_account_risk" => "риск нового аккаунта".to_owned(),
+        _ => humanize_identifier(kind),
+    }
+}
+
+fn human_risk_level(level: &str) -> &str {
+    match level {
+        "high" => "высокий",
+        "medium" => "средний",
+        "low" => "низкий",
+        _ => level,
+    }
+}
+
+fn human_risk_class(class: &str) -> String {
+    match class {
+        "adult_personal_channel_promo" => "реклама 18+ в личном канале".to_owned(),
+        "foreign_invite_link_spam" => "спам через ссылку-приглашение".to_owned(),
+        "llm_profile_bait" => "подозрительный профиль".to_owned(),
+        "promo_dm_bait" => "приманка в личные сообщения".to_owned(),
+        "link_dropper" => "распространение ссылок".to_owned(),
+        "fresh_account_risk" => "риск нового аккаунта".to_owned(),
+        _ => humanize_identifier(class),
+    }
+}
+
+fn human_audit_label(label: &str) -> String {
+    match label {
+        "recent_high_telegram_id" => "очень свежий Telegram ID".to_owned(),
+        "single_message_account" => "первое и единственное сообщение".to_owned(),
+        "very_new_to_chat" => "недавно появился в чате".to_owned(),
+        "only_channel_post_comments" => "комментирует только посты канала".to_owned(),
+        "reply_to_channel_post_not_comment" => {
+            "отвечает прямо на пост, а не на комментарий".to_owned()
+        }
+        "personal_channel_attached" => "подключён личный канал".to_owned(),
+        "personal_channel_external_link" => "в личном канале есть внешняя ссылка".to_owned(),
+        "personal_channel_adult_links" => "в личном канале есть ссылки 18+".to_owned(),
+        "personal_channel_invite_link" => "в личном канале есть ссылка-приглашение".to_owned(),
+        "recent_personal_channel_id" => "очень свежий ID личного канала".to_owned(),
+        "short_burst_account" => "несколько сообщений за короткое время".to_owned(),
+        "chat_message_has_link" => "в сообщении есть ссылка".to_owned(),
+        "invite_link_from_new_user" => "новый пользователь отправил ссылку-приглашение".to_owned(),
+        "foreign_invite_link_message" => "ссылка-приглашение с иностранным текстом".to_owned(),
+        "username_random_suffix" => "username похож на автоматически созданный".to_owned(),
+        "username_many_digits" => "в username много цифр".to_owned(),
+        "missing_profile_photo" => "нет видимой аватарки".to_owned(),
+        "duplicate_message_text" => "повторяются одинаковые сообщения".to_owned(),
+        "duplicate_message_texture" => "повторяется структура сообщений".to_owned(),
+        "similar_message_texture" => "сообщения необычно похожи".to_owned(),
+        "only_replies_or_comments" => "пишет только в ответах и комментариях".to_owned(),
+        "reply_to_bot_comment" => "ответил в ветке комментария бота".to_owned(),
+        "very_short_bio" => "очень короткое описание профиля".to_owned(),
+        "explicit_adult_promo_bio" => "описание профиля рекламирует сервис 18+".to_owned(),
+        "profile_bio_subscription_invite_offer" => {
+            "описание профиля рекламирует платную подписку".to_owned()
+        }
+        "not_present_in_chat" => "пользователь больше не в чате".to_owned(),
+        "mixed_script_profile_homoglyphs" => {
+            "в имени смешаны похожие латинские и кириллические буквы".to_owned()
+        }
+        "atypical_feminine_first_name" => "нетипичный для чата женский шаблон имени".to_owned(),
+        "display_name_reused_by_spammers" => "имя встречалось у спамеров".to_owned(),
+        "username_reused_by_spammers" => "username встречался у спамеров".to_owned(),
+        "display_name_reused_by_mixed_labels" => {
+            "имя встречалось у разных типов пользователей".to_owned()
+        }
+        "username_reused_by_mixed_labels" => {
+            "username встречался у разных типов пользователей".to_owned()
+        }
+        "display_name_reused_by_confirmed_normal" => {
+            "имя встречалось только у обычных пользователей".to_owned()
+        }
+        "username_reused_by_confirmed_normal" => {
+            "username встречался только у обычных пользователей".to_owned()
+        }
+        "display_name_reused_by_new_accounts" => {
+            "имя повторяется у других новых аккаунтов".to_owned()
+        }
+        "username_reused_by_new_accounts" => {
+            "username повторяется у других новых аккаунтов".to_owned()
+        }
+        _ => humanize_identifier(label),
+    }
+}
+
+fn human_audit_reason(reason: &str) -> String {
+    match reason {
+        "Only one observed chat message" => "в чате замечено только одно сообщение".to_owned(),
+        "Few messages concentrated in a short window" => {
+            "несколько сообщений отправлены за короткое время".to_owned()
+        }
+        "New user posted a link" => "новый пользователь отправил ссылку".to_owned(),
+        "New user posted a Telegram invite link with foreign/CJK text" => {
+            "новый пользователь отправил ссылку-приглашение с иностранным текстом".to_owned()
+        }
+        "Very new user posted a Telegram invite link" => {
+            "очень новый пользователь отправил ссылку-приглашение".to_owned()
+        }
+        "Telegram user id is in the recent high-id range observed by the bot" => {
+            "Telegram ID попадает в недавно наблюдавшийся высокий диапазон".to_owned()
+        }
+        "New user only comments under channel posts" => {
+            "новый пользователь комментирует только посты канала".to_owned()
+        }
+        "New user replies directly to a channel post, not another comment" => {
+            "новый пользователь отвечает прямо на пост канала, а не на комментарий".to_owned()
+        }
+        "User was first seen in this chat less than six hours ago" => {
+            "пользователь впервые замечен в чате менее шести часов назад".to_owned()
+        }
+        "User was first seen in this chat less than a day ago" => {
+            "пользователь впервые замечен в чате менее суток назад".to_owned()
+        }
+        "User has an attached personal channel" => {
+            "у пользователя подключён личный канал".to_owned()
+        }
+        "Attached personal channel id is in a very high range" => {
+            "ID личного канала попадает в очень высокий диапазон".to_owned()
+        }
+        "Attached personal channel contains adult/invite promo links" => {
+            "в личном канале есть ссылки 18+ или приглашения".to_owned()
+        }
+        "Attached personal channel contains Telegram invite links" => {
+            "в личном канале есть ссылки-приглашения Telegram".to_owned()
+        }
+        "Attached personal channel contains an external link" => {
+            "в личном канале есть внешняя ссылка".to_owned()
+        }
+        "No visible profile photo via Bot API" => "через Bot API не видна аватарка".to_owned(),
+        "Very short bio on a new account" => "у нового аккаунта очень короткое описание".to_owned(),
+        "Profile name mixes Latin and Cyrillic look-alike letters" => {
+            "в имени смешаны похожие латинские и кириллические буквы".to_owned()
+        }
+        "New user appears only in comment/reply contexts, not as normal chat participant" => {
+            "новый пользователь появляется только в комментариях и ответах".to_owned()
+        }
+        "New user replied to a bot first-comment thread" => {
+            "новый пользователь ответил в ветке первого комментария бота".to_owned()
+        }
+        "Replying to an existing comment is strong evidence of genuine chat participation" => {
+            "ответ на существующий комментарий — сильный признак обычного участия в чате".to_owned()
+        }
+        _ => "дополнительный сигнал аудита".to_owned(),
+    }
+}
+
+fn humanize_identifier(value: &str) -> String {
+    value.replace(['_', '-'], " ")
+}
+
 fn format_time(value: chrono::DateTime<chrono::Utc>) -> String {
-    value.format("%Y-%m-%d %H:%M UTC").to_string()
+    value.format("%d.%m.%Y %H:%M UTC").to_string()
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -427,6 +623,44 @@ mod tests {
     }
 
     #[test]
+    fn puts_original_message_link_before_report_details() {
+        let rendered = render_report(&card());
+        let serialized = serde_json::to_string(&rendered).expect("serialize rich report");
+
+        assert!(serialized.contains("↗ Оригинал сообщения"));
+        assert!(serialized.find("Оригинал сообщения") < serialized.find("Цель:"));
+        rendered
+            .validate_with(&teloxide::RichMessageContext::Send)
+            .expect("report card with original-message link must pass validation");
+    }
+
+    #[test]
+    fn renders_audit_details_in_russian() {
+        let mut card = card();
+        card.audit_risk_score = Some(71);
+        card.audit_risk_level = Some("high".to_owned());
+        card.audit_primary_risk_class = Some("fresh_account_risk".to_owned());
+        card.audit_risk_labels = Some(json!([
+            "only_channel_post_comments",
+            "single_message_account"
+        ]));
+        card.audit_risk_reasons = Some(json!([
+            "Only one observed chat message",
+            "New user only comments under channel posts"
+        ]));
+
+        let serialized =
+            serde_json::to_string(&render_report(&card)).expect("serialize rich report");
+
+        assert!(serialized.contains("риск высокий"));
+        assert!(serialized.contains("риск нового аккаунта"));
+        assert!(serialized.contains("комментирует только посты канала"));
+        assert!(serialized.contains("в чате замечено только одно сообщение"));
+        assert!(!serialized.contains("audit labels"));
+        assert!(!serialized.contains("Only one observed chat message"));
+    }
+
+    #[test]
     fn profile_link_uses_public_username_and_not_user_profile_button() {
         let mut card = card();
         card.profile_username = Some("target_user".to_owned());
@@ -457,14 +691,19 @@ mod tests {
     }
 
     #[test]
-    fn includes_profile_photo_as_a_rich_photo_block() {
+    fn profile_photo_does_not_break_rich_report_delivery() {
         let mut card = card();
         card.profile_photo_file_id = Some("avatar-file-id".to_owned());
         let rendered = render_report(&card);
         let value = serde_json::to_value(&rendered).expect("serialize rich report");
 
-        assert_eq!(value["blocks"][1]["type"], "photo");
-        assert_eq!(value["blocks"][1]["photo"]["media"], "avatar-file-id");
+        assert!(
+            value["blocks"]
+                .as_array()
+                .expect("rich report blocks")
+                .iter()
+                .all(|block| block["type"] != "photo")
+        );
         rendered
             .validate_with(&teloxide::RichMessageContext::Send)
             .expect("report card with avatar must pass Bot API rich-message validation");

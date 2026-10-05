@@ -35,6 +35,10 @@ pub struct ReportCard {
     pub target_snapshot: Value,
     pub resolution: ReportResolution,
     pub profile_username: Option<String>,
+    // Kept in the report projection for a future media-mode card. The current
+    // typed-block card cannot safely embed InputMediaPhoto with this teloxide
+    // fork because Telegram rejects its nested payload without `type`.
+    #[allow(dead_code)]
     pub profile_photo_file_id: Option<String>,
     pub profile_first_name: Option<String>,
     pub profile_last_name: Option<String>,
