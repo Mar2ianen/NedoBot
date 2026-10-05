@@ -47,6 +47,7 @@ jobs:
               retry_pending_comments reconcile_comment_delivery; do
             cp "target/release/$binary" dist/
           done
+          cp scripts/install_release_binaries.sh dist/
           ( cd dist && sha256sum * > SHA256SUMS )
           rustc --version > dist/BUILD_INFO.txt
           git rev-parse HEAD >> dist/BUILD_INFO.txt
@@ -86,7 +87,7 @@ jobs:
           scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
             dist/retry_pending_comments dist/reconcile_comment_delivery \
-            scripts/install_release_binaries.sh \
+            dist/install_release_binaries.sh \
             "$VPS_USER@$VPS_HOST:$stage/"
           test -x dist/tg_ai_bot_teloxide
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
