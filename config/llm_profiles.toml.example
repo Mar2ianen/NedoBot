@@ -317,6 +317,12 @@ search_mcp_tool_reddit = "reddit_search"
 search_mcp_tool_fetch = "web_fetch_exa"
 search_fetch_top_n = 4
 search_fetch_max_chars = 16000
+youtube_subtitles_enabled = true
+youtube_subtitles_command = "yt-dlp"
+youtube_subtitles_languages = ["ru", "ru.*", "en", "en.*"]
+youtube_subtitles_timeout_sec = 15
+youtube_subtitles_max_chars = 12000
+youtube_subtitles_max_videos = 2
 comment_blocked_source_domains = [
   "meduza.io", "theins.ru", "tvrain.tv", "novayagazeta.eu",
   "zona.media", "istories.media", "holod.media", "verstka.media",
@@ -331,6 +337,8 @@ search_github_mcp_tools = ["search_issues", "search_code"]
 
 new_user_audit_enabled = false
 new_user_audit_max_tokens = 900
+cas_enabled = false
+cas_timeout_sec = 5
 gemini_thinking_budget = 1024
 owner_telegram_id = 5939287960
 send_owner_preview = true

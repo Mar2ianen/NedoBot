@@ -313,6 +313,7 @@ async fn materialize_new_user_audit_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     job: &NewUserAuditJob,
     components: &ScoreComponents,
+    embedding_model: &str,
 ) -> anyhow::Result<()> {
     let final_score = components.final_score();
     let final_signals = components.final_signals();
@@ -322,7 +323,15 @@ async fn materialize_new_user_audit_in_transaction(
         set risk_baseline_score = $3, risk_baseline_signals = $4,
             risk_first_message_score = $5, risk_first_message_signals = $6,
             risk_avatar_score = $7, risk_avatar_signals = $8,
-            risk_score = $9, risk_level = $10, risk_signal_breakdown = $11
+            risk_score = $9, risk_level = $10, risk_signal_breakdown = $11,
+            first_message_embedding = case
+                when $13 is null then first_message_embedding
+                else $13::vector
+            end,
+            first_message_embedding_model = case
+                when $13 is null then first_message_embedding_model
+                else $14
+            end
         where chat_id = $1 and telegram_user_id = $2
           and unified_audit_snapshot_hash = $12
         "#,
@@ -339,6 +348,8 @@ async fn materialize_new_user_audit_in_transaction(
     .bind(components.final_level())
     .bind(&final_signals)
     .bind(&job.snapshot_hash)
+    .bind(components.first_message_embedding.clone())
+    .bind(embedding_model)
     .execute(&mut **tx)
     .await?;
     if audit_update.rows_affected() == 0 {
@@ -398,6 +409,7 @@ pub async fn materialize_new_user_audit_job(
     pool: &PgPool,
     job: &NewUserAuditJob,
     components: &ScoreComponents,
+    embedding_model: &str,
 ) -> anyhow::Result<CasResult> {
     let mut tx = pool.begin().await?;
     let update = sqlx::query(
@@ -413,7 +425,7 @@ pub async fn materialize_new_user_audit_job(
         tx.rollback().await?;
         return Ok(result);
     }
-    materialize_new_user_audit_in_transaction(&mut tx, job, components).await?;
+    materialize_new_user_audit_in_transaction(&mut tx, job, components, embedding_model).await?;
     tx.commit().await?;
     Ok(result)
 }

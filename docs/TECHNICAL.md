@@ -119,7 +119,7 @@ Civil date/time и bare clock нормализуются через эту зо�
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. При отказе output validator LLM service пишет в journal только route, fallback index, provider, model, номер попытки, размер ответа и безопасный `validation_reason`; полный prompt и ответ модели не логируются. Для `first_comment` причины типизированы (`missing_chat_link`, `raw_link`, `generic_cta`, `invalid_json`, `chat_evidence`, `source_link`, `blocked_term` и другие), а тот же код сохраняется в `llm_generations.attempts` при успешном fallback. Полная topology приведена в `config/llm_profiles.toml.example`.
 
-Если Gemini недоступен напрямую из региона сервера, `LLM_PROXY_URL` может направить только LLM/Gemini-запросы через HTTP/SOCKS proxy, не трогая Telegram polling. На текущем `vps-153` Gemini-трафик идёт через `LLM_PROXY_URL=socks5h://127.0.0.1:2080`, который поднимает systemd-сервис `gemini-proxy-ssh.service` SSH-туннелем до `vps-85`.
+`LLM_PROXY_URL` остаётся опциональной настройкой для явно проксируемых LLM routes. На текущем `vps-153` все активные routes и Gemini ASR используют прямой egress; Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят.
 
 Для Gemini 3.x бот использует актуальный `thinkingLevel=low` и не передаёт устаревшие `temperature` и числовой `thinkingBudget`. `runtime.llm_max_tokens` задаёт полный лимит вывода; для JSON-комментария нужен запас, поэтому значение по умолчанию — 180. Для старых Gemini-моделей сохраняется `runtime.gemini_thinking_budget`: бот отправляет `maxOutputTokens = runtime.llm_max_tokens + runtime.gemini_thinking_budget`.
 
@@ -162,6 +162,11 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `runtime.search_github_mcp_tools` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
 - Для GitHub results бот дополнительно дочитывает top-N URL через read-only `get_issue` / `get_file_contents`: issue/PR body, `README.md`, `CHANGELOG.md`, release docs и другие blob-файлы попадают в snippet как `Fetch: ...`.
 - `SEARCH_FETCH_TOP_N` ограничивает число URL для fetch, `SEARCH_FETCH_MAX_CHARS` — объём текста на страницу.
+- `runtime.youtube_subtitles_enabled` добавляет к найденным YouTube URL локальное чтение ручных и auto-субтитров через `runtime.youtube_subtitles_command` (обычно `yt-dlp`). Обогащение выполняется после внешнего MCP search/fetch и доступно одинаково первому комментарию и `/ask`; новый MCP transport для этого не создаётся.
+- `runtime.youtube_subtitles_languages` задаёт приоритетные селекторы языков yt-dlp (`ru`, `ru.*`, `en`, `en.*`), `runtime.youtube_subtitles_max_videos` ограничивает число роликов на один source query, а `runtime.youtube_subtitles_max_chars` — объём добавляемого текста. Таймаут subprocess задаётся `runtime.youtube_subtitles_timeout_sec`.
+- При включённой функции отсутствие команды/бинарника или некорректные limits — startup error; при отсутствии субтитров, timeout или ошибке конкретного ролика исходный search result сохраняется без transcript.
+- Внешний RMCP дополнительно предоставляет `youtube.get_subtitles`: он принимает только public URL конкретного YouTube-видео и возвращает найденный язык и очищенный текст субтитров. Настройки отдельного RMCP-сервиса задаются через `MCP_YOUTUBE_SUBTITLES_*`; по умолчанию инструмент выключен, а включение требует установленного `yt-dlp`.
+- RMCP вызывает `yt-dlp` без shell, с `--skip-download` и `--no-playlist`, ограничивает один вызов timeout/размером текста и удаляет временные VTT-файлы после чтения. Плейлисты, credentials в URL и произвольные домены отклоняются до запуска subprocess.
 - Ошибка extract превращается в skipped `SearchContext`; ошибка или таймаут отдельного MCP source оставляет успешные результаты других источников доступными для комментария.
 - Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. В промпт помещается до 24 результатов, до 16 000 символов на результат и до 160 000 символов суммарно; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
@@ -368,6 +373,10 @@ ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --releas
 - `promo_dm_bait` - промо через “могу отправить/поделиться/пишите в личку”, тематика может быть разная, но механика одна.
 - `adult_personal_channel_promo` - личный/personal channel пользователя ведёт на adult-промо, инвайт-ссылки или схожий funnel.
 - Для первого текстового сообщения сохраняются LLM-маркеры кампании, RuBERT-вектор и сходство с вручную подтверждённым спамом. Эти сигналы лишь повышают review-риск; автоматической пометки спамером нет.
+- Эмбеддинг первого сообщения персистится в `telegram_new_user_profile_audits.first_message_embedding` при материализации аудита и пополняет корпус для будущих `spam_similarity`-проверок; история скоринга при этом не пересчитывается. Пустой корпус заполняется бинарём `backfill_audit_embeddings` (`DATABASE_URL` + `RAG_EMBEDDING_*`, флаги `--only-spammers`/`--all`, `--chat-id`, `--limit`).
+- Template-матчинг (`template_match_count`) сравнивает первое сообщение с текстами из `telegram_messages`, у которых выставлен `spam_marked_at`. Ручная разметка обязана штамповать сообщения (`spam_marked_at`, `spam_source='manual_owner_confirmation'`), иначе помеченные спамеры не попадают в корпус: `is_spammer` на пользователе недостаточно.
+- Повтор title личного канала на размеченных спамерах — сильный сигнал reuse (`personal_channel_title_reused_by_spammers`, +24): операторы клонируют фуннель-каналы под каждый аккаунт, chat_id различается, а нормализованный title совпадает.
+- CAS (Combot Anti-Spam, `api.cas.chat`) подключён как слабый внешний сигнал за флагом `cas_enabled` (`cas_timeout_sec`, default 5, валидация 1..30): положительный вердикт даёт не более +12 (`EXTERNAL_SCORE_CAP`) и никогда сам не выводит в high; «Record not found» и любые ошибки трактуются как unknown/clean и ничего не добавляют.
 
 Репорты пользователей:
 
@@ -750,7 +759,7 @@ ryzen_custom_emoji_id = "5444875271163364561"
 - Реакции считаются только с момента включения reaction updates; старые реакции Telegram Bot API задним числом не отдаёт.
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
-- Voice ASR сейчас только через Groq; local Whisper/Ollama audio не подключены.
+- Voice ASR работает в двойном режиме Gemini primary + Groq shadow; local Whisper/Ollama audio не подключены.
 - Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; статические настройки меняются в `[runtime]` profile TOML и требуют рестарта сервиса. DB-backed dynamic policy — отдельный следующий этап.

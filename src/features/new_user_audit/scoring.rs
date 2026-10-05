@@ -13,12 +13,20 @@ pub const REVIEW_RISK_THRESHOLD: i32 = 70;
 #[allow(dead_code)]
 const FIRST_MESSAGE_SCORE_CAP: i32 = 45;
 
+/// Жёсткий cap внешнего репутационного сигнала (CAS): слабый сигнал,
+/// положительный вердикт не должен сам выводить пользователя в high.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub const EXTERNAL_SCORE_CAP: i32 = 12;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FirstMessageScoreContext {
     pub template_matches: i32,
     pub spam_similarity: Option<f64>,
     pub feminine_profile_name: bool,
+    /// Свежий pgvector-литерал первого сообщения для персиста в корпус.
+    /// `None`, когда assessment отсутствует или текст пуст.
+    pub embedding: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -30,12 +38,20 @@ pub struct ScoreComponents {
     pub first_message_signals: Value,
     pub avatar_score: i32,
     pub avatar_signals: Value,
+    /// Свежий эмбеддинг первого сообщения для корпуса `spam_similarity`.
+    /// Хранится отдельно от скора: история скоринга не пересчитывается,
+    /// корпус обслуживает только будущие аудиты.
+    pub first_message_embedding: Option<String>,
+    /// Внешняя репутация (CAS): слабый capped-сигнал поверх локального скора.
+    pub external_score: i32,
+    pub external_signals: Value,
 }
 
 #[allow(dead_code)]
 impl ScoreComponents {
     pub fn final_score(&self) -> i32 {
-        (self.baseline_score + self.first_message_score + self.avatar_score).clamp(0, 100)
+        (self.baseline_score + self.first_message_score + self.avatar_score + self.external_score)
+            .clamp(0, 100)
     }
 
     pub fn final_level(&self) -> &'static str {
@@ -52,12 +68,21 @@ impl ScoreComponents {
             &self.baseline_signals,
             &self.first_message_signals,
             &self.avatar_signals,
+            &self.external_signals,
         ] {
             if let Some(items) = component.as_array() {
                 signals.extend(items.iter().cloned());
             }
         }
         Value::Array(signals)
+    }
+
+    /// Применяет внешний репутационный сигнал с жёстким cap: положительный
+    /// вердикт добавляет очки, unknown/clean ничего не меняют, но unknown
+    /// фиксируется меткой для наблюдаемости.
+    pub fn apply_external(&mut self, score: i32, signals: Value) {
+        self.external_score = score.clamp(0, EXTERNAL_SCORE_CAP);
+        self.external_signals = signals;
     }
 }
 
@@ -71,7 +96,7 @@ pub fn score_assessment(
     let (first_message_score, first_message_signals) = assessment
         .first_message_assessment
         .as_ref()
-        .map(|assessment| score_first_message(assessment, first_message_context))
+        .map(|assessment| score_first_message(assessment, &first_message_context))
         .unwrap_or_else(|| (0, Value::Array(Vec::new())));
     let (avatar_score, avatar_signals) = assessment
         .avatar_observation
@@ -86,12 +111,15 @@ pub fn score_assessment(
         first_message_signals,
         avatar_score,
         avatar_signals,
+        first_message_embedding: first_message_context.embedding,
+        external_score: 0,
+        external_signals: Value::Array(Vec::new()),
     }
 }
 
 fn score_first_message(
     assessment: &FirstMessageAssessment,
-    context: FirstMessageScoreContext,
+    context: &FirstMessageScoreContext,
 ) -> (i32, Value) {
     let paid_easy_task = has_marker(assessment, FirstMessageRiskMarker::PaidEasyTaskOffer);
     let performative_feminine_persona = context.feminine_profile_name
@@ -307,6 +335,7 @@ mod tests {
                 template_matches: 1,
                 spam_similarity: Some(0.9),
                 feminine_profile_name: false,
+                embedding: None,
             },
         );
         assert_eq!(components.first_message_score, 45);
