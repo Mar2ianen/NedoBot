@@ -89,6 +89,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_public_mcp_scope(&pool).await;
     assert_chat_search_quality_path(&pool).await;
     assert_rich_backfill_and_exact_word_counts(&pool).await;
+    assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
@@ -4015,7 +4016,24 @@ async fn assert_rich_backfill_and_exact_word_counts(pool: &PgPool) {
         .bind(CHAT).bind(FOREIGN).execute(pool).await.unwrap();
 }
 
-
+async fn assert_retention_keeps_true_first_seen(pool: &PgPool) {
+    const CHAT: i64 = -1001932061163;
+    let since = Utc::now() - Duration::days(60);
+    query("insert into telegram_messages (chat_id,message_id,user_id,text,created_at) values ($1,880011,880010,'old',$2),($1,880012,880010,'recent',$3),($1,880013,880011,'new',$3)")
+        .bind(CHAT).bind(since-Duration::days(100)).bind(since+Duration::days(1)).execute(pool).await.unwrap();
+    let activity = stats_repo::cohort_activity(pool, CHAT, since)
+        .await
+        .unwrap();
+    assert!(!activity.iter().any(|(user, _)| *user == 880010));
+    assert!(activity.iter().any(|(user, _)| *user == 880011));
+    query(
+        "delete from telegram_messages where chat_id=$1 and message_id between 880011 and 880013",
+    )
+    .bind(CHAT)
+    .execute(pool)
+    .await
+    .unwrap();
+}
 
 async fn assert_reputation_feature_order_upgrade(pool: &PgPool) {
     const CHAT: i64 = -1001932061163;
