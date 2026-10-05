@@ -53,7 +53,7 @@ use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 use crate::telegram::manual_moderation as manual_moderation_frontend;
 #[cfg(feature = "ask")]
 use crate::telegram::media::download_largest_photo_base64;
-use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::render::escape_html;
 use crate::telegram::service_messages::{self, MessageAudience};
 
 pub async fn handle_command(
@@ -672,12 +672,20 @@ async fn handle_ask_command(
         send_command_html(bot, msg, state, "Напиши вопрос: /ask &lt;вопрос&gt;.").await?;
         return Ok(());
     }
-    let scope_chat_id = private_scope_chat_id.unwrap_or(msg.chat.id.0);
+    let scope_chat_id =
+        ask_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), private_scope_chat_id);
 
     let use_native_draft = msg.chat.is_private();
-    let permit = state.ask_slots.clone().try_acquire_owned().map_err(|_| {
-        teloxide::RequestError::Io(std::io::Error::other("ask assistant is busy").into())
-    })?;
+    let Ok(permit) = state.ask_slots.clone().try_acquire_owned() else {
+        send_command_html(
+            bot,
+            msg,
+            state,
+            "Сейчас отвечаю на другой вопрос. Попробуй /ask чуть позже.",
+        )
+        .await?;
+        return Ok(());
+    };
     let backend = AskDrafterBackend::new(
         bot.clone(),
         msg.chat.id,
@@ -768,6 +776,17 @@ async fn handle_ask_command(
                     if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
                         tracing::warn!(%err, message_id = sent.id.0, "failed to save /ask answer message");
                     }
+                    if let Err(err) = crate::db::telegram::record_bot_reply(
+                        &state.pool,
+                        sent.chat.id.0,
+                        sent.id.0,
+                        msg,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%err, "failed to save /ask reply relationship");
+                    }
                     record_ask_delivery(
                         state,
                         answer.ask_run_id,
@@ -781,7 +800,7 @@ async fn handle_ask_command(
                 Err(err) => {
                     fallback_after_finish_error(
                         bot,
-                        msg.chat.id,
+                        msg,
                         state,
                         answer.ask_run_id,
                         AskRunStatus::Completed,
@@ -817,7 +836,7 @@ async fn handle_ask_command(
                 Err(finish_err) => {
                     fallback_after_finish_error(
                         bot,
-                        msg.chat.id,
+                        msg,
                         state,
                         ask_run_id,
                         AskRunStatus::Failed,
@@ -856,7 +875,7 @@ fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
 #[cfg(feature = "ask")]
 async fn fallback_after_finish_error(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    chat_id: ChatId,
+    command: &Message,
     state: &AppState,
     ask_run_id: Option<i64>,
     fallback_status: AskRunStatus,
@@ -877,7 +896,7 @@ async fn fallback_after_finish_error(
     apply_finish_error_policy(
         certainty,
         fallback_status,
-        || send_ask_fallback(bot, chat_id, fallback_text),
+        || send_ask_fallback(bot, command, state, fallback_text),
         || state.ask_delivery_metrics.record_unknown_delivery_failure(),
         |status, outcome, certainty| {
             record_ask_delivery(state, ask_run_id, status, outcome, certainty)
@@ -942,21 +961,41 @@ async fn record_ask_delivery(
 #[cfg(feature = "ask")]
 async fn send_ask_fallback(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    chat_id: ChatId,
+    command: &Message,
+    state: &AppState,
     markdown: &str,
 ) -> ResponseResult<()> {
-    if markdown.chars().count() <= TELEGRAM_TEXT_LIMIT {
-        return send_html(bot, chat_id, escape_html(markdown))
-            .await
-            .map(|_| ());
+    let sent = if markdown.chars().count() <= TELEGRAM_TEXT_LIMIT {
+        crate::telegram::render::send_html_reply(
+            bot,
+            command.chat.id,
+            command.id,
+            escape_html(markdown),
+        )
+        .await?
+    } else {
+        bot.send_document(
+            command.chat.id,
+            InputFile::memory(markdown.as_bytes().to_vec()).file_name("ask-answer.md"),
+        )
+        .reply_parameters(ReplyParameters::new(command.id).allow_sending_without_reply())
+        .await?
+    };
+    if let Err(error) = ingest_message(&state.pool, &sent, &state.config).await {
+        tracing::warn!(%error, "failed to save /ask fallback message");
     }
-
-    bot.send_document(
-        chat_id,
-        InputFile::memory(markdown.as_bytes().to_vec()).file_name("ask-answer.md"),
+    if let Err(error) = crate::db::telegram::record_bot_reply(
+        &state.pool,
+        sent.chat.id.0,
+        sent.id.0,
+        command,
+        Some(markdown),
     )
     .await
-    .map(|_| ())
+    {
+        tracing::warn!(%error, "failed to save /ask fallback reply");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "ask")]
@@ -1003,12 +1042,20 @@ fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<Str
                 .as_deref()
                 .unwrap_or("нет"),
             if media.is_empty() { "нет" } else { &media },
-            reply
-                .text()
-                .or_else(|| reply.caption())
+            crate::telegram::entities::message_text(reply)
+                .as_deref()
                 .unwrap_or("[нет текста]")
         )
     })
+}
+
+#[cfg(feature = "ask")]
+fn ask_scope_chat_id(chat_id: i64, is_private: bool, default_chat_id: Option<i64>) -> i64 {
+    if is_private {
+        default_chat_id.unwrap_or(chat_id)
+    } else {
+        chat_id
+    }
 }
 
 #[cfg(feature = "ask")]
@@ -1224,6 +1271,20 @@ fn status_period_from_args(args: &str) -> Option<StatsPeriod> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ask")]
+    #[test]
+    fn group_ask_uses_its_own_chat_and_rich_reply_is_visible() {
+        assert_eq!(ask_scope_chat_id(-100222, false, Some(-100111)), -100222);
+        assert_eq!(ask_scope_chat_id(42, true, Some(-100111)), -100111);
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "message_id":10,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},"text":"/ask и что?",
+            "reply_to_message":{"message_id":9,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},
+                "rich_message":{"blocks":[{"type":"paragraph","text":"Предыдущий ответ"}]}}
+        })).unwrap();
+        let context = build_ask_reply_context(&msg, -100111).unwrap();
+        assert!(context.contains("Предыдущий ответ"));
+        assert!(!context.contains("[нет текста]"));
+    }
     use super::*;
 
     #[test]

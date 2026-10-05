@@ -484,7 +484,7 @@ models = ["ollama_memory"]
                 selections.selections[1].provider_key,
                 selections.selections[1].model.model.as_str()
             ),
-            ("groq", "qwen/qwen3.6-27b")
+            ("openrouter", "qwen/qwen3.6-27b")
         );
         assert_eq!(
             selections.selections[1].capabilities.structured_output,
@@ -501,24 +501,26 @@ models = ["ollama_memory"]
     }
 
     #[test]
-    fn ask_route_keeps_reasoning_across_qwen_fallbacks() {
+    fn ask_route_keeps_explicit_reasoning_and_an_independent_vision_fallback() {
         let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
 
         let selections = profiles
             .resolve_route("ask", &RouteRequirements::default())
             .unwrap();
 
-        assert_eq!(selections.selections.len(), 3);
+        assert_eq!(selections.selections.len(), 4);
         assert_eq!(selections.selections[0].model.model, "qwen/qwen3.8-27b");
         assert_eq!(selections.selections[1].model.model, "qwen/qwen3.6-27b");
         assert_eq!(selections.selections[2].model.model, "gemma4:31b");
+        assert_eq!(selections.selections[3].model.model, "gemini-3.5-flash");
+        assert!(selections.selections[3].capabilities.supports_images);
         assert_eq!(
             selections.selections[0].capabilities.thinking,
             ThinkingMode::Default
         );
         assert_eq!(
             selections.selections[1].capabilities.thinking,
-            ThinkingMode::Default
+            ThinkingMode::None
         );
         assert_eq!(
             selections.selections[2].capabilities.thinking,

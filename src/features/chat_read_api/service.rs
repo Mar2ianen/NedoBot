@@ -422,13 +422,38 @@ pub async fn count_messages(
     };
     let ts_query = full_text_query(&query, &request.match_mode);
     let whole_word_pattern = whole_word_pattern(&query);
-    count_matching_messages(
+    Ok(count_matching_messages(
         pool,
         chat_id,
         request,
         &ts_query,
         &query,
         &whole_word_pattern,
+        false,
+    )
+    .await?
+    .0)
+}
+
+/// Scope и фильтры общие со счётчиком сообщений; regex строится из escaped текста.
+pub async fn count_word_occurrences(
+    pool: &PgPool,
+    chat_id: i64,
+    request: &MessageSearchRequest,
+) -> anyhow::Result<(i64, i64)> {
+    anyhow::ensure!(
+        request.match_mode == MessageMatch::WholeWord,
+        "word count requires whole_word mode"
+    );
+    let query = normalized_query(&request.query)?;
+    count_matching_messages(
+        pool,
+        chat_id,
+        request,
+        &full_text_query(&query, &request.match_mode),
+        &query,
+        &whole_word_pattern(&query),
+        true,
     )
     .await
 }
@@ -440,10 +465,12 @@ async fn count_matching_messages(
     ts_query: &str,
     query: &str,
     whole_word_pattern: &str,
-) -> anyhow::Result<i64> {
-    sqlx::query_scalar::<_, i64>(
+    count_occurrences: bool,
+) -> anyhow::Result<(i64, i64)> {
+    sqlx::query_as::<_, (i64, i64)>(
         r#"
-        select count(*)::bigint
+        select count(*)::bigint,
+               coalesce(sum(case when $23 then regexp_count(coalesce(m.text, ''), $4, 1, 'i') else 0 end), 0)::bigint
         from mcp_public.telegram_messages m
         left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1
@@ -516,6 +543,7 @@ async fn count_matching_messages(
     .bind(request.is_automatic_forward)
     .bind(request.has_reply)
     .bind(request.is_forwarded)
+    .bind(count_occurrences)
     .fetch_one(pool)
     .await
     .map_err(Into::into)
@@ -855,7 +883,7 @@ fn full_text_query(query: &str, mode: &MessageMatch) -> String {
 
 fn whole_word_pattern(query: &str) -> String {
     format!(
-        r"(?i)(^|[^[:alnum:]_]){}($|[^[:alnum:]_])",
+        r"(?i)(?<![[:alnum:]_]){}(?![[:alnum:]_])",
         regex_escape(query)
     )
 }
@@ -1026,7 +1054,7 @@ mod tests {
     fn whole_word_pattern_escapes_regex_metacharacters() {
         let pattern = whole_word_pattern("Rust 1.85");
         assert!(pattern.contains(r"Rust 1\.85"));
-        assert!(pattern.starts_with(r"(?i)(^|[^[:alnum:]_])"));
+        assert!(pattern.starts_with(r"(?i)(?<![[:alnum:]_])"));
     }
 
     #[test]

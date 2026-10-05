@@ -59,6 +59,9 @@ impl<'a> AskService<'a> {
             self.config,
             self.pool,
             AskRequest {
+                reply_to_message_id: (input.chat_id == input.scope_chat_id)
+                    .then_some(input.reply_to_message_id)
+                    .flatten(),
                 scope_chat_id: input.scope_chat_id,
                 ask_run_id,
                 requester_user_id: input.requester_user_id,

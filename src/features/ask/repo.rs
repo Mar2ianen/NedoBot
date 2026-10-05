@@ -105,10 +105,10 @@ pub async fn finish_run(
             delivery_certainty = $11,
             delivery_outcome = $12,
             tool_call_count = (select count(*) from ask_tool_calls where ask_run_id = $1),
-            step_count = coalesce(
+            step_count = greatest(step_count, coalesce(
                 (select max(step_number) from ask_tool_calls where ask_run_id = $1),
                 0
-            ),
+            )),
             completed_at = case when $2 in ('completed', 'failed') then now() else null end
         where id = $1
         "#,
@@ -127,6 +127,19 @@ pub async fn finish_run(
     .bind(render.delivery_outcome.as_deref())
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+pub async fn record_model_turn(
+    pool: &PgPool,
+    ask_run_id: i64,
+    turn: usize,
+    provider: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("update ask_runs set provider = $2, model = $3, step_count = greatest(step_count, $4) where id = $1 and status = 'running'")
+        .bind(ask_run_id).bind(provider).bind(model).bind(i32::try_from(turn).unwrap_or(i32::MAX))
+        .execute(pool).await?;
     Ok(())
 }
 

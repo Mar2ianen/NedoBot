@@ -9,4 +9,5 @@ pub mod html;
 pub mod manual_moderation;
 pub mod media;
 pub mod render;
+pub mod rich_content;
 pub mod service_messages;

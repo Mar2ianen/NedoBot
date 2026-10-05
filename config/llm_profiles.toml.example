@@ -173,11 +173,13 @@ max_output_tokens = 16384
 request_timeout_sec = 60
 thinking = "none"
 
-[models.groq_qwen_cleanup_fallback]
-provider = "groq"
+# qwen/qwen3.6-27b нет на Groq, поэтому общий fallback обеих Qwen-цепочек
+# живёт на OpenRouter. Vision у него нет: фото-вопросы обслуживает только primary.
+[models.openrouter_qwen_fallback]
+provider = "openrouter"
 model = "qwen/qwen3.6-27b"
 
-[models.groq_qwen_cleanup_fallback.capabilities]
+[models.openrouter_qwen_fallback.capabilities]
 supports_images = false
 supports_tools = true
 supports_system_prompt = true
@@ -192,20 +194,6 @@ provider = "groq"
 model = "qwen/qwen3.8-27b"
 
 [models.groq_qwen_ask.capabilities]
-supports_images = true
-supports_tools = true
-supports_system_prompt = true
-structured_output = "json_object"
-context_window_tokens = 131072
-max_output_tokens = 16384
-request_timeout_sec = 60
-thinking = "default"
-
-[models.groq_qwen_ask_fallback]
-provider = "groq"
-model = "qwen/qwen3.6-27b"
-
-[models.groq_qwen_ask_fallback.capabilities]
 supports_images = true
 supports_tools = true
 supports_system_prompt = true
@@ -275,7 +263,7 @@ fallback_on_validation_failure = true
 models = ["ollama_memory"]
 
 [routes.voice_cleanup]
-models = ["groq_qwen_cleanup", "groq_qwen_cleanup_fallback", "ollama_memory"]
+models = ["groq_qwen_cleanup", "openrouter_qwen_fallback", "ollama_memory"]
 fallback_on_validation_failure = true
 
 [routes.new_user_audit]
@@ -285,7 +273,7 @@ models = ["ollama_audit"]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["groq_qwen_ask", "groq_qwen_ask_fallback", "ollama_memory"]
+models = ["groq_qwen_ask", "openrouter_qwen_fallback", "ollama_memory", "gemini_flash_comment"]
 
 # Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
 # API keys stay in the process environment and are not stored in this file.

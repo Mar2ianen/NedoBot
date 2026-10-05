@@ -85,6 +85,13 @@ impl ChatReadApi {
         service::count_messages(&self.pool, self.scope.discussion_chat_id, request).await
     }
 
+    pub async fn count_word_occurrences(
+        &self,
+        request: &MessageSearchRequest,
+    ) -> anyhow::Result<(i64, i64)> {
+        service::count_word_occurrences(&self.pool, self.scope.discussion_chat_id, request).await
+    }
+
     /// Retrieves only the attachment metadata needed to deliver supported media.
     pub async fn message_media(&self, message_id: i32) -> anyhow::Result<Vec<ChatMediaAttachment>> {
         service::message_media(&self.pool, self.scope.discussion_chat_id, message_id).await

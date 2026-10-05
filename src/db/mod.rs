@@ -62,3 +62,4 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     migrator.run(pool).await?;
     Ok(())
 }
+pub mod rich_backfill;

@@ -210,7 +210,7 @@ models = ["ollama_audit"]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["ollama_minimax", "ollama_memory"]
+models = ["ollama_minimax", "ollama_memory", "gemini_flash_comment"]
 
 # Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
 # API keys stay in the process environment and are not stored in this file.

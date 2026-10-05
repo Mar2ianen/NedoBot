@@ -72,7 +72,7 @@ pub fn target_from_reply(msg: &Message, reason: &str) -> Option<ReportTarget> {
         reporter_user_id: reporter.id.0 as i64,
         reported_user_id: target_user.id.0 as i64,
         reason: normalize_reason(reason),
-        target_text: crate::telegram::entities::message_text(target).map(str::to_owned),
+        target_text: crate::telegram::entities::message_text(target).map(|text| text.into_owned()),
         target_media: media_kind(target),
         target_reply_to_message_id: target.reply_to_message().map(|message| message.id.0),
         target_created_at: target.date,
