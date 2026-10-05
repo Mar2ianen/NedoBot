@@ -474,6 +474,7 @@ models = ["ollama_memory"]
         assert_eq!(
             image_models,
             [
+                ("gemini", "gemini-3.8-flash"),
                 ("gemini", "gemini-3.7-flash"),
                 ("gemini", "gemini-3.6-flash"),
                 ("gemini", "gemini-3.5-flash"),
@@ -494,6 +495,7 @@ models = ["ollama_memory"]
         assert_eq!(
             text_models,
             [
+                ("gemini", "gemini-3.8-flash"),
                 ("gemini", "gemini-3.7-flash"),
                 ("gemini", "gemini-3.6-flash"),
                 ("gemini", "gemini-3.5-flash"),
