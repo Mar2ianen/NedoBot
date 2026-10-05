@@ -41,6 +41,7 @@ use tg_ai_bot_teloxide::features::{
         },
         scoring::ScoreComponents,
     },
+    reports::{ReportCreation, ReportTarget, create_report, load_report},
     spam_review::{
         apply_callback, claim_next_review_delivery, create_review, mark_review_delivery_succeeded,
         send_review,
@@ -61,6 +62,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_report_contract(&pool).await;
+    assert_report_deduplication_and_card_query(&pool).await;
     assert_spam_label_events(&pool).await;
     assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
@@ -2242,6 +2245,107 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         public_messages_view.as_deref(),
         Some("mcp_public.telegram_messages")
     );
+}
+
+async fn assert_report_contract(pool: &PgPool) {
+    for table in ["telegram_reports", "telegram_report_deliveries"] {
+        let relation: Option<String> = query_scalar("select to_regclass($1)::text")
+            .bind(format!("public.{table}"))
+            .fetch_one(pool)
+            .await
+            .expect("report table lookup must succeed");
+        assert_eq!(relation, Some(table.to_owned()));
+    }
+
+    let unique_target: bool = query_scalar(
+        r#"
+        select exists (
+            select 1
+            from pg_constraint constraint_row
+            join pg_class table_row on table_row.oid = constraint_row.conrelid
+            where table_row.relname = 'telegram_reports'
+              and constraint_row.contype = 'u'
+              and pg_get_constraintdef(constraint_row.oid) = 'UNIQUE (chat_id, message_id)'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("report deduplication constraint lookup must succeed");
+    assert!(unique_target, "reports must be unique per chat message");
+
+    let delivery_columns: Vec<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'telegram_report_deliveries' order by ordinal_position",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("report delivery columns must be queryable");
+    assert_eq!(
+        delivery_columns,
+        vec![
+            "report_id",
+            "admin_user_id",
+            "status",
+            "attempt_count",
+            "next_attempt_at",
+            "lease_expires_at",
+            "telegram_message_id",
+            "error_kind",
+            "created_at",
+            "updated_at",
+        ]
+    );
+}
+
+async fn assert_report_deduplication_and_card_query(pool: &PgPool) {
+    let target = ReportTarget {
+        chat_id: -1001932061163,
+        message_id: 9_700_001,
+        reporter_user_id: 9_700_002,
+        reported_user_id: 9_700_003,
+        reason: "integration fixture".to_owned(),
+        target_text: Some("reported message".to_owned()),
+        target_media: "текст".to_owned(),
+        target_reply_to_message_id: None,
+        target_created_at: Utc::now(),
+        reporter_snapshot: serde_json::json!({"first_name": "Reporter"}),
+        target_snapshot: serde_json::json!({"first_name": "Target"}),
+    };
+
+    let report_id = match create_report(pool, &target, &[])
+        .await
+        .expect("report fixture must be created")
+    {
+        ReportCreation::Created(report_id) => report_id,
+        other => panic!("unexpected report creation result: {other:?}"),
+    };
+    let duplicate = create_report(pool, &target, &[])
+        .await
+        .expect("duplicate report fixture must be queryable");
+    assert_eq!(duplicate, ReportCreation::AlreadyExists(report_id));
+
+    let different_message = ReportTarget {
+        message_id: target.message_id + 1,
+        ..target.clone()
+    };
+    assert_eq!(
+        create_report(pool, &different_message, &[])
+            .await
+            .expect("rate-limit fixture must be queryable"),
+        ReportCreation::RateLimited
+    );
+
+    let card = load_report(pool, report_id)
+        .await
+        .expect("report card query must work against migrated schema");
+    assert_eq!(card.id, report_id);
+    assert_eq!(card.target_text.as_deref(), Some("reported message"));
+
+    query("delete from telegram_reports where id = $1")
+        .bind(report_id)
+        .execute(pool)
+        .await
+        .expect("report fixture cleanup must succeed");
 }
 
 async fn assert_spam_label_events(pool: &PgPool) {

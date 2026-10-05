@@ -23,6 +23,8 @@ pub enum Command {
     ChatNote(String),
     #[command(description = "добавить заметку о пользователе reply; /user_note <текст>")]
     UserNote(String),
+    #[command(description = "пожаловаться на сообщение reply; /report [причина]")]
+    Report(String),
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]
     StatsDay(String),
     #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p]")]

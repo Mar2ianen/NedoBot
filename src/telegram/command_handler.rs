@@ -20,6 +20,7 @@ use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_
 use crate::features::first_comment::pipeline::download_largest_photo_base64;
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::memory::report::send_memory_notes;
+use crate::features::reports::{self, ReportCreation};
 use crate::features::stats::report::{
     send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
 };
@@ -30,7 +31,7 @@ use crate::telegram::ask_drafter::AskDrafterBackend;
 use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
-use crate::telegram::render::{escape_html, send_html};
+use crate::telegram::render::{escape_html, send_html, send_html_reply};
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -107,6 +108,9 @@ pub async fn handle_command(
         }
         Command::UserNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, reply_user_id(&msg)).await?;
+        }
+        Command::Report(reason) => {
+            handle_report_command(&bot, &msg, &state, &reason).await?;
         }
         Command::StatsDay(args) => {
             let render = render_from_message_or_args(&msg, &args);
@@ -200,6 +204,67 @@ pub async fn handle_command(
         }
     }
 
+    Ok(())
+}
+
+async fn handle_report_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    reason: &str,
+) -> ResponseResult<()> {
+    if let Err(err) = reports::report_target_context(msg, &state.config) {
+        tracing::debug!(%err, "rejected /report command");
+        send_html_reply(
+            bot,
+            msg.chat.id,
+            msg.id,
+            "Репорт можно отправить только reply на сообщение человека в основном чате.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let Some(target) = reports::target_from_reply(msg, reason) else {
+        send_html_reply(
+            bot,
+            msg.chat.id,
+            msg.id,
+            "Не удалось определить автора сообщения для репорта.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let admin_ids = reports::resolve_admin_ids(bot.inner(), &state.pool, &state.config)
+        .await
+        .map_err(reports::report_error)?;
+    let creation = match reports::create_report(&state.pool, &target, &admin_ids).await {
+        Ok(ReportCreation::RateLimited) => {
+            send_html_reply(
+                bot,
+                msg.chat.id,
+                msg.id,
+                "Ты уже отправлял репорт в последние 10 минут. Повтори позже.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(creation) => creation,
+        Err(err) => return Err(reports::report_error(err)),
+    };
+
+    let text = match creation {
+        ReportCreation::Created(_) if admin_ids.is_empty() => {
+            "Репорт сохранён, но сейчас не найден администратор для личной доставки."
+        }
+        ReportCreation::Created(_) => "Репорт принят и поставлен в очередь для администраторов.",
+        ReportCreation::AlreadyExists(_) => "Это сообщение уже репортировали; повтор не отправлен.",
+        ReportCreation::RateLimited => {
+            "Ты уже отправлял репорт в последние 10 минут. Повтори позже."
+        }
+    };
+    send_html_reply(bot, msg.chat.id, msg.id, text).await?;
     Ok(())
 }
 
