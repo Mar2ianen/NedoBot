@@ -1,3 +1,5 @@
+use crate::llm::types::{ValidationFailureReason, validation_error};
+
 const MAX_VISIBLE_CHARS: usize = 180;
 const MAX_SENTENCE_MARKS: usize = 2;
 const MIN_WORDS: usize = 5;
@@ -114,24 +116,24 @@ const ALLOWED_CHAT_LINK_LABELS: &[&str] = &[
 pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
     let normalized = text.trim();
     if normalized.is_empty() {
-        anyhow::bail!("empty first comment output");
+        return Err(validation_error(ValidationFailureReason::EmptyOutput));
     }
     if ends_with_forbidden_final_punctuation(normalized) {
-        anyhow::bail!("first comment must not end with a dot or ellipsis");
+        return Err(validation_error(ValidationFailureReason::FinalPunctuation));
     }
 
     let placeholders = scan_chat_link_placeholders(normalized)?;
     if placeholders.valid_count == 0 {
-        anyhow::bail!("first comment is missing valid CHAT_LINK placeholder");
+        return Err(validation_error(ValidationFailureReason::MissingChatLink));
     }
     if placeholders.valid_count > 1 {
-        anyhow::bail!("first comment contains multiple CHAT_LINK placeholders");
+        return Err(validation_error(ValidationFailureReason::MultipleChatLinks));
     }
 
     let visible = placeholders.visible_text;
     let visible_len = visible.chars().filter(|ch| !ch.is_whitespace()).count();
     if visible_len > MAX_VISIBLE_CHARS {
-        anyhow::bail!("first comment is too long: {visible_len} visible chars");
+        return Err(validation_error(ValidationFailureReason::TooLong));
     }
 
     let words = visible
@@ -139,14 +141,14 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
         .filter(|word| word.chars().any(char::is_alphanumeric))
         .count();
     if words < MIN_WORDS {
-        anyhow::bail!("first comment is too short: {words} words");
+        return Err(validation_error(ValidationFailureReason::TooShort));
     }
     let sentence_marks = visible
         .chars()
         .filter(|ch| matches!(*ch, '.' | '!' | '?'))
         .count();
     if sentence_marks > MAX_SENTENCE_MARKS {
-        anyhow::bail!("first comment has too many sentences");
+        return Err(validation_error(ValidationFailureReason::TooManySentences));
     }
 
     let cyrillic = visible
@@ -154,35 +156,31 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
         .filter(|ch| matches!(*ch, '\u{0400}'..='\u{04FF}'))
         .count();
     if cyrillic < MIN_CYRILLIC_CHARS {
-        anyhow::bail!("first comment has too little Cyrillic text");
+        return Err(validation_error(ValidationFailureReason::TooLittleCyrillic));
     }
 
     let lower = visible.to_lowercase();
     if lower.contains("http://") || lower.contains("https://") || lower.contains("t.me/") {
-        anyhow::bail!("first comment contains a raw link");
+        return Err(validation_error(ValidationFailureReason::RawLink));
     }
 
-    if let Some(phrase) = GENERIC_PHRASES
-        .iter()
-        .find(|phrase| lower.contains(**phrase))
-    {
-        anyhow::bail!("first comment contains generic CTA phrase: {phrase}");
+    if GENERIC_PHRASES.iter().any(|phrase| lower.contains(*phrase)) {
+        return Err(validation_error(ValidationFailureReason::GenericCta));
     }
     let activity_text = placeholders.activity_text.to_lowercase();
-    if let Some(phrase) = INVENTED_CHAT_ACTIVITY_PHRASES
+    if INVENTED_CHAT_ACTIVITY_PHRASES
         .iter()
-        .find(|phrase| activity_text.contains(**phrase))
+        .any(|phrase| activity_text.contains(*phrase))
     {
-        anyhow::bail!("first comment invents chat activity: {phrase}");
+        return Err(validation_error(
+            ValidationFailureReason::InventedChatActivity,
+        ));
     }
-    if let Some(phrase) = VICTIM_PHRASES
-        .iter()
-        .find(|phrase| lower.contains(**phrase))
-    {
-        anyhow::bail!("first comment sounds like a victim complaint: {phrase}");
+    if VICTIM_PHRASES.iter().any(|phrase| lower.contains(*phrase)) {
+        return Err(validation_error(ValidationFailureReason::VictimTone));
     }
-    if let Some(word) = find_number_word(&lower) {
-        anyhow::bail!("first comment writes a number as a word: {word}");
+    if find_number_word(&lower).is_some() {
+        return Err(validation_error(ValidationFailureReason::NumberWord));
     }
 
     let has_substantive_cyrillic_word = visible.split_whitespace().any(|word| {
@@ -192,7 +190,9 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
             >= 5
     });
     if !has_substantive_cyrillic_word {
-        anyhow::bail!("first comment has no substantive Russian topic word");
+        return Err(validation_error(
+            ValidationFailureReason::NoSubstantiveTopicWord,
+        ));
     }
 
     let latin = visible
@@ -200,7 +200,7 @@ pub fn validate_comment_output(text: &str) -> anyhow::Result<()> {
         .filter(|ch| ch.is_ascii_alphabetic())
         .count();
     if latin > cyrillic && cyrillic < 20 {
-        anyhow::bail!("first comment looks mostly English");
+        return Err(validation_error(ValidationFailureReason::MostlyEnglish));
     }
 
     Ok(())
@@ -235,7 +235,7 @@ fn scan_chat_link_placeholders(text: &str) -> anyhow::Result<PlaceholderScan> {
         activity.push_str(before);
 
         let Some(end) = after_start.find('}') else {
-            anyhow::bail!("first comment contains unterminated CHAT_LINK placeholder");
+            return Err(validation_error(ValidationFailureReason::MalformedChatLink));
         };
 
         let token = &after_start[..=end];
@@ -265,13 +265,15 @@ fn chat_link_activity_label(token: &str) -> anyhow::Result<&str> {
         .and_then(|value| value.strip_suffix('}'))
         .map(str::trim)
     else {
-        anyhow::bail!("first comment contains malformed CHAT_LINK placeholder: {token}");
+        return Err(validation_error(ValidationFailureReason::MalformedChatLink));
     };
 
     if ALLOWED_CHAT_LINK_LABELS.contains(&label) {
         Ok(label)
     } else {
-        anyhow::bail!("first comment contains unsupported CHAT_LINK label: {label}");
+        Err(validation_error(
+            ValidationFailureReason::UnsupportedChatLinkLabel,
+        ))
     }
 }
 
@@ -285,20 +287,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_raw_links() {
-        assert!(
+    fn rejects_raw_links_with_typed_reason() {
+        let error =
             validate_comment_output("Переиздания обсудим в чате https://t.me/example {CHAT_LINK}")
-                .is_err()
+                .unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::llm::types::ValidationFailure>()
+                .map(|failure| failure.reason),
+            Some(ValidationFailureReason::RawLink)
         );
     }
 
     #[test]
-    fn rejects_missing_placeholder() {
-        assert!(
-            validate_comment_output(
-                "Физические релизы превращаются в архивный формат. Охота за коробками началась"
-            )
-            .is_err()
+    fn rejects_missing_placeholder_with_typed_reason() {
+        let error = validate_comment_output(
+            "Физические релизы превращаются в архивный формат. Охота за коробками началась",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::llm::types::ValidationFailure>()
+                .map(|failure| failure.reason),
+            Some(ValidationFailureReason::MissingChatLink)
         );
     }
 
