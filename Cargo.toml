@@ -5,10 +5,19 @@ edition = "2024"
 license = "MIT"
 
 [features]
-# Keep the current Nedonews binary as the default release profile while making
-# community-only builds explicit and fail-fast when config requests a missing
-# application module.
-default = ["auto-comment", "ask", "voice", "public-mcp", "moderation", "spam-sync"]
+# The default feature set is the single release profile: every instance runs
+# the same binary and differs by runtime config only (llm_profiles.toml plus
+# env secrets). Keep community-only builds explicit via --no-default-features
+# and fail-fast when config requests a missing application module.
+default = [
+    "auto-comment",
+    "ask",
+    "voice",
+    "public-mcp",
+    "moderation",
+    "spam-sync",
+    "manual-moderation",
+]
 auto-comment = []
 ask = []
 voice = []

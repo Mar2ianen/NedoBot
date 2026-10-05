@@ -1,0 +1,116 @@
+name: release
+# Single release binary for every instance (default cargo features).
+# Built on ubuntu-24.04 so glibc matches the production host (2.39);
+# developers on newer distros must not ship locally built binaries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (must be merged to main for production deploys)"
+        default: "main"
+        required: true
+      deploy:
+        description: "Copy binaries to vps-153 and restart services"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release (default features = full single binary)
+        run: cargo build --locked --release
+      - name: Guard production glibc compatibility (<= 2.39)
+        run: |
+          max_glibc=$(objdump -T target/release/tg_ai_bot_teloxide \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+          echo "max required glibc: $max_glibc"
+          if [ "$(printf '%s\n%s\n' "$max_glibc" "GLIBC_2.39" | sort -V | tail -1)" != "GLIBC_2.39" ]; then
+            echo "binary requires newer glibc than production (2.39)" >&2
+            exit 1
+          fi
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          for binary in tg_ai_bot_teloxide nedonews_mcp_http chat_db_mcp \
+              retry_pending_comments reconcile_comment_delivery; do
+            cp "target/release/$binary" dist/
+          done
+          ( cd dist && sha256sum * > SHA256SUMS )
+          rustc --version > dist/BUILD_INFO.txt
+          git rev-parse HEAD >> dist/BUILD_INFO.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nedobot-release-${{ github.sha }}
+          path: dist/
+          retention-days: 30
+
+  deploy:
+    if: ${{ inputs.deploy }}
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nedobot-release-${{ github.sha }}
+          path: dist/
+      - name: Verify artifact checksums
+        run: ( cd dist && sha256sum -c SHA256SUMS )
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -m 0700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 0600 ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+      - name: Stage binaries on production host
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          stage="$(ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" 'mktemp -d')"
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
+            dist/retry_pending_comments dist/reconcile_comment_delivery \
+            "$VPS_USER@$VPS_HOST:$stage/"
+          echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
+      - name: Atomic install, restart, verify
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
+            "bash /opt/tg-ai-bot-teloxide/scripts/install_release_binaries.sh '$STAGE_DIR' \
+            && rm -rf '$STAGE_DIR' \
+            && systemctl restart tg-ai-bot-teloxide \
+            && systemctl is-active tg-ai-bot-teloxide \
+            && systemctl restart nedonews-mcp \
+            && systemctl is-active nedonews-mcp"
+      - name: Confirm running binary matches artifact
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          expected="$(awk '$2 == "tg_ai_bot_teloxide" {print $1}' dist/SHA256SUMS)"
+          actual="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
+            'pid=$(systemctl show tg-ai-bot-teloxide -p MainPID --value) && sha256sum "/proc/$pid/exe"' \
+            | awk '{print $1}')"
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          test -n "$expected" && test "$expected" = "$actual"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
+            "journalctl -u tg-ai-bot-teloxide --since '-2 min' -p err --no-pager -o cat"
