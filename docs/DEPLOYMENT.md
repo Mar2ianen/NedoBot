@@ -7,7 +7,31 @@ deploy-YYYY-MM-DD-scope.
 
 ## Перед выкладкой
 
-### Релиз исправлений /ask от 6 октября
+### Расширение лимитов /ask от 6 октября, 10:18 МСК
+
+Фактическая выкладка: tag `deploy-2026-10-06-ask-limits`, source
+`19f9ec21d091d59d935b38d727373911b5ea28ca`, review [PR #34](https://github.com/Mar2ianen/NedoBot/pull/34).
+Точные artifact hashes и backup paths записаны в `TECHNICAL.md`.
+
+В profile НедоNews после бэкапа вручную расширены шесть runtime-параметров:
+16 384 токена, 64 tools / до 68 LLM turns, LLM-попытка 180 секунд,
+общий deadline 1800 секунд, concurrency 4, MCP request 30 секунд.
+Основной `groq_qwen_ask` использует `level_high` и timeout 180 секунд.
+Добавлены отдельные `openrouter_qwen_ask` и `gemini_ask` с теми же effort/timeout;
+`routes.ask.models` ссылается на них. Profile целиком из example не копировать.
+
+`probe_ask_route [--image]` теперь валидирует startup secrets и проверяет
+фактический `ask_llm_max_tokens`, печатая также tool budget и общий deadline.
+До рестарта артефактом проверены staged Groq text/image, OpenRouter text
+и Gemini image; после рестарта повторены Groq text/image на live profile.
+Замена profile выполнена атомарно с проверкой исходного hash и сохранением
+owner/mode. Новых миграций нет. Второй community profile сохранён без
+изменений, `/ask` в ПВО выключен. Перезапуск и health check охватили
+оба бота и MCP. Public RMCP проверен без отправки сообщений в Telegram.
+
+### Релиз исправлений /ask от 6 октября, 09:30 МСК
+
+Ниже сохранён порядок предыдущей выкладки исправлений и backfill.
 
 Аудит и границы проверки: [ASK_AUDIT_2026-10-06.md](ASK_AUDIT_2026-10-06.md).
 Сначала review `dev → main`, затем сборка release с `deploy=false` на точном
