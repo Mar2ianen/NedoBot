@@ -22,6 +22,7 @@ BINARIES=(
     retry_pending_comments
     reconcile_comment_delivery
     backfill_rich_messages
+    import_telegram_export
 )
 
 for binary in "${BINARIES[@]}"; do

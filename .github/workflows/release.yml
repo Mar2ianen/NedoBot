@@ -60,7 +60,8 @@ jobs:
         run: |
           mkdir -p dist
           for binary in tg_ai_bot_teloxide nedonews_mcp_http chat_db_mcp \
-              retry_pending_comments reconcile_comment_delivery backfill_rich_messages probe_ask_route; do
+              retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
+              import_telegram_export probe_ask_route; do
             cp "target/release/$binary" dist/
           done
           cp scripts/install_release_binaries.sh dist/
@@ -88,6 +89,7 @@ jobs:
           # Скачанные из artifact файлы теряют exec-бит — возвращаем явно.
           chmod +x dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
             dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
+            dist/import_telegram_export \
             dist/probe_ask_route \
             dist/install_release_binaries.sh
           test -x dist/tg_ai_bot_teloxide
@@ -110,6 +112,7 @@ jobs:
           scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
             dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
+            dist/import_telegram_export \
             dist/probe_ask_route \
             dist/install_release_binaries.sh \
             "$VPS_USER@$VPS_HOST:$stage/"

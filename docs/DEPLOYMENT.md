@@ -34,6 +34,11 @@ CLI загружает выбранный через `LLM_PROFILES_PATH` profile
 копию profile с добавленным fallback. Возвращаются identity выбранного
 profile и `native_tool_verified`, содержимое ответа не печатается.
 
+Проверка SDK артефактом с VPS подтвердила native tool calls Groq для текста
+и изображения. Scoped dry run НедоNews обнаружил 52 восстанавливаемых
+rich-сообщения. В ПВО найдены два rich-сообщения из Desktop export: их формат
+тоже поддерживают backfill и обновлённый `import_telegram_export`.
+
 При старте встроенная миграция `20261006000000` переочередит materialization
 успешных v7 assessments в v8. LLM-аудит не повторяется. Контролировать
 очередь и CAS/retry метрики обоих инстансов.
@@ -187,7 +192,7 @@ ssh vps-153 'test -s /etc/tg-ai-bot/llm_profiles.toml && test -s /etc/tg-ai-bot/
 ```
 
 В запасном пути собрать один release на сервере с production toolchain и
-локальным cargo cache. Подготовить stage из семи бинарей и installer, как в
+локальным cargo cache. Подготовить stage из бинарей и installer, как в
 workflow `release`, затем установить его через `install_release_binaries.sh`
 сразу в оба checkout. Простого rebuild первого инстанса недостаточно:
 

@@ -7,7 +7,8 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/install_release_binaries.sh"
 BINARIES = ("tg_ai_bot_teloxide", "nedonews_mcp_http", "chat_db_mcp",
-            "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages")
+            "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages",
+            "import_telegram_export")
 
 
 class ReleaseInstall(unittest.TestCase):

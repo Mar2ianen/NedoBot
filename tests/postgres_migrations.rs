@@ -3900,12 +3900,18 @@ async fn assert_rich_backfill_and_exact_word_counts(pool: &PgPool) {
             880002,
             serde_json::json!({"rich_message":{"blocks":[]}}),
         ),
+        (
+            CHAT,
+            880006,
+            serde_json::json!({"id":880006,"type":"message","date_unixtime":"1",
+            "rich_message":{"blocks":[{"type":"paragraph","text":{"type":"text_link","href":"https://example.com","text":{"type":"plain","text":"Desktop rich"}}}]}}),
+        ),
     ] {
         query("insert into telegram_messages (chat_id, message_id, user_id, text, raw_json) values ($1,$2,880000,null,$3)")
             .bind(chat).bind(id).bind(payload).execute(pool).await.unwrap();
     }
     let dry = backfill_rich_messages(pool, CHAT, false).await.unwrap();
-    assert_eq!(dry.repaired, 1);
+    assert_eq!(dry.repaired, 2);
     assert_eq!(dry.unreadable, 1);
     let text: Option<String> =
         query_scalar("select text from telegram_messages where chat_id=$1 and message_id=880001")
@@ -3919,7 +3925,7 @@ async fn assert_rich_backfill_and_exact_word_counts(pool: &PgPool) {
             .await
             .unwrap()
             .repaired,
-        1
+        2
     );
     assert_eq!(
         backfill_rich_messages(pool, CHAT, true)
@@ -3940,6 +3946,14 @@ async fn assert_rich_backfill_and_exact_word_counts(pool: &PgPool) {
             .await
             .unwrap();
     assert!(text.is_none());
+    let repaired: (String, bool) = sqlx::query_as(
+        "select text, has_links from telegram_messages where chat_id=$1 and message_id=880006",
+    )
+    .bind(CHAT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(repaired, ("Desktop rich".into(), true));
     query("insert into telegram_messages(chat_id,message_id,user_id,text,is_forwarded) values ($1,880003,880000,'auditword',true), ($1,880004,880000,'auditwordish',false), ($2,880005,880000,'auditword',false)")
         .bind(CHAT).bind(FOREIGN).execute(pool).await.unwrap();
     let mut request = MessageSearchRequest {
