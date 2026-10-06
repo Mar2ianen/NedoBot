@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ pub struct AskAgentAnswer {
 }
 
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/ask.md");
+const BOT_CHANGELOG: &str = include_str!("../../../docs/BOT_CHANGELOG.md");
 
 enum AgentGenerationError {
     Request(anyhow::Error),
@@ -201,12 +203,14 @@ async fn answer_within_deadline(
         max_attempts,
         semantic_aliases,
     );
+    let system_prompt = system_prompt_for_question(question);
     let mut messages = vec![ask_user_message(initial_prompt, image_base64)];
     for step in 0..turn_limits.max_model_roundtrips.saturating_sub(1) as usize {
         compact_native_history(&mut messages, MAX_CONTEXT_CHARS);
         let generated = generate_turn(
             config,
             &messages,
+            &system_prompt,
             Some(agent_tools.clone()),
             image_base64.is_some(),
         )
@@ -483,9 +487,15 @@ async fn answer_within_deadline(
         continuation_prompt(&observations, 0, &evidence)
     )));
     compact_native_history(&mut messages, MAX_CONTEXT_CHARS);
-    let generated = generate_turn(config, &messages, None, image_base64.is_some())
-        .await
-        .map_err(|AgentGenerationError::Request(error)| error)?;
+    let generated = generate_turn(
+        config,
+        &messages,
+        &system_prompt,
+        None,
+        image_base64.is_some(),
+    )
+    .await
+    .map_err(|AgentGenerationError::Request(error)| error)?;
     record_generated_turn(pool, ask_run_id, max_attempts.saturating_add(1), &generated).await;
     let response = generated.response;
     if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
@@ -538,9 +548,71 @@ fn progress_for_tool(tool: &str) -> AskProgress {
     }
 }
 
+fn system_prompt_for_question(question: &str) -> Cow<'static, str> {
+    let normalized = question.to_lowercase();
+    let words = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let asks_about_the_bot = words.iter().any(|word| {
+        word.starts_with("бот")
+            || *word == "nedobot"
+            || word.starts_with("недобот")
+            || word.starts_with("помощник")
+            || matches!(*word, "ты" | "тебя" | "тебе" | "твой" | "твоя" | "твои")
+            || word.starts_with("сво")
+            || *word == "yourself"
+            || *word == "you"
+            || *word == "your"
+    });
+    let asks_for_updates = words.iter().any(|word| {
+        [
+            "нов",
+            "обнов",
+            "измен",
+            "релиз",
+            "выпуск",
+            "добав",
+            "почин",
+            "науч",
+            "уме",
+            "функц",
+            "фич",
+            "чейндж",
+            "чейнж",
+            "changelog",
+            "change",
+            "new",
+            "release",
+            "update",
+            "feature",
+        ]
+        .iter()
+        .any(|prefix| word.starts_with(prefix))
+    });
+    let asks_for_changelog = normalized.contains("change log")
+        || normalized.contains("чейнджлог")
+        || normalized.contains("чейнжлог")
+        || normalized.contains("чейнджог")
+        || normalized.contains("чейнжог")
+        || words.iter().any(|word| word.starts_with("changelog"));
+
+    if (asks_for_changelog && (asks_about_the_bot || words.len() <= 2))
+        || (asks_about_the_bot && asks_for_updates)
+    {
+        Cow::Owned(format!(
+            "{SYSTEM_PROMPT}\n\nНиже — журнал фактически выпущенных изменений самого NedoBot. Это справка о возможностях бота, а не новости чата. Если вопрос о собственных функциях, обновлениях или релизах бота, отвечай по этой справке и не выдумывай более новые изменения. Если спрашивают, что нового в чате, игнорируй журнал и ищи сообщения инструментами.\n\n{}",
+            BOT_CHANGELOG
+        ))
+    } else {
+        Cow::Borrowed(SYSTEM_PROMPT)
+    }
+}
+
 async fn generate_turn(
     config: &Config,
     messages: &[ChatMessage],
+    system_prompt: &str,
     tools: Option<Vec<Tool>>,
     requires_images: bool,
 ) -> Result<GeneratedChat, AgentGenerationError> {
@@ -553,7 +625,7 @@ async fn generate_turn(
             GenerateChatOptions {
                 fallback_offset,
                 route: "ask",
-                system_prompt: Some(SYSTEM_PROMPT),
+                system_prompt: Some(system_prompt),
                 messages: messages.to_vec(),
                 tools: tools.clone(),
                 requires_images,
@@ -1059,6 +1131,15 @@ async fn external_search(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bot_changelog_is_added_only_for_questions_about_the_bots_updates() {
+        assert!(system_prompt_for_question("что у тебя нового?").contains(BOT_CHANGELOG));
+        assert!(system_prompt_for_question("чейнжог").contains(BOT_CHANGELOG));
+        assert!(system_prompt_for_question("что умеет NedoBot?").contains(BOT_CHANGELOG));
+        assert!(!system_prompt_for_question("что нового в чате?").contains(BOT_CHANGELOG));
+        assert!(!system_prompt_for_question("что сегодня нового?").contains(BOT_CHANGELOG));
+    }
+
     #[test]
     fn counts_require_a_successful_search_with_the_same_complete_scope() {
         let mut evidence = Evidence::default();
