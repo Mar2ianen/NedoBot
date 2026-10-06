@@ -48,6 +48,17 @@ pub fn blocked_post_term(post_text: &str, blocked_terms: &[String]) -> Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advertisement_marker_after_footer_must_be_checked_on_the_original_post() {
+        let markers = vec!["😎НедоNews".to_string()];
+        let blocked = vec!["#реклама".to_string()];
+        let post = "Новый смартфон\n\n😎НедоNews\n#реклама";
+        assert!(should_generate_comment_with_markers(post, &markers));
+        assert_eq!(blocked_post_term(post, &blocked), Some("#реклама".into()));
+        assert!(
+            blocked_post_term(&clean_post_for_llm_with_markers(post, &markers), &blocked).is_none()
+        );
+    }
     use super::*;
 
     const OLD_MARKER: &str = "Не теряем связь";

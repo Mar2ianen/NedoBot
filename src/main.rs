@@ -10,16 +10,7 @@ use teloxide::{
 #[cfg(feature = "moderation")]
 use teloxide::types::CallbackQuery;
 
-mod community;
-mod config;
-mod config_file;
-mod db;
-mod features;
-mod http;
-mod llm;
-mod state;
-mod telegram;
-use tg_ai_bot_teloxide::text;
+use tg_ai_bot_teloxide::{config, db, features, llm, state, telegram};
 
 use config::Config;
 use db::telegram::{

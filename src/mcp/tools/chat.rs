@@ -300,7 +300,16 @@ pub async fn count_messages(
     api: &ChatReadApi,
     input: CountMessagesInput,
 ) -> Result<serde_json::Value, rmcp::ErrorData> {
-    let request = MessageSearchRequest {
+    let request = count_request(input)?;
+    let count = api
+        .count_messages(&request)
+        .await
+        .map_err(|_| read_error("chat message count failed"))?;
+    Ok(serde_json::json!({"count": count, "unit": "messages"}))
+}
+
+fn count_request(input: CountMessagesInput) -> Result<MessageSearchRequest, rmcp::ErrorData> {
+    Ok(MessageSearchRequest {
         query: input.query.unwrap_or_default(),
         user_id: input.user_id,
         date_from: parse_timestamp(input.date_from, DateBoundary::Start)?,
@@ -323,12 +332,27 @@ pub async fn count_messages(
         limit: 1,
         offset: 0,
         include_forwards: input.include_forwards,
-    };
-    let count = api
-        .count_messages(&request)
+    })
+}
+
+pub async fn count_word_occurrences(
+    api: &ChatReadApi,
+    input: CountMessagesInput,
+) -> Result<serde_json::Value, rmcp::ErrorData> {
+    let mut request = count_request(input)?;
+    if request.query.trim().is_empty() {
+        return Err(invalid_arguments(
+            "query must contain the exact word or phrase",
+        ));
+    }
+    request.match_mode = MessageMatch::WholeWord;
+    let (messages, occurrences) = api
+        .count_word_occurrences(&request)
         .await
-        .map_err(|_| read_error("chat message count failed"))?;
-    Ok(serde_json::json!({"count": count}))
+        .map_err(|_| read_error("word occurrence count failed"))?;
+    Ok(
+        serde_json::json!({"count": occurrences, "matching_messages": messages, "unit": "word_occurrences"}),
+    )
 }
 
 pub async fn search_messages_batch(

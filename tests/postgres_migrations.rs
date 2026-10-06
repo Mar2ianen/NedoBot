@@ -88,6 +88,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_chat_search_quality_path(&pool).await;
+    assert_rich_backfill_and_exact_word_counts(&pool).await;
+    assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
@@ -99,6 +101,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_new_user_audit_text_change_reopens_completed_generation(&pool).await;
     assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
     assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
+    assert_reputation_feature_order_upgrade(&pool).await;
     assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(&database_url).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
     assert_successful_audit_replays_for_materialization(&pool).await;
@@ -243,6 +246,15 @@ async fn assert_ask_time_render_audit(pool: &PgPool) {
     let success_id = tg_ai_bot_teloxide::features::ask::repo::create_run(pool, success_id)
         .await
         .expect("success ask run must be created through the production repo");
+    tg_ai_bot_teloxide::features::ask::repo::record_model_turn(
+        pool,
+        success_id,
+        3,
+        "actual-fallback",
+        "actual-model",
+    )
+    .await
+    .unwrap();
     finish_run(
         pool,
         success_id,
@@ -262,6 +274,16 @@ async fn assert_ask_time_render_audit(pool: &PgPool) {
     )
     .await
     .expect("success render audit must be written through finish_run");
+    let actual: (String, Option<String>, i32) =
+        query_as("select provider,model,step_count from ask_runs where id=$1")
+            .bind(success_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        actual,
+        ("actual-fallback".into(), Some("actual-model".into()), 3)
+    );
     finish_delivery(
         pool,
         success_id,
@@ -3862,6 +3884,216 @@ async fn assert_chat_search_quality_path(pool: &PgPool) {
     assert_eq!(without_forward_opt_in, 1);
 
     assert_semantic_search_uses_embeddings_without_freshness_decay(pool).await;
+}
+
+async fn assert_rich_backfill_and_exact_word_counts(pool: &PgPool) {
+    use tg_ai_bot_teloxide::db::rich_backfill::backfill_rich_messages;
+    const CHAT: i64 = -1001932061163;
+    const FOREIGN: i64 = -1009876543210;
+    let raw = serde_json::json!({"message_id":880001,"date":1,"chat":{"id":CHAT,"type":"supergroup","title":"Тест"},
+        "rich_message":{"blocks":[{"type":"paragraph","text":"auditword AuditWord auditword"}]}});
+    for (chat, id, payload) in [
+        (CHAT, 880001, raw.clone()),
+        (FOREIGN, 880001, serde_json::json!({"private":"ignored"})),
+        (
+            CHAT,
+            880002,
+            serde_json::json!({"rich_message":{"blocks":[]}}),
+        ),
+        (
+            CHAT,
+            880006,
+            serde_json::json!({"id":880006,"type":"message","date_unixtime":"1",
+            "rich_message":{"blocks":[{"type":"paragraph","text":{"type":"text_link","href":"https://example.com","text":{"type":"plain","text":"Desktop rich"}}}]}}),
+        ),
+    ] {
+        query("insert into telegram_messages (chat_id, message_id, user_id, text, raw_json) values ($1,$2,880000,null,$3)")
+            .bind(chat).bind(id).bind(payload).execute(pool).await.unwrap();
+    }
+    let dry = backfill_rich_messages(pool, CHAT, false).await.unwrap();
+    assert_eq!(dry.repaired, 2);
+    assert_eq!(dry.unreadable, 1);
+    let text: Option<String> =
+        query_scalar("select text from telegram_messages where chat_id=$1 and message_id=880001")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(text.is_none());
+    assert_eq!(
+        backfill_rich_messages(pool, CHAT, true)
+            .await
+            .unwrap()
+            .repaired,
+        2
+    );
+    assert_eq!(
+        backfill_rich_messages(pool, CHAT, true)
+            .await
+            .unwrap()
+            .repaired,
+        0
+    );
+    let messages = chat_read_service::message_context(pool, CHAT, 880001, 0, 0)
+        .await
+        .unwrap();
+    let message = messages.first().unwrap();
+    assert_eq!(message.text, "auditword AuditWord auditword");
+    let text: Option<String> =
+        query_scalar("select text from telegram_messages where chat_id=$1 and message_id=880001")
+            .bind(FOREIGN)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(text.is_none());
+    let repaired: (String, bool) = sqlx::query_as(
+        "select text, has_links from telegram_messages where chat_id=$1 and message_id=880006",
+    )
+    .bind(CHAT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(repaired, ("Desktop rich".into(), true));
+    query("insert into telegram_messages(chat_id,message_id,user_id,text,is_forwarded) values ($1,880003,880000,'auditword',true), ($1,880004,880000,'auditwordish',false), ($2,880005,880000,'auditword',false)")
+        .bind(CHAT).bind(FOREIGN).execute(pool).await.unwrap();
+    let mut request = MessageSearchRequest {
+        query: "auditword".into(),
+        user_id: Some(880000),
+        date_from: None,
+        date_to: None,
+        reply_to_message_id: None,
+        is_automatic_forward: None,
+        is_forwarded: None,
+        has_reply: None,
+        has_links: None,
+        has_media: None,
+        has_photo: None,
+        has_video: None,
+        has_document: None,
+        has_audio: None,
+        has_voice: None,
+        has_sticker: None,
+        has_animation: None,
+        match_mode: MessageMatch::WholeWord,
+        sort: MessageSort::Relevance,
+        limit: 10,
+        offset: 0,
+        include_forwards: false,
+    };
+    assert_eq!(
+        chat_read_service::count_messages(pool, CHAT, &request)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        chat_read_service::count_word_occurrences(pool, CHAT, &request)
+            .await
+            .unwrap(),
+        (1, 3)
+    );
+    request.include_forwards = true;
+    assert_eq!(
+        chat_read_service::count_word_occurrences(pool, CHAT, &request)
+            .await
+            .unwrap(),
+        (2, 4)
+    );
+    request.query = "auditword|.*".into();
+    assert_eq!(
+        chat_read_service::count_word_occurrences(pool, CHAT, &request)
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+    let command: teloxide::types::Message =
+        serde_json::from_value(serde_json::json!({"message_id":880004,"date":1,
+        "chat":{"id":CHAT,"type":"supergroup","title":"Тест"},"text":"/ask вопрос"}))
+        .unwrap();
+    tg_ai_bot_teloxide::db::telegram::record_bot_reply(pool, CHAT, 880001, &command, None)
+        .await
+        .unwrap();
+    let parent: Option<i32> = query_scalar(
+        "select reply_to_message_id from telegram_messages where chat_id=$1 and message_id=880001",
+    )
+    .bind(CHAT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(parent, Some(880004));
+    assert!(
+        tg_ai_bot_teloxide::db::telegram::record_bot_reply(pool, FOREIGN, 880001, &command, None)
+            .await
+            .is_err()
+    );
+    query("delete from telegram_messages where message_id between 880001 and 880005 and chat_id in ($1,$2)")
+        .bind(CHAT).bind(FOREIGN).execute(pool).await.unwrap();
+}
+
+async fn assert_retention_keeps_true_first_seen(pool: &PgPool) {
+    const CHAT: i64 = -1001932061163;
+    let since = Utc::now() - Duration::days(60);
+    query("insert into telegram_messages (chat_id,message_id,user_id,text,created_at) values ($1,880011,880010,'old',$2),($1,880012,880010,'recent',$3),($1,880013,880011,'new',$3)")
+        .bind(CHAT).bind(since-Duration::days(100)).bind(since+Duration::days(1)).execute(pool).await.unwrap();
+    let activity = stats_repo::cohort_activity(pool, CHAT, since)
+        .await
+        .unwrap();
+    assert!(!activity.iter().any(|(user, _)| *user == 880010));
+    assert!(activity.iter().any(|(user, _)| *user == 880011));
+    query(
+        "delete from telegram_messages where chat_id=$1 and message_id between 880011 and 880013",
+    )
+    .bind(CHAT)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn assert_reputation_feature_order_upgrade(pool: &PgPool) {
+    const CHAT: i64 = -1001932061163;
+    const USER: i64 = 880099;
+    let input = serde_json::json!({"fixture":"reputation upgrade"});
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT,
+            telegram_user_id: USER,
+            snapshot_hash: "rep-snapshot",
+            prompt_version: "rep-prompt",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .unwrap();
+    query("update new_user_audit_jobs set status='succeeded', assessment_json='{}'::jsonb, materialization_version='unified-audit-materialization-v7', materialization_status='processing', materialization_attempts=2, materialization_lease_expires_at=now()+interval '1 minute' where chat_id=$1 and telegram_user_id=$2")
+        .bind(CHAT).bind(USER).execute(pool).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/20261006000000_reputation_feature_order.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let state: (String,String,i32,bool,bool) = query_as("select materialization_version,materialization_status,materialization_attempts,materialization_lease_expires_at is null, assessment_json is not null from new_user_audit_jobs where chat_id=$1 and telegram_user_id=$2")
+        .bind(CHAT).bind(USER).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        state,
+        (
+            "unified-audit-materialization-v8".into(),
+            "retry_wait".into(),
+            0,
+            true,
+            true
+        )
+    );
+    query("delete from new_user_audit_jobs where chat_id=$1 and telegram_user_id=$2")
+        .bind(CHAT)
+        .bind(USER)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &PgPool) {

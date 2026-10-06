@@ -29,6 +29,7 @@ pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
     "chat.resolve_user",
     "chat.get_user_profile",
     "chat.count_messages",
+    "chat.count_word_occurrences",
     "chat.search_messages",
     "chat.search_messages_batch",
     "chat.get_recent_messages",

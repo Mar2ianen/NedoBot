@@ -24,6 +24,8 @@ pub struct GenerateTextOptions<'a> {
 }
 
 pub struct GenerateChatOptions<'a> {
+    /// После дедлайна витка повтор начинаем со следующего совместимого profile.
+    pub fallback_offset: usize,
     /// Имя task route из authoritative `LLM_PROFILES_PATH`.
     pub route: &'a str,
     pub system_prompt: Option<&'a str>,
@@ -38,6 +40,12 @@ pub struct GenerateChatOptions<'a> {
 
 const VALIDATION_RETRY_ATTEMPTS: usize = 1;
 
+pub struct GeneratedChat {
+    pub response: ChatResponse,
+    pub provider: String,
+    pub model: String,
+}
+
 struct GenerateOnceRequest<'a> {
     system_prompt: Option<&'a str>,
     prompt: &'a str,
@@ -51,6 +59,15 @@ pub async fn generate_chat_checked(
     config: &Config,
     options: GenerateChatOptions<'_>,
 ) -> anyhow::Result<ChatResponse> {
+    generate_chat_audited_checked(config, options)
+        .await
+        .map(|generated| generated.response)
+}
+
+pub async fn generate_chat_audited_checked(
+    config: &Config,
+    options: GenerateChatOptions<'_>,
+) -> anyhow::Result<GeneratedChat> {
     let profiles = config
         .llm_profiles
         .as_ref()
@@ -201,13 +218,16 @@ async fn generate_chat_with_profile_checked(
     config: &Config,
     profiles: &crate::llm::profiles::LlmProfiles,
     options: GenerateChatOptions<'_>,
-) -> anyhow::Result<ChatResponse> {
+) -> anyhow::Result<GeneratedChat> {
     let route = options.route;
     let requirements = chat_route_requirements(&options);
     let resolved = profiles.resolve_route(route, &requirements)?;
     let mut last_error = None;
 
-    for (fallback_index, selection) in resolved.selections.iter().enumerate() {
+    let offset = options
+        .fallback_offset
+        .min(resolved.selections.len().saturating_sub(1));
+    for (fallback_index, selection) in resolved.selections.iter().enumerate().skip(offset) {
         match generate_chat_profile_once(config, selection, &options).await {
             Ok(response) => {
                 if fallback_index > 0 {
@@ -219,7 +239,11 @@ async fn generate_chat_with_profile_checked(
                         "LLM chat profile fallback succeeded"
                     );
                 }
-                return Ok(response);
+                return Ok(GeneratedChat {
+                    response,
+                    provider: selection.provider_key.into(),
+                    model: selection.model.model.clone(),
+                });
             }
             Err(error) => {
                 tracing::warn!(
@@ -542,9 +566,100 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn timed_out_native_turn_can_retry_another_profile_and_report_its_identity() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _guard = PROFILE_ENV_LOCK.lock().await;
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let calls = primary_calls.clone();
+        let reply = || {
+            Json(
+                json!({"id":"mock-chat","object":"chat.completion","created":1,"model":"mock-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Готово"},"finish_reason":"stop"}]}),
+            )
+        };
+        let primary = post(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                reply()
+            }
+        });
+        let app = Router::new()
+            .route("/primary/v1/chat/completions", primary)
+            .route(
+                "/fallback/v1/chat/completions",
+                post(move || async move { reply() }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut topology = String::new();
+        for name in ["primary", "fallback"] {
+            topology.push_str(&format!(
+                r#"
+[providers.{name}]
+driver = "openai_compatible"
+base_url = "http://{address}/{name}/v1"
+api_key_env = "PROFILE_NATIVE_RETRY_TEST_KEY"
+[models.{name}]
+provider = "{name}"
+model = "mock-{name}"
+[models.{name}.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "prompt_only"
+context_window_tokens = 4096
+max_output_tokens = 1024
+request_timeout_sec = 2
+thinking = "none"
+"#
+            ));
+        }
+        topology.push_str("\n[routes.ask]\nmodels = ['primary', 'fallback']\n[runtime]\n");
+        let mut config = config();
+        config.llm_profiles = Some(LlmProfiles::from_toml(&topology).unwrap());
+        unsafe { std::env::set_var("PROFILE_NATIVE_RETRY_TEST_KEY", "test-key") };
+        let options = |fallback_offset| GenerateChatOptions {
+            fallback_offset,
+            route: "ask",
+            system_prompt: Some("test"),
+            messages: vec![ChatMessage::user("test")],
+            tools: None,
+            requires_images: false,
+            requires_tools: true,
+            previous_response_id: None,
+            temperature: 0.0,
+            num_predict: 128,
+        };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                generate_chat_audited_checked(&config, options(0))
+            )
+            .await
+            .is_err()
+        );
+        let generated = generate_chat_audited_checked(&config, options(1))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("PROFILE_NATIVE_RETRY_TEST_KEY") };
+        server.abort();
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(generated.provider, "fallback");
+        assert_eq!(generated.model, "mock-fallback");
+        assert_eq!(generated.response.first_text(), Some("Готово"));
+    }
+
     #[test]
-    fn chat_route_requirements_preserve_image_requirement_for_fallback_resolution() {
+    fn chat_route_image_requirement_keeps_only_vision_models() {
         let options = GenerateChatOptions {
+            fallback_offset: 0,
             route: "ask",
             system_prompt: Some("system"),
             messages: Vec::new(),
@@ -564,7 +679,7 @@ mod tests {
 
         assert_eq!(resolved.selections.len(), 2);
         assert_eq!(resolved.selections[0].model.model, "qwen/qwen3.8-27b");
-        assert_eq!(resolved.selections[1].model.model, "qwen/qwen3.6-27b");
+        assert_eq!(resolved.selections[1].model.model, "gemini-3.5-flash");
     }
 
     #[tokio::test]

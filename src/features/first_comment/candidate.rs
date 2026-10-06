@@ -6,7 +6,7 @@ use crate::telegram::entities::{forwarded_channel_post, message_text};
 pub struct CommentCandidate<'a> {
     pub source_channel_id: i64,
     pub source_message_id: MessageId,
-    pub post_text: &'a str,
+    pub post_text: std::borrow::Cow<'a, str>,
     pub post_signature_markers: Vec<String>,
     pub blocked_post_terms: Vec<String>,
 }

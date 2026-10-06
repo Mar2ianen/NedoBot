@@ -179,6 +179,19 @@ impl ChatMcpServer {
     }
 
     #[tool(
+        name = "chat.count_word_occurrences",
+        description = "Считает все вхождения точного слова или фразы (query обязателен), включая повторы внутри одного сообщения. Регистр игнорируется, границы слова учитываются; match_mode всегда whole_word. Все остальные фильтры совпадают с chat.count_messages. Возвращает count (вхождения), matching_messages (сообщения), unit=word_occurrences. Для вопроса «сколько раз сказал слово» используй этот инструмент после chat.search_messages с match_mode=whole_word и теми же фильтрами."
+    )]
+    async fn count_word_occurrences(
+        &self,
+        Parameters(input): Parameters<chat::CountMessagesInput>,
+    ) -> Result<Json<Value>, rmcp::ErrorData> {
+        chat::count_word_occurrences(&self.api, input)
+            .await
+            .map(Json)
+    }
+
+    #[tool(
         name = "chat.search_messages_batch",
         description = "Выполняет до шести поисков сообщений публичного чата."
     )]
@@ -461,6 +474,7 @@ mod tests {
             [
                 "ask.list_runs",
                 "chat.count_messages",
+                "chat.count_word_occurrences",
                 "chat.get_media",
                 "chat.get_message",
                 "chat.get_message_context",

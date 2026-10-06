@@ -162,8 +162,8 @@ pub async fn save_telegram_message(
         on conflict (chat_id, message_id) do update set
             text = excluded.text,
             raw_json = excluded.raw_json,
-            reply_to_message_id = excluded.reply_to_message_id,
-            reply_to_user_id = excluded.reply_to_user_id,
+            reply_to_message_id = coalesce(excluded.reply_to_message_id, telegram_messages.reply_to_message_id),
+            reply_to_user_id = coalesce(excluded.reply_to_user_id, telegram_messages.reply_to_user_id),
             sender_chat_id = excluded.sender_chat_id,
             via_bot_id = excluded.via_bot_id,
             has_photo = excluded.has_photo,
@@ -185,7 +185,7 @@ pub async fn save_telegram_message(
     .bind(source_channel_id)
     .bind(source_message_id)
     .bind(msg.is_automatic_forward())
-    .bind(message_text(msg))
+    .bind(message_text(msg).as_deref())
     .bind(raw_json)
     .bind(reply_to_message_id)
     .bind(reply_to_user_id)
@@ -225,9 +225,9 @@ pub async fn save_edited_telegram_message(
     let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
     let new_text = message_text(msg);
     let new_raw_json = serde_json::to_value(msg)?;
-    let changed = old
-        .as_ref()
-        .is_none_or(|old| old.text.as_deref() != new_text || old.raw_json != new_raw_json);
+    let changed = old.as_ref().is_none_or(|old| {
+        old.text.as_deref() != new_text.as_deref() || old.raw_json != new_raw_json
+    });
 
     save_telegram_message(pool, msg, config).await?;
 
@@ -255,7 +255,7 @@ pub async fn save_edited_telegram_message(
             .or_else(|| old.as_ref().and_then(|old| old.user_id)),
     )
     .bind(old.as_ref().and_then(|old| old.text.as_deref()))
-    .bind(new_text)
+    .bind(new_text.as_deref())
     .bind(old.as_ref().map(|old| &old.raw_json))
     .bind(new_raw_json)
     .bind(edited_at)
@@ -1015,4 +1015,21 @@ fn chat_member_status(kind: &ChatMemberKind) -> String {
         ChatMemberKind::Banned(_) => "banned",
     }
     .to_string()
+}
+/// Edit API может вернуть ответ без reply-полей; связь известна из команды.
+pub async fn record_bot_reply(
+    pool: &PgPool,
+    chat_id: i64,
+    message_id: i32,
+    command: &Message,
+    text_projection: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        command.chat.id.0 == chat_id,
+        "bot reply must belong to the command chat"
+    );
+    sqlx::query("update telegram_messages set reply_to_message_id = coalesce(reply_to_message_id, $3), reply_to_user_id = coalesce(reply_to_user_id, $4), text = coalesce($5, text) where chat_id = $1 and message_id = $2")
+        .bind(chat_id).bind(message_id).bind(command.id.0).bind(command.from.as_ref().map(|user| user.id.0 as i64))
+        .bind(text_projection).execute(pool).await?;
+    Ok(())
 }

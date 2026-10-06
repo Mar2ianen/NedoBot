@@ -346,7 +346,7 @@ async fn import_messages(
             let sender_chat_id = message_sender_chat_id(message);
             let source_channel_id = message_source_channel_id(message);
             let user_id = message_user_id(message);
-            let text = message_text(&message.text);
+            let text = exported_message_text(message);
             let media_type = message.media_type.as_deref();
             let raw_json = serde_json::to_value(message)?;
 
@@ -726,16 +726,32 @@ fn message_text(value: &Value) -> String {
 }
 
 fn message_has_links(message: &ExportMessage) -> bool {
-    let text = message_text(&message.text);
+    let text = exported_message_text(message);
     if text.contains("http://") || text.contains("https://") || text.contains("t.me/") {
         return true;
     }
 
     value_has_link_entity(&message.text)
         || message
+            .extra
+            .get("rich_message")
+            .is_some_and(|rich| tg_ai_bot_teloxide::telegram::export_rich::project(rich).has_links)
+        || message
             .text_entities
             .as_ref()
             .is_some_and(value_has_link_entity)
+}
+
+fn exported_message_text(message: &ExportMessage) -> String {
+    let text = message_text(&message.text);
+    if !text.trim().is_empty() {
+        return text;
+    }
+    message
+        .extra
+        .get("rich_message")
+        .map(|rich| tg_ai_bot_teloxide::telegram::export_rich::project(rich).text)
+        .unwrap_or(text)
 }
 
 fn value_has_link_entity(value: &Value) -> bool {
@@ -780,6 +796,18 @@ mod tests {
     fn flattens_rich_text() {
         let text = serde_json::json!(["hello ", {"type": "link", "text": "https://t.me/x"}]);
         assert_eq!(message_text(&text), "hello https://t.me/x");
+    }
+
+    #[test]
+    fn imports_desktop_rich_text_and_link_metadata_without_replacing_plain_text() {
+        let mut message: ExportMessage = serde_json::from_value(serde_json::json!({
+            "id":1,"type":"message","date":"2026-10-05T00:00:00","date_unixtime":"1791158400","text":"",
+            "rich_message":{"blocks":[{"type":"paragraph","text":{"type":"text_link","href":"https://example.com","text":{"type":"plain","text":"Видимая ссылка"}}}]}
+        })).unwrap();
+        assert_eq!(exported_message_text(&message), "Видимая ссылка");
+        assert!(message_has_links(&message));
+        message.text = Value::String("Обычный текст".into());
+        assert_eq!(exported_message_text(&message), "Обычный текст");
     }
 
     #[test]

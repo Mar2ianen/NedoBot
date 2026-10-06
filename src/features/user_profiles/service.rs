@@ -235,7 +235,7 @@ async fn fetch_personal_channel_messages(
 
 fn build_personal_channel_data(messages: Vec<Message>, raw_json: Value) -> PersonalChannelData {
     let first = messages.first();
-    let last_text = first.and_then(message_text).map(str::to_owned);
+    let last_text = first.and_then(message_text).map(|text| text.into_owned());
     let has_adult_links = messages.iter().any(|message| {
         let text = message_text(message).unwrap_or_default().to_lowercase();
         text.contains("t.me/+")
@@ -259,8 +259,8 @@ fn build_personal_channel_data(messages: Vec<Message>, raw_json: Value) -> Perso
     }
 }
 
-fn message_text(message: &Message) -> Option<&str> {
-    message.text().or_else(|| message.caption())
+fn message_text(message: &Message) -> Option<std::borrow::Cow<'_, str>> {
+    crate::telegram::entities::message_text(message)
 }
 
 fn is_definitive_personal_channel_error(error: &str) -> bool {

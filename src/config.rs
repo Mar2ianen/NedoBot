@@ -559,6 +559,14 @@ impl Config {
                 teloxide_statistics::reputation::ReputationModel::load(&json).map_err(|error| {
                     anyhow::anyhow!("cannot parse reputation model {path:?}: {error}")
                 })?;
+            let supported = crate::features::new_user_audit::service::REPUTATION_FEATURE_NAMES;
+            anyhow::ensure!(
+                model
+                    .features
+                    .iter()
+                    .all(|feature| supported.contains(&feature.as_str())),
+                "reputation model contains unsupported features"
+            );
             tracing::info!(
                 version = model.version.as_str(),
                 features = ?model.features,
@@ -663,7 +671,14 @@ impl Config {
 
         if self.voice_transcription_enabled {
             validate_voice_asr_secret(&mut errors, self);
-            if self.voice_asr_shadow_enabled {
+            // Gemini audio ASR не принимает video notes; для них используется
+            // настроенный Groq media fallback даже без сравнительного shadow.
+            if self.voice_asr_shadow_enabled
+                || self
+                    .voice_asr_provider
+                    .trim()
+                    .eq_ignore_ascii_case("gemini")
+            {
                 validate_voice_asr_shadow_secret(&mut errors, self);
             }
         }

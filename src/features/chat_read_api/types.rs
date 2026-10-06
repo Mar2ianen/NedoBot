@@ -36,7 +36,7 @@ pub struct ChatMediaAttachment {
     pub file_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMatch {
     Hybrid,
@@ -58,7 +58,7 @@ impl MessageMatch {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageSort {
     Relevance,
@@ -76,7 +76,7 @@ impl MessageSort {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct MessageSearchRequest {
     pub query: String,
     pub user_id: Option<i64>,

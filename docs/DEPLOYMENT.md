@@ -7,6 +7,60 @@ deploy-YYYY-MM-DD-scope.
 
 ## Перед выкладкой
 
+### Релиз исправлений /ask от 6 октября
+
+Аудит и границы проверки: [ASK_AUDIT_2026-10-06.md](ASK_AUDIT_2026-10-06.md).
+Сначала review `dev → main`, затем сборка release с `deploy=false` на точном
+SHA и проверка `BUILD_INFO.txt`/`SHA256SUMS`. Деплой обоих ботов и MCP остаётся
+отдельным действием.
+
+В production profile нужна одна ручная правка после бэкапа: добавить
+существующий `gemini_flash_comment` в конец `routes.ask.models`. Это
+независимый vision fallback: текстовые OpenRouter/Ollama profiles при
+приложенной фотографии исключаются capability-фильтром. Секрет
+`GEMINI_API_KEY` уже используется текущими Gemini routes; profile целиком
+из example не копировать. Второй community profile проверяется отдельно.
+
+До рестарта можно проверить staged release CLI из каталога инстанса:
+
+```bash
+./probe_ask_route
+./probe_ask_route --image
+```
+
+CLI загружает выбранный через `LLM_PROFILES_PATH` profile и secrets env;
+вызывается только диагностический LLM tool, без Telegram, БД и заметок.
+Для проверки ещё не изменённой production topology использовать отдельную
+копию profile с добавленным fallback. Возвращаются identity выбранного
+profile и `native_tool_verified`, содержимое ответа не печатается.
+
+Проверка SDK артефактом с VPS подтвердила native tool calls Groq для текста
+и изображения. Scoped dry run НедоNews обнаружил 52 восстанавливаемых
+rich-сообщения. В ПВО найдены два rich-сообщения из Desktop export: их формат
+тоже поддерживают backfill и обновлённый `import_telegram_export`.
+
+При старте встроенная миграция `20261006000000` переочередит materialization
+успешных v7 assessments в v8. LLM-аудит не повторяется. Контролировать
+очередь и CAS/retry метрики обоих инстансов.
+
+После миграций восстановить старые rich-тексты отдельно в каждой БД.
+Выполнять из каталога инстанса с его env; CLI не требует Telegram token:
+
+```bash
+./target/release/backfill_rich_messages -1001932061163
+./target/release/backfill_rich_messages -1001932061163 --apply
+```
+
+Для второго инстанса подставить его chat ID и DSN. Сначала проверить dry
+run, затем `--apply`; повторный запуск идемпотентен. Payload и старый audit
+не меняются, user activity не увеличивается, новые Telegram сообщения
+и LLM jobs не создаются. Бэкап БД перед выкладкой обязателен.
+
+Smoke после выкладки: reply на старый rich-ответ, вопрос о родительском
+посте, точный word count с повтором слова в одной строке, групповой scope
+при включённом private default chat, оба service PID/hash и journal.
+Deployment tag ставить только после фактического успешного deploy.
+
 1. Проверить, что PR слит в main, worktree чистый, а remote head известен:
 
    ```bash
@@ -18,9 +72,9 @@ deploy-YYYY-MM-DD-scope.
 2. Прогнать локальные проверки:
 
    ```bash
-   cargo fmt -- --check
-   cargo test --all-targets
-   cargo clippy --all-targets -- -D warnings
+   cargo fmt --all -- --check
+   cargo test --workspace --all-targets --locked
+   cargo clippy --workspace --all-targets --locked -- -D warnings
    ./scripts/test.sh
    ```
 
@@ -118,29 +172,35 @@ rsync -az \
 удалял `alt_word_char_v2_2026-10-03.json` 2026-10-05 с crash-loop НедоNews до
 восстановления из снапшота (хеш сверен с задокументированным в релизе).
 
-После rsync отдельно проверить доступ сервисного пользователя к checkout:
+При использовании запасного пути повторить source sync для
+`/opt/nedobot-pvo/`, сохранив его собственные `.env`, profile и persistent
+файлы. Затем отдельно проверить доступ сервисного пользователя к обоим
+checkout:
 
 ```bash
 ssh vps-153 'chmod 755 /opt/tg-ai-bot-teloxide && runuser -u tg-ai-bot -- test -x /opt/tg-ai-bot-teloxide'
+ssh vps-153 'chmod 755 /opt/nedobot-pvo && runuser -u tg-ai-bot -- test -x /opt/nedobot-pvo'
 ```
 
 Не выполнять рекурсивный `chmod`: MCP нужен только проход по каталогу и
-доступ к release binary. Затем установить non-secret profile отдельно и
-проверить его наличие до рестарта:
+доступ к release binary. Изменения non-secret profiles внести вручную после
+бэкапа, сохранив настройки каждого инстанса. Example целиком поверх
+существующего profile не копировать. До рестарта проверить оба файла:
 
 ```bash
-rsync -az config/llm_profiles.toml.production.example \
-  vps-153:/etc/tg-ai-bot/llm_profiles.toml
-ssh vps-153 'test -s /etc/tg-ai-bot/llm_profiles.toml'
+ssh vps-153 'test -s /etc/tg-ai-bot/llm_profiles.toml && test -s /etc/tg-ai-bot/pvo-llm_profiles.toml'
 ```
 
-Сборка и restart выполняются на сервере, чтобы release binary использовал
-production toolchain и локальный cargo cache:
+В запасном пути собрать один release на сервере с production toolchain и
+локальным cargo cache. Подготовить stage из бинарей и installer, как в
+workflow `release`, затем установить его через `install_release_binaries.sh`
+сразу в оба checkout. Простого rebuild первого инстанса недостаточно:
 
 ```bash
-ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --release'
-ssh vps-153 'systemctl restart tg-ai-bot-teloxide'
-ssh vps-153 'systemctl is-active tg-ai-bot-teloxide'
+ssh vps-153 'cd /opt/tg-ai-bot-teloxide && /root/.cargo/bin/cargo build --locked --release'
+# После установки проверенного stage через installer:
+ssh vps-153 'systemctl restart tg-ai-bot-teloxide nedobot-pvo'
+ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedobot-pvo'
 ssh vps-153 'systemctl restart nedonews-mcp'
 ssh vps-153 'systemctl is-active nedonews-mcp'
 ```

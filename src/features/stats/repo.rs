@@ -515,8 +515,15 @@ pub async fn cohort_activity(
 
     let rows: Vec<ActivityRow> = sqlx::query_as(
         r#"
+        with eligible_users as (
+            select user_id from telegram_messages
+            where chat_id = $1 and user_id is not null and source_channel_id is null
+              and user_id <> $2
+            group by user_id having min(created_at) >= $3
+        )
         select m.user_id, (extract(epoch from date_trunc('day', m.created_at)) / 86400)::bigint as day
         from telegram_messages m
+        join eligible_users u on u.user_id = m.user_id
         where m.chat_id = $1 and m.user_id is not null and m.source_channel_id is null
           and m.user_id <> $2 and m.created_at >= $3
         group by m.user_id, 2

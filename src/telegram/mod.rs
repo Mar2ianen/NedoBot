@@ -4,9 +4,11 @@ pub mod command_handler;
 pub mod commands;
 pub mod custom_emoji;
 pub mod entities;
+pub mod export_rich;
 pub mod html;
 #[cfg(feature = "manual-moderation")]
 pub mod manual_moderation;
 pub mod media;
 pub mod render;
+pub mod rich_content;
 pub mod service_messages;

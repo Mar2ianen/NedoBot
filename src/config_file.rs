@@ -466,7 +466,7 @@ impl Default for RuntimeSettings {
             voice_language: "ru".to_string(),
             voice_asr_provider: "gemini".to_string(),
             voice_asr_model: "gemini-3.5-transcribe".to_string(),
-            voice_asr_shadow_enabled: true,
+            voice_asr_shadow_enabled: false,
             voice_asr_shadow_model: "whisper-large-v3-turbo".to_string(),
             voice_asr_temperature: 0.0,
             voice_cleanup_temperature: 0.2,
@@ -476,5 +476,20 @@ impl Default for RuntimeSettings {
             public_base_url: None,
             static_files_dir: "/opt/tg-ai-bot-teloxide/static".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeSettings;
+    #[test]
+    fn legacy_groq_profile_does_not_enable_an_unconfigured_gemini_shadow() {
+        let runtime: RuntimeSettings =
+            toml::from_str("voice_asr_provider = 'groq'\nvoice_asr_model = 'whisper-large-v3'")
+                .unwrap();
+        assert!(!runtime.voice_asr_shadow_enabled);
+        let explicit: RuntimeSettings = toml::from_str("voice_asr_provider = 'groq'\nvoice_asr_shadow_enabled = true\nvoice_asr_shadow_model = 'gemini-3.5-transcribe'").unwrap();
+        assert!(explicit.voice_asr_shadow_enabled);
+        assert_eq!(explicit.voice_asr_shadow_model, "gemini-3.5-transcribe");
     }
 }
