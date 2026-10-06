@@ -103,6 +103,21 @@ max_output_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_low"
 
+# Отдельный timeout для /ask; профиль комментариев имеет собственный бюджет.
+[models.gemini_ask]
+provider = "gemini"
+model = "gemini-3.5-flash"
+
+[models.gemini_ask.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1000000
+max_output_tokens = 65536
+request_timeout_sec = 180
+thinking = "level_high"
+
 [models.gemini_flash_lite_comment]
 provider = "gemini"
 model = "gemini-3.5-flash-lite"
@@ -189,6 +204,21 @@ max_output_tokens = 16384
 request_timeout_sec = 60
 thinking = "none"
 
+# /ask имеет собственные effort и timeout, независимо от voice_cleanup.
+[models.openrouter_qwen_ask]
+provider = "openrouter"
+model = "qwen/qwen3.6-27b"
+
+[models.openrouter_qwen_ask.capabilities]
+supports_images = false
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 180
+thinking = "level_high"
+
 [models.groq_qwen_ask]
 provider = "groq"
 model = "qwen/qwen3.8-27b"
@@ -200,8 +230,8 @@ supports_system_prompt = true
 structured_output = "json_object"
 context_window_tokens = 131072
 max_output_tokens = 16384
-request_timeout_sec = 60
-thinking = "default"
+request_timeout_sec = 180
+thinking = "level_high"
 
 [models.cerebras_audit]
 provider = "cerebras"
@@ -273,7 +303,7 @@ models = ["ollama_audit"]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["groq_qwen_ask", "openrouter_qwen_fallback", "ollama_memory", "gemini_flash_comment"]
+models = ["groq_qwen_ask", "openrouter_qwen_ask", "ollama_memory", "gemini_ask"]
 
 # Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
 # API keys stay in the process environment and are not stored in this file.
@@ -349,14 +379,15 @@ ask_enabled = false
 ask_allow_chat_admins = true
 ask_private_user_ids = []
 ask_llm_temperature = 0.2
-ask_llm_max_tokens = 1800
-ask_max_steps = 7
-ask_action_timeout_sec = 45
-ask_total_timeout_sec = 180
-ask_max_concurrency = 1
+# Бюджет исследования: до 64 tools и 68 LLM turns с резервом на финальный ответ.
+ask_llm_max_tokens = 16384
+ask_max_steps = 64
+ask_action_timeout_sec = 180
+ask_total_timeout_sec = 1800
+ask_max_concurrency = 4
 ask_db_mcp_args = []
 ask_db_mcp_env = ["ASK_DATABASE_URL", "MCP_MANIFEST"]
-ask_db_mcp_timeout_sec = 8
+ask_db_mcp_timeout_sec = 30
 
 profile_refresh_concurrency = 4
 comment_custom_emoji_id = "5445092965875729965"

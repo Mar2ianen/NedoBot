@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let config = Config::from_env()?;
+    config.validate_runtime_secrets()?;
     let mut parts = vec![ContentPart::from_text(
         "Вызови inspect с query=test. Это проверка формата, других действий не требуется.",
     )];
@@ -46,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
             requires_tools: true,
             previous_response_id: None,
             temperature: 0.0,
-            num_predict: 1024,
+            num_predict: config.ask_llm_max_tokens,
         },
     )
     .await?;
@@ -57,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .any(|call| call.fn_name == "inspect" && call.fn_arguments["query"] == "test");
     println!(
         "{}",
-        json!({"provider":generated.provider,"model":generated.model,"requires_images":requires_images,"native_tool_verified":verified})
+        json!({"provider":generated.provider,"model":generated.model,"requires_images":requires_images,"native_tool_verified":verified,"configured_output_tokens":config.ask_llm_max_tokens,"configured_tool_budget":config.ask_max_steps,"configured_total_timeout_sec":config.ask_total_timeout_sec})
     );
     anyhow::ensure!(
         verified,

@@ -369,8 +369,17 @@ fn validate_capabilities(
         anyhow::bail!("model profile {name:?} request_timeout_sec must be greater than 0");
     }
     let adapter = provider.genai_adapter();
+    // Compatible chat transports уже сериализуют explicit reasoning_effort.
+    // Числовой budget и provider-specific default этим протоколам не добавляем.
+    let supports_explicit_effort = provider.driver == LlmDriver::OpenaiCompatible
+        && matches!(adapter, GenAiAdapter::OpenAi | GenAiAdapter::OpenRouter)
+        && matches!(
+            capabilities.thinking,
+            ThinkingMode::LevelLow | ThinkingMode::LevelHigh
+        );
     if capabilities.thinking != ThinkingMode::None
         && !matches!(adapter, GenAiAdapter::Gemini | GenAiAdapter::Groq)
+        && !supports_explicit_effort
     {
         anyhow::bail!(
             "model profile {name:?} enables thinking for an unsupported provider adapter {adapter:?}"
@@ -503,6 +512,9 @@ models = ["ollama_memory"]
     #[test]
     fn ask_route_keeps_explicit_reasoning_and_an_independent_vision_fallback() {
         let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
+        assert_eq!(profiles.runtime.ask_llm_max_tokens, 16_384);
+        assert_eq!(profiles.runtime.ask_max_steps, 64);
+        assert_eq!(profiles.runtime.ask_total_timeout_sec, 1_800);
 
         let selections = profiles
             .resolve_route("ask", &RouteRequirements::default())
@@ -516,16 +528,75 @@ models = ["ollama_memory"]
         assert!(selections.selections[3].capabilities.supports_images);
         assert_eq!(
             selections.selections[0].capabilities.thinking,
-            ThinkingMode::Default
+            ThinkingMode::LevelHigh
         );
         assert_eq!(
             selections.selections[1].capabilities.thinking,
-            ThinkingMode::None
+            ThinkingMode::LevelHigh
         );
         assert_eq!(
             selections.selections[2].capabilities.thinking,
             ThinkingMode::None
         );
+        assert_eq!(
+            selections.selections[3].capabilities.thinking,
+            ThinkingMode::LevelHigh
+        );
+        let research_route = profiles
+            .resolve_route(
+                "ask",
+                &RouteRequirements {
+                    requires_tools: true,
+                    num_predict: Some(profiles.runtime.ask_llm_max_tokens),
+                    ..RouteRequirements::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(research_route.selections.len(), 3);
+        assert!(research_route.selections.iter().all(|selection| {
+            selection.capabilities.thinking == ThinkingMode::LevelHigh
+                && selection.capabilities.request_timeout_sec == 180
+        }));
+    }
+
+    #[test]
+    fn compatible_transports_accept_explicit_reasoning_levels() {
+        let profiles = LlmProfiles::from_toml(VALID_PROFILES).unwrap();
+        let mut capabilities = profiles.models["ollama_memory"].capabilities.clone();
+        for adapter in [
+            GenAiAdapter::OpenAi,
+            GenAiAdapter::OpenRouter,
+            GenAiAdapter::Groq,
+        ] {
+            let provider = ProviderProfile {
+                driver: LlmDriver::OpenaiCompatible,
+                base_url: "https://api.example.com/v1".into(),
+                api_key_env: "TEST_API_KEY".into(),
+                adapter: Some(adapter),
+                egress: Egress::Direct,
+            };
+            for thinking in [ThinkingMode::LevelLow, ThinkingMode::LevelHigh] {
+                capabilities.thinking = thinking;
+                validate_capabilities("ask", &provider, &capabilities).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn compatible_transports_reject_unsupported_numeric_thinking_budget() {
+        let profiles = LlmProfiles::from_toml(VALID_PROFILES).unwrap();
+        let mut capabilities = profiles.models["ollama_memory"].capabilities.clone();
+        capabilities.thinking = ThinkingMode::Budget;
+        for adapter in [GenAiAdapter::OpenAi, GenAiAdapter::OpenRouter] {
+            let provider = ProviderProfile {
+                driver: LlmDriver::OpenaiCompatible,
+                base_url: "https://api.example.com/v1".into(),
+                api_key_env: "TEST_API_KEY".into(),
+                adapter: Some(adapter),
+                egress: Egress::Direct,
+            };
+            assert!(validate_capabilities("ask", &provider, &capabilities).is_err());
+        }
     }
 
     #[test]
