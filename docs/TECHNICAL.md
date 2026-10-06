@@ -289,7 +289,17 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-04-rep-v2`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-04-rep-v2) на commit `225e59ddf62a` (merge PR #26). Предыдущие релизы остаются в истории под `deploy-2026-10-04-stats-render` / `d727e0992198`, `deploy-2026-10-04-footer-alias` / `cdfa261f9449`, `deploy-2026-10-04-gemma-head` / `d82d55a083fe` и ранее.
+Текущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-06-ask-audit`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-06-ask-audit) на точном source commit `236e9986333cc3026036365752e764525cce5c86`. Код прошёл review и слит в `main` через [PR #32](https://github.com/Mar2ianen/NedoBot/pull/32); tree merge commit `cbbf4b7c801d` совпадает с tree собранного source. Артефакт из [release workflow](https://github.com/Mar2ianen/NedoBot/actions/runs/37422409833) установлен **2026-10-06 06:30 UTC / 09:30 МСК** в оба community-инстанса; перезапущены `tg-ai-bot-teloxide`, `nedobot-pvo` и `nedonews-mcp`.
+
+Релиз исправляет rich-текст и reply/thread scope `/ask`, точный подсчёт вхождений слов, native tool schemas Gemini, compaction/fallback агента, порядок признаков репутации и voice fallback. В профиле НедоNews в конец `routes.ask.models` добавлен существующий `gemini_flash_comment`; профиль ПВО сохранён без изменений. Миграция `20261006000000_reputation_feature_order.sql` применена в обеих БД: derived materialization v8 использует сохранённый assessment и отсекает устаревшие снимки, без повторного LLM-аудита.
+
+Scoped backfill восстановил текст **52 rich-сообщений НедоNews и 2 ПВО**; повторный dry run в обоих чатах даёт ноль кандидатов. Public MCP возвращает восстановленные сообщения; официальный RMCP client проверил discovery (28 tools) и новый счётчик: 740 вхождений слова «и» в 512 сообщениях за 1–6 октября. SDK проверил native tool calls Groq для текста и изображения с фактическим production-профилем. После restart проверены оба PID и MCP, `NRestarts=0`, успешная миграция, PostgreSQL и оба embedding health endpoints; за шестиминутное окно application `ERROR` и ошибок missing migration нет. Telegram smoke-команды не отправлялись.
+
+SHA256 работающего bot executable обоих инстансов: `dd0f428c283029b324b45b4db4736c6f29a3a029cb8f8b2cfa040fac2541751a`; MCP: `2d744c2f84df77e3923e6ea9406c5e35e63d2ba8efd03208ac4294deee55600b`. Проверенный stage и результаты выкладки сохранены в `/opt/tg-ai-bot-releases/deploy-2026-10-06-ask-audit-236e998/`. До выкладки сохранены и проверены custom dumps обеих БД, consistent SQLite backup, binaries, models, `.env` и profiles в приватном `/opt/tg-ai-bot-releases/deploy-2026-10-06-ask-audit-before-20261006T062533Z/`. Эти данные не публикуются. Дальнейшая разработка идёт в `dev`; deploy tag указывает на собранный source, независимо от последующих documentation commits.
+
+### Предыдущие выкладки 2026-10-04
+
+Предыдущий release зафиксирован под `deploy-2026-10-04-rep-v2` / `225e59ddf62a` (merge PR #26). Ранее: `deploy-2026-10-04-stats-render` / `d727e0992198`, `deploy-2026-10-04-footer-alias` / `cdfa261f9449`, `deploy-2026-10-04-gemma-head` / `d82d55a083fe`. Следующие записи описывают проверки этих исторических выкладок.
 
 Релиз включает репутационную голову `rep-v2-2026-10-04` (`reputation_enabled=true`): 12 point-in-time фичей, двухпроходной скоринг, слот +4/+8, команды исключены. Проверенный deploy: **2026-10-04 14:05 UTC / 17:05 МСК**, binary `45170162da8bdf562badb99f215f35e0c9b41bce783c03495745c01750a50ec8`. На VPS **`enforce_enabled=false`, `enforce_dry_run=true`**: автоматических банов и удалений нет.
 
