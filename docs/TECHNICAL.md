@@ -912,7 +912,7 @@ ryzen_custom_emoji_id = "5444875271163364561"
 
 ## /ask: контекст и аудит native tasks
 
-System prompt вшит из `prompts/ask.md`; после правки нужен rebuild. Typed rich-проекция используется для истории и reply, включая nested blocks, таблицы и captions; служебные metadata и thinking исключены. В group scope берётся ID текущего чата, в private scope — настроенный default chat. Перед ответом на reply агент подтягивает bounded MCP context и записывает его в audit.
+System prompt вшит из `prompts/ask.md`; журнал выпущенных возможностей хранится в `docs/BOT_CHANGELOG.md` и подмешивается в него только для вопросов о самом боте. Оба файла включаются через `include_str!`, поэтому после их правки нужен rebuild. Правило ведения журнала описано в `DEVELOPMENT.md`. Typed rich-проекция используется для истории и reply, включая nested blocks, таблицы и captions; служебные metadata и thinking исключены. В group scope берётся ID текущего чата, в private scope — настроенный default chat. Перед ответом на reply агент подтягивает bounded MCP context и записывает его в audit.
 
 `chat.count_messages` возвращает число сообщений с `unit=messages`. `chat.count_word_occurrences` возвращает число неперекрывающихся вхождений точного слова/фразы и matching_messages, `unit=word_occurrences`. Runtime требует предварительный поиск с теми же фильтрами; count без query разрешён для structural count. Результаты count сохраняются при сокращении контекста. Native tool pairs удаляются целиком, per-turn previews ограничены, provider-specific continuation ID не используется с полной историей. После action timeout повтор начинается со следующего совместимого profile. `ask_runs.provider/model` отражают реально ответивший profile; `step_count` включает model turns без tools.
 
