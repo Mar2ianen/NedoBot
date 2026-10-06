@@ -188,12 +188,22 @@ impl GenAiTransport {
     async fn exec_chat(
         &self,
         model: ModelTarget<'_>,
-        request: ChatRequest,
+        mut request: ChatRequest,
         options: ChatOptions,
         timeout_duration: Duration,
         egress: Egress,
         structured_output: bool,
     ) -> Result<ChatResponse, LlmTransportError> {
+        // genai 0.6.5 сохраняет additionalProperties в function.parameters,
+        // но Gemini Schema отклоняет этот JSON Schema keyword с HTTP 400.
+        // Остальную конвертацию выполняет SDK; строгие схемы других adapter-ов сохраняем.
+        if matches!(model.adapter, GenAiAdapter::Gemini) {
+            for tool in request.tools.iter_mut().flatten() {
+                if let Some(schema) = tool.schema.as_mut() {
+                    remove_gemini_additional_properties(schema);
+                }
+            }
+        }
         let endpoint = format!("{}/", model.endpoint.trim_end_matches('/'));
         let target = ServiceTarget {
             endpoint: Endpoint::from_owned(endpoint),
@@ -214,6 +224,36 @@ impl GenAiTransport {
         .await
         .map_err(|_| LlmTransportError::timeout())?;
         result.map_err(|error| map_genai_error(error, structured_output))
+    }
+}
+
+fn remove_gemini_additional_properties(schema: &mut serde_json::Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    object.remove("additionalProperties");
+    // Имена свойств не являются schema keywords: параметр с таким же
+    // именем сохраняется, а ограничение снимается только внутри его схемы.
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(children) = object
+            .get_mut(key)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for child in children.values_mut() {
+                remove_gemini_additional_properties(child);
+            }
+        }
+    }
+    for key in ["items", "allOf", "anyOf", "oneOf", "prefixItems"] {
+        match object.get_mut(key) {
+            Some(serde_json::Value::Array(children)) => {
+                for child in children {
+                    remove_gemini_additional_properties(child);
+                }
+            }
+            Some(child) => remove_gemini_additional_properties(child),
+            None => {}
+        }
     }
 }
 
@@ -796,8 +836,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_native_tools_remove_unsupported_keywords_and_keep_parameter_names() {
+        async fn response(
+            State(captured): State<CapturedRequest>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *captured.lock().unwrap() = Some((headers, body));
+            Json(
+                serde_json::json!({"candidates":[{"content":{"role":"model","parts":[
+                {"functionCall":{"name":"inspect","args":{"query":"test"}}}
+            ]},"finishReason":"STOP"}]}),
+            )
+        }
+        let captured = CapturedRequest::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = captured.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/v1beta/models/gemini-3.5-flash:generateContent",
+                        post(response),
+                    )
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let endpoint = format!("http://{address}/v1beta");
+        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let result = transport.chat(GenAiChatRequest {
+            model: ModelTarget {adapter: GenAiAdapter::Gemini, endpoint: &endpoint, api_key: "test-key", model: "gemini-3.5-flash"},
+            system_prompt: None,
+            messages: vec![ChatMessage::user("inspect test")],
+            tools: Some(vec![Tool::new("inspect").with_schema(serde_json::json!({
+                "type":"object","additionalProperties":false,"properties":{
+                    "query":{"type":["string","null"]},
+                    "additionalProperties":{"type":"object","additionalProperties":false,"properties":{"value":{"type":"string"}}}
+                }
+            })).with_strict(true)]),
+            previous_response_id: None, temperature: 0.0, max_tokens: 128,
+            timeout: Duration::from_secs(5), reasoning: ThinkingMode::None, reasoning_budget: None, egress: Egress::Direct,
+        }).await.unwrap();
+        assert_eq!(result.tool_calls()[0].fn_name, "inspect");
+        let request = captured.lock().unwrap().take().unwrap().1;
+        let schema = &request["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema["properties"]["additionalProperties"].is_object());
+        assert!(
+            schema["properties"]["additionalProperties"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn native_tool_http_contract_roundtrips_tool_call() {
-        async fn tool_call_response() -> Json<Value> {
+        async fn tool_call_response(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(
+                body["tools"][0]["function"]["parameters"]["additionalProperties"],
+                false
+            );
             Json(serde_json::json!({
                 "id": "tool-contract",
                 "object": "chat.completion",
@@ -850,6 +954,7 @@ mod tests {
                         .with_description("search")
                         .with_schema(serde_json::json!({
                             "type": "object",
+                            "additionalProperties": false,
                             "properties": {"query": {"type": "string"}}
                         }))
                         .with_strict(true),
