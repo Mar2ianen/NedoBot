@@ -5,6 +5,33 @@ vps-13176). Deploy выполняется из слитого main, а не из
 ветки. Фактически запущенный commit фиксируется immutable tag
 deploy-YYYY-MM-DD-scope.
 
+## Последняя фактическая выкладка
+
+6 октября 2026 в **15:36 UTC / 18:36 МСК** выпущен release
+[`deploy-2026-10-06-bot-changelog`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-06-bot-changelog)
+на source `6c11dc761872ae6ee7b650fb59fac2e2f7072f46`, после review
+[PR #36](https://github.com/Mar2ianen/NedoBot/pull/36). Бинарники собраны
+[release workflow](https://github.com/Mar2ianen/NedoBot/actions/runs/37487503523)
+с `deploy=false`; `BUILD_INFO.txt` и все записи `SHA256SUMS` проверены перед
+установкой. Обновлены и перезапущены оба bot-инстанса и `nedonews-mcp`.
+
+Runtime profiles, env и схема БД не менялись. `/ask` теперь получает журнал
+изменений NedoBot только на вопросах о возможностях самого бота. Полный
+список изменений — в [`BOT_CHANGELOG.md`](BOT_CHANGELOG.md).
+
+Оба бота и MCP активны; `/proc/<pid>/exe` hashes совпали с артефактом:
+bot `dd6a39d68fe83412da8eb5d72987e3393919ad2b4f09c9ba0f2198cc71d3050d`,
+MCP `d580d142e0dd3c4808a6a37df83636d04654b0664c7230bdded4cc1c353c9149`.
+В каждой production БД 92 успешные миграции, failed migrations и ошибки
+приложения после рестарта отсутствуют. Local MCP ответил `403`, public MCP —
+`405` на unauthenticated GET; Telegram smoke-команды не отправлялись.
+
+До выкладки сохранены и проверены dumps обеих БД (`pg_restore --list`),
+consistent SQLite backup (`PRAGMA integrity_check`), работающие binaries,
+profiles и env в приватном `/opt/tg-ai-bot-releases/deploy-2026-10-06-bot-changelog-before-20261006T152904Z/`.
+Проверенный artifact и `DEPLOYMENT_RESULT.json` находятся в
+`/opt/tg-ai-bot-releases/deploy-2026-10-06-bot-changelog-6c11dc7/`.
+
 ## Перед выкладкой
 
 ### Расширение лимитов /ask от 6 октября, 10:18 МСК
