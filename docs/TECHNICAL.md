@@ -134,6 +134,22 @@ Civil date/time и bare clock нормализуются через эту зо�
 
 `/ask` использует два независимых deadline: `runtime.ask_action_timeout_sec` ограничивает один native agent turn LLM (с одной retry-попыткой после timeout), а `runtime.ask_total_timeout_sec` ограничивает исследование целиком, включая MCP и внешние tools. Между turn-ами сохраняется полная genai chat history, включая assistant tool calls, call_id-связанные tool responses и thought signatures. Значения `0` запрещены.
 
+В tracked profiles бюджет исследования расширен: `ask_max_steps=64`
+ограничивает число фактических вызовов tools (включая предварительную
+подгрузку reply), а модель получает до 68 turns: 64 основных, 3 коррекционных
+и 1 для финального ответа. `ask_total_timeout_sec=1800` — общий потолок;
+`ask_action_timeout_sec=180` — одна LLM-попытка, с отдельными transport timeout
+из model capabilities (для ask Qwen и отдельного `gemini_ask` — 180 секунд);
+`ask_db_mcp_timeout_sec=30` — один MCP request.
+`ask_llm_max_tokens=16384` задаёт общий верхний бюджет генерации на один LLM-вызов, включая reasoning;
+для ask Qwen и `gemini_ask` включён `thinking="level_high"` (effort `high`),
+`ask_max_concurrency=4` — число одновременно исполняемых `/ask` в инстансе.
+Существующий deployment-profile получает эти значения явно после бэкапа
+и restart; увеличение шаблона само по себе production-конфиг не меняет.
+Модели с `max_output_tokens` ниже 16384 не участвуют в этом маршруте.
+Отдельный `gemini_ask` позволяет задать высокий effort для агента;
+профили memory и first_comment выбирают собственные task budgets.
+
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 
 Telegram lifecycle `/ask` полностью использует shared Drafter: каждое progress-событие проходит через synchronous `DraftSink` с latest-wins/coalescing, начальный preview принудительно отправляется через `flush`, а scheduler сам применяет shared limiter, throttle, retry/backoff и native-draft watchdog. В личке во время исследования отправляется настоящий native rich draft; в группах, где Telegram native drafts недоступны, один rich message отправляется и редактируется in place до финального ответа с reply на исходную команду. Успешный ответ и failure-message проходят через `finish`; при подтверждённом отказе worker перед возвратом ошибки best-effort чистит временный preview, а при `Unknown` его не трогает. `abort` остаётся штатным явным путём отмены; limiter общий для всех `/ask`-драфтеров процесса.
