@@ -900,7 +900,7 @@ fn ready_history_completion() -> HistoryEntryCompletion {
         skip_reason: None,
         provider: "test".to_string(),
         model: "test".to_string(),
-        embedding: Some(vec![0.0; 312]),
+        embedding: Some(vec![0.0; 512]),
         embedding_model: "test".to_string(),
     }
 }
