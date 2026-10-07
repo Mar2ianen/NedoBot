@@ -290,8 +290,9 @@ EmbeddingGemma 300M 768d колонки остаются нетронутыми 
 `avatar_embeddings_enabled=true` включает отдельный bounded worker. Он
 добавляет аватар только после явного spam-label; штатный аудит остальных
 пользователей не сохраняет их image vectors. Снятие метки удаляет записи этого
-пользователя. В Postgres попадает embedding и file id для повторной загрузки,
-изображение байтами не сохраняется.
+пользователя. До векторизации Postgres держит file id только для повторной
+загрузки; после готового embedding он очищается, остаётся только
+non-downloadable file-unique id. Байты изображения не сохраняются.
 
 После переключения проверить `nedobot-rag-embedding` и остановить старые
 `nedobot-chat-embedding`/RuBERT-serving units. При rollback восстановить оба
