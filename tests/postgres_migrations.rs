@@ -36,6 +36,7 @@ use tg_ai_bot_teloxide::features::{
     },
     jobs::{claim::CasResult, observability::load_job_lifecycle_report},
     labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
+    memory::embedding::EMBEDDINGGEMMA2_MODEL_ID,
     memory::service::{
         HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
         finalize_history_failed, finalize_history_retry,
@@ -4134,12 +4135,13 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
         r#"
         insert into telegram_message_embeddings_gemma2
             (chat_id, message_id, embedding, embedding_model, status)
-        values ($1, $2, $3::vector, 'test-gemma', 'ready')
+        values ($1, $2, $3::vector, $4, 'ready')
         "#,
     )
     .bind(-1001932061163_i64)
     .bind(message_id)
     .bind(&embedding_literal)
+    .bind(EMBEDDINGGEMMA2_MODEL_ID)
     .execute(pool)
     .await
     .expect("semantic search embedding fixture must be inserted");
@@ -4153,15 +4155,10 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
     let embedding_server = tokio::spawn(async move {
         let vector = embedding;
         let app = Router::new().route(
-            "/v1/embeddings",
+            "/embed",
             post(move || {
                 let vector = vector.clone();
-                async move {
-                    Json(serde_json::json!({
-                        "object": "list",
-                        "data": [{ "index": 0, "embedding": vector }]
-                    }))
-                }
+                async move { Json(serde_json::json!(vector)) }
             }),
         );
         axum::serve(listener, app)
@@ -4198,7 +4195,7 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
         },
         Some(&SemanticSearchConfig {
             embedding_url: format!("http://{address}"),
-            embedding_model: "test-gemma".into(),
+            embedding_model: EMBEDDINGGEMMA2_MODEL_ID.into(),
             timeout_sec: 5,
             query_prefix: "task: search result | query: ".into(),
         }),
