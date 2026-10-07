@@ -35,12 +35,13 @@ pub(crate) async fn template_match_count(
 }
 
 const SPAM_SIMILARITY_SQL: &str = r#"
-    select max(1.0 - (a.first_message_embedding <=> $1::vector))
+    select max(1.0 - (a.first_message_embedding_gemma2 <=> $1::vector))
     from telegram_new_user_profile_audits a
     join telegram_chat_users u
       on u.chat_id = a.chat_id and u.telegram_user_id = a.telegram_user_id
     where u.is_spammer
-      and a.first_message_embedding is not null
+      and a.first_message_embedding_gemma2 is not null
+      and a.first_message_embedding_gemma2_model = $3
       and a.telegram_user_id <> $2
     "#;
 
@@ -48,10 +49,12 @@ pub(crate) async fn spam_similarity(
     pool: &PgPool,
     candidate_user_id: i64,
     embedding: &str,
+    embedding_model: &str,
 ) -> anyhow::Result<Option<f64>> {
     let value = sqlx::query_scalar::<_, Option<f64>>(SPAM_SIMILARITY_SQL)
         .bind(embedding)
         .bind(candidate_user_id)
+        .bind(embedding_model)
         .fetch_one(pool)
         .await?;
     Ok(value)

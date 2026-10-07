@@ -240,16 +240,16 @@ memory_llm_max_tokens = 220
 
 rag_enabled = true
 rag_embedding_url = "http://127.0.0.1:8788"
-rag_embedding_model = "cointegrated/rubert-tiny2"
-rag_embedding_timeout_sec = 10
+rag_embedding_model = "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+rag_embedding_timeout_sec = 60
 rag_top_k = 6
 rag_min_similarity = 0.55
 rag_temporal_half_life_days = 180.0
 
 chat_retrieval_embeddings_enabled = true
-chat_retrieval_embedding_url = "http://127.0.0.1:8795"
-chat_retrieval_embedding_model = "ggml-org/embeddinggemma-300M-qat-q4_0-GGUF"
-chat_retrieval_embedding_timeout_sec = 30
+chat_retrieval_embedding_url = "http://127.0.0.1:8788"
+chat_retrieval_embedding_model = "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+chat_retrieval_embedding_timeout_sec = 60
 chat_retrieval_embedding_query_prefix = "task: search result | query: "
 chat_retrieval_embedding_document_prefix = "title: none | text: "
 chat_retrieval_embedding_batch_size = 16
@@ -288,6 +288,7 @@ search_github_mcp_env = ["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"]
 search_github_mcp_tools = ["search_issues", "search_code"]
 
 new_user_audit_enabled = true
+avatar_embeddings_enabled = true
 new_user_audit_max_tokens = 900
 gemini_thinking_budget = 1024
 send_owner_preview = true
@@ -367,6 +368,8 @@ review_delivery_enabled = true
 risk_profile = "ru_general_v1"
 review_chat = "main"
 reviewer_user_ids = [5939287960]
+embedding_spam_enabled = true
+embedding_spam_model_path = "/opt/tg-ai-bot-teloxide/models/embeddinggemma2_q4_classification_512_alt_2026-10-07.json"
 
 [manual_moderation]
 enabled = false

@@ -62,8 +62,10 @@ impl RetryPolicy {
 pub const EXTERNAL_REQUEST_LEASE: LeasePolicy = LeasePolicy::new(10 * 60);
 pub const VOICE_TRANSCRIPTION_LEASE: LeasePolicy = LeasePolicy::new(10 * 60);
 pub const CHAT_EMBEDDING_LEASE: LeasePolicy = LeasePolicy::new(10 * 60);
+pub const SPAMMER_AVATAR_EMBEDDING_LEASE: LeasePolicy = LeasePolicy::new(10 * 60);
 pub const POST_HISTORY_LEASE: LeasePolicy = LeasePolicy::new(5 * 60);
 pub const CHAT_EMBEDDING_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 120]);
+pub const SPAMMER_AVATAR_EMBEDDING_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 120, 300]);
 pub const POST_HISTORY_RETRY: RetryPolicy =
     RetryPolicy::new(&[15, 30, 60, 120, 240, 480, 960, 1_920, 3_600]);
 pub const ANALYSIS_RETRY: RetryPolicy = RetryPolicy::new(&[15, 30, 60, 5 * 60, 24 * 60 * 60]);
@@ -74,6 +76,7 @@ pub const MATERIALIZATION_RETRY: RetryPolicy =
     RetryPolicy::new(&[15, 30, 60, 5 * 60, 24 * 60 * 60]);
 pub const EXTERNAL_ANALYSIS_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 pub const POST_HISTORY_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
+pub const SPAMMER_AVATAR_EMBEDDING_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 10);
 pub const VOICE_TRANSCRIPTION_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 
 #[cfg(test)]

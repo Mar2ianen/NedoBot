@@ -41,6 +41,11 @@ use features::spam_review::{
     apply_callback, callback_message_chat_id, is_chat_admin, parse_callback,
     process_next_review_delivery, review_delivery_enabled,
 };
+use features::spammer_avatar_embeddings::{
+    enqueue_existing_spammer_avatars, process_next_spammer_avatar_embedding,
+    worker_error_seconds as spammer_avatar_worker_error_seconds,
+    worker_idle_seconds as spammer_avatar_worker_idle_seconds,
+};
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
@@ -139,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         state.pool.clone(),
         state.config.clone(),
     );
+    spawn_spammer_avatar_embedding_worker(bot.inner().clone(), state.clone());
     #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled {
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
@@ -302,6 +308,36 @@ fn spawn_chat_retrieval_embedding_worker(state: AppState) {
     });
 }
 
+fn spawn_spammer_avatar_embedding_worker(bot: Bot, state: AppState) {
+    if !state.config.avatar_embeddings_enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        match enqueue_existing_spammer_avatars(&state.pool).await {
+            Ok(queued) => tracing::info!(queued, "queued confirmed spammer avatars for embedding"),
+            Err(err) => tracing::warn!(%err, "failed to queue existing confirmed spammer avatars"),
+        }
+        loop {
+            match process_next_spammer_avatar_embedding(&bot, &state.pool, &state.config).await {
+                Ok(true) => continue,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        spammer_avatar_worker_idle_seconds(),
+                    ))
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "spammer avatar embedding worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        spammer_avatar_worker_error_seconds(),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(feature = "voice")]
 fn spawn_voice_transcription_worker(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -446,7 +482,15 @@ async fn handle_callback_query(
             .await?;
         return Ok(());
     }
-    match apply_callback(&state.pool, request_id, decision, reviewer_id).await {
+    match apply_callback(
+        &state.pool,
+        request_id,
+        decision,
+        reviewer_id,
+        state.config.avatar_embeddings_enabled,
+    )
+    .await
+    {
         Ok(Some(text)) => {
             bot.answer_callback_query(query.id.clone())
                 .text(text)
@@ -486,7 +530,15 @@ async fn handle_report_callback(
         return Ok(());
     }
 
-    match reports::apply_action(&state.pool, report_id, action, actor_id).await {
+    match reports::apply_action(
+        &state.pool,
+        report_id,
+        action,
+        actor_id,
+        state.config.avatar_embeddings_enabled,
+    )
+    .await
+    {
         Ok(ReportActionResult::Applied(resolution)) => {
             let text = match resolution {
                 reports::ReportResolution::Accepted => "Репорт принят.",

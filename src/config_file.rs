@@ -97,7 +97,7 @@ pub struct ModerationConfig {
     #[serde(default)]
     pub linear_spam_model_path: Option<String>,
     /// Gemma-голова поверх готовых retrieval-векторов
-    /// (`telegram_message_embeddings_gemma`, префикс документа). Читает
+    /// (`telegram_message_embeddings_gemma2`, префикс документа). Читает
     /// только `ready`-векторы с совпадающим `embedding_model`; иначе —
     /// отсутствие сигнала. Слабый supporting-сигнал поверх LLM.
     #[serde(default)]
@@ -278,6 +278,8 @@ pub struct RuntimeSettings {
     pub rag_embedding_url: String,
     pub rag_embedding_model: String,
     pub rag_embedding_timeout_sec: u64,
+    pub embedding_spam_similarity_supporting_threshold: Option<f64>,
+    pub embedding_spam_similarity_strong_threshold: Option<f64>,
     pub rag_top_k: usize,
     pub rag_min_similarity: f32,
     pub rag_temporal_half_life_days: f32,
@@ -321,6 +323,7 @@ pub struct RuntimeSettings {
     pub search_github_mcp_env: Vec<String>,
     pub search_github_mcp_tools: Vec<String>,
     pub new_user_audit_enabled: bool,
+    pub avatar_embeddings_enabled: bool,
     pub new_user_audit_max_tokens: u32,
     pub gemini_thinking_budget: u32,
     pub owner_telegram_id: Option<i64>,
@@ -379,15 +382,20 @@ impl Default for RuntimeSettings {
             memory_llm_max_tokens: 220,
             rag_enabled: false,
             rag_embedding_url: "http://127.0.0.1:8788".to_string(),
-            rag_embedding_model: "cointegrated/rubert-tiny2".to_string(),
+            rag_embedding_model:
+                "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+                    .to_string(),
             rag_embedding_timeout_sec: 10,
+            embedding_spam_similarity_supporting_threshold: None,
+            embedding_spam_similarity_strong_threshold: None,
             rag_top_k: 6,
             rag_min_similarity: 0.55,
             rag_temporal_half_life_days: 180.0,
             chat_retrieval_embeddings_enabled: false,
-            chat_retrieval_embedding_url: "http://127.0.0.1:8795".to_string(),
-            chat_retrieval_embedding_model: "ggml-org/embeddinggemma-300M-qat-q4_0-GGUF"
-                .to_string(),
+            chat_retrieval_embedding_url: "http://127.0.0.1:8788".to_string(),
+            chat_retrieval_embedding_model:
+                "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+                    .to_string(),
             chat_retrieval_embedding_timeout_sec: 30,
             chat_retrieval_embedding_query_prefix: "task: search result | query: ".to_string(),
             chat_retrieval_embedding_document_prefix: "title: none | text: ".to_string(),
@@ -434,6 +442,7 @@ impl Default for RuntimeSettings {
             ],
             search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             new_user_audit_enabled: false,
+            avatar_embeddings_enabled: false,
             new_user_audit_max_tokens: 900,
             gemini_thinking_budget: 1024,
             owner_telegram_id: None,

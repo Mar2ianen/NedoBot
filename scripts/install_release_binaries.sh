@@ -22,6 +22,9 @@ BINARIES=(
     retry_pending_comments
     reconcile_comment_delivery
     backfill_rich_messages
+    backfill_post_history_embeddings
+    backfill_audit_embeddings
+    backfill_chat_embeddings
     import_telegram_export
 )
 

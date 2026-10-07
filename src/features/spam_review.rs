@@ -667,6 +667,7 @@ pub async fn apply_callback(
     request_id: i64,
     decision: &str,
     owner_id: i64,
+    avatar_embeddings_enabled: bool,
 ) -> anyhow::Result<Option<&'static str>> {
     let status = match decision {
         "spam" => "confirmed_spam",
@@ -695,6 +696,7 @@ pub async fn apply_callback(
                 evidence: serde_json::json!({"review_id": request_id}),
                 operator_id: Some(owner_id),
             },
+            avatar_embeddings_enabled,
         )
         .await?;
     } else if decision == "normal" {

@@ -380,7 +380,7 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     const HIGH_RISK_USER_ID: i64 = 9_000_101;
     const LOW_RISK_USER_ID: i64 = 9_000_102;
     query(
-        "update telegram_message_embeddings_gemma set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
+        "update telegram_message_embeddings_gemma2 set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
     )
     .bind(CHAT_ID)
     .bind(MESSAGE_ID)
@@ -939,7 +939,7 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
             .expect("embedding source message must be inserted");
     }
     query(
-        "insert into telegram_message_embeddings_gemma (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', 1, now(), now() - interval '1 second')",
+        "insert into telegram_message_embeddings_gemma2 (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', 1, now(), now() - interval '1 second')",
     )
     .bind(CHAT_ID)
     .bind(STALE_MESSAGE_ID)
@@ -954,7 +954,7 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
         attempts: 1,
     };
     query(
-        "update telegram_message_embeddings_gemma set status = 'ignored' where status in ('pending', 'retry_wait') and (chat_id, message_id) <> ($1, $2)",
+        "update telegram_message_embeddings_gemma2 set status = 'ignored' where status in ('pending', 'retry_wait') and (chat_id, message_id) <> ($1, $2)",
     )
     .bind(CHAT_ID)
     .bind(STALE_MESSAGE_ID)
@@ -982,7 +982,7 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
     );
     let reclaimed_state: (String, i32, bool, bool) = query_as(
-        "select status, attempts, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2",
+        "select status, attempts, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings_gemma2 where chat_id = $1 and message_id = $2",
     )
     .bind(CHAT_ID)
     .bind(STALE_MESSAGE_ID)
@@ -998,7 +998,7 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
     );
     let ready_state: (String, bool, bool) = query_as(
-        "select status, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2",
+        "select status, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings_gemma2 where chat_id = $1 and message_id = $2",
     )
     .bind(CHAT_ID)
     .bind(STALE_MESSAGE_ID)
@@ -1019,7 +1019,7 @@ async fn assert_embedding_failure_clears_claim(
     expected_status: &str,
 ) {
     query(
-        "insert into telegram_message_embeddings_gemma (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', $3, now(), now() + interval '10 minutes')",
+        "insert into telegram_message_embeddings_gemma2 (chat_id, message_id, status, attempts, processing_started_at, lease_expires_at) values ($1, $2, 'processing', $3, now(), now() + interval '10 minutes')",
     )
     .bind(chat_id)
     .bind(message_id)
@@ -1040,7 +1040,7 @@ async fn assert_embedding_failure_clears_claim(
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
     );
     let state: (String, Option<String>, bool, bool) = query_as(
-        "select status, error_kind, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2",
+        "select status, error_kind, processing_started_at is not null, lease_expires_at is not null from telegram_message_embeddings_gemma2 where chat_id = $1 and message_id = $2",
     )
     .bind(chat_id)
     .bind(message_id)
@@ -3370,13 +3370,13 @@ async fn assert_review_decisions_write_spam_label_events(pool: &PgPool) {
     .expect("normal review fixture must be insertable");
 
     assert_eq!(
-        apply_callback(pool, spam_request_id, "spam", owner_id)
+        apply_callback(pool, spam_request_id, "spam", owner_id, false)
             .await
             .expect("spam review decision must succeed"),
         Some("Помечено как спамер.")
     );
     assert_eq!(
-        apply_callback(pool, normal_request_id, "normal", owner_id)
+        apply_callback(pool, normal_request_id, "normal", owner_id, false)
             .await
             .expect("normal review decision must succeed"),
         Some("Помечено как не спамер.")
@@ -4131,9 +4131,9 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
     .expect("semantic search message fixture must be inserted");
     query(
         r#"
-        insert into telegram_message_embeddings_gemma
+        insert into telegram_message_embeddings_gemma2
             (chat_id, message_id, embedding, embedding_model, status)
-        values ($1, $2, $3::halfvec, 'test-gemma', 'ready')
+        values ($1, $2, $3::vector, 'test-gemma', 'ready')
         "#,
     )
     .bind(-1001932061163_i64)
@@ -4371,7 +4371,7 @@ async fn assert_feature_gated_jobs(pool: &PgPool) {
         .await
         .expect("disabled embedding gate must succeed");
     let embedding_jobs: i64 = query_scalar(
-        "select count(*) from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2",
+        "select count(*) from telegram_message_embeddings_gemma2 where chat_id = $1 and message_id = $2",
     )
     .bind(CHAT_ID)
     .bind(MESSAGE_ID)
@@ -4384,7 +4384,7 @@ async fn assert_feature_gated_jobs(pool: &PgPool) {
         .await
         .expect("enabled embedding gate must succeed");
     let embedding_jobs: i64 = query_scalar(
-        "select count(*) from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2",
+        "select count(*) from telegram_message_embeddings_gemma2 where chat_id = $1 and message_id = $2",
     )
     .bind(CHAT_ID)
     .bind(MESSAGE_ID)
@@ -5414,6 +5414,7 @@ async fn assert_label_writer_roundtrip(pool: &PgPool) {
             evidence: serde_json::json!({"fixture": true}),
             operator_id: Some(1),
         },
+        false,
     )
     .await
     .expect("spam label must record");

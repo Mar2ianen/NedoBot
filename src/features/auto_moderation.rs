@@ -205,6 +205,7 @@ async fn ban_spammer(
             }),
             operator_id: None,
         },
+        false,
     )
     .await?;
     tracing::warn!(
