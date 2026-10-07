@@ -17,7 +17,7 @@ Telegram-бот на Rust/teloxide для `НедоNews Chat`.
 - Подставляет premium/custom emoji по тематике, включая канал/AMD/Radeon/Ryzen.
 - Пишет задачи и результаты генерации в Postgres.
 - После комментария асинхронно создаёт атомарную Gemma-карточку полезного поста; рекламу, мемы и повторы помечает `ignored`.
-- Ищет релевантную историю через RuBERT Tiny 2 и pgvector с отдельными similarity, temporal coefficient и итоговым rank score.
+- Ищет релевантную историю через EmbeddingGemma 2 Q4/512d и pgvector с отдельными similarity, temporal coefficient и итоговым rank score.
 - Подмешивает последние ответы бота в prompt, чтобы не повторять одинаковые CTA.
 - Опционально добавляет свежий web/GitHub/Reddit факт-чек для первого комментария через lazy MCP process, если включён `runtime.search_enabled`.
 - Собирает статистику чата с дневной/недельной/месячной отсечкой в 05:00 МСК.
@@ -128,7 +128,7 @@ Civil date/time и bare clock нормализуются через эту зо�
 - Загруженный profile TOML должен быть валидным; секреты проверяются по `api_key_env` всех включённых route selections.
 - Если включён voice pipeline, `runtime.voice_asr_provider=gemini` требует `GEMINI_API_KEY`; в двойном режиме второй Groq-текст требует `GROQ_API_KEY`.
 - Voice cleanup использует profile route `voice_cleanup` и его fallback chain.
-- `runtime.new_user_audit_enabled=true` запускает единственный unified worker через route `new_user_audit`. `runtime.new_user_audit_max_tokens` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `runtime.rag_embedding_url`, `runtime.rag_embedding_model` и `runtime.rag_embedding_timeout_sec`.
+- `runtime.new_user_audit_enabled=true` запускает единственный unified worker через route `new_user_audit`. `runtime.new_user_audit_max_tokens` ограничивает его output и по умолчанию равен `900`. После refresh профиля baseline и job сохраняются атомарно; worker сохраняет assessment, materialize-ит итоговый score/signals и upsert-ит review request. Для scoring первого сообщения нужны корректные `runtime.rag_embedding_url`, `runtime.rag_embedding_model` и `runtime.rag_embedding_timeout_sec`. `runtime.avatar_embeddings_enabled` отдельно включает bounded image-векторы только после явного spam-label; обычные аудит-аватары не сохраняются, при снятии label dataset rows удаляются, raw image bytes не хранятся.
 
 Это специально ловит ситуацию, когда конфиг переключили на Gemini, но ключ на сервере пустой: бот не стартует с тихим уходом в fallback.
 
@@ -343,7 +343,7 @@ SHA256 bot executable этой выкладки: `dd0f428c283029b324b45b4db4736c
 
 Вместе с ним задеплоены алиасы футера канала (`Не теряем связь` + `😎НедоNews`) и `blocked_post_terms` (`#реклама`, `о рекламодателе`): футер-гейт остаётся allowlist, реклама без футера и медиа-посты пропускаются. В прод-профиле алиас и denylist включены.
 
-Релиз включает Gemma-голову `gemma-768-fx-2026-10-04` (`embedding_spam_enabled=true`): бот читает готовые `ready`-векторы из `telegram_message_embeddings_gemma` с проверкой `embedding_model`, новых inference-запросов ноль. В сигналах раздельно хранятся id энкодера (`embedding_model_version`) и версия головы (`embedding_head_version`). На VPS **`enforce_enabled=false`, `enforce_dry_run=true`**: расчёт риска/аудит продолжаются, автоматических банов и удалений сообщений этой лестницей нет.
+Предыдущая Gemma-голова `gemma-768-fx-2026-10-04` использовала готовые `telegram_message_embeddings_gemma` вектора. Её заменяет 512d EmbeddingGemma 2 голова; текущий rollout и ограничения датасета будут записаны отдельной записью после production-проверки.
 
 Релиз подключает отдельный `teloxide-antispam v0.3.1` (`0828ad6`), Unicode word/char модель `alt-word-char-v2-2026-10-03` и пороги `alt-word-char-validation-2026-10-03-v1`. Настройки доставки ревью, reviewer/owner, LLM topology, `.env` и секреты сохранены. PVO и public MCP не перезапускались.
 
@@ -367,7 +367,7 @@ Binary собран с `--locked --release` из `79921e49d176`; его Git tree
   - `nedobot-rag-embedding.service`
   - `nedonews-mcp.service`
 
-PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg16-bookworm` на том же persistent volume. RuBERT Tiny 2 обслуживается локальным CPU-only Text Embeddings Inference на `127.0.0.1:8788` для memory/audit-потоков. Chat retrieval использует отдельный CPU-only `llama.cpp`-сервис на `127.0.0.1:8795` с официальным QAT `EmbeddingGemma` Q4 и 768-мерными `halfvec`; наружу оба embedding-порта не публикуются.
+PostgreSQL запускается из образа `pgvector/pgvector:0.8.2-pg16-bookworm` на том же persistent volume. Все активные text lanes — memory, unified audit, chat retrieval, локальные `/ask` tools и public MCP semantic search — используют один pinned EmbeddingGemma 2 Q4/512d service на `127.0.0.1:8788`. Image endpoint вызывается только для подтверждённых спамеров. Старые RuBERT 312d и EmbeddingGemma 300M QAT 768d таблицы и unit-конфиги сохранены для rollback, но runtime к ним не обращается. Порты embedding-service наружу не публикуются.
 
 Полезные команды:
 
@@ -428,22 +428,7 @@ podman exec -i tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot \
   -f - < deploy/nedonews-mcp/bootstrap-role.sql
 ```
 
-Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; Telegram token не передаётся, пока выдача медиа выключена. Для включения `chat.get_media` туда отдельно добавляются `MCP_MEDIA_ENABLED=true` и `MCP_TELEGRAM_BOT_TOKEN` из secret store; token не коммитится и не логируется. Для semantic leg `chat.search_messages` в env задаются `ASK_CHAT_EMBEDDING_URL`, `ASK_CHAT_EMBEDDING_MODEL`, `ASK_CHAT_EMBEDDING_TIMEOUT_SEC` и `ASK_CHAT_EMBEDDING_QUERY_PREFIX`; роль MCP получает column-level `SELECT` только на нужные поля `telegram_message_embeddings_gemma`. Перед включением `nedobot-chat-embedding.service` модель `embeddinggemma-300M-qat-Q4_0.gguf` нужно один раз положить в volume `nedobot_chat_embedding` из GGUF-конвертации официальных Google QAT-весов. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
-
-Подготовка chat embedding volume на production host выполняется отдельно от кода и миграции:
-
-```bash
-podman volume create nedobot_chat_embedding
-podman run --rm \
-  -v nedobot_chat_embedding:/models \
-  docker.io/curlimages/curl:8.10.1 \
-  -fL -o /models/embeddinggemma-300M-qat-Q4_0.gguf \
-  https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf
-podman run --rm -v nedobot_chat_embedding:/models:ro docker.io/library/alpine:3.22 \
-  sha256sum /models/embeddinggemma-300M-qat-Q4_0.gguf
-```
-
-После установки unit-файла `deploy/chat-embedding/nedobot-chat-embedding.service` нужно выполнить `systemctl daemon-reload`, запустить `nedobot-chat-embedding` и проверить `curl -fsS http://127.0.0.1:8795/health` до перезапуска MCP и бота.
+Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; Telegram token не передаётся, пока выдача медиа выключена. Для включения `chat.get_media` туда отдельно добавляются `MCP_MEDIA_ENABLED=true` и `MCP_TELEGRAM_BOT_TOKEN` из secret store; token не коммитится и не логируется. Для semantic leg `chat.search_messages` в env задаются `ASK_CHAT_EMBEDDING_URL`, `ASK_CHAT_EMBEDDING_MODEL`, `ASK_CHAT_EMBEDDING_TIMEOUT_SEC` и `ASK_CHAT_EMBEDDING_QUERY_PREFIX`; роль MCP получает column-level `SELECT` только на нужные поля `telegram_message_embeddings_gemma2`. MCP использует общий pinned encoder на `127.0.0.1:8788`; старый отдельный GGUF service не входит в активный runtime. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
 
 Ручной redeploy из локальной папки выполняется только после dry-run и проверки production profile; не использовать старую сокращённую команду без exclusions:
 
@@ -464,7 +449,7 @@ ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 - `telegram_messages` - входящие сообщения и raw Telegram JSON.
 - `post_comment_jobs` - дедупликация и статус комментария под постом.
 - `llm_generations` - prompt, модель, ответ LLM и финальный HTML.
-- `post_history_entries` - атомарная история новых постов: строгий Gemma-summary, сущности, использованный ракурс, реально использованный внешний факт и RuBERT embedding. Исходные посты не склеиваются.
+- `post_history_entries` - атомарная история новых постов: строгий Gemma-summary, сущности, использованный ракурс, реально использованный внешний факт и 512d EmbeddingGemma 2 embedding. Исходные посты не склеиваются.
 - `voice_transcription_jobs` - job/status/raw ASR/segments/cleaned transcript/final HTML/file id для расшифровки голосовых.
 - `telegram_user_profiles` - последние виденные username/name/is_bot/is_premium, а также best-effort детали из `getChat(user_id)`, `getUserProfilePhotos` и `getUserPersonalChatMessages`: bio, avatar file ids, emoji status/accent, personal channel summary/raw JSON и ошибки API.
 - `telegram_chat_users` - явная расширяемая карточка пользователя в конкретном чате: первое/последнее сообщение, счётчики сообщений/реплаев/ссылок/медиа, статус в чате, админство, join/leave/invite-link поля.
@@ -484,8 +469,9 @@ ssh vps-153 'systemctl restart nedonews-mcp && systemctl is-active nedonews-mcp'
 - `llm_generic_comment` - безобидно выглядящий LLM-коммент по теме поста, часто с одинаковым восторженным тоном.
 - `promo_dm_bait` - промо через “могу отправить/поделиться/пишите в личку”, тематика может быть разная, но механика одна.
 - `adult_personal_channel_promo` - личный/personal channel пользователя ведёт на adult-промо, инвайт-ссылки или схожий funnel.
-- Для первого текстового сообщения сохраняются LLM-маркеры кампании, RuBERT-вектор и сходство с вручную подтверждённым спамом. Эти сигналы лишь повышают review-риск; автоматической пометки спамером нет.
-- Эмбеддинг первого сообщения персистится в `telegram_new_user_profile_audits.first_message_embedding` при материализации аудита и пополняет корпус для будущих `spam_similarity`-проверок; история скоринга при этом не пересчитывается. Пустой корпус заполняется бинарём `backfill_audit_embeddings` (`DATABASE_URL` + `RAG_EMBEDDING_*`, флаги `--only-spammers`/`--all`, `--chat-id`, `--limit`).
+- Для первого текстового сообщения сохраняются LLM-маркеры кампании, 512d EmbeddingGemma 2 vector и сходство с вручную подтверждённым спамом. Эти сигналы лишь повышают review-риск; автоматической пометки спамером нет.
+- Эмбеддинг первого сообщения персистится в `telegram_new_user_profile_audits.first_message_embedding_gemma2` при материализации аудита и пополняет корпус для будущих `spam_similarity`-проверок; история скоринга при этом не пересчитывается. Backfill запускается бинарём `backfill_audit_embeddings` с deployment-конфигурацией выбранной базы.
+- `spammer_avatar_embeddings` содержит 512d image vectors и non-downloadable Telegram file-unique identifiers только для пользователей с явной ручной spam-меткой. Download-capable file id очищается после векторизации, байты изображения не сохраняются; снятие метки удаляет строки набора. Эти примеры пока не участвуют в автоматическом image-классификаторе.
 - Template-матчинг (`template_match_count`) сравнивает первое сообщение с текстами из `telegram_messages`, у которых выставлен `spam_marked_at`. Ручная разметка обязана штамповать сообщения (`spam_marked_at`, `spam_source='manual_owner_confirmation'`), иначе помеченные спамеры не попадают в корпус: `is_spammer` на пользователе недостаточно.
 - Повтор title личного канала на размеченных спамерах — сильный сигнал reuse (`personal_channel_title_reused_by_spammers`, +24): операторы клонируют фуннель-каналы под каждый аккаунт, chat_id различается, а нормализованный title совпадает. Реюз считается и через `shared_spam_reputation` соседнего инстанса.
 - Ротация identity (`identity_display_name_rotation` +12, `identity_username_rotation` +8): смена имён/юзернеймов между profile refresh фиксируется в `telegram_profile_identity_observations`, ротация — маркер операторов.
@@ -604,7 +590,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 ### Chat retrieval (shadow rollout)
 
-Gemma строит единый `ResearchPlan`: главный subject/audience, secondary context, chat semantic/lexical queries и запросы к внешним источникам. Shadow retrieval объединяет RuBERT vector, PostgreSQL full-text и безопасные literal-regex совпадения за 30 дней с geometric freshness. Кандидаты и ограниченные ветки сохраняются в `chat_research_runs`, но не меняют комментарий без ручной проверки.
+Gemma строит единый `ResearchPlan`: главный subject/audience, secondary context, chat semantic/lexical queries и запросы к внешним источникам. Shadow retrieval объединяет EmbeddingGemma 2 512d vector, PostgreSQL full-text и безопасные literal-regex совпадения за 30 дней с geometric freshness. Кандидаты и ограниченные ветки сохраняются в `chat_research_runs`, но не меняют комментарий без ручной проверки.
 
 `CHAT_AUTHOR:id` и `CHAT_MESSAGE:id:label` разрешены только для ID из подтверждённого retrieval-контекста. Имя автора берётся только из `first_name`; при username ссылка ведёт на профиль, иначе на сообщение. Без evidence обязателен обычный `CHAT_LINK`.
 
@@ -617,12 +603,12 @@ Cleanup prompt для расшифровки голосовых лежит в [p
 Если поиск вернул безопасный результат с публичным HTTP(S) URL, модель обязана выбрать один отдельный угол, которого нет в новости: связанный релиз, ограничение, последствие, сравнение, цену, changelog или реакцию сообщества. Поиск нельзя использовать только для подтверждения или пересказа факта из поста. `used_search_result_id: null` допускается только при пустом или небезопасном поиске. One-based ID сохраняется в `llm_generations`, а `{SOURCE_LINK:N:подпись}` становится обязательным. Подпись должна быть частью фразы («как пишет VideoCardz»), а не отдельным «детали» или «источник». `COMMENT_BLOCKED_SOURCE_DOMAINS` исключает указанные домены и поддомены до fetch, из prompt и при финальном рендере; `COMMENT_BLOCKED_TERMS` так же исключает результаты и комментарии с заданными фрагментами текста. Search response сохраняется до best-effort fetch: неуспешный fetch не удаляет title/snippet уже найденного источника. Output validator отклоняет факт без источника, raw URL, битые/лишние плейсхолдеры, неподходящий ID, текст длиннее 180 видимых символов и generic CTA. Код сам рендерит ссылки в HTML, а предпросмотр ссылок отключён для обычных и rich text send-путей.
 RAG не предназначен для пересказа новости: пост канала важнее, а карточки нужны только чтобы не писать ложные вещи вроде `Switch 2 еще не вышла`.
 
-Автоматическая история работает поверх RuBERT Tiny 2 и pgvector:
+Автоматическая история работает поверх EmbeddingGemma 2 Q4 и pgvector:
 
 - после успешной отправки комментария создаётся отдельная job с исходным постом, комментарием бота и только реально выбранным результатом поиска;
 - Gemma получает строгую JSON Schema через provider API и возвращает `summary`, `entities`, `used_angle`, `external_fact`, `skip_reason`;
 - `summary: null` разрешён для рекламы, мемов, служебных публикаций, повторов и постов без устойчивого полезного факта; запись становится `ignored` и не участвует в retrieval;
-- полезная запись получает 312-мерный embedding `cointegrated/rubert-tiny2` и становится `ready`;
+- полезная запись получает усечённый и перенормированный 512-мерный embedding EmbeddingGemma 2 и становится `ready`;
 - перед внешним поиском бот строит embedding нового поста и выбирает до шести карточек по cosine similarity;
 - рейтинг считается как `similarity * temporal_coefficient`, где коэффициент свежести плавно снижается от `1.0` к `0.70`, а период полураспада настраивается через `runtime.rag_temporal_half_life_days`;
 - Gemma-поисковик видит `already_known` и `already_used_angles`, поэтому ищет развитие истории, последствия, альтернативы, changelog или свежую реакцию, а при отсутствии нового направления может вернуть `need_search=false`;
@@ -911,7 +897,7 @@ ryzen_custom_emoji_id = "5444875271163364561"
 ## Ограничения MVP
 
 - Новая RAG-история начинается с момента миграции без backfill старых объединённых заметок.
-- RuBERT Tiny 2 работает на CPU и оценивает смысловую близость; окончательное решение о полезности карточки и направлении поиска остаётся за Gemma.
+- EmbeddingGemma 2 Q4 работает на CPU и оценивает смысловую близость; окончательное решение о полезности карточки и направлении поиска остаётся за Gemma.
 - Реакции считаются только с момента включения reaction updates; старые реакции Telegram Bot API задним числом не отдаёт.
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.

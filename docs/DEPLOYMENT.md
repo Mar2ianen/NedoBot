@@ -267,21 +267,37 @@ ssh vps-153 'systemctl restart nedonews-mcp'
 ssh vps-153 'systemctl is-active nedonews-mcp'
 ```
 
-Перед первым включением новой chat-semantic ветки один раз установить unit и
-загрузить модель в persistent volume. Модель — GGUF-конвертация официальных
-Google QAT-весов, а не файл, который должен попадать в checkout:
+Для pinned EmbeddingGemma 2 text+image encoder создать volume и установить unit
+из checkout; unit собирает pinned Transformers.js Q4 image из
+`deploy/rag-embedding` при старте и скачивает model snapshot в постоянный volume:
 
 ```bash
-ssh vps-153 'install -m 0644 /opt/tg-ai-bot-teloxide/deploy/chat-embedding/nedobot-chat-embedding.service /etc/systemd/system/nedobot-chat-embedding.service && podman volume create nedobot_chat_embedding'
-ssh vps-153 'podman run --rm -v nedobot_chat_embedding:/models docker.io/curlimages/curl:8.10.1 -fL -o /models/embeddinggemma-300M-qat-Q4_0.gguf https://huggingface.co/ggml-org/embeddinggemma-300M-qat-q4_0-GGUF/resolve/main/embeddinggemma-300M-qat-Q4_0.gguf'
-ssh vps-153 'systemctl daemon-reload && systemctl enable --now nedobot-chat-embedding && curl -fsS http://127.0.0.1:8795/health'
+ssh vps-153 'podman volume create nedobot_rag_embedding'
+ssh vps-153 'install -m 0644 /opt/tg-ai-bot-teloxide/deploy/rag-embedding/nedobot-rag-embedding.service /etc/systemd/system/nedobot-rag-embedding.service'
+ssh vps-153 'systemctl daemon-reload && systemctl enable --now nedobot-rag-embedding && curl -fsS http://127.0.0.1:8788/healthz'
 ```
 
-После этого migrations запускаются startup-кодом бота. Затем убедиться, что в
-journal нет ошибки profile validation или migration и что контейнер PostgreSQL
-доступен. `nedobot-rag-embedding` не пересобирается при обычной выкладке бота,
-но его health нужно проверить, если включены RAG или другие старые memory/audit
-потоки.
+Миграции запускаются startup-кодом бота. После проверки `/healthz` выставить в
+обоих profile-файлах один pinned model id и URL `http://127.0.0.1:8788` для
+RAG и chat retrieval; конфиги менять отдельно с бэкапом. Старые RuBERT 312d и
+EmbeddingGemma 300M 768d колонки остаются нетронутыми для rollback. Новые
+колонки заполняются бинарями `backfill_post_history_embeddings`,
+`backfill_audit_embeddings` и `backfill_chat_embeddings` для каждой базы.
+Старый cosine порог не переносится. Новая Gemma 2 spam-голова — отдельный
+512d артефакт; устанавливать только этот файл рядом с сохранёнными моделями,
+не синхронизировать каталог `models/` целиком.
+
+`avatar_embeddings_enabled=true` включает отдельный bounded worker. Он
+добавляет аватар только после явного spam-label; штатный аудит остальных
+пользователей не сохраняет их image vectors. Снятие метки удаляет записи этого
+пользователя. До векторизации Postgres держит file id только для повторной
+загрузки; после готового embedding он очищается, остаётся только
+non-downloadable file-unique id. Байты изображения не сохраняются.
+
+После переключения проверить `nedobot-rag-embedding` и остановить старые
+`nedobot-chat-embedding`/RuBERT-serving units. При rollback восстановить оба
+profile-файла и старые unit-ы; legacy-векторы остаются отдельными и не
+перезаписываются.
 
 Для синхронизации репутации спамеров все локальные инстансы должны работать на
 одном сервере и использовать одинаковый абсолютный путь к SQLite-файлу, например
@@ -298,7 +314,7 @@ journal нет ошибки profile validation или migration и что кон
 ## Проверка после restart
 
 ```bash
-ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedobot-pvo nedonews-mcp container-tg-ai-bot-postgres nedobot-rag-embedding nedobot-chat-embedding'
+ssh vps-153 'systemctl is-active tg-ai-bot-teloxide nedobot-pvo nedonews-mcp container-tg-ai-bot-postgres nedobot-rag-embedding'
 ssh vps-153 'journalctl -u tg-ai-bot-teloxide -u nedobot-pvo -n 120 --no-pager'
 ssh vps-153 'journalctl -u nedonews-mcp -n 80 --no-pager'
 ssh vps-153 'podman ps'

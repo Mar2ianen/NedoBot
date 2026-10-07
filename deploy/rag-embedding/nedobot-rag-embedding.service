@@ -1,21 +1,22 @@
 [Unit]
-Description=NedoBot RuBERT Tiny 2 embedding service
+Description=NedoBot EmbeddingGemma 2 Q4 text and image embedding service
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Restart=always
 RestartSec=5
-TimeoutStartSec=300
+TimeoutStartSec=600
 TimeoutStopSec=30
 ExecStartPre=-/usr/bin/podman rm -f nedobot-rag-embedding
+ExecStartPre=/usr/bin/podman build -t localhost/nedobot-rag-embeddinggemma2:2026-10-07 /opt/tg-ai-bot-teloxide/deploy/rag-embedding
 ExecStart=/usr/bin/podman run --rm --name nedobot-rag-embedding \
-    --memory=800m --cpus=1.5 \
-    -p 127.0.0.1:8788:80 \
+    --memory=2g --cpus=1.5 \
+    -p 127.0.0.1:8788:8788 \
     -v nedobot_rag_embedding:/data \
-    ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 \
-    --model-id cointegrated/rubert-tiny2 \
-    --dtype float32
+    -e PORT=8788 -e MODEL_CACHE=/data/hf -e ORT_THREADS=2 \
+    -e NODE_OPTIONS=--max-old-space-size=768 \
+    localhost/nedobot-rag-embeddinggemma2:2026-10-07
 ExecStop=/usr/bin/podman stop --ignore -t 10 nedobot-rag-embedding
 
 [Install]

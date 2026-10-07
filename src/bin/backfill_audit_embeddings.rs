@@ -1,31 +1,18 @@
-use std::time::Duration;
+#[path = "support/embedding_backfill.rs"]
+mod embedding_backfill;
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use embedding_backfill::embed_text_batch_at;
 use sqlx::{PgPool, Row};
-use tg_ai_bot_teloxide::features::memory::embedding::pgvector_literal;
+use tg_ai_bot_teloxide::features::memory::embedding::{
+    EMBEDDINGGEMMA2_CLASSIFICATION_PREFIX, EMBEDDINGGEMMA2_MODEL_ID, pgvector_literal,
+};
 
-/// Заполняет пустой корпус `first_message_embedding` для будущих
-/// `spam_similarity`-проверок. История скоринга не пересчитывается:
-/// эмбеддинги обслуживают только новые аудиты.
+/// Заполняет новый корпус EmbeddingGemma 2 для будущих `spam_similarity`
+/// проверок. История уже выполненного скоринга не пересчитывается.
 ///
 /// Требуется только `DATABASE_URL` и `RAG_EMBEDDING_*`; полный `Config`
 /// с Telegram/LLM-секретами не нужен, polling не запускается.
-#[derive(Debug, Serialize)]
-struct EmbedBatchRequest<'a> {
-    inputs: &'a [&'a str],
-    truncate: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EmbedBatchResponse {
-    Batch(Vec<Vec<f32>>),
-    // TEI иногда отвечает одиночным вектором на batch из одного входа.
-    #[allow(dead_code)]
-    Single(Vec<f32>),
-}
-
 #[derive(Debug)]
 struct Args {
     chat_id: Option<i64>,
@@ -40,8 +27,11 @@ async fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
     let database_url = required_env("DATABASE_URL")?;
     let embedding_url = required_env("RAG_EMBEDDING_URL")?;
-    let embedding_model = absent_or("RAG_EMBEDDING_MODEL", "cointegrated/rubert-tiny2");
-    let embedding_timeout_sec = optional_u64("RAG_EMBEDDING_TIMEOUT_SEC", 10)?;
+    let embedding_model = absent_or("RAG_EMBEDDING_MODEL", EMBEDDINGGEMMA2_MODEL_ID)?;
+    if embedding_model != EMBEDDINGGEMMA2_MODEL_ID {
+        anyhow::bail!("RAG_EMBEDDING_MODEL must match the pinned EmbeddingGemma 2 encoder");
+    }
+    let embedding_timeout_sec = optional_u64("RAG_EMBEDDING_TIMEOUT_SEC", 60)?;
 
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -59,18 +49,19 @@ async fn main() -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(embedding_timeout_sec))
-        .build()
-        .context("backfill embedding http client")?;
     let mut stored = 0usize;
     for chunk in rows.chunks(args.batch_size) {
-        let texts: Vec<&str> = chunk.iter().map(|row| row.text.as_str()).collect();
-        let embeddings = embed_batch(&client, &embedding_url, &texts).await?;
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|row| format!("{EMBEDDINGGEMMA2_CLASSIFICATION_PREFIX}{}", row.text))
+            .collect();
+        let inputs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let embeddings =
+            embed_text_batch_at(&embedding_url, embedding_timeout_sec, &inputs).await?;
         for (row, embedding) in chunk.iter().zip(embeddings.iter()) {
             let literal = pgvector_literal(embedding)?;
             sqlx::query(
-                "update telegram_new_user_profile_audits set first_message_embedding = $3::vector, first_message_embedding_model = $4 where chat_id = $1 and telegram_user_id = $2 and first_message_embedding is null",
+                "update telegram_new_user_profile_audits set first_message_embedding_gemma2 = $3::vector, first_message_embedding_gemma2_model = $4 where chat_id = $1 and telegram_user_id = $2 and first_message_embedding_gemma2 is null",
             )
             .bind(row.chat_id)
             .bind(row.telegram_user_id)
@@ -99,7 +90,7 @@ async fn load_pending(pool: &PgPool, args: &Args) -> anyhow::Result<Vec<PendingR
         from telegram_new_user_profile_audits a
         left join telegram_chat_users u
           on u.chat_id = a.chat_id and u.telegram_user_id = a.telegram_user_id
-        where a.first_message_embedding is null
+        where a.first_message_embedding_gemma2 is null
           and nullif(trim(coalesce(a.first_message_text, '')), '') is not null
           and ($1::bigint is null or a.chat_id = $1)
           and (not $3 or coalesce(u.is_spammer, false))
@@ -123,38 +114,6 @@ async fn load_pending(pool: &PgPool, args: &Args) -> anyhow::Result<Vec<PendingR
             })
         })
         .collect())
-}
-
-async fn embed_batch(
-    client: &reqwest::Client,
-    embedding_url: &str,
-    texts: &[&str],
-) -> anyhow::Result<Vec<Vec<f32>>> {
-    let response = client
-        .post(format!("{}/embed", embedding_url.trim_end_matches('/')))
-        .json(&EmbedBatchRequest {
-            inputs: texts,
-            truncate: true,
-        })
-        .send()
-        .await
-        .context("backfill embedding request")?
-        .error_for_status()
-        .context("backfill embedding status")?
-        .json::<EmbedBatchResponse>()
-        .await
-        .context("backfill embedding body")?;
-    match response {
-        EmbedBatchResponse::Batch(rows) if rows.len() == texts.len() => Ok(rows),
-        EmbedBatchResponse::Batch(rows) => anyhow::bail!(
-            "embedding service returned {} rows for {} inputs",
-            rows.len(),
-            texts.len()
-        ),
-        EmbedBatchResponse::Single(_) => {
-            anyhow::bail!("embedding service returned one row for batch input")
-        }
-    }
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -199,11 +158,13 @@ fn required_env(key: &str) -> anyhow::Result<String> {
         .with_context(|| format!("{key} must be set"))
 }
 
-fn absent_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+fn absent_or(key: &str, default: &str) -> anyhow::Result<String> {
+    match std::env::var(key) {
+        Ok(value) if value.trim().is_empty() => anyhow::bail!("{key} must not be empty"),
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => Ok(default.to_string()),
+        Err(error) => Err(error).with_context(|| format!("failed to read {key}")),
+    }
 }
 
 fn optional_u64(key: &str, default: u64) -> anyhow::Result<u64> {

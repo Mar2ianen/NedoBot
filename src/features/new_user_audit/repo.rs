@@ -304,7 +304,8 @@ async fn finalize_new_user_audit_generation(
                 materialization_next_attempt_at = now(),
                 materialization_processing_started_at = null,
                 materialization_lease_expires_at = null, materialization_error_kind = null,
-                materialized_at = null, updated_at = now()
+                materialized_at = null,
+                updated_at = now()
             where id = $1 and attempts = $2 and status = 'processing'
               and lease_expires_at > now()
             "#,
@@ -411,12 +412,12 @@ async fn materialize_new_user_audit_in_transaction(
             risk_avatar_score = $7, risk_avatar_signals = $8,
             risk_personal_channel_score = $9, risk_personal_channel_signals = $10,
             risk_score = $11, risk_level = $12, risk_signal_breakdown = $13,
-            first_message_embedding = case
-                when $15 is null then first_message_embedding
+            first_message_embedding_gemma2 = case
+                when $15 is null then first_message_embedding_gemma2
                 else $15::vector
             end,
-            first_message_embedding_model = case
-                when $15 is null then first_message_embedding_model
+            first_message_embedding_gemma2_model = case
+                when $15 is null then first_message_embedding_gemma2_model
                 else $16
             end
         where chat_id = $1 and telegram_user_id = $2

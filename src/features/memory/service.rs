@@ -10,7 +10,7 @@ use crate::features::{
         claim::CasResult,
         policy::{POST_HISTORY_LEASE, POST_HISTORY_RETRY},
     },
-    memory::embedding::{embed_text, pgvector_literal},
+    memory::embedding::{embed_rag_document, embed_rag_query, pgvector_literal},
 };
 use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::llm::types::StructuredOutput;
@@ -84,7 +84,7 @@ pub async fn load_relevant_memory_notes(
     }
 
     let started = std::time::Instant::now();
-    let embedding = match embed_text(config, post_text).await {
+    let embedding = match embed_rag_query(config, post_text).await {
         Ok(embedding) => embedding,
         Err(err) => {
             tracing::warn!(%err, "RAG query embedding failed; continue without history");
@@ -112,14 +112,15 @@ pub async fn load_relevant_memory_notes(
                    entities,
                    used_angle,
                    external_fact,
-                   1.0 - (embedding <=> $1::vector) as similarity,
+                   1.0 - (embedding_gemma2 <=> $1::vector) as similarity,
                    0.70 + 0.30 * power(
                        0.5,
-                       greatest(extract(epoch from (now() - created_at)) / 86400.0, 0.0) / $2
+                       greatest(extract(epoch from (now() - created_at)) / 86400.0, 0.0) / $3
                    ) as temporal_coefficient
             from post_history_entries
             where status = 'ready'
-              and embedding is not null
+              and embedding_gemma2 is not null
+              and embedding_gemma2_model = $2
         )
         select source_message_id,
                summary,
@@ -130,12 +131,13 @@ pub async fn load_relevant_memory_notes(
                temporal_coefficient,
                similarity * temporal_coefficient as rank_score
         from ranked
-        where similarity >= $3
+        where similarity >= $4
         order by rank_score desc, source_message_id desc
-        limit $4
+        limit $5
         "#,
     )
     .bind(&embedding)
+    .bind(&config.rag_embedding_model)
     .bind(f64::from(config.rag_temporal_half_life_days))
     .bind(f64::from(config.rag_min_similarity))
     .bind(i64::try_from(config.rag_top_k).unwrap_or(i64::MAX))
@@ -352,7 +354,7 @@ async fn build_history_entry(
         anyhow::bail!("external_fact requires used_search_result");
     }
     let embedding = match summary.summary.as_deref() {
-        Some(_) => Some(embed_text(config, &embedding_text(&summary)).await?),
+        Some(_) => Some(embed_rag_document(config, &embedding_text(&summary)).await?),
         None => None,
     };
     Ok((generation, summary, embedding))
@@ -388,8 +390,8 @@ pub async fn finalize_history_entry(
             status = $7,
             provider = $8,
             model = $9,
-            embedding = $10::vector,
-            embedding_model = case when $10::text is null then null else $11 end,
+            embedding_gemma2 = $10::vector,
+            embedding_gemma2_model = case when $10::text is null then null else $11 end,
             error_kind = null,
             processing_started_at = null,
             lease_expires_at = null,

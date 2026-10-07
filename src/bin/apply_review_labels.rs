@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use sqlx::PgPool;
 
+use tg_ai_bot_teloxide::config::Config;
 use tg_ai_bot_teloxide::db::build_pool;
 use tg_ai_bot_teloxide::features::labels::{LabelSource, SpamLabel, record_not_spam, record_spam};
 
@@ -77,6 +78,7 @@ async fn apply(
     chat_id: i64,
     operator_id: i64,
     decisions: &[Decision],
+    avatar_embeddings_enabled: bool,
 ) -> anyhow::Result<()> {
     for decision in decisions {
         if decision.spam {
@@ -95,6 +97,7 @@ async fn apply(
                     evidence: serde_json::json!({"queue": "label_review.tsv"}),
                     operator_id: Some(operator_id),
                 },
+                avatar_embeddings_enabled,
             )
             .await?;
         } else {
@@ -119,6 +122,7 @@ async fn apply(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     let mut args = std::env::args().skip(1);
     let mut chat_id: Option<i64> = None;
     let mut operator_id: Option<i64> = None;
@@ -166,6 +170,14 @@ async fn main() -> anyhow::Result<()> {
     if dry_run {
         return Ok(());
     }
+    let config = Config::from_env()?;
     let pool = build_pool().await?;
-    apply(&pool, chat_id, operator_id, &decisions).await
+    apply(
+        &pool,
+        chat_id,
+        operator_id,
+        &decisions,
+        config.avatar_embeddings_enabled,
+    )
+    .await
 }

@@ -124,15 +124,15 @@ pub async fn search_messages_with_semantic(
                 e.chat_id,
                 e.message_id,
                 greatest(
-                    1.0 - (e.embedding <=> $26::halfvec),
+                    1.0 - (e.embedding <=> $26::vector),
                     0.0
                 )::real as semantic_relevance
-            from telegram_message_embeddings_gemma e
+            from telegram_message_embeddings_gemma2 e
             where e.chat_id = $1
               and e.status = 'ready'
               and e.embedding_model = $27
               and $26 is not null
-            order by e.embedding <=> $26::halfvec
+            order by e.embedding <=> $26::vector
             limit $28
         ),
         candidate_ids as materialized (

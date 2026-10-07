@@ -1,0 +1,11 @@
+FROM node:24-bookworm-slim
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY server.mjs ./
+
+ENV NODE_ENV=production
+ENV MODEL_CACHE=/data/hf
+EXPOSE 8788
+CMD ["node", "server.mjs"]

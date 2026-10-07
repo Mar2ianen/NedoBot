@@ -1,0 +1,9 @@
+{
+  "name": "nedobot-embeddinggemma2-service",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1"
+  }
+}

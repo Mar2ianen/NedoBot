@@ -124,12 +124,30 @@ async fn process_profile_refresh_job(
         }
     };
 
-    if should_refresh && let Err(err) = refresh_profile(bot, pool, job.user_id).await {
-        let message = err.to_string();
-        if let Err(save_err) = mark_user_profile_refresh_error(pool, job.user_id, &message).await {
-            tracing::warn!(%save_err, user_id = job.user_id, "failed to save profile refresh error");
+    if should_refresh {
+        match refresh_profile(bot, pool, job.user_id).await {
+            Ok(()) => {
+                if let Err(err) =
+                    crate::features::spammer_avatar_embeddings::enqueue_refreshed_spammer_avatars(
+                        pool,
+                        config.avatar_embeddings_enabled,
+                        job.user_id,
+                    )
+                    .await
+                {
+                    tracing::warn!(%err, user_id = job.user_id, "failed to queue confirmed spammer avatar");
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Err(save_err) =
+                    mark_user_profile_refresh_error(pool, job.user_id, &message).await
+                {
+                    tracing::warn!(%save_err, user_id = job.user_id, "failed to save profile refresh error");
+                }
+                tracing::warn!(%err, user_id = job.user_id, "failed to refresh message author profile");
+            }
         }
-        tracing::warn!(%err, user_id = job.user_id, "failed to refresh message author profile");
     }
 
     // Profile freshness is global, while the audit is keyed by (chat, user).

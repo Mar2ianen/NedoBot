@@ -5,7 +5,7 @@ use teloxide::prelude::Bot;
 
 use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
-use crate::features::memory::embedding::{embed_text, pgvector_literal};
+use crate::features::memory::embedding::{embed_classification_text, pgvector_literal};
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
@@ -21,6 +21,11 @@ use teloxide_antispam::assessment::NewUserAuditAssessment;
 use teloxide_antispam::scoring::{
     FirstMessageScoreContext, is_rkn_vpn_restriction_context, score_assessment,
 };
+
+// Значения попадают в supporting/strong bands teloxide_antispam (0.78/0.88)
+// после сравнения raw cosine с отдельно откалиброванными порогами энкодера.
+const CALIBRATED_SPAM_SIMILARITY_SUPPORTING_VALUE: f64 = 0.8;
+const CALIBRATED_SPAM_SIMILARITY_STRONG_VALUE: f64 = 0.9;
 
 /// Обрабатывает одну готовую unified-audit job.
 ///
@@ -376,8 +381,8 @@ async fn load_first_message_score_context(
     let mut reputation_inputs = reputation_inputs;
     reputation_inputs.is_command = text.trim_start().starts_with('/');
     reputation_inputs.has_text = true;
-    let embedding = embed_text(config, &text).await?;
-    let embedding = pgvector_literal(&embedding)?;
+    let embedding = embed_classification_text(config, &text).await?;
+    let embedding_literal = pgvector_literal(&embedding)?;
     let reply_context = first_message_reply_context(&job.input_json);
     let linear_spam_probability = config
         .linear_spam_model
@@ -388,23 +393,23 @@ async fn load_first_message_score_context(
         embedding_model_version,
         embedding_head_version,
         embedding_calibration,
-    ) = load_embedding_spam_signal(
-        pool,
-        config,
-        job.chat_id,
-        row.get::<Option<i32>, _>("first_message_id"),
-    )
-    .await;
+    ) = load_embedding_spam_signal(config, &embedding);
     let context = FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
-        spam_similarity: spam_similarity(pool, job.telegram_user_id, &embedding).await?,
+        spam_similarity: load_calibrated_spam_similarity(
+            pool,
+            config,
+            job.telegram_user_id,
+            &embedding_literal,
+        )
+        .await?,
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
         personal_channel_content,
         // Персист корпуса для будущих similarity-проверок выполняется
         // в materialize через ScoreComponents.first_message_embedding.
-        embedding: Some(embedding),
+        embedding: Some(embedding_literal),
         linear_spam_probability,
         linear_spam_model_version: config
             .linear_spam_model
@@ -430,6 +435,37 @@ async fn load_first_message_score_context(
         reputation_inputs.behavior_available = true;
     }
     Ok((context, reputation_inputs))
+}
+
+async fn load_calibrated_spam_similarity(
+    pool: &PgPool,
+    config: &Config,
+    candidate_user_id: i64,
+    embedding: &str,
+) -> anyhow::Result<Option<f64>> {
+    let (Some(supporting_threshold), Some(strong_threshold)) = (
+        config.embedding_spam_similarity_supporting_threshold,
+        config.embedding_spam_similarity_strong_threshold,
+    ) else {
+        return Ok(None);
+    };
+    let Some(raw_similarity) = spam_similarity(
+        pool,
+        candidate_user_id,
+        embedding,
+        &config.rag_embedding_model,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if raw_similarity >= strong_threshold {
+        Ok(Some(CALIBRATED_SPAM_SIMILARITY_STRONG_VALUE))
+    } else if raw_similarity >= supporting_threshold {
+        Ok(Some(CALIBRATED_SPAM_SIMILARITY_SUPPORTING_VALUE))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Point-in-time behavior for the reputation head. Best-effort: any failure
@@ -574,15 +610,10 @@ pub(crate) const REPUTATION_FEATURE_NAMES: [&str; 12] = [
     "has_text",
 ];
 
-/// Scores the stored Gemma retrieval vector when the embedding head is
-/// configured. Reads only `ready` vectors with a matching `embedding_model`;
-/// a missing, mismatched or unreadable vector is no evidence (`None`), never
-/// a failure of the whole audit.
-async fn load_embedding_spam_signal(
-    pool: &PgPool,
+/// Scores the current Gemma 2 classification vector with its matching head.
+fn load_embedding_spam_signal(
     config: &Config,
-    chat_id: i64,
-    message_id: Option<i32>,
+    embedding: &[f32],
 ) -> (
     Option<f64>,
     Option<String>,
@@ -592,39 +623,16 @@ async fn load_embedding_spam_signal(
     let Some(head) = config.embedding_spam_model.as_ref() else {
         return (None, None, None, None);
     };
-    let Some(message_id) = message_id else {
-        return (None, None, None, None);
-    };
-    let stored: Option<(String, String)> = match sqlx::query_as(
-        "select embedding::text, embedding_model from telegram_message_embeddings_gemma where chat_id = $1 and message_id = $2 and status = 'ready'",
-    )
-    .bind(chat_id)
-    .bind(message_id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(stored) => stored,
-        Err(error) => {
-            tracing::warn!(%error, chat_id, message_id, "embedding spam lookup failed");
-            return (None, None, None, None);
-        }
-    };
-    let Some((literal, stored_model)) = stored else {
-        return (None, None, None, None);
-    };
-    if stored_model != head.embedding_model {
+    if head.embedding_model != config.rag_embedding_model {
         return (None, None, None, None);
     }
-    let vector = parse_halfvec_literal(&literal);
-    let Some(vector) = vector else {
-        tracing::warn!(chat_id, message_id, "embedding spam vector unparsable");
+    let Some(classifier_embedding) = embedding.get(..head.dim) else {
         return (None, None, None, None);
     };
-    let probability = head.spam_probability(&vector);
+    let probability = head.spam_probability(classifier_embedding);
     if probability.is_none() {
         tracing::warn!(
-            chat_id,
-            message_id,
+            model = %head.embedding_model,
             "embedding spam vector rejected by head"
         );
     }
@@ -634,28 +642,6 @@ async fn load_embedding_spam_signal(
         Some(head.version.clone()),
         Some(head.calibration.clone()),
     )
-}
-
-/// Parses a pgvector `halfvec`/`vector` text literal (`[0.1,0.2,...]`) into
-/// floats. Rejects empty input, missing brackets and non-finite values so a
-/// corrupt stored row can never become model evidence.
-fn parse_halfvec_literal(literal: &str) -> Option<Vec<f32>> {
-    let values: Option<Vec<f32>> = literal
-        .trim()
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .and_then(|inner| {
-            inner
-                .split(',')
-                .map(|part| part.trim().parse::<f32>().ok())
-                .collect::<Option<Vec<_>>>()
-        });
-    match values {
-        Some(values) if !values.is_empty() && values.iter().all(|value| value.is_finite()) => {
-            Some(values)
-        }
-        _ => None,
-    }
 }
 
 fn first_message_reply_context(input_json: &Value) -> &str {
@@ -857,17 +843,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn halfvec_literal_parsing_rejects_corrupt_rows() {
-        assert_eq!(
-            parse_halfvec_literal("[0.5, -1.25, 3]"),
-            Some(vec![0.5, -1.25, 3.0])
-        );
-        for bad in ["", "[]", "[0.1", "0.1]", "[NaN]", "[inf]", "[0.1, oops]"] {
-            assert_eq!(parse_halfvec_literal(bad), None, "must reject {bad:?}");
-        }
-    }
 
     fn job_with_input(input_json: Value) -> NewUserAuditJob {
         NewUserAuditJob {

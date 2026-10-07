@@ -47,9 +47,10 @@ pub async fn record_spam(
     chat_id: i64,
     user_id: i64,
     label: &SpamLabel,
+    avatar_embeddings_enabled: bool,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    record_spam_in_transaction(&mut tx, chat_id, user_id, label).await?;
+    record_spam_in_transaction(&mut tx, chat_id, user_id, label, avatar_embeddings_enabled).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -59,6 +60,7 @@ pub async fn record_spam_in_transaction(
     chat_id: i64,
     user_id: i64,
     label: &SpamLabel,
+    avatar_embeddings_enabled: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(
         "insert into spam_label_events (chat_id, telegram_user_id, label, subtype, source, reason, evidence, operator_telegram_user_id) values ($1, $2, 'spam', $3, $4, $5, $6, $7)",
@@ -92,6 +94,12 @@ pub async fn record_spam_in_transaction(
         .bind(&label.subtype)
         .execute(&mut **tx)
         .await?;
+    if avatar_embeddings_enabled {
+        crate::features::spammer_avatar_embeddings::enqueue_confirmed_avatar_in_transaction(
+            tx, chat_id, user_id,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -141,6 +149,13 @@ pub async fn record_not_spam_in_transaction(
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
+    sqlx::query(
+        "delete from spammer_avatar_embeddings where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

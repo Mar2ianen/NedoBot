@@ -56,6 +56,8 @@ pub struct Config {
     pub rag_embedding_url: String,
     pub rag_embedding_model: String,
     pub rag_embedding_timeout_sec: u64,
+    pub embedding_spam_similarity_supporting_threshold: Option<f64>,
+    pub embedding_spam_similarity_strong_threshold: Option<f64>,
     pub rag_top_k: usize,
     pub rag_min_similarity: f32,
     pub rag_temporal_half_life_days: f32,
@@ -98,6 +100,7 @@ pub struct Config {
     pub search_github_mcp_tools: Vec<String>,
     pub groq_api_key: String,
     pub new_user_audit_enabled: bool,
+    pub avatar_embeddings_enabled: bool,
     pub new_user_audit_max_tokens: u32,
     pub linear_spam_model: Option<std::sync::Arc<teloxide_antispam::logreg::LinearSpamModel>>,
     pub embedding_spam_model:
@@ -371,6 +374,10 @@ impl Config {
             rag_embedding_url: runtime.rag_embedding_url,
             rag_embedding_model: runtime.rag_embedding_model,
             rag_embedding_timeout_sec: runtime.rag_embedding_timeout_sec,
+            embedding_spam_similarity_supporting_threshold: runtime
+                .embedding_spam_similarity_supporting_threshold,
+            embedding_spam_similarity_strong_threshold: runtime
+                .embedding_spam_similarity_strong_threshold,
             rag_top_k: runtime.rag_top_k,
             rag_min_similarity: runtime.rag_min_similarity,
             rag_temporal_half_life_days: runtime.rag_temporal_half_life_days,
@@ -429,6 +436,7 @@ impl Config {
             } else {
                 runtime.new_user_audit_enabled
             },
+            avatar_embeddings_enabled: runtime.avatar_embeddings_enabled,
             new_user_audit_max_tokens: runtime.new_user_audit_max_tokens,
             gemini_thinking_budget: runtime.gemini_thinking_budget,
             owner_telegram_id: if telegram_section_present {
@@ -696,6 +704,40 @@ impl Config {
             );
             self.validate_embedding_config(&mut errors);
         }
+        if self.avatar_embeddings_enabled {
+            if !self.new_user_audit_enabled {
+                errors.push(
+                    "avatar_embeddings_enabled=true requires new_user_audit_enabled=true"
+                        .to_string(),
+                );
+            }
+            self.validate_embedding_config(&mut errors);
+        }
+        match (
+            self.embedding_spam_similarity_supporting_threshold,
+            self.embedding_spam_similarity_strong_threshold,
+        ) {
+            (None, None) => {}
+            (Some(supporting), Some(strong))
+                if supporting.is_finite()
+                    && strong.is_finite()
+                    && (0.0..=1.0).contains(&supporting)
+                    && (supporting..=1.0).contains(&strong) => {}
+            _ => errors.push(
+                "embedding spam similarity thresholds must both be set, finite, within 0..=1, and strong must be >= supporting".to_string(),
+            ),
+        }
+        if (self
+            .embedding_spam_similarity_supporting_threshold
+            .is_some()
+            || self.embedding_spam_similarity_strong_threshold.is_some())
+            && !self.new_user_audit_enabled
+        {
+            errors.push(
+                "embedding spam similarity thresholds require new_user_audit_enabled=true"
+                    .to_string(),
+            );
+        }
         if self.profile_refresh_concurrency == 0 {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
@@ -900,6 +942,14 @@ impl Config {
             "CHAT_RETRIEVAL_EMBEDDING_MODEL",
             &self.chat_retrieval_embedding_model,
         );
+        if self.chat_retrieval_embedding_model
+            != crate::features::memory::embedding::EMBEDDINGGEMMA2_MODEL_ID
+        {
+            errors.push(format!(
+                "CHAT_RETRIEVAL_EMBEDDING_MODEL must match the pinned encoder {:?}",
+                crate::features::memory::embedding::EMBEDDINGGEMMA2_MODEL_ID
+            ));
+        }
         require_positive(
             errors,
             "CHAT_RETRIEVAL_EMBEDDING_TIMEOUT_SEC",
@@ -940,6 +990,13 @@ impl Config {
     fn validate_embedding_config(&self, errors: &mut Vec<String>) {
         require_http_url(errors, "RAG_EMBEDDING_URL", &self.rag_embedding_url);
         require_non_empty(errors, "RAG_EMBEDDING_MODEL", &self.rag_embedding_model);
+        if self.rag_embedding_model != crate::features::memory::embedding::EMBEDDINGGEMMA2_MODEL_ID
+        {
+            errors.push(format!(
+                "RAG_EMBEDDING_MODEL must match the pinned encoder {:?}",
+                crate::features::memory::embedding::EMBEDDINGGEMMA2_MODEL_ID
+            ));
+        }
         require_positive(
             errors,
             "RAG_EMBEDDING_TIMEOUT_SEC",
@@ -1599,15 +1656,20 @@ mod tests {
             memory_llm_max_tokens: 220,
             rag_enabled: false,
             rag_embedding_url: "http://127.0.0.1:8788".to_string(),
-            rag_embedding_model: "cointegrated/rubert-tiny2".to_string(),
+            rag_embedding_model:
+                "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+                    .to_string(),
             rag_embedding_timeout_sec: 10,
+            embedding_spam_similarity_supporting_threshold: None,
+            embedding_spam_similarity_strong_threshold: None,
             rag_top_k: 6,
             rag_min_similarity: 0.55,
             rag_temporal_half_life_days: 180.0,
             chat_retrieval_embeddings_enabled: false,
-            chat_retrieval_embedding_url: "http://127.0.0.1:8795".to_string(),
-            chat_retrieval_embedding_model: "ggml-org/embeddinggemma-300M-qat-q4_0-GGUF"
-                .to_string(),
+            chat_retrieval_embedding_url: "http://127.0.0.1:8788".to_string(),
+            chat_retrieval_embedding_model:
+                "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+                    .to_string(),
             chat_retrieval_embedding_timeout_sec: 30,
             chat_retrieval_embedding_query_prefix: "task: search result | query: ".to_string(),
             chat_retrieval_embedding_document_prefix: "title: none | text: ".to_string(),
@@ -1657,6 +1719,7 @@ mod tests {
             search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             groq_api_key: String::new(),
             new_user_audit_enabled: false,
+            avatar_embeddings_enabled: false,
             new_user_audit_max_tokens: 900,
             linear_spam_model: None,
             embedding_spam_model: None,

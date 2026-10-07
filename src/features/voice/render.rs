@@ -214,15 +214,20 @@ mod tests {
             memory_llm_max_tokens: 220,
             rag_enabled: false,
             rag_embedding_url: "http://127.0.0.1:8788".to_string(),
-            rag_embedding_model: "cointegrated/rubert-tiny2".to_string(),
+            rag_embedding_model:
+                "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+                    .to_string(),
             rag_embedding_timeout_sec: 10,
+            embedding_spam_similarity_supporting_threshold: None,
+            embedding_spam_similarity_strong_threshold: None,
             rag_top_k: 6,
             rag_min_similarity: 0.55,
             rag_temporal_half_life_days: 180.0,
             chat_retrieval_embeddings_enabled: false,
-            chat_retrieval_embedding_url: "http://127.0.0.1:8795".to_string(),
-            chat_retrieval_embedding_model: "ggml-org/embeddinggemma-300M-qat-q4_0-GGUF"
-                .to_string(),
+            chat_retrieval_embedding_url: "http://127.0.0.1:8788".to_string(),
+            chat_retrieval_embedding_model:
+                "onnx-community/embeddinggemma-2-ONNX@daa72c51243991dfcaf9f9137d2c573d8f7790c0:q4"
+                    .to_string(),
             chat_retrieval_embedding_timeout_sec: 30,
             chat_retrieval_embedding_query_prefix: "task: search result | query: ".to_string(),
             chat_retrieval_embedding_document_prefix: "title: none | text: ".to_string(),
@@ -272,6 +277,7 @@ mod tests {
             search_github_mcp_tools: vec!["search_issues".to_string(), "search_code".to_string()],
             groq_api_key: String::new(),
             new_user_audit_enabled: false,
+            avatar_embeddings_enabled: false,
             new_user_audit_max_tokens: 900,
             linear_spam_model: None,
             embedding_spam_model: None,

@@ -529,6 +529,7 @@ pub async fn apply_action(
     report_id: i64,
     action: ReportAction,
     actor_id: i64,
+    avatar_embeddings_enabled: bool,
 ) -> anyhow::Result<ReportActionResult> {
     let resolution = match action {
         ReportAction::Accept => ReportResolution::Accepted,
@@ -575,6 +576,7 @@ pub async fn apply_action(
                     evidence: serde_json::json!({"report_id": report_id}),
                     operator_id: Some(actor_id),
                 },
+                avatar_embeddings_enabled,
             )
             .await?;
         }
