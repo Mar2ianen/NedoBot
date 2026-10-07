@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     if embedding_model != EMBEDDINGGEMMA2_MODEL_ID {
         anyhow::bail!("RAG_EMBEDDING_MODEL must match the pinned EmbeddingGemma 2 encoder");
     }
-    let timeout_sec = optional_u64("RAG_EMBEDDING_TIMEOUT_SEC", 10)?;
+    let timeout_sec = optional_u64("RAG_EMBEDDING_TIMEOUT_SEC", 60)?;
 
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
