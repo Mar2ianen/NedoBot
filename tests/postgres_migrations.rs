@@ -971,7 +971,7 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
     assert_eq!(current_claim.message_id, STALE_MESSAGE_ID);
     assert_eq!(current_claim.attempts, 2);
     assert_eq!(
-        mark_embedding_ready(pool, &stale_claim, &vec![0.0; 768], "test-model")
+        mark_embedding_ready(pool, &stale_claim, &vec![0.0; 512], "test-model")
             .await
             .expect("stale ready finalization must execute"),
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost
@@ -993,7 +993,7 @@ async fn assert_embedding_job_finalization_requires_current_claim(pool: &PgPool)
     assert_eq!(reclaimed_state, ("processing".to_string(), 2, true, true));
 
     assert_eq!(
-        mark_embedding_ready(pool, current_claim, &vec![0.0; 768], "test-model")
+        mark_embedding_ready(pool, current_claim, &vec![0.0; 512], "test-model")
             .await
             .expect("current ready finalization must execute"),
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::Applied
@@ -4106,7 +4106,7 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
     let message_id = 9_700_000 + suffix;
     let user_id = 9_700_000 + i64::from(suffix);
     let embedding = std::iter::once(1.0_f32)
-        .chain(std::iter::repeat_n(0.0_f32, 767))
+        .chain(std::iter::repeat_n(0.0_f32, 511))
         .collect::<Vec<_>>();
     let embedding_literal = format!(
         "[{}]",
