@@ -116,6 +116,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
+    assert_spammer_avatar_embedding_label_gate(&pool).await;
     assert_comment_reconciliation_requires_operator_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
     assert_post_history_entry_lease_lifecycle(&pool).await;
@@ -5479,4 +5480,131 @@ async fn assert_label_writer_roundtrip(pool: &PgPool) {
     assert_eq!(journal.len(), 2);
     assert!(journal.iter().any(|entry| entry.kind == "label:spam"));
     assert!(journal.iter().any(|entry| entry.kind == "label:not_spam"));
+}
+
+async fn assert_spammer_avatar_embedding_label_gate(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .subsec_nanos() as i64;
+    let enabled_user_id = 9_500_000_000 + suffix;
+    let disabled_user_id = enabled_user_id + 1;
+    for user_id in [enabled_user_id, disabled_user_id] {
+        query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+            .bind(CHAT_ID)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("avatar dataset fixture user must be insertable");
+        query(
+            "insert into telegram_user_profiles (telegram_user_id, profile_photo_file_id, profile_photo_file_unique_id) values ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(format!("downloadable-file-{user_id}"))
+        .bind(format!("unique-file-{user_id}"))
+        .execute(pool)
+        .await
+        .expect("avatar dataset fixture profile must be insertable");
+    }
+
+    record_spam(
+        pool,
+        CHAT_ID,
+        enabled_user_id,
+        &SpamLabel {
+            subtype: "fixture_manual_spam".to_string(),
+            source: LabelSource::OwnerReview,
+            reason: "avatar dataset gate fixture".to_string(),
+            evidence: serde_json::json!({"fixture": true}),
+            operator_id: Some(1),
+        },
+        true,
+    )
+    .await
+    .expect("enabled avatar dataset should enqueue a manually confirmed spammer");
+    let queued: (String, String, String) = query_as(
+        "select status, avatar_file_id, avatar_file_unique_id from spammer_avatar_embeddings where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(enabled_user_id)
+    .fetch_one(pool)
+    .await
+    .expect("manual spam confirmation must enqueue its cached avatar");
+    assert_eq!(
+        queued,
+        (
+            "pending".to_string(),
+            format!("downloadable-file-{enabled_user_id}"),
+            format!("unique-file-{enabled_user_id}"),
+        )
+    );
+
+    record_spam(
+        pool,
+        CHAT_ID,
+        disabled_user_id,
+        &SpamLabel {
+            subtype: "fixture_manual_spam".to_string(),
+            source: LabelSource::OwnerReview,
+            reason: "avatar dataset disabled fixture".to_string(),
+            evidence: serde_json::json!({"fixture": true}),
+            operator_id: Some(1),
+        },
+        false,
+    )
+    .await
+    .expect("disabled avatar dataset should not affect manual labels");
+    let disabled_count: i64 = query_scalar(
+        "select count(*) from spammer_avatar_embeddings where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(disabled_user_id)
+    .fetch_one(pool)
+    .await
+    .expect("disabled avatar dataset query must succeed");
+    assert_eq!(disabled_count, 0);
+
+    for user_id in [enabled_user_id, disabled_user_id] {
+        record_not_spam(
+            pool,
+            CHAT_ID,
+            user_id,
+            "avatar dataset gate fixture cleanup",
+            &serde_json::json!({"fixture": true}),
+            Some(1),
+        )
+        .await
+        .expect("removing a spam label must succeed");
+    }
+    let removed_count: i64 = query_scalar(
+        "select count(*) from spammer_avatar_embeddings where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(enabled_user_id)
+    .fetch_one(pool)
+    .await
+    .expect("avatar dataset removal query must succeed");
+    assert_eq!(removed_count, 0);
+
+    query("delete from spam_label_events where chat_id = $1 and telegram_user_id in ($2, $3)")
+        .bind(CHAT_ID)
+        .bind(enabled_user_id)
+        .bind(disabled_user_id)
+        .execute(pool)
+        .await
+        .expect("avatar dataset fixture events must be removable");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id in ($2, $3)")
+        .bind(CHAT_ID)
+        .bind(enabled_user_id)
+        .bind(disabled_user_id)
+        .execute(pool)
+        .await
+        .expect("avatar dataset fixture users must be removable");
+    query("delete from telegram_user_profiles where telegram_user_id in ($1, $2)")
+        .bind(enabled_user_id)
+        .bind(disabled_user_id)
+        .execute(pool)
+        .await
+        .expect("avatar dataset fixture profiles must be removable");
 }
