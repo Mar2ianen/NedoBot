@@ -128,14 +128,36 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
-            "bash '$STAGE_DIR/install_release_binaries.sh' '$STAGE_DIR' \
-            && rm -rf '$STAGE_DIR' \
-            && systemctl restart tg-ai-bot-teloxide nedobot-pvo \
-            && systemctl is-active tg-ai-bot-teloxide nedobot-pvo \
-            && podman exec tg-ai-bot-postgres psql -v ON_ERROR_STOP=1 \
-              -U tg_ai_bot -d tg_ai_bot -c 'GRANT SELECT (chat_id, message_id, embedding, embedding_model, status) ON TABLE public.telegram_message_embeddings_gemma2 TO nedobot_mcp_ro' \
-            && systemctl restart nedonews-mcp \
-            && systemctl is-active nedonews-mcp"
+            "bash -s -- '$STAGE_DIR'" <<'REMOTE'
+          set -euo pipefail
+          stage_dir="$1"
+          bash "$stage_dir/install_release_binaries.sh" "$stage_dir"
+          rm -rf "$stage_dir"
+          systemctl restart tg-ai-bot-teloxide nedobot-pvo
+          systemctl is-active tg-ai-bot-teloxide nedobot-pvo
+
+          ready=false
+          for attempt in $(seq 1 60); do
+            main_ready=$(podman exec tg-ai-bot-postgres psql -XAt \
+              -U tg_ai_bot -d tg_ai_bot \
+              -c "select to_regclass('public.telegram_message_embeddings_gemma2') is not null and to_regclass('public.spammer_avatar_embeddings') is not null") || main_ready=false
+            pvo_ready=$(podman exec tg-ai-bot-postgres psql -XAt \
+              -U tg_ai_bot -d tg_ai_bot_pvo \
+              -c "select to_regclass('public.telegram_message_embeddings_gemma2') is not null and to_regclass('public.spammer_avatar_embeddings') is not null") || pvo_ready=false
+            if [ "$main_ready" = "t" ] && [ "$pvo_ready" = "t" ]; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "true"
+
+          podman exec tg-ai-bot-postgres psql -v ON_ERROR_STOP=1 \
+            -U tg_ai_bot -d tg_ai_bot \
+            -c 'GRANT SELECT (chat_id, message_id, embedding, embedding_model, status) ON TABLE public.telegram_message_embeddings_gemma2 TO nedobot_mcp_ro'
+          systemctl restart nedonews-mcp
+          systemctl is-active nedonews-mcp
+          REMOTE
       - name: Confirm running binaries match artifact
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
