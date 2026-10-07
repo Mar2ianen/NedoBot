@@ -7,6 +7,45 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+7 октября 2026 в **19:53 UTC / 22:53 МСК** выпущен release
+[`deploy-2026-10-07-embeddinggemma2`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-07-embeddinggemma2)
+на source `7883f750e86f333fba9f6da2e994dfc6bce73f48` после review
+[PR #40](https://github.com/Mar2ianen/NedoBot/pull/40). Release workflow
+[37676399623](https://github.com/Mar2ianen/NedoBot/actions/runs/37676399623)
+собрал artifact и успешно установил его в оба checkout. В первой попытке
+deploy шаг применил MCP `GRANT` раньше, чем startup-миграции обоих процессов
+завершились; повторный запуск failed job прошёл после создания схемы. В этом
+изменении workflow ждёт таблицы в обеих БД перед выдачей прав.
+
+Оба бота и MCP запущены с artifact hashes:
+bot `9401a65d3467da5cd513689fa74c3fa814091c873d9c19c3984abe223ed8aacf`,
+MCP `00bfebb787904d1a3fcf68d6f10e8e0db82b556bfd7335e5c370a76ff721c317`.
+В каждой БД 93 успешные миграции, failed migrations нет; все три unit-а имеют
+`NRestarts=0`. Local MCP ответил `403`, public MCP — `405` на unauthenticated
+GET; это ожидаемый ответ для этих probes. Оба production profiles используют
+pinned `onnx-community/embeddinggemma-2-ONNX` Q4 revision
+`daa72c51243991dfcaf9f9137d2c573d8f7790c0`, 512d text/image vectors и timeout
+60 секунд. Main использует новый 512d spam-head; общая модерация ПВО осталась
+выключенной. Новый `/embed` и `/embed-image` прошли smoke на тексте и
+синтетическом PNG: по 512 конечных компонентов, L2 norm `1.0`.
+
+`nedobot-rag-embedding` обслуживает новый encoder на `127.0.0.1:8788`.
+Старый 300M chat unit остановлен и отключён, его unit и volume сохранены;
+предыдущий RuBERT unit сохранён в snapshot. Для каждого инстанса запущены
+chat/history backfill и avatar worker. Avatar dataset принимает только
+векторы после явной spam-метки, удаляет строку после снятия метки и не хранит
+image bytes. В момент старта workers нашли 177 ранее помеченных spammer-аватаров
+с доступными Telegram file IDs; обработка и повтор ограниченных download errors
+продолжаются.
+
+До миграции сохранены оба PostgreSQL dump-а, consistent SQLite snapshot,
+profiles, MCP env, units и работающие binaries в приватном
+`/opt/tg-ai-bot-releases/deploy-2026-10-07-embeddinggemma2-before-20261007T192500Z/`.
+Для обоих dump-ов проверены `pg_restore --list` и SHA-256; SQLite прошла
+`PRAGMA integrity_check`.
+
+### Предыдущая выкладка: changelog 6 октября
+
 6 октября 2026 в **16:09 UTC / 19:09 МСК** выпущен release
 [`deploy-2026-10-06-bot-changelog-details`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-06-bot-changelog-details)
 на source `6949a151fc8e9ffd67419a8bb477ebd2b2077fc2`, после review
