@@ -9,7 +9,9 @@ const MAX_BODY_BYTES = 14 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_BATCH_SIZE = 16;
 const MAX_TEXT_CHARS = 16_000;
-const MAX_PENDING_REQUESTS = 3;
+// One active inference is serialized below; leave enough bounded queue slots
+// for both bot instances' chat and avatar workers plus a backfill batch.
+const MAX_PENDING_REQUESTS = 16;
 const PORT = Number(process.env.PORT ?? 8788);
 
 env.cacheDir = process.env.MODEL_CACHE ?? '/data/hf';
