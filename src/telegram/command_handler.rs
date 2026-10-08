@@ -20,7 +20,9 @@ use crate::features::ask::repo;
 #[cfg(feature = "ask")]
 use crate::features::ask::service::AskService;
 #[cfg(feature = "ask")]
-use crate::features::ask::types::{AskCommandInput, AskFailureKind, AskProgress, AskRunStatus};
+use crate::features::ask::types::{
+    AskCommandInput, AskFailureKind, AskProgress, AskRunStatus, AskSandboxFile,
+};
 #[cfg(feature = "auto-comment")]
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
 #[cfg(feature = "auto-comment")]
@@ -52,7 +54,7 @@ use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 #[cfg(feature = "manual-moderation")]
 use crate::telegram::manual_moderation as manual_moderation_frontend;
 #[cfg(feature = "ask")]
-use crate::telegram::media::download_largest_photo_base64;
+use crate::telegram::media::{download_ask_sandbox_document, download_largest_photo_base64};
 use crate::telegram::render::escape_html;
 use crate::telegram::service_messages::{self, MessageAudience};
 
@@ -712,7 +714,6 @@ async fn handle_ask_command(
         tracing::debug!(%err, "failed to deliver initial /ask progress preview");
     }
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let reply_context = build_ask_reply_context(msg, scope_chat_id);
     let reply_image_base64 = match msg.reply_to_message() {
         Some(reply) => match download_largest_photo_base64(bot, reply, config).await {
             Ok(image) => image,
@@ -723,6 +724,22 @@ async fn handle_ask_command(
         },
         None => None,
     };
+    let sandbox_files = if config.ask_python_sandbox_enabled {
+        match msg.reply_to_message() {
+            Some(reply) => match download_ask_sandbox_document(bot, reply).await {
+                Ok(Some(file)) => vec![file],
+                Ok(None) => Vec::new(),
+                Err(_) => {
+                    tracing::warn!("failed to load /ask reply document into Python sandbox");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let reply_context = build_ask_reply_context(msg, scope_chat_id, &sandbox_files);
     let input = AskCommandInput {
         chat_id: msg.chat.id.0,
         scope_chat_id,
@@ -733,6 +750,7 @@ async fn handle_ask_command(
         reply_to_message_id: msg.reply_to_message().map(|reply| reply.id.0),
         reply_context,
         reply_image_base64,
+        sandbox_files,
         allow_mutations: true,
     };
     let ask_service = AskService::new(
@@ -999,7 +1017,11 @@ async fn send_ask_fallback(
 }
 
 #[cfg(feature = "ask")]
-fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<String> {
+fn build_ask_reply_context(
+    msg: &Message,
+    discussion_chat_id: i64,
+    sandbox_files: &[AskSandboxFile],
+) -> Option<String> {
     msg.reply_to_message().map(|reply| {
         let author = reply
             .from
@@ -1032,8 +1054,17 @@ fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<Str
         .flatten()
         .collect::<Vec<_>>()
         .join(", ");
+        let sandbox_files = if sandbox_files.is_empty() {
+            "нет".to_string()
+        } else {
+            sandbox_files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         format!(
-            "message_id={}\nauthor={}\nmessage_url={}\nmedia={}\ntext={}",
+            "message_id={}\nauthor={}\nmessage_url={}\nmedia={}\npython_sandbox_files={}\ntext={}",
             reply.id.0,
             author,
             (reply.chat.id.0 == discussion_chat_id)
@@ -1042,6 +1073,7 @@ fn build_ask_reply_context(msg: &Message, discussion_chat_id: i64) -> Option<Str
                 .as_deref()
                 .unwrap_or("нет"),
             if media.is_empty() { "нет" } else { &media },
+            sandbox_files,
             crate::telegram::entities::message_text(reply)
                 .as_deref()
                 .unwrap_or("[нет текста]")
@@ -1282,8 +1314,14 @@ mod tests {
             "reply_to_message":{"message_id":9,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},
                 "rich_message":{"blocks":[{"type":"paragraph","text":"Предыдущий ответ"}]}}
         })).unwrap();
-        let context = build_ask_reply_context(&msg, -100111).unwrap();
+        let sandbox_files = [AskSandboxFile {
+            name: "upload_report.csv".to_string(),
+            bytes: b"private table contents".to_vec(),
+        }];
+        let context = build_ask_reply_context(&msg, -100111, &sandbox_files).unwrap();
         assert!(context.contains("Предыдущий ответ"));
+        assert!(context.contains("python_sandbox_files=upload_report.csv"));
+        assert!(!context.contains("private table contents"));
         assert!(!context.contains("[нет текста]"));
     }
     use super::*;

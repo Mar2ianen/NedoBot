@@ -308,20 +308,27 @@ ssh vps-153 'systemctl is-active nedonews-mcp'
 
 ### Опциональная Python-песочница `/ask`
 
-Собирай `deploy/ask-sandbox/Containerfile` от заранее проверенного OCI digest
-под отдельным rootless-пользователем. После сборки получи immutable image ID
-через `podman image inspect --format '{{.Id}}' <tag>` и укажи его в
-`ask_python_sandbox_image`; только затем выставляй
-`ask_python_sandbox_enabled=true` в deployment profile. До включения проверь
-`podman info --format '{{.Host.Security.Rootless}}'` от того же пользователя и
-наличие cgroup v2 лимитов. Образ при вызове не скачивается (`--pull=never`). Не
-включай функцию на втором community-инстансе, пока отдельно не проверены его
-rootless Podman и resource limits. В production на 8 октября 2026 оба bot unit
-запускаются от root без rootless Podman runtime, поэтому функция остаётся
-выключенной: запуск rootful-контейнера не считается допустимой заменой. Текущая
-версия даёт эфемерный `/workspace`, но не подключает Telegram-вложения и не
-сохраняет файлы или Python-состояние между вызовами. Сетевого доступа и
-монтирования файлов хоста нет.
+Перед включением создай отдельного `nedobot-sandbox` с домашним каталогом
+`/var/lib/nedobot-sandbox`, выделенным диапазоном subordinate UID/GID и включённым
+lingering через `loginctl enable-linger nedobot-sandbox`. Бот запускается от
+root, но вызывает Podman через `runuser` с очищенным окружением от имени этого
+пользователя. Проверь его `podman info --format
+'{{.Host.Security.Rootless}}'` и cgroup v2 лимиты. Подготовь
+`deploy/ask-sandbox/Containerfile` от проверенного OCI digest; после сборки
+получи immutable image ID через `podman image inspect --format '{{.Id}}'
+<tag>` и укажи его в `ask_python_sandbox_image`. Включай
+`ask_python_sandbox_enabled=true` только после успешного smoke запуска от
+`nedobot-sandbox`. Образ во время запроса не скачивается (`--pull=never`).
+
+Песочница принимает один UTF-8 текстовый файл до 2 MiB из reply для анализа
+табличных данных, обычного текста и исходного кода; документ копируется через
+stdin во временный `/workspace`. Каждый tool call получает новый контейнер, поэтому
+состояние Python не хранится между вызовами и это не постоянное Jupyter-ядро.
+Файлы-результаты отдельно не доставляются. Вложение, сеть и файлы хоста не
+монтируются; сеть контейнера отключена, rootfs read-only, RAM ограничена 256 MiB
+без swap, CPU и PID имеют лимиты, временный диск ограничен. На втором
+community-инстансе оставь функцию выключенной, пока отдельно не проверишь
+rootless Podman и лимиты ресурсов.
 
 Для pinned EmbeddingGemma 2 text+image encoder создать volume и установить unit
 из checkout; unit собирает pinned Transformers.js Q4 image из

@@ -8,6 +8,12 @@ use teloxide::{net::Download, prelude::*, types::FileId};
 use tokio::io::AsyncWrite;
 
 use crate::config::Config;
+#[cfg(feature = "ask")]
+use crate::features::ask::python_sandbox::{
+    MAX_FILE_BYTES, is_supported_sandbox_filename, sanitize_sandbox_filename,
+};
+#[cfg(feature = "ask")]
+use crate::features::ask::types::AskSandboxFile;
 
 #[cfg(feature = "ask")]
 pub(crate) async fn download_largest_photo_base64(
@@ -47,20 +53,51 @@ pub(crate) async fn download_photo_base64(
     Ok(Some(BASE64.encode(bytes.into_inner())))
 }
 
-struct LimitedBytesWriter {
+#[cfg(feature = "ask")]
+pub(crate) async fn download_ask_sandbox_document(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+) -> anyhow::Result<Option<AskSandboxFile>> {
+    let Some(document) = msg.document() else {
+        return Ok(None);
+    };
+    let Some(original_name) = document.file_name.as_deref() else {
+        return Ok(None);
+    };
+    let Some(name) = sanitize_sandbox_filename(original_name) else {
+        return Ok(None);
+    };
+    if !is_supported_sandbox_filename(&name) {
+        return Ok(None);
+    }
+
+    let file = bot.get_file(document.file.id.clone()).await?;
+    anyhow::ensure!(
+        usize::try_from(file.size).unwrap_or(usize::MAX) <= MAX_FILE_BYTES,
+        "reply document exceeds Python sandbox size limit"
+    );
+    let mut bytes = LimitedBytesWriter::new(MAX_FILE_BYTES);
+    bot.download_file(&file.path, &mut bytes).await?;
+    let bytes = bytes.into_inner();
+    std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("reply document is not UTF-8 text"))?;
+
+    Ok(Some(AskSandboxFile { name, bytes }))
+}
+
+pub(crate) struct LimitedBytesWriter {
     bytes: Vec<u8>,
     limit: usize,
 }
 
 impl LimitedBytesWriter {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(limit.min(1024 * 1024)),
             limit,
         }
     }
 
-    fn into_inner(self) -> Vec<u8> {
+    pub(crate) fn into_inner(self) -> Vec<u8> {
         self.bytes
     }
 }
