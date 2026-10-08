@@ -1,6 +1,12 @@
 use serde_json::Value;
 use teloxide::utils::rich_text::RenderedMessage;
 
+#[derive(Clone, Debug)]
+pub struct AskSandboxFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AskProgress {
     Preparing,
@@ -22,6 +28,7 @@ pub struct AskCommandInput {
     pub reply_to_message_id: Option<i32>,
     pub reply_context: Option<String>,
     pub reply_image_base64: Option<String>,
+    pub sandbox_files: Vec<AskSandboxFile>,
     /// Production `/ask` may save verified notes; diagnostic replay remains read-only.
     pub allow_mutations: bool,
 }

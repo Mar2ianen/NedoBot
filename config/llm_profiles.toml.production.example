@@ -341,7 +341,7 @@ ask_db_mcp_args = []
 ask_db_mcp_env = ["ASK_DATABASE_URL", "MCP_MANIFEST"]
 ask_db_mcp_timeout_sec = 30
 ask_python_sandbox_enabled = false
-# Включать только после rootless Podman provisioning; значение — локальный immutable image ID.
+# Опционально; требуется отдельный rootless пользователь nedobot-sandbox и локальный ID образа.
 # ask_python_sandbox_image = "sha256:<64 hex digits>"
 
 profile_refresh_concurrency = 4

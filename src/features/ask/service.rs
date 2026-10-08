@@ -69,6 +69,7 @@ impl<'a> AskService<'a> {
                 question: &input.question,
                 reply_context: input.reply_context.as_deref(),
                 image_base64: input.reply_image_base64.as_deref(),
+                sandbox_files: input.sandbox_files,
                 progress,
                 allow_mutations: input.allow_mutations,
                 semantic_aliases: &semantic_aliases,

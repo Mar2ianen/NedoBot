@@ -21,7 +21,7 @@ use crate::features::ask::mcp_client::{
 use crate::features::ask::notes::add_user_note_from_search;
 use crate::features::ask::python_sandbox::AskPythonSandbox;
 use crate::features::ask::repo;
-use crate::features::ask::types::{AskProgress, PendingToolCallAudit};
+use crate::features::ask::types::{AskProgress, AskSandboxFile, PendingToolCallAudit};
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
 use crate::llm::service::{
@@ -44,6 +44,7 @@ pub struct AskRequest<'a> {
     pub question: &'a str,
     pub reply_context: Option<&'a str>,
     pub image_base64: Option<&'a str>,
+    pub sandbox_files: Vec<AskSandboxFile>,
     pub progress: Option<&'a UnboundedSender<AskProgress>>,
     /// Production `/ask` может сохранять проверенные заметки; diagnostic replay остаётся read-only.
     pub allow_mutations: bool,
@@ -150,6 +151,7 @@ async fn answer_within_deadline(
         question,
         reply_context,
         image_base64,
+        sandbox_files,
         progress,
         allow_mutations,
         semantic_aliases,
@@ -162,7 +164,7 @@ async fn answer_within_deadline(
             .ask_python_sandbox_image
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Python sandbox image is not configured"))?;
-        let sandbox = AskPythonSandbox::new(image_id)?;
+        let sandbox = AskPythonSandbox::new(image_id, sandbox_files)?;
         agent_tools.push(sandbox.tool_definition());
         Some(sandbox)
     } else {
@@ -2030,6 +2032,7 @@ mod tests {
                 question: &question,
                 reply_context: None,
                 image_base64: None,
+                sandbox_files: Vec::new(),
                 progress: None,
                 allow_mutations: false,
                 scope_chat_id: config.discussion_chat_id,

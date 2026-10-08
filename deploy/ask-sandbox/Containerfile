@@ -1,4 +1,4 @@
-ARG PYTHON_BASE_IMAGE
+ARG PYTHON_BASE_IMAGE=docker.io/library/python:3.13-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
 FROM ${PYTHON_BASE_IMAGE}
 
 # Этот образ собирается из заранее выбранного и проверенного base digest.
