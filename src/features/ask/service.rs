@@ -77,7 +77,12 @@ impl<'a> AskService<'a> {
         .await;
 
         match answer {
-            Ok(answer) => match rich_markdown::validate(&answer.markdown) {
+            Ok(answer) => match rich_markdown::validate(
+                &rich_markdown::normalize_message_citations(
+                    &answer.markdown,
+                    &answer.observed_message_ids,
+                ),
+            ) {
                 Ok(markdown) => {
                     let captured_now = Timestamp::now();
                     let bindings = match self.rich_text_bindings(

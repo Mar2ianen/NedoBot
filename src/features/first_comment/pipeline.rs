@@ -249,22 +249,31 @@ async fn process_post_comment_job(
             )
         })?;
     let chat_member_count = get_chat_member_count(bot, job.discussion_chat_id).await;
-    let memory_notes = load_relevant_memory_notes(pool, config, &job.cleaned_post_text)
-        .await
-        .map_err(|err| {
-            CommentFailure::new(
-                CommentErrorKind::Transient,
-                "memory_notes",
-                format!("{err:#}"),
-            )
-        })?;
-    let recent_comments = load_recent_bot_comments(pool).await.map_err(|err| {
+    let memory_notes = load_relevant_memory_notes(
+        pool,
+        config,
+        job.discussion_chat_id,
+        job.source_channel_id,
+        &job.cleaned_post_text,
+    )
+    .await
+    .map_err(|err| {
         CommentFailure::new(
             CommentErrorKind::Transient,
-            "recent_comments",
+            "memory_notes",
             format!("{err:#}"),
         )
     })?;
+    let recent_comments =
+        load_recent_bot_comments(pool, job.discussion_chat_id, job.source_channel_id)
+            .await
+            .map_err(|err| {
+                CommentFailure::new(
+                    CommentErrorKind::Transient,
+                    "recent_comments",
+                    format!("{err:#}"),
+                )
+            })?;
     let topic_comments = Vec::new();
     let search_context = run_search(config, &job.cleaned_post_text, &memory_notes).await;
     if let Err(err) = insert_search_run(pool, job.id, &search_context).await {

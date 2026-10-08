@@ -5,6 +5,7 @@ pub use crate::features::ask_metrics as metrics;
 pub use crate::features::chat_search;
 pub mod mcp_client;
 pub mod notes;
+pub mod python_sandbox;
 pub mod repo;
 pub mod rich_markdown;
 pub mod service;

@@ -122,6 +122,8 @@ pub struct Config {
     pub ask_db_mcp_args: Vec<String>,
     pub ask_db_mcp_env: Vec<String>,
     pub ask_db_mcp_timeout_sec: u64,
+    pub ask_python_sandbox_enabled: bool,
+    pub ask_python_sandbox_image: Option<String>,
     pub profile_refresh_concurrency: usize,
     pub comment_custom_emoji_id: Option<String>,
     pub first_comment_max_image_mb: u32,
@@ -462,6 +464,8 @@ impl Config {
             ask_db_mcp_args: runtime.ask_db_mcp_args,
             ask_db_mcp_env: runtime.ask_db_mcp_env,
             ask_db_mcp_timeout_sec: runtime.ask_db_mcp_timeout_sec,
+            ask_python_sandbox_enabled: runtime.ask_python_sandbox_enabled,
+            ask_python_sandbox_image: runtime.ask_python_sandbox_image,
             profile_refresh_concurrency: runtime.profile_refresh_concurrency,
             comment_custom_emoji_id: runtime.comment_custom_emoji_id,
             first_comment_max_image_mb: runtime.first_comment_max_image_mb,
@@ -765,6 +769,21 @@ impl Config {
                 errors.push("ASK_DB_MCP_TIMEOUT_SEC must be greater than 0".to_string());
             }
         }
+        if self.ask_python_sandbox_enabled {
+            if !self.ask_enabled {
+                errors
+                    .push("ask_python_sandbox_enabled=true requires ask_enabled=true".to_string());
+            }
+            if self
+                .ask_python_sandbox_image
+                .as_deref()
+                .is_none_or(|image| !is_immutable_image_id(image))
+            {
+                errors.push(
+                    "ask_python_sandbox_enabled=true requires ask_python_sandbox_image=sha256:<64 hex digits>".to_string(),
+                );
+            }
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -1002,6 +1021,13 @@ impl Config {
             self.rag_embedding_timeout_sec,
         );
     }
+}
+
+fn is_immutable_image_id(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn require_non_empty(errors: &mut Vec<String>, key: &str, value: &str) {
@@ -1739,6 +1765,8 @@ mod tests {
             ask_db_mcp_args: Vec::new(),
             ask_db_mcp_env: vec!["ASK_DATABASE_URL".to_string(), "MCP_MANIFEST".to_string()],
             ask_db_mcp_timeout_sec: 8,
+            ask_python_sandbox_enabled: false,
+            ask_python_sandbox_image: None,
             profile_refresh_concurrency: 4,
             comment_custom_emoji_id: None,
             first_comment_max_image_mb: 10,
@@ -2308,6 +2336,24 @@ models = ["primary", "fallback"]
         assert!(err.contains("ASK_ENABLED=true requires OWNER_TELEGRAM_ID"));
         assert!(err.contains("LLM_PROFILES_PATH must configure authoritative LLM routes"));
         assert!(err.contains("ASK_ENABLED=true requires ASK_DB_MCP_COMMAND"));
+    }
+
+    #[test]
+    fn python_sandbox_requires_ask_and_an_immutable_image_id() {
+        let mut config = config();
+        config.ask_python_sandbox_enabled = true;
+        config.ask_python_sandbox_image = Some("python:3.13-slim".to_string());
+
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        assert!(error.contains("ask_python_sandbox_enabled=true requires ask_enabled=true"));
+        assert!(error.contains("ask_python_sandbox_image=sha256:<64 hex digits>"));
+
+        config.ask_enabled = true;
+        config.ask_python_sandbox_image = Some(format!("sha256:{}", "a".repeat(64)));
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+        assert!(!error.contains("ask_python_sandbox_enabled=true requires ask_enabled=true"));
+        assert!(!error.contains("ask_python_sandbox_image=sha256:<64 hex digits>"));
     }
 
     #[test]

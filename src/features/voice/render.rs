@@ -298,6 +298,8 @@ mod tests {
             ask_db_mcp_args: Vec::new(),
             ask_db_mcp_env: vec!["ASK_DATABASE_URL".to_string()],
             ask_db_mcp_timeout_sec: 8,
+            ask_python_sandbox_enabled: false,
+            ask_python_sandbox_image: None,
             profile_refresh_concurrency: 4,
             comment_custom_emoji_id: None,
             first_comment_max_image_mb: 10,

@@ -832,16 +832,25 @@ fn retry_delay_seconds(attempts: i32, minimum_delay_seconds: Option<i64>) -> Opt
     Some(delay.max(minimum_delay_seconds.unwrap_or_default()))
 }
 
-pub async fn load_recent_bot_comments(pool: &PgPool) -> anyhow::Result<Vec<String>> {
+pub async fn load_recent_bot_comments(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    source_channel_id: i64,
+) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query_as::<_, (String,)>(
         r#"
-        select coalesce(response, final_html)
-        from llm_generations
-        where coalesce(response, final_html) is not null
-        order by created_at desc
+        select coalesce(generation.response, generation.final_html)
+        from llm_generations generation
+        join post_comment_jobs job on job.id = generation.post_comment_job_id
+        where job.discussion_chat_id = $1
+          and job.source_channel_id = $2
+          and coalesce(generation.response, generation.final_html) is not null
+        order by generation.created_at desc
         limit 12
         "#,
     )
+    .bind(discussion_chat_id)
+    .bind(source_channel_id)
     .fetch_all(pool)
     .await?;
 

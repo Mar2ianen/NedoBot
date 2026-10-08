@@ -20,6 +20,7 @@ const MAX_MESSAGE_PREVIEW_CHARS: usize = 4_096;
 const MAX_SEMANTIC_CANDIDATES: i64 = 1_000;
 const MIN_SEMANTIC_RELEVANCE: f32 = 0.60;
 const SEMANTIC_HNSW_EF_SEARCH: &str = "200";
+const SEMANTIC_HNSW_ITERATIVE_SCAN: &str = "strict_order";
 
 pub async fn message_media(
     pool: &PgPool,
@@ -112,8 +113,11 @@ pub async fn search_messages_with_semantic(
     let query_embedding = query_embedding.as_deref();
     let mut transaction = pool.begin().await?;
     if query_embedding.is_some() {
-        sqlx::query("select set_config('hnsw.ef_search', $1, true)")
+        sqlx::query(
+            "select set_config('hnsw.ef_search', $1, true), set_config('hnsw.iterative_scan', $2, true)",
+        )
             .bind(SEMANTIC_HNSW_EF_SEARCH)
+            .bind(SEMANTIC_HNSW_ITERATIVE_SCAN)
             .execute(&mut *transaction)
             .await?;
     }
@@ -128,10 +132,49 @@ pub async fn search_messages_with_semantic(
                     0.0
                 )::real as semantic_relevance
             from telegram_message_embeddings_gemma2 e
+            join mcp_public.telegram_messages m
+              on m.chat_id = e.chat_id
+             and m.message_id = e.message_id
+            left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
             where e.chat_id = $1
               and e.status = 'ready'
               and e.embedding_model = $27
               and $26 is not null
+              and m.text is not null
+              and m.deleted_by_bot_at is null
+              and m.spam_marked_at is null
+              and (
+                  m.user_id is not null
+                  or ($21::boolean and (
+                      coalesce(m.is_forwarded, false)
+                      or coalesce(m.is_automatic_forward, false)
+                  ))
+              )
+              and not coalesce(p.is_bot, false)
+              and ($21::boolean or not (
+                  coalesce(m.is_forwarded, false)
+                  or coalesce(m.is_automatic_forward, false)
+              ))
+              and ($5::bigint is null or m.user_id = $5)
+              and ($6::timestamptz is null or m.created_at >= $6)
+              and ($7::timestamptz is null or m.created_at <= $7)
+              and ($8::integer is null or m.reply_to_message_id = $8)
+              and ($9::boolean is null or m.has_links = $9)
+              and (
+                  $10::boolean is null
+                  or (m.has_photo or m.has_video or m.has_document or m.has_audio
+                      or m.has_voice or m.has_sticker or m.has_animation) = $10
+              )
+              and ($11::boolean is null or m.has_photo = $11)
+              and ($12::boolean is null or m.has_video = $12)
+              and ($13::boolean is null or m.has_document = $13)
+              and ($14::boolean is null or m.has_audio = $14)
+              and ($15::boolean is null or m.has_voice = $15)
+              and ($16::boolean is null or m.has_sticker = $16)
+              and ($17::boolean is null or m.has_animation = $17)
+              and ($23::boolean is null or m.is_automatic_forward = $23)
+              and ($24::boolean is null or (m.reply_to_message_id is not null) = $24)
+              and ($25::boolean is null or m.is_forwarded = $25)
             order by e.embedding <=> $26::vector
             limit $28
         ),
@@ -191,46 +234,7 @@ pub async fn search_messages_with_semantic(
                 semantic.chat_id,
                 semantic.message_id
             from semantic_candidates semantic
-            join mcp_public.telegram_messages m
-              on m.chat_id = semantic.chat_id
-             and m.message_id = semantic.message_id
-            left join mcp_public.telegram_user_profiles p on p.telegram_user_id = m.user_id
-            where m.chat_id = $1
-              and m.text is not null
-              and m.deleted_by_bot_at is null
-              and m.spam_marked_at is null
-              and (
-                  m.user_id is not null
-                  or ($21::boolean and (
-                      coalesce(m.is_forwarded, false)
-                      or coalesce(m.is_automatic_forward, false)
-                  ))
-              )
-              and not coalesce(p.is_bot, false)
-              and ($21::boolean or not (
-                  coalesce(m.is_forwarded, false)
-                  or coalesce(m.is_automatic_forward, false)
-              ))
-              and ($5::bigint is null or m.user_id = $5)
-              and ($6::timestamptz is null or m.created_at >= $6)
-              and ($7::timestamptz is null or m.created_at <= $7)
-              and ($8::integer is null or m.reply_to_message_id = $8)
-              and ($9::boolean is null or m.has_links = $9)
-              and (
-                  $10::boolean is null
-                  or (m.has_photo or m.has_video or m.has_document or m.has_audio
-                      or m.has_voice or m.has_sticker or m.has_animation) = $10
-              )
-              and ($11::boolean is null or m.has_photo = $11)
-              and ($12::boolean is null or m.has_video = $12)
-              and ($13::boolean is null or m.has_document = $13)
-              and ($14::boolean is null or m.has_audio = $14)
-              and ($15::boolean is null or m.has_sticker = $15)
-              and ($16::boolean is null or m.has_animation = $16)
-              and ($23::boolean is null or m.is_automatic_forward = $23)
-              and ($24::boolean is null or (m.reply_to_message_id is not null) = $24)
-              and ($25::boolean is null or m.is_forwarded = $25)
-              and semantic.semantic_relevance >= $29
+            where semantic.semantic_relevance >= $29
         ),
         matched as materialized (
             select

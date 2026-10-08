@@ -75,6 +75,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     config.validate_runtime_secrets()?;
+    #[cfg(feature = "ask")]
+    if config.ask_python_sandbox_enabled {
+        features::ask::python_sandbox::AskPythonSandbox::validate_runtime(&config).await?;
+    }
     tracing::info!(
         instance_id = %config.community.instance.id,
         instance_name = %config.community.instance.display_name,

@@ -77,6 +77,8 @@ struct MemorySummaryOutput {
 pub async fn load_relevant_memory_notes(
     pool: &PgPool,
     config: &Config,
+    discussion_chat_id: i64,
+    source_channel_id: i64,
     post_text: &str,
 ) -> anyhow::Result<Vec<MemoryNote>> {
     if !config.rag_enabled {
@@ -107,20 +109,24 @@ pub async fn load_relevant_memory_notes(
     >(
         r#"
         with ranked as (
-            select source_message_id,
-                   summary,
-                   entities,
-                   used_angle,
-                   external_fact,
-                   1.0 - (embedding_gemma2 <=> $1::vector) as similarity,
+            select history.source_message_id,
+                   history.summary,
+                   history.entities,
+                   history.used_angle,
+                   history.external_fact,
+                   1.0 - (history.embedding_gemma2 <=> $1::vector) as similarity,
                    0.70 + 0.30 * power(
                        0.5,
-                       greatest(extract(epoch from (now() - created_at)) / 86400.0, 0.0) / $3
+                       greatest(extract(epoch from (now() - history.created_at)) / 86400.0, 0.0) / $5
                    ) as temporal_coefficient
-            from post_history_entries
-            where status = 'ready'
-              and embedding_gemma2 is not null
-              and embedding_gemma2_model = $2
+            from post_history_entries history
+            join post_comment_jobs job on job.id = history.post_comment_job_id
+            where job.discussion_chat_id = $3
+              and job.source_channel_id = $4
+              and history.source_channel_id = $4
+              and history.status = 'ready'
+              and history.embedding_gemma2 is not null
+              and history.embedding_gemma2_model = $2
         )
         select source_message_id,
                summary,
@@ -131,13 +137,15 @@ pub async fn load_relevant_memory_notes(
                temporal_coefficient,
                similarity * temporal_coefficient as rank_score
         from ranked
-        where similarity >= $4
+        where similarity >= $6
         order by rank_score desc, source_message_id desc
-        limit $5
+        limit $7
         "#,
     )
     .bind(&embedding)
     .bind(&config.rag_embedding_model)
+    .bind(discussion_chat_id)
+    .bind(source_channel_id)
     .bind(f64::from(config.rag_temporal_half_life_days))
     .bind(f64::from(config.rag_min_similarity))
     .bind(i64::try_from(config.rag_top_k).unwrap_or(i64::MAX))
