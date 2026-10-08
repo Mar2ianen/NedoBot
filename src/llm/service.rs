@@ -35,7 +35,18 @@ pub struct GenerateChatOptions<'a> {
     pub requires_tools: bool,
     pub previous_response_id: Option<String>,
     pub temperature: f32,
+    /// Запрошенный максимум; `AdaptToModel` ограничивает его cap-ом выбранной модели.
     pub num_predict: u32,
+    pub output_budget_policy: OutputBudgetPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputBudgetPolicy {
+    /// Не менять запрошенный максимум; route resolution проверит профиль модели.
+    #[default]
+    Fixed,
+    /// Передавать каждой fallback-модели min(запрошенный максимум, её profile cap).
+    AdaptToModel,
 }
 
 const VALIDATION_RETRY_ATTEMPTS: usize = 1;
@@ -269,7 +280,10 @@ fn chat_route_requirements(options: &GenerateChatOptions<'_>) -> RouteRequiremen
         requires_images: options.requires_images,
         requires_tools: options.requires_tools || options.tools.is_some(),
         requires_system_prompt: options.system_prompt.is_some(),
-        num_predict: Some(options.num_predict),
+        num_predict: match options.output_budget_policy {
+            OutputBudgetPolicy::Fixed => Some(options.num_predict),
+            OutputBudgetPolicy::AdaptToModel => None,
+        },
         ..RouteRequirements::default()
     }
 }
@@ -293,6 +307,11 @@ async fn generate_chat_profile_once(
             selection.provider.api_key_env
         );
     }
+    let max_tokens = output_budget_for_model(
+        options.num_predict,
+        options.output_budget_policy,
+        selection.capabilities.max_output_tokens,
+    );
     let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     transport
         .chat(GenAiChatRequest {
@@ -307,7 +326,7 @@ async fn generate_chat_profile_once(
             tools: options.tools.clone(),
             previous_response_id: options.previous_response_id.clone(),
             temperature: options.temperature,
-            max_tokens: options.num_predict,
+            max_tokens,
             timeout: std::time::Duration::from_secs(selection.capabilities.request_timeout_sec),
             reasoning: selection.capabilities.thinking,
             reasoning_budget: Some(config.gemini_thinking_budget),
@@ -315,6 +334,13 @@ async fn generate_chat_profile_once(
         })
         .await
         .map_err(anyhow::Error::new)
+}
+
+fn output_budget_for_model(requested: u32, policy: OutputBudgetPolicy, model_limit: u32) -> u32 {
+    match policy {
+        OutputBudgetPolicy::Fixed => requested,
+        OutputBudgetPolicy::AdaptToModel => requested.min(model_limit),
+    }
 }
 
 async fn generate_profile_once(
@@ -642,6 +668,7 @@ thinking = "none"
             previous_response_id: None,
             temperature: 0.0,
             num_predict: 128,
+            output_budget_policy: OutputBudgetPolicy::Fixed,
         };
         assert!(
             tokio::time::timeout(
@@ -675,6 +702,7 @@ thinking = "none"
             previous_response_id: None,
             temperature: 0.0,
             num_predict: 128,
+            output_budget_policy: OutputBudgetPolicy::Fixed,
         };
         let profiles =
             LlmProfiles::from_toml(include_str!("../../config/llm_profiles.toml.example")).unwrap();
@@ -683,9 +711,52 @@ thinking = "none"
             .resolve_route("ask", &chat_route_requirements(&options))
             .unwrap();
 
-        assert_eq!(resolved.selections.len(), 2);
+        assert_eq!(resolved.selections.len(), 3);
         assert_eq!(resolved.selections[0].model.model, "qwen/qwen3.8-27b");
-        assert_eq!(resolved.selections[1].model.model, "gemini-3.5-flash");
+        assert_eq!(resolved.selections[1].model.model, "openrouter/free");
+        assert_eq!(resolved.selections[2].model.model, "minimax-m3");
+    }
+
+    #[test]
+    fn ask_output_budget_is_capped_to_each_selected_model_profile() {
+        assert_eq!(
+            output_budget_for_model(16_384, OutputBudgetPolicy::AdaptToModel, 4_096),
+            4_096
+        );
+        assert_eq!(
+            output_budget_for_model(16_384, OutputBudgetPolicy::AdaptToModel, 16_384),
+            16_384
+        );
+
+        let options = GenerateChatOptions {
+            fallback_offset: 0,
+            route: "ask",
+            system_prompt: Some("system"),
+            messages: Vec::new(),
+            tools: None,
+            requires_images: false,
+            requires_tools: true,
+            previous_response_id: None,
+            temperature: 0.0,
+            num_predict: 16_384,
+            output_budget_policy: OutputBudgetPolicy::AdaptToModel,
+        };
+        let requirements = chat_route_requirements(&options);
+        assert_eq!(requirements.num_predict, None);
+
+        let profiles =
+            LlmProfiles::from_toml(include_str!("../../config/llm_profiles.toml.example")).unwrap();
+        let route = profiles.resolve_route("ask", &requirements).unwrap();
+        assert_eq!(route.selections.len(), 4);
+        assert_eq!(route.selections[1].model.model, "openrouter/free");
+        assert_eq!(
+            output_budget_for_model(
+                options.num_predict,
+                options.output_budget_policy,
+                route.selections[1].capabilities.max_output_tokens,
+            ),
+            4_096
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tg_ai_bot_teloxide::{
     config::Config,
-    llm::service::{GenerateChatOptions, generate_chat_audited_checked},
+    llm::service::{GenerateChatOptions, OutputBudgetPolicy, generate_chat_audited_checked},
 };
 
 #[tokio::main]
@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
             previous_response_id: None,
             temperature: 0.0,
             num_predict: config.ask_llm_max_tokens,
+            output_budget_policy: OutputBudgetPolicy::AdaptToModel,
         },
     )
     .await?;

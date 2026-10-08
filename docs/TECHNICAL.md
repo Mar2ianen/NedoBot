@@ -115,7 +115,7 @@ GenAiTransport создаёт два долгоживущих клиента: di
 
 Civil date/time и bare clock нормализуются через эту зону с compatible DST disambiguation: пропущенное локальное время сдвигается вперёд, неоднозначное выбирается детерминированно. Для точного автоматического события нужно передавать `Instant`; `CivilDateTime` остаётся локальным временем с deterministic compatible resolution, а bare clock — best-effort представлением.
 
-Целевая топология без Gemini вне комментариев: `/ask` использует Groq `qwen/qwen3.8-27b` с vision и reasoning mode `default`, затем общий OpenRouter-fallback `qwen/qwen3.6-27b` без vision и reasoning и затем Ollama Cloud `gemma4:31b` (`qwen/qwen3.6-27b` нет на Groq, поэтому fallback живёт на OpenRouter; фото-вопросы обслуживает только primary с vision); voice cleanup использует Groq `qwen/qwen3.8-27b` без reasoning, тот же OpenRouter-fallback и тот же Ollama fallback. Unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются только в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
+`/ask` использует Groq `qwen/qwen3.8-27b`, затем динамический OpenRouter `openrouter/free`, Ollama Cloud `minimax-m3` и Ollama Cloud `gemma4:31b`. Для каждого запроса output budget ограничивается profile cap выбранного fallback; модель с меньшим cap не выпадает из route. Groq обслуживает vision и reasoning, free router подбирает модель с нужными image/tool capabilities, а модели Ollama с заявленными capabilities остаются fallback-ами. Платные OpenRouter-модели и Gemini в `/ask` не участвуют. Voice cleanup использует отдельную цепочку Groq → OpenRouter Qwen → Ollama. Unified `new_user_audit` — Cerebras `gemma-4-31b`, а Gemini-модели остаются в цепочке `first_comment`. Unified audit сам обрабатывает аватар и первое сообщение в одном запросе; отдельных avatar/first-message pipelines и jobs больше нет.
 
 На старте каждый включённый route разрешается с его фактическими требованиями к изображению, system prompt и числу output tokens. Для каждого совместимого fallback selection проверяется заданная secret env-переменная; ошибка называет только имя переменной, но не её значение. `structured_output = "prompt_only"` намеренно не передаёт OpenAI-compatible `response_format`: JSON-контракт остаётся в prompt и проверяется typed output validator. При отказе output validator LLM service пишет в journal только route, fallback index, provider, model, номер попытки, размер ответа и безопасный `validation_reason`; полный prompt и ответ модели не логируются. Для `first_comment` причины типизированы (`missing_chat_link`, `raw_link`, `generic_cta`, `invalid_json`, `chat_evidence`, `source_link`, `blocked_term` и другие), а тот же код сохраняется в `llm_generations.attempts` при успешном fallback. Полная topology приведена в `config/llm_profiles.toml.example`.
 
@@ -138,17 +138,18 @@ Civil date/time и bare clock нормализуются через эту зо�
 ограничивает число фактических вызовов tools (включая предварительную
 подгрузку reply), а модель получает до 68 turns: 64 основных, 3 коррекционных
 и 1 для финального ответа. `ask_total_timeout_sec=1800` — общий потолок;
-`ask_action_timeout_sec=180` — одна LLM-попытка, с отдельными transport timeout
-из model capabilities (для ask Qwen и отдельного `gemini_ask` — 180 секунд);
+`ask_action_timeout_sec=180` — одна LLM-попытка, с transport timeout
+из model capabilities (для Groq ask — 180 секунд, для OpenRouter Free — 120 секунд);
 `ask_db_mcp_timeout_sec=30` — один MCP request.
-`ask_llm_max_tokens=16384` задаёт общий верхний бюджет генерации на один LLM-вызов, включая reasoning;
-для ask Qwen и `gemini_ask` включён `thinking="level_high"` (effort `high`),
+`ask_llm_max_tokens=16384` задаёт верхний бюджет генерации на один LLM-вызов, включая reasoning.
+Для `/ask` каждый выбранный fallback получает динамический параметр
+`min(ask_llm_max_tokens, model.capabilities.max_output_tokens)`: Qwen получает до 16k,
+OpenRouter Free — до 4k, Ollama Minimax — до 8k. Нижний профильный предел больше не
+исключает fallback из route. Для Qwen включён `thinking="level_high"` (effort `high`),
 `ask_max_concurrency=4` — число одновременно исполняемых `/ask` в инстансе.
 Существующий deployment-profile получает эти значения явно после бэкапа
 и restart; увеличение шаблона само по себе production-конфиг не меняет.
-Модели с `max_output_tokens` ниже 16384 не участвуют в этом маршруте.
-Отдельный `gemini_ask` позволяет задать высокий effort для агента;
-профили memory и first_comment выбирают собственные task budgets.
+Профили memory и first_comment сохраняют собственные task budgets.
 
 MCP и локальные `/ask` tools передаются как `genai::chat::Tool`. Canonical имена с namespace-точкой сохраняются в allowlist, audit и execution policy; на provider wire они получают обратимый alias с `__`, потому что OpenAI-compatible function-name contracts не принимают dotted identifiers. Перед исполнением alias разрешается обратно в canonical имя.
 

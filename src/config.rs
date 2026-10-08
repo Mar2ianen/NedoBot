@@ -855,7 +855,6 @@ impl Config {
                         requires_images,
                         requires_tools: true,
                         requires_system_prompt: true,
-                        num_predict: Some(self.ask_llm_max_tokens),
                         ..RouteRequirements::default()
                     },
                 ));

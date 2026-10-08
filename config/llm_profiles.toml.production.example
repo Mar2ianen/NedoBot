@@ -160,6 +160,34 @@ max_output_tokens = 32768
 request_timeout_sec = 45
 thinking = "none"
 
+[models.groq_qwen_ask]
+provider = "groq"
+model = "qwen/qwen3.8-27b"
+
+[models.groq_qwen_ask.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 131072
+max_output_tokens = 16384
+request_timeout_sec = 180
+thinking = "level_high"
+
+[models.openrouter_free_ask]
+provider = "openrouter"
+model = "openrouter/free"
+
+[models.openrouter_free_ask.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "prompt_only"
+context_window_tokens = 32768
+max_output_tokens = 4096
+request_timeout_sec = 120
+thinking = "none"
+
 [models.cerebras_audit]
 provider = "cerebras"
 model = "gemma-4-31b"
@@ -225,7 +253,12 @@ models = ["ollama_audit"]
 models = ["ollama_memory"]
 
 [routes.ask]
-models = ["ollama_minimax", "ollama_memory", "gemini_ask"]
+models = [
+  "groq_qwen_ask",
+  "openrouter_free_ask",
+  "ollama_minimax",
+  "ollama_memory",
+]
 
 # Non-secret bot/runtime configuration. Credentials, DSNs, invite/proxy URLs and
 # API keys stay in the process environment and are not stored in this file.
