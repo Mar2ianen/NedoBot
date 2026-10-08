@@ -1,3 +1,4 @@
+use crate::telegram::html::{Html, bold as html_bold, lines};
 use serde_json::Value;
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, InputRichBlock,
@@ -97,6 +98,73 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
     ])));
 
     InputRichMessage::blocks(blocks)
+}
+
+/// Compact HTML alternative used when Telegram rejects a rich report payload.
+/// Keep this short enough for ordinary sendMessage and escape every profile and
+/// message field through the shared HTML builder.
+pub fn render_report_html_fallback(card: &ReportCard) -> String {
+    let target_name = display_name(
+        card.profile_username.as_deref(),
+        card.profile_first_name.as_deref(),
+        card.profile_last_name.as_deref(),
+        &card.target_snapshot,
+        card.reported_user_id,
+    );
+    let reporter_name = display_name_from_snapshot(&card.reporter_snapshot, card.reporter_user_id);
+    let target_url =
+        profile_url(card).unwrap_or_else(|| format!("tg://user?id={}", card.reported_user_id));
+
+    let mut html = Html::empty();
+    html.line(html_bold("🚨 Новый репорт"));
+    if let Some(url) = message_url(card.chat_id, card.message_id) {
+        html.line(Html::link("↗ Оригинал сообщения", url));
+    }
+    html.line(lines([
+        html_bold("Цель: "),
+        Html::link(target_name, target_url),
+        Html::text(format!(" · id={}", card.reported_user_id)),
+    ]));
+    html.line(lines([
+        html_bold("Репортёр: "),
+        Html::text(reporter_name),
+        Html::text(format!(" · id={}", card.reporter_user_id)),
+    ]));
+    html.line(Html::text(format!(
+        "Сообщение: {} · {}",
+        card.target_media,
+        format_time(card.target_created_at)
+    )));
+
+    if let Some(reason) = (!card.reason.is_empty()).then_some(card.reason.as_str()) {
+        html.line(Html::text(format!("Причина: {}", truncate(reason, 180))));
+    }
+    if let Some(reply_to_message_id) = card.target_reply_to_message_id {
+        html.line(Html::text(format!(
+            "Ветка: ответ на сообщение #{reply_to_message_id}"
+        )));
+    }
+
+    let quote = truncate(
+        card.target_text
+            .as_deref()
+            .unwrap_or("сообщение без текста"),
+        700,
+    );
+    html.line(Html::expandable_blockquote(quote));
+    html.line(Html::text(format!(
+        "Профиль: {}",
+        truncate(&profile_summary(card), 350)
+    )));
+    html.line(Html::text(format!(
+        "Активность: {}",
+        truncate(&activity_summary(card), 200)
+    )));
+    html.line(Html::text(format!(
+        "Антиспам: {}",
+        truncate(&spam_summary(card), 450)
+    )));
+    html.into_string()
 }
 
 pub fn render_report_keyboard(card: &ReportCard) -> InlineKeyboardMarkup {
@@ -629,6 +697,20 @@ mod tests {
         rendered
             .validate_with(&teloxide::RichMessageContext::Send)
             .expect("report card must pass Bot API rich-message validation");
+    }
+
+    #[test]
+    fn html_fallback_escapes_report_content_and_stays_within_send_message_limit() {
+        let mut card = card();
+        card.target_text = Some("<script>текст & ещё</script>".repeat(100));
+        card.reason = "<b>причина & текст</b>".to_owned();
+
+        let fallback = render_report_html_fallback(&card);
+
+        assert!(fallback.contains("&lt;script&gt;"));
+        assert!(fallback.contains("причина &amp; текст"));
+        assert!(!fallback.contains("<script>"));
+        assert!(fallback.chars().count() <= crate::telegram::html::TELEGRAM_TEXT_LIMIT);
     }
     #[test]
     fn puts_original_message_link_before_report_details() {

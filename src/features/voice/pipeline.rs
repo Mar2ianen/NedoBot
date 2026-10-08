@@ -317,11 +317,15 @@ impl VoiceProcessingFailure {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum VoiceDeliveryFailure {
+    PayloadRejected,
     Rejected,
     Unknown,
 }
 
 fn classify_voice_delivery_error(error: &RequestError) -> VoiceDeliveryFailure {
+    if crate::telegram::service_messages::should_fallback_after_payload_rejection(error) {
+        return VoiceDeliveryFailure::PayloadRejected;
+    }
     match error {
         RequestError::RetryAfter(_)
         | RequestError::Api(_)
@@ -336,7 +340,9 @@ fn classify_voice_delivery_error(error: &RequestError) -> VoiceDeliveryFailure {
 impl From<VoiceDeliveryFailure> for VoiceProcessingFailure {
     fn from(failure: VoiceDeliveryFailure) -> Self {
         match failure {
-            VoiceDeliveryFailure::Rejected => Self::DeliveryRejected,
+            VoiceDeliveryFailure::PayloadRejected | VoiceDeliveryFailure::Rejected => {
+                Self::DeliveryRejected
+            }
             VoiceDeliveryFailure::Unknown => Self::DeliveryUnknown,
         }
     }
@@ -526,9 +532,17 @@ async fn send_rendered_transcript(
                     file_id: None,
                 }),
                 Err(error) => match classify_voice_delivery_error(&error) {
-                    VoiceDeliveryFailure::Rejected => {
-                        send_regular_transcript(bot, chat_id, source_message_id, fallback).await
+                    VoiceDeliveryFailure::PayloadRejected => {
+                        send_regular_transcript(
+                            bot,
+                            chat_id,
+                            source_message_id,
+                            progress_message_id,
+                            fallback,
+                        )
+                        .await
                     }
+                    VoiceDeliveryFailure::Rejected => Err(VoiceDeliveryFailure::Rejected),
                     VoiceDeliveryFailure::Unknown => Err(VoiceDeliveryFailure::Unknown),
                 },
             }
@@ -542,7 +556,14 @@ async fn send_rendered_transcript(
             )
             .await
             .map_err(|error| classify_voice_delivery_error(&error))?;
-            send_regular_transcript(bot, chat_id, source_message_id, rendered).await
+            send_regular_transcript(
+                bot,
+                chat_id,
+                source_message_id,
+                progress_message_id,
+                rendered,
+            )
+            .await
         }
     }
 }
@@ -551,6 +572,7 @@ async fn send_regular_transcript(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     source_message_id: MessageId,
+    progress_message_id: MessageId,
     rendered: &RenderedTranscript,
 ) -> Result<SentRenderedTranscript, VoiceDeliveryFailure> {
     match rendered {
@@ -579,8 +601,24 @@ async fn send_regular_transcript(
                 .reply_parameters(
                     ReplyParameters::new(source_message_id).allow_sending_without_reply(),
                 )
-                .await
-                .map_err(|_| VoiceDeliveryFailure::Unknown)?;
+                .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(error) => {
+                    tracing::warn!(%error, chat_id = chat_id.0, "failed to send full voice transcript file after preview was delivered");
+                    if let Err(edit_error) = edit_transcription_message(
+                        bot,
+                        chat_id,
+                        progress_message_id,
+                        "Не удалось отправить файл расшифровки. Предварительный текст уже отправлен; автоматическая повторная отправка остановлена, чтобы не дублировать сообщение.",
+                    )
+                    .await
+                    {
+                        tracing::warn!(%edit_error, "failed to update voice transcription delivery status");
+                    }
+                    return Err(VoiceDeliveryFailure::Unknown);
+                }
+            };
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: sent.document().map(|document| document.file.id.to_string()),
@@ -623,6 +661,16 @@ mod tests {
         let rejected = RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(1));
         assert_eq!(
             classify_voice_delivery_error(&rejected),
+            VoiceDeliveryFailure::Rejected
+        );
+        assert_eq!(
+            classify_voice_delivery_error(&RequestError::Api(
+                teloxide::ApiError::CantParseEntities("can't parse entities".to_owned())
+            )),
+            VoiceDeliveryFailure::PayloadRejected
+        );
+        assert_eq!(
+            classify_voice_delivery_error(&RequestError::Api(teloxide::ApiError::BotBlocked)),
             VoiceDeliveryFailure::Rejected
         );
 
