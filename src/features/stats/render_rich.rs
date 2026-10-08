@@ -463,15 +463,9 @@ pub fn user_stats(
             )
         })
         .unwrap_or_default();
-    let avatar = data
-        .avatar_url
-        .as_deref()
-        .map(|url| format!("<img src=\"{}\"/>", escape_html(url)))
-        .unwrap_or_default();
     format!(
-        "<h1>{}</h1>{}<details open><summary>{}</summary>{}</details>{}<details open><summary>{}</summary>{}</details><details><summary>{}</summary>{}</details>",
+        "<h1>{}</h1><details open><summary>{}</summary>{}</details>{}<details open><summary>{}</summary>{}</details><details><summary>{}</summary>{}</details>",
         escape_html(&data.user.display_name),
-        avatar,
         strings.details_main,
         table_no_header(&profile_rows),
         bio,
@@ -658,7 +652,9 @@ fn linked_message(
 mod tests {
     use super::*;
     use crate::features::stats::strings::StatsStrings;
-    use crate::features::stats::types::{TopMessageUser, UserPresentation};
+    use crate::features::stats::types::{
+        TopMessageUser, UserModerationSummary, UserPresentation, UserStatsReportData, UserTotals,
+    };
 
     fn ranked_fixture() -> TopMessagesReportData {
         TopMessagesReportData {
@@ -687,5 +683,51 @@ mod tests {
         let report = bottom_messages(&ranked_fixture(), &StatsStrings::russian());
         assert!(report.contains("Тихони чата"));
         assert!(!report.contains("Топ пишущих"));
+    }
+
+    #[test]
+    fn rich_user_stats_omits_unattached_avatar_media() {
+        let data = UserStatsReportData {
+            user: UserPresentation {
+                user_id: 7,
+                display_name: "Артём".to_string(),
+                is_bot: false,
+                status: None,
+                is_admin: false,
+                is_present: Some(true),
+            },
+            username: None,
+            bio: None,
+            avatar_url: Some("https://example.com/avatar.png".to_string()),
+            profile_photo_file_id: None,
+            profile_photo_file_unique_id: None,
+            observed_at: None,
+            moderation: UserModerationSummary::default(),
+            written_tag: None,
+            first_seen_at: "сегодня".to_string(),
+            last_seen_at: "сегодня".to_string(),
+            first_message_id: "1".to_string(),
+            last_message_id: "1".to_string(),
+            first_seen_days_ago: Some(0),
+            last_seen_days_ago: Some(0),
+            totals: UserTotals {
+                messages: 0,
+                replies: 0,
+                links: 0,
+                media: 0,
+                post_comments: 0,
+                replies_to_bot: 0,
+                active_days: 0,
+                voices: 0,
+            },
+            reactions_given: 0,
+            reactions_received: 0,
+            top_words: Vec::new(),
+        };
+
+        let report = user_stats(Some(&data), None, -1001932061163, &StatsStrings::russian());
+
+        assert!(report.contains("Артём"));
+        assert!(!report.contains("<img"));
     }
 }
