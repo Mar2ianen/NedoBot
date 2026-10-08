@@ -1,0 +1,35 @@
+[package]
+name = "provider-access"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Mar2ianen/NedoBot"
+documentation = "https://docs.rs/provider-access"
+description = "OAuth-сессии, каталог моделей и маршрутизация провайдеров для локальных и self-hosted LLM-клиентов."
+readme = "README.md"
+
+[features]
+default = ["genai"]
+genai = ["dep:genai"]
+
+[dependencies]
+async-trait = "0.1"
+async-stream = "0.3"
+base64 = "0.22"
+futures-util = "0.3"
+genai = { version = "=0.6.5", default-features = false, features = ["native-tls"], optional = true }
+fs2 = "0.4"
+jiff = "0.2"
+jsonwebtoken = "9.3"
+reqwest = { version = "0.13", features = ["form", "json", "query", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
