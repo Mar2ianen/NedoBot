@@ -230,7 +230,6 @@ impl<'a> AskService<'a> {
                             requires_images: input.reply_image_base64.is_some(),
                             requires_tools: true,
                             requires_system_prompt: true,
-                            num_predict: Some(self.config.ask_llm_max_tokens),
                             ..RouteRequirements::default()
                         },
                     )

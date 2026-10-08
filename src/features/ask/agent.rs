@@ -23,7 +23,9 @@ use crate::features::ask::repo;
 use crate::features::ask::types::{AskProgress, PendingToolCallAudit};
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
-use crate::llm::service::{GenerateChatOptions, GeneratedChat, generate_chat_audited_checked};
+use crate::llm::service::{
+    GenerateChatOptions, GeneratedChat, OutputBudgetPolicy, generate_chat_audited_checked,
+};
 
 const MAX_OBSERVATION_CHARS: usize = 12_000;
 const MAX_TOOL_PREVIEW_CHARS: usize = 11_000;
@@ -635,6 +637,7 @@ async fn generate_turn(
                 previous_response_id: None,
                 temperature: config.ask_llm_temperature,
                 num_predict: config.ask_llm_max_tokens,
+                output_budget_policy: OutputBudgetPolicy::AdaptToModel,
             },
         )
     })

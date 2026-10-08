@@ -510,7 +510,7 @@ models = ["ollama_memory"]
     }
 
     #[test]
-    fn ask_route_keeps_explicit_reasoning_and_an_independent_vision_fallback() {
+    fn ask_route_orders_groq_free_router_and_ollama_with_model_specific_output_caps() {
         let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
         assert_eq!(profiles.runtime.ask_llm_max_tokens, 16_384);
         assert_eq!(profiles.runtime.ask_max_steps, 64);
@@ -522,17 +522,31 @@ models = ["ollama_memory"]
 
         assert_eq!(selections.selections.len(), 4);
         assert_eq!(selections.selections[0].model.model, "qwen/qwen3.8-27b");
-        assert_eq!(selections.selections[1].model.model, "qwen/qwen3.6-27b");
-        assert_eq!(selections.selections[2].model.model, "gemma4:31b");
-        assert_eq!(selections.selections[3].model.model, "gemini-3.5-flash");
-        assert!(selections.selections[3].capabilities.supports_images);
+        assert_eq!(selections.selections[1].model.model, "openrouter/free");
+        assert_eq!(selections.selections[2].model.model, "minimax-m3");
+        assert_eq!(selections.selections[3].model.model, "gemma4:31b");
+        assert_eq!(selections.selections[3].model.model, "gemma4:31b");
+        assert!(selections.selections[1].capabilities.supports_images);
+        assert!(selections.selections[1].capabilities.supports_tools);
+        assert_eq!(
+            selections.selections[0].capabilities.max_output_tokens,
+            16_384
+        );
+        assert_eq!(
+            selections.selections[1].capabilities.max_output_tokens,
+            4_096
+        );
+        assert_eq!(
+            selections.selections[2].capabilities.max_output_tokens,
+            8_192
+        );
         assert_eq!(
             selections.selections[0].capabilities.thinking,
             ThinkingMode::LevelHigh
         );
         assert_eq!(
             selections.selections[1].capabilities.thinking,
-            ThinkingMode::LevelHigh
+            ThinkingMode::None
         );
         assert_eq!(
             selections.selections[2].capabilities.thinking,
@@ -540,23 +554,44 @@ models = ["ollama_memory"]
         );
         assert_eq!(
             selections.selections[3].capabilities.thinking,
-            ThinkingMode::LevelHigh
+            ThinkingMode::None
         );
-        let research_route = profiles
-            .resolve_route(
-                "ask",
-                &RouteRequirements {
-                    requires_tools: true,
-                    num_predict: Some(profiles.runtime.ask_llm_max_tokens),
-                    ..RouteRequirements::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(research_route.selections.len(), 3);
-        assert!(research_route.selections.iter().all(|selection| {
-            selection.capabilities.thinking == ThinkingMode::LevelHigh
-                && selection.capabilities.request_timeout_sec == 180
-        }));
+        assert_eq!(
+            selections.selections[0].capabilities.request_timeout_sec,
+            180
+        );
+        assert_eq!(
+            selections.selections[1].capabilities.request_timeout_sec,
+            120
+        );
+    }
+
+    #[test]
+    fn production_ask_route_keeps_free_router_between_groq_and_ollama() {
+        let profiles = LlmProfiles::from_toml(include_str!(
+            "../../config/llm_profiles.toml.production.example"
+        ))
+        .unwrap();
+        let route = &profiles.routes["ask"].models;
+        assert_eq!(
+            route,
+            &[
+                "groq_qwen_ask",
+                "openrouter_free_ask",
+                "ollama_minimax",
+                "ollama_memory",
+            ]
+        );
+        assert_eq!(
+            profiles.models["openrouter_free_ask"].model,
+            "openrouter/free"
+        );
+        assert_eq!(
+            profiles.models["openrouter_free_ask"]
+                .capabilities
+                .max_output_tokens,
+            4_096
+        );
     }
 
     #[test]
