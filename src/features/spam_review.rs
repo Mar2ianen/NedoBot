@@ -345,32 +345,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
         return Ok(());
     }
 
-    let result = if let Some(message_id) = review.notification_message_id {
-        bot.edit_message_text(
-            ChatId(review.destination_chat_id),
-            MessageId(message_id),
-            &review.text,
-        )
-        .parse_mode(ParseMode::Html)
-        .link_preview_options(disabled_link_preview())
-        .reply_markup(review_keyboard(review.id))
-        .await
-        .map(|_| message_id)
-    } else {
-        let mut request = bot
-            .send_message(ChatId(review.destination_chat_id), &review.text)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(disabled_link_preview())
-            .reply_markup(review_keyboard(review.id));
-        if review.destination_chat_id == review.chat_id
-            && let Some(message_id) = review.first_message_id
-        {
-            request = request.reply_parameters(
-                ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
-            );
-        }
-        request.await.map(|message| message.id.0)
-    };
+    let result = send_review_message(bot, review).await;
 
     match result {
         Ok(message_id) => match mark_review_delivery_succeeded(pool, review, message_id).await? {
@@ -384,7 +359,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
                 Ok(())
             }
         },
-        Err(err) => match classify_delivery_error(&err) {
+        Err(err) => match classify_delivery_error(&err, review.notification_message_id.is_some()) {
             DeliveryFailure::AlreadyApplied => {
                 match mark_review_delivery_succeeded(
                     pool,
@@ -416,6 +391,79 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
                 Err(err.into())
             }
         },
+    }
+}
+
+async fn send_review_message(
+    bot: &Bot,
+    review: &SpamReview,
+) -> Result<i32, teloxide::RequestError> {
+    let result = if let Some(message_id) = review.notification_message_id {
+        bot.edit_message_text(
+            ChatId(review.destination_chat_id),
+            MessageId(message_id),
+            &review.text,
+        )
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(disabled_link_preview())
+        .reply_markup(review_keyboard(review.id))
+        .await
+        .map(|_| message_id)
+    } else {
+        let mut request = bot
+            .send_message(ChatId(review.destination_chat_id), &review.text)
+            .parse_mode(ParseMode::Html)
+            .link_preview_options(disabled_link_preview())
+            .reply_markup(review_keyboard(review.id));
+        if review.destination_chat_id == review.chat_id
+            && let Some(message_id) = review.first_message_id
+        {
+            request = request.reply_parameters(
+                ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
+            );
+        }
+        request.await.map(|message| message.id.0)
+    };
+
+    match result {
+        Ok(message_id) => Ok(message_id),
+        Err(error)
+            if crate::telegram::service_messages::should_fallback_after_payload_rejection(
+                &error,
+            ) =>
+        {
+            tracing::warn!(
+                %error,
+                request_id = review.id,
+                "Telegram rejected HTML spam-review card; retrying as plain text"
+            );
+            let text = crate::telegram::service_messages::html_to_plain_text(&review.text);
+            if let Some(message_id) = review.notification_message_id {
+                bot.edit_message_text(
+                    ChatId(review.destination_chat_id),
+                    MessageId(message_id),
+                    text,
+                )
+                .link_preview_options(disabled_link_preview())
+                .reply_markup(review_keyboard(review.id))
+                .await
+                .map(|_| message_id)
+            } else {
+                let mut request = bot
+                    .send_message(ChatId(review.destination_chat_id), text)
+                    .link_preview_options(disabled_link_preview())
+                    .reply_markup(review_keyboard(review.id));
+                if review.destination_chat_id == review.chat_id
+                    && let Some(message_id) = review.first_message_id
+                {
+                    request = request.reply_parameters(
+                        ReplyParameters::new(MessageId(message_id)).allow_sending_without_reply(),
+                    );
+                }
+                request.await.map(|message| message.id.0)
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -563,11 +611,22 @@ enum DeliveryFailure {
     AlreadyApplied,
 }
 
-fn classify_delivery_error(error: &teloxide::RequestError) -> DeliveryFailure {
+fn classify_delivery_error(
+    error: &teloxide::RequestError,
+    editing_existing_message: bool,
+) -> DeliveryFailure {
     if let teloxide::RequestError::RetryAfter(seconds) = error {
         return DeliveryFailure::Retryable {
             retry_after_seconds: Some(i64::from(seconds.seconds())),
         };
+    }
+    if crate::telegram::service_messages::should_fallback_after_payload_rejection(error) {
+        return DeliveryFailure::Terminal("telegram_payload_rejected");
+    }
+    if crate::telegram::service_messages::delivery_outcome_is_unknown(error)
+        && !editing_existing_message
+    {
+        return DeliveryFailure::Terminal("telegram_delivery_unknown");
     }
     if matches!(
         error,
@@ -1111,13 +1170,38 @@ mod tests {
 
     #[test]
     fn keeps_telegram_retry_after_for_delivery_delay() {
-        let failure = classify_delivery_error(&teloxide::RequestError::RetryAfter(
-            teloxide::types::Seconds::from_seconds(75),
-        ));
+        let failure = classify_delivery_error(
+            &teloxide::RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(75)),
+            false,
+        );
         assert_eq!(
             failure,
             DeliveryFailure::Retryable {
                 retry_after_seconds: Some(75)
+            }
+        );
+    }
+
+    #[test]
+    fn plain_review_fallback_removes_markup_without_reinterpreting_text() {
+        assert_eq!(
+            crate::telegram::service_messages::html_to_plain_text("<b>Имя &amp; &lt;текст&gt;</b>"),
+            "Имя & <текст>"
+        );
+    }
+
+    #[test]
+    fn unknown_initial_delivery_is_terminal_to_avoid_duplicate_review_cards() {
+        let error = teloxide::RequestError::Io(std::sync::Arc::new(std::io::Error::other("test")));
+        let failure = classify_delivery_error(&error, false);
+        assert_eq!(
+            failure,
+            DeliveryFailure::Terminal("telegram_delivery_unknown")
+        );
+        assert_eq!(
+            classify_delivery_error(&error, true),
+            DeliveryFailure::Retryable {
+                retry_after_seconds: None
             }
         );
     }

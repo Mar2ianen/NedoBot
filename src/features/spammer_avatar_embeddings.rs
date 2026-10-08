@@ -260,6 +260,7 @@ async fn mark_ready(
         update spammer_avatar_embeddings e
         set embedding = $5::vector,
             embedding_model = $6,
+            dataset_avatar_file_id = avatar_file_id,
             avatar_file_id = null,
             status = 'ready',
             processing_started_at = null,

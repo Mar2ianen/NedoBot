@@ -1,8 +1,11 @@
 use teloxide::{
     adaptors::DefaultParseMode,
+    errors::{ApiError, RequestError},
     payloads::{SendMessageSetters, SendRichMessageSetters},
     prelude::{Bot, ChatId, Message, Requester, ResponseResult},
-    types::{EphemeralMessageParameters, InputRichMessage, MessageId, ThreadId, UserId},
+    types::{
+        EphemeralMessageParameters, InputRichMessage, MessageId, ReplyParameters, ThreadId, UserId,
+    },
 };
 
 use crate::telegram::render::{disabled_link_preview, normalize_rich_text, normalize_send_text};
@@ -57,8 +60,14 @@ pub async fn send_html(
     text: impl Into<String>,
     audience: MessageAudience,
 ) -> ResponseResult<Message> {
-    let text = normalize_send_text(text)?;
-    match audience {
+    let original_text = text.into();
+    let text = match normalize_send_text(original_text.clone()) {
+        Ok(text) => text,
+        Err(error) => {
+            return send_plain_fallback(bot, chat_id, None, &original_text, audience, error).await;
+        }
+    };
+    let result = match audience {
         MessageAudience::Public => {
             bot.send_message(chat_id, text)
                 .link_preview_options(disabled_link_preview())
@@ -81,6 +90,13 @@ pub async fn send_html(
                 .link_preview_options(disabled_link_preview())
                 .await
         }
+    };
+    match result {
+        Ok(sent) => Ok(sent),
+        Err(error) if should_fallback_after_payload_rejection(&error) => {
+            send_plain_fallback(bot, chat_id, None, &original_text, audience, error).await
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -91,8 +107,22 @@ pub async fn send_html_reply(
     text: impl Into<String>,
     audience: MessageAudience,
 ) -> ResponseResult<Message> {
-    let text = normalize_send_text(text)?;
-    match audience {
+    let original_text = text.into();
+    let text = match normalize_send_text(original_text.clone()) {
+        Ok(text) => text,
+        Err(error) => {
+            return send_plain_fallback(
+                bot,
+                chat_id,
+                Some(reply_to_message_id),
+                &original_text,
+                audience,
+                error,
+            )
+            .await;
+        }
+    };
+    let result = match audience {
         MessageAudience::Public => {
             bot.send_message(chat_id, text)
                 .reply_parameters(
@@ -125,7 +155,131 @@ pub async fn send_html_reply(
                 .link_preview_options(disabled_link_preview())
                 .await
         }
+    };
+    match result {
+        Ok(sent) => Ok(sent),
+        Err(error) if should_fallback_after_payload_rejection(&error) => {
+            send_plain_fallback(
+                bot,
+                chat_id,
+                Some(reply_to_message_id),
+                &original_text,
+                audience,
+                error,
+            )
+            .await
+        }
+        Err(error) => Err(error),
     }
+}
+
+async fn send_plain_fallback(
+    bot: &DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    reply_to_message_id: Option<MessageId>,
+    html: &str,
+    audience: MessageAudience,
+    original_error: RequestError,
+) -> ResponseResult<Message> {
+    let plain = html_to_plain_text(html);
+    let plain = match normalize_send_text(plain) {
+        Ok(plain) => plain,
+        Err(_) => return Err(original_error),
+    };
+    tracing::warn!(
+        %original_error,
+        chat_id = chat_id.0,
+        "Telegram HTML delivery failed; retrying as escaped plain text"
+    );
+    let bot = bot.inner();
+    let request = bot
+        .send_message(chat_id, plain)
+        .link_preview_options(disabled_link_preview());
+    match audience {
+        MessageAudience::Public => match reply_to_message_id {
+            Some(message_id) => {
+                request
+                    .reply_parameters(
+                        ReplyParameters::new(message_id).allow_sending_without_reply(),
+                    )
+                    .await
+            }
+            None => request.await,
+        },
+        MessageAudience::Ephemeral {
+            receiver_user_id,
+            message_thread_id,
+        } if chat_id.0 < 0 => {
+            let request = with_ephemeral_parameters(request, receiver_user_id, message_thread_id);
+            request.await
+        }
+        MessageAudience::Ephemeral { .. } => match reply_to_message_id {
+            Some(message_id) => {
+                request
+                    .reply_parameters(
+                        ReplyParameters::new(message_id).allow_sending_without_reply(),
+                    )
+                    .await
+            }
+            None => request.await,
+        },
+    }
+}
+
+pub(crate) fn html_to_plain_text(html: &str) -> String {
+    let mut characters = html.chars().peekable();
+    let mut plain = String::with_capacity(html.len());
+    while let Some(character) = characters.next() {
+        match character {
+            '<' => {
+                let mut tag = String::new();
+                for next in characters.by_ref() {
+                    if next == '>' {
+                        break;
+                    }
+                    tag.push(next);
+                }
+                let tag = tag.trim().to_ascii_lowercase();
+                if tag.starts_with("br")
+                    || tag.starts_with("/p")
+                    || tag.starts_with("/h")
+                    || tag.starts_with("/blockquote")
+                    || tag.starts_with("/div")
+                {
+                    plain.push('\n');
+                }
+            }
+            '&' => {
+                let mut entity = String::new();
+                while let Some(&next) = characters.peek() {
+                    if next == ';' || entity.chars().count() >= 8 {
+                        break;
+                    }
+                    entity.push(next);
+                    characters.next();
+                }
+                if characters.next_if_eq(&';').is_some() {
+                    match entity.as_str() {
+                        "amp" => plain.push('&'),
+                        "lt" => plain.push('<'),
+                        "gt" => plain.push('>'),
+                        "quot" => plain.push('"'),
+                        "#39" => plain.push('\''),
+                        _ => {
+                            plain.push('&');
+                            plain.push_str(&entity);
+                            plain.push(';');
+                        }
+                    }
+                } else {
+                    plain.push('&');
+                    plain.push_str(&entity);
+                }
+            }
+            _ => plain.push(character),
+        }
+    }
+    plain.trim().to_owned()
 }
 
 pub async fn send_rich_html(
@@ -134,8 +288,9 @@ pub async fn send_rich_html(
     html: impl Into<String>,
     audience: MessageAudience,
 ) -> ResponseResult<Message> {
-    let message = InputRichMessage::html(normalize_rich_text(html)?);
-    match audience {
+    let html = normalize_rich_text(html)?;
+    let message = InputRichMessage::html(html.clone());
+    let result = match audience {
         MessageAudience::Public => bot.send_rich_message(chat_id, message).await,
         MessageAudience::Ephemeral {
             receiver_user_id,
@@ -151,7 +306,41 @@ pub async fn send_rich_html(
             request.await
         }
         MessageAudience::Ephemeral { .. } => bot.send_rich_message(chat_id, message).await,
+    };
+
+    match result {
+        Ok(sent) => Ok(sent),
+        Err(error) if should_fallback_after_payload_rejection(&error) => {
+            tracing::warn!(%error, chat_id = chat_id.0, "Telegram rejected rich message; retrying with HTML fallback");
+            send_html(bot, chat_id, html, audience).await
+        }
+        Err(error) => Err(error),
     }
+}
+
+/// A rich-send retry is safe only when Telegram (or local request validation)
+/// confirmed that it rejected the payload. Network and response parsing errors
+/// can mean the original message was accepted, so callers must not send again.
+pub fn should_fallback_after_payload_rejection(error: &RequestError) -> bool {
+    match error {
+        RequestError::Validation(_) => true,
+        RequestError::Api(ApiError::CantParseEntities(_) | ApiError::MessageIsTooLong) => true,
+        RequestError::Api(ApiError::Unknown(description)) => {
+            description.starts_with("Bad Request:")
+        }
+        RequestError::RetryAfter(_)
+        | RequestError::Api(_)
+        | RequestError::MigrateToChatId(_)
+        | RequestError::Network(_)
+        | RequestError::InvalidJson { .. }
+        | RequestError::Io(_) => false,
+    }
+}
+
+/// A failed send with no definitive Telegram rejection may already have been
+/// accepted. Durable senders should not retry it as a new message.
+pub fn delivery_outcome_is_unknown(error: &RequestError) -> bool {
+    matches!(error, RequestError::Network(_) | RequestError::Io(_))
 }
 
 fn with_ephemeral_parameters<R: SendMessageSetters>(
@@ -169,11 +358,20 @@ fn with_ephemeral_parameters<R: SendMessageSetters>(
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageAudience, audience_for_command, with_ephemeral_parameters};
+    use super::{
+        MessageAudience, audience_for_command, delivery_outcome_is_unknown,
+        should_fallback_after_payload_rejection, with_ephemeral_parameters,
+    };
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+    };
     use teloxide::{
-        prelude::{Bot, ChatId, Requester},
+        errors::{ApiError, RequestError},
+        prelude::{Bot, ChatId, Requester, RequesterExt},
         requests::HasPayload,
-        types::{MessageId, ThreadId, UserId},
+        types::{MessageId, ParseMode, ThreadId, UserId},
     };
 
     #[test]
@@ -237,5 +435,130 @@ mod tests {
             audience_for_command(true, true, None, false, false, None),
             Some(MessageAudience::Public)
         );
+    }
+
+    #[test]
+    fn rich_html_fallback_only_runs_after_a_confirmed_payload_rejection() {
+        assert!(should_fallback_after_payload_rejection(&RequestError::Api(
+            ApiError::Unknown("Bad Request: invalid rich message".to_owned())
+        )));
+        assert!(should_fallback_after_payload_rejection(&RequestError::Api(
+            ApiError::CantParseEntities("Bad Request: can't parse entities".to_owned())
+        )));
+        assert!(!should_fallback_after_payload_rejection(
+            &RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(30))
+        ));
+        assert!(!should_fallback_after_payload_rejection(
+            &RequestError::Api(ApiError::BotBlocked)
+        ));
+    }
+
+    #[test]
+    fn html_fallback_preserves_readable_text_and_decodes_entities_without_markup() {
+        assert_eq!(
+            super::html_to_plain_text(
+                "<b>Имя &amp; &lt;текст&gt;</b><br><a href=\"tg://user?id=42\">Профиль</a>"
+            ),
+            "Имя & <текст>\nПрофиль"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_html_rejection_retries_as_plain_text_without_exposing_ephemeral_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Telegram API");
+        let address = listener.local_addr().expect("mock API address");
+        let server = thread::spawn(move || {
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept Telegram request");
+                let payload = read_request_payload(&stream);
+                if request_index == 0 {
+                    let body = r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}"#;
+                    write_json_response(&mut stream, "400 Bad Request", body);
+                    continue;
+                }
+
+                assert_eq!(payload["text"], "Hello & <world>");
+                assert!(payload.get("parse_mode").is_none());
+                assert_eq!(payload["message_thread_id"], 77);
+                assert_eq!(
+                    payload["ephemeral_message_parameters"]["receiver_user_id"],
+                    42
+                );
+                assert!(payload.get("reply_parameters").is_none());
+
+                let body = serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "message_id": 5,
+                        "date": 1,
+                        "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
+                        "text": "Hello & <world>"
+                    }
+                })
+                .to_string();
+                write_json_response(&mut stream, "200 OK", &body);
+            }
+        });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let thread_id = ThreadId(MessageId(77));
+
+        let sent = super::send_html(
+            &bot,
+            ChatId(-1001),
+            "<b>Hello &amp; &lt;world&gt;</b>",
+            MessageAudience::Ephemeral {
+                receiver_user_id: UserId(42),
+                message_thread_id: Some(thread_id),
+            },
+        )
+        .await
+        .expect("plain text fallback should be delivered");
+
+        server.join().expect("mock server thread");
+        assert_eq!(sent.id, MessageId(5));
+    }
+
+    fn read_request_payload(stream: &TcpStream) -> serde_json::Value {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().expect("content length");
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).expect("read request body");
+        serde_json::from_slice(&body).expect("Telegram JSON request")
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write mock Telegram response");
+        stream.flush().expect("flush mock Telegram response");
+    }
+
+    #[test]
+    fn ambiguous_transport_failures_are_not_safe_to_retry_as_new_messages() {
+        let io_error = RequestError::Io(std::sync::Arc::new(std::io::Error::other("test")));
+        assert!(delivery_outcome_is_unknown(&io_error));
+        assert!(!delivery_outcome_is_unknown(&RequestError::RetryAfter(
+            teloxide::types::Seconds::from_seconds(30)
+        )));
+        assert!(!delivery_outcome_is_unknown(&RequestError::Api(
+            ApiError::Unknown("Internal Server Error".to_owned())
+        )));
     }
 }

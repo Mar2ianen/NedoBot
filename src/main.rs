@@ -98,8 +98,8 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
         tracing::warn!(%err, "failed to refresh member snapshots");
     }
-    if let Err(err) = warn_if_reaction_updates_unavailable(&bot, &config).await {
-        tracing::warn!(%err, "failed to check reaction update availability");
+    if let Err(err) = warn_if_group_update_permissions_unavailable(&bot, &config).await {
+        tracing::warn!(%err, "failed to check Telegram group privacy and update permissions");
     }
     if let Err(err) = warn_if_join_leave_cleanup_unavailable(&bot, &config).await {
         tracing::warn!(%err, "failed to check join/leave message cleanup availability");
@@ -732,26 +732,50 @@ async fn handle_chat_member(
     Ok(())
 }
 
-async fn warn_if_reaction_updates_unavailable(
+async fn warn_if_group_update_permissions_unavailable(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     config: &Config,
 ) -> anyhow::Result<()> {
     let me = bot.get_me().await?;
-    for chat_id in config.managed_chat_ids() {
-        let member = bot.get_chat_member(ChatId(chat_id), me.id).await?;
-        if !matches!(
+    for chat_id in config.managed_chat_ids().filter(|chat_id| *chat_id < 0) {
+        let member = match bot.get_chat_member(ChatId(chat_id), me.id).await {
+            Ok(member) => member,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    chat_id,
+                    "could not check bot membership; reaction and chat_member updates may be unavailable"
+                );
+                continue;
+            }
+        };
+        let is_admin = matches!(
             member.kind,
             ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
-        ) {
+        );
+        if !is_admin {
             tracing::warn!(
                 chat_id,
                 status = ?member.kind,
-                "bot is not chat administrator; Telegram will not send message_reaction updates"
+                "bot is not chat administrator; Telegram will not send message_reaction, message_reaction_count, or chat_member updates"
+            );
+        }
+
+        if config.chat_allows(chat_id, |chat| chat.ingest)
+            && privacy_mode_blocks_group_messages(me.can_read_all_group_messages, is_admin)
+        {
+            tracing::error!(
+                chat_id,
+                "bot cannot read ordinary group messages: disable Group Privacy in BotFather and re-add the bot, or make it a chat administrator; message ingestion, anti-spam context, and channel-post comments will miss updates"
             );
         }
     }
 
     Ok(())
+}
+
+fn privacy_mode_blocks_group_messages(privacy_disabled: bool, is_admin: bool) -> bool {
+    !privacy_disabled && !is_admin
 }
 
 async fn warn_if_join_leave_cleanup_unavailable(
@@ -846,4 +870,16 @@ async fn preflight_managed_chats(
             .map_err(|error| anyhow::anyhow!("managed chat {chat_id} preflight failed: {error}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::privacy_mode_blocks_group_messages;
+
+    #[test]
+    fn privacy_mode_only_blocks_group_ingress_when_bot_is_not_admin() {
+        assert!(privacy_mode_blocks_group_messages(false, false));
+        assert!(!privacy_mode_blocks_group_messages(true, false));
+        assert!(!privacy_mode_blocks_group_messages(false, true));
+    }
 }

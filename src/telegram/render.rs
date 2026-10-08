@@ -1,5 +1,6 @@
 use teloxide::{
     prelude::*,
+    requests::validation::{InvalidValueReason, RequestFieldPath, RequestValidationError},
     types::{InputRichMessage, LinkPreviewOptions, MessageId, ReplyParameters},
 };
 
@@ -42,10 +43,11 @@ pub async fn send_rich_html(
     chat_id: ChatId,
     html: impl Into<String>,
 ) -> ResponseResult<Message> {
-    send_rich_message(
+    crate::telegram::service_messages::send_rich_html(
         bot,
         chat_id,
-        InputRichMessage::html(normalize_rich_text(html)?),
+        html,
+        crate::telegram::service_messages::MessageAudience::Public,
     )
     .await
 }
@@ -82,9 +84,7 @@ pub(crate) fn normalize_send_text(text: impl Into<String>) -> ResponseResult<Str
 
     let char_count = text.chars().count();
     if char_count > TELEGRAM_TEXT_LIMIT {
-        return Err(io_request_error(format!(
-            "HTML message exceeds Telegram text limit: {char_count}/{TELEGRAM_TEXT_LIMIT}"
-        )));
+        return Err(text_length_validation_error(TELEGRAM_TEXT_LIMIT));
     }
 
     if !is_safe_len(&text) {
@@ -103,9 +103,7 @@ pub(crate) fn normalize_rich_text(text: impl Into<String>) -> ResponseResult<Str
     let char_count = text.chars().count();
 
     if char_count > TELEGRAM_RICH_TEXT_LIMIT {
-        return Err(io_request_error(format!(
-            "rich message exceeds Telegram rich text limit: {char_count}/{TELEGRAM_RICH_TEXT_LIMIT}"
-        )));
+        return Err(text_length_validation_error(TELEGRAM_RICH_TEXT_LIMIT));
     }
 
     Ok(text)
@@ -120,8 +118,11 @@ fn normalize_non_empty_text(text: impl Into<String>) -> String {
     }
 }
 
-fn io_request_error(error: impl std::fmt::Display) -> teloxide::RequestError {
-    teloxide::RequestError::Io(std::io::Error::other(error.to_string()).into())
+fn text_length_validation_error(max: usize) -> teloxide::RequestError {
+    teloxide::RequestError::Validation(RequestValidationError::InvalidValue {
+        path: RequestFieldPath::field("text"),
+        reason: InvalidValueReason::MustBeInRange { min: 1, max },
+    })
 }
 
 pub(crate) fn disabled_link_preview() -> LinkPreviewOptions {

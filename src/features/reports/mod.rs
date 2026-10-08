@@ -8,10 +8,10 @@ use sqlx::{PgPool, Row};
 use teloxide::{
     Bot,
     prelude::*,
-    types::{ChatId, ChatMemberKind, Message, User},
+    types::{ChatId, ChatMemberKind, Message, ParseMode, User},
 };
 
-pub use render::{render_report, render_report_keyboard};
+pub use render::{render_report, render_report_html_fallback, render_report_keyboard};
 pub use repo::{ReportCard, ReportResolution};
 
 const MAX_REASON_CHARS: usize = 500;
@@ -328,10 +328,7 @@ pub async fn process_next_delivery(bot: &Bot, pool: &PgPool) -> anyhow::Result<b
         return Ok(false);
     };
     let report = repo::load_report(pool, delivery.report_id).await?;
-    let message = bot
-        .send_rich_message(ChatId(delivery.admin_user_id), render_report(&report))
-        .reply_markup(render_report_keyboard(&report))
-        .await;
+    let message = send_report_notification(bot, delivery.admin_user_id, &report).await;
     match message {
         Ok(message) => {
             mark_delivery_sent(pool, &delivery, message.id.0).await?;
@@ -361,6 +358,61 @@ pub async fn process_next_delivery(bot: &Bot, pool: &PgPool) -> anyhow::Result<b
     Ok(true)
 }
 
+async fn send_report_notification(
+    bot: &Bot,
+    admin_user_id: i64,
+    report: &ReportCard,
+) -> Result<Message, teloxide::RequestError> {
+    let chat_id = ChatId(admin_user_id);
+    let keyboard = render_report_keyboard(report);
+    match bot
+        .send_rich_message(chat_id, render_report(report))
+        .reply_markup(keyboard.clone())
+        .await
+    {
+        Ok(message) => Ok(message),
+        Err(error)
+            if crate::telegram::service_messages::should_fallback_after_payload_rejection(
+                &error,
+            ) =>
+        {
+            tracing::warn!(
+                %error,
+                report_id = report.id,
+                "Telegram rejected rich report; retrying with compact HTML fallback"
+            );
+            let html = render_report_html_fallback(report);
+            match bot
+                .send_message(chat_id, html.clone())
+                .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
+                .await
+            {
+                Ok(message) => Ok(message),
+                Err(error)
+                    if crate::telegram::service_messages::should_fallback_after_payload_rejection(
+                        &error,
+                    ) =>
+                {
+                    tracing::warn!(
+                        %error,
+                        report_id = report.id,
+                        "Telegram rejected compact HTML report; retrying as plain text"
+                    );
+                    bot.send_message(
+                        chat_id,
+                        crate::telegram::service_messages::html_to_plain_text(&html),
+                    )
+                    .reply_markup(render_report_keyboard(report))
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DeliveryFailure {
     error_kind: &'static str,
@@ -380,6 +432,20 @@ fn classify_delivery_error(error: &teloxide::RequestError, attempt: i32) -> Deli
             error_kind: "telegram_retry_after",
             retryable: true,
             delay_seconds: i64::from(seconds.seconds()),
+        };
+    }
+    if crate::telegram::service_messages::delivery_outcome_is_unknown(error) {
+        return DeliveryFailure {
+            error_kind: "telegram_delivery_unknown",
+            retryable: false,
+            delay_seconds: 0,
+        };
+    }
+    if crate::telegram::service_messages::should_fallback_after_payload_rejection(error) {
+        return DeliveryFailure {
+            error_kind: "telegram_payload_rejected",
+            retryable: false,
+            delay_seconds: 0,
         };
     }
     let message = error.to_string().to_lowercase();
@@ -644,6 +710,14 @@ mod tests {
     fn enforces_reporter_rate_limit_contract() {
         assert_eq!(MAX_REPORTS_PER_WINDOW, 1);
         assert_eq!(REPORT_WINDOW_MINUTES, 10);
+    }
+
+    #[test]
+    fn ambiguous_report_send_is_terminal_to_prevent_duplicate_private_messages() {
+        let error = teloxide::RequestError::Io(std::sync::Arc::new(std::io::Error::other("test")));
+        let failure = classify_delivery_error(&error, 1);
+        assert_eq!(failure.error_kind, "telegram_delivery_unknown");
+        assert!(!failure.retryable());
     }
 
     #[test]

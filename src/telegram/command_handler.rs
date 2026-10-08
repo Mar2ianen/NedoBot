@@ -983,14 +983,8 @@ async fn send_ask_fallback(
     state: &AppState,
     markdown: &str,
 ) -> ResponseResult<()> {
-    let sent = if markdown.chars().count() <= TELEGRAM_TEXT_LIMIT {
-        crate::telegram::render::send_html_reply(
-            bot,
-            command.chat.id,
-            command.id,
-            escape_html(markdown),
-        )
-        .await?
+    let sent = if let Some(html) = ask_fallback_html(markdown) {
+        crate::telegram::render::send_html_reply(bot, command.chat.id, command.id, html).await?
     } else {
         bot.send_document(
             command.chat.id,
@@ -1014,6 +1008,12 @@ async fn send_ask_fallback(
         tracing::warn!(%error, "failed to save /ask fallback reply");
     }
     Ok(())
+}
+
+#[cfg(feature = "ask")]
+fn ask_fallback_html(markdown: &str) -> Option<String> {
+    let html = escape_html(markdown);
+    (html.chars().count() <= TELEGRAM_TEXT_LIMIT).then_some(html)
 }
 
 #[cfg(feature = "ask")]
@@ -1305,6 +1305,8 @@ fn status_period_from_args(args: &str) -> Option<StatsPeriod> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "ask")]
+    use super::ask_fallback_html;
+    #[cfg(feature = "ask")]
     #[test]
     fn group_ask_uses_its_own_chat_and_rich_reply_is_visible() {
         assert_eq!(ask_scope_chat_id(-100222, false, Some(-100111)), -100222);
@@ -1336,6 +1338,16 @@ mod tests {
             render_from_args("--rich --poor"),
             StatsRender::Html
         ));
+    }
+
+    #[cfg(feature = "ask")]
+    #[test]
+    fn ask_fallback_uses_a_document_when_html_escaping_expands_the_text_past_limit() {
+        assert!(ask_fallback_html(&"<&>".repeat(500)).is_none());
+        assert_eq!(
+            ask_fallback_html("short answer").as_deref(),
+            Some("short answer")
+        );
     }
 
     #[test]
