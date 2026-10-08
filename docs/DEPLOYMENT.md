@@ -7,6 +7,29 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+8 октября 2026 в **19:20 UTC / 22:20 МСК** выпущен release
+[`deploy-2026-10-08-telegram-send-fallback`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-08-telegram-send-fallback)
+на merge commit `3b427de3e3caa3cc7a996b12ce8132b603c2d6c9` после review
+[PR #47](https://github.com/Mar2ianen/NedoBot/pull/47). Release workflow
+[37829976468](https://github.com/Mar2ianen/NedoBot/actions/runs/37829976468)
+успешно собрал artifact, проверил glibc ≤ 2.39 и установил его в оба bot
+instance и MCP. SHA-256 обоих bot binaries —
+`48f05e673ebb67af0655804ce193644f2e172052468d8b6cb9649b480f3c65a2`, MCP —
+`9bf767116cf9e3edf4b0e8d6229882ebf5861e57426d36967bd9ea8deac92bf2`.
+
+В обеих production БД успешно применены все 94 миграции, failed migrations
+нет; последняя — `20261008183924_preserve_spammer_avatar_dataset_refs`, колонка
+`dataset_avatar_file_id` присутствует. Оба бота и `nedonews-mcp` активны с
+`NRestarts=0`; hashes работающих bot processes и MCP совпали с artifact.
+Error-level journal обоих ботов после выкладки пуст. Telegram API подтверждает
+`can_read_all_group_messages=true` для Недострая и ПВО: обычные сообщения групп
+читаются. Недострай не администратор группы (`restricted`), поэтому Telegram не
+передаёт ему реакции и `chat_member`; его доступ к source channel при этом
+подтверждён. ПВО — администратор. Команду-smoke в чаты не отправляли.
+
+В релиз также вошёл `provider-access` как самостоятельный workspace crate;
+приложение пока не использует его как runtime route.
+
 8 октября 2026 в **16:26 UTC / 19:26 МСК** выпущен release
 [`deploy-2026-10-08-ask-python-files`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-08-ask-python-files)
 на merge commit `e1a6ab47b88f3eccfa2100c8857a8cbd544ce0f3` после review
