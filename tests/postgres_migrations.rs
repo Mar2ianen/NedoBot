@@ -3093,6 +3093,25 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         "voice ASR alternatives migration must be applied"
     );
 
+    let avatar_dataset_reference_column: bool = query_scalar(
+        r#"
+        select exists (
+            select 1 from information_schema.columns
+            where table_schema = 'public'
+              and table_name = 'spammer_avatar_embeddings'
+              and column_name = 'dataset_avatar_file_id'
+              and is_nullable = 'YES'
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("spammer avatar dataset reference column lookup must succeed");
+    assert!(
+        avatar_dataset_reference_column,
+        "spammer avatar dataset reference migration must be applied"
+    );
+
     let public_messages_view: Option<String> =
         query_scalar("select to_regclass('mcp_public.telegram_messages')::text")
             .fetch_one(pool)
