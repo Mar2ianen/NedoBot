@@ -1,0 +1,11 @@
+ARG PYTHON_BASE_IMAGE
+FROM ${PYTHON_BASE_IMAGE}
+
+# Этот образ собирается из заранее выбранного и проверенного base digest.
+# Сам контейнер запускается с отдельным immutable image ID из runtime-профиля.
+ENV HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /workspace
+USER 1000:1000

@@ -8,6 +8,7 @@ pub enum AskProgress {
     SearchingChat,
     CheckingExternalSources,
     CheckingNotes,
+    Computing,
     FormingAnswer,
 }
 

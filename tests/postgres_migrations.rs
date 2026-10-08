@@ -11,58 +11,63 @@ use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
 use teloxide_antispam::scoring::ScoreComponents;
 
-use tg_ai_bot_teloxide::features::{
-    ask::notes::add_user_note_from_search,
-    ask::{
-        repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
-        types::AskRunStatus,
-    },
-    chat_read_api::{
-        service as chat_read_service,
-        types::{MessageMatch, MessageSearchRequest, MessageSort, SemanticSearchConfig},
-    },
-    chat_retrieval::{
-        EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
-        mark_embedding_failed, mark_embedding_ready,
-    },
-    first_comment::repo::{
-        CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
-        OperatorAuditParams, begin_post_comment_delivery,
-        claim_delivery_unknown_post_comment_for_operator_retry, claim_next_post_comment_job,
-        create_post_comment_job, finalize_post_comment_sent,
-        mark_delivery_unknown_post_comment_delivered, mark_delivery_unknown_post_comment_failed,
-        mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
-        mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
-    },
-    jobs::{claim::CasResult, observability::load_job_lifecycle_report},
-    labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
-    memory::embedding::EMBEDDINGGEMMA2_MODEL_ID,
-    memory::service::{
-        HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
-        finalize_history_failed, finalize_history_retry,
-    },
-    new_user_audit::repo::{
-        NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-        finalize_new_user_audit_job, mark_new_user_audit_failed,
-        mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-        mark_new_user_audit_retry, materialize_new_user_audit_job,
-    },
-    reports::{ReportCreation, ReportTarget, create_report, load_report},
-    spam_review::{
-        apply_callback, claim_next_review_delivery, create_review, mark_review_delivery_succeeded,
-        send_review, suppress_pending_review_deliveries,
-    },
-    stats::{
-        render_html, render_rich, repo as stats_repo,
-        types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
-    },
-    voice::{
-        repo::{
-            VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
-            mark_voice_job_delivery_unknown, mark_voice_job_phase, mark_voice_job_retry_or_failed,
-            recover_expired_voice_deliveries, save_progress_message,
+use tg_ai_bot_teloxide::{
+    config::Config,
+    features::{
+        ask::notes::add_user_note_from_search,
+        ask::{
+            repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
+            types::AskRunStatus,
         },
-        types::{VoiceMedia, VoiceMediaKind},
+        chat_read_api::{
+            service as chat_read_service,
+            types::{MessageMatch, MessageSearchRequest, MessageSort, SemanticSearchConfig},
+        },
+        chat_retrieval::{
+            EmbeddingJob, claim_embedding_jobs, enqueue_message_embedding_if_enabled,
+            mark_embedding_failed, mark_embedding_ready,
+        },
+        first_comment::repo::{
+            CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent,
+            LlmGenerationInsert, OperatorAuditParams, begin_post_comment_delivery,
+            claim_delivery_unknown_post_comment_for_operator_retry, claim_next_post_comment_job,
+            create_post_comment_job, finalize_post_comment_sent, load_recent_bot_comments,
+            mark_delivery_unknown_post_comment_delivered,
+            mark_delivery_unknown_post_comment_failed,
+            mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
+            mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
+        },
+        jobs::{claim::CasResult, observability::load_job_lifecycle_report},
+        labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
+        memory::embedding::EMBEDDINGGEMMA2_MODEL_ID,
+        memory::service::{
+            HistoryEntryCompletion, claim_next_history_entry, finalize_history_entry,
+            finalize_history_failed, finalize_history_retry, load_relevant_memory_notes,
+        },
+        new_user_audit::repo::{
+            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
+            finalize_new_user_audit_job, mark_new_user_audit_failed,
+            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+            mark_new_user_audit_retry, materialize_new_user_audit_job,
+        },
+        reports::{ReportCreation, ReportTarget, create_report, load_report},
+        spam_review::{
+            apply_callback, claim_next_review_delivery, create_review,
+            mark_review_delivery_succeeded, send_review, suppress_pending_review_deliveries,
+        },
+        stats::{
+            render_html, render_rich, repo as stats_repo,
+            types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
+        },
+        voice::{
+            repo::{
+                VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
+                mark_voice_job_delivery_unknown, mark_voice_job_phase,
+                mark_voice_job_retry_or_failed, recover_expired_voice_deliveries,
+                save_progress_message,
+            },
+            types::{VoiceMedia, VoiceMediaKind},
+        },
     },
 };
 
@@ -4145,6 +4150,39 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
     .execute(pool)
     .await
     .expect("semantic search embedding fixture must be inserted");
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, text, has_voice, has_sticker, has_animation)
+        values
+            ($1, $2 + 1, $3 + 1, 'semantic voice filter fixture', true, false, false),
+            ($1, $2 + 2, $3 + 2, 'semantic sticker filter fixture', false, true, false),
+            ($1, $2 + 3, $3 + 3, 'semantic animation filter fixture', false, false, true)
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("semantic media-filter fixtures must be inserted");
+    query(
+        r#"
+        insert into telegram_message_embeddings_gemma2
+            (chat_id, message_id, embedding, embedding_model, status)
+        values
+            ($1, $2 + 1, $3::vector, $4, 'ready'),
+            ($1, $2 + 2, $3::vector, $4, 'ready'),
+            ($1, $2 + 3, $3::vector, $4, 'ready')
+        "#,
+    )
+    .bind(-1001932061163_i64)
+    .bind(message_id)
+    .bind(&embedding_literal)
+    .bind(EMBEDDINGGEMMA2_MODEL_ID)
+    .execute(pool)
+    .await
+    .expect("semantic media-filter vectors must be inserted");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -4166,47 +4204,243 @@ async fn assert_semantic_search_uses_embeddings_without_freshness_decay(pool: &P
             .expect("embedding fixture server must run");
     });
 
+    let request = MessageSearchRequest {
+        query: "term_without_lexical_match".into(),
+        user_id: Some(user_id),
+        date_from: None,
+        date_to: None,
+        reply_to_message_id: None,
+        is_automatic_forward: None,
+        is_forwarded: None,
+        has_reply: None,
+        has_links: None,
+        has_media: None,
+        has_photo: None,
+        has_video: None,
+        has_document: None,
+        has_audio: None,
+        has_voice: None,
+        has_sticker: None,
+        has_animation: None,
+        match_mode: MessageMatch::Hybrid,
+        sort: MessageSort::Relevance,
+        limit: 10,
+        offset: 0,
+        include_forwards: false,
+    };
+    let semantic_config = SemanticSearchConfig {
+        embedding_url: format!("http://{address}"),
+        embedding_model: EMBEDDINGGEMMA2_MODEL_ID.into(),
+        timeout_sec: 5,
+        query_prefix: "task: search result | query: ".into(),
+    };
     let page = chat_read_service::search_messages_with_semantic(
         pool,
         -1001932061163,
-        &MessageSearchRequest {
-            query: "term_without_lexical_match".into(),
-            user_id: None,
-            date_from: None,
-            date_to: None,
-            reply_to_message_id: None,
-            is_automatic_forward: None,
-            is_forwarded: None,
-            has_reply: None,
-            has_links: None,
-            has_media: None,
-            has_photo: None,
-            has_video: None,
-            has_document: None,
-            has_audio: None,
-            has_voice: None,
-            has_sticker: None,
-            has_animation: None,
-            match_mode: MessageMatch::Hybrid,
-            sort: MessageSort::Relevance,
-            limit: 1,
-            offset: 0,
-            include_forwards: false,
-        },
-        Some(&SemanticSearchConfig {
-            embedding_url: format!("http://{address}"),
-            embedding_model: EMBEDDINGGEMMA2_MODEL_ID.into(),
-            timeout_sec: 5,
-            query_prefix: "task: search result | query: ".into(),
-        }),
+        &request,
+        Some(&semantic_config),
     )
     .await
     .expect("semantic chat search must execute through the production read service");
-    embedding_server.abort();
 
     assert_eq!(page.total_count, 1);
     assert_eq!(page.messages[0].message_id, message_id);
     assert_eq!(page.messages[0].relevance, 550);
+
+    for (user_offset, flags, expected_count) in [
+        (1_i64, (Some(true), None, None), 1_i64),
+        (2_i64, (None, Some(true), None), 1_i64),
+        (3_i64, (None, None, Some(false)), 0_i64),
+        (1_i64, (None, None, Some(true)), 0_i64),
+    ] {
+        let scoped_request = MessageSearchRequest {
+            user_id: Some(user_id + user_offset),
+            has_voice: flags.0,
+            has_sticker: flags.1,
+            has_animation: flags.2,
+            ..request.clone()
+        };
+        let scoped_page = chat_read_service::search_messages_with_semantic(
+            pool,
+            -1001932061163,
+            &scoped_request,
+            Some(&semantic_config),
+        )
+        .await
+        .expect("semantic media filters must match their own columns");
+        assert_eq!(scoped_page.total_count, expected_count);
+        if expected_count == 1 {
+            assert_eq!(scoped_page.messages[0].user_id, Some(user_id + user_offset));
+        }
+    }
+    assert_first_comment_context_isolated(
+        pool,
+        &format!("http://{address}"),
+        &embedding_literal,
+        message_id,
+    )
+    .await;
+    embedding_server.abort();
+}
+
+async fn assert_first_comment_context_isolated(
+    pool: &PgPool,
+    embedding_url: &str,
+    embedding_literal: &str,
+    suffix: i32,
+) {
+    const DISCUSSION_CHAT_ID: i64 = -1001932061163;
+    const OTHER_DISCUSSION_CHAT_ID: i64 = -1001932061164;
+    const SOURCE_CHANNEL_ID: i64 = -1001575496091;
+    const OTHER_SOURCE_CHANNEL_ID: i64 = -1001575496092;
+    let source_message_id = suffix + 10_000;
+    let target_job_id = create_post_comment_job(
+        pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: DISCUSSION_CHAT_ID,
+            discussion_message_id: suffix + 20_000,
+            source_channel_id: SOURCE_CHANNEL_ID,
+            source_message_id,
+            cleaned_post_text: "target post",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("target post job must be created")
+    .expect("target post job must be unique");
+    let other_channel_job_id = create_post_comment_job(
+        pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: DISCUSSION_CHAT_ID,
+            discussion_message_id: suffix + 20_001,
+            source_channel_id: OTHER_SOURCE_CHANNEL_ID,
+            source_message_id: source_message_id + 1,
+            cleaned_post_text: "other channel post",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("other-channel post job must be created")
+    .expect("other-channel post job must be unique");
+    let other_discussion_job_id = create_post_comment_job(
+        pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: OTHER_DISCUSSION_CHAT_ID,
+            discussion_message_id: suffix + 20_002,
+            source_channel_id: SOURCE_CHANNEL_ID,
+            source_message_id: source_message_id + 2,
+            cleaned_post_text: "other discussion post",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("other-discussion post job must be created")
+    .expect("other-discussion post job must be unique");
+    query("update post_comment_jobs set status = 'failed', error = 'context isolation fixture' where id = any($1)")
+        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id])
+        .execute(pool)
+        .await
+        .expect("context fixture jobs must not enter the pending delivery queue");
+
+    for (job_id, response) in [
+        (target_job_id, "target recent comment"),
+        (other_channel_job_id, "foreign source comment"),
+        (other_discussion_job_id, "foreign discussion comment"),
+    ] {
+        query(
+            r#"
+            insert into llm_generations
+                (post_comment_job_id, provider, model, prompt, response, final_html)
+            values ($1, 'fixture', 'fixture', 'fixture prompt', $2, $2)
+            "#,
+        )
+        .bind(job_id)
+        .bind(response)
+        .execute(pool)
+        .await
+        .expect("scoped recent-comment fixture must be inserted");
+    }
+
+    for (job_id, channel_id, message_offset, summary) in [
+        (
+            target_job_id,
+            SOURCE_CHANNEL_ID,
+            0,
+            "target history summary",
+        ),
+        (
+            other_channel_job_id,
+            OTHER_SOURCE_CHANNEL_ID,
+            1,
+            "foreign source summary",
+        ),
+        (
+            other_discussion_job_id,
+            SOURCE_CHANNEL_ID,
+            2,
+            "foreign discussion summary",
+        ),
+    ] {
+        query(
+            r#"
+            insert into post_history_entries
+                (post_comment_job_id, source_channel_id, source_message_id, post_text,
+                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model)
+            values ($1, $2, $3, 'fixture post', 'fixture comment', 'ready', $4,
+                    $5::vector, $6)
+            "#,
+        )
+        .bind(job_id)
+        .bind(channel_id)
+        .bind(source_message_id + message_offset)
+        .bind(summary)
+        .bind(embedding_literal)
+        .bind(EMBEDDINGGEMMA2_MODEL_ID)
+        .execute(pool)
+        .await
+        .expect("scoped RAG fixture must be inserted");
+    }
+
+    let recent_comments = load_recent_bot_comments(pool, DISCUSSION_CHAT_ID, SOURCE_CHANNEL_ID)
+        .await
+        .expect("recent bot comments must use the current source route");
+    assert!(
+        recent_comments
+            .iter()
+            .any(|comment| comment == "target recent comment")
+    );
+    assert!(!recent_comments.iter().any(
+        |comment| comment.contains("foreign source") || comment.contains("foreign discussion")
+    ));
+
+    let mut config = Config::from_env().expect("test runtime config must load");
+    config.rag_enabled = true;
+    config.rag_embedding_url = embedding_url.to_owned();
+    config.rag_embedding_model = EMBEDDINGGEMMA2_MODEL_ID.to_owned();
+    config.rag_embedding_timeout_sec = 5;
+    config.rag_top_k = 6;
+    config.rag_min_similarity = 0.6;
+    config.rag_temporal_half_life_days = 180.0;
+    let memory_notes = load_relevant_memory_notes(
+        pool,
+        &config,
+        DISCUSSION_CHAT_ID,
+        SOURCE_CHANNEL_ID,
+        "semantic memory scope query",
+    )
+    .await
+    .expect("history retrieval must stay inside the current discussion and source");
+    assert!(
+        memory_notes
+            .iter()
+            .any(|note| note.summary == "target history summary")
+    );
+    assert!(!memory_notes.iter().any(|note| {
+        note.summary == "foreign source summary" || note.summary == "foreign discussion summary"
+    }));
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

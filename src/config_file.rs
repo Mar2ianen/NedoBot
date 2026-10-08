@@ -341,6 +341,10 @@ pub struct RuntimeSettings {
     pub ask_db_mcp_args: Vec<String>,
     pub ask_db_mcp_env: Vec<String>,
     pub ask_db_mcp_timeout_sec: u64,
+    #[serde(default)]
+    pub ask_python_sandbox_enabled: bool,
+    #[serde(default)]
+    pub ask_python_sandbox_image: Option<String>,
     pub profile_refresh_concurrency: usize,
     pub comment_custom_emoji_id: Option<String>,
     pub first_comment_max_image_mb: u32,
@@ -460,6 +464,8 @@ impl Default for RuntimeSettings {
             ask_db_mcp_args: Vec::new(),
             ask_db_mcp_env: vec!["ASK_DATABASE_URL".to_string(), "MCP_MANIFEST".to_string()],
             ask_db_mcp_timeout_sec: 8,
+            ask_python_sandbox_enabled: false,
+            ask_python_sandbox_image: None,
             profile_refresh_concurrency: 4,
             comment_custom_emoji_id: None,
             first_comment_max_image_mb: 10,
@@ -491,6 +497,14 @@ impl Default for RuntimeSettings {
 #[cfg(test)]
 mod tests {
     use super::RuntimeSettings;
+
+    #[test]
+    fn python_sandbox_is_opt_in_and_has_no_implicit_image() {
+        let runtime = RuntimeSettings::default();
+        assert!(!runtime.ask_python_sandbox_enabled);
+        assert!(runtime.ask_python_sandbox_image.is_none());
+    }
+
     #[test]
     fn legacy_groq_profile_does_not_enable_an_unconfigured_gemini_shadow() {
         let runtime: RuntimeSettings =

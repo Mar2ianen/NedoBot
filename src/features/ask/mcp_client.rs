@@ -25,6 +25,12 @@ const MAX_TOOL_CATALOG_CHARS: usize = 12_000;
 const PROVIDER_TOOL_NAME_SEPARATOR: &str = "__";
 
 pub const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github.search"];
+pub const RESERVED_LOCAL_AGENT_TOOLS: &[&str] = &[
+    "notes.add_user",
+    "web.search",
+    "github.search",
+    "sandbox.python",
+];
 pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
     "chat.resolve_user",
     "chat.get_user_profile",
@@ -190,7 +196,7 @@ pub(crate) fn wire_tool_name(canonical_name: &str) -> String {
 fn reject_local_tool_collisions(tools: &[Tool]) -> anyhow::Result<()> {
     if let Some(tool) = tools
         .iter()
-        .find(|tool| LOCAL_AGENT_TOOLS.contains(&tool.name.as_ref()))
+        .find(|tool| RESERVED_LOCAL_AGENT_TOOLS.contains(&tool.name.as_ref()))
     {
         anyhow::bail!(
             "chat DB MCP tool {:?} collides with a local ASK tool",

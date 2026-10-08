@@ -408,6 +408,9 @@ ask_max_concurrency = 4
 ask_db_mcp_args = []
 ask_db_mcp_env = ["ASK_DATABASE_URL", "MCP_MANIFEST"]
 ask_db_mcp_timeout_sec = 30
+ask_python_sandbox_enabled = false
+# Включать только после rootless Podman provisioning; значение — локальный immutable image ID.
+# ask_python_sandbox_image = "sha256:<64 hex digits>"
 
 profile_refresh_concurrency = 4
 comment_custom_emoji_id = "5445092965875729965"

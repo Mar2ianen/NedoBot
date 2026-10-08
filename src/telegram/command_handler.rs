@@ -1066,6 +1066,7 @@ fn ask_progress_message(progress: AskProgress) -> &'static str {
         AskProgress::SearchingChat => "🔎 Ищу и сверяю сообщения в истории чата…",
         AskProgress::CheckingExternalSources => "🌐 Проверяю внешние источники…",
         AskProgress::CheckingNotes => "📝 Проверяю сохранённые заметки…",
+        AskProgress::Computing => "🧮 Считаю в изолированной песочнице…",
         AskProgress::FormingAnswer => "✍️ Формирую ответ…",
     }
 }

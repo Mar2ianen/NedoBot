@@ -306,6 +306,23 @@ ssh vps-153 'systemctl restart nedonews-mcp'
 ssh vps-153 'systemctl is-active nedonews-mcp'
 ```
 
+### Опциональная Python-песочница `/ask`
+
+Собирай `deploy/ask-sandbox/Containerfile` от заранее проверенного OCI digest
+под отдельным rootless-пользователем. После сборки получи immutable image ID
+через `podman image inspect --format '{{.Id}}' <tag>` и укажи его в
+`ask_python_sandbox_image`; только затем выставляй
+`ask_python_sandbox_enabled=true` в deployment profile. До включения проверь
+`podman info --format '{{.Host.Security.Rootless}}'` от того же пользователя и
+наличие cgroup v2 лимитов. Образ при вызове не скачивается (`--pull=never`). Не
+включай функцию на втором community-инстансе, пока отдельно не проверены его
+rootless Podman и resource limits. В production на 8 октября 2026 оба bot unit
+запускаются от root без rootless Podman runtime, поэтому функция остаётся
+выключенной: запуск rootful-контейнера не считается допустимой заменой. Текущая
+версия даёт эфемерный `/workspace`, но не подключает Telegram-вложения и не
+сохраняет файлы или Python-состояние между вызовами. Сетевого доступа и
+монтирования файлов хоста нет.
+
 Для pinned EmbeddingGemma 2 text+image encoder создать volume и установить unit
 из checkout; unit собирает pinned Transformers.js Q4 image из
 `deploy/rag-embedding` при старте и скачивает model snapshot в постоянный volume:
@@ -364,7 +381,7 @@ curl -sS -o /dev/null -w 'public=%{http_code} %{time_total}\n' https://nedobot.c
 Для unauthenticated probe `403` на локальном endpoint и `405` на публичном
 GET могут быть нормальным результатом: health-check подтверждает, что route
 доступен, а не что MCP-клиент уже выполнил POST discovery. Реальный smoke
-должен использовать MCP client с разрешённым origin/auth контрактом.
+должен использовать MCP client с текущим RMCP v2 контрактом и допустимым Host/Origin; application auth намеренно отсутствует у публичного read-only endpoint-а.
 
 Для Telegram runtime smoke используется отдельный тестовый чат и команда
 /ping, затем /ask с коротким вопросом. Для /ask проверить:
