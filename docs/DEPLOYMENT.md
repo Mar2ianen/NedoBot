@@ -7,6 +7,52 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+8 октября 2026 в **16:26 UTC / 19:26 МСК** выпущен release
+[`deploy-2026-10-08-ask-python-files`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-08-ask-python-files)
+на merge commit `e1a6ab47b88f3eccfa2100c8857a8cbd544ce0f3` после review
+[PR #45](https://github.com/Mar2ianen/NedoBot/pull/45). Сборка и deploy обоих
+ботов и public MCP прошли в [release workflow 37807666497](https://github.com/Mar2ianen/NedoBot/actions/runs/37807666497).
+Для обоих ботов SHA-256 исполняемого файла —
+`5eef9f12104a6c0be1653effe42a039ece06fb3ef21d80c4c55eb9ef746a44cd`, для MCP —
+`a9e4a1c16769431c5569b885dc201a13f45bc8426e981bd9db1d17beb9e4261c`.
+
+В production включён `sandbox.python` только в профиле НедоNews; профиль ПВО
+оставлен выключенным. Образ Python закреплён digest
+`sha256:2a890751d3ac217ba36aab6235e15fa29d0f0e28f72ab040afac0d8180a0fdbd`.
+Команда запускает одноразовый rootless Podman-контейнер от `nedobot-sandbox`:
+без сети, host mounts, секретов и capabilities, с read-only root, лимитами CPU,
+памяти, процессов и времени. Модель может передать ему один UTF-8 текстовый
+документ из reply размером до 2 MiB; работают только стандартная библиотека
+Python и временный `/workspace`. Файлы результата и состояние между вызовами
+не сохраняются, постоянного Jupyter kernel нет. Startup preflight выполнил
+`pass` в контейнере. До рестарта сделан закрытый backup основного профиля в
+`/opt/tg-ai-bot-releases/deploy-2026-10-08-ask-python-files-before-20261008T162503Z/`.
+
+После включения профиля оба бота и MCP перезапущены явным systemd system
+manager; все три unit-а активны, `NRestarts=0`, application journal без ошибок.
+Telegram smoke-команду не отправляли.
+
+### Предыдущие выпуски 8 октября
+
+PR [#44](https://github.com/Mar2ianen/NedoBot/pull/44), tag
+[`deploy-2026-10-08-userstatus-rich-photo`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-08-userstatus-rich-photo),
+устранил отказ `/userstatus`: renderer отдавал ссылку на кэшированный avatar
+без передачи media, из-за чего Telegram отклонял всю rich-карточку. Workflow
+[37800916143](https://github.com/Mar2ianen/NedoBot/actions/runs/37800916143)
+успешно установил artifact `4266e6c8f8a3c6ded1f95800e3f6b98156e2fdcfda303b2bd3dc170c2e7a2997`.
+Неполученные во время сбоя старые ответы Telegram не переигрывает; команду нужно
+повторить.
+
+PR [#43](https://github.com/Mar2ianen/NedoBot/pull/43), tag
+[`deploy-2026-10-08-ask-context-grounding`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-08-ask-context-grounding),
+обновил изоляцию контекста `/ask`, границы недоверенных данных и проверку
+grounding цитат. Workflow
+[37799237640](https://github.com/Mar2ianen/NedoBot/actions/runs/37799237640)
+успешно завершился. Public MCP остаётся намеренно публичным read-only allowlist;
+добавлять к нему Bearer-auth не требуется.
+
+### Предыдущая выкладка: EmbeddingGemma 2, 7 октября
+
 7 октября 2026 в **19:53 UTC / 22:53 МСК** выпущен release
 [`deploy-2026-10-07-embeddinggemma2`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-07-embeddinggemma2)
 на source `7883f750e86f333fba9f6da2e994dfc6bce73f48` после review
