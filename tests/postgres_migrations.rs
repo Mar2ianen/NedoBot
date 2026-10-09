@@ -83,6 +83,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_userstatus_post_comment_count_backfill(&pool).await;
     assert_report_outbox_lifecycle(&pool).await;
     assert_report_contract(&pool).await;
     assert_report_deduplication_and_card_query(&pool).await;
@@ -3076,6 +3077,17 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         "userstatus thread-root partial index must be valid and ready"
     );
 
+    let post_comment_count_backfill_applied: bool = query_scalar(
+        "select exists (select 1 from _sqlx_migrations where version = 20261009183000 and success)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("userstatus post-comment count backfill lookup must succeed");
+    assert!(
+        post_comment_count_backfill_applied,
+        "userstatus post-comment count backfill migration must be applied"
+    );
+
     let sent_at_column: bool = query_scalar(
         r#"
         select exists (
@@ -3148,6 +3160,99 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         spam_reputation_table.as_deref(),
         Some("shared_spam_reputation")
     );
+}
+
+async fn assert_userstatus_post_comment_count_backfill(pool: &PgPool) {
+    const CHAT_ID: i64 = -900_000_000_000_001;
+    const SOURCE_CHANNEL_ID: i64 = -900_000_000_000_002;
+    const ROOT_MESSAGE_ID: i32 = 9_100_001;
+
+    let user_id = 8_000_000_000_i64 + Utc::now().timestamp();
+    let direct_replier_id = user_id;
+    let nested_replier_id = user_id + 1;
+    let unrelated_replier_id = user_id + 2;
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("post-comment count fixture transaction must start");
+
+    query(
+        r#"
+        insert into telegram_messages (chat_id, message_id, user_id, source_channel_id, reply_to_message_id)
+        values
+            ($1, $2, null, $3, null),
+            ($1, $2 + 1, $4, null, $2),
+            ($1, $2 + 2, $5, null, $2 + 1),
+            ($1, $2 + 3, $5, null, $2 + 2),
+            ($1, $2 + 4, $6, null, $2 + 99)
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(ROOT_MESSAGE_ID)
+    .bind(SOURCE_CHANNEL_ID)
+    .bind(direct_replier_id)
+    .bind(nested_replier_id)
+    .bind(unrelated_replier_id)
+    .execute(&mut *tx)
+    .await
+    .expect("post-comment thread fixture messages must be stored");
+
+    query(
+        r#"
+        insert into telegram_chat_users (chat_id, telegram_user_id, reply_to_channel_post_count)
+        values ($1, $2, 1), ($1, $3, 0), ($1, $4, 0)
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(direct_replier_id)
+    .bind(nested_replier_id)
+    .bind(unrelated_replier_id)
+    .execute(&mut *tx)
+    .await
+    .expect("post-comment thread fixture users must be stored");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/20261009183000_userstatus_post_comment_count_backfill.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .expect("post-comment count backfill must include nested replies");
+
+    let counts: Vec<(i64, i64)> = query_as(
+        "select telegram_user_id, reply_to_channel_post_count from telegram_chat_users where chat_id = $1 order by telegram_user_id",
+    )
+    .bind(CHAT_ID)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("backfilled post-comment counts must be queryable");
+    assert_eq!(
+        counts,
+        vec![
+            (direct_replier_id, 1),
+            (nested_replier_id, 2),
+            (unrelated_replier_id, 0),
+        ]
+    );
+
+    tx.commit()
+        .await
+        .expect("post-comment count fixture must be committed for repository checks");
+
+    let nested_count = stats_repo::user_post_comment_count(pool, CHAT_ID, nested_replier_id)
+        .await
+        .expect("missing-cache post-comment fallback must query nested replies");
+    assert_eq!(nested_count, 2);
+
+    query("delete from telegram_messages where chat_id = $1")
+        .bind(CHAT_ID)
+        .execute(pool)
+        .await
+        .expect("post-comment fixture messages must be removed");
+    query("delete from telegram_chat_users where chat_id = $1")
+        .bind(CHAT_ID)
+        .execute(pool)
+        .await
+        .expect("post-comment fixture users must be removed");
 }
 
 async fn assert_report_outbox_lifecycle(pool: &PgPool) {
