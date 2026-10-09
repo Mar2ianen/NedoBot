@@ -255,7 +255,7 @@ pub async fn handle_command(
                 StatsPeriod::Day,
                 render,
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, &args),
             )
             .await?;
         }
@@ -270,7 +270,7 @@ pub async fn handle_command(
                 StatsPeriod::Week,
                 render,
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, &args),
             )
             .await?;
         }
@@ -285,7 +285,7 @@ pub async fn handle_command(
                 StatsPeriod::Month,
                 render,
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, &args),
             )
             .await?;
         }
@@ -302,7 +302,7 @@ pub async fn handle_command(
                 period,
                 render,
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, raw_args),
             )
             .await?;
         }
@@ -314,18 +314,19 @@ pub async fn handle_command(
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, &args),
             )
             .await?;
         }
         Command::TopWord(args) => {
             let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
             let Some(parsed) = parse_top_word_args(raw_args) else {
-                send_command_reply_html(
+                send_command_reply_html_for_args(
                     &bot,
                     &msg,
                     &state,
-                    "Использование: /topword <слово> [-r|-p]. Ищет отдельные вхождения без учета регистра.",
+                    raw_args,
+                    "Использование: /topword <слово> [-r|-p] [-e]. Ищет отдельные вхождения без учета регистра.",
                 )
                 .await?;
                 return Ok(());
@@ -338,7 +339,7 @@ pub async fn handle_command(
                 &parsed.word,
                 parsed.render,
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, raw_args),
             )
             .await?;
         }
@@ -350,7 +351,7 @@ pub async fn handle_command(
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, &args),
             )
             .await?;
         }
@@ -362,7 +363,7 @@ pub async fn handle_command(
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, &args),
             )
             .await?;
         }
@@ -381,7 +382,7 @@ pub async fn handle_command(
                 fallback_user_id,
                 args.render,
                 &strings,
-                command_audience(&msg, &state),
+                command_audience_for_args(&msg, &state, raw_args),
             )
             .await?;
         }
@@ -391,9 +392,27 @@ pub async fn handle_command(
 }
 
 fn command_audience(msg: &Message, state: &AppState) -> Option<MessageAudience> {
-    let ephemeral_enabled = state
-        .config
-        .chat_allows(msg.chat.id.0, |chat| chat.ephemeral_command_replies);
+    command_audience_with_ephemeral_override(msg, state, false)
+}
+
+fn command_audience_for_args(
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+) -> Option<MessageAudience> {
+    let request_ephemeral = args.split_whitespace().any(is_ephemeral_flag);
+    command_audience_with_ephemeral_override(msg, state, request_ephemeral)
+}
+
+fn command_audience_with_ephemeral_override(
+    msg: &Message,
+    state: &AppState,
+    request_ephemeral: bool,
+) -> Option<MessageAudience> {
+    let ephemeral_enabled = request_ephemeral
+        || state
+            .config
+            .chat_allows(msg.chat.id.0, |chat| chat.ephemeral_command_replies);
     let audience = service_messages::command_audience(msg, ephemeral_enabled);
     if audience.is_none() {
         tracing::warn!(
@@ -426,6 +445,21 @@ async fn send_command_reply_html(
     text: impl Into<String>,
 ) -> ResponseResult<Option<Message>> {
     let Some(audience) = command_audience(msg, state) else {
+        return Ok(None);
+    };
+    service_messages::send_html_reply(bot, msg.chat.id, msg.id, text, audience)
+        .await
+        .map(Some)
+}
+
+async fn send_command_reply_html_for_args(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+    text: impl Into<String>,
+) -> ResponseResult<Option<Message>> {
+    let Some(audience) = command_audience_for_args(msg, state, args) else {
         return Ok(None);
     };
     service_messages::send_html_reply(bot, msg.chat.id, msg.id, text, audience)
@@ -1275,7 +1309,7 @@ struct UserStatsArgs {
 }
 
 fn parse_user_stats_args(args: &str) -> UserStatsArgs {
-    let target = strip_render_flag(args);
+    let target = strip_output_flags(args);
     UserStatsArgs {
         target: (!target.is_empty()).then_some(target),
         render: render_from_args(args),
@@ -1296,7 +1330,7 @@ struct TopWordArgs {
 }
 
 fn parse_top_word_args(args: &str) -> Option<TopWordArgs> {
-    let word = strip_render_flag(args);
+    let word = strip_output_flags(args);
     let mut parts = word.split_whitespace();
     let word = parts.next()?;
     if parts.next().is_some()
@@ -1325,21 +1359,27 @@ fn is_plain_render_flag(part: &str) -> bool {
     matches!(part, "-p" | "--plain" | "--poor")
 }
 
+fn is_ephemeral_flag(part: &str) -> bool {
+    part == "-e"
+}
+
 fn raw_command_args(text: &str) -> Option<&str> {
     let mut parts = text.trim().splitn(2, char::is_whitespace);
     parts.next()?;
     Some(parts.next().unwrap_or_default().trim())
 }
 
-fn strip_render_flag(args: &str) -> String {
+fn strip_output_flags(args: &str) -> String {
     args.split_whitespace()
-        .filter(|part| !is_rich_render_flag(part) && !is_plain_render_flag(part))
+        .filter(|part| {
+            !is_rich_render_flag(part) && !is_plain_render_flag(part) && !is_ephemeral_flag(part)
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
 fn status_period_from_args(args: &str) -> Option<StatsPeriod> {
-    strip_render_flag(args)
+    strip_output_flags(args)
         .split_whitespace()
         .next()
         .and_then(|period| match period.to_lowercase().as_str() {
