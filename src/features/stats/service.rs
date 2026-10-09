@@ -280,6 +280,17 @@ pub async fn user_stats_report_data(
         totals.replies_to_bot = totals.replies_to_bot.max(stats.replies_to_bot);
         totals.voices = totals.voices.max(stats.voices);
     }
+    let cached_message_count_covers_history = cached
+        .as_ref()
+        .is_some_and(|stats| stats.messages >= totals.messages);
+    if !cached_message_count_covers_history {
+        totals.post_comments = timed_user_stats_query(
+            trace_id,
+            "sql_user_post_comments_fallback",
+            repo::user_post_comment_count(pool, chat_id, user_id),
+        )
+        .await?;
+    }
     let (
         first_seen_at,
         last_seen_at,

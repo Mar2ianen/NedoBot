@@ -718,19 +718,14 @@ pub async fn user_totals(
     discussion_chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<UserTotals> {
+    // Post-comment totals are merged from telegram_chat_users in the service layer.
+    // The cache is reconciled by migration and updated during message ingestion.
     sqlx::query_as(
         r#"
-        with recursive post_thread_messages as (
-            select chat_id, message_id from telegram_messages where chat_id = $1 and source_channel_id is not null
-            union
-            select child.chat_id, child.message_id from telegram_messages child
-            join post_thread_messages parent on parent.chat_id = child.chat_id and parent.message_id = child.reply_to_message_id
-            where child.chat_id = $1 and child.source_channel_id is null
-        )
         select count(*)::bigint as messages, count(*) filter (where reply_to_message_id is not null)::bigint as replies,
                count(*) filter (where has_links)::bigint as links,
                count(*) filter (where has_photo or has_video or has_document or has_audio or has_voice or has_sticker or has_animation)::bigint as media,
-               count(*) filter (where message_id in (select message_id from post_thread_messages))::bigint as post_comments,
+               0::bigint as post_comments,
                count(*) filter (where reply_to_message_id in (select bot_comment_message_id from post_comment_jobs))::bigint as replies_to_bot,
                count(distinct date_trunc('day', created_at at time zone 'Europe/Moscow' - interval '5 hours'))::bigint as active_days,
                count(*) filter (where has_voice)::bigint as voices
@@ -742,6 +737,45 @@ pub async fn user_totals(
     .fetch_one(pool)
     .await
     .map_err(Into::into)
+}
+
+pub async fn user_post_comment_count(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        with recursive post_thread_messages as (
+            select chat_id, message_id
+            from telegram_messages
+            where chat_id = $1 and source_channel_id is not null
+
+            union
+
+            select child.chat_id, child.message_id
+            from telegram_messages child
+            join post_thread_messages parent
+              on parent.chat_id = child.chat_id
+             and parent.message_id = child.reply_to_message_id
+            where child.chat_id = $1 and child.source_channel_id is null
+        )
+        select count(*)::bigint
+        from telegram_messages messages
+        where messages.chat_id = $1
+          and messages.user_id = $2
+          and messages.source_channel_id is null
+          and messages.message_id in (
+              select message_id from post_thread_messages
+          )
+        "#,
+    )
+    .bind(discussion_chat_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(count)
 }
 
 pub async fn user_reactions_given(
