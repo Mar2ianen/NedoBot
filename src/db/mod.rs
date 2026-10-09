@@ -17,7 +17,7 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes.
     // Touched with each migration addition because SQLx embeds this directory at compile time.
-    // Userstatus cache backfill, job observability, moderation operation-intent, and MCP media migrations are embedded here.
+    // Userstatus totals covering index, cache backfill, job observability, moderation operation-intent, and MCP media migrations are embedded here.
     const KNOWN_UNRESOLVED_PRODUCTION_MIGRATIONS: &[i64] = &[20260927120000];
 
     let migration_table_exists: bool =
