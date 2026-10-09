@@ -97,6 +97,19 @@ pub struct TopMessage {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TopWordUserRow {
+    pub user_id: i64,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub is_bot: bool,
+    pub status: String,
+    pub is_admin: bool,
+    pub is_present: bool,
+    pub occurrences: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TopReactedMessage {
     pub message_id: i32,
     pub user_id: i64,
@@ -414,6 +427,58 @@ pub async fn bottom_message_users(
     limit: i64,
 ) -> anyhow::Result<Vec<TopMessage>> {
     ranked_message_users(pool, discussion_chat_id, limit, true).await
+}
+
+pub async fn top_word_users(
+    pool: &PgPool,
+    discussion_chat_id: i64,
+    word: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<TopWordUserRow>> {
+    sqlx::query_as(
+        r#"
+        with eligible_messages as (
+            select m.user_id, m.text
+            from telegram_messages m
+            left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+            where m.chat_id = $1 and m.user_id is not null and m.source_channel_id is null
+              and m.user_id <> $2 and coalesce(p.is_bot, false) = false
+              and lower(coalesce(m.text, '')) like '%' || lower($3) || '%'
+        ), word_counts as (
+            select m.user_id, count(*)::bigint as occurrences
+            from eligible_messages m
+            cross join lateral regexp_split_to_table(
+                lower(coalesce(m.text, '')), '[^[:alnum:]а-яё]+'
+            ) as tokens(token)
+            where tokens.token = lower($3)
+            group by m.user_id
+        )
+        select counts.user_id, p.username,
+               coalesce(nullif(case when p.first_name = 'пользователь' then '' else p.first_name end, ''), raw_name.display_name, 'скрытый пользователь') as first_name,
+               p.last_name, coalesce(p.is_bot, false) as is_bot, coalesce(s.status, 'unknown') as status,
+               coalesce(s.is_admin, false) as is_admin, coalesce(s.is_present, false) as is_present,
+               counts.occurrences
+        from word_counts counts
+        left join telegram_user_profiles p on p.telegram_user_id = counts.user_id
+        left join telegram_chat_member_snapshots s on s.chat_id = $1 and s.telegram_user_id = counts.user_id
+        left join lateral (
+            select coalesce(nullif(tm.raw_json #>> '{from,first_name}', ''), nullif(tm.raw_json ->> 'from', '')) as display_name
+            from telegram_messages tm
+            where tm.chat_id = $1 and tm.user_id = counts.user_id
+              and coalesce(nullif(tm.raw_json #>> '{from,first_name}', ''), nullif(tm.raw_json ->> 'from', '')) is not null
+            order by tm.created_at desc limit 1
+        ) raw_name on true
+        order by counts.occurrences desc, counts.user_id asc
+        limit $4
+        "#,
+    )
+    .bind(discussion_chat_id)
+    .bind(TELEGRAM_SERVICE_USER_ID)
+    .bind(word)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
 }
 
 async fn ranked_message_users(

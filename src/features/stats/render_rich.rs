@@ -2,7 +2,8 @@ use crate::features::stats::document::Section;
 use crate::features::stats::render_html::{human_comment_preview, message_preview, message_url};
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{
-    ChatStatsReportData, TopMessagesReportData, TopReactedReportData, UserStatsReportData,
+    ChatStatsReportData, TopMessagesReportData, TopReactedReportData, TopWordReportData,
+    UserStatsReportData,
 };
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
@@ -288,6 +289,43 @@ pub fn top_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> Str
 
 pub fn bottom_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> String {
     ranked_users(data, strings.quiet_ones, strings)
+}
+
+pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
+    if data.users.is_empty() {
+        return format!(
+            "<h1>{} «{}»</h1><p>{}</p>",
+            strings.top_word_usage,
+            escape_html(&data.word),
+            strings.no_data,
+        );
+    }
+    let rows = data
+        .users
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            vec![
+                (index + 1).to_string(),
+                user_link(&row.username, row.user.user_id, &row.user.display_name),
+                bold_num(row.occurrences),
+            ]
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "<h1>{} «{}»</h1><p>{}</p>{}",
+        strings.top_word_usage,
+        escape_html(&data.word),
+        strings.all_time,
+        table(
+            &[
+                strings.col_number,
+                strings.col_who,
+                strings.word_occurrences
+            ],
+            &rows,
+        ),
+    )
 }
 
 fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsStrings) -> String {
@@ -653,7 +691,8 @@ mod tests {
     use super::*;
     use crate::features::stats::strings::StatsStrings;
     use crate::features::stats::types::{
-        TopMessageUser, UserModerationSummary, UserPresentation, UserStatsReportData, UserTotals,
+        TopMessageUser, TopWordReportData, TopWordUser, UserModerationSummary, UserPresentation,
+        UserStatsReportData, UserTotals,
     };
 
     fn ranked_fixture() -> TopMessagesReportData {
@@ -683,6 +722,30 @@ mod tests {
         let report = bottom_messages(&ranked_fixture(), &StatsStrings::russian());
         assert!(report.contains("Тихони чата"));
         assert!(!report.contains("Топ пишущих"));
+    }
+
+    #[test]
+    fn rich_top_word_escapes_term_and_renders_usage_count() {
+        let data = TopWordReportData {
+            word: "<слово>".to_string(),
+            users: vec![TopWordUser {
+                user: UserPresentation {
+                    user_id: 7,
+                    display_name: "Участник".to_string(),
+                    is_bot: false,
+                    status: None,
+                    is_admin: false,
+                    is_present: None,
+                },
+                username: None,
+                occurrences: 12,
+            }],
+        };
+
+        let report = top_word(&data, &StatsStrings::russian());
+        assert!(report.contains("&lt;слово&gt;"));
+        assert!(report.contains("<strong>12</strong>"));
+        assert!(report.contains("вхождений"));
     }
 
     #[test]

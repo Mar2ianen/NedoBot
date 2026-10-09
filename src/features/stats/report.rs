@@ -16,6 +16,7 @@ use crate::telegram::render::{send_html, send_rich_html};
 use crate::telegram::service_messages::{self, MessageAudience};
 
 static NEXT_USER_STATS_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+const TOP_WORD_LIMIT: i64 = 20;
 
 /// Transport wiring for stats commands. Data is assembled in `service`; output is
 /// formatted in the selected renderer. Neither renderer has database access.
@@ -127,6 +128,33 @@ pub async fn send_top_reacted(
     let report = match render {
         StatsRender::Html => render_html::top_reacted(&data, stats_scope_chat_id, strings),
         StatsRender::Rich => render_rich::top_reacted(&data, stats_scope_chat_id, strings),
+    };
+    send_stats_report(bot, chat_id, report, render, audience).await?;
+    Ok(())
+}
+
+// This matches the neighboring stats transport functions; `word` is its
+// report-specific input, so a shared request struct would add no domain value.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_top_word(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    pool: &PgPool,
+    stats_scope_chat_id: i64,
+    word: &str,
+    render: StatsRender,
+    strings: &StatsStrings,
+    audience: Option<MessageAudience>,
+) -> ResponseResult<()> {
+    let Some(audience) = audience else {
+        return Ok(());
+    };
+    let data = service::top_word_report_data(pool, stats_scope_chat_id, word, TOP_WORD_LIMIT)
+        .await
+        .map_err(stats_error("failed to build top word report"))?;
+    let report = match render {
+        StatsRender::Html => render_html::top_word(&data, strings),
+        StatsRender::Rich => render_rich::top_word(&data, strings),
     };
     send_stats_report(bot, chat_id, report, render, audience).await?;
     Ok(())

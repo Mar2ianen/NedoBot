@@ -1,5 +1,19 @@
 use teloxide::utils::command::BotCommands;
 
+#[cfg(test)]
+mod top_word_tests {
+    use super::Command;
+    use teloxide::utils::command::BotCommands;
+
+    #[test]
+    fn topword_command_parses_the_word_and_render_flag() {
+        assert!(matches!(
+            Command::parse("/topword амудятел -p", "nedobot"),
+            Ok(Command::TopWord(args)) if args == "амудятел -p"
+        ));
+    }
+}
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "snake_case")]
 pub enum Command {
@@ -83,6 +97,11 @@ pub enum Command {
         description = "топ 20 пользователей по сообщениям; [-r|-p]"
     )]
     TopMsg(String),
+    #[command(
+        rename = "topword",
+        description = "топ 20 пользователей по употреблению слова; /topword <слово> [-r|-p]"
+    )]
+    TopWord(String),
     #[command(
         rename = "topreact",
         description = "топ 20 сообщений по реакциям со ссылками; [-r|-p]"
