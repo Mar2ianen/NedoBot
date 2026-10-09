@@ -787,6 +787,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 - `Комменты бота` сортируются по обсуждению за 30 минут, прямым реплаям и реакциям. Текст очищается от HTML/AI-маркеров и обрезается до короткого превью.
 - Period-данные собирает `features/stats/service.rs` в `ChatStatsReportData`; `render_html.rs` и `render_rich.rs` получают одну typed-модель и не выполняют SQL. SQL и repository DTO находятся в `features/stats/repo.rs`.
 - Аватар в `/userstats` обогащается только для Rich-отчёта; plain HTML-вариант не вызывает Telegram API и локальный avatar cache ради неиспользуемого изображения.
+- Время `/userstatus` пишется структурированными событиями `userstatus timing`: общий итог, Telegram refresh, каждый SQL-этап, аватар, рендер и доставка. Для корреляции используется локальный `trace_id`; имя, Telegram ID, username и текст запроса в эти события не попадают. На сервере события доступны через `journalctl -u tg-ai-bot-teloxide --since today | grep 'userstatus timing'` (для ПВО — `nedobot-pvo`).
 
 Что важно помнить по данным:
 

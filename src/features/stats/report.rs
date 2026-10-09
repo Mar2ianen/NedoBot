@@ -1,6 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use sqlx::PgPool;
 use teloxide::prelude::*;
 use teloxide::utils::time::TimeContext;
+use tracing::Instrument;
 
 use crate::config::Config;
 use crate::features::stats::render_html;
@@ -10,6 +14,8 @@ use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::telegram::render::{send_html, send_rich_html};
 use crate::telegram::service_messages::{self, MessageAudience};
+
+static NEXT_USER_STATS_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Transport wiring for stats commands. Data is assembled in `service`; output is
 /// formatted in the selected renderer. Neither renderer has database access.
@@ -142,26 +148,163 @@ pub async fn send_user_stats(
     let Some(audience) = audience else {
         return Ok(());
     };
-    if let Some(user_id) = numeric_target_user_id(target).or(reply_user_id) {
-        service::refresh_user_profile(bot, pool, stats_scope_chat_id, user_id).await;
-    }
-    let mut data =
-        service::user_stats_report_data(pool, stats_scope_chat_id, target, reply_user_id)
-            .await
-            .map_err(stats_error("failed to build user stats"))?;
-    if let (StatsRender::Rich, Some(data)) = (render, data.as_mut()) {
-        service::enrich_user_stats_avatar(bot, config, data).await;
-    }
-    let report = match render {
-        StatsRender::Html => {
-            render_html::user_stats(data.as_ref(), target, stats_scope_chat_id, strings)
+    let trace_id = NEXT_USER_STATS_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+    let render_name = stats_render_name(render);
+    let target_kind = user_stats_target_kind(target, reply_user_id);
+    let span = tracing::info_span!("userstatus", trace_id, render = render_name, target_kind);
+    let mut timer = UserStatsCommandTimer::new(trace_id);
+    let result = async {
+        let profile_refresh_started = Instant::now();
+        let refresh_user_id = numeric_target_user_id(target).or(reply_user_id);
+        if let Some(user_id) = refresh_user_id {
+            service::refresh_user_profile(bot, pool, stats_scope_chat_id, user_id, trace_id).await;
         }
-        StatsRender::Rich => {
-            render_rich::user_stats(data.as_ref(), target, stats_scope_chat_id, strings)
+        log_user_stats_stage(
+            trace_id,
+            "profile_refresh",
+            profile_refresh_started,
+            if refresh_user_id.is_some() {
+                "best_effort"
+            } else {
+                "skipped"
+            },
+        );
+
+        let report_data_started = Instant::now();
+        let report_data_result = service::user_stats_report_data(
+            pool,
+            stats_scope_chat_id,
+            target,
+            reply_user_id,
+            trace_id,
+        )
+        .await;
+        log_user_stats_stage(
+            trace_id,
+            "report_data",
+            report_data_started,
+            if report_data_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            },
+        );
+        let mut data = report_data_result.map_err(stats_error("failed to build user stats"))?;
+
+        let avatar_started = Instant::now();
+        let avatar_skipped = render != StatsRender::Rich || data.is_none();
+        if let (StatsRender::Rich, Some(data)) = (render, data.as_mut()) {
+            service::enrich_user_stats_avatar(bot, config, data).await;
         }
-    };
-    send_stats_report(bot, chat_id, report, render, audience).await?;
-    Ok(())
+        log_user_stats_stage(
+            trace_id,
+            "avatar_enrichment",
+            avatar_started,
+            if avatar_skipped {
+                "skipped"
+            } else {
+                "best_effort"
+            },
+        );
+
+        let render_started = Instant::now();
+        let report = match render {
+            StatsRender::Html => {
+                render_html::user_stats(data.as_ref(), target, stats_scope_chat_id, strings)
+            }
+            StatsRender::Rich => {
+                render_rich::user_stats(data.as_ref(), target, stats_scope_chat_id, strings)
+            }
+        };
+        log_user_stats_stage(trace_id, "render", render_started, "ok");
+
+        let delivery_started = Instant::now();
+        let delivery_result = send_stats_report(bot, chat_id, report, render, audience).await;
+        log_user_stats_stage(
+            trace_id,
+            "telegram_delivery",
+            delivery_started,
+            if delivery_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            },
+        );
+        delivery_result?;
+        Ok(())
+    }
+    .instrument(span)
+    .await;
+    timer.set_outcome(if result.is_ok() { "ok" } else { "error" });
+    result
+}
+
+fn stats_render_name(render: StatsRender) -> &'static str {
+    match render {
+        StatsRender::Html => "html",
+        StatsRender::Rich => "rich",
+    }
+}
+
+fn user_stats_target_kind(target: Option<&str>, reply_user_id: Option<i64>) -> &'static str {
+    if numeric_target_user_id(target).is_some() {
+        "id"
+    } else if target.is_some() {
+        "username"
+    } else if reply_user_id.is_some() {
+        "reply"
+    } else {
+        "none"
+    }
+}
+
+fn log_user_stats_stage(
+    trace_id: u64,
+    stage: &'static str,
+    started: Instant,
+    outcome: &'static str,
+) {
+    tracing::info!(
+        target: "nedobot::stats::perf",
+        trace_id,
+        stage,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        outcome,
+        "userstatus timing"
+    );
+}
+
+struct UserStatsCommandTimer {
+    trace_id: u64,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl UserStatsCommandTimer {
+    fn new(trace_id: u64) -> Self {
+        Self {
+            trace_id,
+            started: Instant::now(),
+            outcome: "cancelled",
+        }
+    }
+
+    fn set_outcome(&mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for UserStatsCommandTimer {
+    fn drop(&mut self) {
+        tracing::info!(
+            target: "nedobot::stats::perf",
+            trace_id = self.trace_id,
+            stage = "total",
+            elapsed_ms = self.started.elapsed().as_secs_f64() * 1_000.0,
+            outcome = self.outcome,
+            "userstatus timing"
+        );
+    }
 }
 
 async fn send_stats_report(
