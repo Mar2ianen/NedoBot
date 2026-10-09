@@ -793,6 +793,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 - Аватар в `/userstats` обогащается только для Rich-отчёта; plain HTML-вариант не вызывает Telegram API и локальный avatar cache ради неиспользуемого изображения.
 - Время `/userstatus` пишется структурированными событиями `userstatus timing`: общий итог, Telegram refresh, каждый SQL-этап, аватар, рендер и доставка. Для корреляции используется локальный `trace_id`; имя, Telegram ID, username и текст запроса в эти события не попадают. На сервере события доступны через `journalctl -u tg-ai-bot-teloxide --since today | grep 'userstatus timing'` (для ПВО — `nedobot-pvo`).
 - Число комментариев под постами берётся из `telegram_chat_users.reply_to_channel_post_count`: миграция рекурсивно пересчитывает исторические ветки, а обработка новых сообщений увеличивает тот же счётчик. `/userstatus` больше не обходит всё дерево ответов на каждый запрос; если кэш отсутствует или отстаёт по числу сообщений, остаётся точный рекурсивный fallback. Частичный индекс `telegram_messages_source_channel_root_idx` ускоряет исторический пересчёт и строится до возобновления polling после рестарта.
+- Для сводки `user_totals` добавлен частичный покрывающий индекс `telegram_messages_userstatus_totals_idx` по `(chat_id, user_id, created_at)` для сообщений без `source_channel_id`; он включает поля счётчиков ответов, ссылок, медиа и голосовых и даёт планировщику возможность читать эту выборку через index-only scan.
 
 Что важно помнить по данным:
 
