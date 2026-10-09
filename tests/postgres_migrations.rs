@@ -84,6 +84,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
 
     assert_clean_database_migrations(&pool).await;
     assert_userstatus_post_comment_count_backfill(&pool).await;
+    assert_userstatus_totals_covering_index(&pool).await;
     assert_report_outbox_lifecycle(&pool).await;
     assert_report_contract(&pool).await;
     assert_report_deduplication_and_card_query(&pool).await;
@@ -3253,6 +3254,23 @@ async fn assert_userstatus_post_comment_count_backfill(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("post-comment fixture users must be removed");
+}
+
+async fn assert_userstatus_totals_covering_index(pool: &PgPool) {
+    let index_definition: Option<String> = query_scalar(
+        "select indexdef from pg_indexes where schemaname = 'public' and indexname = 'telegram_messages_userstatus_totals_idx'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("userstatus totals index definition must be queryable");
+    let index_definition =
+        index_definition.expect("userstatus totals covering index migration must be applied");
+
+    assert!(index_definition.contains("(chat_id, user_id, created_at)"));
+    assert!(index_definition.contains("INCLUDE"));
+    assert!(index_definition.contains("reply_to_message_id"));
+    assert!(index_definition.contains("has_animation"));
+    assert!(index_definition.contains("WHERE (source_channel_id IS NULL)"));
 }
 
 async fn assert_report_outbox_lifecycle(pool: &PgPool) {
