@@ -249,60 +249,56 @@ pub async fn user_stats_report_data(
     else {
         return Ok(None);
     };
-    let profile = timed_user_stats_query(
-        trace_id,
-        "sql_user_profile",
-        repo::user_profile(pool, user_id),
-    )
-    .await?;
-    let member = timed_user_stats_query(
-        trace_id,
-        "sql_chat_member",
-        repo::chat_member_snapshot(pool, chat_id, user_id),
-    )
-    .await?;
-    let moderation = timed_user_stats_query(
-        trace_id,
-        "sql_moderation_summary",
-        repo::user_moderation_summary(pool, chat_id, user_id),
-    )
-    .await?;
-    let cached = timed_user_stats_query(
-        trace_id,
-        "sql_cached_chat_stats",
-        repo::chat_user_stats(pool, chat_id, user_id),
-    )
-    .await?;
-    let mut totals = user_totals(
+    // Independent read queries run in waves of four; their per-query timings overlap.
+    let (profile, member, moderation, cached) = tokio::try_join!(
         timed_user_stats_query(
             trace_id,
-            "sql_user_totals",
-            repo::user_totals(pool, chat_id, user_id),
-        )
-        .await?,
-    );
-    let reactions_given = timed_user_stats_query(
-        trace_id,
-        "sql_reactions_given",
-        repo::user_reactions_given(pool, chat_id, user_id),
-    )
-    .await?;
-    let reactions_received = timed_user_stats_query(
-        trace_id,
-        "sql_reactions_received",
-        repo::user_reactions_received(pool, chat_id, user_id),
-    )
-    .await?;
+            "sql_user_profile",
+            repo::user_profile(pool, user_id),
+        ),
+        timed_user_stats_query(
+            trace_id,
+            "sql_chat_member",
+            repo::chat_member_snapshot(pool, chat_id, user_id),
+        ),
+        timed_user_stats_query(
+            trace_id,
+            "sql_moderation_summary",
+            repo::user_moderation_summary(pool, chat_id, user_id),
+        ),
+        timed_user_stats_query(
+            trace_id,
+            "sql_cached_chat_stats",
+            repo::chat_user_stats(pool, chat_id, user_id),
+        ),
+    )?;
     let stop_words = USER_TOP_WORD_STOP_WORDS
         .iter()
         .map(|word| (*word).to_string())
         .collect::<Vec<_>>();
-    let top_words = timed_user_stats_query(
-        trace_id,
-        "sql_user_top_words",
-        repo::user_top_words(pool, chat_id, user_id, &stop_words, USER_TOP_WORDS_LIMIT),
-    )
-    .await?;
+    let (totals, reactions_given, reactions_received, top_words) = tokio::try_join!(
+        timed_user_stats_query(
+            trace_id,
+            "sql_user_totals",
+            repo::user_totals(pool, chat_id, user_id),
+        ),
+        timed_user_stats_query(
+            trace_id,
+            "sql_reactions_given",
+            repo::user_reactions_given(pool, chat_id, user_id),
+        ),
+        timed_user_stats_query(
+            trace_id,
+            "sql_reactions_received",
+            repo::user_reactions_received(pool, chat_id, user_id),
+        ),
+        timed_user_stats_query(
+            trace_id,
+            "sql_user_top_words",
+            repo::user_top_words(pool, chat_id, user_id, &stop_words, USER_TOP_WORDS_LIMIT),
+        ),
+    )?;
+    let mut totals = user_totals(totals);
 
     let user = user_presentation(user_id, profile.as_ref(), member.as_ref());
     if let Some(stats) = cached.as_ref() {
@@ -436,32 +432,35 @@ pub async fn refresh_user_profile(
     user_id: i64,
     trace_id: u64,
 ) {
-    let member_started = Instant::now();
-    let member_result = refresh_chat_member_snapshot(bot, pool, chat_id, user_id).await;
-    log_user_stats_operation(
-        trace_id,
-        "telegram_chat_member_refresh",
-        member_started,
-        if member_result.is_ok() { "ok" } else { "error" },
-    );
-    if let Err(err) = member_result {
-        tracing::debug!(%err, user_id, "failed to refresh member snapshot from Telegram");
-    }
-    let profile_started = Instant::now();
-    let profile_result = refresh_profile(bot.inner(), pool, user_id).await;
-    log_user_stats_operation(
-        trace_id,
-        "telegram_profile_refresh",
-        profile_started,
-        if profile_result.is_ok() {
-            "ok"
-        } else {
-            "error"
+    // These updates touch separate tables; run them together. Their trace timings overlap.
+    tokio::join!(
+        async {
+            let started = Instant::now();
+            let result = refresh_chat_member_snapshot(bot, pool, chat_id, user_id).await;
+            log_user_stats_operation(
+                trace_id,
+                "telegram_chat_member_refresh",
+                started,
+                if result.is_ok() { "ok" } else { "error" },
+            );
+            if let Err(err) = result {
+                tracing::debug!(%err, user_id, "failed to refresh member snapshot from Telegram");
+            }
+        },
+        async {
+            let started = Instant::now();
+            let result = refresh_profile(bot.inner(), pool, user_id).await;
+            log_user_stats_operation(
+                trace_id,
+                "telegram_profile_refresh",
+                started,
+                if result.is_ok() { "ok" } else { "error" },
+            );
+            if let Err(err) = result {
+                tracing::debug!(%err, user_id, "failed to refresh full user profile from Telegram");
+            }
         },
     );
-    if let Err(err) = profile_result {
-        tracing::debug!(%err, user_id, "failed to refresh full user profile from Telegram");
-    }
 }
 
 fn log_user_stats_operation(
