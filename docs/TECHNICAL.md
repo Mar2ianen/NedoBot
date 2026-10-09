@@ -321,7 +321,7 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 Измеренный до оптимизации `/userstatus` занял **915 мс**: обновление профиля — 150 мс, сбор данных — 272 мс, Telegram delivery — 492 мс. Чтобы уменьшить последовательное ожидание, member/profile refresh теперь идут параллельно, как и независимые чтения отчёта двумя группами максимум по четыре SQL-запроса. Субтаймеры этих групп пересекаются; wall-clock таймеры `profile_refresh`, `report_data` и `total` остаются временем полного этапа. На **20:24 UTC** полных командных trace-ов после этой выкладки ещё не было, поэтому фактический выигрыш не подтверждён.
 
-`/topword <слово> [-r|-p]` считает отдельные вхождения без учёта регистра и выводит 20 самых частых участников.
+`/topword <слово> [-r|-p] [-e]` считает отдельные вхождения без учёта регистра и выводит 20 самых частых участников. Для любой статистической команды `-e` запрашивает ephemeral-ответ, видимый только автору команды и боту; флаги можно комбинировать (`/topword амудятел -p -e`). В личном чате обычный ответ и так виден только его участнику.
 
 Предыдущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-09-topword`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-09-topword) на merge commit `fd3209cdce2fb1596ac27bbb8be9bb01ba157946`. Команда прошла review через [PR #55](https://github.com/Mar2ianen/NedoBot/pull/55); artifact с SHA-256 `af7e9d12e0990434a3b0fd80d7b49937441ea329e8c7dd9bacf1b34c636d4cda` из [release workflow](https://github.com/Mar2ianen/NedoBot/actions/runs/37980549503) установлен **2026-10-09 19:35 UTC / 22:35 МСК** в оба community-инстанса и public MCP.
 
@@ -578,16 +578,16 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /format_test <текст поста>
 /memory
 /ask <вопрос>
-/status day|week|month [-r|-p]
-/stats_day [-r|-p]
-/stats_week [-r|-p]
-/stats_month [-r|-p]
-/topmsg [-r|-p]
-/topword <слово> [-r|-p]
-/topreact [-r|-p]
-/bottommsg [-r|-p]
-/userstats <id|username> [-r|-p]
-/userstatus <id|username> [-r|-p]
+/status day|week|month [-r|-p] [-e]
+/stats_day [-r|-p] [-e]
+/stats_week [-r|-p] [-e]
+/stats_month [-r|-p] [-e]
+/topmsg [-r|-p] [-e]
+/topword <слово> [-r|-p] [-e]
+/topreact [-r|-p] [-e]
+/bottommsg [-r|-p] [-e]
+/userstats <id|username> [-r|-p] [-e]
+/userstatus <id|username> [-r|-p] [-e]
 /mute [duration] [reply|id|@username ...] [-- optional reason]
 /ban [duration] [reply|id|@username ...] [-- optional reason]
 /warn [duration] [reply|id|@username ...] [-- optional reason]
@@ -616,7 +616,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 
 Приветствие и прощание настраиваются шаблонами `chats.<name>.welcome_message` и `chats.<name>.farewell_message`. Оба параметра по умолчанию отсутствуют. События берутся из `chat_member`; для их получения бот должен быть администратором чата. Чтобы заменить стандартные уведомления Telegram своими шаблонами, включи `delete_join_leave_messages`. В шаблонах можно использовать `{first_name}`, `{last_name}`, `{full_name}`, `{username}`, `{user_id}` и `{chat_title}`. Значения пользователя и чата автоматически экранируются для HTML; сам шаблон допускает HTML-разметку. Боты не получают приветствия и прощания.
 
-`chats.<name>.ephemeral_command_replies = true` отправляет поддерживаемые ответы команд как Telegram ephemeral: их видит автор команды и бот, остальные участники группы их не видят. Эта настройка распространяется на ответы ручной модерации, статистики, репортов, заметок и короткие служебные команды; длинный ответ `/ask`, результаты `/transcribe` и обычные сообщения фоновых задач остаются публичными. В forum topics сохраняется исходная тема, хотя ephemeral-ответ не цитирует публичную команду. Если у команды нет обычного пользовательского автора, ответа не будет; он не станет публичным. Для ephemeral бот должен быть администратором чата; Telegram не гарантирует доставку, поэтому ошибка отправки не переключает приватный ответ на публичный.
+`chats.<name>.ephemeral_command_replies = true` отправляет поддерживаемые ответы команд как Telegram ephemeral: их видит автор команды и бот, остальные участники группы их не видят. Эта настройка распространяется на ответы ручной модерации, статистики, репортов, заметок и короткие служебные команды; длинный ответ `/ask`, результаты `/transcribe` и обычные сообщения фоновых задач остаются публичными. Для статистических команд можно запросить ephemeral-ответ разово флагом `-e`, в том числе при выключенной общей настройке: например, `/userstatus -e` или `/topword амудятел -p -e`. Это не включает режим для следующих команд. В forum topics сохраняется исходная тема, хотя ephemeral-ответ не цитирует публичную команду. Если у команды нет обычного пользовательского автора, ответа не будет; он не станет публичным. Для ephemeral бот должен быть администратором чата; Telegram не гарантирует доставку, поэтому ошибка отправки не переключает приватный ответ на публичный.
 
 
 ## Prompt

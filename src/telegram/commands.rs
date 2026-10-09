@@ -81,45 +81,45 @@ pub enum Command {
     #[cfg(feature = "manual-moderation")]
     #[command(description = "отменить последнюю свою команду модерации в этом чате")]
     Undo,
-    #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p]")]
+    #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p] [-e]")]
     StatsDay(String),
-    #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p]")]
+    #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p] [-e]")]
     StatsWeek(String),
-    #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК; [-r|-p]")]
+    #[command(description = "статистика за текущий месяц с 1 числа 05:00 МСК; [-r|-p] [-e]")]
     StatsMonth(String),
     #[command(
         rename = "status",
-        description = "статистика: /status day|week|month [-r|-p]"
+        description = "статистика: /status day|week|month [-r|-p] [-e]"
     )]
     Status(String),
     #[command(
         rename = "topmsg",
-        description = "топ 20 пользователей по сообщениям; [-r|-p]"
+        description = "топ 20 пользователей по сообщениям; [-r|-p] [-e]"
     )]
     TopMsg(String),
     #[command(
         rename = "topword",
-        description = "топ 20 пользователей по употреблению слова; /topword <слово> [-r|-p]"
+        description = "топ 20 пользователей по употреблению слова; /topword <слово> [-r|-p] [-e]"
     )]
     TopWord(String),
     #[command(
         rename = "topreact",
-        description = "топ 20 сообщений по реакциям со ссылками; [-r|-p]"
+        description = "топ 20 сообщений по реакциям со ссылками; [-r|-p] [-e]"
     )]
     TopReact(String),
     #[command(
         rename = "bottommsg",
-        description = "20 самых молчаливых пользователей; [-r|-p]"
+        description = "20 самых молчаливых пользователей; [-r|-p] [-e]"
     )]
     BottomMsg(String),
     #[command(
         rename = "userstats",
-        description = "статистика пользователя: /userstats <id|username> [-r|-p], или reply на сообщение"
+        description = "статистика пользователя: /userstats <id|username> [-r|-p] [-e], или reply на сообщение"
     )]
     UserStats(String),
     #[command(
         rename = "userstatus",
-        description = "alias /userstats: /userstatus <id|username> [-r|-p], или reply"
+        description = "alias /userstats: /userstatus <id|username> [-r|-p] [-e], или reply"
     )]
     UserStatus(String),
 }

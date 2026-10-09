@@ -91,17 +91,18 @@ migrations/                            — sqlx compile-time миграции
 | `/chat_note <текст>` | Добавить общую заметку чата |
 | `/user_note <текст>` | Добавить заметку о пользователе reply |
 | `/report [причина]` | Пожаловаться на человеческое сообщение reply; карточка уходит администраторам в личку |
-| `/stats_day [-r\|-p]` | Статистика дня (05:00 МСК) |
-| `/stats_week [-r\|-p]` | Статистика недели |
-| `/stats_month [-r\|-p]` | Статистика месяца |
-| `/status day\|week\|month [-r\|-p]` | Alias для статистики |
-| `/topmsg [-r\|-p]` | Топ 20 по сообщениям |
-| `/topreact [-r\|-p]` | Топ 20 по реакциям |
-| `/bottommsg [-r\|-p]` | 20 самых молчаливых |
-| `/userstats <id\|username> [-r\|-p]` | Карточка пользователя |
-| `/userstatus <id\|username> [-r\|-p]` | Alias /userstats |
+| `/stats_day [-r\|-p] [-e]` | Статистика дня (05:00 МСК) |
+| `/stats_week [-r\|-p] [-e]` | Статистика недели |
+| `/stats_month [-r\|-p] [-e]` | Статистика месяца |
+| `/status day\|week\|month [-r\|-p] [-e]` | Alias для статистики |
+| `/topmsg [-r\|-p] [-e]` | Топ 20 по сообщениям |
+| `/topword <слово> [-r\|-p] [-e]` | Топ по числу вхождений слова |
+| `/topreact [-r\|-p] [-e]` | Топ 20 по реакциям |
+| `/bottommsg [-r\|-p] [-e]` | 20 самых молчаливых |
+| `/userstats <id\|username> [-r\|-p] [-e]` | Карточка пользователя |
+| `/userstatus <id\|username> [-r\|-p] [-e]` | Alias /userstats |
 
-`-r` = rich HTML (дефолт), `-p` = plain text. Reply на сообщение работает как implicit target для `/userstats`.
+`-r` = rich HTML (дефолт), `-p` = plain text, `-e` = ответ только автору команды в группе. Reply на сообщение работает как implicit target для `/userstats`.
 
 ## Конфигурация
 
