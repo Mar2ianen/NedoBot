@@ -3059,6 +3059,23 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
             .expect("post_comment_jobs lookup must succeed");
     assert_eq!(post_comment_jobs.as_deref(), Some("post_comment_jobs"));
 
+    let thread_root_index_ready: bool = query_scalar(
+        r#"
+        select exists (
+            select 1 from pg_index
+            where indexrelid = to_regclass('public.telegram_messages_source_channel_root_idx')
+              and indisvalid and indisready
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("userstatus thread-root index lookup must succeed");
+    assert!(
+        thread_root_index_ready,
+        "userstatus thread-root partial index must be valid and ready"
+    );
+
     let sent_at_column: bool = query_scalar(
         r#"
         select exists (
