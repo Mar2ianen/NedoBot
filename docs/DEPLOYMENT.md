@@ -7,6 +7,23 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+9 октября 2026 в **20:21 UTC / 23:21 МСК** выпущен release
+[`deploy-2026-10-09-userstatus-parallel`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-09-userstatus-parallel)
+на merge commit `f6d1c00cfad8a081a58344a037a3974cf960cac4` после review
+[PR #57](https://github.com/Mar2ianen/NedoBot/pull/57). Release workflow
+[37985398485](https://github.com/Mar2ianen/NedoBot/actions/runs/37985398485)
+успешно собрал artifact, проверил glibc ≤ 2.39 и установил его в оба bot
+instance и MCP. SHA-256 обоих bot binaries —
+`2ca45b0161e9b98b78e2832d71e2f73dc48312a5255c27d940e06d6cffe1cdec`, MCP —
+`939fc9160824752b6000254432df717abf9f37831b1ed5f789bdc1ee0a378305`.
+
+Оба бота и `nedonews-mcp` активны с `NRestarts=0`; хеши работающих процессов
+совпали с release artifact, error-level journal после выкладки пуст. В
+`/userstatus` независимое обновление member/profile и SQL-чтения выполняются
+параллельно; до четырёх DB-запросов одновременно. На момент проверки в
+20:24 UTC новых полных командных trace-ов после выкладки ещё не было, команду
+smoke в чаты не отправляли.
+
 8 октября 2026 в **19:20 UTC / 22:20 МСК** выпущен release
 [`deploy-2026-10-08-telegram-send-fallback`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-08-telegram-send-fallback)
 на merge commit `3b427de3e3caa3cc7a996b12ce8132b603c2d6c9` после review
