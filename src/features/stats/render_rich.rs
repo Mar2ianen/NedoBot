@@ -293,12 +293,7 @@ pub fn bottom_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> 
 
 pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
     if data.users.is_empty() {
-        return format!(
-            "<h1>{} «{}»</h1><p>{}</p>",
-            strings.top_word_usage,
-            escape_html(&data.word),
-            strings.no_data,
-        );
+        return format!("<p>{}</p>", strings.no_data);
     }
     let rows = data
         .users
@@ -308,24 +303,11 @@ pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
             vec![
                 (index + 1).to_string(),
                 user_link(&row.username, row.user.user_id, &row.user.display_name),
-                bold_num(row.occurrences),
+                format!("{} {}", bold_num(row.occurrences), strings.word_occurrences),
             ]
         })
         .collect::<Vec<_>>();
-    format!(
-        "<h1>{} «{}»</h1><p>{}</p>{}",
-        strings.top_word_usage,
-        escape_html(&data.word),
-        strings.all_time,
-        table(
-            &[
-                strings.col_number,
-                strings.col_who,
-                strings.word_occurrences
-            ],
-            &rows,
-        ),
-    )
+    table_no_header(&rows)
 }
 
 fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsStrings) -> String {
@@ -725,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_top_word_escapes_term_and_renders_usage_count() {
+    fn rich_top_word_omits_headings_and_renders_usage_count() {
         let data = TopWordReportData {
             word: "<слово>".to_string(),
             users: vec![TopWordUser {
@@ -743,9 +725,11 @@ mod tests {
         };
 
         let report = top_word(&data, &StatsStrings::russian());
-        assert!(report.contains("&lt;слово&gt;"));
         assert!(report.contains("<strong>12</strong>"));
         assert!(report.contains("вхождений"));
+        assert!(!report.contains("<h1>"));
+        assert!(!report.contains("<th>"));
+        assert!(!report.contains("За всё время"));
     }
 
     #[test]

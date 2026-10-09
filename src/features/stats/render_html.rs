@@ -296,19 +296,16 @@ pub fn bottom_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> 
 }
 
 pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
-    let mut report = format!(
-        "<b>{} «{}»</b>\n{}",
-        strings.top_word_usage,
-        Html::text(&data.word).into_string(),
-        strings.all_time,
-    );
     if data.users.is_empty() {
-        report.push_str(&format!("\n\n{}", strings.no_data));
-        return report;
+        return strings.no_data.to_string();
     }
+    let mut report = String::new();
     for (index, row) in data.users.iter().enumerate() {
+        if index > 0 {
+            report.push_str("\n\n");
+        }
         report.push_str(&format!(
-            "\n\n{}. {}: <b>{}</b> {}",
+            "{}. {}: <b>{}</b> {}",
             index + 1,
             row.user.linked_with_known_badges(),
             row.occurrences,
@@ -624,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn top_word_escapes_the_search_term_and_shows_occurrences() {
+    fn top_word_omits_headings_and_shows_occurrences() {
         let data = TopWordReportData {
             word: "<слово>".to_string(),
             users: vec![TopWordUser {
@@ -642,8 +639,8 @@ mod tests {
         };
 
         let report = top_word(&data, &StatsStrings::russian());
-        assert!(report.contains("&lt;слово&gt;"));
         assert!(report.contains("<b>12</b> вхождений"));
-        assert!(!report.contains("<слово>"));
+        assert!(!report.contains("Топ употреблений слова"));
+        assert!(!report.contains("За всё время"));
     }
 }
