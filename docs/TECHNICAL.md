@@ -573,6 +573,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /stats_week [-r|-p]
 /stats_month [-r|-p]
 /topmsg [-r|-p]
+/topword <слово> [-r|-p]
 /topreact [-r|-p]
 /bottommsg [-r|-p]
 /userstats <id|username> [-r|-p]

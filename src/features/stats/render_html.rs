@@ -2,7 +2,7 @@ use crate::features::stats::document::{Kv, Section};
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{
     ChatStatsReportData, MessageMediaPreview, TopMessagesReportData, TopReactedReportData,
-    UserStatsReportData,
+    TopWordReportData, UserStatsReportData,
 };
 use crate::telegram::html::{Html, truncate_text};
 use crate::telegram::render::escape_html;
@@ -295,6 +295,29 @@ pub fn bottom_messages(data: &TopMessagesReportData, strings: &StatsStrings) -> 
     ranked_users(data, strings.quiet_ones, strings)
 }
 
+pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
+    let mut report = format!(
+        "<b>{} «{}»</b>\n{}",
+        strings.top_word_usage,
+        Html::text(&data.word).into_string(),
+        strings.all_time,
+    );
+    if data.users.is_empty() {
+        report.push_str(&format!("\n\n{}", strings.no_data));
+        return report;
+    }
+    for (index, row) in data.users.iter().enumerate() {
+        report.push_str(&format!(
+            "\n\n{}. {}: <b>{}</b> {}",
+            index + 1,
+            row.user.linked_with_known_badges(),
+            row.occurrences,
+            strings.word_occurrences,
+        ));
+    }
+    report
+}
+
 fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsStrings) -> String {
     let mut report = format!("<b>{title}</b>\n{}\n", strings.all_time);
     if data.users.is_empty() {
@@ -562,7 +585,9 @@ fn linked_message(
 mod tests {
     use super::*;
     use crate::features::stats::strings::StatsStrings;
-    use crate::features::stats::types::{TopMessageUser, UserPresentation};
+    use crate::features::stats::types::{
+        TopMessageUser, TopWordReportData, TopWordUser, UserPresentation,
+    };
 
     fn ranked_fixture() -> TopMessagesReportData {
         TopMessagesReportData {
@@ -596,5 +621,29 @@ mod tests {
     #[test]
     fn top_ranking_keeps_loud_title() {
         assert!(top_messages(&ranked_fixture(), &StatsStrings::russian()).contains("Топ пишущих"));
+    }
+
+    #[test]
+    fn top_word_escapes_the_search_term_and_shows_occurrences() {
+        let data = TopWordReportData {
+            word: "<слово>".to_string(),
+            users: vec![TopWordUser {
+                user: UserPresentation {
+                    user_id: 7,
+                    display_name: "Участник".to_string(),
+                    is_bot: false,
+                    status: None,
+                    is_admin: false,
+                    is_present: None,
+                },
+                username: None,
+                occurrences: 12,
+            }],
+        };
+
+        let report = top_word(&data, &StatsStrings::russian());
+        assert!(report.contains("&lt;слово&gt;"));
+        assert!(report.contains("<b>12</b> вхождений"));
+        assert!(!report.contains("<слово>"));
     }
 }

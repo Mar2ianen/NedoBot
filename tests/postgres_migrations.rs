@@ -4641,6 +4641,31 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     .expect("windowed stats messages must be inserted");
     query(
         r#"
+        insert into telegram_messages (chat_id, message_id, user_id, source_channel_id, text)
+        values
+            ($1, 2000000001, 1900000001, null, 'Амудятел, амудятелом амудятел!'),
+            ($1, 2000000002, 1900000002, null, 'АМУДЯТЕЛ амудятел'),
+            ($1, 2000000003, 1900000003, null, 'суперамудятел'),
+            ($1, 2000000004, 1900000004, -1001575496091, 'амудятел амудятел')
+        "#,
+    )
+    .bind(CHAT_ID)
+    .execute(pool)
+    .await
+    .expect("top word test messages must be inserted");
+    let top_word = stats_repo::top_word_users(pool, CHAT_ID, "амудятел", 20)
+        .await
+        .expect("top word query must succeed");
+    assert_eq!(
+        top_word
+            .iter()
+            .map(|row| (row.user_id, row.occurrences))
+            .collect::<Vec<_>>(),
+        vec![(1_900_000_001, 2), (1_900_000_002, 2)],
+        "top word counts case-insensitive whole-token occurrences and excludes substrings and channel posts"
+    );
+    query(
+        r#"
         insert into post_comment_jobs
             (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
              cleaned_post_text, status, bot_comment_message_id, created_at, sent_at)

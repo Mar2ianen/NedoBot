@@ -114,6 +114,19 @@ pub struct TopMessagesReportData {
 }
 
 #[derive(Clone)]
+pub struct TopWordReportData {
+    pub word: String,
+    pub users: Vec<TopWordUser>,
+}
+
+#[derive(Clone)]
+pub struct TopWordUser {
+    pub user: UserPresentation,
+    pub username: Option<String>,
+    pub occurrences: i64,
+}
+
+#[derive(Clone)]
 pub struct TopMessageUser {
     pub user: UserPresentation,
     pub username: Option<String>,

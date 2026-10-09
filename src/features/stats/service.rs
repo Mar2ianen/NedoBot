@@ -11,7 +11,8 @@ use crate::features::stats::stop_words::USER_TOP_WORD_STOP_WORDS;
 use crate::features::stats::types::{
     AttractionMetrics, BotCommentStats, ChatStatsReportData, DailyActive, MessageMediaPreview,
     PeriodTopUser, RetentionSummary, TopMessageUser, TopMessagesReportData, TopReactedMessage,
-    TopReactedReportData, UserPresentation, UserStatsReportData, UserTotals, display_name,
+    TopReactedReportData, TopWordReportData, TopWordUser, UserPresentation, UserStatsReportData,
+    UserTotals, display_name,
 };
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
@@ -132,6 +133,39 @@ pub async fn bottom_messages_report_data(
         .map(top_message_user)
         .collect();
     Ok(TopMessagesReportData { users })
+}
+
+pub async fn top_word_report_data(
+    pool: &PgPool,
+    chat_id: i64,
+    word: &str,
+    limit: i64,
+) -> anyhow::Result<TopWordReportData> {
+    let users = repo::top_word_users(pool, chat_id, word, limit)
+        .await?
+        .into_iter()
+        .map(|row| TopWordUser {
+            user: UserPresentation {
+                user_id: row.user_id,
+                display_name: display_name(
+                    row.username.as_deref(),
+                    row.first_name.as_deref(),
+                    row.last_name.as_deref(),
+                    row.user_id,
+                ),
+                is_bot: row.is_bot,
+                status: Some(row.status),
+                is_admin: row.is_admin,
+                is_present: Some(row.is_present),
+            },
+            username: row.username,
+            occurrences: row.occurrences,
+        })
+        .collect();
+    Ok(TopWordReportData {
+        word: word.to_string(),
+        users,
+    })
 }
 
 fn top_message_user(row: repo::TopMessage) -> TopMessageUser {

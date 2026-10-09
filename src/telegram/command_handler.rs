@@ -32,7 +32,8 @@ use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allo
 use crate::features::manual_moderation::types::CommandKind as ManualCommandKind;
 use crate::features::memory::report::send_memory_notes;
 use crate::features::stats::report::{
-    send_bottom_messages, send_chat_stats, send_top_messages, send_top_reacted, send_user_stats,
+    send_bottom_messages, send_chat_stats, send_top_messages, send_top_reacted, send_top_word,
+    send_user_stats,
 };
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
@@ -91,6 +92,7 @@ pub async fn handle_command(
             | Command::StatsMonth(_)
             | Command::Status(_)
             | Command::TopMsg(_)
+            | Command::TopWord(_)
             | Command::TopReact(_)
             | Command::BottomMsg(_)
             | Command::UserStats(_)
@@ -311,6 +313,30 @@ pub async fn handle_command(
                 pool,
                 msg.chat.id.0,
                 render_from_message_or_args(&msg, &args),
+                &strings,
+                command_audience(&msg, &state),
+            )
+            .await?;
+        }
+        Command::TopWord(args) => {
+            let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
+            let Some(parsed) = parse_top_word_args(raw_args) else {
+                send_command_reply_html(
+                    &bot,
+                    &msg,
+                    &state,
+                    "Использование: /topword <слово> [-r|-p]. Ищет отдельные вхождения без учета регистра.",
+                )
+                .await?;
+                return Ok(());
+            };
+            send_top_word(
+                &bot,
+                msg.chat.id,
+                pool,
+                msg.chat.id.0,
+                &parsed.word,
+                parsed.render,
                 &strings,
                 command_audience(&msg, &state),
             )
@@ -1264,6 +1290,28 @@ fn render_from_args(args: &str) -> StatsRender {
     }
 }
 
+struct TopWordArgs {
+    word: String,
+    render: StatsRender,
+}
+
+fn parse_top_word_args(args: &str) -> Option<TopWordArgs> {
+    let word = strip_render_flag(args);
+    let mut parts = word.split_whitespace();
+    let word = parts.next()?;
+    if parts.next().is_some()
+        || word.chars().count() > 64
+        || !word.chars().all(char::is_alphanumeric)
+    {
+        return None;
+    }
+
+    Some(TopWordArgs {
+        word: word.to_string(),
+        render: render_from_args(args),
+    })
+}
+
 fn has_render_flag(args: &str) -> bool {
     args.split_whitespace()
         .any(|part| is_rich_render_flag(part) || is_plain_render_flag(part))
@@ -1338,6 +1386,25 @@ mod tests {
             render_from_args("--rich --poor"),
             StatsRender::Html
         ));
+    }
+
+    #[test]
+    fn parses_topword_argument_and_render_flags() {
+        let parsed = parse_top_word_args("амудятел -p").expect("valid word");
+        assert_eq!(parsed.word, "амудятел");
+        assert_eq!(parsed.render, StatsRender::Html);
+
+        let parsed = parse_top_word_args("SpaceBunny --rich").expect("valid word");
+        assert_eq!(parsed.word, "SpaceBunny");
+        assert_eq!(parsed.render, StatsRender::Rich);
+    }
+
+    #[test]
+    fn rejects_missing_multiword_and_non_word_topword_arguments() {
+        assert!(parse_top_word_args("").is_none());
+        assert!(parse_top_word_args("два слова").is_none());
+        assert!(parse_top_word_args("слово!").is_none());
+        assert!(parse_top_word_args(&"а".repeat(65)).is_none());
     }
 
     #[cfg(feature = "ask")]
