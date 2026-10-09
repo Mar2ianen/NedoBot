@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::time::Instant;
+
 use sqlx::PgPool;
 use teloxide::prelude::*;
 
@@ -201,23 +204,71 @@ pub async fn user_stats_report_data(
     chat_id: i64,
     target: Option<&str>,
     reply_user_id: Option<i64>,
+    trace_id: u64,
 ) -> anyhow::Result<Option<UserStatsReportData>> {
-    let Some(user_id) = repo::resolve_user_id(pool, target, reply_user_id).await? else {
+    let Some(user_id) = timed_user_stats_query(
+        trace_id,
+        "sql_resolve_user",
+        repo::resolve_user_id(pool, target, reply_user_id),
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    let profile = repo::user_profile(pool, user_id).await?;
-    let member = repo::chat_member_snapshot(pool, chat_id, user_id).await?;
-    let moderation = repo::user_moderation_summary(pool, chat_id, user_id).await?;
-    let cached = repo::chat_user_stats(pool, chat_id, user_id).await?;
-    let mut totals = user_totals(repo::user_totals(pool, chat_id, user_id).await?);
-    let reactions_given = repo::user_reactions_given(pool, chat_id, user_id).await?;
-    let reactions_received = repo::user_reactions_received(pool, chat_id, user_id).await?;
+    let profile = timed_user_stats_query(
+        trace_id,
+        "sql_user_profile",
+        repo::user_profile(pool, user_id),
+    )
+    .await?;
+    let member = timed_user_stats_query(
+        trace_id,
+        "sql_chat_member",
+        repo::chat_member_snapshot(pool, chat_id, user_id),
+    )
+    .await?;
+    let moderation = timed_user_stats_query(
+        trace_id,
+        "sql_moderation_summary",
+        repo::user_moderation_summary(pool, chat_id, user_id),
+    )
+    .await?;
+    let cached = timed_user_stats_query(
+        trace_id,
+        "sql_cached_chat_stats",
+        repo::chat_user_stats(pool, chat_id, user_id),
+    )
+    .await?;
+    let mut totals = user_totals(
+        timed_user_stats_query(
+            trace_id,
+            "sql_user_totals",
+            repo::user_totals(pool, chat_id, user_id),
+        )
+        .await?,
+    );
+    let reactions_given = timed_user_stats_query(
+        trace_id,
+        "sql_reactions_given",
+        repo::user_reactions_given(pool, chat_id, user_id),
+    )
+    .await?;
+    let reactions_received = timed_user_stats_query(
+        trace_id,
+        "sql_reactions_received",
+        repo::user_reactions_received(pool, chat_id, user_id),
+    )
+    .await?;
     let stop_words = USER_TOP_WORD_STOP_WORDS
         .iter()
         .map(|word| (*word).to_string())
         .collect::<Vec<_>>();
-    let top_words =
-        repo::user_top_words(pool, chat_id, user_id, &stop_words, USER_TOP_WORDS_LIMIT).await?;
+    let top_words = timed_user_stats_query(
+        trace_id,
+        "sql_user_top_words",
+        repo::user_top_words(pool, chat_id, user_id, &stop_words, USER_TOP_WORDS_LIMIT),
+    )
+    .await?;
 
     let user = user_presentation(user_id, profile.as_ref(), member.as_ref());
     if let Some(stats) = cached.as_ref() {
@@ -298,6 +349,24 @@ pub async fn user_stats_report_data(
     }))
 }
 
+async fn timed_user_stats_query<T>(
+    trace_id: u64,
+    stage: &'static str,
+    future: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let started = Instant::now();
+    let result = future.await;
+    tracing::info!(
+        target: "nedobot::stats::perf",
+        trace_id,
+        stage,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        outcome = if result.is_ok() { "ok" } else { "error" },
+        "userstatus timing"
+    );
+    result
+}
+
 /// Rich reports may show an avatar. Keep this network and file-cache work out of
 /// the plain HTML path, where the result would be discarded.
 pub async fn enrich_user_stats_avatar(
@@ -320,13 +389,50 @@ pub async fn refresh_user_profile(
     pool: &PgPool,
     chat_id: i64,
     user_id: i64,
+    trace_id: u64,
 ) {
-    if let Err(err) = refresh_chat_member_snapshot(bot, pool, chat_id, user_id).await {
+    let member_started = Instant::now();
+    let member_result = refresh_chat_member_snapshot(bot, pool, chat_id, user_id).await;
+    log_user_stats_operation(
+        trace_id,
+        "telegram_chat_member_refresh",
+        member_started,
+        if member_result.is_ok() { "ok" } else { "error" },
+    );
+    if let Err(err) = member_result {
         tracing::debug!(%err, user_id, "failed to refresh member snapshot from Telegram");
     }
-    if let Err(err) = refresh_profile(bot.inner(), pool, user_id).await {
+    let profile_started = Instant::now();
+    let profile_result = refresh_profile(bot.inner(), pool, user_id).await;
+    log_user_stats_operation(
+        trace_id,
+        "telegram_profile_refresh",
+        profile_started,
+        if profile_result.is_ok() {
+            "ok"
+        } else {
+            "error"
+        },
+    );
+    if let Err(err) = profile_result {
         tracing::debug!(%err, user_id, "failed to refresh full user profile from Telegram");
     }
+}
+
+fn log_user_stats_operation(
+    trace_id: u64,
+    stage: &'static str,
+    started: Instant,
+    outcome: &'static str,
+) {
+    tracing::info!(
+        target: "nedobot::stats::perf",
+        trace_id,
+        stage,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        outcome,
+        "userstatus timing"
+    );
 }
 
 pub async fn refresh_top_message_users(
