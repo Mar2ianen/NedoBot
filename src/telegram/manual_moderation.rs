@@ -363,6 +363,22 @@ pub async fn handle(
                 return Ok(());
             }
             send_reply(bot, msg, state, &text).await?;
+            if matches!(
+                kind,
+                CommandKind::Mute | CommandKind::Ban | CommandKind::Warn
+            ) {
+                match manual_moderation::actions_in_batch(&state.pool, batch.id).await {
+                    Ok(actions) if should_delete_moderation_messages(kind, &actions) => {
+                        delete_configured_messages(bot, msg, state).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(
+                        %error,
+                        batch_id = batch.id,
+                        "failed to check whether moderation message deletion is allowed"
+                    ),
+                }
+            }
         }
         Err(error) => {
             tracing::error!(%error, command = kind.as_str(), "manual moderation command failed");
@@ -376,6 +392,50 @@ pub async fn handle(
         }
     }
     Ok(())
+}
+
+fn should_delete_moderation_messages(kind: CommandKind, actions: &[ActionRecord]) -> bool {
+    matches!(
+        kind,
+        CommandKind::Mute | CommandKind::Ban | CommandKind::Warn
+    ) && actions.iter().any(|action| {
+        action.status == "applied"
+            && matches!(
+                action.action.as_str(),
+                "mute" | "ban" | "warn" | "auto_mute"
+            )
+    })
+}
+
+async fn delete_configured_messages(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+) {
+    let Some(chat) = state.config.chat_by_id(msg.chat.id.0) else {
+        return;
+    };
+    if chat.config.moderation_delete_target_message
+        && let Some(target) = msg.reply_to_message()
+        && let Err(error) = bot.delete_message(msg.chat.id, target.id).await
+    {
+        tracing::warn!(
+            %error,
+            chat_id = msg.chat.id.0,
+            target_message_id = target.id.0,
+            "failed to delete configured moderation target message"
+        );
+    }
+    if chat.config.moderation_delete_command_message
+        && let Err(error) = bot.delete_message(msg.chat.id, msg.id).await
+    {
+        tracing::warn!(
+            %error,
+            chat_id = msg.chat.id.0,
+            command_message_id = msg.id.0,
+            "failed to delete configured moderation command message"
+        );
+    }
 }
 
 async fn authorize_actor(
@@ -1366,6 +1426,45 @@ mod tests {
     fn temporary_telegram_restrictions_keep_a_margin_above_the_api_30_second_boundary() {
         assert!(safe_telegram_until_date(Utc::now() + ChronoDuration::seconds(44)).is_err());
         assert!(safe_telegram_until_date(Utc::now() + ChronoDuration::seconds(60)).is_ok());
+    }
+
+    #[test]
+    fn moderation_messages_are_deleted_only_after_applied_negative_actions() {
+        let action = |action: &str, status: &str| ActionRecord {
+            id: 1,
+            batch_id: 1,
+            chat_id: -1001,
+            target_user_id: 2,
+            actor_user_id: 3,
+            action: action.to_string(),
+            reason: None,
+            status: status.to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+            supersedes_action_id: None,
+            automatic: false,
+        };
+
+        assert!(should_delete_moderation_messages(
+            CommandKind::Ban,
+            &[action("ban", "applied")]
+        ));
+        assert!(should_delete_moderation_messages(
+            CommandKind::Mute,
+            &[action("mute", "applied")]
+        ));
+        assert!(should_delete_moderation_messages(
+            CommandKind::Warn,
+            &[action("warn", "applied")]
+        ));
+        assert!(!should_delete_moderation_messages(
+            CommandKind::Ban,
+            &[action("ban", "failed")]
+        ));
+        assert!(!should_delete_moderation_messages(
+            CommandKind::Unban,
+            &[action("ban", "applied")]
+        ));
     }
 
     #[test]

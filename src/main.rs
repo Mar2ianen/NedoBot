@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
     preflight_managed_chats(&bot, &config).await?;
+    preflight_moderation_message_deletion(&bot, &config).await?;
     #[cfg(feature = "moderation")]
     preflight_risk_captcha_permissions(&bot, &config).await?;
     let pool = build_pool().await?;
@@ -1002,6 +1003,39 @@ async fn preflight_managed_chats(
         bot.get_chat(ChatId(chat_id))
             .await
             .map_err(|error| anyhow::anyhow!("managed chat {chat_id} preflight failed: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn preflight_moderation_message_deletion(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let chat_ids = config
+        .managed_chat_ids()
+        .filter(|chat_id| {
+            config.chat_allows(*chat_id, |chat| {
+                chat.moderation_delete_target_message || chat.moderation_delete_command_message
+            })
+        })
+        .collect::<Vec<_>>();
+    if chat_ids.is_empty() {
+        return Ok(());
+    }
+
+    let bot_id = bot.get_me().await?.id;
+    for chat_id in chat_ids {
+        let member = bot
+            .get_chat_member(ChatId(chat_id), bot_id)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("cannot verify message deletion permission in chat {chat_id}")
+            })?;
+        if !member.kind.can_delete_messages() {
+            anyhow::bail!(
+                "moderation message deletion is enabled for chat {chat_id}, but the bot lacks can_delete_messages"
+            );
+        }
     }
     Ok(())
 }
