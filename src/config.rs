@@ -1279,6 +1279,15 @@ fn validate_community_config(
     }
     let manual_moderation_chat_enabled =
         community.chats.values().any(|chat| chat.manual_moderation);
+    for (key, chat) in &community.chats {
+        if (chat.moderation_delete_target_message || chat.moderation_delete_command_message)
+            && !chat.manual_moderation
+        {
+            anyhow::bail!(
+                "chats.{key} moderation message deletion requires manual_moderation=true"
+            );
+        }
+    }
     if community.manual_moderation.enabled {
         require_compiled_feature("manual-moderation", cfg!(feature = "manual-moderation"))?;
         if !manual_moderation_chat_enabled {
@@ -1559,6 +1568,8 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
                 farewell_message: None,
                 moderation: true,
                 manual_moderation: false,
+                moderation_delete_target_message: false,
+                moderation_delete_command_message: false,
                 stats: true,
                 voice: true,
                 ask: true,
@@ -1668,6 +1679,22 @@ mod tests {
                     .contains("missing from this binary")
             );
         }
+    }
+
+    #[test]
+    fn moderation_message_deletion_requires_manual_moderation_for_the_chat() {
+        let (mut community, registry) = test_community_config();
+        community
+            .chats
+            .get_mut("main")
+            .unwrap()
+            .moderation_delete_command_message = true;
+
+        let error = validate_community_config(&community, &registry)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("moderation message deletion requires manual_moderation=true"));
     }
 
     #[test]
@@ -2445,6 +2472,8 @@ models = ["primary", "fallback"]
                 farewell_message: None,
                 moderation: false,
                 manual_moderation: false,
+                moderation_delete_target_message: false,
+                moderation_delete_command_message: false,
                 stats: false,
                 voice: false,
                 ask: true,

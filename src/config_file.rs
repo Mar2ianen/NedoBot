@@ -45,6 +45,10 @@ pub struct ChatConfig {
     #[serde(default)]
     pub manual_moderation: bool,
     #[serde(default)]
+    pub moderation_delete_target_message: bool,
+    #[serde(default)]
+    pub moderation_delete_command_message: bool,
+    #[serde(default)]
     pub stats: bool,
     #[serde(default)]
     pub voice: bool,
@@ -517,7 +521,15 @@ impl Default for RuntimeSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeSettings;
+    use super::{ChatConfig, RuntimeSettings};
+
+    #[test]
+    fn moderation_message_deletion_is_disabled_when_omitted() {
+        let chat: ChatConfig = toml::from_str("id = -1001").unwrap();
+
+        assert!(!chat.moderation_delete_target_message);
+        assert!(!chat.moderation_delete_command_message);
+    }
 
     #[test]
     fn python_sandbox_is_opt_in_and_has_no_implicit_image() {
