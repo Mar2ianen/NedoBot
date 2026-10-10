@@ -18,9 +18,12 @@ SHA-256 обоих bot binaries —
 Оба бота и `nedonews-mcp` active с `NRestarts=0`; running binary hashes совпали с artifact,
 error-level journal после выкладки пуст. Обе production БД применили migrations
 `20261010120000` и `20261010130000`; таблица `telegram_risk_captcha_challenges` есть в PVO.
-В PVO-профиле включены `captcha_enabled=true`, `captcha_dry_run=false`, порог `70`, TTL `600` секунд;
-до изменения сохранена копия `/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261010T1148Z`.
-Startup preflight подтвердил права бота ПВО на удаление сообщений и ограничения участников.
+При релизе в PVO-профиле включены `captcha_enabled=true`, `captcha_dry_run=false`, порог `70`, TTL `600` секунд;
+предрелизная копия: `/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261010T1148Z`. Startup preflight подтвердил права бота ПВО
+на удаление сообщений и ограничения участников.
+10 октября в **12:09 UTC / 15:09 МСК** runtime-порог капчи поднят с `70` до `85`; TTL остался 600 секунд.
+Перед правкой сохранена копия `/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261010T120842Z`, перезапущен только `nedobot-pvo`;
+после рестарта все три unit-а active, `NRestarts=0`, свежих error-level записей нет.
 
 9 октября 2026 в **20:21 UTC / 23:21 МСК** выпущен release
 [`deploy-2026-10-09-userstatus-parallel`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-09-userstatus-parallel)
