@@ -7,6 +7,21 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+10 октября 2026 в **11:55 UTC / 14:55 МСК** выпущен release
+[`deploy-2026-10-10-pvo-risk-captcha`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-10-pvo-risk-captcha)
+на merge commit `f33cfd4b9695b2205f5f06173f47f2c87a24d22d` после review [PR #63](https://github.com/Mar2ianen/NedoBot/pull/63). [Release workflow 38049697137](https://github.com/Mar2ianen/NedoBot/actions/runs/38049697137)
+собрал artifact на Ubuntu 24.04, проверил glibc ≤ 2.39 и установил его в оба bot instance и MCP.
+SHA-256 обоих bot binaries —
+`248965b10992ad10dc9ebab5c2484eddce54a21cc19afc05364da847aff3b7f7`, MCP —
+`0a6c0a8f008fc2878a59d094f4801a3af09447d1eedf002acd5b2a259dc5b186`.
+
+Оба бота и `nedonews-mcp` active с `NRestarts=0`; running binary hashes совпали с artifact,
+error-level journal после выкладки пуст. Обе production БД применили migrations
+`20261010120000` и `20261010130000`; таблица `telegram_risk_captcha_challenges` есть в PVO.
+В PVO-профиле включены `captcha_enabled=true`, `captcha_dry_run=false`, порог `70`, TTL `600` секунд;
+до изменения сохранена копия `/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261010T1148Z`.
+Startup preflight подтвердил права бота ПВО на удаление сообщений и ограничения участников.
+
 9 октября 2026 в **20:21 UTC / 23:21 МСК** выпущен release
 [`deploy-2026-10-09-userstatus-parallel`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-09-userstatus-parallel)
 на merge commit `f6d1c00cfad8a081a58344a037a3974cf960cac4` после review
