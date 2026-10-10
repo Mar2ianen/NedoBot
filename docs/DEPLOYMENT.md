@@ -7,6 +7,22 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+10 октября 2026 в **18:23 UTC / 21:23 МСК** выпущен release
+[`deploy-2026-10-10-moderation-message-delete`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-10-moderation-message-delete)
+на merge commit `7ea41fe8dab67dd1ffc43213f0f86e9611909425` после review
+[PR #66](https://github.com/Mar2ianen/NedoBot/pull/66). [Release workflow 38074803057](https://github.com/Mar2ianen/NedoBot/actions/runs/38074803057)
+успешно установил artifact в оба community-инстанса и MCP. SHA-256 обоих bot binaries —
+`53aef7c8bccb6a6b8972389ef8faa2b84aa864676a4b1fab63b001ab5cf84a62`; SHA-256 MCP —
+`2357ceb9d9b7460aced6b35516e4ad1221abe8591466e81fa4bea69c6451cfab`.
+
+Все три unit-а active, `NRestarts=0`; хеши обоих работающих bot binaries совпали с artifact,
+свежих error-level записей после рестарта нет. В PVO-профиле для `chats.review` включены
+`moderation_delete_command_message=true` и `moderation_delete_target_message=true`;
+в Nedonews эти опции не включены. Удаление выполняется только после успешного `/ban`, `/mute`
+или `/warn`. Перед правкой PVO-профиля сохранена копия
+`/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261010T181144Z`; startup preflight подтвердил
+право PVO-бота удалять сообщения.
+
 10 октября 2026 в **11:55 UTC / 14:55 МСК** выпущен release
 [`deploy-2026-10-10-pvo-risk-captcha`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-10-pvo-risk-captcha)
 на merge commit `f33cfd4b9695b2205f5f06173f47f2c87a24d22d` после review [PR #63](https://github.com/Mar2ianen/NedoBot/pull/63). [Release workflow 38049697137](https://github.com/Mar2ianen/NedoBot/actions/runs/38049697137)
