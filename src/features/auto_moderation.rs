@@ -3,6 +3,7 @@ use teloxide::{
     types::{ChatId, MessageId, UserId},
 };
 
+use serde_json::Value;
 use teloxide_antispam::policy::{AutoAction, AutoPolicy, decide_auto_action};
 
 use crate::{
@@ -18,14 +19,27 @@ use crate::{
 /// нельзя, replay пересчитывает историю новым кодом.
 const ENFORCE_FRESHNESS: chrono::Duration = chrono::Duration::hours(24);
 const MAX_DELETE_MESSAGES: i64 = 10;
+const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
+    "shared_spammer_identity",
+    "lols_spammer_identity",
+    "tree_personal_channel_adult_funnel",
+    "tree_personal_channel_invite_funnel",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnforcementDecision {
+    pub action: AutoAction,
+    pub safety_gate: &'static str,
+    pub auto_ban_evidence: Vec<String>,
+}
 
 /// Применяет лестницу автомодерации к свежему materialize-аудиту.
 ///
-/// Ступени: review-порог — удалить первое сообщение (карточка идёт обычным
-/// путём, улики уже в аудите); ban-порог — бан плюс удаление недавних
-/// сообщений плюс System-метка в корпус. Всё идемпотентно: повторный прогон
-/// пропускается по `is_spammer` и существующей System-метке, повторное
-/// удаление — по `deleted_by_bot_at`.
+/// На review-пороге первое сообщение удаляется только при включённой доставке
+/// карточек. Бан-порог требует отдельного подтверждённого сигнала; одного
+/// score недостаточно. Бан удаляет недавние сообщения и пишет System-метку.
+/// Всё идемпотентно: повторный прогон пропускается по `is_spammer` и
+/// существующей System-метке, повторное удаление — по `deleted_by_bot_at`.
 ///
 /// При `enforce_dry_run` только пишется warn-лог, Telegram API и записи
 /// не трогаются.
@@ -49,8 +63,8 @@ pub async fn maybe_enforce_audit(
         review_threshold: job.review_threshold,
         ban_threshold: moderation.enforce_ban_threshold,
     };
-    let action = decide_auto_action(score, &policy);
-    if action == AutoAction::None {
+    let proposed_action = decide_auto_action(score, &policy);
+    if proposed_action == AutoAction::None {
         return Ok(());
     }
     let user: Option<(bool, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
@@ -87,13 +101,40 @@ pub async fn maybe_enforce_audit(
     if system_labeled {
         return Ok(());
     }
+    let decision = decide_enforcement_for_audit(
+        pool,
+        job.chat_id,
+        job.telegram_user_id,
+        proposed_action,
+        moderation.review_delivery_enabled,
+    )
+    .await?;
+    let EnforcementDecision {
+        action,
+        safety_gate,
+        auto_ban_evidence,
+    } = decision;
+    if action == AutoAction::None {
+        tracing::warn!(
+            chat_id = job.chat_id,
+            user_id = job.telegram_user_id,
+            score,
+            proposed_action = ?proposed_action,
+            safety_gate,
+            "auto moderation action suppressed by safety gate"
+        );
+        return Ok(());
+    }
     if moderation.enforce_dry_run {
         tracing::warn!(
             chat_id = job.chat_id,
             user_id = job.telegram_user_id,
             score,
             ban_threshold = policy.ban_threshold,
+            proposed_action = ?proposed_action,
             action = ?action,
+            safety_gate,
+            auto_ban_evidence = ?auto_ban_evidence,
             "auto moderation dry-run: Telegram API not called"
         );
         return Ok(());
@@ -101,7 +142,83 @@ pub async fn maybe_enforce_audit(
     match action {
         AutoAction::None => Ok(()),
         AutoAction::DeleteMessages => delete_first_message(bot, pool, job).await,
-        AutoAction::Ban => ban_spammer(bot, pool, config, job, score, &policy).await,
+        AutoAction::Ban => {
+            ban_spammer(bot, pool, config, job, score, &policy, &auto_ban_evidence).await
+        }
+    }
+}
+
+/// Loads persisted audit signals and applies the evidence/review delivery gates.
+/// The durable JSON is covered by PostgreSQL integration tests.
+pub async fn decide_enforcement_for_audit(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    telegram_user_id: i64,
+    proposed_action: AutoAction,
+    review_delivery_enabled: bool,
+) -> anyhow::Result<EnforcementDecision> {
+    let auto_ban_evidence = if proposed_action == AutoAction::Ban {
+        let signals: Value = sqlx::query_scalar(
+            "select risk_signal_breakdown from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+        )
+        .bind(chat_id)
+        .bind(telegram_user_id)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or_default();
+        qualifying_auto_ban_evidence(&signals)
+    } else {
+        Vec::new()
+    };
+    let (action, safety_gate) = effective_action(
+        proposed_action,
+        review_delivery_enabled,
+        !auto_ban_evidence.is_empty(),
+    );
+    Ok(EnforcementDecision {
+        action,
+        safety_gate,
+        auto_ban_evidence,
+    })
+}
+
+fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
+    signals
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|signal| {
+            let label = signal.get("label")?.as_str()?;
+            let qualifies = if label == "known_spam_campaign_match" {
+                signal
+                    .get("template_matches")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|count| count > 0)
+            } else {
+                AUTO_BAN_EVIDENCE_LABELS.contains(&label)
+            };
+            qualifies.then(|| label.to_owned())
+        })
+        .collect()
+}
+
+fn effective_action(
+    proposed_action: AutoAction,
+    review_delivery_enabled: bool,
+    has_auto_ban_evidence: bool,
+) -> (AutoAction, &'static str) {
+    match proposed_action {
+        AutoAction::None => (AutoAction::None, "below_review_threshold"),
+        AutoAction::DeleteMessages if review_delivery_enabled => {
+            (AutoAction::DeleteMessages, "review_delivery_enabled")
+        }
+        AutoAction::DeleteMessages => (AutoAction::None, "review_delivery_disabled"),
+        AutoAction::Ban if has_auto_ban_evidence => (AutoAction::Ban, "confirmed_ban_evidence"),
+        AutoAction::Ban if review_delivery_enabled => (
+            AutoAction::DeleteMessages,
+            "ban_evidence_missing_review_fallback",
+        ),
+        AutoAction::Ban => (AutoAction::None, "ban_evidence_missing_and_review_disabled"),
     }
 }
 
@@ -154,6 +271,7 @@ async fn ban_spammer(
     job: &NewUserAuditJob,
     score: i32,
     policy: &AutoPolicy,
+    auto_ban_evidence: &[String],
 ) -> anyhow::Result<()> {
     let message_ids: Vec<i32> = sqlx::query_scalar(
         "select message_id from telegram_messages where chat_id = $1 and user_id = $2 and source_channel_id is null order by message_id desc limit $3",
@@ -198,9 +316,10 @@ async fn ban_spammer(
                 policy.review_threshold, policy.ban_threshold
             ),
             evidence: serde_json::json!({
-                "score": score,
+                    "score": score,
                 "review_threshold": policy.review_threshold,
                 "ban_threshold": policy.ban_threshold,
+                "auto_ban_evidence": auto_ban_evidence,
                 "deleted_messages": deleted,
             }),
             operator_id: None,

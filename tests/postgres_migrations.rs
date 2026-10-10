@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
 
 use tg_ai_bot_teloxide::{
@@ -19,6 +20,7 @@ use tg_ai_bot_teloxide::{
             repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
             types::AskRunStatus,
         },
+        auto_moderation::decide_enforcement_for_audit,
         chat_read_api::{
             service as chat_read_service,
             types::{MessageMatch, MessageSearchRequest, MessageSort, SemanticSearchConfig},
@@ -89,6 +91,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_report_contract(&pool).await;
     assert_report_deduplication_and_card_query(&pool).await;
     assert_spam_label_events(&pool).await;
+    assert_auto_moderation_evidence_gate(&pool).await;
     assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
@@ -3417,6 +3420,151 @@ async fn assert_report_deduplication_and_card_query(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("report fixture cleanup must succeed");
+}
+
+async fn assert_auto_moderation_evidence_gate(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const SCORE_ONLY_USER_ID: i64 = 9_000_009_101;
+    const SIMILARITY_ONLY_USER_ID: i64 = 9_000_009_102;
+    const TEMPLATE_MATCH_USER_ID: i64 = 9_000_009_103;
+    const CHANNEL_FUNNEL_USER_ID: i64 = 9_000_009_104;
+    const USER_IDS: [i64; 4] = [
+        SCORE_ONLY_USER_ID,
+        SIMILARITY_ONLY_USER_ID,
+        TEMPLATE_MATCH_USER_ID,
+        CHANNEL_FUNNEL_USER_ID,
+    ];
+
+    for sql in [
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = any($2)",
+    ] {
+        query(sql)
+            .bind(CHAT_ID)
+            .bind(USER_IDS.as_slice())
+            .execute(pool)
+            .await
+            .expect("auto moderation audit fixtures must be reset");
+    }
+    for (user_id, signals) in [
+        (
+            SCORE_ONLY_USER_ID,
+            serde_json::json!([{"label": "telegram_id_spam_probability", "coefficient": 13}]),
+        ),
+        (
+            SIMILARITY_ONLY_USER_ID,
+            serde_json::json!([{
+                "label": "known_spam_campaign_match",
+                "template_matches": 0,
+                "spam_similarity": 0.99
+            }]),
+        ),
+        (
+            TEMPLATE_MATCH_USER_ID,
+            serde_json::json!([{
+                "label": "known_spam_campaign_match",
+                "template_matches": 1,
+                "spam_similarity": 0.99
+            }]),
+        ),
+        (
+            CHANNEL_FUNNEL_USER_ID,
+            serde_json::json!([{"label": "tree_personal_channel_invite_funnel"}]),
+        ),
+    ] {
+        query(
+            "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_signal_breakdown) values ($1, $2, $3) on conflict (chat_id, telegram_user_id) do update set risk_signal_breakdown = excluded.risk_signal_breakdown",
+        )
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .bind(signals)
+        .execute(pool)
+        .await
+        .expect("auto moderation audit fixture must be stored");
+    }
+
+    let score_only =
+        decide_enforcement_for_audit(pool, CHAT_ID, SCORE_ONLY_USER_ID, AutoAction::Ban, false)
+            .await
+            .expect("score-only ban decision must load its audit");
+    assert_eq!(score_only.action, AutoAction::None);
+    assert_eq!(
+        score_only.safety_gate,
+        "ban_evidence_missing_and_review_disabled"
+    );
+
+    let score_only_review =
+        decide_enforcement_for_audit(pool, CHAT_ID, SCORE_ONLY_USER_ID, AutoAction::Ban, true)
+            .await
+            .expect("score-only review fallback must load its audit");
+    assert_eq!(score_only_review.action, AutoAction::DeleteMessages);
+    assert_eq!(
+        score_only_review.safety_gate,
+        "ban_evidence_missing_review_fallback"
+    );
+
+    let similarity_only = decide_enforcement_for_audit(
+        pool,
+        CHAT_ID,
+        SIMILARITY_ONLY_USER_ID,
+        AutoAction::Ban,
+        false,
+    )
+    .await
+    .expect("similarity-only ban decision must load its audit");
+    assert_eq!(similarity_only.action, AutoAction::None);
+    assert!(similarity_only.auto_ban_evidence.is_empty());
+
+    let template_match = decide_enforcement_for_audit(
+        pool,
+        CHAT_ID,
+        TEMPLATE_MATCH_USER_ID,
+        AutoAction::Ban,
+        false,
+    )
+    .await
+    .expect("confirmed template ban decision must load its audit");
+    assert_eq!(template_match.action, AutoAction::Ban);
+    assert_eq!(
+        template_match.auto_ban_evidence,
+        vec!["known_spam_campaign_match"]
+    );
+
+    let channel_funnel = decide_enforcement_for_audit(
+        pool,
+        CHAT_ID,
+        CHANNEL_FUNNEL_USER_ID,
+        AutoAction::Ban,
+        false,
+    )
+    .await
+    .expect("explicit channel funnel ban decision must load its audit");
+    assert_eq!(channel_funnel.action, AutoAction::Ban);
+    assert_eq!(
+        channel_funnel.auto_ban_evidence,
+        vec!["tree_personal_channel_invite_funnel"]
+    );
+
+    let review_without_delivery = decide_enforcement_for_audit(
+        pool,
+        CHAT_ID,
+        SCORE_ONLY_USER_ID,
+        AutoAction::DeleteMessages,
+        false,
+    )
+    .await
+    .expect("review safety gate must not require evidence lookup");
+    assert_eq!(review_without_delivery.action, AutoAction::None);
+    assert_eq!(
+        review_without_delivery.safety_gate,
+        "review_delivery_disabled"
+    );
+
+    query("delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = any($2)")
+        .bind(CHAT_ID)
+        .bind(USER_IDS.as_slice())
+        .execute(pool)
+        .await
+        .expect("auto moderation audit fixtures must be removable");
 }
 
 async fn assert_spam_label_events(pool: &PgPool) {
