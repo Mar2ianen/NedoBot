@@ -93,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
     GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
     preflight_managed_chats(&bot, &config).await?;
+    #[cfg(feature = "moderation")]
+    preflight_risk_captcha_permissions(&bot, &config).await?;
     let pool = build_pool().await?;
     migrate(&pool).await?;
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
@@ -152,6 +154,12 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled {
         spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
+    }
+    #[cfg(feature = "moderation")]
+    if state.config.community.moderation.captcha_enabled
+        && !state.config.community.moderation.captcha_dry_run
+    {
+        spawn_risk_captcha_worker(bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled
@@ -454,6 +462,13 @@ async fn handle_callback_query(
     query: CallbackQuery,
     state: AppState,
 ) -> ResponseResult<()> {
+    if query
+        .data
+        .as_deref()
+        .is_some_and(features::risk_captcha::is_callback_data)
+    {
+        return handle_risk_captcha_callback(&bot, &query, &state).await;
+    }
     if let Some((report_id, action)) = query.data.as_deref().and_then(reports::parse_callback) {
         return handle_report_callback(&bot, &query, &state, report_id, action).await;
     }
@@ -513,6 +528,83 @@ async fn handle_callback_query(
             bot.answer_callback_query(query.id)
                 .text("Не удалось сохранить решение.")
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn handle_risk_captcha_callback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    query: &CallbackQuery,
+    state: &AppState,
+) -> ResponseResult<()> {
+    let callback_chat_id = query.regular_message().map(|message| message.chat.id.0);
+    let outcome = match features::risk_captcha::handle_callback(
+        bot.inner(),
+        &state.pool,
+        callback_chat_id,
+        query.from.id.0 as i64,
+        query.data.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                user_id = query.from.id.0,
+                "risk captcha callback failed"
+            );
+            bot.answer_callback_query(query.id.clone())
+                .text("Не удалось обработать ответ. Попробуйте ещё раз.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let text = match outcome.attempts_left() {
+        Some(attempts_left) => format!("Неверный ответ. Осталось попыток: {attempts_left}."),
+        None => outcome.text().to_string(),
+    };
+    bot.answer_callback_query(query.id.clone())
+        .text(text)
+        .show_alert(matches!(
+            outcome,
+            features::risk_captcha::CaptchaCallbackOutcome::NotForThisUser
+                | features::risk_captcha::CaptchaCallbackOutcome::Failed
+                | features::risk_captcha::CaptchaCallbackOutcome::Expired
+        ))
+        .await?;
+
+    if outcome.is_terminal()
+        && let Some(message) = query.regular_message()
+    {
+        let card_text = match outcome {
+            features::risk_captcha::CaptchaCallbackOutcome::Passed => {
+                "Проверка пройдена. Ограничения сняты."
+            }
+            features::risk_captcha::CaptchaCallbackOutcome::PassedButOtherRestrictionRemains => {
+                "Проверка пройдена. Другое ограничение остаётся."
+            }
+            features::risk_captcha::CaptchaCallbackOutcome::Failed => {
+                "Попытки закончились. Ограничение остаётся; обратитесь к модератору."
+            }
+            features::risk_captcha::CaptchaCallbackOutcome::Expired => {
+                "Время истекло. Проверка закрывается."
+            }
+            _ => "Проверка уже недействительна.",
+        };
+        if let Err(error) = bot
+            .edit_message_text(message.chat.id, message.id, card_text)
+            .reply_markup(teloxide::types::InlineKeyboardMarkup::new(Vec::<
+                Vec<teloxide::types::InlineKeyboardButton>,
+            >::new(
+            )))
+            .await
+        {
+            tracing::debug!(%error, "failed to update completed risk captcha card");
         }
     }
     Ok(())
@@ -615,6 +707,48 @@ fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
                 }
                 Err(err) => {
                     tracing::warn!(%err, "unified new user audit worker failed to claim a job");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(feature = "moderation")]
+fn spawn_risk_captcha_worker(bot: Bot, state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match features::risk_captcha::process_next_expired(&bot, &state.pool).await {
+                Ok(true) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "risk captcha expiration worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            match features::risk_captcha::process_next_setup(
+                &bot,
+                &state.pool,
+                state.config.community.moderation.captcha_ttl_sec,
+            )
+            .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
+                    ))
+                    .await
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "risk captcha setup worker failed");
                     tokio::time::sleep(std::time::Duration::from_secs(
                         EXTERNAL_ANALYSIS_POLL.error_seconds(),
                     ))
@@ -868,6 +1002,39 @@ async fn preflight_managed_chats(
         bot.get_chat(ChatId(chat_id))
             .await
             .map_err(|error| anyhow::anyhow!("managed chat {chat_id} preflight failed: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn preflight_risk_captcha_permissions(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    config: &Config,
+) -> anyhow::Result<()> {
+    if !config.community.moderation.captcha_enabled || config.community.moderation.captcha_dry_run {
+        return Ok(());
+    }
+    let bot_id = bot.get_me().await?.id;
+    for chat_id in config
+        .managed_chat_ids()
+        .filter(|chat_id| config.chat_allows(*chat_id, |chat| chat.moderation))
+    {
+        let member = bot
+            .get_chat_member(ChatId(chat_id), bot_id)
+            .await
+            .map_err(|_| anyhow::anyhow!("cannot verify captcha permissions in chat {chat_id}"))?;
+        let has_permissions = match member.kind {
+            ChatMemberKind::Owner(_) => true,
+            ChatMemberKind::Administrator(admin) => {
+                admin.can_delete_messages && admin.can_restrict_members
+            }
+            _ => false,
+        };
+        if !has_permissions {
+            anyhow::bail!(
+                "moderation.captcha_enabled=true requires the bot to have can_delete_messages and can_restrict_members in chat {chat_id}"
+            );
+        }
     }
     Ok(())
 }

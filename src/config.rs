@@ -660,6 +660,11 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.community.moderation.captcha_enabled && !self.new_user_audit_enabled {
+            errors.push(
+                "moderation.captcha_enabled=true requires new_user_audit_enabled=true".to_string(),
+            );
+        }
 
         if let Err(error) = teloxide::utils::time::TimeContext::from_name(&self.render_timezone) {
             errors.push(format!("invalid RENDER_TIMEZONE: {error}"));
@@ -1320,6 +1325,23 @@ fn validate_community_config(
             anyhow::bail!("moderation.enforce_ban_threshold must be between 50 and 100");
         }
     }
+    if community.moderation.captcha_enabled {
+        if !(50..=100).contains(&community.moderation.captcha_threshold) {
+            anyhow::bail!("moderation.captcha_threshold must be between 50 and 100");
+        }
+        if !(60..=86_400).contains(&community.moderation.captcha_ttl_sec) {
+            anyhow::bail!("moderation.captcha_ttl_sec must be between 60 and 86400");
+        }
+        require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
+        if !community.moderation.enabled {
+            anyhow::bail!("moderation.captcha_enabled=true requires moderation.enabled=true");
+        }
+        if !community.chats.values().any(|chat| chat.moderation) {
+            anyhow::bail!(
+                "moderation.captcha_enabled=true requires at least one chat with moderation=true"
+            );
+        }
+    }
     if community.moderation.linear_spam_enabled {
         let path = community
             .moderation
@@ -1572,6 +1594,44 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn risk_captcha_is_disabled_by_default_and_validates_its_threshold() {
+        let moderation = toml::from_str::<crate::config_file::ModerationConfig>("")
+            .expect("omitted captcha settings must deserialize to safe defaults");
+        assert!(!moderation.captcha_enabled);
+        assert!(moderation.captcha_dry_run);
+        assert_eq!(moderation.captcha_threshold, 70);
+        assert_eq!(moderation.captcha_ttl_sec, 600);
+
+        let (mut community, registry) = test_community_config();
+        community.moderation.captcha_enabled = true;
+        community.moderation.captcha_threshold = 101;
+        let error = validate_community_config(&community, &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("captcha_threshold must be between 50 and 100"));
+
+        community.moderation.captcha_threshold = 70;
+        community.moderation.captcha_ttl_sec = 30;
+        community.moderation.enabled = true;
+        community.moderation.risk_profile = "test".to_string();
+        community.moderation.review_chat = Some("main".to_string());
+        community.moderation.reviewer_user_ids = vec![1];
+        community.risk_profiles.insert(
+            "test".to_string(),
+            crate::config_file::RiskProfile {
+                version: "test".to_string(),
+                old_user_message_threshold: 5,
+                review_threshold: 70,
+                telegram_id: None,
+            },
+        );
+        let error = validate_community_config(&community, &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("captcha_ttl_sec must be between 60 and 86400"));
+    }
 
     #[test]
     fn committed_production_profile_has_valid_community_config() {

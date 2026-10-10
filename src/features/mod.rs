@@ -28,6 +28,8 @@ pub mod new_user_analysis;
 pub mod new_user_audit;
 #[cfg(feature = "moderation")]
 pub mod reports;
+#[cfg(feature = "moderation")]
+pub mod risk_captcha;
 pub mod search;
 pub mod service_message_cleanup;
 #[cfg(feature = "spam-sync")]

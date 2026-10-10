@@ -40,7 +40,26 @@ enabled = true
 risk_profile = "ru_general_v1"
 review_chat = "review"
 reviewer_user_ids = [5939287960]
+captcha_enabled = false
+captcha_dry_run = true
+captcha_threshold = 70
+captcha_ttl_sec = 600
 ```
+
+`captcha_enabled` включает challenge для новых участников, чей score не ниже
+и `captcha_threshold`, и `review_threshold` выбранного risk-профиля.
+Для проверки сохраняются текущие права чата, участник временно лишается всех
+прав отправки, а первое сообщение удаляется. Только правильный ответ снимает
+это ограничение и возвращает сохранённые права. Капча не снимается по таймеру;
+после трёх неверных ответов пользователь остаётся ограничен до ручного решения.
+Сначала оставьте `captcha_dry_run = true`, затем включайте реальные действия
+только в профиле нужного instance. Капча заменяет автоудаление/автобан для
+подходящих по score пользователей и не создаёт spam label.
+TTL начинается после отправки challenge. По истечении 10 минут участник
+обратимо удаляется из чата (kick без постоянного бана); при повторном входе
+high-risk аудит может выдать новую капчу.
+Для реальных действий бот должен быть администратором с правами
+`can_delete_messages` и `can_restrict_members` в каждом модерируемом чате.
 
 Spam-review buttons are available to configured `reviewer_user_ids` and to
 current administrators/owners of the configured `review_chat`.
