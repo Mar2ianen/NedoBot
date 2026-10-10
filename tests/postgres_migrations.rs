@@ -11,6 +11,7 @@ use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
 use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
+use uuid::Uuid;
 
 use tg_ai_bot_teloxide::{
     config::Config,
@@ -53,6 +54,7 @@ use tg_ai_bot_teloxide::{
             mark_new_user_audit_retry, materialize_new_user_audit_job,
         },
         reports::{ReportCreation, ReportTarget, create_report, load_report},
+        risk_captcha::{CaptchaCallbackOutcome, mark_solving, record_wrong_answer, set_passed},
         spam_review::{
             apply_callback, claim_next_review_delivery, create_review,
             mark_review_delivery_succeeded, send_review, suppress_pending_review_deliveries,
@@ -92,6 +94,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_report_deduplication_and_card_query(&pool).await;
     assert_spam_label_events(&pool).await;
     assert_auto_moderation_evidence_gate(&pool).await;
+    assert_risk_captcha_state_transitions(&pool).await;
     assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
@@ -3057,6 +3060,26 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         .expect("migration ledger must exist");
     assert!(migration_count > 0, "all migrations must be applied");
 
+    let captcha_table: Option<String> =
+        query_scalar("select to_regclass('public.telegram_risk_captcha_challenges')::text")
+            .fetch_one(pool)
+            .await
+            .expect("risk captcha migration must be applied");
+    assert_eq!(
+        captcha_table.as_deref(),
+        Some("telegram_risk_captcha_challenges")
+    );
+    let captcha_restriction_state_column: Option<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'telegram_risk_captcha_challenges' and column_name = 'restriction_applied_at'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("captcha restriction state column must be queryable");
+    assert_eq!(
+        captcha_restriction_state_column.as_deref(),
+        Some("restriction_applied_at")
+    );
+
     let post_comment_jobs: Option<String> =
         query_scalar("select to_regclass('public.post_comment_jobs')::text")
             .fetch_one(pool)
@@ -3565,6 +3588,87 @@ async fn assert_auto_moderation_evidence_gate(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("auto moderation audit fixtures must be removable");
+}
+
+async fn assert_risk_captcha_state_transitions(pool: &PgPool) {
+    let chat_id = -1_001_932_061_163_i64;
+    let user_id = 9_000_009_901_i64;
+    let failed_id = Uuid::new_v4();
+    query(
+        r#"insert into telegram_risk_captcha_challenges
+               (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
+                options, correct_option, restore_permissions)
+           values ($1, $2, $3, 1, 80, '2 + 2 = ?', '["3", "4", "5", "6"]', 1,
+                   '{"can_send_messages": true}')"#,
+    )
+    .bind(failed_id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("captcha failure fixture must be created");
+
+    assert_eq!(
+        record_wrong_answer(pool, failed_id)
+            .await
+            .expect("first wrong answer must be recorded"),
+        CaptchaCallbackOutcome::Wrong { attempts_left: 2 }
+    );
+    assert_eq!(
+        record_wrong_answer(pool, failed_id)
+            .await
+            .expect("second wrong answer must be recorded"),
+        CaptchaCallbackOutcome::Wrong { attempts_left: 1 }
+    );
+    assert_eq!(
+        record_wrong_answer(pool, failed_id)
+            .await
+            .expect("third wrong answer must close the challenge"),
+        CaptchaCallbackOutcome::Failed
+    );
+    let failed_status: String =
+        query_scalar("select status from telegram_risk_captcha_challenges where id = $1")
+            .bind(failed_id)
+            .fetch_one(pool)
+            .await
+            .expect("failed captcha state must be readable");
+    assert_eq!(failed_status, "failed");
+
+    let passed_id = Uuid::new_v4();
+    query(
+        r#"insert into telegram_risk_captcha_challenges
+               (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
+                options, correct_option, restore_permissions)
+           values ($1, $2, $3, 1, 90, '1 + 1 = ?', '["2", "3", "4", "5"]', 0,
+                   '{"can_send_messages": true}')"#,
+    )
+    .bind(passed_id)
+    .bind(chat_id)
+    .bind(user_id + 1)
+    .execute(pool)
+    .await
+    .expect("captcha success fixture must be created");
+    assert!(
+        mark_solving(pool, passed_id)
+            .await
+            .expect("valid answer must start the solve transition")
+    );
+    set_passed(pool, passed_id)
+        .await
+        .expect("restored permissions must finalize the challenge");
+    let passed_status: String =
+        query_scalar("select status from telegram_risk_captcha_challenges where id = $1")
+            .bind(passed_id)
+            .fetch_one(pool)
+            .await
+            .expect("passed captcha state must be readable");
+    assert_eq!(passed_status, "passed");
+
+    query("delete from telegram_risk_captcha_challenges where id = any($1)")
+        .bind(vec![failed_id, passed_id])
+        .execute(pool)
+        .await
+        .expect("captcha state fixtures must be cleaned");
 }
 
 async fn assert_spam_label_events(pool: &PgPool) {

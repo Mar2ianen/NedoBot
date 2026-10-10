@@ -404,6 +404,9 @@ review_delivery_enabled = true
 risk_profile = "ru_general_v1"
 review_chat = "main"
 reviewer_user_ids = [5939287960]
+captcha_enabled = false
+captcha_dry_run = true
+captcha_threshold = 70
 embedding_spam_enabled = true
 embedding_spam_model_path = "/opt/tg-ai-bot-teloxide/models/embeddinggemma2_q4_classification_512_alt_2026-10-07.json"
 

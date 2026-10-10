@@ -90,6 +90,16 @@ pub struct ModerationConfig {
     /// сообщений с сохранением review-карточки.
     #[serde(default = "default_enforce_ban_threshold")]
     pub enforce_ban_threshold: i32,
+    /// Капча вместо удаления/бана для высокорисковых новых участников.
+    /// Включается отдельно для конкретного community instance.
+    #[serde(default)]
+    pub captcha_enabled: bool,
+    /// Не вызывает Telegram API, только пишет решение в журнал.
+    #[serde(default = "default_true")]
+    pub captcha_dry_run: bool,
+    /// Минимальный риск-скор для выдачи капчи.
+    #[serde(default = "default_captcha_threshold")]
+    pub captcha_threshold: i32,
     /// Нейроскоринг первого сообщения (word TF-IDF + LogReg, экспорт
     /// `eval/train_linear_spam.py`). Слабый supporting-сигнал поверх LLM.
     #[serde(default)]
@@ -134,6 +144,10 @@ fn default_true() -> bool {
 
 fn default_enforce_ban_threshold() -> i32 {
     90
+}
+
+fn default_captcha_threshold() -> i32 {
+    70
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

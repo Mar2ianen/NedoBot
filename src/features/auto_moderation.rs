@@ -41,8 +41,8 @@ pub struct EnforcementDecision {
 /// Всё идемпотентно: повторный прогон пропускается по `is_spammer` и
 /// существующей System-метке, повторное удаление — по `deleted_by_bot_at`.
 ///
-/// При `enforce_dry_run` только пишется warn-лог, Telegram API и записи
-/// не трогаются.
+/// Капча — независимая review-ступень: для настроенного community она
+/// заменяет удаление/бан и ограничивает участника до успешного ответа.
 pub async fn maybe_enforce_audit(
     bot: &Bot,
     pool: &sqlx::PgPool,
@@ -51,7 +51,7 @@ pub async fn maybe_enforce_audit(
     score: i32,
 ) -> anyhow::Result<()> {
     let moderation = &config.community.moderation;
-    if !moderation.enforce_enabled {
+    if !moderation.enforce_enabled && !moderation.captcha_enabled {
         return Ok(());
     }
     if !is_managed_chat(config, job.chat_id)
@@ -99,6 +99,34 @@ pub async fn maybe_enforce_audit(
     .fetch_one(pool)
     .await?;
     if system_labeled {
+        return Ok(());
+    }
+    if moderation.captcha_enabled
+        && score >= job.review_threshold
+        && score >= moderation.captcha_threshold
+    {
+        if moderation.captcha_dry_run {
+            tracing::warn!(
+                chat_id = job.chat_id,
+                user_id = job.telegram_user_id,
+                score,
+                captcha_threshold = moderation.captcha_threshold,
+                "risk captcha dry-run: Telegram API not called"
+            );
+            return Ok(());
+        }
+        let result =
+            crate::features::risk_captcha::apply_risk_captcha(bot, pool, job, score).await?;
+        tracing::warn!(
+            chat_id = job.chat_id,
+            user_id = job.telegram_user_id,
+            score,
+            outcome = ?result,
+            "risk captcha applied"
+        );
+        return Ok(());
+    }
+    if !moderation.enforce_enabled {
         return Ok(());
     }
     let decision = decide_enforcement_for_audit(
@@ -222,16 +250,44 @@ fn effective_action(
     }
 }
 
-async fn delete_first_message(
+pub(crate) async fn delete_first_message(
     bot: &Bot,
     pool: &sqlx::PgPool,
     job: &NewUserAuditJob,
 ) -> anyhow::Result<()> {
+    delete_first_message_for_user(bot, pool, job.chat_id, job.telegram_user_id).await
+}
+
+pub(crate) async fn delete_first_message_for_user(
+    bot: &Bot,
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    delete_first_message_for_user_inner(bot, pool, chat_id, user_id, false).await
+}
+
+pub(crate) async fn delete_first_message_for_user_required(
+    bot: &Bot,
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    delete_first_message_for_user_inner(bot, pool, chat_id, user_id, true).await
+}
+
+async fn delete_first_message_for_user_inner(
+    bot: &Bot,
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    user_id: i64,
+    fail_on_telegram_error: bool,
+) -> anyhow::Result<()> {
     let row: Option<(i32, bool)> = sqlx::query_as(
         "select m.message_id, m.deleted_by_bot_at is not null as deleted from telegram_messages m join telegram_new_user_profile_audits a on a.chat_id = m.chat_id and a.first_message_id = m.message_id and a.telegram_user_id = m.user_id where a.chat_id = $1 and a.telegram_user_id = $2",
     )
-    .bind(job.chat_id)
-    .bind(job.telegram_user_id)
+    .bind(chat_id)
+    .bind(user_id)
     .fetch_optional(pool)
     .await?;
     let Some((message_id, already_deleted)) = row else {
@@ -241,21 +297,24 @@ async fn delete_first_message(
         return Ok(());
     }
     if let Err(error) = bot
-        .delete_message(ChatId(job.chat_id), MessageId(message_id))
+        .delete_message(ChatId(chat_id), MessageId(message_id))
         .await
     {
         tracing::warn!(
-            chat_id = job.chat_id,
-            user_id = job.telegram_user_id,
+            chat_id,
+            user_id,
             message_id,
             %error,
             "auto moderation failed to delete first message"
         );
+        if fail_on_telegram_error {
+            return Err(error.into());
+        }
         return Ok(());
     }
     crate::db::telegram::mark_message_deleted_by_bot(
         pool,
-        job.chat_id,
+        chat_id,
         message_id,
         None,
         Some("auto_moderation_delete"),
