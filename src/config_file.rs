@@ -100,6 +100,9 @@ pub struct ModerationConfig {
     /// Минимальный риск-скор для выдачи капчи.
     #[serde(default = "default_captcha_threshold")]
     pub captcha_threshold: i32,
+    /// Сколько секунд даётся на решение до обратимого удаления из чата.
+    #[serde(default = "default_captcha_ttl_sec")]
+    pub captcha_ttl_sec: i64,
     /// Нейроскоринг первого сообщения (word TF-IDF + LogReg, экспорт
     /// `eval/train_linear_spam.py`). Слабый supporting-сигнал поверх LLM.
     #[serde(default)]
@@ -148,6 +151,10 @@ fn default_enforce_ban_threshold() -> i32 {
 
 fn default_captcha_threshold() -> i32 {
     70
+}
+
+fn default_captcha_ttl_sec() -> i64 {
+    600
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

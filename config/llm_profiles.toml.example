@@ -479,6 +479,7 @@ enforce_ban_threshold = 90
 captcha_enabled = false
 captcha_dry_run = true
 captcha_threshold = 70
+captcha_ttl_sec = 600
 linear_spam_enabled = false
 linear_spam_model_path = "/opt/tg-ai-bot-teloxide/models/linear_spam_word12_v1.json"
 embedding_spam_enabled = false

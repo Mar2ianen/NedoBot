@@ -1,7 +1,10 @@
 use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgRow};
 use teloxide::{
-    payloads::{RestrictChatMemberSetters, SendMessageSetters},
+    payloads::{
+        EditMessageTextSetters, RestrictChatMemberSetters, SendMessageSetters,
+        UnbanChatMemberSetters,
+    },
     prelude::{Bot, Requester},
     types::{
         ChatId, ChatMemberKind, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, UserId,
@@ -23,6 +26,7 @@ pub enum CaptchaOutcome {
     FailedAttempts,
     SetupFailed,
     Overridden,
+    Expired,
     Ineligible,
 }
 
@@ -32,6 +36,7 @@ pub enum CaptchaCallbackOutcome {
     PassedButOtherRestrictionRemains,
     Wrong { attempts_left: i32 },
     Failed,
+    Expired,
     Stale,
     NotForThisUser,
 }
@@ -45,6 +50,7 @@ impl CaptchaCallbackOutcome {
             }
             Self::Wrong { .. } => "Неверный ответ.",
             Self::Failed => "Попытки закончились. Ограничение остаётся; обратитесь к модератору.",
+            Self::Expired => "Время на проверку истекло.",
             Self::Stale => "Эта проверка уже недействительна.",
             Self::NotForThisUser => "Эта проверка предназначена другому участнику.",
         }
@@ -60,7 +66,11 @@ impl CaptchaCallbackOutcome {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Passed | Self::PassedButOtherRestrictionRemains | Self::Failed | Self::Stale
+            Self::Passed
+                | Self::PassedButOtherRestrictionRemains
+                | Self::Failed
+                | Self::Expired
+                | Self::Stale
         )
     }
 }
@@ -84,6 +94,7 @@ struct CaptchaChallenge {
     restore_permissions: ChatPermissions,
     restriction_applied_at: Option<chrono::DateTime<chrono::Utc>>,
     message_id: Option<i32>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
     status: String,
     setup_attempts: i32,
 }
@@ -95,8 +106,22 @@ pub async fn apply_risk_captcha(
     pool: &PgPool,
     job: &NewUserAuditJob,
     risk_score: i32,
+    ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
     let challenge = match load_user_challenge(pool, job.chat_id, job.telegram_user_id).await? {
+        Some(challenge) if challenge.status == "expired" => {
+            let member = bot
+                .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
+                .await?;
+            if !matches!(member.kind, ChatMemberKind::Member(_)) {
+                return Ok(CaptchaOutcome::Expired);
+            }
+            let chat = bot.get_chat(ChatId(job.chat_id)).await?;
+            let restore_permissions = chat.permissions().unwrap_or_else(ChatPermissions::all);
+            let math = generate_math_challenge(Uuid::new_v4());
+            let permissions_json = serde_json::to_value(restore_permissions)?;
+            reopen_expired_challenge(pool, job, risk_score, &math, &permissions_json).await?
+        }
         Some(challenge) => challenge,
         None => {
             let member = bot
@@ -107,8 +132,7 @@ pub async fn apply_risk_captcha(
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
             let restore_permissions = chat.permissions().unwrap_or_else(ChatPermissions::all);
-            let seed = Uuid::new_v4();
-            let math = generate_math_challenge(seed);
+            let math = generate_math_challenge(Uuid::new_v4());
             let permissions_json = serde_json::to_value(restore_permissions)?;
             create_or_load_challenge(pool, job, risk_score, &math, &permissions_json).await?
         }
@@ -119,6 +143,7 @@ pub async fn apply_risk_captcha(
         "failed" => return Ok(CaptchaOutcome::FailedAttempts),
         "setup_failed" => return Ok(CaptchaOutcome::SetupFailed),
         "overridden" => return Ok(CaptchaOutcome::Overridden),
+        "expired" => return Ok(CaptchaOutcome::Expired),
         "solving" => return Ok(CaptchaOutcome::AlreadyPending),
         "pending" if challenge.message_id.is_some() => {
             return Ok(CaptchaOutcome::AlreadyPending);
@@ -129,16 +154,30 @@ pub async fn apply_risk_captcha(
     let Some(claimed) = claim_setup_by_id(pool, challenge.id).await? else {
         return Ok(CaptchaOutcome::AlreadyPending);
     };
-    run_claimed_setup(bot, pool, &claimed).await
+    run_claimed_setup(bot, pool, &claimed, ttl_seconds).await
 }
 
 /// Берёт одну доставку капчи из PostgreSQL с `SKIP LOCKED`. Lease возвращает
 /// зависшую настройку в очередь после падения процесса; число попыток ограничено.
-pub async fn process_next_setup(bot: &Bot, pool: &PgPool) -> anyhow::Result<bool> {
+pub async fn process_next_setup(
+    bot: &Bot,
+    pool: &PgPool,
+    ttl_seconds: i64,
+) -> anyhow::Result<bool> {
     let Some(challenge) = claim_next_setup(pool).await? else {
         return Ok(false);
     };
-    run_claimed_setup(bot, pool, &challenge).await?;
+    run_claimed_setup(bot, pool, &challenge, ttl_seconds).await?;
+    Ok(true)
+}
+
+/// Завершает одну истёкшую капчу. Claim lease позволяет повторить kick после
+/// рестарта, если Telegram принял только часть ban/unban последовательности.
+pub async fn process_next_expired(bot: &Bot, pool: &PgPool) -> anyhow::Result<bool> {
+    let Some(challenge) = claim_next_expired(pool).await? else {
+        return Ok(false);
+    };
+    expire_claimed_challenge(bot, pool, &challenge).await?;
     Ok(true)
 }
 
@@ -146,8 +185,9 @@ async fn run_claimed_setup(
     bot: &Bot,
     pool: &PgPool,
     challenge: &CaptchaChallenge,
+    ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
-    match deliver_challenge(bot, pool, challenge).await {
+    match deliver_challenge(bot, pool, challenge, ttl_seconds).await {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
             retry_or_finish_setup(bot, pool, challenge).await?;
@@ -160,6 +200,7 @@ async fn deliver_challenge(
     bot: &Bot,
     pool: &PgPool,
     challenge: &CaptchaChallenge,
+    ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
     if !ensure_restricted(bot, pool, challenge).await? {
         return Ok(CaptchaOutcome::Overridden);
@@ -173,14 +214,15 @@ async fn deliver_challenge(
     )
     .await?;
     let text = format!(
-        "Проверка нового участника\nРешите пример: {}.\nДо успешного ответа отправка сообщений ограничена.",
-        challenge.question
+        "Проверка нового участника\nРешите пример: {}.\nУ вас {} мин. До успешного ответа отправка сообщений ограничена; после истечения времени бот удалит вас из чата.",
+        challenge.question,
+        ttl_seconds.saturating_add(59) / 60
     );
     let sent = bot
         .send_message(ChatId(challenge.chat_id), text)
         .reply_markup(keyboard(challenge))
         .await?;
-    set_message_sent(pool, challenge.id, sent.id.0).await?;
+    set_message_sent(pool, challenge.id, sent.id.0, ttl_seconds).await?;
     Ok(CaptchaOutcome::Issued)
 }
 
@@ -246,12 +288,19 @@ pub async fn handle_callback(
     if actor_user_id != challenge.user_id {
         return Ok(CaptchaCallbackOutcome::NotForThisUser);
     }
+    if challenge
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+    {
+        return Ok(CaptchaCallbackOutcome::Expired);
+    }
     if !matches!(
         challenge.status.as_str(),
         "preparing" | "setting_up" | "pending" | "solving"
     ) {
         return Ok(match challenge.status.as_str() {
             "failed" => CaptchaCallbackOutcome::Failed,
+            "expired" | "expiring" => CaptchaCallbackOutcome::Expired,
             _ => CaptchaCallbackOutcome::Stale,
         });
     }
@@ -505,6 +554,46 @@ async fn create_or_load_challenge(
     decode_challenge(row)
 }
 
+async fn reopen_expired_challenge(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    risk_score: i32,
+    math: &MathChallenge,
+    restore_permissions: &Value,
+) -> anyhow::Result<CaptchaChallenge> {
+    let options = serde_json::to_value(&math.options)?;
+    let updated_id = sqlx::query_scalar::<_, Uuid>(
+        r#"update telegram_risk_captcha_challenges
+           set id = $1, audit_job_id = $2, risk_score = $3, question = $4,
+               options = $5, correct_option = $6, restore_permissions = $7,
+               restriction_applied_at = null, message_id = null, expires_at = null,
+               status = 'preparing', attempts = 0, setup_attempts = 0,
+               setup_next_attempt_at = now(), setup_lease_expires_at = null,
+               setup_error_kind = null, created_at = now(), updated_at = now(),
+               solved_at = null
+           where chat_id = $8 and telegram_user_id = $9 and status = 'expired'
+           returning id"#,
+    )
+    .bind(math.id)
+    .bind(job.id)
+    .bind(risk_score)
+    .bind(&math.question)
+    .bind(options)
+    .bind(restore_permissions)
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .fetch_optional(pool)
+    .await?;
+    match updated_id {
+        Some(id) => load_challenge(pool, id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("reopened risk captcha challenge disappeared")),
+        None => load_user_challenge(pool, job.chat_id, job.telegram_user_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("risk captcha challenge disappeared during renewal")),
+    }
+}
+
 async fn claim_setup_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
     let claimed_id = sqlx::query_scalar::<_, Uuid>(
         r#"update telegram_risk_captcha_challenges
@@ -549,7 +638,7 @@ async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallen
            returning challenge.id, challenge.chat_id, challenge.telegram_user_id,
                      challenge.question, challenge.options, challenge.correct_option,
                      challenge.restore_permissions, challenge.restriction_applied_at,
-                     challenge.message_id,
+                     challenge.message_id, challenge.expires_at,
                      challenge.status, challenge.setup_attempts"#,
     )
     .bind(SETUP_LEASE_SECONDS)
@@ -558,13 +647,115 @@ async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallen
     row.map(decode_challenge).transpose()
 }
 
+async fn claim_next_expired(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallenge>> {
+    let row = sqlx::query(
+        r#"with candidate as (
+               select id
+               from telegram_risk_captcha_challenges
+               where (status in ('pending', 'failed') and expires_at <= now())
+                  or (status = 'solving' and expires_at <= now()
+                      and setup_lease_expires_at <= now())
+                  or (status = 'expiring' and setup_lease_expires_at <= now())
+               order by expires_at, created_at, id
+               for update skip locked
+               limit 1
+           )
+           update telegram_risk_captcha_challenges challenge
+           set status = 'expiring',
+               setup_lease_expires_at = now() + ($1 * interval '1 second'),
+               updated_at = now()
+           from candidate
+           where challenge.id = candidate.id
+           returning challenge.id, challenge.chat_id, challenge.telegram_user_id,
+                     challenge.question, challenge.options, challenge.correct_option,
+                     challenge.restore_permissions, challenge.restriction_applied_at,
+                     challenge.message_id, challenge.expires_at,
+                     challenge.status, challenge.setup_attempts"#,
+    )
+    .bind(SETUP_LEASE_SECONDS)
+    .fetch_optional(pool)
+    .await?;
+    row.map(decode_challenge).transpose()
+}
+
+async fn expire_claimed_challenge(
+    bot: &Bot,
+    pool: &PgPool,
+    challenge: &CaptchaChallenge,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "manual-moderation")]
+    if crate::features::manual_moderation::active_restriction_action(
+        pool,
+        challenge.chat_id,
+        challenge.user_id,
+    )
+    .await?
+    .is_some()
+    {
+        set_status(pool, challenge.id, "overridden").await?;
+        update_captcha_card(bot, challenge, "Проверка отменена другим ограничением.").await;
+        return Ok(());
+    }
+
+    let member = bot
+        .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+        .await?;
+    match member.kind {
+        ChatMemberKind::Restricted(restricted)
+            if restricted.is_member
+                && has_no_permissions(&restricted)
+                && challenge.restriction_applied_at.is_some() =>
+        {
+            bot.ban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+                .await?;
+            bot.unban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+                .only_if_banned(true)
+                .await?;
+        }
+        ChatMemberKind::Banned(_) if challenge.restriction_applied_at.is_some() => {
+            bot.unban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+                .only_if_banned(true)
+                .await?;
+        }
+        ChatMemberKind::Left => {}
+        _ => {
+            set_status(pool, challenge.id, "overridden").await?;
+            update_captcha_card(bot, challenge, "Проверка отменена модератором.").await;
+            return Ok(());
+        }
+    }
+
+    set_expired(pool, challenge.id).await?;
+    update_captcha_card(bot, challenge, "Время вышло. Участник удалён из чата.").await;
+    Ok(())
+}
+
+async fn update_captcha_card(bot: &Bot, challenge: &CaptchaChallenge, text: &str) {
+    let Some(message_id) = challenge.message_id else {
+        return;
+    };
+    if let Err(error) = bot
+        .edit_message_text(
+            ChatId(challenge.chat_id),
+            teloxide::types::MessageId(message_id),
+            text,
+        )
+        .reply_markup(InlineKeyboardMarkup::new(
+            Vec::<Vec<InlineKeyboardButton>>::new(),
+        ))
+        .await
+    {
+        tracing::debug!(%error, chat_id = challenge.chat_id, user_id = challenge.user_id, "failed to update expired risk captcha card");
+    }
+}
+
 async fn load_user_challenge(
     pool: &PgPool,
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, status, setup_attempts from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(chat_id)
     .bind(user_id)
@@ -575,7 +766,7 @@ async fn load_user_challenge(
 
 async fn load_challenge(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -588,7 +779,7 @@ async fn select_challenge_by_id(
     id: Uuid,
 ) -> anyhow::Result<PgRow> {
     Ok(sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_one(&mut **tx)
@@ -606,17 +797,24 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         restore_permissions: serde_json::from_value(row.try_get("restore_permissions")?)?,
         restriction_applied_at: row.try_get("restriction_applied_at")?,
         message_id: row.try_get("message_id")?,
+        expires_at: row.try_get("expires_at")?,
         status: row.try_get("status")?,
         setup_attempts: row.try_get("setup_attempts")?,
     })
 }
 
-async fn set_message_sent(pool: &PgPool, id: Uuid, message_id: i32) -> anyhow::Result<()> {
+async fn set_message_sent(
+    pool: &PgPool,
+    id: Uuid,
+    message_id: i32,
+    ttl_seconds: i64,
+) -> anyhow::Result<()> {
     sqlx::query(
-        "update telegram_risk_captcha_challenges set status = 'pending', message_id = coalesce(message_id, $2), setup_lease_expires_at = null, setup_error_kind = null, updated_at = now() where id = $1 and status in ('preparing', 'setting_up', 'pending')",
+        "update telegram_risk_captcha_challenges set status = 'pending', message_id = coalesce(message_id, $2), expires_at = coalesce(expires_at, now() + ($3 * interval '1 second')), setup_lease_expires_at = null, setup_error_kind = null, updated_at = now() where id = $1 and status in ('preparing', 'setting_up', 'pending')",
     )
     .bind(id)
     .bind(message_id)
+    .bind(ttl_seconds)
     .execute(pool)
     .await?;
     Ok(())
@@ -643,6 +841,16 @@ async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn set_expired(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'expired', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'expiring'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Фиксирует завершение только после успешного восстановления Telegram-прав.
 pub async fn set_passed(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
     sqlx::query(
@@ -658,9 +866,10 @@ pub async fn set_passed(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
 /// повторяет API-вызов после временной ошибки или рестарта процесса.
 pub async fn mark_solving(pool: &PgPool, id: Uuid) -> anyhow::Result<bool> {
     let result = sqlx::query(
-        "update telegram_risk_captcha_challenges set status = 'solving', setup_lease_expires_at = null, updated_at = now() where id = $1 and status in ('preparing', 'setting_up', 'pending', 'solving')",
+        "update telegram_risk_captcha_challenges set status = 'solving', setup_lease_expires_at = now() + ($2 * interval '1 second'), updated_at = now() where id = $1 and status in ('preparing', 'setting_up', 'pending', 'solving') and (expires_at is null or expires_at > now())",
     )
     .bind(id)
+    .bind(SETUP_LEASE_SECONDS)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -677,6 +886,7 @@ pub async fn record_wrong_answer(
                status = case when attempts + 1 >= $2 then 'failed' else 'pending' end,
                updated_at = now()
            where id = $1 and status in ('preparing', 'setting_up', 'pending')
+             and (expires_at is null or expires_at > now())
            returning attempts, status"#,
     )
     .bind(id)

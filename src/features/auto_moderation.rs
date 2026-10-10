@@ -115,8 +115,14 @@ pub async fn maybe_enforce_audit(
             );
             return Ok(());
         }
-        let result =
-            crate::features::risk_captcha::apply_risk_captcha(bot, pool, job, score).await?;
+        let result = crate::features::risk_captcha::apply_risk_captcha(
+            bot,
+            pool,
+            job,
+            score,
+            moderation.captcha_ttl_sec,
+        )
+        .await?;
         tracing::warn!(
             chat_id = job.chat_id,
             user_id = job.telegram_user_id,

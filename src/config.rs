@@ -1329,6 +1329,9 @@ fn validate_community_config(
         if !(50..=100).contains(&community.moderation.captcha_threshold) {
             anyhow::bail!("moderation.captcha_threshold must be between 50 and 100");
         }
+        if !(60..=86_400).contains(&community.moderation.captcha_ttl_sec) {
+            anyhow::bail!("moderation.captcha_ttl_sec must be between 60 and 86400");
+        }
         require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
         if !community.moderation.enabled {
             anyhow::bail!("moderation.captcha_enabled=true requires moderation.enabled=true");
@@ -1599,6 +1602,7 @@ mod tests {
         assert!(!moderation.captcha_enabled);
         assert!(moderation.captcha_dry_run);
         assert_eq!(moderation.captcha_threshold, 70);
+        assert_eq!(moderation.captcha_ttl_sec, 600);
 
         let (mut community, registry) = test_community_config();
         community.moderation.captcha_enabled = true;
@@ -1609,10 +1613,24 @@ mod tests {
         assert!(error.contains("captcha_threshold must be between 50 and 100"));
 
         community.moderation.captcha_threshold = 70;
+        community.moderation.captcha_ttl_sec = 30;
+        community.moderation.enabled = true;
+        community.moderation.risk_profile = "test".to_string();
+        community.moderation.review_chat = Some("main".to_string());
+        community.moderation.reviewer_user_ids = vec![1];
+        community.risk_profiles.insert(
+            "test".to_string(),
+            crate::config_file::RiskProfile {
+                version: "test".to_string(),
+                old_user_message_threshold: 5,
+                review_threshold: 70,
+                telegram_id: None,
+            },
+        );
         let error = validate_community_config(&community, &registry)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("captcha_enabled=true requires moderation.enabled=true"));
+        assert!(error.contains("captcha_ttl_sec must be between 60 and 86400"));
     }
 
     #[test]

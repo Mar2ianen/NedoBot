@@ -574,6 +574,7 @@ async fn handle_risk_captcha_callback(
             outcome,
             features::risk_captcha::CaptchaCallbackOutcome::NotForThisUser
                 | features::risk_captcha::CaptchaCallbackOutcome::Failed
+                | features::risk_captcha::CaptchaCallbackOutcome::Expired
         ))
         .await?;
 
@@ -589,6 +590,9 @@ async fn handle_risk_captcha_callback(
             }
             features::risk_captcha::CaptchaCallbackOutcome::Failed => {
                 "Попытки закончились. Ограничение остаётся; обратитесь к модератору."
+            }
+            features::risk_captcha::CaptchaCallbackOutcome::Expired => {
+                "Время истекло. Проверка закрывается."
             }
             _ => "Проверка уже недействительна.",
         };
@@ -717,7 +721,25 @@ fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
 fn spawn_risk_captcha_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
-            match features::risk_captcha::process_next_setup(&bot, &state.pool).await {
+            match features::risk_captcha::process_next_expired(&bot, &state.pool).await {
+                Ok(true) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "risk captcha expiration worker failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
+                    ))
+                    .await;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            match features::risk_captcha::process_next_setup(
+                &bot,
+                &state.pool,
+                state.config.community.moderation.captcha_ttl_sec,
+            )
+            .await
+            {
                 Ok(true) => continue,
                 Ok(false) => {
                     tokio::time::sleep(std::time::Duration::from_secs(

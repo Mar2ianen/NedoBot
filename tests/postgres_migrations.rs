@@ -3079,6 +3079,13 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         captcha_restriction_state_column.as_deref(),
         Some("restriction_applied_at")
     );
+    let captcha_expiry_column: Option<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'telegram_risk_captcha_challenges' and column_name = 'expires_at'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("captcha expiry column must be queryable");
+    assert_eq!(captcha_expiry_column.as_deref(), Some("expires_at"));
 
     let post_comment_jobs: Option<String> =
         query_scalar("select to_regclass('public.post_comment_jobs')::text")
@@ -3594,6 +3601,7 @@ async fn assert_risk_captcha_state_transitions(pool: &PgPool) {
     let chat_id = -1_001_932_061_163_i64;
     let user_id = 9_000_009_901_i64;
     let failed_id = Uuid::new_v4();
+    let expired_id = Uuid::new_v4();
     query(
         r#"insert into telegram_risk_captcha_challenges
                (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
@@ -3634,6 +3642,28 @@ async fn assert_risk_captcha_state_transitions(pool: &PgPool) {
             .expect("failed captcha state must be readable");
     assert_eq!(failed_status, "failed");
 
+    query(
+        r#"insert into telegram_risk_captcha_challenges
+               (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
+                options, correct_option, restore_permissions, status, expires_at)
+           values ($1, $2, $3, 1, 80, '2 + 2 = ?', '["3", "4", "5", "6"]', 1,
+                   '{"can_send_messages": true}', 'expired', now() - interval '1 second')"#,
+    )
+    .bind(expired_id)
+    .bind(chat_id)
+    .bind(user_id + 2)
+    .execute(pool)
+    .await
+    .expect("expired captcha state must be valid");
+    let expired: (String, bool) = query_as(
+        "select status, expires_at <= now() from telegram_risk_captcha_challenges where id = $1",
+    )
+    .bind(expired_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired captcha state must be readable");
+    assert_eq!(expired, ("expired".into(), true));
+
     let passed_id = Uuid::new_v4();
     query(
         r#"insert into telegram_risk_captcha_challenges
@@ -3665,7 +3695,7 @@ async fn assert_risk_captcha_state_transitions(pool: &PgPool) {
     assert_eq!(passed_status, "passed");
 
     query("delete from telegram_risk_captcha_challenges where id = any($1)")
-        .bind(vec![failed_id, passed_id])
+        .bind(vec![failed_id, expired_id, passed_id])
         .execute(pool)
         .await
         .expect("captcha state fixtures must be cleaned");

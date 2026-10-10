@@ -43,6 +43,7 @@ reviewer_user_ids = [5939287960]
 captcha_enabled = false
 captcha_dry_run = true
 captcha_threshold = 70
+captcha_ttl_sec = 600
 ```
 
 `captcha_enabled` включает challenge для новых участников, чей score не ниже
@@ -54,6 +55,9 @@ captcha_threshold = 70
 Сначала оставьте `captcha_dry_run = true`, затем включайте реальные действия
 только в профиле нужного instance. Капча заменяет автоудаление/автобан для
 подходящих по score пользователей и не создаёт spam label.
+TTL начинается после отправки challenge. По истечении 10 минут участник
+обратимо удаляется из чата (kick без постоянного бана); при повторном входе
+high-risk аудит может выдать новую капчу.
 Для реальных действий бот должен быть администратором с правами
 `can_delete_messages` и `can_restrict_members` в каждом модерируемом чате.
 
