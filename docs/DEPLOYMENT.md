@@ -7,6 +7,22 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+11 октября 2026 в **08:27 UTC / 11:27 МСК** выпущен release
+[`deploy-2026-10-11-captcha-message-cleanup`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-11-captcha-message-cleanup)
+на merge commit `a20fc82b0569eea6209e6bc60196c17de138ae44` после review
+[PR #68](https://github.com/Mar2ianen/NedoBot/pull/68). [Release workflow 38124356577](https://github.com/Mar2ianen/NedoBot/actions/runs/38124356577)
+установил artifact в оба community-инстанса и public MCP. SHA-256 обоих bot binaries —
+`c2018639febab83c95f0d660c1b0e63d031050430c842874a4bd6943ead77a94`; MCP —
+`2a04055fe0351ddc27c1d6f72037b2fd2b87eca654a98568fb4a6cfea4872c03`.
+
+Все три unit-а active с `NRestarts=0`; хеши обоих bot executable совпали с artifact,
+error-level journal после рестарта пуст. Капча очищает свежую пачку сообщений автора
+в границах аудита; повторная обработка ожидающей капчи сохраняет карточку и TTL.
+В PVO подтверждены `captcha_threshold=85`, `captcha_ttl_sec=600`, реальные действия
+без dry-run и оба флага удаления сообщений ручных команд модерации.
+Проверки перед выкладкой: `scripts/test.sh` с PostgreSQL и Telegram stub,
+`cargo clippy --all-targets --locked -- -D warnings`, зелёный CI PR #68.
+
 10 октября 2026 в **18:23 UTC / 21:23 МСК** выпущен release
 [`deploy-2026-10-10-moderation-message-delete`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-10-moderation-message-delete)
 на merge commit `7ea41fe8dab67dd1ffc43213f0f86e9611909425` после review
