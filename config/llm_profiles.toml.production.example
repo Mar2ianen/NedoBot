@@ -296,15 +296,15 @@ chat_retrieval_half_life_days = 7.0
 search_enabled = true
 search_extract_temperature = 0.1
 search_extract_max_tokens = 900
-search_mcp_command = "npx"
-search_mcp_args = ["-y", "mcp-remote", "https://mcp.exa.ai/mcp"]
+search_mcp_command = "env"
+search_mcp_args = ["MODE=stdio", "DEFAULT_SEARCH_ENGINE=duckduckgo", "SEARCH_MODE=request", "MCP_TOOL_SEARCH_NAME=search", "npx", "--yes", "open-websearch@2.2.0"]
 search_mcp_env = ["PATH", "HOME"]
 search_mcp_timeout_sec = 30
 search_query_timeout_sec = 20
-search_mcp_tool_web = "web_search_exa"
-search_mcp_tool_github = "web_search_exa"
-search_mcp_tool_reddit = "web_search_exa"
-search_mcp_tool_fetch = "web_fetch_exa"
+search_mcp_tool_web = "search"
+search_mcp_tool_github = "search"
+search_mcp_tool_reddit = "search"
+search_mcp_tool_fetch = ""
 search_fetch_top_n = 2
 search_fetch_max_chars = 16000
 comment_blocked_source_domains = [
@@ -315,10 +315,6 @@ comment_blocked_source_domains = [
   "ridl.io", "doxa.team", "7x7-journal.ru", "paperpaper.ru",
 ]
 comment_blocked_terms = []
-search_github_mcp_command = "npx"
-search_github_mcp_args = ["-y", "@modelcontextprotocol/server-github"]
-search_github_mcp_env = ["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"]
-search_github_mcp_tools = ["search_issues", "search_code"]
 
 new_user_audit_enabled = true
 avatar_embeddings_enabled = true

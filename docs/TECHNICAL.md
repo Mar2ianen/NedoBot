@@ -184,7 +184,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - `runtime.search_mcp_env` — allowlist имён env vars, которые можно передать MCP child process. Значения не логируются.
 - `runtime.search_query_timeout_sec` — отдельный deadline одного source query. Таймаут GitHub, Reddit или web не отбрасывает результаты остальных источников.
 - `runtime.search_mcp_tool_web`, `runtime.search_mcp_tool_github`, `runtime.search_mcp_tool_reddit` задают имена MCP tools для основного MCP server.
-- `runtime.search_mcp_tool_fetch` включает дополнительный fetch top URL после search. Для Exa это `web_fetch_exa`.
+- `runtime.search_mcp_tool_fetch` включает дополнительный fetch top URL после search. Пустая строка отключает fetch.
 - `runtime.search_github_mcp_command` / `runtime.search_github_mcp_args` включают отдельный GitHub MCP server для запросов `source=github`; если они не заданы, GitHub-запросы идут через основной `runtime.search_mcp_tool_github`.
 - `runtime.search_github_mcp_env` по умолчанию пропускает только `PATH,HOME,GITHUB_PERSONAL_ACCESS_TOKEN`; значения не логируются.
 - `runtime.search_github_mcp_tools` по умолчанию вызывает только read-only `search_issues,search_code`; write tools GitHub MCP не вызываются.
@@ -200,25 +200,25 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
 - Chat retrieval работает отдельно: `runtime.chat_retrieval_shadow_enabled` сохраняет гибридные кандидаты и раскрытый контекст только для аудита. `runtime.chat_retrieval_evidence_enabled` по умолчанию выключен; включать его можно лишь после ручной оценки shadow-выборки. Даже при включении в prompt попадают только кандидаты не ниже `runtime.chat_retrieval_evidence_min_score`.
 
-Проверенный вариант без отдельного API key — hosted Exa MCP через `mcp-remote`:
+Для поиска без платного API используется локальный stdio MCP [`open-websearch`](https://github.com/Aas-ee/open-webSearch), который отправляет запросы нескольким публичным поисковикам без API-ключей. Его сервер запускается только как дочерний процесс бота; `MODE=stdio` обязателен, чтобы MCP-пакет не поднимал дополнительный HTTP listener. Провайдер скрейпит публичные страницы поиска, поэтому выдача зависит от доступности и ограничений поисковиков; это не API с гарантированной квотой или SLA.
 
 ```toml
 [runtime]
 search_enabled = true
-search_mcp_command = "npx"
-search_mcp_args = ["-y", "mcp-remote", "https://mcp.exa.ai/mcp"]
+search_mcp_command = "env"
+search_mcp_args = ["MODE=stdio", "DEFAULT_SEARCH_ENGINE=duckduckgo", "SEARCH_MODE=request", "MCP_TOOL_SEARCH_NAME=search", "npx", "--yes", "open-websearch@2.2.0"]
 search_mcp_env = ["PATH", "HOME"]
 search_mcp_timeout_sec = 30
 search_query_timeout_sec = 20
-search_mcp_tool_web = "web_search_exa"
-search_mcp_tool_github = "web_search_exa"
-search_mcp_tool_reddit = "web_search_exa"
-search_mcp_tool_fetch = "web_fetch_exa"
+search_mcp_tool_web = "search"
+search_mcp_tool_github = "search"
+search_mcp_tool_reddit = "search"
+search_mcp_tool_fetch = ""
 search_fetch_top_n = 4
 search_fetch_max_chars = 16000
 ```
 
-Для новостей об утилитах можно добавить GitHub MCP поверх Exa, чтобы `source=github` ходил в GitHub issues/code отдельно:
+Для `github` и `reddit` запросов общий инструмент получает `site:github.com` или `site:reddit.com`; результаты дополнительно фильтруются по домену до передачи модели. Отдельный GitHub MCP можно включить при наличии GitHub token, но базовый веб-поиск от него не зависит.
 
 ```env
 GITHUB_PERSONAL_ACCESS_TOKEN=
@@ -232,7 +232,7 @@ search_github_mcp_env = ["PATH", "HOME", "GITHUB_PERSONAL_ACCESS_TOKEN"]
 search_github_mcp_tools = ["search_issues", "search_code"]
 ```
 
-`PATH,HOME` нужны не Exa, а `npx`/`mcp-remote` после `env_clear()`. Значения не логируются.
+`PATH,HOME` нужны для запуска `npx` и доступа к его локальному пакету после `env_clear()`. Дочерний MCP работает только в stdio-режиме; значения env не логируются.
 
 Voice transcription (`[runtime]` в profile TOML):
 

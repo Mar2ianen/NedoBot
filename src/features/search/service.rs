@@ -83,9 +83,9 @@ async fn run_search_enabled(
 
 async fn run_queries_in_parallel(config: &Config, queries: &[SearchQuery]) -> Vec<SearchResult> {
     let mut tasks = JoinSet::new();
-    // Web and Reddit share the same remote Exa MCP. Starting every query at once
-    // made those short-lived proxy processes compete with each other and lose
-    // otherwise valid search responses. GitHub uses a separate MCP process.
+    // Web and Reddit share the same short-lived MCP search process. Starting every query at once
+    // made those subprocesses compete with each other and lose
+    // otherwise valid search responses. A dedicated GitHub MCP may use a separate process.
     let shared_mcp_slots = Arc::new(Semaphore::new(2));
 
     for (index, query) in queries.iter().cloned().enumerate() {
