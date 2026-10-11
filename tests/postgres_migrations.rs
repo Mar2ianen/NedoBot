@@ -77,6 +77,9 @@ use tg_ai_bot_teloxide::{
 
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
 
+#[path = "support/risk_captcha_cleanup.rs"]
+mod risk_captcha_cleanup;
+
 #[tokio::test]
 #[ignore = "run with ./scripts/test.sh against the local test database"]
 async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecycle() {
@@ -95,6 +98,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_spam_label_events(&pool).await;
     assert_auto_moderation_evidence_gate(&pool).await;
     assert_risk_captcha_state_transitions(&pool).await;
+    risk_captcha_cleanup::assert_cleanup(&pool).await;
     assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;

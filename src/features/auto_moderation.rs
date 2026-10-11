@@ -17,7 +17,7 @@ use crate::{
 
 /// Окно свежести для enforcement: банить задним числом по старым аудитам
 /// нельзя, replay пересчитывает историю новым кодом.
-const ENFORCE_FRESHNESS: chrono::Duration = chrono::Duration::hours(24);
+pub(crate) const ENFORCE_FRESHNESS: chrono::Duration = chrono::Duration::hours(24);
 const MAX_DELETE_MESSAGES: i64 = 10;
 const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
     "shared_spammer_identity",
@@ -270,25 +270,6 @@ pub(crate) async fn delete_first_message_for_user(
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<()> {
-    delete_first_message_for_user_inner(bot, pool, chat_id, user_id, false).await
-}
-
-pub(crate) async fn delete_first_message_for_user_required(
-    bot: &Bot,
-    pool: &sqlx::PgPool,
-    chat_id: i64,
-    user_id: i64,
-) -> anyhow::Result<()> {
-    delete_first_message_for_user_inner(bot, pool, chat_id, user_id, true).await
-}
-
-async fn delete_first_message_for_user_inner(
-    bot: &Bot,
-    pool: &sqlx::PgPool,
-    chat_id: i64,
-    user_id: i64,
-    fail_on_telegram_error: bool,
-) -> anyhow::Result<()> {
     let row: Option<(i32, bool)> = sqlx::query_as(
         "select m.message_id, m.deleted_by_bot_at is not null as deleted from telegram_messages m join telegram_new_user_profile_audits a on a.chat_id = m.chat_id and a.first_message_id = m.message_id and a.telegram_user_id = m.user_id where a.chat_id = $1 and a.telegram_user_id = $2",
     )
@@ -313,9 +294,6 @@ async fn delete_first_message_for_user_inner(
             %error,
             "auto moderation failed to delete first message"
         );
-        if fail_on_telegram_error {
-            return Err(error.into());
-        }
         return Ok(());
     }
     crate::db::telegram::mark_message_deleted_by_bot(
