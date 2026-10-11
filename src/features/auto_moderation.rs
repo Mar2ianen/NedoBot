@@ -1,6 +1,6 @@
 use teloxide::{
     prelude::*,
-    types::{ChatId, MessageId, UserId},
+    types::{ChatId, ChatMemberKind, MessageId, UserId},
 };
 
 use serde_json::Value;
@@ -20,6 +20,7 @@ use crate::{
 pub(crate) const ENFORCE_FRESHNESS: chrono::Duration = chrono::Duration::hours(24);
 const MAX_DELETE_MESSAGES: i64 = 10;
 const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
+    "local_spammer_identity",
     "shared_spammer_identity",
     "lols_spammer_identity",
     "tree_personal_channel_adult_funnel",
@@ -38,8 +39,8 @@ pub struct EnforcementDecision {
 /// На review-пороге первое сообщение удаляется только при включённой доставке
 /// карточек. Бан-порог требует отдельного подтверждённого сигнала; одного
 /// score недостаточно. Бан удаляет недавние сообщения и пишет System-метку.
-/// Всё идемпотентно: повторный прогон пропускается по `is_spammer` и
-/// существующей System-метке, повторное удаление — по `deleted_by_bot_at`.
+/// Разметка усиливает риск, но не доказывает исполнение действия. Повторный
+/// прогон сверяет текущий статус в Telegram; удаление — `deleted_by_bot_at`.
 ///
 /// Капча — независимая review-ступень: для настроенного community она
 /// заменяет удаление/бан и ограничивает участника до успешного ответа.
@@ -77,12 +78,12 @@ pub async fn maybe_enforce_audit(
     let Some((is_spammer, first_seen_at)) = user else {
         return Ok(());
     };
-    if is_spammer {
-        return Ok(());
-    }
     let fresh = first_seen_at
         .is_some_and(|seen| chrono::Utc::now().signed_duration_since(seen) <= ENFORCE_FRESHNESS);
-    if !fresh {
+    // Размеченный участник может снова писать через недели после вступления.
+    // Исторического replay недостаточно: нужен свежий апдейт в текущем аудите.
+    let recent_known_spammer = is_spammer && has_recent_audited_activity(pool, job).await?;
+    if !fresh && !recent_known_spammer {
         tracing::info!(
             chat_id = job.chat_id,
             user_id = job.telegram_user_id,
@@ -91,14 +92,21 @@ pub async fn maybe_enforce_audit(
         );
         return Ok(());
     }
-    let system_labeled: bool = sqlx::query_scalar(
-        "select exists (select 1 from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'spam' and source = 'system')",
-    )
-    .bind(job.chat_id)
-    .bind(job.telegram_user_id)
-    .fetch_one(pool)
-    .await?;
-    if system_labeled {
+    let member = bot
+        .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
+        .await?;
+    let eligible = match member.kind {
+        ChatMemberKind::Member(_) => true,
+        ChatMemberKind::Restricted(restricted) => restricted.is_member,
+        _ => false,
+    };
+    if !eligible {
+        tracing::info!(
+            chat_id = job.chat_id,
+            user_id = job.telegram_user_id,
+            score,
+            "auto moderation skipped ineligible Telegram membership"
+        );
         return Ok(());
     }
     if moderation.captcha_enabled
@@ -180,6 +188,34 @@ pub async fn maybe_enforce_audit(
             ban_spammer(bot, pool, config, job, score, &policy, &auto_ban_evidence).await
         }
     }
+}
+
+async fn has_recent_audited_activity(
+    pool: &sqlx::PgPool,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        r#"select exists (
+             select 1 from telegram_messages m
+             join telegram_new_user_profile_audits a
+               on a.chat_id = m.chat_id and a.telegram_user_id = m.user_id
+             where a.chat_id = $1 and a.telegram_user_id = $2
+               and a.unified_audit_snapshot_hash = $3
+               and m.message_id = a.last_message_id
+               and m.source_channel_id is null and m.deleted_by_bot_at is null
+               and case when jsonb_typeof(m.raw_json -> 'date') = 'number'
+                 then (m.raw_json ->> 'date')::numeric >=
+                      extract(epoch from now()) - $4::bigint
+                 else m.created_at >= now() - ($4::bigint * interval '1 second')
+               end
+           )"#,
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .bind(&job.snapshot_hash)
+    .bind(ENFORCE_FRESHNESS.num_seconds())
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Loads persisted audit signals and applies the evidence/review delivery gates.

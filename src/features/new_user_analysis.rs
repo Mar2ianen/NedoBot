@@ -49,7 +49,7 @@ fn analysis_config_from_runtime(config: &Config) -> NewUserAnalysisConfig {
 /// Сохраняет baseline, ревизию снимка и unified-audit job одной транзакцией.
 /// Между baseline и job нет окна, в котором materializer может увидеть
 /// несогласованное состояние.
-pub(crate) async fn enqueue_new_user_audit_for_profile_refresh(
+pub async fn enqueue_new_user_audit_for_profile_refresh(
     pool: &PgPool,
     runtime_config: &Config,
     chat_id: i64,
@@ -113,7 +113,7 @@ fn project_unified_user_audit_material_revision(
     // Изменение текстовых сообщений должно создавать новую генерацию, а не
     // только перезаписывать input_json у уже завершённой оценки.
     json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
         "review_threshold": config.review_threshold,
@@ -126,6 +126,7 @@ fn project_unified_user_audit_material_revision(
             "display_name": bounded_audit_text(features.display_name.as_deref()),
             "bio_preview": bounded_audit_text(features.bio.as_deref()),
             "profile_photo_unique_id": features.profile_photo_file_unique_id,
+            "local_spammer_identity": features.local_spammer_identity,
             "shared_spammer_identity": features.shared_spammer_identity,
             "lols_spammer_identity": features.lols_spammer_identity,
         },
@@ -234,6 +235,7 @@ fn project_unified_user_audit_snapshot(
             }),
             "shared_spammer_identity": features.shared_spammer_identity,
             "score": risk.score,
+            "local_spammer_identity": features.local_spammer_identity,
             "level": risk.level,
             "primary_class": risk.primary_class,
             "class_scores": risk.class_scores,
@@ -401,6 +403,7 @@ async fn load_features(
             p.username,
             coalesce(uns.reuse_count, 0)::bigint as username_reuse_count,
             coalesce(uns.reuse_spammer_count, 0)::bigint as username_reuse_spammer_count,
+            coalesce(cu.is_spammer, false) as local_spammer_identity,
             exists (
                 select 1
                 from shared_spam_reputation r
@@ -598,6 +601,7 @@ async fn load_features(
             username: row.get("username"),
             username_reuse_count: row.get("username_reuse_count"),
             username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
+            local_spammer_identity: row.get("local_spammer_identity"),
             shared_spammer_identity: row.get("shared_spammer_identity"),
             lols_spammer_identity: row.get("lols_spammer_identity"),
             first_name: row.get("first_name"),
@@ -1093,6 +1097,24 @@ mod tests {
         assert_ne!(
             revision,
             project_unified_user_audit_material_revision(&changed_message, &config)
+        );
+    }
+
+    #[test]
+    fn local_spam_label_changes_the_canonical_audit_revision() {
+        let config = NewUserAnalysisConfig::default();
+        let features = NewUserFeatures::default();
+        let original = project_unified_user_audit_material_revision(&features, &config);
+        let labeled = NewUserFeatures {
+            local_spammer_identity: true,
+            ..features.clone()
+        };
+        let revision = project_unified_user_audit_material_revision(&labeled, &config);
+        assert_ne!(original, revision);
+        assert_eq!(revision["profile"]["local_spammer_identity"], true);
+        assert_eq!(
+            original,
+            project_unified_user_audit_material_revision(&features, &config)
         );
     }
 
