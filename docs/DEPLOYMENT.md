@@ -7,6 +7,26 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+11 октября 2026 в **09:55 UTC / 12:55 МСК** выпущен release
+[`deploy-2026-10-11-known-spammer-risk`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-11-known-spammer-risk)
+на merge commit `9a5f54b839acdc94acef58ebeec075c81bb25f99` после review
+[PR #70](https://github.com/Mar2ianen/NedoBot/pull/70). [Release workflow 38129601469](https://github.com/Mar2ianen/NedoBot/actions/runs/38129601469)
+установил artifact в оба community-инстанса и public MCP. SHA-256 обоих bot binaries —
+`0817aa8075e84e3b65b5cd4d6cd6edc2896cf00f6d5b4363678a4beb0293de3a`; MCP —
+`6d5d3940698fb59e02455bf3a9738319a24ff19da17becd1ad20c817eeb76446`.
+
+Все три unit-а active с `NRestarts=0`; хеши обоих работающих bot executable совпали
+с artifact, error-level journal после рестарта пуст. Текущая локальная spam-метка
+усиливает baseline на 70 баллов, сохраняет полный аудит и меняет ревизию снимка.
+Ранее размеченный участник с новым сообщением может получить капчу после первых
+суток в чате; старый replay без свежей активности действий не выполняет.
+Текущий статус проверяется через typed Telegram API: banned/left и администраторы
+пропускаются. PVO-порог 85 и TTL 600 секунд сохранены.
+Проверки: `scripts/test.sh`, strict Clippy, зелёный [CI 38129117611](https://github.com/Mar2ianen/NedoBot/actions/runs/38129117611),
+PostgreSQL + Telegram stub для +70, chat scope, свежести исходной Telegram date,
+повторной капчи и снятия метки. Для зависимости прошла полная матрица features
+([teloxide-antispam PR #1](https://github.com/Mar2ianen/teloxide-antispam/pull/1)).
+
 11 октября 2026 в **08:27 UTC / 11:27 МСК** выпущен release
 [`deploy-2026-10-11-captcha-message-cleanup`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-11-captcha-message-cleanup)
 на merge commit `a20fc82b0569eea6209e6bc60196c17de138ae44` после review
