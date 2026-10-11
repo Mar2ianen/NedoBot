@@ -61,25 +61,22 @@ impl SearchProvider for McpSearchProvider {
                 );
                 Ok(results)
             }
-            Ok(Err(err)) => {
+            Ok(Err(_err)) => {
                 tracing::warn!(
-                    %err,
                     source = ?query.source,
-                    query = %query.text,
                     latency_ms = started.elapsed().as_millis(),
                     "MCP search source failed"
                 );
-                Ok(Vec::new())
+                Err(anyhow::anyhow!("external search is unavailable"))
             }
             Err(_) => {
                 tracing::warn!(
                     source = ?query.source,
-                    query = %query.text,
                     timeout_secs = self.config.search_query_timeout_sec,
                     latency_ms = started.elapsed().as_millis(),
                     "MCP search source timed out"
                 );
-                Ok(Vec::new())
+                Err(anyhow::anyhow!("external search timed out"))
             }
         }
     }
@@ -114,7 +111,10 @@ struct McpProcessConfig {
 impl McpProcessConfig {
     fn for_query(config: &Config, query: &SearchQuery) -> anyhow::Result<Self> {
         if query.source == SearchSource::Github
-            && let Some(command) = config.search_github_mcp_command.as_deref()
+            && let Some(command) = config
+                .search_github_mcp_command
+                .as_deref()
+                .filter(|command| !command.trim().is_empty())
         {
             return Ok(Self {
                 command: command.to_string(),
@@ -135,7 +135,11 @@ impl McpProcessConfig {
             args: config.search_mcp_args.clone(),
             env: config.search_mcp_env.clone(),
             tool_names: vec![tool_name(config, query.source).to_string()],
-            fetch_tool: config.search_mcp_fetch_tool.clone(),
+            fetch_tool: config
+                .search_mcp_fetch_tool
+                .as_deref()
+                .filter(|tool| !tool.trim().is_empty())
+                .map(str::to_owned),
         })
     }
 }
@@ -151,6 +155,20 @@ fn github_tool_names(config: &Config) -> Vec<String> {
 
 fn is_github_readonly_search_tool(tool_name: &str) -> bool {
     matches!(tool_name, "search_issues" | "search_code")
+}
+
+fn matches_source_domain(source: SearchSource, value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return source == SearchSource::Web;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return source == SearchSource::Web;
+    };
+    match source {
+        SearchSource::Web => true,
+        SearchSource::Github => host == "github.com" || host.ends_with(".github.com"),
+        SearchSource::Reddit => host == "reddit.com" || host.ends_with(".reddit.com"),
+    }
 }
 
 async fn spawn_mcp_service(
@@ -189,28 +207,35 @@ async fn run_mcp_flow(
         let response =
             match call_mcp_tool(service, tool_name, tool_arguments(tool_name, query)).await {
                 Ok(response) => response,
-                Err(err) => {
+                Err(_err) => {
                     tracing::warn!(
-                        %err,
                         source = ?query.source,
                         tool = %tool_name,
                         result_count = results.len(),
                         "MCP search tool failed after partial results"
                     );
+                    if results.is_empty() {
+                        anyhow::bail!("MCP search tool call failed");
+                    }
                     break;
                 }
             };
         match parse_mcp_tool_response(query.source, &response) {
             Ok(mut parsed) => results.append(&mut parsed),
-            Err(err) => tracing::warn!(
-                %err,
-                source = ?query.source,
-                tool = %tool_name,
-                result_count = results.len(),
-                "MCP search response could not be parsed after partial results"
-            ),
+            Err(_err) => {
+                tracing::warn!(
+                    source = ?query.source,
+                    tool = %tool_name,
+                    result_count = results.len(),
+                    "MCP search response could not be parsed after partial results"
+                );
+                if results.is_empty() {
+                    anyhow::bail!("MCP search response could not be parsed");
+                }
+            }
         }
     }
+    results.retain(|result| matches_source_domain(query.source, &result.url));
     results.retain(|result| is_allowed_search_result(config, result));
 
     if let Some(fetch_tool) = process_config.fetch_tool.as_deref() {
@@ -253,7 +278,13 @@ async fn run_mcp_flow(
         }
     }
 
-    if query.source == SearchSource::Github && process_config.fetch_tool.is_none() {
+    if query.source == SearchSource::Github
+        && process_config.fetch_tool.is_none()
+        && config
+            .search_github_mcp_command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty())
+    {
         enrich_github_results(service, &mut results, config.search_fetch_top_n).await;
     }
 
@@ -287,6 +318,19 @@ fn tool_name(config: &Config, source: SearchSource) -> &str {
 
 fn tool_arguments(tool_name: &str, query: &SearchQuery) -> Value {
     match tool_name {
+        "search" => {
+            let query_text = match query.source {
+                SearchSource::Github => format!("site:github.com {}", query.text),
+                SearchSource::Reddit => format!("site:reddit.com {}", query.text),
+                SearchSource::Web => query.text.clone(),
+            };
+            json!({
+                "query": query_text,
+                "limit": 5,
+                "engines": ["duckduckgo", "brave"],
+                "searchMode": "request"
+            })
+        }
         "web_search_exa" | "web_search_advanced_exa" => json!({
             "query": query.text,
             "numResults": 5
@@ -550,6 +594,15 @@ fn parse_tool_output(source: SearchSource, text: &str) -> anyhow::Result<Vec<Sea
                 anyhow::anyhow!("MCP tool output must be array or object with results/items")
             })?,
     };
+
+    if items.is_empty()
+        && value
+            .get("partialFailures")
+            .and_then(Value::as_array)
+            .is_some_and(|failures| !failures.is_empty())
+    {
+        anyhow::bail!("all configured search engines failed");
+    }
 
     Ok(items
         .iter()
