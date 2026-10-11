@@ -7,7 +7,8 @@ use teloxide::{
     },
     prelude::{Bot, Requester},
     types::{
-        ChatId, ChatMemberKind, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, UserId,
+        ChatId, ChatMemberKind, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup,
+        MessageId, UserId,
     },
 };
 use uuid::Uuid;
@@ -17,6 +18,8 @@ use crate::features::new_user_audit::repo::NewUserAuditJob;
 const MAX_WRONG_ANSWERS: i32 = 3;
 const MAX_SETUP_ATTEMPTS: i32 = 5;
 const SETUP_LEASE_SECONDS: i64 = 120;
+const TELEGRAM_DELETE_BATCH_SIZE: usize = 100;
+const MAX_CAPTCHA_CLEANUP_MESSAGES: i64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptchaOutcome {
@@ -146,6 +149,10 @@ pub async fn apply_risk_captcha(
         "expired" => return Ok(CaptchaOutcome::Expired),
         "solving" => return Ok(CaptchaOutcome::AlreadyPending),
         "pending" if challenge.message_id.is_some() => {
+            if !ensure_restricted(bot, pool, &challenge).await? {
+                return Ok(CaptchaOutcome::Overridden);
+            }
+            delete_audited_messages(bot, pool, &challenge).await?;
             return Ok(CaptchaOutcome::AlreadyPending);
         }
         "preparing" | "setting_up" | "pending" => {}
@@ -206,13 +213,7 @@ async fn deliver_challenge(
         return Ok(CaptchaOutcome::Overridden);
     }
 
-    crate::features::auto_moderation::delete_first_message_for_user_required(
-        bot,
-        pool,
-        challenge.chat_id,
-        challenge.user_id,
-    )
-    .await?;
+    delete_audited_messages(bot, pool, challenge).await?;
     let text = format!(
         "Проверка нового участника\nРешите пример: {}.\nУ вас {} мин. До успешного ответа отправка сообщений ограничена; после истечения времени бот удалит вас из чата.",
         challenge.question,
@@ -224,6 +225,69 @@ async fn deliver_challenge(
         .await?;
     set_message_sent(pool, challenge.id, sent.id.0, ttl_seconds).await?;
     Ok(CaptchaOutcome::Issued)
+}
+
+/// После мута очищаем всю свежую пачку пользователя в границах аудита.
+/// Пакетный Telegram-метод пропускает уже удалённые модератором сообщения;
+/// подтверждённые пачки отмечаются в БД и не отправляются повторно при retry.
+async fn delete_audited_messages(
+    bot: &Bot,
+    pool: &PgPool,
+    challenge: &CaptchaChallenge,
+) -> anyhow::Result<()> {
+    let message_ids: Vec<i32> = sqlx::query_scalar(
+        r#"select m.message_id
+           from telegram_messages m
+           join telegram_new_user_profile_audits a
+             on a.chat_id = m.chat_id and a.telegram_user_id = m.user_id
+           where a.chat_id = $1 and a.telegram_user_id = $2
+             and m.message_id between a.first_message_id and a.last_message_id
+             and m.source_channel_id is null and m.deleted_by_bot_at is null
+             and m.created_at >= now() - ($3 * interval '1 second')
+             and (nullif(btrim(m.text), '') is not null
+                  or m.has_photo or m.has_video or m.has_document or m.has_audio
+                  or m.has_voice or m.has_sticker or m.has_animation
+                  or m.raw_json ?| array['poll', 'video_note', 'contact', 'location',
+                                        'venue', 'dice', 'paid_media', 'story', 'game'])
+           order by m.message_id desc limit $4"#,
+    )
+    .bind(challenge.chat_id)
+    .bind(challenge.user_id)
+    .bind(crate::features::auto_moderation::ENFORCE_FRESHNESS.num_seconds())
+    .bind(MAX_CAPTCHA_CLEANUP_MESSAGES)
+    .fetch_all(pool)
+    .await?;
+    for batch in message_ids.chunks(TELEGRAM_DELETE_BATCH_SIZE) {
+        bot.delete_messages(
+            ChatId(challenge.chat_id),
+            batch.iter().copied().map(MessageId),
+        )
+        .await?;
+        sqlx::query(
+            "update telegram_messages set deleted_by_bot_at = now(), deleted_by_bot_actor_id = null, deleted_by_bot_reason = 'risk_captcha_cleanup', updated_at = now() where chat_id = $1 and user_id = $2 and message_id = any($3) and deleted_by_bot_at is null",
+        )
+        .bind(challenge.chat_id)
+        .bind(challenge.user_id)
+        .bind(batch)
+        .execute(pool)
+        .await?;
+    }
+    if !message_ids.is_empty() {
+        tracing::info!(
+            chat_id = challenge.chat_id,
+            user_id = challenge.user_id,
+            deleted_messages = message_ids.len(),
+            "risk captcha audit messages cleaned"
+        );
+    }
+    if message_ids.len() == MAX_CAPTCHA_CLEANUP_MESSAGES as usize {
+        tracing::warn!(
+            chat_id = challenge.chat_id,
+            user_id = challenge.user_id,
+            "risk captcha cleanup reached its message budget"
+        );
+    }
+    Ok(())
 }
 
 async fn retry_or_finish_setup(
