@@ -381,8 +381,11 @@ async fn load_first_message_score_context(
     let mut reputation_inputs = reputation_inputs;
     reputation_inputs.is_command = text.trim_start().starts_with('/');
     reputation_inputs.has_text = true;
-    let embedding = embed_classification_text(config, &text).await?;
-    let embedding_literal = pgvector_literal(&embedding)?;
+    let embedding = best_effort_first_message_embedding(
+        embed_classification_text(config, &text).await,
+        job.chat_id,
+        job.telegram_user_id,
+    );
     let reply_context = first_message_reply_context(&job.input_json);
     let linear_spam_probability = config
         .linear_spam_model
@@ -393,23 +396,27 @@ async fn load_first_message_score_context(
         embedding_model_version,
         embedding_head_version,
         embedding_calibration,
-    ) = load_embedding_spam_signal(config, &embedding);
+    ) = embedding
+        .as_ref()
+        .map(|(embedding, _)| load_embedding_spam_signal(config, embedding))
+        .unwrap_or_default();
+    let spam_similarity = match embedding.as_ref() {
+        Some((_, embedding_literal)) => {
+            load_calibrated_spam_similarity(pool, config, job.telegram_user_id, embedding_literal)
+                .await?
+        }
+        None => None,
+    };
     let context = FirstMessageScoreContext {
         template_matches: template_match_count(pool, job.chat_id, job.telegram_user_id, &text)
             .await?,
-        spam_similarity: load_calibrated_spam_similarity(
-            pool,
-            config,
-            job.telegram_user_id,
-            &embedding_literal,
-        )
-        .await?,
+        spam_similarity,
         feminine_profile_name: row.get("first_name_feminine_pattern"),
         rkn_vpn_restriction_context: is_rkn_vpn_restriction_context(reply_context),
         personal_channel_content,
         // Персист корпуса для будущих similarity-проверок выполняется
         // в materialize через ScoreComponents.first_message_embedding.
-        embedding: Some(embedding_literal),
+        embedding: embedding.map(|(_, embedding_literal)| embedding_literal),
         linear_spam_probability,
         linear_spam_model_version: config
             .linear_spam_model
@@ -435,6 +442,27 @@ async fn load_first_message_score_context(
         reputation_inputs.behavior_available = true;
     }
     Ok((context, reputation_inputs))
+}
+
+fn best_effort_first_message_embedding(
+    result: anyhow::Result<Vec<f32>>,
+    chat_id: i64,
+    user_id: i64,
+) -> Option<(Vec<f32>, String)> {
+    match result.and_then(|embedding| {
+        let literal = pgvector_literal(&embedding)?;
+        Ok((embedding, literal))
+    }) {
+        Ok(embedding) => Some(embedding),
+        Err(_) => {
+            tracing::warn!(
+                chat_id,
+                user_id,
+                "first-message embedding unavailable; continuing text-based risk scoring"
+            );
+            None
+        }
+    }
 }
 
 async fn load_calibrated_spam_similarity(
@@ -875,6 +903,57 @@ mod tests {
                 "summary": "Оснований для проверки нет."
             }
         })
+    }
+
+    #[test]
+    fn unavailable_embedding_does_not_block_evidence_backed_first_message_scoring() {
+        let embedding = best_effort_first_message_embedding(
+            Err(anyhow::anyhow!("embedding service unavailable")),
+            -1001748745317,
+            8692711426,
+        );
+        assert!(embedding.is_none());
+
+        let assessment = NewUserAuditAssessment::parse(
+            r#"{
+                "avatar_observation": null,
+                "first_message_assessment": {
+                    "relation_to_chat": "off_topic",
+                    "direct_dm_offer": true,
+                    "offtopic_promo": true,
+                    "template_campaign": true,
+                    "self_reference_grammar": "none_or_unclear",
+                    "profile_name_grammar_relation": "not_applicable",
+                    "risk_markers": ["paid_easy_task_offer", "direct_messages"],
+                    "evidence": [
+                        {"marker": "paid_easy_task_offer", "quote": "Доход за день"},
+                        {"marker": "direct_messages", "quote": "Пиши в личку"}
+                    ],
+                    "summary": "Предложение заработка с переходом в личные сообщения.",
+                    "confidence": 0.95
+                },
+                "profile_assessment": {
+                    "risk_patterns": ["no_material_risk_pattern"],
+                    "evidence": [],
+                    "contradictions": [],
+                    "review_priority": "high",
+                    "confidence": 0.9,
+                    "summary": "Текстовый профиль не меняет оценку сообщения."
+                }
+            }"#,
+        )
+        .expect("assessment must satisfy the stored contract");
+        let score = score_assessment(
+            70,
+            json!([]),
+            &assessment,
+            FirstMessageScoreContext::default(),
+            70,
+        );
+
+        assert_eq!(score.first_message_score, 30);
+        assert_eq!(score.final_score(), 100);
+        assert!(score.first_message_embedding.is_none());
     }
 
     #[test]
