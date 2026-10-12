@@ -740,7 +740,7 @@ Cleanup prompt находится в `prompts/voice_cleanup.md`. Он долже
 
 `src/features/new_user_analysis.rs` собирает профильные и поведенческие метрики новых/низкоактивных пользователей. Live flow запускает аудит после refresh профиля автора сообщения; `message_count >= 5` считается old-active baseline: snapshot сохраняется, но риск-сигналы не начисляются.
 
-`runtime.new_user_audit_enabled=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. Startup validation проверяет profile route, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
+`runtime.new_user_audit_enabled=false` по умолчанию. При включении после profile refresh создаётся только unified job: один LLM assessment содержит profile, avatar и first-message sections, после чего bounded materialization атомарно обновляет score/signals и review request. EmbeddingGemma — дополнительный сигнал: при ошибке запроса или невалидном векторе пропускаются только embedding-head и similarity, а текстовая оценка всё равно материализуется и передаётся автомодерации. Ошибки БД по-прежнему отправляют materialization на retry. Startup validation проверяет profile route, output limit и embedding-конфиг; параллельных источников риска и отдельных legacy jobs нет.
 
 Ключевая таблица: `telegram_new_user_profile_audits`. В ней сохраняются классы риска, labels/reasons, возраст в чате, reply/comment context, текстовая повторяемость, профиль/персональный канал, наличие/метрики фото. `profile_photo_reuse_count` сейчас метрика only и не добавляет risk score.
 
