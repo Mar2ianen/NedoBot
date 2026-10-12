@@ -7,6 +7,26 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+12 октября 2026 в **09:21 UTC / 12:21 МСК** выпущен release
+[`deploy-2026-10-12-spam-audit-embedding-fallback`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-12-spam-audit-embedding-fallback)
+на merge commit `8eafb8d7019e49f424530a0090a1693c96b7784f` после review
+[PR #73](https://github.com/Mar2ianen/NedoBot/pull/73). [Release workflow 38228410730](https://github.com/Mar2ianen/NedoBot/actions/runs/38228410730)
+установил artifact в оба community-инстанса и public MCP. SHA-256 обоих bot binaries —
+`3b8394451336738481de72f1933f31af388a34dffb70395af769136eb216ce3c`; MCP —
+`bb000a8ea6c93987ef9c000a12f708d17ebbe72c2d25ca35e97a8df89baafbc0`.
+
+Все три unit-а active с `NRestarts=0`; хеши обоих bot executable совпали с artifact,
+error-level journal после рестарта пуст. Ошибка/невалидный ответ EmbeddingGemma теперь
+пропускает только similarity и embedding-head: текстовая first-message оценка сохраняется
+и передаётся автомодерации. После выкладки один из двух зависших PVO-аудитов получил
+капчу с риском 100 и TTL 600 секунд; второй к моменту повторной проверки уже был banned,
+поэтому автоматическое действие для него было пропущено.
+
+`nedobot-rag-embedding` остановлен после 1 869 перезапусков и `SIGKILL` (exit status 137):
+на VPS исчерпалась RAM и swap. Text-based аудит спама продолжает работать без embedding,
+но retrieval/similarity функции, которым нужен этот сервис, остаются недоступны до
+устранения нехватки памяти.
+
 11 октября 2026 в **09:55 UTC / 12:55 МСК** выпущен release
 [`deploy-2026-10-11-known-spammer-risk`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-11-known-spammer-risk)
 на merge commit `9a5f54b839acdc94acef58ebeec075c81bb25f99` после review
