@@ -3094,6 +3094,16 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
     .await
     .expect("captcha expiry column must be queryable");
     assert_eq!(captcha_expiry_column.as_deref(), Some("expires_at"));
+    let captcha_trigger_source_column: Option<String> = query_scalar(
+        "select column_name from information_schema.columns where table_schema = 'public' and table_name = 'telegram_risk_captcha_challenges' and column_name = 'trigger_source'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("captcha trigger source column must be queryable");
+    assert_eq!(
+        captcha_trigger_source_column.as_deref(),
+        Some("trigger_source")
+    );
 
     let post_comment_jobs: Option<String> =
         query_scalar("select to_regclass('public.post_comment_jobs')::text")

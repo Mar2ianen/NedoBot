@@ -403,6 +403,7 @@ risk_profile = "ru_general_v1"
 review_chat = "main"
 reviewer_user_ids = [5939287960]
 captcha_enabled = false
+paid_dm_plus_captcha_enabled = false
 captcha_dry_run = true
 captcha_threshold = 70
 captcha_ttl_sec = 600

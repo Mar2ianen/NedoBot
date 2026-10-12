@@ -45,6 +45,17 @@ pub async fn process_next_new_user_audit_job(
 }
 
 async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAuditJob) {
+    if let Err(error) =
+        crate::features::auto_moderation::maybe_apply_paid_dm_plus_captcha(bot, pool, config, job)
+            .await
+    {
+        tracing::warn!(
+            job_id = job.id,
+            %error,
+            "local paid DM plus captcha rule failed"
+        );
+    }
+
     if job.is_materialization_replay {
         match materialize_stored_assessment(pool, config, job).await {
             Ok(Some(score)) => {

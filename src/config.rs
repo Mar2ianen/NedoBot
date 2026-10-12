@@ -665,6 +665,12 @@ impl Config {
                 "moderation.captcha_enabled=true requires new_user_audit_enabled=true".to_string(),
             );
         }
+        if self.community.moderation.paid_dm_plus_captcha_enabled && !self.new_user_audit_enabled {
+            errors.push(
+                "moderation.paid_dm_plus_captcha_enabled=true requires new_user_audit_enabled=true"
+                    .to_string(),
+            );
+        }
 
         if let Err(error) = teloxide::utils::time::TimeContext::from_name(&self.render_timezone) {
             errors.push(format!("invalid RENDER_TIMEZONE: {error}"));
@@ -1351,6 +1357,11 @@ fn validate_community_config(
             );
         }
     }
+    if community.moderation.paid_dm_plus_captcha_enabled && !community.moderation.captcha_enabled {
+        anyhow::bail!(
+            "moderation.paid_dm_plus_captcha_enabled=true requires moderation.captcha_enabled=true"
+        );
+    }
     if community.moderation.linear_spam_enabled {
         let path = community
             .moderation
@@ -1611,6 +1622,7 @@ mod tests {
         let moderation = toml::from_str::<crate::config_file::ModerationConfig>("")
             .expect("omitted captcha settings must deserialize to safe defaults");
         assert!(!moderation.captcha_enabled);
+        assert!(!moderation.paid_dm_plus_captcha_enabled);
         assert!(moderation.captcha_dry_run);
         assert_eq!(moderation.captcha_threshold, 70);
         assert_eq!(moderation.captcha_ttl_sec, 600);
@@ -1642,6 +1654,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("captcha_ttl_sec must be between 60 and 86400"));
+    }
+
+    #[test]
+    fn paid_dm_plus_rule_requires_captcha_to_be_enabled() {
+        let (mut community, registry) = test_community_config();
+        community.moderation.paid_dm_plus_captcha_enabled = true;
+        let error = validate_community_config(&community, &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(
+            "moderation.paid_dm_plus_captcha_enabled=true requires moderation.captcha_enabled=true"
+        ));
     }
 
     #[test]

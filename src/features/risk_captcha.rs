@@ -34,6 +34,21 @@ pub enum CaptchaOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptchaTriggerSource {
+    AuditScore,
+    PaidDmPlusOffer,
+}
+
+impl CaptchaTriggerSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuditScore => "audit_score",
+            Self::PaidDmPlusOffer => "paid_dm_plus_offer_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptchaCallbackOutcome {
     Passed,
     PassedButOtherRestrictionRemains,
@@ -100,6 +115,7 @@ struct CaptchaChallenge {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     status: String,
     setup_attempts: i32,
+    trigger_source: String,
 }
 
 /// Создаёт durable challenge и запускает его доставку. Незавершённая настройка
@@ -110,6 +126,25 @@ pub async fn apply_risk_captcha(
     job: &NewUserAuditJob,
     risk_score: i32,
     ttl_seconds: i64,
+) -> anyhow::Result<CaptchaOutcome> {
+    apply_risk_captcha_with_source(
+        bot,
+        pool,
+        job,
+        risk_score,
+        ttl_seconds,
+        CaptchaTriggerSource::AuditScore,
+    )
+    .await
+}
+
+pub async fn apply_risk_captcha_with_source(
+    bot: &Bot,
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    risk_score: i32,
+    ttl_seconds: i64,
+    trigger_source: CaptchaTriggerSource,
 ) -> anyhow::Result<CaptchaOutcome> {
     let challenge = match load_user_challenge(pool, job.chat_id, job.telegram_user_id).await? {
         Some(challenge) if challenge.status == "expired" => {
@@ -123,9 +158,20 @@ pub async fn apply_risk_captcha(
             let restore_permissions = chat.permissions().unwrap_or_else(ChatPermissions::all);
             let math = generate_math_challenge(Uuid::new_v4());
             let permissions_json = serde_json::to_value(restore_permissions)?;
-            reopen_expired_challenge(pool, job, risk_score, &math, &permissions_json).await?
+            reopen_expired_challenge(
+                pool,
+                job,
+                risk_score,
+                trigger_source,
+                &math,
+                &permissions_json,
+            )
+            .await?
         }
-        Some(challenge) => challenge,
+        Some(challenge) => {
+            update_challenge_trigger(pool, challenge.id, risk_score, trigger_source).await?;
+            challenge
+        }
         None => {
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
@@ -137,7 +183,15 @@ pub async fn apply_risk_captcha(
             let restore_permissions = chat.permissions().unwrap_or_else(ChatPermissions::all);
             let math = generate_math_challenge(Uuid::new_v4());
             let permissions_json = serde_json::to_value(restore_permissions)?;
-            create_or_load_challenge(pool, job, risk_score, &math, &permissions_json).await?
+            create_or_load_challenge(
+                pool,
+                job,
+                risk_score,
+                trigger_source,
+                &math,
+                &permissions_json,
+            )
+            .await?
         }
     };
 
@@ -209,6 +263,12 @@ async fn deliver_challenge(
     challenge: &CaptchaChallenge,
     ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
+    tracing::info!(
+        chat_id = challenge.chat_id,
+        user_id = challenge.user_id,
+        trigger_source = challenge.trigger_source,
+        "setting up risk captcha"
+    );
     if !ensure_restricted(bot, pool, challenge).await? {
         return Ok(CaptchaOutcome::Overridden);
     }
@@ -578,6 +638,7 @@ async fn create_or_load_challenge(
     pool: &PgPool,
     job: &NewUserAuditJob,
     risk_score: i32,
+    trigger_source: CaptchaTriggerSource,
     math: &MathChallenge,
     restore_permissions: &Value,
 ) -> anyhow::Result<CaptchaChallenge> {
@@ -586,8 +647,8 @@ async fn create_or_load_challenge(
     let inserted = sqlx::query(
         r#"insert into telegram_risk_captcha_challenges
                (id, chat_id, telegram_user_id, audit_job_id, risk_score,
-                question, options, correct_option, restore_permissions)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                question, options, correct_option, restore_permissions, trigger_source)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            on conflict (chat_id, telegram_user_id) do nothing
            returning id"#,
     )
@@ -600,18 +661,28 @@ async fn create_or_load_challenge(
     .bind(options)
     .bind(math.correct_option)
     .bind(restore_permissions)
+    .bind(trigger_source.as_str())
     .fetch_optional(&mut *tx)
     .await?;
     let challenge_id = if let Some(row) = inserted {
         row.try_get("id")?
     } else {
-        sqlx::query_scalar(
+        let id = sqlx::query_scalar(
             "select id from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2 for update",
         )
         .bind(job.chat_id)
         .bind(job.telegram_user_id)
         .fetch_one(&mut *tx)
-        .await?
+        .await?;
+        sqlx::query(
+            "update telegram_risk_captcha_challenges set risk_score = greatest(risk_score, $2), trigger_source = case when $3 = 'paid_dm_plus_offer_v1' then $3 else trigger_source end where id = $1",
+        )
+        .bind(id)
+        .bind(risk_score)
+        .bind(trigger_source.as_str())
+        .execute(&mut *tx)
+        .await?;
+        id
     };
     let row = select_challenge_by_id(&mut tx, challenge_id).await?;
     tx.commit().await?;
@@ -622,6 +693,7 @@ async fn reopen_expired_challenge(
     pool: &PgPool,
     job: &NewUserAuditJob,
     risk_score: i32,
+    trigger_source: CaptchaTriggerSource,
     math: &MathChallenge,
     restore_permissions: &Value,
 ) -> anyhow::Result<CaptchaChallenge> {
@@ -630,12 +702,13 @@ async fn reopen_expired_challenge(
         r#"update telegram_risk_captcha_challenges
            set id = $1, audit_job_id = $2, risk_score = $3, question = $4,
                options = $5, correct_option = $6, restore_permissions = $7,
+               trigger_source = $8,
                restriction_applied_at = null, message_id = null, expires_at = null,
                status = 'preparing', attempts = 0, setup_attempts = 0,
                setup_next_attempt_at = now(), setup_lease_expires_at = null,
                setup_error_kind = null, created_at = now(), updated_at = now(),
                solved_at = null
-           where chat_id = $8 and telegram_user_id = $9 and status = 'expired'
+           where chat_id = $9 and telegram_user_id = $10 and status = 'expired'
            returning id"#,
     )
     .bind(math.id)
@@ -644,6 +717,7 @@ async fn reopen_expired_challenge(
     .bind(&math.question)
     .bind(options)
     .bind(restore_permissions)
+    .bind(trigger_source.as_str())
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
     .fetch_optional(pool)
@@ -656,6 +730,23 @@ async fn reopen_expired_challenge(
             .await?
             .ok_or_else(|| anyhow::anyhow!("risk captcha challenge disappeared during renewal")),
     }
+}
+
+async fn update_challenge_trigger(
+    pool: &PgPool,
+    challenge_id: Uuid,
+    risk_score: i32,
+    trigger_source: CaptchaTriggerSource,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set risk_score = greatest(risk_score, $2), trigger_source = case when $3 = 'paid_dm_plus_offer_v1' then $3 else trigger_source end, updated_at = now() where id = $1",
+    )
+    .bind(challenge_id)
+    .bind(risk_score)
+    .bind(trigger_source.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn claim_setup_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
@@ -819,7 +910,7 @@ async fn load_user_challenge(
     user_id: i64,
 ) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts, trigger_source from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(chat_id)
     .bind(user_id)
@@ -830,7 +921,7 @@ async fn load_user_challenge(
 
 async fn load_challenge(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts, trigger_source from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -843,7 +934,7 @@ async fn select_challenge_by_id(
     id: Uuid,
 ) -> anyhow::Result<PgRow> {
     Ok(sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts, trigger_source from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_one(&mut **tx)
@@ -864,6 +955,7 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         expires_at: row.try_get("expires_at")?,
         status: row.try_get("status")?,
         setup_attempts: row.try_get("setup_attempts")?,
+        trigger_source: row.try_get("trigger_source")?,
     })
 }
 

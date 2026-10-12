@@ -11,7 +11,8 @@ use crate::{
     features::{
         ingest::{is_managed_chat, managed_chat_allows},
         labels::{LabelSource, SpamLabel, record_spam},
-        new_user_audit::repo::NewUserAuditJob,
+        new_user_audit::{paid_dm_plus::matches_paid_dm_plus_offer, repo::NewUserAuditJob},
+        risk_captcha::CaptchaTriggerSource,
     },
 };
 
@@ -19,6 +20,74 @@ use crate::{
 /// нельзя, replay пересчитывает историю новым кодом.
 pub(crate) const ENFORCE_FRESHNESS: chrono::Duration = chrono::Duration::hours(24);
 const MAX_DELETE_MESSAGES: i64 = 10;
+
+/// Ловит узкую рекламную связку локально до необязательного LLM-аудита.
+/// Совпадение запускает капчу и никогда не приводит к автобану.
+pub async fn maybe_apply_paid_dm_plus_captcha(
+    bot: &Bot,
+    pool: &sqlx::PgPool,
+    config: &Config,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<()> {
+    let moderation = &config.community.moderation;
+    if !moderation.paid_dm_plus_captcha_enabled
+        || !moderation.captcha_enabled
+        || !is_managed_chat(config, job.chat_id)
+        || !managed_chat_allows(config, job.chat_id, |chat| chat.moderation)
+    {
+        return Ok(());
+    }
+    let Some(text) = job.input_json["text"]["first_message_preview"].as_str() else {
+        return Ok(());
+    };
+    if !matches_paid_dm_plus_offer(text) {
+        return Ok(());
+    }
+
+    let user_state: Option<(Option<chrono::DateTime<chrono::Utc>>, i32)> = sqlx::query_as(
+        "select u.first_seen_at, coalesce(a.risk_score, 0) from telegram_chat_users u left join telegram_new_user_profile_audits a on a.chat_id = u.chat_id and a.telegram_user_id = u.telegram_user_id where u.chat_id = $1 and u.telegram_user_id = $2",
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((Some(first_seen_at), risk_score)) = user_state else {
+        return Ok(());
+    };
+    if chrono::Utc::now().signed_duration_since(first_seen_at) > ENFORCE_FRESHNESS {
+        return Ok(());
+    }
+
+    if moderation.captcha_dry_run {
+        tracing::warn!(
+            chat_id = job.chat_id,
+            user_id = job.telegram_user_id,
+            rule = "paid_dm_plus_offer_v1",
+            risk_score,
+            "paid DM plus rule matched; captcha is in dry-run"
+        );
+        return Ok(());
+    }
+
+    let outcome = crate::features::risk_captcha::apply_risk_captcha_with_source(
+        bot,
+        pool,
+        job,
+        risk_score,
+        moderation.captcha_ttl_sec,
+        CaptchaTriggerSource::PaidDmPlusOffer,
+    )
+    .await?;
+    tracing::warn!(
+        chat_id = job.chat_id,
+        user_id = job.telegram_user_id,
+        rule = "paid_dm_plus_offer_v1",
+        risk_score,
+        outcome = ?outcome,
+        "paid DM plus rule applied risk captcha"
+    );
+    Ok(())
+}
 const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
     "local_spammer_identity",
     "shared_spammer_identity",

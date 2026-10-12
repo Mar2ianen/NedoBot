@@ -9,7 +9,9 @@ use sqlx::{PgPool, query, query_scalar};
 use teloxide::Bot;
 use tg_ai_bot_teloxide::features::{
     new_user_audit::repo::NewUserAuditJob,
-    risk_captcha::{CaptchaOutcome, apply_risk_captcha},
+    risk_captcha::{
+        CaptchaOutcome, CaptchaTriggerSource, apply_risk_captcha, apply_risk_captcha_with_source,
+    },
 };
 use uuid::Uuid;
 
@@ -166,9 +168,16 @@ pub async fn assert_cleanup(pool: &PgPool) {
     let bot = Bot::new("fixture-token").set_api_url(format!("http://{address}/").parse().unwrap());
 
     assert!(
-        apply_risk_captcha(&bot, pool, &job, 100, 600)
-            .await
-            .is_err()
+        apply_risk_captcha_with_source(
+            &bot,
+            pool,
+            &job,
+            100,
+            600,
+            CaptchaTriggerSource::PaidDmPlusOffer,
+        )
+        .await
+        .is_err()
     );
     assert_eq!(delete_batches(&stub), vec![vec![103, 102, 101]]);
     assert_eq!(
@@ -176,8 +185,8 @@ pub async fn assert_cleanup(pool: &PgPool) {
         0,
         "failed cleanup must precede captcha delivery"
     );
-    let state: (String, Option<String>) = sqlx::query_as(
-        "select status, setup_error_kind from telegram_risk_captcha_challenges where id = $1",
+    let state: (String, Option<String>, String) = sqlx::query_as(
+        "select status, setup_error_kind, trigger_source from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_one(pool)
@@ -185,7 +194,11 @@ pub async fn assert_cleanup(pool: &PgPool) {
     .unwrap();
     assert_eq!(
         state,
-        ("preparing".into(), Some("setup_attempt_failed".into()))
+        (
+            "preparing".into(),
+            Some("setup_attempt_failed".into()),
+            "paid_dm_plus_offer_v1".into()
+        )
     );
     let unmarked: i64 = query_scalar(
         "select count(*) from telegram_messages where chat_id = $1 and message_id between 101 and 103 and deleted_by_bot_at is null",
@@ -211,6 +224,13 @@ pub async fn assert_cleanup(pool: &PgPool) {
             .unwrap(),
         CaptchaOutcome::Issued
     );
+    let trigger_source: String =
+        query_scalar("select trigger_source from telegram_risk_captcha_challenges where id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(trigger_source, "paid_dm_plus_offer_v1");
     assert_eq!(send_count(&stub), 1);
     let expiry: chrono::DateTime<chrono::Utc> =
         query_scalar("select expires_at from telegram_risk_captcha_challenges where id = $1")

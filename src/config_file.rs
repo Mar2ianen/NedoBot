@@ -98,6 +98,10 @@ pub struct ModerationConfig {
     /// Включается отдельно для конкретного community instance.
     #[serde(default)]
     pub captcha_enabled: bool,
+    /// Локальный high-confidence триггер капчи для денежного предложения
+    /// с CTA «плюс в личку». Включается отдельно для community.
+    #[serde(default)]
+    pub paid_dm_plus_captcha_enabled: bool,
     /// Не вызывает Telegram API, только пишет решение в журнал.
     #[serde(default = "default_true")]
     pub captcha_dry_run: bool,
