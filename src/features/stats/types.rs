@@ -39,17 +39,27 @@ impl ReportWindow {
 #[derive(Clone)]
 pub struct ChatStatsSummary {
     pub start_at: DateTime<Utc>,
+    /// User-authored discussion messages in the report window.
     pub messages: i64,
+    /// Distinct human authors of messages in the report window.
     pub active_users: i64,
+    /// Human messages that reply to another message.
     pub replies: i64,
+    /// Human messages containing one or more links.
     pub links: i64,
+    /// Human messages with any supported media type; a message counts once.
     pub media: i64,
     pub channel_posts: i64,
     pub bot_comments: i64,
+    /// Human messages in the report window replying directly to any sent bot comment.
     pub replies_to_bot: i64,
+    /// Added reaction identities in event updates; removals do not decrement this.
     pub reaction_additions: i64,
+    /// Messages whose latest stored reaction-count snapshot was updated in the window.
     pub messages_with_reaction_count_update: i64,
+    /// Sum of latest stored reaction counts on bot comments created in the window.
     pub bot_comment_reactions: i64,
+    /// Present-state transitions, including `restricted.is_member` changes.
     pub joins: i64,
     pub leaves: i64,
 }
@@ -65,6 +75,7 @@ pub struct ChatStatsReportData {
     pub bot_comments: Vec<BotCommentStats>,
     pub reaction_sentiment: teloxide_statistics::sentiment::SentimentCounts,
     pub daily_active: Vec<DailyActive>,
+    pub daily_activity_summary: Option<DailyActivitySummary>,
     pub retention: RetentionSummary,
     /// Live member count at report time for the engagement denominator.
     /// `None` when the Bot API lookup fails; renderers show a dash.
@@ -73,8 +84,30 @@ pub struct ChatStatsReportData {
 
 #[derive(Clone)]
 pub struct DailyActive {
+    /// Moscow reporting date with the 05:00 boundary; zero-activity days are present.
     pub day: chrono::NaiveDate,
     pub users: i64,
+}
+
+#[derive(Clone, Copy)]
+pub struct DailyActivitySummary {
+    /// Mean active users across every reporting day, including zero-activity days.
+    pub average_users: f64,
+    pub max_users: i64,
+}
+
+impl DailyActivitySummary {
+    pub fn from_days(days: &[DailyActive]) -> Option<Self> {
+        if days.is_empty() {
+            return None;
+        }
+        let total = days.iter().map(|day| i128::from(day.users)).sum::<i128>();
+        let max_users = days.iter().map(|day| day.users).max().unwrap_or(0);
+        Some(Self {
+            average_users: total as f64 / days.len() as f64,
+            max_users,
+        })
+    }
 }
 
 /// Cohort return rates: share of each first-day cohort active again after
@@ -88,6 +121,7 @@ pub struct RetentionSummary {
 
 #[derive(Clone)]
 pub struct AttractionMetrics {
+    /// Averages across fully completed post-comment windows only.
     pub messages_5m: String,
     pub messages_30m: String,
     pub messages_24h: String,
@@ -101,6 +135,7 @@ pub struct PeriodTopUser {
     pub messages: i64,
     pub replies: i64,
     pub links: i64,
+    /// Number of messages with supported media; voice messages are included.
     pub media: i64,
 }
 
@@ -108,8 +143,11 @@ pub struct PeriodTopUser {
 pub struct BotCommentStats {
     pub source_message_id: i32,
     pub response: String,
-    pub messages_30m: i64,
-    pub direct_replies: i64,
+    /// `None` until the complete 30-minute window fits inside the report window.
+    pub messages_30m: Option<i64>,
+    /// Direct human non-command replies in the same complete 30-minute window.
+    pub direct_replies: Option<i64>,
+    /// Latest stored count on this bot comment; zero when no snapshot row exists.
     pub reactions: i64,
 }
 
@@ -197,8 +235,11 @@ pub struct UserModerationSummary {
 #[derive(Clone)]
 pub struct UserActivityExtras {
     pub active_days: i64,
+    /// Reaction-addition events observed for this user, not current reactions.
     pub reactions_given: i64,
+    /// Human messages anywhere below a channel post in its reply tree.
     pub post_comments: i64,
+    /// Human messages replying directly to a sent bot comment.
     pub replies_to_bot: i64,
 }
 

@@ -5014,7 +5014,8 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         "an incomplete 30-minute user cohort must be unavailable"
     );
     assert_eq!(
-        bot_comments[0].messages_30m, 1,
+        bot_comments[0].messages_30m,
+        Some(1),
         "per-comment engagement must exclude activity before sent_at"
     );
     let data = ChatStatsReportData {
@@ -5035,6 +5036,7 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
             unknown: 0,
         },
         daily_active: Vec::new(),
+        daily_activity_summary: None,
         retention: Default::default(),
         member_count: Some(100),
     };

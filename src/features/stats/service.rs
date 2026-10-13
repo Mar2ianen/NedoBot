@@ -9,18 +9,17 @@ use crate::db::telegram::refresh_chat_member_snapshot;
 use crate::features::stats::repo;
 use crate::features::stats::stop_words::USER_TOP_WORD_STOP_WORDS;
 use crate::features::stats::types::{
-    AttractionMetrics, BotCommentStats, ChatStatsReportData, DailyActive, MessageMediaPreview,
-    PeriodTopUser, RetentionSummary, TopMessageUser, TopMessagesReportData, TopReactedMessage,
-    TopReactedReportData, TopWordReportData, TopWordUser, UserActivityExtras, UserPresentation,
-    UserStatsReportData, display_name,
+    AttractionMetrics, BotCommentStats, ChatStatsReportData, DailyActive, DailyActivitySummary,
+    MessageMediaPreview, PeriodTopUser, RetentionSummary, TopMessageUser, TopMessagesReportData,
+    TopReactedMessage, TopReactedReportData, TopWordReportData, TopWordUser, UserActivityExtras,
+    UserPresentation, UserStatsReportData, display_name,
 };
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
 
 const PERIOD_TOP_USERS_LIMIT: i64 = 8;
 const BOT_COMMENTS_LIMIT: i64 = 5;
-pub const HTML_TOP_LIMIT: i64 = 20;
-pub const RICH_TOP_LIMIT: i64 = 30;
+pub const STATS_TOP_LIMIT: i64 = 20;
 pub const USER_TOP_WORDS_LIMIT: i64 = 10;
 
 pub async fn chat_stats_report_data(
@@ -61,6 +60,12 @@ pub async fn chat_stats_report_data(
         }
     }
 
+    let daily_active: Vec<DailyActive> = repo::daily_active_users(pool, chat_id, window)
+        .await?
+        .into_iter()
+        .map(|(day, users)| DailyActive { day, users })
+        .collect();
+
     Ok(ChatStatsReportData {
         period,
         summary,
@@ -73,11 +78,8 @@ pub async fn chat_stats_report_data(
         top_users,
         bot_comments,
         reaction_sentiment,
-        daily_active: repo::daily_active_users(pool, chat_id, window)
-            .await?
-            .into_iter()
-            .map(|(day, users)| DailyActive { day, users })
-            .collect(),
+        daily_activity_summary: DailyActivitySummary::from_days(&daily_active),
+        daily_active,
         retention: retention_summary(
             &repo::cohort_activity(pool, chat_id, window.start_at - chrono::Duration::days(60))
                 .await?,
@@ -191,7 +193,6 @@ fn top_message_user(row: repo::TopMessage) -> TopMessageUser {
             media: row.media,
             voices: row.voices,
             reactions_received: row.reactions_received,
-            ..Default::default()
         },
     }
 }
@@ -300,16 +301,16 @@ pub async fn user_stats_report_data(
     };
 
     let user = user_presentation(user_id, profile.as_ref(), member.as_ref());
-    if let Some(stats) = cached.as_ref() {
+    let has_human_activity = activity.messages > 0;
+    if has_human_activity && let Some(stats) = cached.as_ref() {
         activity_extras.post_comments = activity_extras
             .post_comments
             .max(stats.replies_to_channel_posts);
-        activity_extras.replies_to_bot = activity_extras.replies_to_bot.max(stats.replies_to_bot);
     }
     let cached_message_count_covers_history = cached
         .as_ref()
         .is_some_and(|stats| stats.messages >= activity.messages);
-    if !cached_message_count_covers_history {
+    if has_human_activity && !cached_message_count_covers_history {
         activity_extras.post_comments = timed_user_stats_query(
             trace_id,
             "sql_user_post_comments_fallback",
@@ -324,7 +325,7 @@ pub async fn user_stats_report_data(
         last_message_id,
         first_seen_days_ago,
         last_seen_days_ago,
-    ) = cached.as_ref().map_or_else(
+    ) = cached.as_ref().filter(|_| has_human_activity).map_or_else(
         || {
             (
                 "нет данных".to_string(),
@@ -483,7 +484,7 @@ pub async fn refresh_top_message_users(
         bot,
         pool,
         chat_id,
-        repo::top_message_user_ids(pool, chat_id, RICH_TOP_LIMIT).await,
+        repo::top_message_user_ids(pool, chat_id, STATS_TOP_LIMIT).await,
     )
     .await;
 }
@@ -497,7 +498,7 @@ pub async fn refresh_top_reacted_users(
         bot,
         pool,
         chat_id,
-        repo::top_reacted_user_ids(pool, chat_id, RICH_TOP_LIMIT).await,
+        repo::top_reacted_user_ids(pool, chat_id, STATS_TOP_LIMIT).await,
     )
     .await;
 }

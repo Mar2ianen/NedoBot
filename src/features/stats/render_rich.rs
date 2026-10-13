@@ -123,18 +123,18 @@ pub fn chat_stats(
             },
             crate::features::stats::document::Kv {
                 label: strings.active_by_day,
-                value: if data.daily_active.is_empty() {
-                    strings.not_available.to_string()
-                } else {
-                    let users: Vec<i64> = data.daily_active.iter().map(|day| day.users).collect();
-                    format!(
-                        "{} {:.0}, {} {}",
-                        strings.avg_word,
-                        users.iter().sum::<i64>() as f64 / users.len() as f64,
-                        strings.max_word,
-                        users.into_iter().max().unwrap_or(0)
-                    )
-                },
+                value: data.daily_activity_summary.map_or_else(
+                    || strings.not_available.to_string(),
+                    |summary| {
+                        format!(
+                            "{} {:.0}, {} {}",
+                            strings.avg_word,
+                            summary.average_users,
+                            strings.max_word,
+                            summary.max_users
+                        )
+                    },
+                ),
             },
             crate::features::stats::document::Kv {
                 label: strings.returns,
@@ -255,8 +255,12 @@ pub fn chat_stats(
                             message_url(discussion_chat_id, row.source_message_id),
                         )
                         .into_string(),
-                        bold_num(row.messages_30m),
-                        row.direct_replies.to_string(),
+                        row.messages_30m
+                            .map(bold_num)
+                            .unwrap_or_else(|| strings.not_available.to_string()),
+                        row.direct_replies
+                            .map(bold_num)
+                            .unwrap_or_else(|| strings.not_available.to_string()),
                         row.reactions.to_string(),
                         escape_html(&truncate_text(
                             &human_comment_preview(&row.response, strings),
@@ -312,7 +316,10 @@ pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
 
 fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsStrings) -> String {
     if data.users.is_empty() {
-        return format!("<h1>{title}</h1><p>{}</p>", strings.no_data);
+        return format!(
+            "<h1>{title}</h1><p>{}; {}; {}</p><p>{}</p>",
+            strings.all_time, strings.latest_snapshot, strings.ranked_scope, strings.no_data
+        );
     }
     let mut details = Vec::new();
     let rows = data
@@ -336,7 +343,10 @@ fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsString
         })
         .collect::<Vec<_>>();
     format!(
-        "<h1>{title}</h1>{}<details><summary>{}</summary>{}</details><hr/><footer>{}</footer>",
+        "<h1>{title}</h1><p>{}; {}; {}</p>{}<details><summary>{}</summary>{}</details><hr/><footer>{}</footer>",
+        strings.all_time,
+        strings.latest_snapshot,
+        strings.ranked_scope,
         table(
             &[
                 strings.col_number,
@@ -367,8 +377,8 @@ pub fn top_reacted(
 ) -> String {
     if data.messages.is_empty() {
         return format!(
-            "<h1>{}</h1><p>{}</p>",
-            strings.top_reacted_messages, strings.no_data
+            "<h1>{}</h1><p>{}</p><p>{}</p>",
+            strings.top_reacted_messages, strings.latest_snapshot, strings.no_data
         );
     }
     let mut previews = Vec::new();
@@ -405,8 +415,9 @@ pub fn top_reacted(
         })
         .collect::<Vec<_>>();
     format!(
-        "<h1>{}</h1>{}<details><summary>{}</summary>{}</details><hr/><footer>{}</footer>",
+        "<h1>{}</h1><p>{}</p>{}<details><summary>{}</summary>{}</details><hr/><footer>{}</footer>",
         strings.top_reactions_short,
+        strings.latest_snapshot,
         table(
             &[
                 strings.col_number,

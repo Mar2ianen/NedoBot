@@ -9,7 +9,7 @@ use tracing::Instrument;
 use crate::config::Config;
 use crate::features::stats::render_html;
 use crate::features::stats::render_rich;
-use crate::features::stats::service::{self, HTML_TOP_LIMIT, RICH_TOP_LIMIT};
+use crate::features::stats::service::{self, STATS_TOP_LIMIT};
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 use crate::telegram::render::{send_html, send_rich_html};
@@ -62,11 +62,7 @@ pub async fn send_top_messages(
         return Ok(());
     };
     service::refresh_top_message_users(bot, pool, stats_scope_chat_id).await;
-    let limit = match render {
-        StatsRender::Html => HTML_TOP_LIMIT,
-        StatsRender::Rich => RICH_TOP_LIMIT,
-    };
-    let data = service::top_messages_report_data(pool, stats_scope_chat_id, limit)
+    let data = service::top_messages_report_data(pool, stats_scope_chat_id, STATS_TOP_LIMIT)
         .await
         .map_err(stats_error("failed to build top messages report"))?;
     let report = match render {
@@ -90,11 +86,7 @@ pub async fn send_bottom_messages(
         return Ok(());
     };
     service::refresh_top_message_users(bot, pool, stats_scope_chat_id).await;
-    let limit = match render {
-        StatsRender::Html => HTML_TOP_LIMIT,
-        StatsRender::Rich => RICH_TOP_LIMIT,
-    };
-    let data = service::bottom_messages_report_data(pool, stats_scope_chat_id, limit)
+    let data = service::bottom_messages_report_data(pool, stats_scope_chat_id, STATS_TOP_LIMIT)
         .await
         .map_err(stats_error("failed to build bottom messages report"))?;
     let report = match render {
@@ -118,11 +110,7 @@ pub async fn send_top_reacted(
         return Ok(());
     };
     service::refresh_top_reacted_users(bot, pool, stats_scope_chat_id).await;
-    let limit = match render {
-        StatsRender::Html => HTML_TOP_LIMIT,
-        StatsRender::Rich => RICH_TOP_LIMIT,
-    };
-    let data = service::top_reacted_report_data(pool, stats_scope_chat_id, limit)
+    let data = service::top_reacted_report_data(pool, stats_scope_chat_id, STATS_TOP_LIMIT)
         .await
         .map_err(stats_error("failed to build top reacted report"))?;
     let report = match render {

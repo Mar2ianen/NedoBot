@@ -58,17 +58,15 @@ fn reply_share_value(replies: i64, messages: i64, strings: &StatsStrings) -> Str
 
 fn daily_active_value(
     daily: &[crate::features::stats::types::DailyActive],
+    summary: Option<crate::features::stats::types::DailyActivitySummary>,
     strings: &StatsStrings,
 ) -> String {
-    if daily.is_empty() {
+    let Some(summary) = summary else {
         return strings.not_available.to_string();
-    }
-    let users: Vec<i64> = daily.iter().map(|day| day.users).collect();
-    let avg = users.iter().sum::<i64>() as f64 / users.len() as f64;
-    let max = users.into_iter().max().unwrap_or(0);
+    };
     let mut value = format!(
         "{} <b>{:.0}</b>, {} <b>{}</b>",
-        strings.avg_word, avg, strings.max_word, max
+        strings.avg_word, summary.average_users, strings.max_word, summary.max_users
     );
     let recent: Vec<String> = daily
         .iter()
@@ -208,7 +206,7 @@ pub fn chat_stats(
             },
             Kv {
                 label: strings.active_by_day,
-                value: daily_active_value(&data.daily_active, strings),
+                value: daily_active_value(&data.daily_active, data.daily_activity_summary, strings),
             },
             Kv {
                 label: strings.returns,
@@ -267,9 +265,15 @@ pub fn chat_stats(
                     format!(
                         "#{id}: {m30} {u30}, {d} {ru}, {r} {rd}{preview}",
                         id = row.source_message_id,
-                        m30 = row.messages_30m,
+                        m30 = row
+                            .messages_30m
+                            .map(bold_num)
+                            .unwrap_or_else(|| strings.not_available.to_string()),
                         u30 = strings.per_30m_unit,
-                        d = row.direct_replies,
+                        d = row
+                            .direct_replies
+                            .map(bold_num)
+                            .unwrap_or_else(|| strings.not_available.to_string()),
                         ru = strings.replies_unit_short,
                         r = row.reactions,
                         rd = strings.reactions_dash,
@@ -316,22 +320,31 @@ pub fn top_word(data: &TopWordReportData, strings: &StatsStrings) -> String {
 }
 
 fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsStrings) -> String {
-    let mut report = format!("<b>{title}</b>\n{}\n", strings.all_time);
+    let mut report = format!(
+        "<b>{title}</b>\n{}; {}; {}.\n",
+        strings.all_time, strings.latest_snapshot, strings.ranked_scope
+    );
     if data.users.is_empty() {
         report.push_str("\nНет данных.");
         return report;
     }
     for (index, row) in data.users.iter().enumerate() {
         report.push_str(&format!(
-            "\n{}. {}: <b>{}</b> соо, {} reply, {} медиа, {} голосовых, {} ссылок, {} реакций",
+            "\n{}. {}: <b>{}</b> {}, {} {}, {} {} ({} {}), {} {}, {} {}",
             index + 1,
             row.user.linked_with_known_badges(),
             row.activity.messages,
+            strings.messages_unit_short,
             row.activity.replies,
+            strings.replies_unit_short,
             row.activity.media,
+            strings.media_unit_short,
             row.activity.voices,
+            strings.voices,
             row.activity.links,
+            strings.links_unit_short,
             row.activity.reactions_received,
+            strings.reactions_row,
         ));
     }
     report
@@ -344,7 +357,7 @@ pub fn top_reacted(
 ) -> String {
     let mut report = format!(
         "<b>{}</b>\n{}\n",
-        strings.top_reacted_messages, strings.all_time
+        strings.top_reacted_messages, strings.latest_snapshot
     );
     if data.messages.is_empty() {
         report.push_str(&format!("\n{}", strings.no_data));

@@ -104,8 +104,8 @@ pub struct PeriodTopUserRow {
 pub struct BotCommentStatsRow {
     pub source_message_id: i32,
     pub response: String,
-    pub messages_30m: i64,
-    pub direct_replies: i64,
+    pub messages_30m: Option<i64>,
+    pub direct_replies: Option<i64>,
     pub reactions: i64,
 }
 
@@ -195,7 +195,6 @@ pub struct ChatUserStats {
     pub links: i64,
     pub media: i64,
     pub replies_to_channel_posts: i64,
-    pub replies_to_bot: i64,
     pub voices: i64,
 }
 
@@ -319,6 +318,10 @@ pub async fn chat_stats_summary(
             where j.discussion_chat_id = $1 and j.status = 'sent'
               and j.sent_at >= b.start_at and j.sent_at < b.end_at
         ),
+        sent_bot_comments as (
+            select distinct j.bot_comment_message_id from post_comment_jobs j
+            where j.discussion_chat_id = $1 and j.status = 'sent'
+        ),
         reactions as (
             select r.* from telegram_message_reactions r, bounds b
             where r.chat_id = $1 and r.event_at >= b.start_at and r.event_at < b.end_at
@@ -335,7 +338,16 @@ pub async fn chat_stats_summary(
              and rc.message_id = j.bot_comment_message_id
         ),
         member_events as (
-            select e.* from telegram_chat_member_events e, bounds b
+            select e.*,
+                   case when e.old_status = 'restricted'
+                        then coalesce((e.raw_json #>> '{old_chat_member,is_member}')::boolean, false)
+                        else e.old_status not in ('left', 'banned')
+                   end as old_is_present,
+                   case when e.new_status = 'restricted'
+                        then coalesce((e.raw_json #>> '{new_chat_member,is_member}')::boolean, false)
+                        else e.new_status not in ('left', 'banned')
+                   end as new_is_present
+            from telegram_chat_member_events e, bounds b
             where e.chat_id = $1 and e.event_at >= b.start_at and e.event_at < b.end_at
         )
         select
@@ -344,7 +356,7 @@ pub async fn chat_stats_summary(
             count(distinct m.user_id)::bigint as active_users,
             (select count(*) from messages where is_automatic_forward)::bigint as channel_posts,
             (select count(*) from bot_comments)::bigint as bot_comments,
-            (select count(*) from human_messages m join bot_comments j on m.reply_to_message_id = j.bot_comment_message_id)::bigint as replies_to_bot,
+            (select count(*) from human_messages m join sent_bot_comments j on m.reply_to_message_id = j.bot_comment_message_id)::bigint as replies_to_bot,
             (select count(*)
              from reactions r,
                   jsonb_array_elements(r.new_reactions) as added(value)
@@ -354,8 +366,8 @@ pub async fn chat_stats_summary(
              ))::bigint as reaction_additions,
             (select count(*) from reaction_counts)::bigint as messages_with_reaction_count_update,
             (select total from bot_comment_reactions)::bigint as bot_comment_reactions,
-            (select count(*) from member_events where old_status in ('left', 'banned') and new_status not in ('left', 'banned'))::bigint as joins,
-            (select count(*) from member_events where old_status not in ('left', 'banned') and new_status in ('left', 'banned'))::bigint as leaves
+            (select count(*) from member_events where not old_is_present and new_is_present)::bigint as joins,
+            (select count(*) from member_events where old_is_present and not new_is_present)::bigint as leaves
         from human_messages m
         "#;
     let sql = with_user_activity_aggregates(&with_human_message_filter(sql, "$2"));
@@ -388,10 +400,10 @@ pub async fn chat_attraction_metrics(
         ),
         metrics as (
             select j.sent_at,
-                   count(m.*) filter (where m.created_at <= j.sent_at + interval '5 minutes' and coalesce(m.text,'') !~ '^/') as messages_5m,
-                   count(m.*) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as messages_30m,
-                   count(m.*) filter (where m.created_at <= j.sent_at + interval '24 hours' and coalesce(m.text,'') !~ '^/') as messages_24h,
-                   count(distinct m.user_id) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/') as users_30m
+                   count(m.*) filter (where m.created_at <= j.sent_at + interval '5 minutes' and coalesce(m.text,'') !~ '^[[:space:]]*/') as messages_5m,
+                   count(m.*) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^[[:space:]]*/') as messages_30m,
+                   count(m.*) filter (where m.created_at <= j.sent_at + interval '24 hours' and coalesce(m.text,'') !~ '^[[:space:]]*/') as messages_24h,
+                   count(distinct m.user_id) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^[[:space:]]*/') as users_30m
             from post_comment_jobs j
             left join human_messages m on m.chat_id = j.discussion_chat_id
                 and m.created_at > j.sent_at and m.created_at <= j.sent_at + interval '24 hours'
@@ -467,8 +479,12 @@ pub async fn bot_comments_for_period(
             where m.chat_id = $1 and {human_message_filter}
         )
         select j.source_message_id, coalesce(g.response, '') as response,
-               count(m.*) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^/')::bigint as messages_30m,
-               count(m.*) filter (where m.reply_to_message_id = j.bot_comment_message_id)::bigint as direct_replies,
+               case when j.sent_at + interval '30 minutes' <= (select end_at from bounds)
+                    then count(m.*) filter (where m.created_at <= j.sent_at + interval '30 minutes' and coalesce(m.text,'') !~ '^[[:space:]]*/')
+               end as messages_30m,
+               case when j.sent_at + interval '30 minutes' <= (select end_at from bounds)
+                    then count(m.*) filter (where m.reply_to_message_id = j.bot_comment_message_id and coalesce(m.text,'') !~ '^[[:space:]]*/')
+               end as direct_replies,
                coalesce(max(rc.total_count), 0)::bigint as reactions
         from post_comment_jobs j
         left join llm_generations g on g.post_comment_job_id = j.id
@@ -479,7 +495,7 @@ pub async fn bot_comments_for_period(
         where j.discussion_chat_id = $1 and j.status = 'sent'
           and j.sent_at >= (select start_at from bounds) and j.sent_at < (select end_at from bounds)
         group by j.source_message_id, g.response, j.sent_at
-        order by messages_30m desc, direct_replies desc, reactions desc
+        order by messages_30m desc nulls last, direct_replies desc nulls last, reactions desc
         limit $5
         "#;
     let sql = with_human_message_filter(sql, "$2");
@@ -626,15 +642,28 @@ pub async fn daily_active_users(
     }
 
     let sql = r#"
-        with bounds as (select $3::timestamptz as start_at, $4::timestamptz as end_at)
-        select date_trunc('day', m.created_at at time zone 'Europe/Moscow' - interval '5 hours')::date as day,
-               count(distinct m.user_id)::bigint as users
-        from telegram_messages m
-        cross join bounds b
-        left join telegram_user_profiles p on p.telegram_user_id = m.user_id
-        where m.chat_id = $1 and {human_message_filter}
-          and m.created_at >= b.start_at and m.created_at < b.end_at
-        group by 1 order by 1
+        with bounds as (select $3::timestamptz as start_at, $4::timestamptz as end_at),
+        calendar as (
+            select generate_series(
+                date_trunc('day', (b.start_at at time zone 'Europe/Moscow') - interval '5 hours'),
+                date_trunc('day', ((b.end_at - interval '1 microsecond') at time zone 'Europe/Moscow') - interval '5 hours'),
+                interval '1 day'
+            )::date as day
+            from bounds b
+        ),
+        active as (
+            select date_trunc('day', m.created_at at time zone 'Europe/Moscow' - interval '5 hours')::date as day,
+                   count(distinct m.user_id)::bigint as users
+            from telegram_messages m
+            cross join bounds b
+            left join telegram_user_profiles p on p.telegram_user_id = m.user_id
+            where m.chat_id = $1 and {human_message_filter}
+              and m.created_at >= b.start_at and m.created_at < b.end_at
+            group by 1
+        )
+        select calendar.day, coalesce(active.users, 0)::bigint as users
+        from calendar left join active using (day)
+        order by calendar.day
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
@@ -856,7 +885,7 @@ pub async fn chat_user_stats(
                floor(extract(epoch from (now() - first_seen_at)) / 86400)::bigint as first_seen_days_ago,
                floor(extract(epoch from (now() - last_seen_at)) / 86400)::bigint as last_seen_days_ago,
                message_count as messages, reply_count as replies, link_count as links, media_count as media,
-               reply_to_channel_post_count as replies_to_channel_posts, reply_to_bot_count as replies_to_bot,
+               reply_to_channel_post_count as replies_to_channel_posts,
                0::bigint as voices
         from telegram_chat_users where chat_id = $1 and telegram_user_id = $2
         "#,
