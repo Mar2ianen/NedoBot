@@ -5014,10 +5014,57 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         "an incomplete 30-minute user cohort must be unavailable"
     );
     assert_eq!(
-        bot_comments[0].messages_30m,
-        Some(1),
-        "per-comment engagement must exclude activity before sent_at"
+        bot_comments[0].messages_30m, None,
+        "per-comment engagement must stay unavailable while its 30-minute window is incomplete"
     );
+    assert_eq!(bot_comments[0].direct_replies, None);
+
+    let mature_comment_at = Utc
+        .with_ymd_and_hms(2000, 1, 1, 12, 10, 0)
+        .single()
+        .expect("mature comment timestamp must be valid");
+    let mature_window = ReportWindow::new(
+        mature_comment_at - Duration::minutes(1),
+        mature_comment_at + Duration::minutes(31),
+        10_957,
+    );
+    query(
+        r#"
+        insert into telegram_messages
+            (chat_id, message_id, user_id, source_channel_id, reply_to_message_id, text, created_at)
+        values
+            ($1, 905, 905, null, null, 'before bot comment', $2),
+            ($1, 906, 906, null, 1914, 'after bot comment', $3)
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(mature_comment_at - Duration::seconds(30))
+    .bind(mature_comment_at + Duration::seconds(30))
+    .execute(pool)
+    .await
+    .expect("mature comment engagement messages must be inserted");
+    query(
+        r#"
+        insert into post_comment_jobs
+            (discussion_chat_id, discussion_message_id, source_channel_id, source_message_id,
+             cleaned_post_text, status, bot_comment_message_id, created_at, sent_at)
+        values
+            ($1, 914, -1001575496091, 914, 'mature comment', 'sent', 1914, $2, $3)
+        "#,
+    )
+    .bind(CHAT_ID)
+    .bind(mature_comment_at - Duration::minutes(1))
+    .bind(mature_comment_at)
+    .execute(pool)
+    .await
+    .expect("mature comment job must be inserted");
+    let mature_comments = stats_repo::bot_comments_for_period(pool, CHAT_ID, mature_window, 10)
+        .await
+        .expect("mature comment engagement query must succeed");
+    assert_eq!(mature_comments.len(), 1);
+    assert_eq!(mature_comments[0].messages_30m, Some(1));
+    assert_eq!(mature_comments[0].direct_replies, Some(1));
+
     let data = ChatStatsReportData {
         period: StatsPeriod::Day,
         summary: summary.clone(),
@@ -5051,8 +5098,8 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     assert!(rich.contains(&messages));
     assert!(html.contains(&active_users));
     assert!(rich.contains(&active_users));
-    assert!(html.contains("Настроение реакций"));
-    assert!(rich.contains("Настроение реакций"));
+    assert!(html.contains(strings.sentiment_mood));
+    assert!(rich.contains(strings.sentiment_mood));
     assert!(html.contains("позитив"));
 }
 
