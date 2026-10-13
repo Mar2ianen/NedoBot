@@ -4901,6 +4901,7 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
         Utc.with_ymd_and_hms(2000, 1, 2, 0, 0, 0)
             .single()
             .expect("test end timestamp must be valid"),
+        10_958,
     );
     let inside_at = Utc
         .with_ymd_and_hms(2000, 1, 1, 12, 0, 0)

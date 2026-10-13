@@ -87,12 +87,12 @@ pub fn chat_stats(
                 value: rich_sentiment_value(&data.reaction_sentiment, strings),
             },
             crate::features::stats::document::Kv {
-                label: strings.reaction_events,
-                value: bold_num(summary.reaction_events),
+                label: strings.reaction_additions,
+                value: bold_num(summary.reaction_additions),
             },
             crate::features::stats::document::Kv {
-                label: strings.reaction_count_updates,
-                value: bold_num(summary.reaction_count_updates),
+                label: strings.messages_with_reaction_count_update,
+                value: bold_num(summary.messages_with_reaction_count_update),
             },
             crate::features::stats::document::Kv {
                 label: strings.bot_comment_reactions,
@@ -323,15 +323,15 @@ fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsString
             let link = user_link(&row.username, row.user.user_id, &row.user.display_name);
             details.push(vec![
                 link.clone(),
-                row.replies.to_string(),
-                format!("{} / {}", row.media, row.voices),
-                row.links.to_string(),
+                row.activity.replies.to_string(),
+                format!("{} / {}", row.activity.media, row.activity.voices),
+                row.activity.links.to_string(),
             ]);
             vec![
                 (index + 1).to_string(),
                 link,
-                bold_num(row.messages),
-                row.reactions_received.to_string(),
+                bold_num(row.activity.messages),
+                row.activity.reactions_received.to_string(),
             ]
         })
         .collect::<Vec<_>>();
@@ -491,37 +491,37 @@ pub fn user_stats(
         bio,
         strings.details_activity,
         table_no_header(&[
-            vec![strings.messages.into(), bold_num(data.totals.messages)],
-            vec![strings.row_reply.into(), bold_num(data.totals.replies)],
+            vec![strings.messages.into(), bold_num(data.activity.messages)],
+            vec![strings.row_reply.into(), bold_num(data.activity.replies)],
             vec![
                 strings.comments_pair.into(),
                 format!(
                     "{} / {}",
-                    bold_num(data.totals.post_comments),
-                    bold_num(data.totals.replies_to_bot)
+                    bold_num(data.activity_extras.post_comments),
+                    bold_num(data.activity_extras.replies_to_bot)
                 )
             ],
-            vec![strings.links.into(), bold_num(data.totals.links)],
+            vec![strings.links.into(), bold_num(data.activity.links)],
             vec![
                 strings.media_voice_pair.into(),
                 format!(
                     "{} / {}",
-                    bold_num(data.totals.media),
-                    bold_num(data.totals.voices)
+                    bold_num(data.activity.media),
+                    bold_num(data.activity.voices)
                 )
             ],
             vec![
                 strings.active_days.into(),
-                bold_num(data.totals.active_days)
+                bold_num(data.activity_extras.active_days)
             ],
             vec![
                 strings.reactions_row.into(),
                 format!(
                     "{} {} / {} {}",
                     strings.reactions_pair,
-                    bold_num(data.reactions_given),
+                    bold_num(data.activity_extras.reactions_given),
                     strings.received_verb,
-                    bold_num(data.reactions_received)
+                    bold_num(data.activity.reactions_received)
                 )
             ],
         ]),
@@ -673,8 +673,8 @@ mod tests {
     use super::*;
     use crate::features::stats::strings::StatsStrings;
     use crate::features::stats::types::{
-        TopMessageUser, TopWordReportData, TopWordUser, UserModerationSummary, UserPresentation,
-        UserStatsReportData, UserTotals,
+        TopMessageUser, TopWordReportData, TopWordUser, UserActivityExtras, UserModerationSummary,
+        UserPresentation, UserStatsReportData,
     };
 
     fn ranked_fixture() -> TopMessagesReportData {
@@ -689,12 +689,10 @@ mod tests {
                     is_present: None,
                 },
                 username: None,
-                messages: 1,
-                replies: 0,
-                media: 0,
-                voices: 0,
-                links: 0,
-                reactions_received: 0,
+                activity: teloxide_statistics::activity::UserActivity {
+                    messages: 1,
+                    ..Default::default()
+                },
             }],
         }
     }
@@ -757,18 +755,13 @@ mod tests {
             last_message_id: "1".to_string(),
             first_seen_days_ago: Some(0),
             last_seen_days_ago: Some(0),
-            totals: UserTotals {
-                messages: 0,
-                replies: 0,
-                links: 0,
-                media: 0,
+            activity: teloxide_statistics::activity::UserActivity::default(),
+            activity_extras: UserActivityExtras {
+                active_days: 0,
+                reactions_given: 0,
                 post_comments: 0,
                 replies_to_bot: 0,
-                active_days: 0,
-                voices: 0,
             },
-            reactions_given: 0,
-            reactions_received: 0,
             top_words: Vec::new(),
         };
 

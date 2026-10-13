@@ -11,8 +11,8 @@ use crate::features::stats::stop_words::USER_TOP_WORD_STOP_WORDS;
 use crate::features::stats::types::{
     AttractionMetrics, BotCommentStats, ChatStatsReportData, DailyActive, MessageMediaPreview,
     PeriodTopUser, RetentionSummary, TopMessageUser, TopMessagesReportData, TopReactedMessage,
-    TopReactedReportData, TopWordReportData, TopWordUser, UserPresentation, UserStatsReportData,
-    UserTotals, display_name,
+    TopReactedReportData, TopWordReportData, TopWordUser, UserActivityExtras, UserPresentation,
+    UserStatsReportData, display_name,
 };
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
@@ -81,14 +81,14 @@ pub async fn chat_stats_report_data(
         retention: retention_summary(
             &repo::cohort_activity(pool, chat_id, window.start_at - chrono::Duration::days(60))
                 .await?,
+            window.chat_day_index,
         ),
         member_count: None,
     })
 }
 
-fn retention_summary(activity: &[(i64, i64)]) -> RetentionSummary {
-    // Day indices are days since epoch, matching `cohort_activity`.
-    let today = chrono::Utc::now().timestamp() / 86_400;
+fn retention_summary(activity: &[(i64, i64)], today: i64) -> RetentionSummary {
+    // Both values use the report's 05:00 Moscow day boundary.
     let table = teloxide_statistics::engagement::retention_table(activity, 30);
     let rate = |offset: i64| {
         let mut weighted = 0.0;
@@ -184,12 +184,15 @@ fn top_message_user(row: repo::TopMessage) -> TopMessageUser {
             is_present: Some(row.is_present),
         },
         username: row.username,
-        messages: row.messages,
-        replies: row.replies,
-        media: row.media,
-        voices: row.voices,
-        links: row.links,
-        reactions_received: row.reactions_received,
+        activity: teloxide_statistics::activity::UserActivity {
+            messages: row.messages,
+            replies: row.replies,
+            links: row.links,
+            media: row.media,
+            voices: row.voices,
+            reactions_received: row.reactions_received,
+            ..Default::default()
+        },
     }
 }
 
@@ -276,21 +279,11 @@ pub async fn user_stats_report_data(
         .iter()
         .map(|word| (*word).to_string())
         .collect::<Vec<_>>();
-    let (totals, reactions_given, reactions_received, top_words) = tokio::try_join!(
+    let (summary, top_words) = tokio::try_join!(
         timed_user_stats_query(
             trace_id,
-            "sql_user_totals",
-            repo::user_totals(pool, chat_id, user_id),
-        ),
-        timed_user_stats_query(
-            trace_id,
-            "sql_reactions_given",
-            repo::user_reactions_given(pool, chat_id, user_id),
-        ),
-        timed_user_stats_query(
-            trace_id,
-            "sql_reactions_received",
-            repo::user_reactions_received(pool, chat_id, user_id),
+            "sql_user_activity",
+            repo::user_activity(pool, chat_id, user_id),
         ),
         timed_user_stats_query(
             trace_id,
@@ -298,23 +291,26 @@ pub async fn user_stats_report_data(
             repo::user_top_words(pool, chat_id, user_id, &stop_words, USER_TOP_WORDS_LIMIT),
         ),
     )?;
-    let mut totals = user_totals(totals);
+    let activity = summary.activity;
+    let mut activity_extras = UserActivityExtras {
+        active_days: summary.extras.active_days,
+        reactions_given: summary.extras.reactions_given,
+        replies_to_bot: summary.extras.replies_to_bot,
+        post_comments: summary.extras.post_comments,
+    };
 
     let user = user_presentation(user_id, profile.as_ref(), member.as_ref());
     if let Some(stats) = cached.as_ref() {
-        totals.messages = totals.messages.max(stats.messages);
-        totals.replies = totals.replies.max(stats.replies);
-        totals.links = totals.links.max(stats.links);
-        totals.media = totals.media.max(stats.media);
-        totals.post_comments = totals.post_comments.max(stats.replies_to_channel_posts);
-        totals.replies_to_bot = totals.replies_to_bot.max(stats.replies_to_bot);
-        totals.voices = totals.voices.max(stats.voices);
+        activity_extras.post_comments = activity_extras
+            .post_comments
+            .max(stats.replies_to_channel_posts);
+        activity_extras.replies_to_bot = activity_extras.replies_to_bot.max(stats.replies_to_bot);
     }
     let cached_message_count_covers_history = cached
         .as_ref()
-        .is_some_and(|stats| stats.messages >= totals.messages);
+        .is_some_and(|stats| stats.messages >= activity.messages);
     if !cached_message_count_covers_history {
-        totals.post_comments = timed_user_stats_query(
+        activity_extras.post_comments = timed_user_stats_query(
             trace_id,
             "sql_user_post_comments_fallback",
             repo::user_post_comment_count(pool, chat_id, user_id),
@@ -383,9 +379,8 @@ pub async fn user_stats_report_data(
         last_message_id,
         first_seen_days_ago,
         last_seen_days_ago,
-        totals,
-        reactions_given,
-        reactions_received,
+        activity,
+        activity_extras,
         top_words,
     }))
 }
@@ -606,18 +601,5 @@ fn user_presentation(
         status: member.map(|member| member.status.clone()),
         is_admin: member.is_some_and(|member| member.is_admin),
         is_present: member.map(|member| member.is_present),
-    }
-}
-
-fn user_totals(totals: repo::UserTotals) -> UserTotals {
-    UserTotals {
-        messages: totals.messages,
-        replies: totals.replies,
-        links: totals.links,
-        media: totals.media,
-        post_comments: totals.post_comments,
-        replies_to_bot: totals.replies_to_bot,
-        active_days: totals.active_days,
-        voices: totals.voices,
     }
 }

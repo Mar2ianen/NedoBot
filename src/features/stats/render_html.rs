@@ -173,12 +173,12 @@ pub fn chat_stats(
                 value: bold_num(summary.replies_to_bot),
             },
             Kv {
-                label: strings.reaction_events,
+                label: strings.reaction_additions,
                 value: format!(
                     "{}, {}: {}",
-                    bold_num(summary.reaction_events),
-                    strings.reaction_count_updates,
-                    bold_num(summary.reaction_count_updates),
+                    bold_num(summary.reaction_additions),
+                    strings.messages_with_reaction_count_update,
+                    bold_num(summary.messages_with_reaction_count_update),
                 ),
             },
             Kv {
@@ -326,12 +326,12 @@ fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsString
             "\n{}. {}: <b>{}</b> соо, {} reply, {} медиа, {} голосовых, {} ссылок, {} реакций",
             index + 1,
             row.user.linked_with_known_badges(),
-            row.messages,
-            row.replies,
-            row.media,
-            row.voices,
-            row.links,
-            row.reactions_received,
+            row.activity.messages,
+            row.activity.replies,
+            row.activity.media,
+            row.activity.voices,
+            row.activity.links,
+            row.activity.reactions_received,
         ));
     }
     report
@@ -427,42 +427,42 @@ pub fn user_stats(
         rows: vec![
             Kv {
                 label: strings.messages,
-                value: bold_num(data.totals.messages),
+                value: bold_num(data.activity.messages),
             },
             Kv {
                 label: strings.replies,
-                value: bold_num(data.totals.replies),
+                value: bold_num(data.activity.replies),
             },
             Kv {
                 label: strings.comments,
-                value: bold_num(data.totals.post_comments),
+                value: bold_num(data.activity_extras.post_comments),
             },
             Kv {
                 label: strings.bot_replies,
-                value: bold_num(data.totals.replies_to_bot),
+                value: bold_num(data.activity_extras.replies_to_bot),
             },
             Kv {
                 label: strings.links,
                 value: format!(
                     "{}, {}: {}, {}: {}",
-                    bold_num(data.totals.links),
+                    bold_num(data.activity.links),
                     strings.media,
-                    bold_num(data.totals.media),
+                    bold_num(data.activity.media),
                     strings.voices,
-                    bold_num(data.totals.voices),
+                    bold_num(data.activity.voices),
                 ),
             },
             Kv {
                 label: strings.active_days,
-                value: bold_num(data.totals.active_days),
+                value: bold_num(data.activity_extras.active_days),
             },
             Kv {
                 label: strings.reactions_given,
-                value: bold_num(data.reactions_given),
+                value: bold_num(data.activity_extras.reactions_given),
             },
             Kv {
                 label: strings.reactions_received,
-                value: bold_num(data.reactions_received),
+                value: bold_num(data.activity.reactions_received),
             },
         ],
     };
@@ -598,12 +598,10 @@ mod tests {
                     is_present: None,
                 },
                 username: None,
-                messages: 1,
-                replies: 0,
-                media: 0,
-                voices: 0,
-                links: 0,
-                reactions_received: 0,
+                activity: teloxide_statistics::activity::UserActivity {
+                    messages: 1,
+                    ..Default::default()
+                },
             }],
         }
     }

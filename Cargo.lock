@@ -3340,7 +3340,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=3ca1b7f15ee8a4f8c1af0d79c962c5587e26029e#3ca1b7f15ee8a4f8c1af0d79c962c5587e26029e"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=90520abd37154e8c48a54e5daded4d64ef1f9e0c#90520abd37154e8c48a54e5daded4d64ef1f9e0c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "teloxide-statistics"
 version = "0.2.0"
-source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=7e2a5859849044121b9e693bc1ed36e7440db139#7e2a5859849044121b9e693bc1ed36e7440db139"
+source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=e21824229982afead049fc121842565f2618790d#e21824229982afead049fc121842565f2618790d"
 dependencies = [
  "anyhow",
  "serde",

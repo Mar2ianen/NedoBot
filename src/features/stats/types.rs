@@ -23,11 +23,16 @@ pub enum StatsRender {
 pub struct ReportWindow {
     pub start_at: DateTime<Utc>,
     pub end_at: DateTime<Utc>,
+    pub chat_day_index: i64,
 }
 
 impl ReportWindow {
-    pub const fn new(start_at: DateTime<Utc>, end_at: DateTime<Utc>) -> Self {
-        Self { start_at, end_at }
+    pub const fn new(start_at: DateTime<Utc>, end_at: DateTime<Utc>, chat_day_index: i64) -> Self {
+        Self {
+            start_at,
+            end_at,
+            chat_day_index,
+        }
     }
 }
 
@@ -42,8 +47,8 @@ pub struct ChatStatsSummary {
     pub channel_posts: i64,
     pub bot_comments: i64,
     pub replies_to_bot: i64,
-    pub reaction_events: i64,
-    pub reaction_count_updates: i64,
+    pub reaction_additions: i64,
+    pub messages_with_reaction_count_update: i64,
     pub bot_comment_reactions: i64,
     pub joins: i64,
     pub leaves: i64,
@@ -130,12 +135,7 @@ pub struct TopWordUser {
 pub struct TopMessageUser {
     pub user: UserPresentation,
     pub username: Option<String>,
-    pub messages: i64,
-    pub replies: i64,
-    pub media: i64,
-    pub voices: i64,
-    pub links: i64,
-    pub reactions_received: i64,
+    pub activity: teloxide_statistics::activity::UserActivity,
 }
 
 #[derive(Clone)]
@@ -181,9 +181,8 @@ pub struct UserStatsReportData {
     pub last_message_id: String,
     pub first_seen_days_ago: Option<i64>,
     pub last_seen_days_ago: Option<i64>,
-    pub totals: UserTotals,
-    pub reactions_given: i64,
-    pub reactions_received: i64,
+    pub activity: teloxide_statistics::activity::UserActivity,
+    pub activity_extras: UserActivityExtras,
     pub top_words: Vec<(String, i64)>,
 }
 
@@ -196,15 +195,11 @@ pub struct UserModerationSummary {
 }
 
 #[derive(Clone)]
-pub struct UserTotals {
-    pub messages: i64,
-    pub replies: i64,
-    pub links: i64,
-    pub media: i64,
+pub struct UserActivityExtras {
+    pub active_days: i64,
+    pub reactions_given: i64,
     pub post_comments: i64,
     pub replies_to_bot: i64,
-    pub active_days: i64,
-    pub voices: i64,
 }
 
 #[derive(Clone)]

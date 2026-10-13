@@ -76,6 +76,8 @@
 ## 7. Рендер и доставка
 
 - Rich и HTML получают одну typed-модель данных из service/repo. Renderer занимается представлением: SQL, получение профиля и расчёт бизнес-метрик выполняются до него. См. [`stats/document.rs`](../src/features/stats/document.rs).
+- `/topmsg` и `/userstatus` разделяют `teloxide_statistics::activity::UserActivity`: совпадающие счётчики берутся из одной базы метрик, и оба frontend показывают их без повторного расчёта.
+- «Реакций поставил» считает добавления реакций в истории событий; снятие не добавляет счётчик. «Реакций получил» — текущая сумма на сообщениях пользователя.
 - HTML-текст, имена, причины, bio и подписи ссылок экранировать через [`Html`](../src/telegram/html.rs). `raw_trusted` разрешён только для уже безопасно собранной внутренней разметки. Пользовательский текст и LLM output туда не передаются.
 - Rich HTML компилировать штатным frontend fork-а либо строить сообщение из typed `InputRichMessage` blocks. `<h1>`, `<table>` и `<details>` относятся к Rich; нельзя отправлять их как обычный Telegram `ParseMode::Html`.
 - Не добавлять собственный Telegram HTTP-клиент, wire-модели, CSS и обходы валидатора ради оформления. Использовать существующие [`render.rs`](../src/telegram/render.rs) и [`service_messages.rs`](../src/telegram/service_messages.rs).
