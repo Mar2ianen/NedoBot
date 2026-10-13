@@ -7,6 +7,20 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+13 октября 2026 в **21:04 UTC / 14 октября 00:04 МСК** выпущен release
+[`deploy-2026-10-14-stats-semantics`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-14-stats-semantics)
+на merge commit `28bad6606531155454e860ab21344ff78d783b20` после успешных проверок
+[PR #75](https://github.com/Mar2ianen/NedoBot/pull/75). [Release workflow 38466458639](https://github.com/Mar2ianen/NedoBot/actions/runs/38466458639)
+установил artifact в оба community-инстанса и public MCP. SHA-256 обоих bot binaries —
+`466e48b2a88dbe85b2329b3add137a02900c3fcf78216ff2beb9dc0f2bd0e0e2`; MCP —
+`c75fa302535cc2771fe4828bbf6c2b9d5355e35b996b24515f4df34b64148a98`.
+
+Все три unit-а active с `NRestarts=0`; хеши обоих bot executable и MCP совпали с artifact,
+error-level journal после рестарта пуст. Статистические метрики приведены к общим определениям
+для HTML и Rich отчётов: отдельно подписаны добавления реакций и обновления снимков, переходы
+участия учитывают `restricted.is_member`, а 30-минутная активность показывается только для
+полностью завершённых окон. PostgreSQL integration suite прошёл на тестовой БД.
+
 12 октября 2026 в **09:21 UTC / 12:21 МСК** выпущен release
 [`deploy-2026-10-12-spam-audit-embedding-fallback`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-12-spam-audit-embedding-fallback)
 на merge commit `8eafb8d7019e49f424530a0090a1693c96b7784f` после review
