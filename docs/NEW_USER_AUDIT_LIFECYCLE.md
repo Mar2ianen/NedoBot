@@ -5,7 +5,7 @@
 
 1. refresh профиля;
 2. bounded snapshot профиля, поведения, первого сообщения и аватара;
-3. один LLM audit на route `new_user_audit`;
+3. точные детерминированные проверки известных кампаний; если они не сработали — один LLM audit на route `new_user_audit`;
 4. атомарная materialization score/signals и review request;
 5. отдельная bounded Telegram delivery при включённых moderation/review-delivery flags и `risk_score >= review_threshold` для сохранённого запроса; маршрут и reviewer задаёт инстанс.
 
@@ -17,6 +17,18 @@ Avatar и first-message являются секциями единого assessm
 очередей, LLM routes и workers для них нет. Старые таблицы и миграции остаются
 в БД для backward compatibility, но runtime их больше не enqueue-ит и не
 обрабатывает.
+
+Для управляемых чатов с включённой модерацией перед LLM проверяются только
+высокоуверенные кампании среди участников не старше 24 часов и с не более чем
+тремя сообщениями: денежное/рабочее предложение с призывом перейти в личные
+сообщения, товар «на пробу» с ограничением числа мест и ссылки на adult-промо
+в личном канале. Совпадение сохраняет
+assessment с версией правила и пропускает внешний LLM-вызов. При
+materialization участник и его сообщение получают durable spam-разметку через
+`features::labels::record_spam`; последующие review/captcha/delete решения
+остаются за действующей moderation policy. Само совпадение не даёт разрешения
+на бан. Системные метки не попадают в curated датасет аватаров и ручной
+template-корпус; их можно отменить обычным `/notspam`.
 
 ## State machine
 

@@ -138,6 +138,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
+    assert_system_spam_label_transition(&pool).await;
     assert_spammer_avatar_embedding_label_gate(&pool).await;
     assert_comment_reconciliation_requires_operator_claim(&pool).await;
     assert_embedding_job_finalization_requires_current_claim(&pool).await;
@@ -1083,8 +1084,12 @@ async fn assert_embedding_failure_clears_claim(
 
 async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
-    const HISTORICAL_USER_ID: i64 = 9_000_010;
-    const CURRENT_USER_ID: i64 = 9_000_011;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .subsec_nanos() as i64;
+    let historical_user_id = 9_000_000_000 + suffix * 2;
+    let current_user_id = historical_user_id + 1;
     let lifecycle_installed_on: chrono::DateTime<Utc> =
         query_scalar("select installed_on from _sqlx_migrations where version = 20260729100000")
             .fetch_one(pool)
@@ -1092,11 +1097,11 @@ async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
             .expect("lifecycle migration timestamp must exist");
     for (user_id, notified_at) in [
         (
-            HISTORICAL_USER_ID,
+            historical_user_id,
             lifecycle_installed_on - Duration::seconds(1),
         ),
         (
-            CURRENT_USER_ID,
+            current_user_id,
             lifecycle_installed_on + Duration::seconds(1),
         ),
     ] {
@@ -1110,7 +1115,7 @@ async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
     }
     query("update spam_review_requests set risk_score = 65 where chat_id = $1 and telegram_user_id = $2")
         .bind(CHAT_ID)
-        .bind(CURRENT_USER_ID)
+        .bind(current_user_id)
         .execute(pool)
         .await
         .expect("post-lifecycle fixture must not be claimable by high-risk delivery worker");
@@ -1124,7 +1129,7 @@ async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
         "select notification_status, notified_risk_score, notified_risk_signals from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(CHAT_ID)
-    .bind(HISTORICAL_USER_ID)
+    .bind(historical_user_id)
     .fetch_one(pool)
     .await
     .expect("historical review fixture must remain queryable");
@@ -1138,11 +1143,18 @@ async fn assert_spam_review_safety_backfill_upgrade(pool: &PgPool) {
         "select notification_status, notified_risk_score from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(CHAT_ID)
-    .bind(CURRENT_USER_ID)
+    .bind(current_user_id)
     .fetch_one(pool)
     .await
     .expect("post-lifecycle review fixture must remain queryable");
     assert_eq!(current, ("pending".into(), None));
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id in ($2, $3)")
+        .bind(CHAT_ID)
+        .bind(historical_user_id)
+        .bind(current_user_id)
+        .execute(pool)
+        .await
+        .expect("review upgrade fixtures must be removable");
 }
 
 async fn assert_post_comment_delivery_lifecycle_upgrade(pool: &PgPool) {
@@ -6235,6 +6247,138 @@ async fn assert_label_writer_roundtrip(pool: &PgPool) {
     assert_eq!(journal.len(), 2);
     assert!(journal.iter().any(|entry| entry.kind == "label:spam"));
     assert!(journal.iter().any(|entry| entry.kind == "label:not_spam"));
+}
+
+async fn assert_system_spam_label_transition(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .subsec_nanos() as i64;
+    let user_id = 9_000_000_000 + suffix;
+    let message_id = 9000 + suffix as i32;
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1, $2)")
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label fixture user must exist");
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, 'fixture money offer')")
+        .bind(CHAT_ID)
+        .bind(message_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label fixture message must exist");
+    query("insert into telegram_user_profiles (telegram_user_id, profile_photo_file_id, profile_photo_file_unique_id) values ($1, 'system-avatar-file', 'system-avatar-unique')")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label avatar fixture must exist");
+
+    record_spam(
+        pool,
+        CHAT_ID,
+        user_id,
+        &SpamLabel {
+            subtype: "money_dm_bait".to_string(),
+            source: LabelSource::System,
+            reason: "deterministic campaign fixture".to_string(),
+            evidence: serde_json::json!({
+                "rule": "fresh_money_work_private_contact",
+                "rule_version": "new-user-campaign-v1"
+            }),
+            operator_id: None,
+        },
+        true,
+    )
+    .await
+    .expect("deterministic system label must be recorded");
+
+    let state: (bool, i32, Option<String>) = query_as(
+        "select is_spammer, spam_score, spam_type from telegram_chat_users where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("system-labeled user must exist");
+    assert_eq!(state, (true, 100, Some("money_dm_bait".to_string())));
+
+    let event: (String, Option<i64>, serde_json::Value) = query_as(
+        "select source, operator_telegram_user_id, evidence from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'spam' order by id desc limit 1",
+    )
+    .bind(CHAT_ID)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("system spam label event must exist");
+    assert_eq!(event.0, "system");
+    assert_eq!(event.1, None);
+    assert_eq!(event.2["rule_version"], "new-user-campaign-v1");
+
+    let stamped: (i64, Option<String>) = query_as(
+        "select count(*), min(spam_source) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null",
+    )
+    .bind(CHAT_ID)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("system label must stamp its evidence message");
+    assert_eq!(stamped, (1, Some("system_automatic".to_string())));
+
+    let avatar_rows: i64 = query_scalar(
+        "select count(*) from spammer_avatar_embeddings where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("system labels must not enter the confirmed avatar dataset");
+    assert_eq!(avatar_rows, 0);
+
+    record_not_spam(
+        pool,
+        CHAT_ID,
+        user_id,
+        "system-label fixture cleanup",
+        &serde_json::json!({"fixture": true}),
+        Some(1),
+    )
+    .await
+    .expect("system-label fixture must be cleanable");
+    let remaining_marks: i64 = query_scalar(
+        "select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null",
+    )
+    .bind(CHAT_ID)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("not-spam decision must remove system-only template marks");
+    assert_eq!(remaining_marks, 0);
+    query("delete from spam_label_events where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label fixture events must be removable");
+    query("delete from telegram_messages where chat_id = $1 and user_id = $2")
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label fixture messages must be removable");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label fixture profile must be removable");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("system-label fixture user must be removable");
 }
 
 async fn assert_spammer_avatar_embedding_label_gate(pool: &PgPool) {

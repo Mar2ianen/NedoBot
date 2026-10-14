@@ -2,6 +2,24 @@ use sqlx::{PgPool, Row};
 
 use teloxide_antispam::text::{jaccard, token_set};
 
+const TEMPLATE_MATCH_SQL: &str = r#"
+    select distinct m.text
+    from telegram_messages m
+    where m.chat_id = $1
+      and m.spam_marked_at is not null
+      and m.spam_source = 'manual_owner_confirmation'
+      and (
+          select e.source
+          from spam_label_events e
+          where e.chat_id = m.chat_id
+            and e.telegram_user_id = m.user_id
+          order by e.created_at desc, e.id desc
+          limit 1
+      ) in ('owner_review', 'owner_manual', 'legacy_backfill')
+      and m.user_id <> $2
+      and m.text is not null
+    "#;
+
 /// DB-доступ для first-message скоринга. Чистый скоринг живёт в
 /// `teloxide_antispam::scoring`, здесь только SQL-корпус: template-тексты
 /// помеченных сообщений и similarity по персистнутым эмбеддингам.
@@ -11,20 +29,11 @@ pub(crate) async fn template_match_count(
     user_id: i64,
     text: &str,
 ) -> anyhow::Result<i32> {
-    let rows = sqlx::query(
-        r#"
-        select distinct m.text
-        from telegram_messages m
-        where m.chat_id = $1
-          and m.spam_marked_at is not null
-          and m.user_id <> $2
-          and m.text is not null
-        "#,
-    )
-    .bind(chat_id)
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(TEMPLATE_MATCH_SQL)
+        .bind(chat_id)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
     let current = token_set(text);
     Ok(rows
         .into_iter()
@@ -63,6 +72,14 @@ pub(crate) async fn spam_similarity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_corpus_uses_only_manually_confirmed_messages() {
+        assert!(TEMPLATE_MATCH_SQL.contains("m.spam_source = 'manual_owner_confirmation'"));
+        assert!(
+            TEMPLATE_MATCH_SQL.contains("in ('owner_review', 'owner_manual', 'legacy_backfill')")
+        );
+    }
 
     #[test]
     fn spam_similarity_query_excludes_the_candidate_users_own_messages() {
