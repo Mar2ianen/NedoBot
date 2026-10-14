@@ -7,6 +7,23 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+14 октября 2026 в **12:55 UTC / 15:55 МСК** выпущен release
+[`deploy-2026-10-14-deterministic-spam`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-14-deterministic-spam)
+на merge commit `a2dcc618bba80f19f699b589551a4d0b90119479` после review
+[PR #77](https://github.com/Mar2ianen/NedoBot/pull/77). [Release workflow 38566401993](https://github.com/Mar2ianen/NedoBot/actions/runs/38566401993)
+собрал и установил artifact на оба community-инстанса и перезапустил public MCP.
+SHA-256 обоих bot binaries —
+`2dec6fe5e691a6f44ab089b907177d619df6035036a748a488a54eba4367454b`; оба
+запущенных процесса совпали с artifact.
+
+Оба бота и `nedonews-mcp` active; error-level journal обоих ботов за 15 минут
+после выкладки пуст, сообщений о пропущенных миграциях нет. CI
+[38565369859](https://github.com/Mar2ianen/NedoBot/actions/runs/38565369859)
+прошёл formatting, tests, Clippy и PostgreSQL integration suites.
+Новые высокоуверенные кампании спама среди свежих пользователей теперь получают
+system spam label без LLM-вызова; дальнейшее действие задаёт обычная политика
+модерации инстанса. Это правило не выдаёт безусловный ban.
+
 13 октября 2026 в **21:04 UTC / 14 октября 00:04 МСК** выпущен release
 [`deploy-2026-10-14-stats-semantics`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-14-stats-semantics)
 на merge commit `28bad6606531155454e860ab21344ff78d783b20` после успешных проверок
