@@ -6,6 +6,7 @@ use teloxide::prelude::Bot;
 use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_classification_text, pgvector_literal};
+use crate::features::new_user_audit::deterministic::{self, CampaignMatch};
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
@@ -173,6 +174,12 @@ async fn materialize_stored_assessment(
         first_message_context,
         job.review_threshold,
     );
+    if let Some(campaign) = deterministic_campaign_for_job(pool, config, job).await? {
+        if let Some(signals) = components.first_message_signals.as_array_mut() {
+            signals.push(campaign.score_signal());
+        }
+        ensure_deterministic_spam_label(pool, job, campaign, components.final_score()).await?;
+    }
     // CAS — слабый внешний сигнал: положительный вердикт добавляет не более
     // EXTERNAL_SCORE_CAP, unknown/clean ничего не меняют. Проверка выполняется
     // для каждого аудита, а не только при наличии первого сообщения: рецидивист
@@ -226,6 +233,38 @@ async fn generate_and_finalize(
     config: &Config,
     job: &NewUserAuditJob,
 ) -> anyhow::Result<()> {
+    if let Some(campaign) = deterministic_campaign_for_job(pool, config, job).await? {
+        let has_first_message_input = has_first_message_input(&job.input_json);
+        let assessment = campaign.assessment(has_first_message_input);
+        let assessment_text = serde_json::to_string(&assessment)?;
+        NewUserAuditAssessment::parse_for_modalities(
+            &assessment_text,
+            false,
+            has_first_message_input,
+        )?;
+        let outcome = NewUserAuditOutcome {
+            assessment_json: &assessment,
+            provider: "deterministic_rules",
+            model: deterministic::RULE_VERSION,
+        };
+        let finalized = finalize_new_user_audit_job(pool, job, outcome).await?;
+        if finalized == CasResult::LeaseLost {
+            tracing::warn!(
+                job_id = job.id,
+                attempts = job.attempts,
+                "deterministic spam assessment lost its generation lease before finalization"
+            );
+        } else {
+            tracing::info!(
+                chat_id = job.chat_id,
+                user_id = job.telegram_user_id,
+                rule = campaign.rule,
+                "new-user audit used deterministic spam fast path; LLM skipped"
+            );
+        }
+        return Ok(());
+    }
+
     let image_base64 = load_avatar_input(bot, config, job).await?;
     let has_avatar_input = image_base64.is_some();
     let mut input_json = job.input_json.clone();
@@ -282,6 +321,104 @@ async fn generate_and_finalize(
             "new user audit lease was reclaimed before finalization"
         );
     }
+    Ok(())
+}
+
+async fn deterministic_campaign_for_job(
+    pool: &PgPool,
+    config: &Config,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<Option<CampaignMatch>> {
+    if !config.community.moderation.enabled
+        || !crate::features::ingest::is_managed_chat(config, job.chat_id)
+        || !crate::features::ingest::managed_chat_allows(config, job.chat_id, |chat| {
+            chat.moderation
+        })
+    {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        r#"select first_message_text, message_count, first_seen_at,
+                  personal_channel_has_adult_links
+           from telegram_new_user_profile_audits
+           where chat_id = $1 and telegram_user_id = $2
+             and unified_audit_snapshot_hash = $3"#,
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .bind(&job.snapshot_hash)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let first_message = has_first_message_input(&job.input_json)
+        .then(|| row.get::<Option<String>, _>("first_message_text"))
+        .flatten();
+    let first_seen_at = row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("first_seen_at");
+    let chat_age_seconds =
+        first_seen_at.map(|seen| chrono::Utc::now().signed_duration_since(seen).num_seconds());
+    Ok(deterministic::classify(
+        first_message.as_deref(),
+        row.get("message_count"),
+        chat_age_seconds,
+        row.get("personal_channel_has_adult_links"),
+    ))
+}
+
+async fn ensure_deterministic_spam_label(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+    campaign: CampaignMatch,
+    score: i32,
+) -> anyhow::Result<()> {
+    let current_label_state: Option<(bool, Option<String>)> = sqlx::query_as(
+        r#"select coalesce(u.is_spammer, false), (
+               select e.label
+               from spam_label_events e
+               where e.chat_id = u.chat_id and e.telegram_user_id = u.telegram_user_id
+               order by e.created_at desc, e.id desc
+               limit 1
+           )
+           from telegram_chat_users u
+           where u.chat_id = $1 and u.telegram_user_id = $2"#,
+    )
+    .bind(job.chat_id)
+    .bind(job.telegram_user_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((is_spammer, latest_label)) = current_label_state else {
+        return Ok(());
+    };
+    if is_spammer || latest_label.as_deref() == Some("not_spam") {
+        return Ok(());
+    }
+
+    crate::features::labels::record_spam(
+        pool,
+        job.chat_id,
+        job.telegram_user_id,
+        &crate::features::labels::SpamLabel {
+            subtype: campaign.subtype.to_string(),
+            source: crate::features::labels::LabelSource::System,
+            reason: campaign.reason.to_string(),
+            evidence: serde_json::json!({
+                "rule": campaign.rule,
+                "rule_version": deterministic::RULE_VERSION,
+                "score": score,
+                "snapshot_hash": job.snapshot_hash,
+            }),
+            operator_id: None,
+        },
+        false,
+    )
+    .await?;
+    tracing::warn!(
+        chat_id = job.chat_id,
+        user_id = job.telegram_user_id,
+        subtype = campaign.subtype,
+        rule = campaign.rule,
+        score,
+        "deterministic new-user campaign was labeled as spam"
+    );
     Ok(())
 }
 

@@ -8,13 +8,12 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 /// ещё и `spam_label_events`. Без событий в `spam_label_events` reuse-сигналы
 /// (`display_name/username/channel_title_reused_by_spammers`) и template-корпус
 /// слепнут: `is_spammer` на пользователе для них недостаточно.
-/// Источник разметки. `OwnerManual` (ручные SQL-батчи) и `System`
-/// (автомодерация) зарезервированы под следующие слайсы enforcement ladder.
+/// Источник durable-разметки. Системные метки не считаются ручным
+/// подтверждением для текстового template-корпуса и датасета аватаров.
 pub enum LabelSource {
     OwnerReview,
     #[allow(dead_code)]
     OwnerManual,
-    #[allow(dead_code)]
     System,
 }
 
@@ -24,6 +23,13 @@ impl LabelSource {
             Self::OwnerReview => "owner_review",
             Self::OwnerManual => "owner_manual",
             Self::System => "system",
+        }
+    }
+
+    fn message_source(&self) -> &'static str {
+        match self {
+            Self::OwnerReview | Self::OwnerManual => "manual_owner_confirmation",
+            Self::System => "system_automatic",
         }
     }
 }
@@ -38,9 +44,7 @@ pub struct SpamLabel {
 
 /// Помечает пользователя спамером: событие + флаги + штампы сообщений +
 /// пересчёт счётчика. Семантика повторяет прежний `apply_callback("spam")`,
-/// плюс пишется `spam_label_events`.
-// NOTE: прямой вызов появится в enforcement ladder; пока используется
-// транзакционная версия из review-колбэка.
+/// плюс пишет `spam_label_events`.
 #[allow(dead_code)]
 pub async fn record_spam(
     pool: &PgPool,
@@ -81,11 +85,12 @@ pub async fn record_spam_in_transaction(
         .bind(&label.subtype)
         .execute(&mut **tx)
         .await?;
-    sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = $3, spam_source = 'manual_owner_confirmation', spam_type = coalesce(spam_type, $4) where chat_id = $1 and user_id = $2 and source_channel_id is null")
+    sqlx::query("update telegram_messages set spam_marked_at = coalesce(spam_marked_at, now()), spam_reason = $3, spam_source = $5, spam_type = coalesce(spam_type, $4) where chat_id = $1 and user_id = $2 and source_channel_id is null")
         .bind(chat_id)
         .bind(user_id)
         .bind(&label.reason)
         .bind(&label.subtype)
+        .bind(label.source.message_source())
         .execute(&mut **tx)
         .await?;
     sqlx::query("update telegram_chat_users set spam_message_count = (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null), spam_types = coalesce(spam_types, '{}'::jsonb) || jsonb_build_object($3, (select count(*) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null)) where chat_id = $1 and telegram_user_id = $2")
@@ -94,7 +99,7 @@ pub async fn record_spam_in_transaction(
         .bind(&label.subtype)
         .execute(&mut **tx)
         .await?;
-    if avatar_embeddings_enabled {
+    if avatar_embeddings_enabled && !matches!(&label.source, LabelSource::System) {
         crate::features::spammer_avatar_embeddings::enqueue_confirmed_avatar_in_transaction(
             tx, chat_id, user_id,
         )
@@ -144,7 +149,7 @@ pub async fn record_not_spam_in_transaction(
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
-    sqlx::query("update telegram_messages set spam_marked_at = null, spam_reason = null, spam_source = null where chat_id = $1 and user_id = $2 and source_channel_id is null and spam_source = 'manual_owner_confirmation'")
+    sqlx::query("update telegram_messages set spam_marked_at = null, spam_reason = null, spam_source = null where chat_id = $1 and user_id = $2 and source_channel_id is null and spam_source in ('manual_owner_confirmation', 'system_automatic')")
         .bind(chat_id)
         .bind(user_id)
         .execute(&mut **tx)
