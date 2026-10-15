@@ -6286,7 +6286,7 @@ async fn assert_system_spam_label_transition(pool: &PgPool) {
             reason: "deterministic campaign fixture".to_string(),
             evidence: serde_json::json!({
                 "rule": "fresh_money_work_private_contact",
-                "rule_version": "new-user-campaign-v1"
+                "rule_version": "new-user-campaign-v2"
             }),
             operator_id: None,
         },
@@ -6315,7 +6315,7 @@ async fn assert_system_spam_label_transition(pool: &PgPool) {
     .expect("system spam label event must exist");
     assert_eq!(event.0, "system");
     assert_eq!(event.1, None);
-    assert_eq!(event.2["rule_version"], "new-user-campaign-v1");
+    assert_eq!(event.2["rule_version"], "new-user-campaign-v2");
 
     let stamped: (i64, Option<String>) = query_as(
         "select count(*), min(spam_source) from telegram_messages where chat_id = $1 and user_id = $2 and spam_marked_at is not null",
