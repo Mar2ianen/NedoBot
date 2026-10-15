@@ -7,6 +7,25 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+15 октября 2026 в **20:06 UTC / 23:06 МСК** выпущен release
+[`deploy-2026-10-15-spam-patterns`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-15-spam-patterns)
+на merge commit `155c47bd3da5718def0fae601bc64844f7c175f3` после review
+[PR #79](https://github.com/Mar2ianen/NedoBot/pull/79). [Release workflow 38798335159](https://github.com/Mar2ianen/NedoBot/actions/runs/38798335159)
+собрал и установил artifact на оба community-инстанса и перезапустил public MCP.
+SHA-256 обоих bot binaries —
+`24b8d268a0a19c0cf0d654b1a10dd40cacc6ee277c075d67ffc150f19b073c08`; оба
+работающих процесса совпали с artifact.
+
+Оба бота и `nedonews-mcp` active; error-level journal после выкладки пуст,
+сообщений о пропущенных миграциях нет. CI
+[38797292117](https://github.com/Mar2ianen/NedoBot/actions/runs/38797292117)
+прошёл форматирование, тесты, Clippy и PostgreSQL integration suites. К
+детерминированному аудиту свежих аккаунтов добавлены два подтверждённых PVO
+шаблона: оплата «на руки» с личным CTA и короткая задача с суммой в рублях
+после выполнения. Правило короткой задачи требует одновременно все признаки и
+не более трёх сообщений за первые сутки; автоматическое действие по-прежнему
+определяет общая moderation policy.
+
 14 октября 2026 в **12:55 UTC / 15:55 МСК** выпущен release
 [`deploy-2026-10-14-deterministic-spam`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-14-deterministic-spam)
 на merge commit `a2dcc618bba80f19f699b589551a4d0b90119479` после review
