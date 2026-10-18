@@ -7,6 +7,23 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+18 октября 2026 в **14:06 UTC / 17:06 МСК** выпущен release
+[`deploy-2026-10-18-risk-captcha-ephemeral`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-18-risk-captcha-ephemeral)
+на merge commit `89427ff54e6a18b44c2ed95e10f6c3bf95e2de1a` после review
+[PR #81](https://github.com/Mar2ianen/NedoBot/pull/81). [Release workflow 39133862251](https://github.com/Mar2ianen/NedoBot/actions/runs/39133862251)
+установил artifact в оба community-инстанса и перезапустил public MCP.
+SHA-256 обоих bot binaries —
+`eaf09b61010657bfbdd2c553fa564eb3197075352903ddb4d04c8b4e3cdafaf8`; оба
+работающих процесса совпали с artifact.
+
+Оба бота и `nedonews-mcp` active; error-level journal после рестарта пуст.
+Новая миграция `20261018120000` применена в обе БД. CI
+[39133347843](https://github.com/Mar2ianen/NedoBot/actions/runs/39133347843)
+прошёл format, tests, Clippy и PostgreSQL integration suites. Капча теперь
+отправляется эфемерно только проверяемому участнику; успешный ответ обновляет
+его приватную карточку, неверные ответы не дают уведомлений, после трёх ошибок
+кнопки убираются, а истёкшая карточка удаляется без текста о неудаче.
+
 15 октября 2026 в **20:06 UTC / 23:06 МСК** выпущен release
 [`deploy-2026-10-15-spam-patterns`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-15-spam-patterns)
 на merge commit `155c47bd3da5718def0fae601bc64844f7c175f3` после review
