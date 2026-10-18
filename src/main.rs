@@ -557,56 +557,36 @@ async fn handle_risk_captcha_callback(
                 user_id = query.from.id.0,
                 "risk captcha callback failed"
             );
-            bot.answer_callback_query(query.id.clone())
-                .text("Не удалось обработать ответ. Попробуйте ещё раз.")
-                .show_alert(true)
-                .await?;
+            bot.answer_callback_query(query.id.clone()).await?;
             return Ok(());
         }
     };
 
-    let text = match outcome.attempts_left() {
-        Some(attempts_left) => format!("Неверный ответ. Осталось попыток: {attempts_left}."),
-        None => outcome.text().to_string(),
-    };
-    bot.answer_callback_query(query.id.clone())
-        .text(text)
-        .show_alert(matches!(
-            outcome,
-            features::risk_captcha::CaptchaCallbackOutcome::NotForThisUser
-                | features::risk_captcha::CaptchaCallbackOutcome::Failed
-                | features::risk_captcha::CaptchaCallbackOutcome::Expired
-        ))
-        .await?;
+    let message = query.regular_message();
+    let success_text = outcome.success_message();
+    let answer = bot.answer_callback_query(query.id.clone());
+    if let Some(success_text) = success_text
+        && message.is_some_and(|message| message.ephemeral_message_id.is_none())
+    {
+        // Legacy public captcha cards are removed after deploy; show their
+        // success result only to the participant who pressed the button.
+        answer.text(success_text).show_alert(true).await?;
+    } else {
+        answer.await?;
+    }
 
     if outcome.is_terminal()
-        && let Some(message) = query.regular_message()
+        && let Some(message) = message
     {
-        let card_text = match outcome {
-            features::risk_captcha::CaptchaCallbackOutcome::Passed => {
-                "Проверка пройдена. Ограничения сняты."
-            }
-            features::risk_captcha::CaptchaCallbackOutcome::PassedButOtherRestrictionRemains => {
-                "Проверка пройдена. Другое ограничение остаётся."
-            }
-            features::risk_captcha::CaptchaCallbackOutcome::Failed => {
-                "Попытки закончились. Ограничение остаётся; обратитесь к модератору."
-            }
-            features::risk_captcha::CaptchaCallbackOutcome::Expired => {
-                "Время истекло. Проверка закрывается."
-            }
-            _ => "Проверка уже недействительна.",
-        };
-        if let Err(error) = bot
-            .edit_message_text(message.chat.id, message.id, card_text)
-            .reply_markup(teloxide::types::InlineKeyboardMarkup::new(Vec::<
-                Vec<teloxide::types::InlineKeyboardButton>,
-            >::new(
-            )))
-            .await
-        {
-            tracing::debug!(%error, "failed to update completed risk captcha card");
-        }
+        features::risk_captcha::finish_captcha_card(
+            bot.inner(),
+            message.chat.id,
+            query.from.id,
+            message.id,
+            message.ephemeral_message_id,
+            success_text,
+        )
+        .await;
     }
     Ok(())
 }

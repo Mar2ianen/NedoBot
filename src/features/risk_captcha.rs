@@ -2,13 +2,13 @@ use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgRow};
 use teloxide::{
     payloads::{
-        EditMessageTextSetters, RestrictChatMemberSetters, SendMessageSetters,
-        UnbanChatMemberSetters,
+        EditEphemeralMessageReplyMarkupSetters, EditEphemeralMessageTextSetters,
+        RestrictChatMemberSetters, SendMessageSetters, UnbanChatMemberSetters,
     },
     prelude::{Bot, Requester},
     types::{
-        ChatId, ChatMemberKind, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup,
-        MessageId, UserId,
+        ChatId, ChatMemberKind, ChatPermissions, EphemeralMessageParameters, InlineKeyboardButton,
+        InlineKeyboardMarkup, MessageId, UserId,
     },
 };
 use uuid::Uuid;
@@ -45,24 +45,17 @@ pub enum CaptchaCallbackOutcome {
 }
 
 impl CaptchaCallbackOutcome {
-    pub fn text(self) -> &'static str {
+    pub fn success_message(self) -> Option<&'static str> {
         match self {
-            Self::Passed => "Проверка пройдена, ограничения сняты.",
+            Self::Passed => Some("Проверка пройдена. Ограничения сняты."),
             Self::PassedButOtherRestrictionRemains => {
-                "Проверка пройдена. Другое ограничение остаётся, обратитесь к модератору."
+                Some("Проверка пройдена. Другое ограничение остаётся.")
             }
-            Self::Wrong { .. } => "Неверный ответ.",
-            Self::Failed => "Попытки закончились. Ограничение остаётся; обратитесь к модератору.",
-            Self::Expired => "Время на проверку истекло.",
-            Self::Stale => "Эта проверка уже недействительна.",
-            Self::NotForThisUser => "Эта проверка предназначена другому участнику.",
-        }
-    }
-
-    pub fn attempts_left(self) -> Option<i32> {
-        match self {
-            Self::Wrong { attempts_left } => Some(attempts_left),
-            _ => None,
+            Self::Wrong { .. }
+            | Self::Failed
+            | Self::Expired
+            | Self::Stale
+            | Self::NotForThisUser => None,
         }
     }
 
@@ -97,6 +90,7 @@ struct CaptchaChallenge {
     restore_permissions: ChatPermissions,
     restriction_applied_at: Option<chrono::DateTime<chrono::Utc>>,
     message_id: Option<i32>,
+    ephemeral_message_id: Option<i32>,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     status: String,
     setup_attempts: i32,
@@ -219,11 +213,20 @@ async fn deliver_challenge(
         challenge.question,
         ttl_seconds.saturating_add(59) / 60
     );
-    let sent = bot
-        .send_message(ChatId(challenge.chat_id), text)
-        .reply_markup(keyboard(challenge))
-        .await?;
-    set_message_sent(pool, challenge.id, sent.id.0, ttl_seconds).await?;
+    let sent = with_captcha_ephemeral_parameters(
+        bot.send_message(ChatId(challenge.chat_id), text),
+        UserId(challenge.user_id as u64),
+    )
+    .reply_markup(keyboard(challenge))
+    .await?;
+    set_message_sent(
+        pool,
+        challenge.id,
+        sent.id.0,
+        sent.ephemeral_message_id,
+        ttl_seconds,
+    )
+    .await?;
     Ok(CaptchaOutcome::Issued)
 }
 
@@ -630,7 +633,8 @@ async fn reopen_expired_challenge(
         r#"update telegram_risk_captcha_challenges
            set id = $1, audit_job_id = $2, risk_score = $3, question = $4,
                options = $5, correct_option = $6, restore_permissions = $7,
-               restriction_applied_at = null, message_id = null, expires_at = null,
+               restriction_applied_at = null, message_id = null,
+               ephemeral_message_id = null, expires_at = null,
                status = 'preparing', attempts = 0, setup_attempts = 0,
                setup_next_attempt_at = now(), setup_lease_expires_at = null,
                setup_error_kind = null, created_at = now(), updated_at = now(),
@@ -702,7 +706,8 @@ async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallen
            returning challenge.id, challenge.chat_id, challenge.telegram_user_id,
                      challenge.question, challenge.options, challenge.correct_option,
                      challenge.restore_permissions, challenge.restriction_applied_at,
-                     challenge.message_id, challenge.expires_at,
+                     challenge.message_id, challenge.ephemeral_message_id,
+                     challenge.expires_at,
                      challenge.status, challenge.setup_attempts"#,
     )
     .bind(SETUP_LEASE_SECONDS)
@@ -733,7 +738,8 @@ async fn claim_next_expired(pool: &PgPool) -> anyhow::Result<Option<CaptchaChall
            returning challenge.id, challenge.chat_id, challenge.telegram_user_id,
                      challenge.question, challenge.options, challenge.correct_option,
                      challenge.restore_permissions, challenge.restriction_applied_at,
-                     challenge.message_id, challenge.expires_at,
+                     challenge.message_id, challenge.ephemeral_message_id,
+                     challenge.expires_at,
                      challenge.status, challenge.setup_attempts"#,
     )
     .bind(SETUP_LEASE_SECONDS)
@@ -757,7 +763,7 @@ async fn expire_claimed_challenge(
     .is_some()
     {
         set_status(pool, challenge.id, "overridden").await?;
-        update_captcha_card(bot, challenge, "Проверка отменена другим ограничением.").await;
+        remove_captcha_card(bot, challenge).await;
         return Ok(());
     }
 
@@ -784,33 +790,67 @@ async fn expire_claimed_challenge(
         ChatMemberKind::Left => {}
         _ => {
             set_status(pool, challenge.id, "overridden").await?;
-            update_captcha_card(bot, challenge, "Проверка отменена модератором.").await;
+            remove_captcha_card(bot, challenge).await;
             return Ok(());
         }
     }
 
     set_expired(pool, challenge.id).await?;
-    update_captcha_card(bot, challenge, "Время вышло. Участник удалён из чата.").await;
+    remove_captcha_card(bot, challenge).await;
     Ok(())
 }
 
-async fn update_captcha_card(bot: &Bot, challenge: &CaptchaChallenge, text: &str) {
-    let Some(message_id) = challenge.message_id else {
-        return;
+async fn remove_captcha_card(bot: &Bot, challenge: &CaptchaChallenge) {
+    let result = match (challenge.ephemeral_message_id, challenge.message_id) {
+        (Some(ephemeral_message_id), _) => {
+            bot.delete_ephemeral_message(
+                ChatId(challenge.chat_id),
+                UserId(challenge.user_id as u64),
+                ephemeral_message_id,
+            )
+            .await
+        }
+        (None, Some(message_id)) => {
+            bot.delete_message(ChatId(challenge.chat_id), MessageId(message_id))
+                .await
+        }
+        (None, None) => return,
     };
-    if let Err(error) = bot
-        .edit_message_text(
-            ChatId(challenge.chat_id),
-            teloxide::types::MessageId(message_id),
-            text,
-        )
-        .reply_markup(InlineKeyboardMarkup::new(
-            Vec::<Vec<InlineKeyboardButton>>::new(),
-        ))
-        .await
-    {
-        tracing::debug!(%error, chat_id = challenge.chat_id, user_id = challenge.user_id, "failed to update expired risk captcha card");
+    if let Err(error) = result {
+        tracing::debug!(%error, chat_id = challenge.chat_id, user_id = challenge.user_id, "failed to remove completed risk captcha message");
     }
+}
+
+pub async fn finish_captcha_card(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: UserId,
+    message_id: MessageId,
+    ephemeral_message_id: Option<i32>,
+    success_text: Option<&str>,
+) {
+    let empty_keyboard = InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
+    let result = match (ephemeral_message_id, success_text) {
+        (Some(ephemeral_message_id), Some(text)) => bot
+            .edit_ephemeral_message_text(chat_id, user_id, ephemeral_message_id)
+            .text(text)
+            .reply_markup(empty_keyboard)
+            .await
+            .map(|_| ()),
+        (Some(ephemeral_message_id), None) => bot
+            .edit_ephemeral_message_reply_markup(chat_id, user_id, ephemeral_message_id)
+            .reply_markup(empty_keyboard)
+            .await
+            .map(|_| ()),
+        (None, _) => bot.delete_message(chat_id, message_id).await.map(|_| ()),
+    };
+    if let Err(error) = result {
+        tracing::debug!(%error, chat_id = chat_id.0, user_id = user_id.0, "failed to finish risk captcha message");
+    }
+}
+
+fn with_captcha_ephemeral_parameters<R: SendMessageSetters>(request: R, user_id: UserId) -> R {
+    request.ephemeral_message_parameters(EphemeralMessageParameters::new(user_id))
 }
 
 async fn load_user_challenge(
@@ -819,7 +859,7 @@ async fn load_user_challenge(
     user_id: i64,
 ) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(chat_id)
     .bind(user_id)
@@ -830,7 +870,7 @@ async fn load_user_challenge(
 
 async fn load_challenge(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -843,7 +883,7 @@ async fn select_challenge_by_id(
     id: Uuid,
 ) -> anyhow::Result<PgRow> {
     Ok(sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_one(&mut **tx)
@@ -861,6 +901,7 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         restore_permissions: serde_json::from_value(row.try_get("restore_permissions")?)?,
         restriction_applied_at: row.try_get("restriction_applied_at")?,
         message_id: row.try_get("message_id")?,
+        ephemeral_message_id: row.try_get("ephemeral_message_id")?,
         expires_at: row.try_get("expires_at")?,
         status: row.try_get("status")?,
         setup_attempts: row.try_get("setup_attempts")?,
@@ -871,13 +912,15 @@ async fn set_message_sent(
     pool: &PgPool,
     id: Uuid,
     message_id: i32,
+    ephemeral_message_id: Option<i32>,
     ttl_seconds: i64,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "update telegram_risk_captcha_challenges set status = 'pending', message_id = coalesce(message_id, $2), expires_at = coalesce(expires_at, now() + ($3 * interval '1 second')), setup_lease_expires_at = null, setup_error_kind = null, updated_at = now() where id = $1 and status in ('preparing', 'setting_up', 'pending')",
+        "update telegram_risk_captcha_challenges set status = 'pending', message_id = coalesce(message_id, $2), ephemeral_message_id = coalesce(ephemeral_message_id, $3), expires_at = coalesce(expires_at, now() + ($4 * interval '1 second')), setup_lease_expires_at = null, setup_error_kind = null, updated_at = now() where id = $1 and status in ('preparing', 'setting_up', 'pending')",
     )
     .bind(id)
     .bind(message_id)
+    .bind(ephemeral_message_id)
     .bind(ttl_seconds)
     .execute(pool)
     .await?;
@@ -973,8 +1016,54 @@ pub async fn record_wrong_answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_math_challenge, is_callback_data, parse_callback_data};
+    use super::{
+        CaptchaCallbackOutcome, generate_math_challenge, is_callback_data, parse_callback_data,
+        with_captcha_ephemeral_parameters,
+    };
+    use teloxide::{
+        prelude::{Bot, ChatId, Requester},
+        requests::HasPayload,
+        types::UserId,
+    };
     use uuid::Uuid;
+
+    #[test]
+    fn captcha_message_is_visible_only_to_its_challenged_user() {
+        let recipient = UserId(42);
+        let request = with_captcha_ephemeral_parameters(
+            Bot::new("123456:TEST_TOKEN").send_message(ChatId(-1001), "solve this"),
+            recipient,
+        );
+
+        assert_eq!(
+            request
+                .payload_ref()
+                .ephemeral_message_parameters
+                .as_ref()
+                .map(|parameters| parameters.receiver_user_id),
+            Some(recipient)
+        );
+        assert!(request.payload_ref().reply_parameters.is_none());
+    }
+
+    #[test]
+    fn only_successful_captcha_outcomes_have_visible_result_text() {
+        assert!(CaptchaCallbackOutcome::Passed.success_message().is_some());
+        assert!(
+            CaptchaCallbackOutcome::PassedButOtherRestrictionRemains
+                .success_message()
+                .is_some()
+        );
+        for outcome in [
+            CaptchaCallbackOutcome::Wrong { attempts_left: 2 },
+            CaptchaCallbackOutcome::Failed,
+            CaptchaCallbackOutcome::Expired,
+            CaptchaCallbackOutcome::Stale,
+            CaptchaCallbackOutcome::NotForThisUser,
+        ] {
+            assert_eq!(outcome.success_message(), None);
+        }
+    }
 
     #[test]
     fn generated_math_captcha_has_four_distinct_options_and_one_correct_answer() {
