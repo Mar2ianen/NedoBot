@@ -3688,9 +3688,10 @@ async fn assert_risk_captcha_state_transitions(pool: &PgPool) {
     query(
         r#"insert into telegram_risk_captcha_challenges
                (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
-                options, correct_option, restore_permissions)
+                options, correct_option, restore_permissions, message_id,
+                ephemeral_message_id)
            values ($1, $2, $3, 1, 90, '1 + 1 = ?', '["2", "3", "4", "5"]', 0,
-                   '{"can_send_messages": true}')"#,
+                   '{"can_send_messages": true}', 71, 9071)"#,
     )
     .bind(passed_id)
     .bind(chat_id)
@@ -3713,6 +3714,14 @@ async fn assert_risk_captcha_state_transitions(pool: &PgPool) {
             .await
             .expect("passed captcha state must be readable");
     assert_eq!(passed_status, "passed");
+    let message_ids: (Option<i32>, Option<i32>) = query_as(
+        "select message_id, ephemeral_message_id from telegram_risk_captcha_challenges where id = $1",
+    )
+    .bind(passed_id)
+    .fetch_one(pool)
+    .await
+    .expect("captcha message identifiers must be queryable");
+    assert_eq!(message_ids, (Some(71), Some(9071)));
 
     query("delete from telegram_risk_captcha_challenges where id = any($1)")
         .bind(vec![failed_id, expired_id, passed_id])
