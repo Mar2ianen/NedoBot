@@ -7,6 +7,29 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+20 октября 2026 в **18:06 UTC / 21:06 МСК** выпущен release
+[`deploy-2026-10-20-tls-security`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-20-tls-security)
+на merge commit `5be14fcc14c6d4dbc9b984b5a2c40d1a1283d2fe` после PR
+[#83](https://github.com/Mar2ianen/NedoBot/pull/83). [Release workflow
+39470540838](https://github.com/Mar2ianen/NedoBot/actions/runs/39470540838)
+установил бинарники в оба community-инстанса и public MCP. SHA-256 обоих bot
+binaries — `43c7521b46a9c4679c3c7c9b1ea3b023af61a7034d7ba23921e86808fcc72486`,
+MCP — `56f67e85f3594f081e664adaaa85085238f867af1fcdac052632ea6f1a55c16b`;
+хеши запущенных процессов совпали с artifact.
+
+В `Cargo.lock` обновлены `rustls` до 0.23.46, `rustls-webpki` до 0.103.16,
+`reqwest` до 0.13.5, `rustls-platform-verifier` до 0.7.1 и совместимые TLS
+зависимости. На `vps-153` исключён корень `emSign ECC Root CA - G3` в
+`/etc/ca-certificates.conf`; `update-ca-certificates` удалил один сертификат
+из системного bundle, а OpenSSL подтвердил, что корень больше не доверенный.
+Резервная копия конфигурации:
+`/etc/ca-certificates.conf.bak-emSign-20261020T175330Z`. После изменения
+перезапущены `tg-ai-bot-teloxide`, `nedobot-pvo` и `nedonews-mcp`; все три
+active, error-level journal пуст. TLS-проверки до `api.telegram.org` и
+`generativelanguage.googleapis.com` прошли успешно. В CI
+[39469538568](https://github.com/Mar2ianen/NedoBot/actions/runs/39469538568)
+прошли форматирование, все targets, Clippy и PostgreSQL integration suites.
+
 18 октября 2026 в **14:06 UTC / 17:06 МСК** выпущен release
 [`deploy-2026-10-18-risk-captcha-ephemeral`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-18-risk-captcha-ephemeral)
 на merge commit `89427ff54e6a18b44c2ed95e10f6c3bf95e2de1a` после review
