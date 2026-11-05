@@ -11,7 +11,7 @@ use teloxide_antispam::scoring::ScoreComponents;
 
 /// Версия правил записи unified score. Меняется при изменении scoring/materializer,
 /// чтобы выбранные сохранённые assessments можно было безопасно переиграть.
-pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v8";
+pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v9";
 
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
 /// generation boundary. Job остаётся под исходным generation lease.
@@ -84,6 +84,25 @@ pub async fn has_materialized_audit_for_first_message(
     .await?)
 }
 
+pub async fn latest_audit_trigger_fingerprint(
+    pool: &PgPool,
+    chat_id: i64,
+    telegram_user_id: i64,
+) -> anyhow::Result<Option<(String, String, bool)>> {
+    Ok(sqlx::query_as(
+        r#"select input_json->>'audit_trigger_fingerprint', status,
+                  assessment_json is not null
+           from new_user_audit_jobs
+           where chat_id = $1 and telegram_user_id = $2
+             and input_json->>'audit_trigger_fingerprint' is not null
+           order by updated_at desc, id desc limit 1"#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 #[allow(dead_code)] // Используется PostgreSQL migration/integration harness.
 pub async fn enqueue_new_user_audit_job(
     pool: &PgPool,
@@ -116,55 +135,85 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
         do update set
             status = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then 'pending'
                 else new_user_audit_jobs.status
             end,
             attempts = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then 0
                 else new_user_audit_jobs.attempts
             end,
             next_attempt_at = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then now()
                 else new_user_audit_jobs.next_attempt_at
             end,
             processing_started_at = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.processing_started_at
             end,
             lease_expires_at = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.lease_expires_at
             end,
             error_kind = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.error_kind
             end,
             assessment_json = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.assessment_json
             end,
             provider = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.provider
             end,
             model = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.model
             end,
             completed_at = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.completed_at
             end,
-            input_json = excluded.input_json,
+            input_json = case
+                when excluded.input_json ->> 'deterministic_campaign_rule' is null
+                  and new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is not null
+                then jsonb_set(
+                    excluded.input_json,
+                    '{deterministic_campaign_rule}',
+                    new_user_audit_jobs.input_json -> 'deterministic_campaign_rule',
+                    true
+                )
+                else excluded.input_json
+            end,
             avatar_file_id = excluded.avatar_file_id,
             avatar_file_unique_id = excluded.avatar_file_unique_id,
             review_threshold = excluded.review_threshold,
@@ -172,42 +221,57 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
             materialization_status = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then 'pending'
                 else new_user_audit_jobs.materialization_status
             end,
             materialization_attempts = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then 0
                 else new_user_audit_jobs.materialization_attempts
             end,
             materialization_next_attempt_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then now()
                 else new_user_audit_jobs.materialization_next_attempt_at
             end,
             materialization_processing_started_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialization_processing_started_at
             end,
             materialization_lease_expires_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialization_lease_expires_at
             end,
             materialization_error_kind = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialization_error_kind
             end,
             materialized_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialized_at
             end,
             updated_at = now()
@@ -221,6 +285,40 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
     .bind(params.avatar_file_id)
     .bind(params.avatar_file_unique_id)
     .bind(params.review_threshold)
+    .bind(CURRENT_MATERIALIZATION_VERSION)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Reopens only the saved-assessment materializer when its rules version is
+/// obsolete. This never schedules generation or interrupts current retries.
+pub async fn reopen_obsolete_materialization_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    params: NewUserAuditJobParams<'_>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update new_user_audit_jobs
+        set materialization_version = $5,
+            materialization_status = 'pending',
+            materialization_attempts = 0,
+            materialization_next_attempt_at = now(),
+            materialization_processing_started_at = null,
+            materialization_lease_expires_at = null,
+            materialization_error_kind = null,
+            materialized_at = null,
+            updated_at = now()
+        where chat_id = $1 and telegram_user_id = $2
+          and snapshot_hash = $3 and prompt_version = $4
+          and status = 'succeeded' and assessment_json is not null
+          and materialization_version is distinct from $5
+        "#,
+    )
+    .bind(params.chat_id)
+    .bind(params.telegram_user_id)
+    .bind(params.snapshot_hash)
+    .bind(params.prompt_version)
     .bind(CURRENT_MATERIALIZATION_VERSION)
     .execute(&mut **tx)
     .await?;

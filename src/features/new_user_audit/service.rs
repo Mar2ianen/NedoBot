@@ -337,6 +337,11 @@ async fn deterministic_campaign_for_job(
     {
         return Ok(None);
     }
+    if let Some(rule) = job.input_json.get("deterministic_campaign_rule") {
+        return Ok(rule
+            .as_str()
+            .and_then(deterministic::CampaignMatch::from_rule));
+    }
     let row = sqlx::query(
         r#"select first_message_text, message_count, first_seen_at,
                   personal_channel_has_adult_links
