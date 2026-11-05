@@ -11,8 +11,9 @@ use crate::{
         prompt::PROMPT_VERSION,
         repo::{
             NewUserAuditJobParams, enqueue_new_user_audit_job_in_transaction,
-            has_materialized_audit_for_first_message, latest_audit_trigger_fingerprint,
-            record_new_user_audit_snapshot_in_transaction,
+            has_materialized_audit_for_first_message, latest_audit_link_message_id,
+            latest_audit_trigger_fingerprint, record_new_user_audit_snapshot_in_transaction,
+            refresh_in_flight_audit_snapshot_in_transaction,
             reopen_obsolete_materialization_in_transaction,
             supersede_unneeded_new_user_audit_jobs_in_transaction,
             sync_spam_review_from_audit_in_transaction,
@@ -84,16 +85,26 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     let avatar_changed = previous_avatar_file_unique_id.as_deref()
         != features.profile_photo_file_unique_id.as_deref();
     let latest_link_evidence = load_latest_link_evidence(pool, chat_id, telegram_user_id).await?;
-    let trigger_fingerprint = audit_trigger_fingerprint(&features, latest_link_evidence.as_ref());
+    let latest_long_message_evidence =
+        load_latest_long_message_evidence(pool, chat_id, telegram_user_id).await?;
+    let trigger_fingerprint = audit_trigger_fingerprint(
+        &features,
+        latest_link_evidence.as_ref(),
+        latest_long_message_evidence.as_ref(),
+    );
     let previous_trigger_fingerprint =
         latest_audit_trigger_fingerprint(pool, chat_id, telegram_user_id).await?;
+    let previous_link_message_id =
+        latest_audit_link_message_id(pool, chat_id, telegram_user_id).await?;
+    let link_evidence_changed = latest_link_evidence
+        .as_ref()
+        .is_some_and(|(message_id, _)| Some(*message_id) != previous_link_message_id);
     let fresh_content_changed =
         trigger_fingerprint
             .as_ref()
             .is_some_and(|fingerprint| match previous_trigger_fingerprint.as_ref() {
                 Some((previous, status, has_assessment)) if previous == fingerprint => {
-                    matches!(status.as_str(), "pending" | "retry_wait" | "processing")
-                        || (status == "succeeded" && !has_assessment)
+                    status == "succeeded" && !has_assessment
                 }
                 _ => true,
             });
@@ -105,17 +116,36 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         first_message_preview.as_deref(),
     )
     .await?;
-    let run_audit_job = should_enqueue_new_user_audit_job(
+    let run_audit_job = should_enqueue_new_user_audit_job_with_link(
         &features,
         &risk,
         is_old_active_user,
         avatar_changed,
         fresh_content_changed,
+        link_evidence_changed,
         !has_completed_first_message_audit && !is_old_active_user,
     );
+    let same_fingerprint_in_flight = match (
+        trigger_fingerprint.as_ref(),
+        previous_trigger_fingerprint.as_ref(),
+    ) {
+        (Some(current), Some((previous, status, _))) => {
+            current == previous
+                && matches!(status.as_str(), "pending" | "retry_wait" | "processing")
+        }
+        _ => false,
+    };
     let mut input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
     input_json["audit_trigger_fingerprint"] = trigger_fingerprint
         .map(Value::String)
+        .unwrap_or(Value::Null);
+    input_json["latest_link_message_id"] = latest_link_evidence
+        .as_ref()
+        .map(|(message_id, _)| Value::from(*message_id))
+        .unwrap_or(Value::Null);
+    input_json["latest_long_message_id"] = latest_long_message_evidence
+        .as_ref()
+        .map(|(message_id, _)| Value::from(*message_id))
         .unwrap_or(Value::Null);
     let deterministic_campaign = deterministic::classify(
         features.first_message_text.as_deref(),
@@ -145,13 +175,19 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     };
     let mut tx = pool.begin().await?;
     // Authoritative transactions consistently lock job, then audit, then review.
-    if run_audit_job {
-        enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
+    let preserved_in_flight = if run_audit_job || same_fingerprint_in_flight {
+        let reused_in_flight =
+            refresh_in_flight_audit_snapshot_in_transaction(&mut tx, params).await?;
+        if run_audit_job && !reused_in_flight {
+            enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
+        }
+        reused_in_flight
     } else {
         reopen_obsolete_materialization_in_transaction(&mut tx, params).await?;
         supersede_unneeded_new_user_audit_jobs_in_transaction(&mut tx, chat_id, telegram_user_id)
             .await?;
-    }
+        false
+    };
     save_audit_in_transaction(&mut tx, &features, &risk, &analysis_config, avatar_changed).await?;
     if !run_audit_job || avatar_changed {
         sync_spam_review_from_audit_in_transaction(
@@ -170,7 +206,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         telegram_user_id,
         risk_score = risk.score,
         risk_level = %risk.level,
-        audit_job_queued = run_audit_job,
+        audit_job_queued = run_audit_job && !preserved_in_flight,
         "unified new user audit baseline and job saved"
     );
     Ok(())
@@ -181,12 +217,33 @@ const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
 const NEW_USER_LLM_AUDIT_MIN_BASELINE_SCORE: i32 = 25;
 const LONG_FIRST_COMMENT_MIN_CHARS: usize = 220;
 
+#[cfg(test)]
 fn should_enqueue_new_user_audit_job(
     features: &NewUserFeatures,
     risk: &RiskAnalysis,
     is_old_active_user: bool,
     avatar_changed: bool,
     fresh_content_changed: bool,
+    needs_initial_audit: bool,
+) -> bool {
+    should_enqueue_new_user_audit_job_with_link(
+        features,
+        risk,
+        is_old_active_user,
+        avatar_changed,
+        fresh_content_changed,
+        false,
+        needs_initial_audit,
+    )
+}
+
+fn should_enqueue_new_user_audit_job_with_link(
+    features: &NewUserFeatures,
+    risk: &RiskAnalysis,
+    is_old_active_user: bool,
+    avatar_changed: bool,
+    fresh_content_changed: bool,
+    link_evidence_changed: bool,
     needs_initial_audit: bool,
 ) -> bool {
     let has_deterministic_campaign = deterministic::classify(
@@ -203,6 +260,7 @@ fn should_enqueue_new_user_audit_job(
             is_old_active_user,
             avatar_changed,
             fresh_content_changed,
+            link_evidence_changed,
             needs_initial_audit,
         )
 }
@@ -213,13 +271,14 @@ fn should_run_new_user_llm_audit(
     is_old_active_user: bool,
     avatar_changed: bool,
     fresh_content_changed: bool,
+    link_evidence_changed: bool,
     needs_initial_audit: bool,
 ) -> bool {
     // Mature accounts do not need an LLM pass on every profile refresh. Keep
     // the pass when current activity carries evidence that can change the
     // decision: changed avatar/content evidence or a strong local score.
     // Profile metadata alone is useful only for genuinely new/low-activity accounts.
-    let has_fresh_content_signal = avatar_changed || fresh_content_changed;
+    let has_fresh_content_signal = avatar_changed || fresh_content_changed || link_evidence_changed;
 
     if is_old_active_user {
         return risk.score >= NEW_USER_LLM_AUDIT_MIN_BASELINE_SCORE || has_fresh_content_signal;
@@ -233,6 +292,7 @@ fn should_run_new_user_llm_audit(
                 || features.personal_channel_has_adult_links
                 || personal_channel_has_invite_link(features)
                 || personal_channel_has_external_link(features)))
+        || link_evidence_changed
 }
 
 async fn load_latest_link_evidence(
@@ -254,19 +314,31 @@ async fn load_latest_link_evidence(
     .await?)
 }
 
+async fn load_latest_long_message_evidence(
+    pool: &PgPool,
+    chat_id: i64,
+    telegram_user_id: i64,
+) -> anyhow::Result<Option<(i32, Option<String>)>> {
+    Ok(sqlx::query_as(
+        r#"select message_id, text
+           from telegram_messages
+           where chat_id = $1 and user_id = $2 and source_channel_id is null
+             and text is not null and char_length(text) >= $3
+             and created_at >= now() - interval '24 hours'
+           order by created_at desc, message_id desc limit 1"#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(LONG_FIRST_COMMENT_MIN_CHARS as i32)
+    .fetch_optional(pool)
+    .await?)
+}
+
 fn audit_trigger_fingerprint(
     features: &NewUserFeatures,
     latest_link_evidence: Option<&(i32, Option<String>)>,
+    latest_long_message_evidence: Option<&(i32, Option<String>)>,
 ) -> Option<String> {
-    let recent_trigger_messages = features
-        .recent_message_texts
-        .iter()
-        .take(UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT)
-        .filter(|text| {
-            text.chars().count() >= LONG_FIRST_COMMENT_MIN_CHARS || looks_like_link_text(text)
-        })
-        .map(|text| bounded_audit_text(Some(text)))
-        .collect::<Vec<_>>();
     let channel_has_promotional_links = features.personal_channel_has_adult_links
         || personal_channel_has_invite_link(features)
         || personal_channel_has_external_link(features);
@@ -282,7 +354,7 @@ fn audit_trigger_fingerprint(
             "external_link": personal_channel_has_external_link(features),
         })
     });
-    if recent_trigger_messages.is_empty()
+    if latest_long_message_evidence.is_none()
         && channel_evidence.is_none()
         && latest_link_evidence.is_none()
     {
@@ -290,7 +362,7 @@ fn audit_trigger_fingerprint(
     }
     let evidence = json!({
         "avatar": features.profile_photo_file_unique_id,
-        "recent_trigger_messages": recent_trigger_messages,
+        "latest_long_message": latest_long_message_evidence,
         "latest_link_message": latest_link_evidence,
         "channel": channel_evidence,
     });
@@ -298,13 +370,6 @@ fn audit_trigger_fingerprint(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&evidence).unwrap_or_default())
     ))
-}
-
-fn looks_like_link_text(text: &str) -> bool {
-    let normalized = text.to_lowercase();
-    ["http://", "https://", "t.me/", "telegram.me/", "www."]
-        .iter()
-        .any(|marker| normalized.contains(marker))
 }
 
 fn has_long_first_comment(features: &NewUserFeatures) -> bool {
@@ -952,6 +1017,8 @@ fn audit_insert_columns() -> &'static [&'static str] {
         "risk_avatar_signals",
         "risk_personal_channel_score",
         "risk_personal_channel_signals",
+        "risk_external_score",
+        "risk_external_signals",
         "risk_score",
         "risk_level",
         "primary_risk_class",
@@ -1170,6 +1237,8 @@ async fn save_audit_in_transaction(
         values.push_bind(json!([]));
         values.push_bind(0_i32);
         values.push_bind(json!([]));
+        values.push_bind(0_i32);
+        values.push_bind(json!([]));
         values.push_bind(risk.score);
         values.push_bind(&risk.level);
         values.push_bind(&risk.primary_class);
@@ -1197,6 +1266,12 @@ async fn save_audit_in_transaction(
         } else {
             "telegram_new_user_profile_audits.risk_avatar_signals"
         };
+        let previous_personal_channel_score =
+            "telegram_new_user_profile_audits.risk_personal_channel_score";
+        let previous_personal_channel_signals =
+            "telegram_new_user_profile_audits.risk_personal_channel_signals";
+        let previous_external_score = "telegram_new_user_profile_audits.risk_external_score";
+        let previous_external_signals = "telegram_new_user_profile_audits.risk_external_signals";
         for column in columns.iter().copied().filter(|column| {
             !matches!(
                 *column,
@@ -1210,6 +1285,8 @@ async fn save_audit_in_transaction(
                     | "risk_avatar_signals"
                     | "risk_personal_channel_score"
                     | "risk_personal_channel_signals"
+                    | "risk_external_score"
+                    | "risk_external_signals"
                     | "risk_score"
                     | "risk_level"
                     | "risk_signal_breakdown"
@@ -1223,11 +1300,24 @@ async fn save_audit_in_transaction(
         updates.push(format_args!(
             "risk_avatar_signals = {previous_avatar_signals}"
         ));
-        updates.push("risk_personal_channel_score = 0");
-        updates.push("risk_personal_channel_signals = '[]'::jsonb");
-        updates.push(format_args!("risk_score = least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score})"));
-        updates.push(format_args!("risk_level = case when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score}) >= 70 then 'high' when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score}) >= 40 then 'medium' else 'low' end"));
-        updates.push(format_args!("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || {previous_avatar_signals}"));
+        updates.push(format_args!(
+            "risk_personal_channel_score = {previous_personal_channel_score}"
+        ));
+        updates.push(format_args!(
+            "risk_personal_channel_signals = {previous_personal_channel_signals}"
+        ));
+        updates.push(format_args!(
+            "risk_external_score = {previous_external_score}"
+        ));
+        updates.push(format_args!(
+            "risk_external_signals = {previous_external_signals}"
+        ));
+        let combined = format_args!(
+            "least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score} + {previous_personal_channel_score} + {previous_external_score})"
+        );
+        updates.push(format_args!("risk_score = {combined}"));
+        updates.push(format_args!("risk_level = case when {combined} >= 70 then 'high' when {combined} >= 40 then 'medium' else 'low' end"));
+        updates.push(format_args!("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || {previous_avatar_signals} || {previous_personal_channel_signals} || {previous_external_signals}"));
     }
 
     query.build().execute(&mut **tx).await?;
@@ -1436,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_fingerprint_uses_only_the_latest_five_trigger_messages() {
+    fn trigger_fingerprint_uses_stable_message_ids_for_link_and_long_text_evidence() {
         let historical_long_message = NewUserFeatures {
             recent_message_texts: vec![
                 "short one".into(),
@@ -1449,8 +1539,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            audit_trigger_fingerprint(&historical_long_message, None),
+            audit_trigger_fingerprint(&historical_long_message, None, None),
             None
+        );
+
+        let long_evidence = (20, Some("x".repeat(LONG_FIRST_COMMENT_MIN_CHARS)));
+        let long_fingerprint =
+            audit_trigger_fingerprint(&historical_long_message, None, Some(&long_evidence));
+        assert_eq!(
+            audit_trigger_fingerprint(&NewUserFeatures::default(), None, Some(&long_evidence)),
+            long_fingerprint
         );
 
         let link_message = NewUserFeatures {
@@ -1460,7 +1558,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        let original = audit_trigger_fingerprint(&link_message, None).unwrap();
+        let link_evidence = (19, Some("promo".into()));
+        let original =
+            audit_trigger_fingerprint(&link_message, Some(&link_evidence), None).unwrap();
         let after_ordinary_message = NewUserFeatures {
             recent_message_texts: vec![
                 "ещё обычный комментарий".into(),
@@ -1471,23 +1571,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            audit_trigger_fingerprint(&after_ordinary_message, None),
+            audit_trigger_fingerprint(&after_ordinary_message, Some(&link_evidence), None),
             Some(original)
         );
 
         let latest_link_evidence = (21, Some("visible anchor text".into()));
         let hidden_link = NewUserFeatures::default();
         let hidden_link_fingerprint =
-            audit_trigger_fingerprint(&hidden_link, Some(&latest_link_evidence)).unwrap();
+            audit_trigger_fingerprint(&hidden_link, Some(&latest_link_evidence), None).unwrap();
         assert_eq!(
-            audit_trigger_fingerprint(&hidden_link, Some(&latest_link_evidence)),
+            audit_trigger_fingerprint(&hidden_link, Some(&latest_link_evidence), None),
             Some(hidden_link_fingerprint.clone())
         );
         assert_ne!(
             Some(hidden_link_fingerprint),
             audit_trigger_fingerprint(
                 &hidden_link,
-                Some(&(22, Some("visible anchor text".into())))
+                Some(&(22, Some("visible anchor text".into()))),
+                None,
             )
         );
     }
@@ -1502,7 +1603,7 @@ mod tests {
             personal_channel_last_text: Some("Смотрите https://example.org".into()),
             ..Default::default()
         };
-        let first_fingerprint = audit_trigger_fingerprint(&mature, None);
+        let first_fingerprint = audit_trigger_fingerprint(&mature, None, None);
         assert!(first_fingerprint.is_some());
         assert!(should_enqueue_new_user_audit_job(
             &mature,
@@ -1524,7 +1625,36 @@ mod tests {
             personal_channel_last_message_id: Some(11),
             ..mature
         };
-        assert_ne!(first_fingerprint, audit_trigger_fingerprint(&changed, None));
+        assert_ne!(
+            first_fingerprint,
+            audit_trigger_fingerprint(&changed, None, None)
+        );
+    }
+
+    #[test]
+    fn a_new_short_link_triggers_audit_for_a_low_activity_user() {
+        let features = NewUserFeatures {
+            message_count: 4,
+            ..Default::default()
+        };
+        assert!(should_enqueue_new_user_audit_job_with_link(
+            &features,
+            &risk_with_score(18),
+            false,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert!(!should_enqueue_new_user_audit_job_with_link(
+            &features,
+            &risk_with_score(18),
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]

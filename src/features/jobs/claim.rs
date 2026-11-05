@@ -6,6 +6,8 @@
 pub enum CasResult {
     Applied,
     LeaseLost,
+    /// The worker still owned its job, but the underlying audit snapshot changed.
+    Stale,
 }
 
 impl CasResult {

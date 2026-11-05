@@ -34,8 +34,11 @@ pub struct NewUserAuditJob {
     pub review_threshold: i32,
     /// Monotonic generation claim sequence, used only by generation finalizers.
     pub attempts: i32,
-    /// Independent replay claim sequence, used only by materialization finalizers.
+    /// Monotonic lease fences; unlike retry counters these are never reset.
+    pub generation_fence: i64,
     pub materialization_attempts: i32,
+    pub materialization_fence: i64,
+    pub audit_generation: i64,
     pub is_materialization_replay: bool,
 }
 
@@ -103,6 +106,81 @@ pub async fn latest_audit_trigger_fingerprint(
     .await?)
 }
 
+pub async fn latest_audit_link_message_id(
+    pool: &PgPool,
+    chat_id: i64,
+    telegram_user_id: i64,
+) -> anyhow::Result<Option<i32>> {
+    Ok(sqlx::query_scalar(
+        r#"select nullif(input_json->>'latest_link_message_id', '')::integer
+           from new_user_audit_jobs
+           where chat_id = $1 and telegram_user_id = $2
+             and input_json->>'audit_trigger_fingerprint' is not null
+           order by updated_at desc, id desc limit 1"#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
+/// Moves a still-running generation to a newer material snapshot when the
+/// triggering evidence and frozen deterministic rule are unchanged. The LLM
+/// request remains unique while its eventual materialization targets latest data.
+pub async fn refresh_in_flight_audit_snapshot_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    params: NewUserAuditJobParams<'_>,
+) -> anyhow::Result<bool> {
+    let updated = sqlx::query(
+        r#"with candidate as (
+               select id from new_user_audit_jobs
+               where chat_id = $1 and telegram_user_id = $2
+                 and snapshot_hash <> $3 and prompt_version = $4
+                 and status in ('pending', 'retry_wait', 'processing')
+                 and assessment_json is null
+                 and input_json->>'audit_trigger_fingerprint' = $5
+                 and input_json->>'deterministic_campaign_rule'
+                       is not distinct from $6::text
+                 and not exists (
+                     select 1 from new_user_audit_jobs existing
+                     where existing.chat_id = $1 and existing.telegram_user_id = $2
+                       and existing.snapshot_hash = $3 and existing.prompt_version = $4
+                 )
+               order by updated_at desc, id desc
+               for update skip locked limit 1
+           )
+           update new_user_audit_jobs job
+           set snapshot_hash = $3, input_json = $7,
+               avatar_file_id = $8, avatar_file_unique_id = $9,
+               review_threshold = $10, updated_at = now()
+           from candidate where job.id = candidate.id"#,
+    )
+    .bind(params.chat_id)
+    .bind(params.telegram_user_id)
+    .bind(params.snapshot_hash)
+    .bind(params.prompt_version)
+    .bind(
+        params
+            .input_json
+            .get("audit_trigger_fingerprint")
+            .and_then(Value::as_str),
+    )
+    .bind(
+        params
+            .input_json
+            .get("deterministic_campaign_rule")
+            .and_then(Value::as_str),
+    )
+    .bind(params.input_json)
+    .bind(params.avatar_file_id)
+    .bind(params.avatar_file_unique_id)
+    .bind(params.review_threshold)
+    .execute(&mut **tx)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
 #[allow(dead_code)] // Используется PostgreSQL migration/integration harness.
 pub async fn enqueue_new_user_audit_job(
     pool: &PgPool,
@@ -139,6 +217,13 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
                   or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then 'pending'
                 else new_user_audit_jobs.status
+            end,
+            generation_fence = new_user_audit_jobs.generation_fence + case when
+                (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then 1
+                else 0
             end,
             attempts = case
                 when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
@@ -226,6 +311,12 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
                   or new_user_audit_jobs.error_kind = 'audit_not_required' then 'pending'
                 else new_user_audit_jobs.materialization_status
             end,
+            materialization_fence = new_user_audit_jobs.materialization_fence + case when
+                new_user_audit_jobs.materialization_version is distinct from $9
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.input_json ->> 'audit_trigger_fingerprint' is distinct from excluded.input_json ->> 'audit_trigger_fingerprint'
+                  or new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule' is distinct from coalesce(excluded.input_json ->> 'deterministic_campaign_rule', new_user_audit_jobs.input_json ->> 'deterministic_campaign_rule')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then 1 else 0 end,
             materialization_attempts = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
                   or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
@@ -303,6 +394,7 @@ pub async fn reopen_obsolete_materialization_in_transaction(
         set materialization_version = $5,
             materialization_status = 'pending',
             materialization_attempts = 0,
+            materialization_fence = materialization_fence + 1,
             materialization_next_attempt_at = now(),
             materialization_processing_started_at = null,
             materialization_lease_expires_at = null,
@@ -330,14 +422,26 @@ pub async fn record_new_user_audit_snapshot_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     params: NewUserAuditJobParams<'_>,
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = $3, unified_audit_generation = unified_audit_generation + 1 where chat_id = $1 and telegram_user_id = $2",
+    let generation: Option<i64> = sqlx::query_scalar(
+        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = $3, unified_audit_generation = unified_audit_generation + 1 where chat_id = $1 and telegram_user_id = $2 returning unified_audit_generation",
     )
     .bind(params.chat_id)
     .bind(params.telegram_user_id)
     .bind(params.snapshot_hash)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    if let Some(generation) = generation {
+        sqlx::query(
+            "update new_user_audit_jobs set audit_generation = $5 where chat_id = $1 and telegram_user_id = $2 and snapshot_hash = $3 and prompt_version = $4",
+        )
+        .bind(params.chat_id)
+        .bind(params.telegram_user_id)
+        .bind(params.snapshot_hash)
+        .bind(params.prompt_version)
+        .bind(generation)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -488,10 +592,12 @@ pub async fn claim_next_new_user_audit_job(
         update new_user_audit_jobs job
         set status = case when candidate.is_materialization_replay then job.status else 'processing' end,
             attempts = case when candidate.is_materialization_replay then job.attempts else job.attempts + 1 end,
+            generation_fence = case when candidate.is_materialization_replay then job.generation_fence else job.generation_fence + 1 end,
             processing_started_at = case when candidate.is_materialization_replay then job.processing_started_at else now() end,
             lease_expires_at = case when candidate.is_materialization_replay then job.lease_expires_at else now() + ($1 * interval '1 second') end,
             materialization_status = case when candidate.is_materialization_replay then 'processing' else job.materialization_status end,
             materialization_attempts = case when candidate.is_materialization_replay then job.materialization_attempts + 1 else job.materialization_attempts end,
+            materialization_fence = case when candidate.is_materialization_replay then job.materialization_fence + 1 else job.materialization_fence end,
             materialization_processing_started_at = case when candidate.is_materialization_replay then now() else job.materialization_processing_started_at end,
             materialization_lease_expires_at = case when candidate.is_materialization_replay then now() + ($1 * interval '1 second') else job.materialization_lease_expires_at end,
             updated_at = now()
@@ -500,7 +606,8 @@ pub async fn claim_next_new_user_audit_job(
         returning job.id, job.chat_id, job.telegram_user_id, job.snapshot_hash,
                   job.prompt_version, job.input_json, job.avatar_file_id,
                   job.avatar_file_unique_id, job.assessment_json, job.review_threshold, job.attempts,
-                  job.materialization_attempts, candidate.is_materialization_replay
+                  job.materialization_attempts, job.generation_fence, job.materialization_fence,
+                  job.audit_generation, candidate.is_materialization_replay
         "#,
     )
     .bind(EXTERNAL_REQUEST_LEASE.seconds())
@@ -521,6 +628,9 @@ pub async fn claim_next_new_user_audit_job(
         review_threshold: row.get("review_threshold"),
         attempts: row.get("attempts"),
         materialization_attempts: row.get("materialization_attempts"),
+        generation_fence: row.get("generation_fence"),
+        materialization_fence: row.get("materialization_fence"),
+        audit_generation: row.get("audit_generation"),
         is_materialization_replay: row.get("is_materialization_replay"),
     }))
 }
@@ -563,7 +673,7 @@ async fn finalize_new_user_audit_generation(
                 materialization_lease_expires_at = null, materialization_error_kind = null,
                 materialized_at = null,
                 updated_at = now()
-            where id = $1 and attempts = $2 and status = 'processing'
+            where id = $1 and attempts = $2 and generation_fence = $7 and status = 'processing'
               and lease_expires_at > now()
             "#,
         )
@@ -573,6 +683,7 @@ async fn finalize_new_user_audit_generation(
         .bind(outcome.provider)
         .bind(outcome.model)
         .bind(CURRENT_MATERIALIZATION_VERSION)
+        .bind(job.generation_fence)
         .execute(pool)
         .await;
 
@@ -628,7 +739,8 @@ async fn materialize_new_user_audit_in_transaction(
     job: &NewUserAuditJob,
     components: &ScoreComponents,
     embedding_model: &str,
-) -> anyhow::Result<()> {
+    deterministic_spam_label: Option<&crate::features::labels::SpamLabel>,
+) -> anyhow::Result<CasResult> {
     // Keep the database's non-negative score-component constraints authoritative,
     // even if a future scorer accidentally emits a negative component.
     let baseline_score = components.baseline_score.clamp(0, 100);
@@ -668,17 +780,19 @@ async fn materialize_new_user_audit_in_transaction(
             risk_first_message_score = $5, risk_first_message_signals = $6,
             risk_avatar_score = $7, risk_avatar_signals = $8,
             risk_personal_channel_score = $9, risk_personal_channel_signals = $10,
-            risk_score = $11, risk_level = $12, risk_signal_breakdown = $13,
+            risk_external_score = $11, risk_external_signals = $12,
+            risk_score = $13, risk_level = $14, risk_signal_breakdown = $15,
             first_message_embedding_gemma2 = case
-                when $15 is null then first_message_embedding_gemma2
-                else $15::vector
+                when $18 is null then first_message_embedding_gemma2
+                else $18::vector
             end,
             first_message_embedding_gemma2_model = case
-                when $15 is null then first_message_embedding_gemma2_model
-                else $16
+                when $18 is null then first_message_embedding_gemma2_model
+                else $19
             end
         where chat_id = $1 and telegram_user_id = $2
-          and unified_audit_snapshot_hash = $14
+          and unified_audit_snapshot_hash = $16
+          and unified_audit_generation = $17
         "#,
     )
     .bind(job.chat_id)
@@ -691,26 +805,84 @@ async fn materialize_new_user_audit_in_transaction(
     .bind(&components.avatar_signals)
     .bind(personal_channel_score)
     .bind(&components.personal_channel_signals)
+    .bind(external_score)
+    .bind(&components.external_signals)
     .bind(final_score)
     .bind(components.final_level())
     .bind(&final_signals)
     .bind(&job.snapshot_hash)
+    .bind(job.audit_generation)
     .bind(components.first_message_embedding.clone())
     .bind(embedding_model)
     .execute(&mut **tx)
     .await?;
     if audit_update.rows_affected() == 0 {
         let stale = sqlx::query(
-            "update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = 'snapshot_stale', materialization_processing_started_at = null, materialization_lease_expires_at = null where id = $1 and (not $4 or (status = 'succeeded' and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3))",
+            r#"update new_user_audit_jobs
+               set materialization_status = case when exists (
+                       select 1 from telegram_new_user_profile_audits a
+                       where a.chat_id = new_user_audit_jobs.chat_id
+                         and a.telegram_user_id = new_user_audit_jobs.telegram_user_id
+                         and a.unified_audit_snapshot_hash = new_user_audit_jobs.snapshot_hash
+                   ) then 'retry_wait' else 'stale' end,
+                   materialization_next_attempt_at = now() + interval '5 seconds',
+                   materialized_at = now(),
+                   materialization_error_kind = case when exists (
+                       select 1 from telegram_new_user_profile_audits a
+                       where a.chat_id = new_user_audit_jobs.chat_id
+                         and a.telegram_user_id = new_user_audit_jobs.telegram_user_id
+                         and a.unified_audit_snapshot_hash = new_user_audit_jobs.snapshot_hash
+                   ) then 'snapshot_generation_changed' else 'snapshot_stale' end,
+                   materialization_processing_started_at = null,
+                   materialization_lease_expires_at = null
+               where id = $1 and (not $4 or (status = 'succeeded'
+                 and materialization_status = 'processing'
+                 and materialization_attempts = $2
+                 and materialization_version = $3
+                 and materialization_fence = $5))"#,
         )
         .bind(job.id)
         .bind(job.materialization_attempts)
         .bind(CURRENT_MATERIALIZATION_VERSION)
         .bind(job.is_materialization_replay)
+        .bind(job.materialization_fence)
         .execute(&mut **tx)
         .await?;
-        CasResult::from_rows_affected(stale.rows_affected())?;
-        return Ok(());
+        let stale_result = CasResult::from_rows_affected(stale.rows_affected())?;
+        return Ok(if stale_result == CasResult::Applied {
+            CasResult::Stale
+        } else {
+            stale_result
+        });
+    }
+
+    if let Some(label) = deterministic_spam_label {
+        let current_label_state: Option<(bool, Option<String>)> = sqlx::query_as(
+            r#"select coalesce(u.is_spammer, false), (
+                   select e.label from spam_label_events e
+                   where e.chat_id = u.chat_id and e.telegram_user_id = u.telegram_user_id
+                   order by e.created_at desc, e.id desc limit 1
+               )
+               from telegram_chat_users u
+               where u.chat_id = $1 and u.telegram_user_id = $2
+               for update of u"#,
+        )
+        .bind(job.chat_id)
+        .bind(job.telegram_user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((false, latest_label)) = current_label_state
+            && latest_label.as_deref() != Some("not_spam")
+        {
+            crate::features::labels::record_spam_in_transaction(
+                tx,
+                job.chat_id,
+                job.telegram_user_id,
+                label,
+                false,
+            )
+            .await?;
+        }
     }
 
     upsert_spam_review_request_in_transaction(
@@ -723,16 +895,17 @@ async fn materialize_new_user_audit_in_transaction(
     )
     .await?;
     let finalized = sqlx::query(
-        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null, materialization_processing_started_at = null, materialization_lease_expires_at = null where id = $1 and (not $4 or (status = 'succeeded' and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3))",
+        "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null, materialization_processing_started_at = null, materialization_lease_expires_at = null where id = $1 and (not $4 or (status = 'succeeded' and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3 and materialization_fence = $5))",
     )
     .bind(job.id)
     .bind(job.materialization_attempts)
     .bind(CURRENT_MATERIALIZATION_VERSION)
     .bind(job.is_materialization_replay)
+    .bind(job.materialization_fence)
     .execute(&mut **tx)
     .await?;
     CasResult::from_rows_affected(finalized.rows_affected())?;
-    Ok(())
+    Ok(CasResult::Applied)
 }
 
 /// Завершает lease успешной job и materializes уже сохранённый assessment.
@@ -742,14 +915,16 @@ pub async fn materialize_new_user_audit_job(
     job: &NewUserAuditJob,
     components: &ScoreComponents,
     embedding_model: &str,
+    deterministic_spam_label: Option<&crate::features::labels::SpamLabel>,
 ) -> anyhow::Result<CasResult> {
     let mut tx = pool.begin().await?;
     let update = sqlx::query(
-        "update new_user_audit_jobs set updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3",
+        "update new_user_audit_jobs set updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3 and materialization_fence = $4",
     )
     .bind(job.id)
     .bind(job.materialization_attempts)
     .bind(CURRENT_MATERIALIZATION_VERSION)
+    .bind(job.materialization_fence)
     .execute(&mut *tx)
     .await?;
     let result = CasResult::from_rows_affected(update.rows_affected())?;
@@ -757,7 +932,14 @@ pub async fn materialize_new_user_audit_job(
         tx.rollback().await?;
         return Ok(result);
     }
-    materialize_new_user_audit_in_transaction(&mut tx, job, components, embedding_model).await?;
+    let result = materialize_new_user_audit_in_transaction(
+        &mut tx,
+        job,
+        components,
+        embedding_model,
+        deterministic_spam_label,
+    )
+    .await?;
     tx.commit().await?;
     Ok(result)
 }
@@ -769,12 +951,13 @@ pub async fn mark_new_user_audit_materialization_stale(
     error_kind: &str,
 ) -> anyhow::Result<CasResult> {
     let update = sqlx::query(
-        "update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = $3, materialization_processing_started_at = null, materialization_lease_expires_at = null, updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $4",
+        "update new_user_audit_jobs set materialization_status = 'stale', materialized_at = now(), materialization_error_kind = $3, materialization_processing_started_at = null, materialization_lease_expires_at = null, updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $4 and materialization_fence = $5",
     )
     .bind(job.id)
     .bind(job.materialization_attempts)
     .bind(error_kind)
     .bind(CURRENT_MATERIALIZATION_VERSION)
+    .bind(job.materialization_fence)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())
@@ -792,13 +975,14 @@ pub async fn mark_new_user_audit_materialization_retry(
         return mark_new_user_audit_materialization_stale(pool, job, "retry_exhausted").await;
     };
     let update = sqlx::query(
-        "update new_user_audit_jobs set materialization_status = 'retry_wait', materialization_error_kind = $3, materialization_next_attempt_at = now() + ($4 * interval '1 second'), materialization_processing_started_at = null, materialization_lease_expires_at = null, updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $5",
+        "update new_user_audit_jobs set materialization_status = 'retry_wait', materialization_error_kind = $3, materialization_next_attempt_at = now() + ($4 * interval '1 second'), materialization_processing_started_at = null, materialization_lease_expires_at = null, updated_at = now() where id = $1 and status = 'succeeded' and assessment_json is not null and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $5 and materialization_fence = $6",
     )
     .bind(job.id)
     .bind(job.materialization_attempts)
     .bind(error_kind)
     .bind(delay_seconds)
     .bind(CURRENT_MATERIALIZATION_VERSION)
+    .bind(job.materialization_fence)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())
@@ -821,13 +1005,14 @@ pub async fn mark_new_user_audit_retry(
         set status = 'retry_wait', error_kind = $3,
             next_attempt_at = now() + ($4 * interval '1 second'),
             lease_expires_at = null, updated_at = now()
-        where id = $1 and attempts = $2 and status = 'processing'
+        where id = $1 and attempts = $2 and generation_fence = $5 and status = 'processing'
         "#,
     )
     .bind(job.id)
     .bind(job.attempts)
     .bind(error_kind)
     .bind(delay_seconds)
+    .bind(job.generation_fence)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())
@@ -843,12 +1028,13 @@ pub async fn mark_new_user_audit_failed(
         update new_user_audit_jobs
         set status = 'failed', error_kind = $3, completed_at = now(),
             lease_expires_at = null, updated_at = now()
-        where id = $1 and attempts = $2 and status = 'processing'
+        where id = $1 and attempts = $2 and generation_fence = $4 and status = 'processing'
         "#,
     )
     .bind(job.id)
     .bind(job.attempts)
     .bind(error_kind)
+    .bind(job.generation_fence)
     .execute(pool)
     .await?;
     CasResult::from_rows_affected(update.rows_affected())

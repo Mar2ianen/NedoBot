@@ -358,6 +358,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
                 );
                 Ok(())
             }
+            CasResult::Stale => Ok(()),
         },
         Err(err) => match classify_delivery_error(&err, review.notification_message_id.is_some()) {
             DeliveryFailure::AlreadyApplied => {
@@ -377,6 +378,7 @@ pub async fn send_review(bot: &Bot, pool: &PgPool, review: &SpamReview) -> anyho
                         );
                         Ok(())
                     }
+                    CasResult::Stale => Ok(()),
                 }
             }
             failure => {
