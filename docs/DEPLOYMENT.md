@@ -7,20 +7,26 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
-5 ноября 2026 в **17:10 UTC / 20:10 МСК** выпущен release
+5 ноября 2026 в **18:27 UTC / 21:27 МСК** выпущен release
+[`deploy-2026-11-05-audit-trigger-fingerprints`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-05-audit-trigger-fingerprints)
+на merge commit `50fd2de8d54be6384e9424ee99169f8b79a7cef6` после PR
+[#87](https://github.com/Mar2ianen/NedoBot/pull/87). [Release workflow
+42082883617](https://github.com/Mar2ianen/NedoBot/actions/runs/42082883617)
+собрал и установил artifact в основной и PVO инстансы, применил проверки миграций
+в обеих production БД и перезапустил public MCP. SHA-256 обоих bot binaries —
+`2f42bdb82e8654becd23e762e46799d88ea69bb0990b5df26944f02090b8fd3b`; хеши
+запущенных `tg-ai-bot-teloxide` и `nedobot-pvo` совпали с artifact. Все три
+unit-а active, `NRestarts=0`, error-level journal после рестарта пуст; миграция
+`20261018120000` есть в обеих БД. CI прошёл format, все targets, Clippy и
+PostgreSQL integration suites.
+
+Предыдущий deploy: 5 ноября 2026 в **17:10 UTC / 20:10 МСК**, tag
 [`deploy-2026-11-05-audit-cost-gate`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-05-audit-cost-gate)
-на merge commit `3c84c639db6858ff0bc5b0074a07cc8d35ef9174` после PR
-[#85](https://github.com/Mar2ianen/NedoBot/pull/85). [Release workflow
-42070378287](https://github.com/Mar2ianen/NedoBot/actions/runs/42070378287)
-собрал и установил artifact в основной и PVO инстансы, применил миграции в обе
-production БД и перезапустил public MCP. SHA-256 обоих bot binaries —
-`30c9fc53fd45be5a95f79a89cadb052f1576679a74e24457dbfa74e7a07aae63`; SHA-256
-MCP — `457e73883b10ccfce0e9be86d08c7d7c0a528c4d8c30560991c9e064c40e344e`.
-Хеши обоих запущенных ботов и MCP совпали с установленными бинарниками. Все
-три unit-а active, `NRestarts=0`, error-level journal после рестарта пуст;
-миграция `20261018120000` есть в обеих БД. CI
-[42068803215](https://github.com/Mar2ianen/NedoBot/actions/runs/42068803215)
-прошёл format, все targets, Clippy и PostgreSQL integration suites.
+на commit `3c84c639db6858ff0bc5b0074a07cc8d35ef9174` после PR
+[#85](https://github.com/Mar2ianen/NedoBot/pull/85). Release workflow
+[42070378287](https://github.com/Mar2ianen/NedoBot/actions/runs/42070378287)
+обновил оба бота, MCP и миграции; SHA-256 обоих bot binaries был
+`30c9fc53fd45be5a95f79a89cadb052f1576679a74e24457dbfa74e7a07aae63`.
 
 20 октября 2026 в **18:06 UTC / 21:06 МСК** выпущен release
 [`deploy-2026-10-20-tls-security`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-20-tls-security)
