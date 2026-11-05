@@ -14,6 +14,7 @@ use teloxide_antispam::scoring::ScoreComponents;
 use uuid::Uuid;
 
 use tg_ai_bot_teloxide::{
+    community::ChatRegistry,
     config::Config,
     features::{
         ask::notes::add_user_note_from_search,
@@ -57,6 +58,7 @@ use tg_ai_bot_teloxide::{
             supersede_unneeded_new_user_audit_jobs_in_transaction,
             sync_spam_review_from_audit_in_transaction,
         },
+        new_user_audit::service::process_next_new_user_audit_job,
         reports::{ReportCreation, ReportTarget, create_report, load_report},
         risk_captcha::{CaptchaCallbackOutcome, mark_solving, record_wrong_answer, set_passed},
         spam_review::{
@@ -131,6 +133,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
     assert_local_only_refresh_reopens_obsolete_materialization(&pool).await;
     assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(&pool).await;
+    assert_stale_deterministic_audit_does_not_write_spam_label(&pool).await;
+    assert_stale_materialization_result_is_distinct(&pool).await;
     assert_reputation_feature_order_upgrade(&pool).await;
     assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(&database_url).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
@@ -2055,6 +2059,16 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
     .await
     .expect("pending trigger-fingerprint audit must be enqueued");
 
+    let job_id: i64 = query_scalar(
+        "select id from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2 and snapshot_hash = $3",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .bind("trigger-fingerprint-snapshot-a")
+    .fetch_one(pool)
+    .await
+    .expect("trigger-fingerprint job id must be queryable");
+
     assert_eq!(
         latest_audit_trigger_fingerprint(pool, CHAT_ID, USER_ID)
             .await
@@ -2066,15 +2080,11 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
         ))
     );
 
-    query(
-        "update new_user_audit_jobs set status = 'processing', attempts = 1, processing_started_at = now(), lease_expires_at = now() + interval '1 minute' where chat_id = $1 and telegram_user_id = $2 and snapshot_hash = $3",
-    )
-    .bind(CHAT_ID)
-    .bind(USER_ID)
-    .bind("trigger-fingerprint-snapshot-a")
-    .execute(pool)
-    .await
-    .expect("trigger-fingerprint job must enter in-flight state");
+    let worker_a = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("worker A claim must execute")
+        .expect("trigger-fingerprint job must enter in-flight state");
+    assert_eq!(worker_a.id, job_id);
     assert_eq!(
         latest_audit_trigger_fingerprint(pool, CHAT_ID, USER_ID)
             .await
@@ -2135,12 +2145,321 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
         "changing exact link evidence must revoke the old lease and preserve the verdict frozen for this generation"
     );
 
+    let worker_b = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("worker B claim must execute")
+        .expect("reopened same-key generation must be claimable");
+    assert_eq!(worker_b.id, job_id);
+    let stale_deterministic_assessment = serde_json::json!({
+        "first_message_assessment": null,
+        "avatar_observation": null,
+        "profile_assessment": {
+            "risk_patterns": ["money_dm_bait"], "evidence": [],
+            "contradictions": [], "review_priority": "high",
+            "confidence": 0.99, "summary": "Stale worker A result."
+        }
+    });
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &worker_a,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &stale_deterministic_assessment,
+                provider: "deterministic_rules",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("stale worker A finalizer must execute"),
+        CasResult::LeaseLost,
+        "same-key fingerprint replacement must fence worker A from finalizing worker B's generation"
+    );
+    let current_assessment = serde_json::json!({
+        "first_message_assessment": null,
+        "avatar_observation": null,
+        "profile_assessment": {
+            "risk_patterns": ["no_material_risk_pattern"], "evidence": [],
+            "contradictions": [], "review_priority": "low",
+            "confidence": 0.5, "summary": "Worker B snapshot."
+        }
+    });
+    assert_eq!(
+        finalize_new_user_audit_job(
+            pool,
+            &worker_b,
+            tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditOutcome {
+                assessment_json: &current_assessment,
+                provider: "fixture",
+                model: "fixture",
+            },
+        )
+        .await
+        .expect("current worker B finalizer must execute"),
+        CasResult::Applied
+    );
+    let persisted_assessment: serde_json::Value =
+        query_scalar("select assessment_json from new_user_audit_jobs where id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("current worker B assessment must remain stored");
+    assert_eq!(persisted_assessment, current_assessment);
+
     query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
         .bind(CHAT_ID)
         .bind(USER_ID)
         .execute(pool)
         .await
         .expect("trigger-fingerprint fixtures must be removed");
+}
+
+async fn assert_stale_deterministic_audit_does_not_write_spam_label(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_203;
+    const MESSAGE_ID: i32 = 9_000_203;
+    let input = serde_json::json!({
+        "schema_version": "stale-deterministic-snapshot",
+        "audit_trigger_fingerprint": "old-campaign-link",
+        "deterministic_campaign_rule": "fresh_money_work_private_contact",
+        "text": {"first_message_preview": "Оплачу задание, пишите в личку"}
+    });
+    let snapshot_hash = "stale-deterministic-snapshot-a";
+    query(
+        "insert into telegram_chat_users (chat_id, telegram_user_id, first_seen_at, member_status, is_present) values ($1, $2, now(), 'member', true)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale deterministic fixture user must exist");
+    query(
+        "insert into telegram_messages (chat_id, message_id, user_id, text, raw_json) values ($1, $2, $3, 'Оплачу за задание, пишите в личку', jsonb_build_object('date', extract(epoch from now())::bigint))",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale deterministic fixture message must exist");
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 0, 'low', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale deterministic fixture audit must exist");
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash,
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("stale deterministic fixture job must be enqueued");
+    query(
+        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = 'newer-snapshot' where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("audit must advance beyond the queued deterministic snapshot");
+
+    let mut config = Config::from_env().expect("test runtime config must load");
+    config.community.chats.get_mut("main").unwrap().id = CHAT_ID;
+    config.community.chats.get_mut("main").unwrap().moderation = true;
+    config.community.moderation.enabled = true;
+    config.llm_profiles = None;
+    config.chat_registry =
+        ChatRegistry::new(&config.community).expect("fixture chat registry must build");
+    process_next_new_user_audit_job(&Bot::new("fixture-token"), pool, &config)
+        .await
+        .expect("stale deterministic job processing must finish without API calls");
+
+    let is_spammer: bool = query_scalar(
+        "select is_spammer from telegram_chat_users where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("fixture spam status must be queryable");
+    let system_spam_labels: i64 = query_scalar(
+        "select count(*) from spam_label_events where chat_id = $1 and telegram_user_id = $2 and label = 'spam' and source = 'system'",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("system spam-label count must be queryable");
+
+    query("delete from spam_label_events where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale deterministic label events must be removed");
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale deterministic audit job must be removed");
+    query(
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale deterministic audit must be removed");
+    query("delete from telegram_messages where chat_id = $1 and user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale deterministic message must be removed");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale deterministic user must be removed");
+
+    assert!(
+        !is_spammer,
+        "stale campaign snapshot must not label the user spam"
+    );
+    assert_eq!(
+        system_spam_labels, 0,
+        "stale campaign must not write a system label"
+    );
+}
+
+async fn assert_stale_materialization_result_is_distinct(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_204;
+    let input = serde_json::json!({"text": {"first_message_preview": null}});
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 12, 'low', '[]'::jsonb)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale materialization audit fixture must exist");
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "materialization-snapshot-old",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("stale materialization fixture job must be enqueued");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"fixture\": \"saved\"}'::jsonb, materialization_status = 'pending', materialization_version = $3 where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .bind(tg_ai_bot_teloxide::features::new_user_audit::repo::CURRENT_MATERIALIZATION_VERSION)
+    .execute(pool)
+    .await
+    .expect("stored assessment must be ready for materialization replay");
+    query(
+        "update telegram_new_user_profile_audits set unified_audit_snapshot_hash = 'materialization-snapshot-current' where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("baseline must advance beyond the saved assessment");
+
+    let replay = claim_next_new_user_audit_job(pool)
+        .await
+        .expect("stale materialization claim must execute")
+        .expect("saved assessment must be claimable for replay");
+    assert!(replay.is_materialization_replay);
+    let result = materialize_new_user_audit_job(
+        pool,
+        &replay,
+        &ScoreComponents {
+            baseline_score: 80,
+            baseline_signals: serde_json::json!([{"label": "stale_fixture"}]),
+            first_message_score: 0,
+            first_message_signals: serde_json::json!([]),
+            avatar_score: 0,
+            avatar_signals: serde_json::json!([]),
+            personal_channel_score: 0,
+            personal_channel_signals: serde_json::json!([]),
+            review_threshold: 70,
+            first_message_embedding: None,
+            external_score: 0,
+            external_signals: serde_json::json!([]),
+        },
+        "fixture-embedding-model",
+        None,
+    )
+    .await
+    .expect("stale materialization must return a classified CAS result");
+
+    let (materialization_status, error_kind): (String, Option<String>) = query_as(
+        "select materialization_status, materialization_error_kind from new_user_audit_jobs where id = $1",
+    )
+    .bind(replay.id)
+    .fetch_one(pool)
+    .await
+    .expect("stale materialization terminal state must be queryable");
+    let review_count: i64 = query_scalar(
+        "select count(*) from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("stale materialization must not create a review request");
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale materialization review fixture must be removed");
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("stale materialization job must be removed");
+    query(
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("stale materialization audit must be removed");
+
+    assert_eq!(result, CasResult::Stale);
+    assert_eq!(materialization_status, "stale");
+    assert_eq!(error_kind.as_deref(), Some("snapshot_stale"));
+    assert_eq!(
+        review_count, 0,
+        "stale score must not enter moderator review"
+    );
 }
 
 async fn assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(
@@ -2450,6 +2769,7 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
                 external_signals: serde_json::json!([]),
             },
             "fixture-embedding-model",
+            None,
         )
         .await
         .expect("stored assessment materialization must finalize"),
@@ -2995,7 +3315,7 @@ async fn assert_text_observations_materialize_without_promoting_review_risk(pool
         70,
     );
     assert_eq!(
-        materialize_new_user_audit_job(pool, &replay, &components, "fixture-embedding")
+        materialize_new_user_audit_job(pool, &replay, &components, "fixture-embedding", None)
             .await
             .unwrap(),
         CasResult::Applied

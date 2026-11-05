@@ -182,6 +182,9 @@ fn print_transition(
         tg_ai_bot_teloxide::features::jobs::claim::CasResult::LeaseLost => {
             println!("post comment job {job_id} was not delivery_unknown; no change made")
         }
+        tg_ai_bot_teloxide::features::jobs::claim::CasResult::Stale => {
+            println!("post comment job {job_id} reconciliation result was stale")
+        }
     }
 }
 

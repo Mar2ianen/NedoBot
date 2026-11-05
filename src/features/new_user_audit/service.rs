@@ -123,6 +123,10 @@ async fn process_job(bot: &Bot, pool: &PgPool, config: &Config, job: &NewUserAud
                 "new user audit failure ignored because its lease was reclaimed"
             );
         }
+        Ok(CasResult::Stale) => tracing::warn!(
+            job_id = job.id,
+            "new user audit failure state became stale before persistence"
+        ),
         Err(_) => {
             tracing::warn!(
                 job_id = job.id,
@@ -174,12 +178,25 @@ async fn materialize_stored_assessment(
         first_message_context,
         job.review_threshold,
     );
-    if let Some(campaign) = deterministic_campaign_for_job(pool, config, job).await? {
-        if let Some(signals) = components.first_message_signals.as_array_mut() {
-            signals.push(campaign.score_signal());
-        }
-        ensure_deterministic_spam_label(pool, job, campaign, components.final_score()).await?;
+    let deterministic_campaign = deterministic_campaign_for_job(pool, config, job).await?;
+    if let Some(campaign) = deterministic_campaign.as_ref()
+        && let Some(signals) = components.first_message_signals.as_array_mut()
+    {
+        signals.push(campaign.score_signal());
     }
+    let deterministic_spam_label =
+        deterministic_campaign.map(|campaign| crate::features::labels::SpamLabel {
+            subtype: campaign.subtype.to_string(),
+            source: crate::features::labels::LabelSource::System,
+            reason: campaign.reason.to_string(),
+            evidence: serde_json::json!({
+                "rule": campaign.rule,
+                "rule_version": deterministic::RULE_VERSION,
+                "score": components.final_score(),
+                "snapshot_hash": job.snapshot_hash,
+            }),
+            operator_id: None,
+        });
     // CAS — слабый внешний сигнал: положительный вердикт добавляет не более
     // EXTERNAL_SCORE_CAP, unknown/clean ничего не меняют. Проверка выполняется
     // для каждого аудита, а не только при наличии первого сообщения: рецидивист
@@ -193,13 +210,20 @@ async fn materialize_stored_assessment(
         let (score, signals) = teloxide_antispam::external::external_component(verdict);
         components.apply_external(score, signals);
     }
-    let finalized =
-        materialize_new_user_audit_job(pool, job, &components, &config.rag_embedding_model).await?;
-    if finalized == CasResult::LeaseLost {
+    let finalized = materialize_new_user_audit_job(
+        pool,
+        job,
+        &components,
+        &config.rag_embedding_model,
+        deterministic_spam_label.as_ref(),
+    )
+    .await?;
+    if finalized != CasResult::Applied {
         tracing::warn!(
             job_id = job.id,
             attempts = job.attempts,
-            "new user audit materialization lease was reclaimed"
+            result = ?finalized,
+            "new user audit materialization was not applied"
         );
         return Ok(None);
     }
@@ -219,6 +243,9 @@ fn log_materialization_failure(
         ),
         Ok(CasResult::LeaseLost) => {
             tracing::warn!(job_id = job.id, "stale materialization failure ignored")
+        }
+        Ok(CasResult::Stale) => {
+            tracing::warn!(job_id = job.id, "materialization snapshot is stale")
         }
         Err(_) => tracing::warn!(
             job_id = job.id,
@@ -367,64 +394,6 @@ async fn deterministic_campaign_for_job(
         chat_age_seconds,
         row.get("personal_channel_has_adult_links"),
     ))
-}
-
-async fn ensure_deterministic_spam_label(
-    pool: &PgPool,
-    job: &NewUserAuditJob,
-    campaign: CampaignMatch,
-    score: i32,
-) -> anyhow::Result<()> {
-    let current_label_state: Option<(bool, Option<String>)> = sqlx::query_as(
-        r#"select coalesce(u.is_spammer, false), (
-               select e.label
-               from spam_label_events e
-               where e.chat_id = u.chat_id and e.telegram_user_id = u.telegram_user_id
-               order by e.created_at desc, e.id desc
-               limit 1
-           )
-           from telegram_chat_users u
-           where u.chat_id = $1 and u.telegram_user_id = $2"#,
-    )
-    .bind(job.chat_id)
-    .bind(job.telegram_user_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some((is_spammer, latest_label)) = current_label_state else {
-        return Ok(());
-    };
-    if is_spammer || latest_label.as_deref() == Some("not_spam") {
-        return Ok(());
-    }
-
-    crate::features::labels::record_spam(
-        pool,
-        job.chat_id,
-        job.telegram_user_id,
-        &crate::features::labels::SpamLabel {
-            subtype: campaign.subtype.to_string(),
-            source: crate::features::labels::LabelSource::System,
-            reason: campaign.reason.to_string(),
-            evidence: serde_json::json!({
-                "rule": campaign.rule,
-                "rule_version": deterministic::RULE_VERSION,
-                "score": score,
-                "snapshot_hash": job.snapshot_hash,
-            }),
-            operator_id: None,
-        },
-        false,
-    )
-    .await?;
-    tracing::warn!(
-        chat_id = job.chat_id,
-        user_id = job.telegram_user_id,
-        subtype = campaign.subtype,
-        rule = campaign.rule,
-        score,
-        "deterministic new-user campaign was labeled as spam"
-    );
-    Ok(())
 }
 
 /// Валидирует сохранённый результат перед materialization replay.
@@ -1027,7 +996,10 @@ mod tests {
             review_threshold: 70,
             assessment_json: None,
             attempts: 1,
+            generation_fence: 1,
             materialization_attempts: 1,
+            materialization_fence: 1,
+            audit_generation: 0,
             is_materialization_replay: true,
         }
     }

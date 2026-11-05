@@ -108,7 +108,10 @@ async fn load_job(pool: &PgPool) -> NewUserAuditJob {
         assessment_json: None,
         review_threshold: 70,
         attempts: 1,
+        generation_fence: 1,
         materialization_attempts: 1,
+        materialization_fence: 1,
+        audit_generation: 0,
         is_materialization_replay: true,
     }
 }
