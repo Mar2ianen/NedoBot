@@ -7,6 +7,17 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+5 ноября 2026 в **19:41 UTC / 22:41 МСК** выпущен release
+[`deploy-2026-11-05-audit-review-fencing`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-05-audit-review-fencing)
+на merge commit `8695830e8d78d4ac68c465e6e1883ef347934570` после PR
+[#89](https://github.com/Mar2ianen/NedoBot/pull/89), устраняющего гонки generation/materialization,
+stale deterministic labels и потерю score-компонентов. [Release workflow
+42095198276](https://github.com/Mar2ianen/NedoBot/actions/runs/42095198276)
+успешно обновил НедоNews, PVO и public MCP и применил migration
+`20261105190000` в обеих production БД. SHA-256 обоих bot binaries —
+`e74038868a93bd7a15cbcdae51946c82dc767cb6179e099c811c0066b27c28da`.
+Все три unit-а active, `NRestarts=0`, error-level journal за 10 минут пуст.
+
 5 ноября 2026 в **18:27 UTC / 21:27 МСК** выпущен release
 [`deploy-2026-11-05-audit-trigger-fingerprints`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-05-audit-trigger-fingerprints)
 на merge commit `50fd2de8d54be6384e9424ee99169f8b79a7cef6` после PR
