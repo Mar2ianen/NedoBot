@@ -1,4 +1,4 @@
-mod deterministic;
+pub(crate) mod deterministic;
 pub mod prompt;
 pub mod repo;
 pub mod scoring;

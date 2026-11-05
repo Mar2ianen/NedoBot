@@ -7,10 +7,14 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use crate::{
     config::Config,
     features::new_user_audit::{
+        deterministic,
         prompt::PROMPT_VERSION,
         repo::{
             NewUserAuditJobParams, enqueue_new_user_audit_job_in_transaction,
+            has_materialized_audit_for_first_message,
             record_new_user_audit_snapshot_in_transaction,
+            supersede_unneeded_new_user_audit_jobs_in_transaction,
+            sync_spam_review_from_audit_in_transaction,
         },
     },
 };
@@ -68,6 +72,31 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     let analysis_config = analysis_config_from_runtime(runtime_config);
     let is_old_active_user = features.message_count >= analysis_config.old_user_message_threshold;
     let risk = analyze_risk(&features, &analysis_config, is_old_active_user);
+    let previous_avatar_file_unique_id: Option<String> = sqlx::query_scalar(
+        "select profile_photo_file_unique_id from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    let avatar_changed = previous_avatar_file_unique_id.as_deref()
+        != features.profile_photo_file_unique_id.as_deref();
+    let first_message_preview = bounded_audit_text(features.first_message_text.as_deref());
+    let has_completed_first_message_audit = has_materialized_audit_for_first_message(
+        pool,
+        chat_id,
+        telegram_user_id,
+        first_message_preview.as_deref(),
+    )
+    .await?;
+    let run_audit_job = should_enqueue_new_user_audit_job(
+        &features,
+        &risk,
+        is_old_active_user,
+        avatar_changed,
+        !has_completed_first_message_audit && !is_old_active_user,
+    );
     let input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
     let material_revision =
         project_unified_user_audit_material_revision(&features, &analysis_config);
@@ -88,8 +117,22 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     };
     let mut tx = pool.begin().await?;
     // Authoritative transactions consistently lock job, then audit, then review.
-    enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
-    save_audit_in_transaction(&mut tx, &features, &risk, &analysis_config).await?;
+    if run_audit_job {
+        enqueue_new_user_audit_job_in_transaction(&mut tx, params).await?;
+    } else {
+        supersede_unneeded_new_user_audit_jobs_in_transaction(&mut tx, chat_id, telegram_user_id)
+            .await?;
+    }
+    save_audit_in_transaction(&mut tx, &features, &risk, &analysis_config, avatar_changed).await?;
+    if !run_audit_job || avatar_changed {
+        sync_spam_review_from_audit_in_transaction(
+            &mut tx,
+            chat_id,
+            telegram_user_id,
+            analysis_config.review_threshold,
+        )
+        .await?;
+    }
     record_new_user_audit_snapshot_in_transaction(&mut tx, params).await?;
     tx.commit().await?;
 
@@ -98,6 +141,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         telegram_user_id,
         risk_score = risk.score,
         risk_level = %risk.level,
+        audit_job_queued = run_audit_job,
         "unified new user audit baseline and job saved"
     );
     Ok(())
@@ -105,6 +149,71 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
 
 const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
 const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
+const NEW_USER_LLM_AUDIT_MIN_BASELINE_SCORE: i32 = 25;
+const LONG_FIRST_COMMENT_MIN_CHARS: usize = 220;
+
+fn should_enqueue_new_user_audit_job(
+    features: &NewUserFeatures,
+    risk: &RiskAnalysis,
+    is_old_active_user: bool,
+    avatar_changed: bool,
+    needs_initial_audit: bool,
+) -> bool {
+    let has_deterministic_campaign = deterministic::classify(
+        features.first_message_text.as_deref(),
+        features.message_count,
+        features.chat_age_sec,
+        features.personal_channel_has_adult_links,
+    )
+    .is_some();
+    has_deterministic_campaign
+        || should_run_new_user_llm_audit(
+            features,
+            risk,
+            is_old_active_user,
+            avatar_changed,
+            needs_initial_audit,
+        )
+}
+
+fn should_run_new_user_llm_audit(
+    features: &NewUserFeatures,
+    risk: &RiskAnalysis,
+    is_old_active_user: bool,
+    avatar_changed: bool,
+    needs_initial_audit: bool,
+) -> bool {
+    // Mature accounts do not need an LLM pass on every profile refresh. Keep
+    // the pass when current activity carries evidence that can change the
+    // decision: links, long recent text, or a strong local score. Profile
+    // metadata alone is useful only for genuinely new/low-activity accounts.
+    let has_fresh_content_signal = avatar_changed
+        || features.link_count_24h > 0
+        || features.personal_channel_has_adult_links
+        || features
+            .recent_message_texts
+            .iter()
+            .any(|text| text.chars().count() >= LONG_FIRST_COMMENT_MIN_CHARS);
+
+    if is_old_active_user {
+        return risk.score >= NEW_USER_LLM_AUDIT_MIN_BASELINE_SCORE || has_fresh_content_signal;
+    }
+
+    avatar_changed
+        || needs_initial_audit
+        || risk.score >= NEW_USER_LLM_AUDIT_MIN_BASELINE_SCORE
+        || has_long_first_comment(features)
+        || features.personal_channel_has_adult_links
+        || personal_channel_has_invite_link(features)
+        || personal_channel_has_external_link(features)
+}
+
+fn has_long_first_comment(features: &NewUserFeatures) -> bool {
+    features
+        .first_message_text
+        .as_deref()
+        .is_some_and(|text| text.chars().count() >= LONG_FIRST_COMMENT_MIN_CHARS)
+}
 
 fn project_unified_user_audit_material_revision(
     features: &NewUserFeatures,
@@ -764,6 +873,7 @@ async fn save_audit_in_transaction(
     features: &NewUserFeatures,
     risk: &RiskAnalysis,
     config: &NewUserAnalysisConfig,
+    reset_avatar_risk: bool,
 ) -> anyhow::Result<()> {
     let username_stats = username_stats(features.username.as_deref());
     let profile_photo_dc = best_effort_profile_photo_dc(features.profile_photo_file_id.as_deref());
@@ -978,6 +1088,16 @@ async fn save_audit_in_transaction(
     query.push(") on conflict (chat_id, telegram_user_id) do update set analyzed_at = now(), ");
     {
         let mut updates = query.separated(", ");
+        let previous_avatar_score = if reset_avatar_risk {
+            "0"
+        } else {
+            "telegram_new_user_profile_audits.risk_avatar_score"
+        };
+        let previous_avatar_signals = if reset_avatar_risk {
+            "'[]'::jsonb"
+        } else {
+            "telegram_new_user_profile_audits.risk_avatar_signals"
+        };
         for column in columns.iter().copied().filter(|column| {
             !matches!(
                 *column,
@@ -1000,11 +1120,15 @@ async fn save_audit_in_transaction(
         }
         updates.push("risk_baseline_score = excluded.risk_baseline_score");
         updates.push("risk_baseline_signals = excluded.risk_baseline_signals");
+        updates.push(format_args!("risk_avatar_score = {previous_avatar_score}"));
+        updates.push(format_args!(
+            "risk_avatar_signals = {previous_avatar_signals}"
+        ));
         updates.push("risk_personal_channel_score = 0");
         updates.push("risk_personal_channel_signals = '[]'::jsonb");
-        updates.push("risk_score = least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score)");
-        updates.push("risk_level = case when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score) >= 70 then 'high' when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + telegram_new_user_profile_audits.risk_avatar_score) >= 40 then 'medium' else 'low' end");
-        updates.push("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || telegram_new_user_profile_audits.risk_avatar_signals");
+        updates.push(format_args!("risk_score = least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score})"));
+        updates.push(format_args!("risk_level = case when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score}) >= 70 then 'high' when least(100, excluded.risk_baseline_score + telegram_new_user_profile_audits.risk_first_message_score + {previous_avatar_score}) >= 40 then 'medium' else 'low' end"));
+        updates.push(format_args!("risk_signal_breakdown = excluded.risk_baseline_signals || telegram_new_user_profile_audits.risk_first_message_signals || {previous_avatar_signals}"));
     }
 
     query.build().execute(&mut **tx).await?;
@@ -1056,6 +1180,154 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 mod tests {
     use super::*;
     use teloxide_antispam::signals::analyze_new_or_low_activity_user;
+
+    fn risk_with_score(score: i32) -> RiskAnalysis {
+        RiskAnalysis {
+            score,
+            level: if score >= 70 { "high" } else { "low" }.to_string(),
+            primary_class: None,
+            class_scores: json!({}),
+            labels: Vec::new(),
+            reasons: Vec::new(),
+            signals: json!([]),
+        }
+    }
+
+    #[test]
+    fn audit_gate_skips_mature_profile_refreshes_but_keeps_fresh_signals() {
+        let config = NewUserAnalysisConfig::default();
+        let ordinary = NewUserFeatures {
+            message_count: 2,
+            first_message_text: Some("Привет всем".to_string()),
+            ..Default::default()
+        };
+        assert!(!should_enqueue_new_user_audit_job(
+            &ordinary,
+            &risk_with_score(12),
+            false,
+            false,
+            false,
+        ));
+        assert!(should_enqueue_new_user_audit_job(
+            &ordinary,
+            &risk_with_score(25),
+            false,
+            false,
+            false,
+        ));
+        assert!(should_enqueue_new_user_audit_job(
+            &NewUserFeatures {
+                message_count: 2,
+                ..ordinary.clone()
+            },
+            &risk_with_score(12),
+            false,
+            false,
+            true,
+        ));
+        assert!(should_enqueue_new_user_audit_job(
+            &ordinary,
+            &risk_with_score(12),
+            false,
+            true,
+            false,
+        ));
+
+        let profile_photo = NewUserFeatures {
+            profile_photo_count: Some(1),
+            ..ordinary.clone()
+        };
+        assert!(should_enqueue_new_user_audit_job(
+            &profile_photo,
+            &risk_with_score(12),
+            false,
+            true,
+            false,
+        ));
+
+        let mature = NewUserFeatures {
+            message_count: config.old_user_message_threshold,
+            profile_photo_count: Some(1),
+            ..ordinary
+        };
+        assert!(!should_enqueue_new_user_audit_job(
+            &mature,
+            &risk_with_score(12),
+            true,
+            false,
+            false,
+        ));
+        assert!(should_enqueue_new_user_audit_job(
+            &mature,
+            &risk_with_score(12),
+            true,
+            true,
+            false,
+        ));
+
+        let mature_with_link = NewUserFeatures {
+            link_count_24h: 1,
+            ..mature.clone()
+        };
+        assert!(should_enqueue_new_user_audit_job(
+            &mature_with_link,
+            &risk_with_score(12),
+            true,
+            false,
+            false,
+        ));
+
+        let mature_with_long_recent_text = NewUserFeatures {
+            recent_message_texts: vec!["текст".repeat(LONG_FIRST_COMMENT_MIN_CHARS / 5 + 1)],
+            ..mature
+        };
+        assert!(should_enqueue_new_user_audit_job(
+            &mature_with_long_recent_text,
+            &risk_with_score(12),
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn audit_gate_keeps_long_comments_and_deterministic_campaign_fast_paths() {
+        for (length, expected) in [
+            (LONG_FIRST_COMMENT_MIN_CHARS - 1, false),
+            (LONG_FIRST_COMMENT_MIN_CHARS, true),
+        ] {
+            let features = NewUserFeatures {
+                message_count: 2,
+                first_message_text: Some("я".repeat(length)),
+                ..Default::default()
+            };
+            assert_eq!(
+                should_enqueue_new_user_audit_job(
+                    &features,
+                    &risk_with_score(12),
+                    false,
+                    false,
+                    false,
+                ),
+                expected,
+                "comment length {length}"
+            );
+        }
+
+        let paid_dm_campaign = NewUserFeatures {
+            message_count: 1,
+            chat_age_sec: Some(60),
+            first_message_text: Some("Кидай + в директ — с меня 400 ₽".to_string()),
+            ..Default::default()
+        };
+        assert!(should_enqueue_new_user_audit_job(
+            &paid_dm_campaign,
+            &risk_with_score(12),
+            false,
+            false,
+            false,
+        ));
+    }
 
     #[test]
     fn latest_personal_channel_content_is_a_redacted_material_audit_input() {
