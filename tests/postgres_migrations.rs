@@ -49,9 +49,11 @@ use tg_ai_bot_teloxide::{
         },
         new_user_audit::repo::{
             NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_new_user_audit_job,
+            finalize_new_user_audit_job, has_materialized_audit_for_first_message,
+            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
+            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
+            materialize_new_user_audit_job, supersede_unneeded_new_user_audit_jobs_in_transaction,
+            sync_spam_review_from_audit_in_transaction,
         },
         reports::{ReportCreation, ReportTarget, create_report, load_report},
         risk_captcha::{CaptchaCallbackOutcome, mark_solving, record_wrong_answer, set_passed},
@@ -120,6 +122,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
     assert_paused_review_delivery_suppresses_unsent_cards(&pool).await;
     assert_new_user_audit_job_lifecycle(&pool).await;
+    assert_unneeded_new_user_audit_preserves_local_review(&pool).await;
+    assert_first_message_audit_requires_matching_materialization(&pool).await;
     assert_new_user_audit_text_change_reopens_completed_generation(&pool).await;
     assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
     assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
@@ -1450,6 +1454,232 @@ async fn assert_new_user_audit_job_lifecycle(pool: &PgPool) {
             .await
             .expect("terminal audit status must be stored");
     assert_eq!(terminal_status, "failed");
+}
+
+async fn assert_unneeded_new_user_audit_preserves_local_review(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_201;
+    let combined_signals = serde_json::json!([
+        {"label": "baseline_campaign_signal", "score": 34},
+        {"label": "first_message_promo", "score": 42}
+    ]);
+    let input = serde_json::json!({"schema_version": "audit-not-required-fixture"});
+
+    query(
+        "insert into telegram_new_user_profile_audits (chat_id, telegram_user_id, risk_baseline_score, risk_first_message_score, risk_score, risk_level, risk_signal_breakdown) values ($1, $2, 34, 42, 76, 'high', $3)",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .bind(&combined_signals)
+    .execute(pool)
+    .await
+    .expect("combined baseline audit must be inserted");
+
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "audit-not-required-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("pending LLM job must be enqueued");
+
+    let mut tx = pool.begin().await.expect("fixture transaction must begin");
+    supersede_unneeded_new_user_audit_jobs_in_transaction(&mut tx, CHAT_ID, USER_ID)
+        .await
+        .expect("unneeded pending job must be superseded");
+    sync_spam_review_from_audit_in_transaction(&mut tx, CHAT_ID, USER_ID, 70)
+        .await
+        .expect("local combined audit must be synced to review");
+    tx.commit().await.expect("fixture state must commit");
+
+    let job_state: (String, Option<String>, bool, bool) = query_as(
+        "select status, error_kind, processing_started_at is null, lease_expires_at is null from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("superseded job state must be queryable");
+    assert_eq!(
+        job_state,
+        (
+            "failed".to_string(),
+            Some("audit_not_required".to_string()),
+            true,
+            true
+        )
+    );
+
+    let review: (i32, serde_json::Value) = query_as(
+        "select risk_score, risk_signals from spam_review_requests where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("local spam review must be queryable");
+    assert_eq!(review, (76, combined_signals));
+
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "audit-not-required-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("a later-required identical snapshot must be re-enqueued");
+    let reopened_status: String = query_scalar(
+        "select status from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("reopened job state must be queryable");
+    assert_eq!(reopened_status, "pending");
+
+    query("delete from spam_review_requests where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("fixture review must be removed");
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("fixture audit job must be removed");
+    query(
+        "delete from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("fixture profile audit must be removed");
+}
+
+async fn assert_first_message_audit_requires_matching_materialization(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_202;
+    let profile_only_input = serde_json::json!({
+        "text": {"first_message_preview": null}
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "first-text-audit-snapshot",
+            prompt_version: "prompt-v1",
+            input_json: &profile_only_input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("profile-only generation must enqueue");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"first_message_assessment\":null}'::jsonb, materialization_status = 'succeeded' where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("profile-only assessment must be materialized");
+
+    assert!(
+        has_materialized_audit_for_first_message(pool, CHAT_ID, USER_ID, None)
+            .await
+            .expect("profile-only completion must be recognized")
+    );
+    assert!(
+        !has_materialized_audit_for_first_message(
+            pool,
+            CHAT_ID,
+            USER_ID,
+            Some("Пиши за подробностями в личку"),
+        )
+        .await
+        .expect("new text must not match profile-only completion")
+    );
+
+    let text_input = serde_json::json!({
+        "text": {"first_message_preview": "Пиши за подробностями в личку"}
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "first-text-audit-snapshot-v2",
+            prompt_version: "prompt-v1",
+            input_json: &text_input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("text generation must enqueue");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"first_message_assessment\":{}}'::jsonb, materialization_status = 'pending' where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("text assessment must finish generation");
+    assert!(
+        !has_materialized_audit_for_first_message(
+            pool,
+            CHAT_ID,
+            USER_ID,
+            Some("Пиши за подробностями в личку"),
+        )
+        .await
+        .expect("generation alone must not count before materialization")
+    );
+    query("update new_user_audit_jobs set materialization_status = 'succeeded' where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("text assessment materialization must finish");
+    assert!(
+        has_materialized_audit_for_first_message(
+            pool,
+            CHAT_ID,
+            USER_ID,
+            Some("Пиши за подробностями в личку"),
+        )
+        .await
+        .expect("matching text completion must be recognized")
+    );
+
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("first-text audit fixtures must be removed");
 }
 
 async fn assert_new_user_audit_text_change_reopens_completed_generation(pool: &PgPool) {

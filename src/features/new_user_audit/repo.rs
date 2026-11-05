@@ -51,6 +51,39 @@ pub struct NewUserAuditJobParams<'a> {
     pub review_threshold: i32,
 }
 
+/// Returns whether an assessment covering this first text has been applied to
+/// the baseline. A profile-only or still-pending materialization is not enough.
+pub async fn has_materialized_audit_for_first_message(
+    pool: &PgPool,
+    chat_id: i64,
+    telegram_user_id: i64,
+    first_message_preview: Option<&str>,
+) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        r#"
+        select exists(
+            select 1
+            from new_user_audit_jobs
+            where chat_id = $1 and telegram_user_id = $2
+              and status = 'succeeded'
+              and materialization_status = 'succeeded'
+              and input_json #>> '{text,first_message_preview}' is not distinct from $3
+              and (
+                    ($3::text is null and assessment_json->'first_message_assessment' = 'null'::jsonb)
+                    or ($3::text is not null
+                        and assessment_json->'first_message_assessment' is not null
+                        and assessment_json->'first_message_assessment' <> 'null'::jsonb)
+              )
+        )
+        "#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(first_message_preview)
+    .fetch_one(pool)
+    .await?)
+}
+
 #[allow(dead_code)] // Используется PostgreSQL migration/integration harness.
 pub async fn enqueue_new_user_audit_job(
     pool: &PgPool,
@@ -82,43 +115,53 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
         on conflict (chat_id, telegram_user_id, snapshot_hash, prompt_version)
         do update set
             status = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 'pending'
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then 'pending'
                 else new_user_audit_jobs.status
             end,
             attempts = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 0
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then 0
                 else new_user_audit_jobs.attempts
             end,
             next_attempt_at = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then now()
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then now()
                 else new_user_audit_jobs.next_attempt_at
             end,
             processing_started_at = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.processing_started_at
             end,
             lease_expires_at = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.lease_expires_at
             end,
             error_kind = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.error_kind
             end,
             assessment_json = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.assessment_json
             end,
             provider = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.provider
             end,
             model = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.model
             end,
             completed_at = case
-                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                when (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.completed_at
             end,
             input_json = excluded.input_json,
@@ -128,32 +171,38 @@ pub async fn enqueue_new_user_audit_job_in_transaction(
             materialization_version = $9,
             materialization_status = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 'pending'
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then 'pending'
                 else new_user_audit_jobs.materialization_status
             end,
             materialization_attempts = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then 0
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then 0
                 else new_user_audit_jobs.materialization_attempts
             end,
             materialization_next_attempt_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then now()
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then now()
                 else new_user_audit_jobs.materialization_next_attempt_at
             end,
             materialization_processing_started_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialization_processing_started_at
             end,
             materialization_lease_expires_at = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialization_lease_expires_at
             end,
             materialization_error_kind = case
                 when new_user_audit_jobs.materialization_version is distinct from $9
-                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text') then null
+                  or (new_user_audit_jobs.input_json -> 'text') is distinct from (excluded.input_json -> 'text')
+                  or new_user_audit_jobs.error_kind = 'audit_not_required' then null
                 else new_user_audit_jobs.materialization_error_kind
             end,
             materialized_at = case
@@ -189,6 +238,116 @@ pub async fn record_new_user_audit_snapshot_in_transaction(
     .bind(params.chat_id)
     .bind(params.telegram_user_id)
     .bind(params.snapshot_hash)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Prevents obsolete generation jobs from making LLM requests after the
+/// latest profile snapshot has been classified as local-only.
+pub async fn supersede_unneeded_new_user_audit_jobs_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    chat_id: i64,
+    telegram_user_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        update new_user_audit_jobs
+        set status = 'failed', error_kind = 'audit_not_required', completed_at = now(),
+            processing_started_at = null, lease_expires_at = null, updated_at = now()
+        where chat_id = $1 and telegram_user_id = $2
+          and status in ('pending', 'retry_wait', 'processing')
+          and assessment_json is null
+        "#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Creates or refreshes the moderator queue row inside the caller's transaction.
+pub async fn upsert_spam_review_request_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    chat_id: i64,
+    telegram_user_id: i64,
+    risk_score: i32,
+    review_threshold: i32,
+    risk_signals: &Value,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        insert into spam_review_requests
+            (chat_id, telegram_user_id, risk_score, review_threshold, risk_signals)
+        values ($1, $2, $3, $4, $5)
+        on conflict (chat_id, telegram_user_id) do update
+        set risk_score = excluded.risk_score,
+            review_threshold = excluded.review_threshold,
+            risk_signals = excluded.risk_signals,
+            notification_status = case when spam_review_requests.status = 'pending'
+                and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
+                and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                    is distinct from (excluded.risk_score, excluded.risk_signals)
+                then 'retry_wait' else spam_review_requests.notification_status end,
+            notification_next_attempt_at = case when spam_review_requests.status = 'pending'
+                and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
+                and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
+                    is distinct from (excluded.risk_score, excluded.risk_signals)
+                then now() else spam_review_requests.notification_next_attempt_at end
+        "#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(risk_score.clamp(0, 100))
+    .bind(review_threshold.clamp(0, 100))
+    .bind(risk_signals)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Uses the saved combined score and signals as the source of truth for local review.
+pub async fn sync_spam_review_from_audit_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    chat_id: i64,
+    telegram_user_id: i64,
+    review_threshold: i32,
+) -> anyhow::Result<()> {
+    let (risk_score, risk_signals): (i32, Value) = sqlx::query_as(
+        "select risk_score, risk_signal_breakdown from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if risk_score >= review_threshold {
+        return upsert_spam_review_request_in_transaction(
+            tx,
+            chat_id,
+            telegram_user_id,
+            risk_score,
+            review_threshold,
+            &risk_signals,
+        )
+        .await;
+    }
+
+    // A lower local score must not create a new queue item, but should refresh
+    // an existing pending row so an older high-risk notification cannot win a
+    // race with the newer snapshot.
+    sqlx::query(
+        r#"
+        update spam_review_requests
+        set risk_score = $3, review_threshold = $4, risk_signals = $5
+        where chat_id = $1 and telegram_user_id = $2 and status = 'pending'
+        "#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(risk_score.clamp(0, 100))
+    .bind(review_threshold.clamp(0, 100))
+    .bind(risk_signals)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -456,33 +615,14 @@ async fn materialize_new_user_audit_in_transaction(
         return Ok(());
     }
 
-    sqlx::query(
-        r#"
-        insert into spam_review_requests
-            (chat_id, telegram_user_id, risk_score, review_threshold, risk_signals)
-        values ($1, $2, $3, $4, $5)
-        on conflict (chat_id, telegram_user_id) do update
-        set risk_score = excluded.risk_score,
-            review_threshold = excluded.review_threshold,
-            risk_signals = excluded.risk_signals,
-            notification_status = case when spam_review_requests.status = 'pending'
-                and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
-                and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
-                    is distinct from (excluded.risk_score, excluded.risk_signals)
-                then 'retry_wait' else spam_review_requests.notification_status end,
-            notification_next_attempt_at = case when spam_review_requests.status = 'pending'
-                and spam_review_requests.notification_status in ('pending', 'retry_wait', 'sent')
-                and (spam_review_requests.notified_risk_score, spam_review_requests.notified_risk_signals)
-                    is distinct from (excluded.risk_score, excluded.risk_signals)
-                then now() else spam_review_requests.notification_next_attempt_at end
-        "#,
+    upsert_spam_review_request_in_transaction(
+        tx,
+        job.chat_id,
+        job.telegram_user_id,
+        final_score,
+        job.review_threshold,
+        &final_signals,
     )
-    .bind(job.chat_id)
-    .bind(job.telegram_user_id)
-    .bind(final_score)
-    .bind(job.review_threshold)
-    .bind(&final_signals)
-    .execute(&mut **tx)
     .await?;
     let finalized = sqlx::query(
         "update new_user_audit_jobs set materialization_status = 'succeeded', materialized_at = now(), materialization_error_kind = null, materialization_processing_started_at = null, materialization_lease_expires_at = null where id = $1 and (not $4 or (status = 'succeeded' and materialization_status = 'processing' and materialization_attempts = $2 and materialization_version = $3))",
