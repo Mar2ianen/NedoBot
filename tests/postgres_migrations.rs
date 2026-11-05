@@ -50,9 +50,11 @@ use tg_ai_bot_teloxide::{
         new_user_audit::repo::{
             NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
             finalize_new_user_audit_job, has_materialized_audit_for_first_message,
-            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
-            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
-            materialize_new_user_audit_job, supersede_unneeded_new_user_audit_jobs_in_transaction,
+            latest_audit_trigger_fingerprint, mark_new_user_audit_failed,
+            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
+            mark_new_user_audit_retry, materialize_new_user_audit_job,
+            reopen_obsolete_materialization_in_transaction,
+            supersede_unneeded_new_user_audit_jobs_in_transaction,
             sync_spam_review_from_audit_in_transaction,
         },
         reports::{ReportCreation, ReportTarget, create_report, load_report},
@@ -127,6 +129,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_new_user_audit_text_change_reopens_completed_generation(&pool).await;
     assert_new_user_audit_generation_cas_requires_live_lease_and_current_version(&pool).await;
     assert_new_user_audit_enqueue_version_bump_reopens_completed_materialization(&pool).await;
+    assert_local_only_refresh_reopens_obsolete_materialization(&pool).await;
+    assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(&pool).await;
     assert_reputation_feature_order_upgrade(&pool).await;
     assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(&database_url).await;
     assert_unified_enqueue_and_finalizer_share_lock_order(&pool).await;
@@ -1934,6 +1938,211 @@ async fn assert_new_user_audit_enqueue_version_bump_reopens_completed_materializ
     .expect("version bump replay fixture must be closed");
 }
 
+async fn assert_local_only_refresh_reopens_obsolete_materialization(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_112;
+    let input = serde_json::json!({"fixture": "local-only-materialization-replay"});
+    let params = NewUserAuditJobParams {
+        chat_id: CHAT_ID,
+        telegram_user_id: USER_ID,
+        snapshot_hash: "local-only-materialization-snapshot",
+        prompt_version: "prompt-v1",
+        input_json: &input,
+        avatar_file_id: None,
+        avatar_file_unique_id: None,
+        review_threshold: 70,
+    };
+    enqueue_new_user_audit_job(pool, params)
+        .await
+        .expect("local-only materialization fixture must be enqueued");
+    query(
+        "update new_user_audit_jobs set status = 'succeeded', assessment_json = '{\"fixture\": \"saved\"}'::jsonb, materialization_version = 'obsolete-version', materialization_status = 'succeeded', materialized_at = now() where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("saved assessment with obsolete materializer must be stored");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("local-only refresh transaction must start");
+    reopen_obsolete_materialization_in_transaction(&mut tx, params)
+        .await
+        .expect("local-only refresh must reopen only the materializer");
+    tx.commit()
+        .await
+        .expect("local-only materializer replay must commit");
+
+    let state: (String, String, String, bool, bool) = query_as(
+        "select status, materialization_status, materialization_version, assessment_json is not null, materialization_next_attempt_at <= now() from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("local-only materialization state must be queryable");
+    assert_eq!(
+        state,
+        (
+            "succeeded".into(),
+            "pending".into(),
+            tg_ai_bot_teloxide::features::new_user_audit::repo::CURRENT_MATERIALIZATION_VERSION
+                .into(),
+            true,
+            true
+        )
+    );
+    query(
+        "update new_user_audit_jobs set materialization_status = 'retry_wait', materialization_attempts = 3, materialization_next_attempt_at = now() + interval '1 hour', materialization_error_kind = 'retry_backoff', materialized_at = null where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .execute(pool)
+    .await
+    .expect("current-version retry backoff fixture must be stored");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("current-version materializer transaction must start");
+    reopen_obsolete_materialization_in_transaction(&mut tx, params)
+        .await
+        .expect("current-version materializer must remain untouched");
+    tx.commit()
+        .await
+        .expect("current-version materializer state must commit");
+    let current_version_retry: (String, i32, bool, Option<String>) = query_as(
+        "select materialization_status, materialization_attempts, materialization_next_attempt_at > now(), materialization_error_kind from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("current-version retry state must be queryable");
+    assert_eq!(
+        current_version_retry,
+        ("retry_wait".into(), 3, true, Some("retry_backoff".into()))
+    );
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("local-only materialization fixture must be removed from the ready queue");
+}
+
+async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool: &PgPool) {
+    const CHAT_ID: i64 = -1001932061163;
+    const USER_ID: i64 = 9_000_202;
+    let input = serde_json::json!({
+        "audit_trigger_fingerprint": "hidden-link-message-21",
+        "deterministic_campaign_rule": "fresh_money_work_private_contact"
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "trigger-fingerprint-snapshot-a",
+            prompt_version: "prompt-v1",
+            input_json: &input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("pending trigger-fingerprint audit must be enqueued");
+
+    assert_eq!(
+        latest_audit_trigger_fingerprint(pool, CHAT_ID, USER_ID)
+            .await
+            .expect("pending trigger fingerprint must be readable"),
+        Some((
+            "hidden-link-message-21".to_string(),
+            "pending".to_string(),
+            false
+        ))
+    );
+
+    query(
+        "update new_user_audit_jobs set status = 'processing', attempts = 1, processing_started_at = now(), lease_expires_at = now() + interval '1 minute' where chat_id = $1 and telegram_user_id = $2 and snapshot_hash = $3",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .bind("trigger-fingerprint-snapshot-a")
+    .execute(pool)
+    .await
+    .expect("trigger-fingerprint job must enter in-flight state");
+    assert_eq!(
+        latest_audit_trigger_fingerprint(pool, CHAT_ID, USER_ID)
+            .await
+            .expect("in-flight trigger fingerprint must be readable"),
+        Some((
+            "hidden-link-message-21".to_string(),
+            "processing".to_string(),
+            false
+        ))
+    );
+
+    let changed_input = serde_json::json!({
+        "audit_trigger_fingerprint": "hidden-link-message-22",
+        "deterministic_campaign_rule": null
+    });
+    enqueue_new_user_audit_job(
+        pool,
+        NewUserAuditJobParams {
+            chat_id: CHAT_ID,
+            telegram_user_id: USER_ID,
+            snapshot_hash: "trigger-fingerprint-snapshot-a",
+            prompt_version: "prompt-v1",
+            input_json: &changed_input,
+            avatar_file_id: None,
+            avatar_file_unique_id: None,
+            review_threshold: 70,
+        },
+    )
+    .await
+    .expect("changed exact-link evidence must reopen the same-key generation");
+    assert_eq!(
+        latest_audit_trigger_fingerprint(pool, CHAT_ID, USER_ID)
+            .await
+            .expect("latest changed trigger fingerprint must be readable"),
+        Some((
+            "hidden-link-message-22".to_string(),
+            "pending".to_string(),
+            false
+        ))
+    );
+    let generation_state: (String, i32, bool, Option<String>) = query_as(
+        "select status, attempts, lease_expires_at is null, input_json->>'deterministic_campaign_rule' from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2 and snapshot_hash = $3",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .bind("trigger-fingerprint-snapshot-a")
+    .fetch_one(pool)
+    .await
+    .expect("changed trigger generation state must be queryable");
+    assert_eq!(
+        generation_state,
+        (
+            "pending".into(),
+            0,
+            true,
+            Some("fresh_money_work_private_contact".into())
+        ),
+        "changing exact link evidence must revoke the old lease and preserve the verdict frozen for this generation"
+    );
+
+    query("delete from new_user_audit_jobs where chat_id = $1 and telegram_user_id = $2")
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("trigger-fingerprint fixtures must be removed");
+}
+
 async fn assert_new_user_audit_generation_finalizer_retries_real_transient_sqlstate(
     database_url: &str,
 ) {
@@ -2210,6 +2419,18 @@ async fn assert_successful_audit_replays_for_materialization(pool: &PgPool) {
         .expect("replay claim must execute")
         .expect("successful assessment must be replayable");
     assert!(replay_claim.is_materialization_replay);
+    let current_snapshot_hash: Option<String> = query_scalar(
+        "select unified_audit_snapshot_hash from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(USER_ID)
+    .fetch_one(pool)
+    .await
+    .expect("materialization snapshot must be queryable");
+    assert_eq!(
+        current_snapshot_hash.as_deref(),
+        Some(replay_claim.snapshot_hash.as_str())
+    );
     assert_eq!(
         materialize_new_user_audit_job(
             pool,

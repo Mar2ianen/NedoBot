@@ -23,6 +23,37 @@ pub(crate) struct CampaignMatch {
 }
 
 impl CampaignMatch {
+    pub fn from_rule(rule: &str) -> Option<Self> {
+        [
+            Self {
+                kind: CampaignKind::MoneyDmFunnel,
+                rule: "fresh_money_work_private_contact",
+                subtype: "money_dm_bait",
+                reason: "Свежий участник предлагает деньги или работу и сразу переводит контакт в личные сообщения.",
+            },
+            Self {
+                kind: CampaignKind::PaidShortTaskOffer,
+                rule: "fresh_paid_short_task_with_concrete_payout",
+                subtype: "paid_short_task_bait",
+                reason: "Свежий участник рекламирует короткое разовое задание с конкретной оплатой после выполнения.",
+            },
+            Self {
+                kind: CampaignKind::LimitedProductTrial,
+                rule: "fresh_limited_product_trial_offer",
+                subtype: "product_trial_bait",
+                reason: "Свежий участник рекламирует товар на пробу с искусственным ограничением числа мест.",
+            },
+            Self {
+                kind: CampaignKind::AdultPersonalChannel,
+                rule: "fresh_adult_personal_channel",
+                subtype: "adult_personal_channel_promo",
+                reason: "У свежего участника личный канал содержит ссылки на adult-промо.",
+            },
+        ]
+        .into_iter()
+        .find(|campaign| campaign.rule == rule)
+    }
+
     pub fn assessment(self, has_first_message: bool) -> Value {
         let first_message_assessment = if !has_first_message {
             Value::Null
@@ -470,5 +501,20 @@ mod tests {
         let first_message = parsed.first_message_assessment.unwrap();
         assert!(first_message.offtopic_promo);
         assert!(!first_message.direct_dm_offer);
+    }
+
+    #[test]
+    fn stored_campaign_rules_resolve_to_the_same_static_match() {
+        for message in [
+            "Получить 500 рублей? Пишите в личку.",
+            "Есть дельце на пару часов, по завершению 7.000р!!!",
+            "Дам товар на пробу, мест всего 7",
+        ] {
+            let campaign = classify(Some(message), 1, Some(60), false).unwrap();
+            assert_eq!(CampaignMatch::from_rule(campaign.rule), Some(campaign));
+        }
+        let adult = classify(None, 1, Some(60), true).unwrap();
+        assert_eq!(CampaignMatch::from_rule(adult.rule), Some(adult));
+        assert_eq!(CampaignMatch::from_rule("unknown-rule"), None);
     }
 }
