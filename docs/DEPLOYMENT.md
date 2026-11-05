@@ -13,10 +13,16 @@ deploy-YYYY-MM-DD-scope.
 [#89](https://github.com/Mar2ianen/NedoBot/pull/89), устраняющего гонки generation/materialization,
 stale deterministic labels и потерю score-компонентов. [Release workflow
 42095198276](https://github.com/Mar2ianen/NedoBot/actions/runs/42095198276)
-успешно обновил НедоNews, PVO и public MCP и применил migration
-`20261105190000` в обеих production БД. SHA-256 обоих bot binaries —
-`e74038868a93bd7a15cbcdae51946c82dc767cb6179e099c811c0066b27c28da`.
-Все три unit-а active, `NRestarts=0`, error-level journal за 10 минут пуст.
+успешно установил binaries и перезапустил НедоNews, PVO и public MCP.
+При отдельной ручной проверке по SSH и SQL в 19:42 UTC подтверждены SHA-256
+обоих bot binaries (`e74038868a93bd7a15cbcdae51946c82dc767cb6179e099c811c0066b27c28da`),
+наличие migration `20261105190000` в БД `tg_ai_bot` и `tg_ai_bot_pvo`, активность
+всех трёх unit-ов, `NRestarts=0` и пустой error-level journal за последние 10 минут.
+В run `42095198276` явная проверка `_sqlx_migrations` ещё не включала новую
+версию, поэтому применение подтверждено отдельным SQL-запросом. Этот follow-up
+добавляет release workflow проверку последней migration собираемого ref и
+проверку активности, прироста `NRestarts` и error-level journal для всех трёх
+unit-ов.
 
 5 ноября 2026 в **18:27 UTC / 21:27 МСК** выпущен release
 [`deploy-2026-11-05-audit-trigger-fingerprints`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-05-audit-trigger-fingerprints)
