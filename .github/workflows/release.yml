@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       commit: ${{ steps.source.outputs.commit }}
+      migration_version: ${{ steps.source.outputs.migration_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +42,13 @@ jobs:
           DEPLOY_REQUESTED: ${{ inputs.deploy }}
         run: |
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          migration_version=$(find migrations -maxdepth 1 -type f -name '*.sql' -printf '%f\n' \
+            | sed -E 's/^([0-9]+)_.*/\1/' | sort -n | tail -1)
+          if ! [[ "$migration_version" =~ ^[0-9]+$ ]]; then
+            echo "could not determine latest SQLx migration version" >&2
+            exit 1
+          fi
+          echo "migration_version=$migration_version" >> "$GITHUB_OUTPUT"
           if [ "$DEPLOY_REQUESTED" = true ]; then
             git merge-base --is-ancestor HEAD origin/main
           fi
@@ -126,11 +134,21 @@ jobs:
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          EXPECTED_MIGRATION_VERSION: ${{ needs.build.outputs.migration_version }}
         run: |
+          if ! [[ "$EXPECTED_MIGRATION_VERSION" =~ ^[0-9]+$ ]]; then
+            echo "invalid expected migration version" >&2
+            exit 1
+          fi
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
-            "bash -s -- '$STAGE_DIR'" <<'REMOTE'
+            "bash -s -- '$STAGE_DIR' '$EXPECTED_MIGRATION_VERSION'" <<'REMOTE'
           set -euo pipefail
           stage_dir="$1"
+          expected_migration_version="$2"
+          deploy_started_at=$(date --iso-8601=seconds)
+          main_restarts_before=$(systemctl show tg-ai-bot-teloxide -p NRestarts --value)
+          pvo_restarts_before=$(systemctl show nedobot-pvo -p NRestarts --value)
+          mcp_restarts_before=$(systemctl show nedonews-mcp -p NRestarts --value)
           bash "$stage_dir/install_release_binaries.sh" "$stage_dir"
           rm -rf "$stage_dir"
           systemctl restart tg-ai-bot-teloxide nedobot-pvo
@@ -141,10 +159,10 @@ jobs:
           for attempt in $(seq 1 300); do
             main_ready=$(podman exec tg-ai-bot-postgres psql -XAt \
               -U tg_ai_bot -d tg_ai_bot \
-              -c "select to_regclass('public.telegram_message_embeddings_gemma2') is not null and to_regclass('public.spammer_avatar_embeddings') is not null and to_regclass('public.telegram_messages_userstatus_totals_idx') is not null and exists (select 1 from _sqlx_migrations where version = 20261009190000 and success) and exists (select 1 from _sqlx_migrations where version = 20261018120000 and success)") || main_ready=false
+              -c "select to_regclass('public.telegram_message_embeddings_gemma2') is not null and to_regclass('public.spammer_avatar_embeddings') is not null and to_regclass('public.telegram_messages_userstatus_totals_idx') is not null and exists (select 1 from _sqlx_migrations where version = 20261009190000 and success) and exists (select 1 from _sqlx_migrations where version = 20261018120000 and success) and exists (select 1 from _sqlx_migrations where version = $expected_migration_version and success)") || main_ready=false
             pvo_ready=$(podman exec tg-ai-bot-postgres psql -XAt \
               -U tg_ai_bot -d tg_ai_bot_pvo \
-              -c "select to_regclass('public.telegram_message_embeddings_gemma2') is not null and to_regclass('public.spammer_avatar_embeddings') is not null and to_regclass('public.telegram_messages_userstatus_totals_idx') is not null and exists (select 1 from _sqlx_migrations where version = 20261009190000 and success) and exists (select 1 from _sqlx_migrations where version = 20261018120000 and success)") || pvo_ready=false
+              -c "select to_regclass('public.telegram_message_embeddings_gemma2') is not null and to_regclass('public.spammer_avatar_embeddings') is not null and to_regclass('public.telegram_messages_userstatus_totals_idx') is not null and exists (select 1 from _sqlx_migrations where version = 20261009190000 and success) and exists (select 1 from _sqlx_migrations where version = 20261018120000 and success) and exists (select 1 from _sqlx_migrations where version = $expected_migration_version and success)") || pvo_ready=false
             if [ "$main_ready" = "t" ] && [ "$pvo_ready" = "t" ]; then
               ready=true
               break
@@ -158,6 +176,19 @@ jobs:
             -c 'GRANT SELECT (chat_id, message_id, embedding, embedding_model, status) ON TABLE public.telegram_message_embeddings_gemma2 TO nedobot_mcp_ro'
           systemctl restart nedonews-mcp
           systemctl is-active nedonews-mcp
+
+          for unit in tg-ai-bot-teloxide nedobot-pvo nedonews-mcp; do
+            systemctl is-active --quiet "$unit"
+          done
+          test "$(systemctl show tg-ai-bot-teloxide -p NRestarts --value)" = "$main_restarts_before"
+          test "$(systemctl show nedobot-pvo -p NRestarts --value)" = "$pvo_restarts_before"
+          test "$(systemctl show nedonews-mcp -p NRestarts --value)" = "$mcp_restarts_before"
+          errors=$(journalctl -u tg-ai-bot-teloxide -u nedobot-pvo -u nedonews-mcp \
+            --since "$deploy_started_at" -p err --no-pager -o cat)
+          if [ -n "$errors" ]; then
+            printf '%s\n' "$errors" >&2
+            exit 1
+          fi
           REMOTE
       - name: Confirm running binaries match artifact
         env:
@@ -173,5 +204,3 @@ jobs:
             echo "$unit actual:   $actual"
             test -n "$expected" && test "$expected" = "$actual"
           done
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
-            "journalctl -u tg-ai-bot-teloxide -u nedobot-pvo --since '-2 min' -p err --no-pager -o cat"
