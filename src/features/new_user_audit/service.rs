@@ -183,23 +183,24 @@ async fn materialize_stored_assessment(
         if let Some(signals) = components.first_message_signals.as_array_mut() {
             signals.push(campaign.score_signal());
         }
-        if matches!(
-            campaign.kind,
-            deterministic::CampaignKind::MoneyDmFunnel
-                | deterministic::CampaignKind::PaidShortTaskOffer
-                | deterministic::CampaignKind::PaidWorkOpportunity
-                | deterministic::CampaignKind::FinancialOffer
-                | deterministic::CampaignKind::LimitedProductTrial
-                | deterministic::CampaignKind::ContentShareFunnel
-                | deterministic::CampaignKind::AdultPersonalChannel
-        ) {
-            // Fast path uses a configured high-confidence feature combination;
-            // it should reach the enforcement threshold without another LLM call.
-            components.first_message_score = 100;
-        }
+        components.first_message_score = if campaign.auto_ban_eligible {
+            100
+        } else {
+            // Low-confidence campaign matches are persisted for review without
+            // claiming spam or reaching the automatic-ban threshold.
+            job.review_threshold.min(
+                config
+                    .community
+                    .moderation
+                    .enforce_ban_threshold
+                    .saturating_sub(1),
+            )
+        };
     }
-    let deterministic_spam_label =
-        deterministic_campaign.map(|campaign| crate::features::labels::SpamLabel {
+    let deterministic_spam_label = deterministic_campaign
+        .as_ref()
+        .filter(|campaign| campaign.auto_ban_eligible)
+        .map(|campaign| crate::features::labels::SpamLabel {
             subtype: campaign.subtype.to_string(),
             source: crate::features::labels::LabelSource::System,
             reason: campaign.reason.to_string(),
