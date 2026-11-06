@@ -25,8 +25,9 @@ const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
     "lols_spammer_identity",
     "tree_personal_channel_adult_funnel",
     "tree_personal_channel_invite_funnel",
-    "deterministic_campaign_fast_path",
 ];
+const DETERMINISTIC_AUTO_BAN_LABEL: &str = "deterministic_campaign_fast_path";
+const DETERMINISTIC_REVIEW_LABEL: &str = "deterministic_campaign_review_candidate";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnforcementDecision {
@@ -59,6 +60,14 @@ pub async fn maybe_enforce_audit(
     if !is_managed_chat(config, job.chat_id)
         || !managed_chat_allows(config, job.chat_id, |chat| chat.moderation)
     {
+        return Ok(());
+    }
+    if latest_label_is_not_spam(pool, job.chat_id, job.telegram_user_id).await? {
+        tracing::info!(
+            chat_id = job.chat_id,
+            user_id = job.telegram_user_id,
+            "auto moderation skipped because latest manual label is not_spam"
+        );
         return Ok(());
     }
     let policy = AutoPolicy {
@@ -126,6 +135,14 @@ pub async fn maybe_enforce_audit(
             );
             return Ok(());
         }
+        if latest_label_is_not_spam(pool, job.chat_id, job.telegram_user_id).await? {
+            tracing::info!(
+                chat_id = job.chat_id,
+                user_id = job.telegram_user_id,
+                "risk captcha skipped because latest manual label is not_spam"
+            );
+            return Ok(());
+        }
         let result = crate::features::risk_captcha::apply_risk_captcha(
             bot,
             pool,
@@ -188,9 +205,36 @@ pub async fn maybe_enforce_audit(
         AutoAction::None => Ok(()),
         AutoAction::DeleteMessages => delete_first_message(bot, pool, job).await,
         AutoAction::Ban => {
+            if latest_label_is_not_spam(pool, job.chat_id, job.telegram_user_id).await? {
+                tracing::info!(
+                    chat_id = job.chat_id,
+                    user_id = job.telegram_user_id,
+                    "auto ban skipped because latest manual label is not_spam"
+                );
+                return Ok(());
+            }
             ban_spammer(bot, pool, config, job, score, &policy, &auto_ban_evidence).await
         }
     }
+}
+
+fn is_not_spam_label(latest_label: Option<&str>) -> bool {
+    latest_label == Some("not_spam")
+}
+
+async fn latest_label_is_not_spam(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    let latest_label: Option<String> = sqlx::query_scalar(
+        "select label from spam_label_events where chat_id = $1 and telegram_user_id = $2 order by created_at desc, id desc limit 1",
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(is_not_spam_label(latest_label.as_deref()))
 }
 
 async fn has_recent_audited_activity(
@@ -230,7 +274,7 @@ pub async fn decide_enforcement_for_audit(
     proposed_action: AutoAction,
     review_delivery_enabled: bool,
 ) -> anyhow::Result<EnforcementDecision> {
-    let auto_ban_evidence = if proposed_action == AutoAction::Ban {
+    let signals = if proposed_action != AutoAction::None {
         let signals: Value = sqlx::query_scalar(
             "select risk_signal_breakdown from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
         )
@@ -239,15 +283,12 @@ pub async fn decide_enforcement_for_audit(
         .fetch_optional(pool)
         .await?
         .unwrap_or_default();
-        qualifying_auto_ban_evidence(&signals)
+        signals
     } else {
-        Vec::new()
+        Value::Array(Vec::new())
     };
-    let (action, safety_gate) = effective_action(
-        proposed_action,
-        review_delivery_enabled,
-        !auto_ban_evidence.is_empty(),
-    );
+    let (action, safety_gate, auto_ban_evidence) =
+        enforcement_for_signals(proposed_action, review_delivery_enabled, &signals);
     Ok(EnforcementDecision {
         action,
         safety_gate,
@@ -262,7 +303,9 @@ fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|signal| {
             let label = signal.get("label")?.as_str()?;
-            let qualifies = if label == "known_spam_campaign_match" {
+            let qualifies = if label == DETERMINISTIC_AUTO_BAN_LABEL {
+                signal.get("auto_ban_eligible").and_then(Value::as_bool) == Some(true)
+            } else if label == "known_spam_campaign_match" {
                 signal
                     .get("template_matches")
                     .and_then(Value::as_i64)
@@ -273,6 +316,31 @@ fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
             qualifies.then(|| label.to_owned())
         })
         .collect()
+}
+
+fn has_review_only_campaign_signal(signals: &Value) -> bool {
+    signals.as_array().into_iter().flatten().any(|signal| {
+        signal.get("label").and_then(Value::as_str) == Some(DETERMINISTIC_REVIEW_LABEL)
+    })
+}
+
+fn enforcement_for_signals(
+    proposed_action: AutoAction,
+    review_delivery_enabled: bool,
+    signals: &Value,
+) -> (AutoAction, &'static str, Vec<String>) {
+    let auto_ban_evidence = qualifying_auto_ban_evidence(signals);
+    let (action, safety_gate) =
+        if has_review_only_campaign_signal(signals) && auto_ban_evidence.is_empty() {
+            (AutoAction::None, "deterministic_campaign_review_only")
+        } else {
+            effective_action(
+                proposed_action,
+                review_delivery_enabled,
+                !auto_ban_evidence.is_empty(),
+            )
+        };
+    (action, safety_gate, auto_ban_evidence)
 }
 
 fn has_deterministic_campaign(input_json: &Value) -> bool {
@@ -316,6 +384,14 @@ pub(crate) async fn delete_first_message_for_user(
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<()> {
+    if latest_label_is_not_spam(pool, chat_id, user_id).await? {
+        tracing::info!(
+            chat_id,
+            user_id,
+            "automatic message deletion skipped because latest manual label is not_spam"
+        );
+        return Ok(());
+    }
     let row: Option<(i32, bool)> = sqlx::query_as(
         "select m.message_id, m.deleted_by_bot_at is not null as deleted from telegram_messages m join telegram_new_user_profile_audits a on a.chat_id = m.chat_id and a.first_message_id = m.message_id and a.telegram_user_id = m.user_id where a.chat_id = $1 and a.telegram_user_id = $2",
     )
@@ -370,6 +446,15 @@ async fn ban_spammer(
     .bind(MAX_DELETE_MESSAGES)
     .fetch_all(pool)
     .await?;
+    // Recheck after DB reads, immediately before the irreversible Telegram call.
+    if latest_label_is_not_spam(pool, job.chat_id, job.telegram_user_id).await? {
+        tracing::info!(
+            chat_id = job.chat_id,
+            user_id = job.telegram_user_id,
+            "auto ban skipped because latest manual label is not_spam"
+        );
+        return Ok(());
+    }
     if let Err(error) = bot
         .ban_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
         .await
@@ -434,13 +519,54 @@ mod tests {
     #[test]
     fn deterministic_campaign_is_confirmed_auto_ban_evidence() {
         let evidence = qualifying_auto_ban_evidence(&json!([
-            {"label": "deterministic_campaign_fast_path", "rule_version": "new-user-campaign-v3"}
+            {"label": "deterministic_campaign_fast_path", "auto_ban_eligible": true, "rule_version": "new-user-features-v2"}
         ]));
         assert_eq!(evidence, ["deterministic_campaign_fast_path"]);
         assert_eq!(
             effective_action(AutoAction::Ban, false, !evidence.is_empty()),
             (AutoAction::Ban, "confirmed_ban_evidence")
         );
+    }
+
+    #[test]
+    fn unverified_and_legacy_deterministic_campaigns_are_not_ban_evidence() {
+        for signal in [
+            json!({"label": "deterministic_campaign_fast_path", "auto_ban_eligible": false}),
+            json!({"label": "deterministic_campaign_fast_path"}),
+            json!({"label": "deterministic_campaign_review_candidate"}),
+        ] {
+            assert!(qualifying_auto_ban_evidence(&json!([signal])).is_empty());
+        }
+    }
+
+    #[test]
+    fn review_only_campaign_suppresses_automatic_deletion_and_ban() {
+        let signals = json!([{"label": "deterministic_campaign_review_candidate"}]);
+        for proposed in [AutoAction::DeleteMessages, AutoAction::Ban] {
+            let (action, gate, evidence) = enforcement_for_signals(proposed, true, &signals);
+            assert_eq!(action, AutoAction::None);
+            assert_eq!(gate, "deterministic_campaign_review_only");
+            assert!(evidence.is_empty());
+        }
+    }
+
+    #[test]
+    fn review_only_campaign_does_not_suppress_independent_ban_evidence() {
+        let signals = json!([
+            {"label": "deterministic_campaign_review_candidate"},
+            {"label": "local_spammer_identity"}
+        ]);
+        let (action, gate, evidence) = enforcement_for_signals(AutoAction::Ban, false, &signals);
+        assert_eq!(action, AutoAction::Ban);
+        assert_eq!(gate, "confirmed_ban_evidence");
+        assert_eq!(evidence, ["local_spammer_identity"]);
+    }
+
+    #[test]
+    fn latest_manual_not_spam_label_blocks_automatic_enforcement() {
+        assert!(is_not_spam_label(Some("not_spam")));
+        assert!(!is_not_spam_label(Some("spam")));
+        assert!(!is_not_spam_label(None));
     }
 
     #[test]

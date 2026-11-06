@@ -1,13 +1,13 @@
 use std::{collections::HashSet, sync::OnceLock};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use teloxide_antispam::{preprocess::prepare_text, text::normalize_cyrillic_homoglyphs};
 
-pub(crate) const RULE_VERSION: &str = "new-user-features-v1";
+pub(crate) const RULE_VERSION: &str = "new-user-features-v2";
 const FEATURE_CONFIG: &str = include_str!("spam_features.toml");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CampaignKind {
     MoneyDmFunnel,
@@ -32,6 +32,8 @@ struct FeatureDefinition {
 struct CampaignDefinition {
     rule: String,
     kind: CampaignKind,
+    #[serde(default)]
+    auto_ban_eligible: bool,
     subtype: String,
     reason: String,
     priority: i32,
@@ -68,6 +70,9 @@ fn config() -> &'static FeatureConfig {
 pub(crate) struct CampaignMatch {
     pub kind: CampaignKind,
     pub rule: String,
+    pub rule_version: String,
+    pub feature_config_version: String,
+    pub auto_ban_eligible: bool,
     pub subtype: String,
     pub reason: String,
     pub feature_score: i32,
@@ -80,6 +85,9 @@ impl CampaignMatch {
             return Some(Self {
                 kind: CampaignKind::AdultPersonalChannel,
                 rule: rule.to_owned(),
+                rule_version: RULE_VERSION.to_owned(),
+                feature_config_version: config().version.clone(),
+                auto_ban_eligible: false,
                 subtype: "adult_personal_channel_promo".to_owned(),
                 reason: "У свежего участника личный канал содержит ссылки на adult-промо."
                     .to_owned(),
@@ -95,7 +103,46 @@ impl CampaignMatch {
     }
 
     pub fn from_stored_evidence(rule: &str, evidence: Option<&Value>) -> Option<Self> {
-        let mut campaign = Self::from_rule(rule)?;
+        let mut campaign = evidence
+            .and_then(|evidence| {
+                Some(Self {
+                    kind: serde_json::from_value(evidence.get("kind")?.clone()).ok()?,
+                    rule: evidence
+                        .get("rule")
+                        .and_then(Value::as_str)
+                        .unwrap_or(rule)
+                        .to_owned(),
+                    rule_version: evidence
+                        .get("rule_version")
+                        .and_then(Value::as_str)
+                        .unwrap_or(RULE_VERSION)
+                        .to_owned(),
+                    feature_config_version: evidence
+                        .get("feature_config_version")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&config().version)
+                        .to_owned(),
+                    auto_ban_eligible: evidence
+                        .get("auto_ban_eligible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    subtype: evidence.get("subtype")?.as_str()?.to_owned(),
+                    reason: evidence.get("reason")?.as_str()?.to_owned(),
+                    feature_score: evidence
+                        .get("feature_score")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default() as i32,
+                    matched_features: evidence
+                        .get("matched_features")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                })
+            })
+            .or_else(|| Self::from_rule(rule))?;
         if let Some(evidence) = evidence {
             campaign.feature_score = evidence
                 .get("feature_score")
@@ -109,6 +156,12 @@ impl CampaignMatch {
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect();
+            // Signals from older builds did not contain a confidence tier;
+            // fail closed for auto-ban while retaining the persisted wording.
+            campaign.auto_ban_eligible = evidence
+                .get("auto_ban_eligible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         }
         Some(campaign)
     }
@@ -121,6 +174,9 @@ impl CampaignMatch {
         Self {
             kind: campaign.kind,
             rule: campaign.rule.clone(),
+            rule_version: RULE_VERSION.to_owned(),
+            feature_config_version: config().version.clone(),
+            auto_ban_eligible: campaign.auto_ban_eligible,
             subtype: campaign.subtype.clone(),
             reason: campaign.reason.clone(),
             feature_score,
@@ -129,6 +185,9 @@ impl CampaignMatch {
     }
 
     pub fn assessment(&self, has_first_message: bool) -> Value {
+        if !self.auto_ban_eligible {
+            return self.review_only_assessment(has_first_message);
+        }
         let first_message_assessment = if !has_first_message {
             Value::Null
         } else if self.kind == CampaignKind::MoneyDmFunnel {
@@ -244,19 +303,55 @@ impl CampaignMatch {
         })
     }
 
+    fn review_only_assessment(&self, has_first_message: bool) -> Value {
+        let first_message_assessment = has_first_message.then(|| {
+            json!({
+                "relation_to_chat": "loosely_related",
+                "direct_dm_offer": false,
+                "offtopic_promo": false,
+                "template_campaign": false,
+                "self_reference_grammar": "none_or_unclear",
+                "profile_name_grammar_relation": "not_applicable",
+                "risk_markers": [],
+                "evidence": [],
+                "summary": self.reason,
+                "confidence": 0.4
+            })
+        });
+        json!({
+            "avatar_observation": null,
+            "first_message_assessment": first_message_assessment,
+            "profile_assessment": {
+                "risk_patterns": [],
+                "evidence": [],
+                "contradictions": [],
+                "review_priority": "medium",
+                "confidence": 0.4,
+                "summary": self.reason
+            }
+        })
+    }
+
     pub fn score_signal(&self) -> Value {
+        let label = if self.auto_ban_eligible {
+            "deterministic_campaign_fast_path"
+        } else {
+            "deterministic_campaign_review_candidate"
+        };
         json!({
             "class": "deterministic_campaign",
-            "label": "deterministic_campaign_fast_path",
+            "label": label,
+            "auto_ban_eligible": self.auto_ban_eligible,
+            "kind": self.kind,
             "subtype": self.subtype,
             "reason": self.reason,
             "rule": self.rule,
-            "rule_version": RULE_VERSION,
-            "feature_config_version": config().version,
+            "rule_version": self.rule_version,
+            "feature_config_version": self.feature_config_version,
             "feature_score": self.feature_score,
             "matched_features": self.matched_features,
-            "decision": "auto_spam",
-            "warning_strength": "strong"
+            "decision": if self.auto_ban_eligible { "auto_spam" } else { "manual_review" },
+            "warning_strength": if self.auto_ban_eligible { "strong" } else { "supporting" }
         })
     }
 }
@@ -553,6 +648,12 @@ mod tests {
     fn embedded_feature_configuration_is_valid_and_features_are_shared() {
         let parsed: FeatureConfig = toml::from_str(FEATURE_CONFIG).unwrap();
         validate_config(&parsed).unwrap();
+        assert!(
+            parsed
+                .campaigns
+                .iter()
+                .all(|campaign| !campaign.auto_ban_eligible)
+        );
         assert!(parsed.features.len() >= 8);
         assert!(parsed.campaigns.len() >= 3);
     }
@@ -734,13 +835,64 @@ mod tests {
         let assessment = campaign.assessment(true);
         assert_eq!(
             assessment["first_message_assessment"]["direct_dm_offer"],
-            true
+            false
         );
         assert_eq!(
             campaign.score_signal()["feature_config_version"],
-            "new-user-features-v1"
+            "new-user-features-v2"
         );
+        assert_eq!(
+            campaign.score_signal()["label"],
+            "deterministic_campaign_review_candidate"
+        );
+        assert_eq!(campaign.score_signal()["auto_ban_eligible"], false);
         assert!(campaign.feature_score >= 65);
         assert!(campaign.matched_features.contains(&"economic".to_owned()));
+    }
+
+    #[test]
+    fn plausible_book_and_audio_offers_are_review_only_candidates() {
+        for message in [
+            "До жути понравилась книга «Время — деньги». Есть и в аудио, могу переслать, я сам и читал, и слушал.",
+            "Кому интересно, могу скинуть подкаст о репутации и навыках — он действительно полезный",
+        ] {
+            let campaign = classify_fresh(message).unwrap();
+            assert_eq!(campaign.kind, CampaignKind::ContentShareFunnel);
+            assert!(!campaign.auto_ban_eligible);
+            assert_eq!(
+                campaign.score_signal()["label"],
+                "deterministic_campaign_review_candidate"
+            );
+            let assessment = campaign.assessment(true);
+            assert_eq!(assessment["first_message_assessment"]["confidence"], 0.4);
+            assert_eq!(
+                assessment["first_message_assessment"]["direct_dm_offer"],
+                false
+            );
+            assert_eq!(
+                assessment["first_message_assessment"]["evidence"],
+                serde_json::json!([])
+            );
+        }
+    }
+
+    #[test]
+    fn stored_verdict_survives_rule_removal_and_configuration_changes() {
+        let original = classify_fresh("Нужны срочно деньги???Пиши-мне!!!").unwrap();
+        let evidence = original.score_signal();
+        let restored =
+            CampaignMatch::from_stored_evidence("removed_from_config", Some(&evidence)).unwrap();
+
+        assert_eq!(restored.kind, original.kind);
+        assert_eq!(restored.rule, original.rule);
+        assert_eq!(restored.subtype, original.subtype);
+        assert_eq!(restored.reason, original.reason);
+        assert_eq!(restored.rule_version, original.rule_version);
+        assert_eq!(
+            restored.feature_config_version,
+            original.feature_config_version
+        );
+        assert_eq!(restored.auto_ban_eligible, original.auto_ban_eligible);
+        assert_eq!(restored.matched_features, original.matched_features);
     }
 }

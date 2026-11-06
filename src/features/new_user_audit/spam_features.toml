@@ -1,7 +1,7 @@
 # Versioned lexical features used by the new-user deterministic classifier.
 # Keep lexical evidence and calibration data here; the Rust code only extracts
 # these features and evaluates the combinations below.
-version = "new-user-features-v1"
+version = "new-user-features-v2"
 max_messages = 10
 max_chat_age_seconds = 259200
 
@@ -133,6 +133,7 @@ markers = [
 [[campaigns]]
 rule = "fresh_content_share_funnel"
 kind = "content_share_funnel"
+auto_ban_eligible = false
 subtype = "offtopic_audio_bait"
 reason = "Свежий участник продвигает аудио или книгу и предлагает переслать материал в личном разговоре."
 priority = 50
@@ -143,6 +144,7 @@ require_any = [["private_contact", "conversation_cta"]]
 [[campaigns]]
 rule = "fresh_paid_work_recruitment"
 kind = "paid_work_opportunity"
+auto_ban_eligible = false
 subtype = "paid_work_offer"
 reason = "Свежий участник вербует людей на работу или задание и обещает денежную компенсацию."
 priority = 25
@@ -153,6 +155,7 @@ require_any = []
 [[campaigns]]
 rule = "fresh_direct_credit_offer"
 kind = "financial_offer"
+auto_ban_eligible = false
 subtype = "lending_offer_bait"
 reason = "Свежий участник рекламирует выдачу займа или денег в долг."
 priority = 45
@@ -163,6 +166,7 @@ require_any = []
 [[campaigns]]
 rule = "fresh_money_work_private_contact"
 kind = "money_dm_funnel"
+auto_ban_eligible = false
 subtype = "money_dm_bait"
 reason = "Свежий участник предлагает деньги, работу или материал и зовёт продолжить контакт отдельно от чата."
 priority = 40
@@ -173,6 +177,7 @@ require_any = [["economic", "large_amount"], ["private_contact", "conversation_c
 [[campaigns]]
 rule = "fresh_paid_short_task_with_concrete_payout"
 kind = "paid_short_task_offer"
+auto_ban_eligible = false
 subtype = "paid_short_task_bait"
 reason = "Свежий участник рекламирует короткое разовое задание с денежным вознаграждением после выполнения."
 priority = 20
@@ -183,6 +188,7 @@ require_any = [["concrete_payout", "large_amount"]]
 [[campaigns]]
 rule = "fresh_limited_product_trial_offer"
 kind = "limited_product_trial"
+auto_ban_eligible = false
 subtype = "product_trial_bait"
 reason = "Свежий участник продвигает пробный товар с искусственным ограничением числа мест."
 priority = 30
