@@ -7,6 +7,22 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+6 ноября 2026 в **19:21 UTC / 22:21 МСК** выпущен release
+[`deploy-2026-11-06-configurable-spam-features`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-06-configurable-spam-features)
+на merge commit `78e5a4f1d12a6e25614293d17976eff279586b5f` после PR
+[#94](https://github.com/Mar2ianen/NedoBot/pull/94). [Release workflow
+42277501394](https://github.com/Mar2ianen/NedoBot/actions/runs/42277501394)
+успешно установил artifact в основной и PVO инстансы и перезапустил public MCP.
+SHA-256 работающих bot binaries на `tg-ai-bot-teloxide` и `nedobot-pvo`
+совпадает: `f55d0a42b3c1d7621af0c40c7d8b62c58eb43fc442f06efe694ce91aa73df070`.
+Все три unit-а active; workflow подтвердил отсутствие новых рестартов, пустой
+error-level journal с момента выкладки и миграцию `20261105190000` в обеих БД.
+Выпуск выносит детерминированные spam-сигналы в общий конфигурируемый набор
+признаков и правил кампаний: просьбы о деньгах в личку, платные задания и найм,
+финансовые предложения, раздача контента, ограниченные предложения и adult
+каналы. При совпадении правила fast path срабатывает до LLM; существующие
+moderation policy gates сохранены.
+
 6 ноября 2026 в **15:24 UTC / 18:24 МСК** выпущен release
 [`deploy-2026-11-06-money-dm-campaigns`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-06-money-dm-campaigns)
 на merge commit `7d0e9c7cf234f69c700d223e975b0d2d1b4a108f` после PR
