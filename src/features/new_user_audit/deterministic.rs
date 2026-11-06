@@ -1,10 +1,10 @@
 use serde_json::{Value, json};
-use teloxide_antispam::preprocess::prepare_text;
+use teloxide_antispam::{preprocess::prepare_text, text::normalize_cyrillic_homoglyphs};
 
-pub(crate) const RULE_VERSION: &str = "new-user-campaign-v2";
+pub(crate) const RULE_VERSION: &str = "new-user-campaign-v3";
 
-const MAX_MESSAGES: i64 = 3;
-const MAX_CHAT_AGE_SECONDS: i64 = 24 * 60 * 60;
+const MAX_MESSAGES: i64 = 10;
+const MAX_CHAT_AGE_SECONDS: i64 = 3 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CampaignKind {
@@ -177,7 +177,8 @@ pub(crate) fn classify(
         });
     }
 
-    let normalized = prepare_text(first_message?).model_text();
+    let normalized = normalize_money_homoglyphs(first_message?);
+    let normalized = prepare_text(&normalized).model_text();
     let limited_product_trial = normalized.contains("на пробу")
         && normalized.contains("товар")
         && [
@@ -258,6 +259,10 @@ pub(crate) fn classify(
         "заработ",
         "ваканси",
         "работ",
+        "нужны срочно",
+        "нужны деньги",
+        "нуждаешься",
+        "нуждаетесь",
     ]
     .iter()
     .any(|marker| normalized.contains(marker));
@@ -287,6 +292,33 @@ pub(crate) fn classify(
         subtype: "money_dm_bait",
         reason: "Свежий участник предлагает деньги или работу и сразу переводит контакт в личные сообщения.",
     })
+}
+
+/// Дополняет общий homoglyph-map латинской `b`, которой в составе русских
+/// слов часто подменяют мягкий знак: `ДЕНbГАХ` → `ДЕНЬГАХ`.
+fn normalize_money_homoglyphs(text: &str) -> String {
+    let mapped = normalize_cyrillic_homoglyphs(text);
+    let chars: Vec<char> = mapped.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            if matches!(ch, 'b' | 'B')
+                && index > 0
+                && index + 1 < chars.len()
+                && is_cyrillic(chars[index - 1])
+                && is_cyrillic(chars[index + 1])
+            {
+                if *ch == 'B' { 'Ь' } else { 'ь' }
+            } else {
+                *ch
+            }
+        })
+        .collect()
+}
+
+fn is_cyrillic(ch: char) -> bool {
+    matches!(ch, '\u{0400}'..='\u{04ff}')
 }
 
 fn has_concrete_ruble_amount(text: &str) -> bool {
@@ -354,6 +386,9 @@ mod tests {
     #[test]
     fn catches_money_dm_templates_and_mixed_script_evasion() {
         for message in [
+            "Нужны срочно деньги???Пиши-мне!!!",
+            "Нужны срочно деньги??? Пиши-мне!!!",
+            "Нуждаешься в ДEHbГAX ? Маякни в личные, по быстрому решим этот момент!",
             "Думаешь где взять деньжат? Маякни в личные, по быстрому решим этот момент!",
             "Думаешь где взять ДEHEГ? Маякни в личные, по быстрому решим этот вопрос!",
             "👀 Есть желающие получить 500 ₽? Черканите мне в личку 💰",
@@ -380,6 +415,32 @@ mod tests {
                 "missed: {message}"
             );
         }
+    }
+
+    #[test]
+    fn money_dm_campaign_covers_slightly_late_and_repeated_first_messages() {
+        for (message, message_count, chat_age_seconds) in [
+            ("Нужны срочно деньги???Пиши-мне!!!", 3, 26 * 60 * 60),
+            (
+                "Нуждаешься в ДEHbГAX ? Маякни в личные, по быстрому решим этот момент!",
+                4,
+                10 * 60 * 60,
+            ),
+        ] {
+            assert_eq!(
+                classify(Some(message), message_count, Some(chat_age_seconds), false)
+                    .map(|campaign| campaign.kind),
+                Some(CampaignKind::MoneyDmFunnel),
+                "missed: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn money_dm_campaign_keeps_activity_and_age_bounds() {
+        let message = "Нужны срочно деньги???Пиши-мне!!!";
+        assert!(classify(Some(message), 11, Some(60), false).is_none());
+        assert!(classify(Some(message), 2, Some(3 * 24 * 60 * 60 + 1), false).is_none());
     }
 
     #[test]
@@ -445,8 +506,8 @@ mod tests {
     #[test]
     fn requires_fresh_low_activity_context() {
         let message = "Думаешь где взять деньжат? Маякни в личные, по быстрому решим вопрос!";
-        assert!(classify(Some(message), 4, Some(60), false).is_none());
-        assert!(classify(Some(message), 1, Some(90_000), false).is_none());
+        assert!(classify(Some(message), 11, Some(60), false).is_none());
+        assert!(classify(Some(message), 1, Some(3 * 24 * 60 * 60 + 1), false).is_none());
         assert!(classify(Some(message), 1, None, false).is_none());
     }
 

@@ -179,10 +179,22 @@ async fn materialize_stored_assessment(
         job.review_threshold,
     );
     let deterministic_campaign = deterministic_campaign_for_job(pool, config, job).await?;
-    if let Some(campaign) = deterministic_campaign.as_ref()
-        && let Some(signals) = components.first_message_signals.as_array_mut()
-    {
-        signals.push(campaign.score_signal());
+    if let Some(campaign) = deterministic_campaign.as_ref() {
+        if let Some(signals) = components.first_message_signals.as_array_mut() {
+            signals.push(campaign.score_signal());
+        }
+        if matches!(
+            campaign.kind,
+            deterministic::CampaignKind::MoneyDmFunnel
+                | deterministic::CampaignKind::PaidShortTaskOffer
+                | deterministic::CampaignKind::LimitedProductTrial
+                | deterministic::CampaignKind::AdultPersonalChannel
+        ) {
+            // Узкий deterministic fast path — это подтверждённый шаблон, а не
+            // накопление косвенных признаков профиля. Он должен достигать
+            // enforcement-порога без повторного вызова LLM.
+            components.first_message_score = 100;
+        }
     }
     let deterministic_spam_label =
         deterministic_campaign.map(|campaign| crate::features::labels::SpamLabel {
