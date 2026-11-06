@@ -7,6 +7,24 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+6 ноября 2026 в **15:24 UTC / 18:24 МСК** выпущен release
+[`deploy-2026-11-06-money-dm-campaigns`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-06-money-dm-campaigns)
+на merge commit `7d0e9c7cf234f69c700d223e975b0d2d1b4a108f` после PR
+[#92](https://github.com/Mar2ianen/NedoBot/pull/92). [Release workflow
+42241754588](https://github.com/Mar2ianen/NedoBot/actions/runs/42241754588)
+успешно собрал и установил binary в оба community-инстанса и public MCP.
+SHA-256 обоих работающих bot executable —
+`3c27e0665c1692f4d10630ac9df96a4486bb82a3fe1d9fa9692f89e5d8de9527`.
+После релиза в PVO включён `enforce_dry_run=false`; перед правкой профиля
+сохранён backup `pvo-llm_profiles.toml.bak-20261106-money-dm-campaign`.
+Финальная проверка после рестарта PVO: три unit-а active, `NRestarts=0`, хеши
+запущенных ботов совпадают с artifact, error-level journal пуст. Миграция
+`20261105190000` подтверждена в обеих production БД. На этот выпуск также
+размечены три подтверждённых вручную заблокированных денежно-DM спамера.
+Детерминированный фильтр теперь ловит прямую просьбу о деньгах с CTA в личку,
+учитывает homoglyph-варианты, действует в пределах 10 сообщений и трёх дней и
+может банить совпавшую кампанию без LLM-вызова.
+
 5 ноября 2026 в **19:41 UTC / 22:41 МСК** выпущен release
 [`deploy-2026-11-05-audit-review-fencing`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-05-audit-review-fencing)
 на merge commit `8695830e8d78d4ac68c465e6e1883ef347934570` после PR
