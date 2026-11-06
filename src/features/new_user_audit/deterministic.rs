@@ -1,60 +1,134 @@
+use std::{collections::HashSet, sync::OnceLock};
+
+use serde::Deserialize;
 use serde_json::{Value, json};
 use teloxide_antispam::{preprocess::prepare_text, text::normalize_cyrillic_homoglyphs};
 
-pub(crate) const RULE_VERSION: &str = "new-user-campaign-v3";
+pub(crate) const RULE_VERSION: &str = "new-user-features-v1";
+const FEATURE_CONFIG: &str = include_str!("spam_features.toml");
 
-const MAX_MESSAGES: i64 = 10;
-const MAX_CHAT_AGE_SECONDS: i64 = 3 * 24 * 60 * 60;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CampaignKind {
     MoneyDmFunnel,
     PaidShortTaskOffer,
+    PaidWorkOpportunity,
+    FinancialOffer,
     LimitedProductTrial,
+    ContentShareFunnel,
     AdultPersonalChannel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize)]
+struct FeatureDefinition {
+    name: String,
+    weight: i32,
+    markers: Vec<String>,
+    #[serde(default)]
+    matcher: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CampaignDefinition {
+    rule: String,
+    kind: CampaignKind,
+    subtype: String,
+    reason: String,
+    priority: i32,
+    minimum_score: i32,
+    require_all: Vec<String>,
+    require_any: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeatureConfig {
+    version: String,
+    max_messages: i64,
+    max_chat_age_seconds: i64,
+    features: Vec<FeatureDefinition>,
+    campaigns: Vec<CampaignDefinition>,
+}
+
+static CONFIG: OnceLock<FeatureConfig> = OnceLock::new();
+
+fn config() -> &'static FeatureConfig {
+    CONFIG.get_or_init(|| {
+        let mut config: FeatureConfig = toml::from_str(FEATURE_CONFIG)
+            .expect("embedded new-user spam feature configuration must be valid");
+        validate_config(&config)
+            .expect("embedded new-user spam feature configuration must be coherent");
+        config
+            .campaigns
+            .sort_by_key(|campaign| std::cmp::Reverse(campaign.priority));
+        config
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CampaignMatch {
     pub kind: CampaignKind,
-    pub rule: &'static str,
-    pub subtype: &'static str,
-    pub reason: &'static str,
+    pub rule: String,
+    pub subtype: String,
+    pub reason: String,
+    pub feature_score: i32,
+    pub matched_features: Vec<String>,
 }
 
 impl CampaignMatch {
     pub fn from_rule(rule: &str) -> Option<Self> {
-        [
-            Self {
-                kind: CampaignKind::MoneyDmFunnel,
-                rule: "fresh_money_work_private_contact",
-                subtype: "money_dm_bait",
-                reason: "Свежий участник предлагает деньги или работу и сразу переводит контакт в личные сообщения.",
-            },
-            Self {
-                kind: CampaignKind::PaidShortTaskOffer,
-                rule: "fresh_paid_short_task_with_concrete_payout",
-                subtype: "paid_short_task_bait",
-                reason: "Свежий участник рекламирует короткое разовое задание с конкретной оплатой после выполнения.",
-            },
-            Self {
-                kind: CampaignKind::LimitedProductTrial,
-                rule: "fresh_limited_product_trial_offer",
-                subtype: "product_trial_bait",
-                reason: "Свежий участник рекламирует товар на пробу с искусственным ограничением числа мест.",
-            },
-            Self {
+        if rule == "fresh_adult_personal_channel" {
+            return Some(Self {
                 kind: CampaignKind::AdultPersonalChannel,
-                rule: "fresh_adult_personal_channel",
-                subtype: "adult_personal_channel_promo",
-                reason: "У свежего участника личный канал содержит ссылки на adult-промо.",
-            },
-        ]
-        .into_iter()
-        .find(|campaign| campaign.rule == rule)
+                rule: rule.to_owned(),
+                subtype: "adult_personal_channel_promo".to_owned(),
+                reason: "У свежего участника личный канал содержит ссылки на adult-промо."
+                    .to_owned(),
+                feature_score: 100,
+                matched_features: vec!["personal_channel_adult_links".to_owned()],
+            });
+        }
+        config()
+            .campaigns
+            .iter()
+            .find(|campaign| campaign.rule == rule)
+            .map(|campaign| Self::from_definition(campaign, 0, Vec::new()))
     }
 
-    pub fn assessment(self, has_first_message: bool) -> Value {
+    pub fn from_stored_evidence(rule: &str, evidence: Option<&Value>) -> Option<Self> {
+        let mut campaign = Self::from_rule(rule)?;
+        if let Some(evidence) = evidence {
+            campaign.feature_score = evidence
+                .get("feature_score")
+                .and_then(Value::as_i64)
+                .unwrap_or_default() as i32;
+            campaign.matched_features = evidence
+                .get("matched_features")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+        }
+        Some(campaign)
+    }
+
+    fn from_definition(
+        campaign: &CampaignDefinition,
+        feature_score: i32,
+        matched_features: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: campaign.kind,
+            rule: campaign.rule.clone(),
+            subtype: campaign.subtype.clone(),
+            reason: campaign.reason.clone(),
+            feature_score,
+            matched_features,
+        }
+    }
+
+    pub fn assessment(&self, has_first_message: bool) -> Value {
         let first_message_assessment = if !has_first_message {
             Value::Null
         } else if self.kind == CampaignKind::MoneyDmFunnel {
@@ -67,13 +141,16 @@ impl CampaignMatch {
                 "profile_name_grammar_relation": "not_applicable",
                 "risk_markers": ["direct_messages", "self_help_or_finance_promo"],
                 "evidence": [
-                    {"marker": "direct_messages", "quote": "Сочетание явного призыва перейти в личные сообщения с предложением денег или работы."},
-                    {"marker": "self_help_or_finance_promo", "quote": "Денежное или рабочее предложение новому участнику."}
+                    {"marker": "direct_messages", "quote": "Комбинация денежного или рабочего предложения с призывом продолжить контакт отдельно от чата."},
+                    {"marker": "self_help_or_finance_promo", "quote": self.reason}
                 ],
                 "summary": self.reason,
                 "confidence": 1.0
             })
-        } else if self.kind == CampaignKind::PaidShortTaskOffer {
+        } else if matches!(
+            self.kind,
+            CampaignKind::PaidShortTaskOffer | CampaignKind::PaidWorkOpportunity
+        ) {
             json!({
                 "relation_to_chat": "off_topic",
                 "direct_dm_offer": false,
@@ -82,10 +159,33 @@ impl CampaignMatch {
                 "self_reference_grammar": "none_or_unclear",
                 "profile_name_grammar_relation": "not_applicable",
                 "risk_markers": ["paid_easy_task_offer"],
-                "evidence": [{
-                    "marker": "paid_easy_task_offer",
-                    "quote": "Короткая задача рекламируется как разовое дельце с конкретной оплатой после выполнения."
-                }],
+                "evidence": [{"marker": "paid_easy_task_offer", "quote": self.reason}],
+                "summary": self.reason,
+                "confidence": 1.0
+            })
+        } else if self.kind == CampaignKind::FinancialOffer {
+            json!({
+                "relation_to_chat": "off_topic",
+                "direct_dm_offer": false,
+                "offtopic_promo": true,
+                "template_campaign": true,
+                "self_reference_grammar": "none_or_unclear",
+                "profile_name_grammar_relation": "not_applicable",
+                "risk_markers": ["self_help_or_finance_promo"],
+                "evidence": [{"marker": "self_help_or_finance_promo", "quote": self.reason}],
+                "summary": self.reason,
+                "confidence": 1.0
+            })
+        } else if self.kind == CampaignKind::ContentShareFunnel {
+            json!({
+                "relation_to_chat": "off_topic",
+                "direct_dm_offer": true,
+                "offtopic_promo": true,
+                "template_campaign": true,
+                "self_reference_grammar": "none_or_unclear",
+                "profile_name_grammar_relation": "not_applicable",
+                "risk_markers": ["direct_messages", "send_or_share_offer"],
+                "evidence": [{"marker": "send_or_share_offer", "quote": self.reason}],
                 "summary": self.reason,
                 "confidence": 1.0
             })
@@ -98,9 +198,7 @@ impl CampaignMatch {
                 "self_reference_grammar": "none_or_unclear",
                 "profile_name_grammar_relation": "not_applicable",
                 "risk_markers": ["send_or_share_offer"],
-                "evidence": [
-                    {"marker": "send_or_share_offer", "quote": "Предложение товара на пробу ограничено числом мест."}
-                ],
+                "evidence": [{"marker": "send_or_share_offer", "quote": self.reason}],
                 "summary": self.reason,
                 "confidence": 1.0
             })
@@ -114,15 +212,18 @@ impl CampaignMatch {
                 "profile_name_grammar_relation": "not_applicable",
                 "risk_markers": [],
                 "evidence": [],
-                "summary": "Текст сообщения не использовался: детерминированное правило обнаружило рекламный adult-канал.",
+                "summary": self.reason,
                 "confidence": 1.0
             })
         };
 
         let evidence_source = match self.kind {
-            CampaignKind::MoneyDmFunnel => "first_message",
-            CampaignKind::PaidShortTaskOffer => "first_message",
-            CampaignKind::LimitedProductTrial => "first_message",
+            CampaignKind::MoneyDmFunnel
+            | CampaignKind::PaidShortTaskOffer
+            | CampaignKind::LimitedProductTrial => "first_message",
+            CampaignKind::PaidWorkOpportunity
+            | CampaignKind::FinancialOffer
+            | CampaignKind::ContentShareFunnel => "first_message",
             CampaignKind::AdultPersonalChannel => "personal_channel",
         };
         json!({
@@ -143,7 +244,7 @@ impl CampaignMatch {
         })
     }
 
-    pub fn score_signal(self) -> Value {
+    pub fn score_signal(&self) -> Value {
         json!({
             "class": "deterministic_campaign",
             "label": "deterministic_campaign_fast_path",
@@ -151,9 +252,36 @@ impl CampaignMatch {
             "reason": self.reason,
             "rule": self.rule,
             "rule_version": RULE_VERSION,
+            "feature_config_version": config().version,
+            "feature_score": self.feature_score,
+            "matched_features": self.matched_features,
             "decision": "auto_spam",
             "warning_strength": "strong"
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedFeatures {
+    matched: Vec<String>,
+    score: i32,
+}
+
+impl ExtractedFeatures {
+    fn contains(&self, feature: &str) -> bool {
+        self.matched.iter().any(|matched| matched == feature)
+    }
+
+    fn satisfies(&self, campaign: &CampaignDefinition) -> bool {
+        campaign
+            .require_all
+            .iter()
+            .all(|feature| self.contains(feature))
+            && campaign
+                .require_any
+                .iter()
+                .all(|group| group.iter().any(|feature| self.contains(feature)))
+            && self.score >= campaign.minimum_score
     }
 }
 
@@ -163,142 +291,90 @@ pub(crate) fn classify(
     chat_age_seconds: Option<i64>,
     personal_channel_has_adult_links: bool,
 ) -> Option<CampaignMatch> {
+    let config = config();
     let chat_age_seconds = chat_age_seconds?;
-    if message_count > MAX_MESSAGES || !(0..=MAX_CHAT_AGE_SECONDS).contains(&chat_age_seconds) {
+    if message_count > config.max_messages
+        || !(0..=config.max_chat_age_seconds).contains(&chat_age_seconds)
+    {
         return None;
     }
 
     if personal_channel_has_adult_links {
-        return Some(CampaignMatch {
-            kind: CampaignKind::AdultPersonalChannel,
-            rule: "fresh_adult_personal_channel",
-            subtype: "adult_personal_channel_promo",
-            reason: "У свежего участника личный канал содержит ссылки на adult-промо.",
-        });
+        return CampaignMatch::from_rule("fresh_adult_personal_channel");
     }
 
-    let normalized = normalize_money_homoglyphs(first_message?);
+    let normalized = first_message?;
+    let normalized = normalize_mixed_script_homoglyphs(normalized);
     let normalized = prepare_text(&normalized).model_text();
-    let limited_product_trial = normalized.contains("на пробу")
-        && normalized.contains("товар")
-        && [
-            "мест всего",
-            "мест осталось",
-            "осталось мест",
-            "ограниченное количество",
-        ]
+    let features = extract_features(&normalized, config);
+    config
+        .campaigns
         .iter()
-        .any(|marker| normalized.contains(marker))
-        && ["дам", "предлагаю", "отдам"]
+        .find(|campaign| features.satisfies(campaign))
+        .map(|campaign| CampaignMatch::from_definition(campaign, features.score, features.matched))
+}
+
+fn extract_features(text: &str, config: &FeatureConfig) -> ExtractedFeatures {
+    let matching_features: Vec<_> = config
+        .features
+        .iter()
+        .filter(|feature| {
+            feature
+                .markers
+                .iter()
+                .any(|marker| contains_feature_marker(text, marker))
+                || feature
+                    .matcher
+                    .as_deref()
+                    .is_some_and(|matcher| matches_feature_matcher(text, matcher))
+        })
+        .collect();
+    ExtractedFeatures {
+        matched: matching_features
             .iter()
-            .any(|marker| normalized.contains(marker));
-    if limited_product_trial {
-        return Some(CampaignMatch {
-            kind: CampaignKind::LimitedProductTrial,
-            rule: "fresh_limited_product_trial_offer",
-            subtype: "product_trial_bait",
-            reason: "Свежий участник рекламирует товар на пробу с искусственным ограничением числа мест.",
-        });
+            .map(|feature| feature.name.clone())
+            .collect(),
+        score: matching_features.iter().map(|feature| feature.weight).sum(),
     }
+}
 
-    let paid_short_task_offer = normalized.contains("дельце")
-        && ["на пару часов", "на несколько часов", "на пару час"]
-            .iter()
-            .any(|marker| normalized.contains(marker))
-        && ["по заверш", "после заверш", "после выполн", "за выполн"]
-            .iter()
-            .any(|marker| normalized.contains(marker))
-        && has_concrete_ruble_amount(&normalized);
-    if paid_short_task_offer {
-        return Some(CampaignMatch {
-            kind: CampaignKind::PaidShortTaskOffer,
-            rule: "fresh_paid_short_task_with_concrete_payout",
-            subtype: "paid_short_task_bait",
-            reason: "Свежий участник рекламирует короткое разовое задание с конкретной оплатой после выполнения.",
-        });
-    }
-
-    let money_or_work_offer = [
-        "деньг",
-        "деньжат",
-        "денег",
-        "заработ",
-        "доход",
-        "выплат",
-        "руб",
-        "₽",
-        "$",
-        "доллар",
-        "евро",
-        "зарплат",
-        "зп ",
-        "аванс",
-        "оплат",
-        "на руки",
-        "за пару часов",
-        "за смен",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let explicit_offer = [
-        "получ",
-        "с меня",
-        "дам ",
-        "плачу",
-        "оплат",
-        "аванс",
-        "без опыта",
-        "требуются работник",
-        "ищем помощник",
-        "помощь в",
-        "маякни",
-        "решим этот вопрос",
-        "решим этот момент",
-        "кидай +",
-        "кидайте +",
-        "заработ",
-        "ваканси",
-        "работ",
-        "нужны срочно",
-        "нужны деньги",
-        "нуждаешься",
-        "нуждаетесь",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let private_contact_cta = [
-        "в личк",
-        "личные сообщения",
-        "в директ",
-        "директ",
-        "в лс",
-        "маякни",
-        "маякните",
-        "черканите",
-        "пиши",
-        "пишите",
-        "напиши",
-        "напишите",
-        "кидай +",
-        "кидайте +",
-        "@",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-
-    (money_or_work_offer && explicit_offer && private_contact_cta).then_some(CampaignMatch {
-        kind: CampaignKind::MoneyDmFunnel,
-        rule: "fresh_money_work_private_contact",
-        subtype: "money_dm_bait",
-        reason: "Свежий участник предлагает деньги или работу и сразу переводит контакт в личные сообщения.",
+fn contains_feature_marker(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(index, _)| {
+        let prefix = &text[..index];
+        let starts_at_word = index == 0
+            || prefix
+                .chars()
+                .next_back()
+                .is_none_or(|previous| !previous.is_alphanumeric());
+        let immediately_negated = prefix.split_whitespace().next_back() == Some("не");
+        starts_at_word && !immediately_negated
     })
 }
 
-/// Дополняет общий homoglyph-map латинской `b`, которой в составе русских
-/// слов часто подменяют мягкий знак: `ДЕНbГАХ` → `ДЕНЬГАХ`.
-fn normalize_money_homoglyphs(text: &str) -> String {
-    let mapped = normalize_cyrillic_homoglyphs(text);
-    let chars: Vec<char> = mapped.chars().collect();
+fn matches_feature_matcher(text: &str, matcher: &str) -> bool {
+    match matcher {
+        "concrete_ruble_amount" => has_concrete_ruble_amount(text),
+        "large_number" => numeric_amounts(text)
+            .into_iter()
+            .any(|(amount, _)| amount >= 100),
+        _ => false,
+    }
+}
+
+fn normalize_mixed_script_homoglyphs(text: &str) -> String {
+    let visually_mapped = normalize_cyrillic_homoglyphs(text);
+    visually_mapped
+        .split_inclusive(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .map(normalize_mixed_token)
+        .collect()
+}
+
+fn normalize_mixed_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    let has_cyrillic = chars.iter().any(|ch| is_cyrillic(*ch));
+    let latin_count = chars.iter().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let cyrillic_count = chars.iter().filter(|ch| is_cyrillic(**ch)).count();
+    let translate_mixed_word = has_cyrillic && latin_count <= cyrillic_count + 3;
     chars
         .iter()
         .enumerate()
@@ -309,9 +385,39 @@ fn normalize_money_homoglyphs(text: &str) -> String {
                 && is_cyrillic(chars[index - 1])
                 && is_cyrillic(chars[index + 1])
             {
-                if *ch == 'B' { 'Ь' } else { 'ь' }
-            } else {
-                *ch
+                return if *ch == 'B' { 'Ь' } else { 'ь' };
+            }
+            if !translate_mixed_word || !ch.is_ascii_alphabetic() {
+                return *ch;
+            }
+            match ch.to_ascii_lowercase() {
+                'a' => 'а',
+                'b' => 'б',
+                'c' => 'с',
+                'd' => 'д',
+                'e' => 'е',
+                'f' => 'ф',
+                'g' => 'г',
+                'h' => 'х',
+                'i' => 'и',
+                'j' => 'й',
+                'k' => 'к',
+                'l' => 'л',
+                'm' => 'м',
+                'n' => 'н',
+                'o' => 'о',
+                'p' => 'п',
+                'q' => 'к',
+                'r' => 'р',
+                's' => 'с',
+                't' => 'т',
+                'u' => 'у',
+                'v' => 'в',
+                'w' => 'в',
+                'x' => 'х',
+                'y' => 'ы',
+                'z' => 'з',
+                _ => *ch,
             }
         })
         .collect()
@@ -323,6 +429,14 @@ fn is_cyrillic(ch: char) -> bool {
 
 fn has_concrete_ruble_amount(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
+    numeric_amounts(text)
+        .into_iter()
+        .any(|(amount, end)| amount >= 100 && is_ruble_suffix(&chars, end))
+}
+
+fn numeric_amounts(text: &str) -> Vec<(u64, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut amounts = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         if !chars[index].is_ascii_digit() {
@@ -331,31 +445,39 @@ fn has_concrete_ruble_amount(text: &str) -> bool {
         }
 
         let mut end = index;
+        let mut digits = String::new();
         while end < chars.len() {
-            if chars[end].is_ascii_digit() {
+            let ch = chars[end];
+            if ch.is_ascii_digit() {
+                digits.push(ch);
                 end += 1;
                 continue;
             }
-            if matches!(chars[end], '.' | ',' | ' ')
-                && chars.get(end + 1).is_some_and(char::is_ascii_digit)
+            if is_ocr_zero(ch) {
+                digits.push('0');
+                end += 1;
+                continue;
+            }
+            if matches!(ch, '.' | ',' | ' ')
+                && chars
+                    .get(end + 1)
+                    .is_some_and(|next| next.is_ascii_digit() || is_ocr_zero(*next))
             {
                 end += 1;
                 continue;
             }
             break;
         }
-
-        let digits: String = chars[index..end]
-            .iter()
-            .filter(|ch| ch.is_ascii_digit())
-            .collect();
-        let has_concrete_amount = digits.parse::<u64>().is_ok_and(|amount| amount >= 100);
-        if has_concrete_amount && is_ruble_suffix(&chars, end) {
-            return true;
+        if let Ok(amount) = digits.parse::<u64>() {
+            amounts.push((amount, end));
         }
         index = end.max(index + 1);
     }
-    false
+    amounts
+}
+
+fn is_ocr_zero(ch: char) -> bool {
+    matches!(ch, 'o' | 'O' | 'о' | 'О')
 }
 
 fn is_ruble_suffix(chars: &[char], mut index: usize) -> bool {
@@ -377,59 +499,81 @@ fn is_ruble_suffix(chars: &[char], mut index: usize) -> bool {
             .is_none_or(|next| !next.is_alphanumeric())
 }
 
+fn validate_config(config: &FeatureConfig) -> Result<(), String> {
+    if config.version != RULE_VERSION
+        || config.max_messages <= 0
+        || config.max_chat_age_seconds <= 0
+    {
+        return Err("version and freshness limits must be set".to_owned());
+    }
+    let mut feature_names = HashSet::new();
+    for feature in &config.features {
+        if feature.name.trim().is_empty()
+            || feature.weight <= 0
+            || (feature.markers.is_empty() && feature.matcher.is_none())
+            || feature
+                .matcher
+                .as_deref()
+                .is_some_and(|matcher| !matches!(matcher, "concrete_ruble_amount" | "large_number"))
+            || !feature_names.insert(feature.name.as_str())
+        {
+            return Err(format!("invalid or duplicate feature: {}", feature.name));
+        }
+    }
+    let mut rules = HashSet::new();
+    for campaign in &config.campaigns {
+        let mut references = campaign
+            .require_all
+            .iter()
+            .chain(campaign.require_any.iter().flatten());
+        if campaign.rule.trim().is_empty()
+            || campaign.subtype.trim().is_empty()
+            || campaign.reason.trim().is_empty()
+            || campaign.minimum_score <= 0
+            || !rules.insert(campaign.rule.as_str())
+            || references.any(|feature| !feature_names.contains(feature.as_str()))
+        {
+            return Err(format!("invalid campaign definition: {}", campaign.rule));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FRESH_LOW_ACTIVITY: (i64, Option<i64>) = (1, Some(60));
+    const FRESH: (i64, Option<i64>) = (1, Some(60));
 
-    #[test]
-    fn catches_money_dm_templates_and_mixed_script_evasion() {
-        for message in [
-            "Нужны срочно деньги???Пиши-мне!!!",
-            "Нужны срочно деньги??? Пиши-мне!!!",
-            "Нуждаешься в ДEHbГAX ? Маякни в личные, по быстрому решим этот момент!",
-            "Думаешь где взять деньжат? Маякни в личные, по быстрому решим этот момент!",
-            "Думаешь где взять ДEHEГ? Маякни в личные, по быстрому решим этот вопрос!",
-            "👀 Есть желающие получить 500 ₽? Черканите мне в личку 💰",
-            "💵 Кидай + в директ — с меня 400 ₽",
-            "Помощь в ресторане. Зп от 55$ за смену. По всем вопросам к нему - @GoodWorkings",
-            "Требуются работники. Оплата от 5 000 рублей. Пишите в личные сообщения.",
-            "Есть возможность! От 9.000 за пару часов! Без опыта + авансы. Пиши -- @DMX_2213",
-            "Есть несколько свободных мест на вечер. Ничего сложного, можно без опыта и с 16 лет. За выполнение предусмотрено от 8500 на руки. Если интересно, напиши в личные сообщения.",
-            "Дам0.5 на пробу любого товара мест всего 7",
-        ] {
-            assert_eq!(
-                classify(
-                    Some(message),
-                    FRESH_LOW_ACTIVITY.0,
-                    FRESH_LOW_ACTIVITY.1,
-                    false
-                )
-                .map(|campaign| campaign.kind),
-                Some(if message.contains("на пробу") {
-                    CampaignKind::LimitedProductTrial
-                } else {
-                    CampaignKind::MoneyDmFunnel
-                }),
-                "missed: {message}"
-            );
-        }
+    fn classify_fresh(message: &str) -> Option<CampaignMatch> {
+        classify(Some(message), FRESH.0, FRESH.1, false)
     }
 
     #[test]
-    fn money_dm_campaign_covers_slightly_late_and_repeated_first_messages() {
-        for (message, message_count, chat_age_seconds) in [
-            ("Нужны срочно деньги???Пиши-мне!!!", 3, 26 * 60 * 60),
-            (
-                "Нуждаешься в ДEHbГAX ? Маякни в личные, по быстрому решим этот момент!",
-                4,
-                10 * 60 * 60,
-            ),
+    fn embedded_feature_configuration_is_valid_and_features_are_shared() {
+        let parsed: FeatureConfig = toml::from_str(FEATURE_CONFIG).unwrap();
+        validate_config(&parsed).unwrap();
+        assert!(parsed.features.len() >= 8);
+        assert!(parsed.campaigns.len() >= 3);
+    }
+
+    #[test]
+    fn catches_manual_money_dm_examples_through_feature_combinations() {
+        for message in [
+            "Нужны срочно деньги???Пиши-мне!!!",
+            "Нуждаешься в ДEHbГAX ? Маякни в личные, по быстрому решим этот момент!",
+            "Думаешь где взять деньжат? Маякни в личные, по быстрому решим этот момент!",
+            "В поиске ДEHEГ ? Есть вариации как для девушек так и для мужчин, в личные!",
+            "Даю деньги за улыбку пиши",
+            "Дополнительная прибыль в свободное время. Детали обсудим",
+            "Вакансии с хорошим доходом! 14+ Зп от 75$ за смену. Все детали у @contact",
+            "Есть деньги за услугу — пишите в личные сообщения",
+            "ДОХОД Д0 2ОК В ДЕНЬ! ПИШИ СЮДА https://t.me/m/example",
+            "Помогу с деньгами за услугу — пишите",
+            "Ищем людей на вечер, без опыта, от 8500 на руки. За подробностями пиши в личку",
         ] {
             assert_eq!(
-                classify(Some(message), message_count, Some(chat_age_seconds), false)
-                    .map(|campaign| campaign.kind),
+                classify_fresh(message).map(|campaign| campaign.kind),
                 Some(CampaignKind::MoneyDmFunnel),
                 "missed: {message}"
             );
@@ -437,145 +581,166 @@ mod tests {
     }
 
     #[test]
-    fn money_dm_campaign_keeps_activity_and_age_bounds() {
-        let message = "Нужны срочно деньги???Пиши-мне!!!";
-        assert!(classify(Some(message), 11, Some(60), false).is_none());
-        assert!(classify(Some(message), 2, Some(3 * 24 * 60 * 60 + 1), false).is_none());
+    fn specific_campaigns_take_precedence_over_the_general_money_contact_rule() {
+        let paid_task =
+            classify_fresh("Есть дельце на пару часов, по завершению 7.000р!!!").unwrap();
+        assert_eq!(paid_task.kind, CampaignKind::PaidShortTaskOffer);
+        assert_eq!(paid_task.rule, "fresh_paid_short_task_with_concrete_payout");
+
+        let product = classify_fresh("Предлагаю товар на пробу, мест всего 7").unwrap();
+        assert_eq!(product.kind, CampaignKind::LimitedProductTrial);
+        assert_eq!(product.rule, "fresh_limited_product_trial_offer");
     }
 
     #[test]
-    fn catches_confirmed_short_paid_task_campaign_and_ruble_amount_variants() {
-        let campaign = classify(
-            Some("Есть дельце на пару часов, по завершению 7.000р!!!"),
-            1,
-            Some(60),
-            false,
-        )
-        .unwrap();
-        assert_eq!(campaign.kind, CampaignKind::PaidShortTaskOffer);
-        assert_eq!(campaign.rule, "fresh_paid_short_task_with_concrete_payout");
-        assert!(has_concrete_ruble_amount("от 8 500 руб."));
-        assert!(has_concrete_ruble_amount("выплата 8500 ₽"));
-        assert!(!has_concrete_ruble_amount("получишь 85р"));
-    }
-
-    #[test]
-    fn short_paid_task_rule_requires_the_full_high_confidence_pattern() {
-        for message in [
-            "Есть дельце на пару часов, по завершению расскажу подробности.",
-            "Есть дельце на пару часов, оплата 7.000р.",
-            "За пару часов работы заплатили 7.000р, рассказываю как было.",
+    fn catches_generalized_work_and_compensation_combinations() {
+        for (message, expected_kind) in [
+            (
+                "Кто завтра свободен для комплектования материалов к встрече? 5 600 на руки + обеды и компенсация дороги",
+                CampaignKind::PaidWorkOpportunity,
+            ),
+            (
+                "Помощь в ресторане. Зп от 55$ за смену. По всем вопросам к нему - @contact",
+                CampaignKind::MoneyDmFunnel,
+            ),
+            (
+                "Курьер в шоп. Плата в день 200$. Сегодня аванс. Без вложений. В лс @someone",
+                CampaignKind::MoneyDmFunnel,
+            ),
+            (
+                "Несколько часов твоего времени и 9 ОООр твои. Обращайся",
+                CampaignKind::MoneyDmFunnel,
+            ),
+            (
+                "Есть несколько свободных мест на вечер. Без опыта, от 8500 на руки. За выполнение предусмотрено. Напиши в личные сообщения",
+                CampaignKind::MoneyDmFunnel,
+            ),
+            (
+                "Дам 1800 за небольшую помощь",
+                CampaignKind::PaidShortTaskOffer,
+            ),
+            (
+                "Нужно три человека в криптопроект. Открыты к новичкам. Пишите: @someone",
+                CampaignKind::MoneyDmFunnel,
+            ),
+            (
+                "Мы в поисках сотрудников. От 15,ОООр. Начинай уже сегодня! С 16+ лет. Пиши по контакту: @someone",
+                CampaignKind::PaidWorkOpportunity,
+            ),
+            (
+                "Дам 5000 за пару лёгких движений, жду @someone",
+                CampaignKind::MoneyDmFunnel,
+            ),
+            ("ДАМ В ДОЛГ!!!", CampaignKind::FinancialOffer),
+            (
+                "Кто в поиске ДEHEГ? Маякни в личные, по быстрому решим этот вопрос!",
+                CampaignKind::MoneyDmFunnel,
+            ),
         ] {
-            assert!(
-                classify(Some(message), 1, Some(60), false).is_none(),
-                "unexpected match: {message}"
+            assert_eq!(
+                classify_fresh(message).map(|campaign| campaign.kind),
+                Some(expected_kind),
+                "missed: {message}"
             );
         }
     }
 
     #[test]
-    fn catches_adult_channel_for_fresh_low_activity_member_without_text_evidence() {
+    fn catches_repeated_free_audio_and_book_contact_campaigns() {
+        for message in [
+            "До жути понравилась книга «Время — деньги». Есть и в аудио, могу переслать, я сам и читал, и слушал.",
+            "Кому интересно, могу скинуть подкаст о репутации и навыках — он действительно полезный",
+        ] {
+            let campaign = classify_fresh(message).unwrap();
+            assert_eq!(campaign.kind, CampaignKind::ContentShareFunnel);
+            assert_eq!(campaign.rule, "fresh_content_share_funnel");
+        }
+    }
+
+    #[test]
+    fn ordinary_money_discussion_without_offer_and_contact_stays_unmatched() {
+        for message in [
+            "В статье обсуждают доходы и расходы семьи",
+            "Ищу работу, но пока ничего не нашёл",
+            "Нужны деньги на ремонт, кто знает хорошего мастера?",
+            "Нашёл книгу «Время — деньги», интересное обсуждение",
+            "Вакансии сейчас часто обсуждают в новостях",
+            "Пять лет прироста дохода у компании обсуждали в статье",
+            "Я не дам в долг, сначала надо понять, что произошло",
+        ] {
+            assert!(
+                classify_fresh(message).is_none(),
+                "false positive: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_configured_first_message_campaign_emits_a_valid_assessment() {
+        for message in [
+            "Нужны срочно деньги???Пиши-мне!!!",
+            "Есть дельце на пару часов, по завершению 7.000р!!!",
+            "Кто завтра свободен для комплектования материалов? 5 600 на руки + компенсация дороги",
+            "ДАМ В ДОЛГ!!!",
+            "Предлагаю товар на пробу, мест всего 7",
+            "До жути понравилась книга «Время — деньги». Есть и в аудио, могу переслать.",
+        ] {
+            let campaign = classify_fresh(message).unwrap();
+            let serialized = serde_json::to_string(&campaign.assessment(true)).unwrap();
+            teloxide_antispam::assessment::NewUserAuditAssessment::parse_for_modalities(
+                &serialized,
+                false,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("invalid assessment for {message:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn campaign_requires_fresh_low_activity_account() {
+        let message = "Нужны срочно деньги???Пиши-мне!!!";
+        assert!(classify(Some(message), 11, Some(60), false).is_none());
+        assert!(classify(Some(message), 2, Some(259_201), false).is_none());
+        assert!(classify(Some(message), 2, None, false).is_none());
+    }
+
+    #[test]
+    fn adult_personal_channel_rule_is_stable() {
         assert_eq!(
             classify(None, 1, Some(60), true).map(|campaign| campaign.kind),
             Some(CampaignKind::AdultPersonalChannel)
         );
+        assert!(CampaignMatch::from_rule("fresh_adult_personal_channel").is_some());
     }
 
     #[test]
-    fn does_not_flag_topic_messages_or_ambiguous_profile_signals() {
-        for message in [
-            "Они изобрели пасту ГОИ?",
-            "Отлично она 4к тянет",
-            "На одной 3060 и 64 GB производительность та же",
-            "Кухни от производителя, скидка 15%, пришлём каталог по запросу @MasterMKuhni",
-            "Маякни в личные, могу прислать ссылку на документацию",
-        ] {
-            assert!(
-                classify(
-                    Some(message),
-                    FRESH_LOW_ACTIVITY.0,
-                    FRESH_LOW_ACTIVITY.1,
-                    false
-                )
-                .is_none(),
-                "unexpected match: {message}"
-            );
-        }
+    fn mixed_script_normalization_handles_latin_transliteration_and_soft_sign_evasion() {
+        let normalized = normalize_mixed_script_homoglyphs("ДEHEГ");
+        assert!(
+            normalized.to_lowercase().contains("денег"),
+            "normalized as {normalized:?}"
+        );
+        assert!(
+            normalize_mixed_script_homoglyphs("ДEHbГAX")
+                .to_lowercase()
+                .contains("деньгах")
+        );
+        assert_eq!(normalize_mixed_script_homoglyphs("Hello123"), "Hello123");
     }
 
     #[test]
-    fn requires_fresh_low_activity_context() {
-        let message = "Думаешь где взять деньжат? Маякни в личные, по быстрому решим вопрос!";
-        assert!(classify(Some(message), 11, Some(60), false).is_none());
-        assert!(classify(Some(message), 1, Some(3 * 24 * 60 * 60 + 1), false).is_none());
-        assert!(classify(Some(message), 1, None, false).is_none());
-    }
-
-    #[test]
-    fn fast_path_assessment_satisfies_the_strict_audit_schema() {
-        let campaign = classify(
-            Some("Получить 500 рублей? Пишите в личку."),
-            1,
-            Some(60),
-            false,
-        )
-        .unwrap();
-        let serialized = serde_json::to_string(&campaign.assessment(true)).unwrap();
-        let parsed = teloxide_antispam::assessment::NewUserAuditAssessment::parse_for_modalities(
-            &serialized,
-            false,
-            true,
-        )
-        .unwrap();
-        assert!(parsed.first_message_assessment.unwrap().direct_dm_offer);
-
-        let product_trial = classify(
-            Some("Дам0.5 на пробу любого товара мест всего 7"),
-            1,
-            Some(60),
-            false,
-        )
-        .unwrap();
-        let serialized = serde_json::to_string(&product_trial.assessment(true)).unwrap();
-        let parsed = teloxide_antispam::assessment::NewUserAuditAssessment::parse_for_modalities(
-            &serialized,
-            false,
-            true,
-        )
-        .unwrap();
-        assert!(parsed.first_message_assessment.unwrap().offtopic_promo);
-
-        let paid_task = classify(
-            Some("Есть дельце на пару часов, по завершению 7.000р!!!"),
-            1,
-            Some(60),
-            false,
-        )
-        .unwrap();
-        let serialized = serde_json::to_string(&paid_task.assessment(true)).unwrap();
-        let parsed = teloxide_antispam::assessment::NewUserAuditAssessment::parse_for_modalities(
-            &serialized,
-            false,
-            true,
-        )
-        .unwrap();
-        let first_message = parsed.first_message_assessment.unwrap();
-        assert!(first_message.offtopic_promo);
-        assert!(!first_message.direct_dm_offer);
-    }
-
-    #[test]
-    fn stored_campaign_rules_resolve_to_the_same_static_match() {
-        for message in [
-            "Получить 500 рублей? Пишите в личку.",
-            "Есть дельце на пару часов, по завершению 7.000р!!!",
-            "Дам товар на пробу, мест всего 7",
-        ] {
-            let campaign = classify(Some(message), 1, Some(60), false).unwrap();
-            assert_eq!(CampaignMatch::from_rule(campaign.rule), Some(campaign));
-        }
-        let adult = classify(None, 1, Some(60), true).unwrap();
-        assert_eq!(CampaignMatch::from_rule(adult.rule), Some(adult));
-        assert_eq!(CampaignMatch::from_rule("unknown-rule"), None);
+    fn deterministic_assessment_and_signal_preserve_rule_evidence() {
+        let campaign = classify_fresh("Нужны срочно деньги???Пиши-мне!!!").unwrap();
+        let assessment = campaign.assessment(true);
+        assert_eq!(
+            assessment["first_message_assessment"]["direct_dm_offer"],
+            true
+        );
+        assert_eq!(
+            campaign.score_signal()["feature_config_version"],
+            "new-user-features-v1"
+        );
+        assert!(campaign.feature_score >= 65);
+        assert!(campaign.matched_features.contains(&"economic".to_owned()));
     }
 }
