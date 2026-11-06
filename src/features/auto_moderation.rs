@@ -25,6 +25,7 @@ const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
     "lols_spammer_identity",
     "tree_personal_channel_adult_funnel",
     "tree_personal_channel_invite_funnel",
+    "deterministic_campaign_fast_path",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,9 +110,11 @@ pub async fn maybe_enforce_audit(
         );
         return Ok(());
     }
+    let deterministic_campaign = has_deterministic_campaign(&job.input_json);
     if moderation.captcha_enabled
         && score >= job.review_threshold
         && score >= moderation.captcha_threshold
+        && !deterministic_campaign
     {
         if moderation.captcha_dry_run {
             tracing::warn!(
@@ -272,6 +275,13 @@ fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
         .collect()
 }
 
+fn has_deterministic_campaign(input_json: &Value) -> bool {
+    input_json
+        .get("deterministic_campaign_rule")
+        .and_then(Value::as_str)
+        .is_some()
+}
+
 fn effective_action(
     proposed_action: AutoAction,
     review_delivery_enabled: bool,
@@ -414,4 +424,32 @@ async fn ban_spammer(
         "auto moderation banned user"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn deterministic_campaign_is_confirmed_auto_ban_evidence() {
+        let evidence = qualifying_auto_ban_evidence(&json!([
+            {"label": "deterministic_campaign_fast_path", "rule_version": "new-user-campaign-v3"}
+        ]));
+        assert_eq!(evidence, ["deterministic_campaign_fast_path"]);
+        assert_eq!(
+            effective_action(AutoAction::Ban, false, !evidence.is_empty()),
+            (AutoAction::Ban, "confirmed_ban_evidence")
+        );
+    }
+
+    #[test]
+    fn deterministic_campaign_does_not_enter_captcha_path() {
+        assert!(has_deterministic_campaign(&json!({
+            "deterministic_campaign_rule": "fresh_money_work_private_contact"
+        })));
+        assert!(!has_deterministic_campaign(&json!({
+            "deterministic_campaign_rule": null
+        })));
+    }
 }
