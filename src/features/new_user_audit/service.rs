@@ -187,12 +187,14 @@ async fn materialize_stored_assessment(
             campaign.kind,
             deterministic::CampaignKind::MoneyDmFunnel
                 | deterministic::CampaignKind::PaidShortTaskOffer
+                | deterministic::CampaignKind::PaidWorkOpportunity
+                | deterministic::CampaignKind::FinancialOffer
                 | deterministic::CampaignKind::LimitedProductTrial
+                | deterministic::CampaignKind::ContentShareFunnel
                 | deterministic::CampaignKind::AdultPersonalChannel
         ) {
-            // Узкий deterministic fast path — это подтверждённый шаблон, а не
-            // накопление косвенных признаков профиля. Он должен достигать
-            // enforcement-порога без повторного вызова LLM.
+            // Fast path uses a configured high-confidence feature combination;
+            // it should reach the enforcement threshold without another LLM call.
             components.first_message_score = 100;
         }
     }
@@ -377,9 +379,12 @@ async fn deterministic_campaign_for_job(
         return Ok(None);
     }
     if let Some(rule) = job.input_json.get("deterministic_campaign_rule") {
-        return Ok(rule
-            .as_str()
-            .and_then(deterministic::CampaignMatch::from_rule));
+        return Ok(rule.as_str().and_then(|rule| {
+            deterministic::CampaignMatch::from_stored_evidence(
+                rule,
+                job.input_json.get("deterministic_campaign_evidence"),
+            )
+        }));
     }
     let row = sqlx::query(
         r#"select first_message_text, message_count, first_seen_at,

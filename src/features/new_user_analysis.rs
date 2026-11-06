@@ -154,7 +154,12 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         features.personal_channel_has_adult_links,
     );
     input_json["deterministic_campaign_rule"] = deterministic_campaign
-        .map(|campaign| Value::String(campaign.rule.to_string()))
+        .as_ref()
+        .map(|campaign| Value::String(campaign.rule.clone()))
+        .unwrap_or(Value::Null);
+    input_json["deterministic_campaign_evidence"] = deterministic_campaign
+        .as_ref()
+        .map(deterministic::CampaignMatch::score_signal)
         .unwrap_or(Value::Null);
     let material_revision =
         project_unified_user_audit_material_revision(&features, &analysis_config);
@@ -386,7 +391,8 @@ fn project_unified_user_audit_material_revision(
     // Изменение текстовых сообщений должно создавать новую генерацию, а не
     // только перезаписывать input_json у уже завершённой оценки.
     json!({
-        "schema_version": 4,
+        "schema_version": 5,
+        "deterministic_feature_config_version": deterministic::RULE_VERSION,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
         "review_threshold": config.review_threshold,

@@ -1,0 +1,191 @@
+# Versioned lexical features used by the new-user deterministic classifier.
+# Keep lexical evidence and calibration data here; the Rust code only extracts
+# these features and evaluates the combinations below.
+version = "new-user-features-v1"
+max_messages = 10
+max_chat_age_seconds = 259200
+
+[[features]]
+name = "economic"
+weight = 25
+matcher = "large_number"
+markers = [
+    "деньг", "денег", "денеж", "деньжат", "бабк", "доход", "прибыл", "заработ",
+    "оплат", "плат", "выплат", "зарплат", "зп ", "аванс", "компенсац", "в долг", "крипт", "руб", "₽", "$",
+    "доллар", "евро", "вознагражден", "преми", "бонус", "финанс",
+    "денежн", "гонорар", "ставк", "на руки", "за смен",
+]
+
+[[features]]
+name = "credit_offer"
+weight = 35
+markers = ["дам в долг", "предлагаю займ", "выдам кредит", "дам под процент"]
+
+[[features]]
+name = "work"
+weight = 20
+markers = [
+    "ваканс", "работ", "подработ", "смен", "задани", "задач", "дельц", "курьер", "комплектован", "помощь", "проект",
+    "без опыт", "сотрудник", "ищем людей", "нужны люди", "требуются",
+    "на вечер", "на пару часов", "на несколько часов", "несколько часов", "занятост",
+]
+
+[[features]]
+name = "offer"
+weight = 25
+markers = [
+    "предлага", "дам", "даю", "плачу", "с меня", "помог", "помощ", "получ", "ищем ", "где взять",
+    "ваканс", "доход", "прибыл", "заработ", "есть деньги", "есть вариа",
+    "есть вариан", "есть возможност", "дополнительн",
+    "свободное время", "нужны срочно деньги", "нужны деньги", "нуждаешься",
+    "нуждаетесь", "скину", "перешлю", "могу отправ", "могу переслать",
+    "отдам", "раздам", "ищу людей", "набор людей", "в поиске людей",
+    "в поиске", "ищу заработок", "без вложений", "твои", "закинет",
+    "переведет", "нужно ", "нужны ", "открыты к", "есть несколько свободных мест",
+    "как делать деньги", "как заработать",
+    "дельце",
+]
+
+[[features]]
+name = "private_contact"
+weight = 25
+markers = [
+    "в личк", "личные", "личн", "в лс", "лс ", "директ", "в директ",
+    "маякни", "маякните", "черканите", "пиши", "напиши", "пишите",
+    "напишите", "обращайся", "обращайтесь", "свяжись", "свяжитесь",
+    "пиши сюда", "пиши мне", "пиши-мне", "кидай +", "кидайте +", "черкани", "черкните",
+    "по всем вопросам", "@", "t.me/",
+]
+
+[[features]]
+name = "conversation_cta"
+weight = 20
+markers = [
+    "детали обсуд", "детал обсуд", "подробности обсуд", "подробност обсуд",
+    "детали уточ", "детал уточ", "подробности уточ", "подробност уточ",
+    "детали в лич", "подробности в лич", "узнать подробност", "за подробност",
+    "все детали у", "все подробности у", "расскажу подробнее", "обсудим лично",
+    "кому интересно", "если интересно", "могу переслать", "могу скинуть",
+    "могу отправить", "могу поделиться", "есть аудио", "есть подкаст",
+]
+
+[[features]]
+name = "task_completion"
+weight = 20
+markers = [
+    "по заверш", "после заверш", "после выполн", "за выполн", "за выполнение",
+    "за улыбку", "за услугу", "за небольшую помощь", "на пару час", "на несколько час",
+    "несколько часов",
+]
+
+[[features]]
+name = "concrete_payout"
+weight = 15
+matcher = "concrete_ruble_amount"
+markers = []
+
+[[features]]
+name = "large_amount"
+weight = 15
+matcher = "large_number"
+markers = []
+
+[[features]]
+name = "recruitment"
+weight = 20
+markers = [
+    "кто завтра свободен", "кто свободен", "свободен для", "нужно три человека",
+    "нужно несколько человек", "нужны люди", "нужен помощник", "открыты к новичкам",
+    "ищем людей", "требуются люди", "в поисках сотрудников",
+]
+
+[[features]]
+name = "product"
+weight = 20
+markers = ["товар", "продукт", "космет", "подарок", "образец"]
+
+[[features]]
+name = "trial"
+weight = 15
+markers = ["на пробу", "попробовать", "тестирован", "тестовый период", "бесплатный образец"]
+
+[[features]]
+name = "scarcity"
+weight = 20
+markers = [
+    "мест всего", "мест осталось", "осталось мест", "ограниченное количество",
+    "ограничен набор", "последние места", "успейте", "успей",
+]
+
+[[features]]
+name = "content_asset"
+weight = 20
+markers = ["аудиокниг", "аудио", "подкаст", "книг"]
+
+[[features]]
+name = "share_offer"
+weight = 25
+markers = [
+    "могу переслать", "могу скинуть", "могу отправить", "могу поделиться",
+    "есть аудио", "есть подкаст", "скину аудио", "перешлю аудио", "поделюсь аудио",
+]
+
+[[campaigns]]
+rule = "fresh_content_share_funnel"
+kind = "content_share_funnel"
+subtype = "offtopic_audio_bait"
+reason = "Свежий участник продвигает аудио или книгу и предлагает переслать материал в личном разговоре."
+priority = 50
+minimum_score = 65
+require_all = ["content_asset", "share_offer"]
+require_any = [["private_contact", "conversation_cta"]]
+
+[[campaigns]]
+rule = "fresh_paid_work_recruitment"
+kind = "paid_work_opportunity"
+subtype = "paid_work_offer"
+reason = "Свежий участник вербует людей на работу или задание и обещает денежную компенсацию."
+priority = 25
+minimum_score = 65
+require_all = ["work", "economic", "recruitment"]
+require_any = []
+
+[[campaigns]]
+rule = "fresh_direct_credit_offer"
+kind = "financial_offer"
+subtype = "lending_offer_bait"
+reason = "Свежий участник рекламирует выдачу займа или денег в долг."
+priority = 45
+minimum_score = 75
+require_all = ["credit_offer", "economic", "offer"]
+require_any = []
+
+[[campaigns]]
+rule = "fresh_money_work_private_contact"
+kind = "money_dm_funnel"
+subtype = "money_dm_bait"
+reason = "Свежий участник предлагает деньги, работу или материал и зовёт продолжить контакт отдельно от чата."
+priority = 40
+minimum_score = 65
+require_all = ["offer"]
+require_any = [["economic", "large_amount"], ["private_contact", "conversation_cta"]]
+
+[[campaigns]]
+rule = "fresh_paid_short_task_with_concrete_payout"
+kind = "paid_short_task_offer"
+subtype = "paid_short_task_bait"
+reason = "Свежий участник рекламирует короткое разовое задание с денежным вознаграждением после выполнения."
+priority = 20
+minimum_score = 55
+require_all = ["work", "task_completion", "offer"]
+require_any = [["concrete_payout", "large_amount"]]
+
+[[campaigns]]
+rule = "fresh_limited_product_trial_offer"
+kind = "limited_product_trial"
+subtype = "product_trial_bait"
+reason = "Свежий участник продвигает пробный товар с искусственным ограничением числа мест."
+priority = 30
+minimum_score = 70
+require_all = ["product", "trial", "scarcity", "offer"]
+require_any = []
