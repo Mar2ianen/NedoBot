@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn deterministic_campaign_is_confirmed_auto_ban_evidence() {
         let evidence = qualifying_auto_ban_evidence(&json!([
-            {"label": "deterministic_campaign_fast_path", "auto_ban_eligible": true, "rule_version": "new-user-features-v2"}
+            {"label": "deterministic_campaign_fast_path", "auto_ban_eligible": true, "rule_version": "new-user-features-v3"}
         ]));
         assert_eq!(evidence, ["deterministic_campaign_fast_path"]);
         assert_eq!(

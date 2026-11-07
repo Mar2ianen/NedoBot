@@ -1,7 +1,7 @@
 # Versioned lexical features used by the new-user deterministic classifier.
 # Keep lexical evidence and calibration data here; the Rust code only extracts
 # these features and evaluates the combinations below.
-version = "new-user-features-v2"
+version = "new-user-features-v3"
 max_messages = 10
 max_chat_age_seconds = 259200
 
@@ -67,6 +67,7 @@ markers = [
     "все детали у", "все подробности у", "расскажу подробнее", "обсудим лично",
     "кому интересно", "если интересно", "могу переслать", "могу скинуть",
     "могу отправить", "могу поделиться", "есть аудио", "есть подкаст",
+    "дай знать", "дайте знать", "дай мне знать",
 ]
 
 [[features]]
@@ -74,8 +75,24 @@ name = "task_completion"
 weight = 20
 markers = [
     "по заверш", "после заверш", "после выполн", "за выполн", "за выполнение",
-    "за улыбку", "за услугу", "за небольшую помощь", "на пару час", "на несколько час",
+    "сразу после", "по факту", "за улыбку", "за услугу", "за небольшую помощь", "на пару час", "на несколько час",
     "несколько часов",
+]
+
+[[features]]
+name = "casual_easy_task"
+weight = 30
+markers = [
+    "лёгкую тему", "легкую тему", "лёгкое дело", "легкое дело",
+    "простое задание", "лёгкую задачу", "легкую задачу",
+]
+
+[[features]]
+name = "short_duration"
+weight = 20
+markers = [
+    "около часа", "примерно час", "пара минут", "полчаса",
+    "за час", "на час", "час работы", "час времени",
 ]
 
 [[features]]
@@ -184,6 +201,17 @@ priority = 20
 minimum_score = 55
 require_all = ["work", "task_completion", "offer"]
 require_any = [["concrete_payout", "large_amount"]]
+
+[[campaigns]]
+rule = "fresh_casual_easy_task_with_immediate_payout"
+kind = "paid_short_task_offer"
+auto_ban_eligible = false
+subtype = "paid_short_task_bait"
+reason = "Свежий участник предлагает простое короткое дело за крупную сумму с оплатой сразу после выполнения и зовёт связаться."
+priority = 60
+minimum_score = 85
+require_all = ["casual_easy_task", "task_completion", "large_amount", "short_duration"]
+require_any = [["private_contact", "conversation_cta"]]
 
 [[campaigns]]
 rule = "fresh_limited_product_trial_offer"
