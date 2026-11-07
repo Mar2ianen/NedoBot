@@ -7,6 +7,31 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+6 ноября 2026 в **22:44 UTC / 7 ноября 01:44 МСК** выпущен release
+[`deploy-2026-11-07-review-campaign-safety`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-review-campaign-safety)
+на merge commit `43d94871a1bc1a78e14b06b3b5714d28e71d8edd` после PR
+[#96](https://github.com/Mar2ianen/NedoBot/pull/96). [Release workflow
+42305860555](https://github.com/Mar2ianen/NedoBot/actions/runs/42305860555)
+успешно установил artifact в оба community-инстанса и public MCP. SHA-256
+обоих работающих bot executable —
+`29886991d026d45b4e810252ad78d39327a62f39a025649d720d1e87edbf93b6`.
+Миграция `20261105190000` подтверждена в обеих БД; все три unit-а active.
+После release workflow PVO профиль был возвращён из временного dry-run в
+`enforce_enabled=true`, `enforce_dry_run=false`, threshold `90`. PVO перезапущен
+7 ноября в 09:07 UTC: оба bot hash совпадают с artifact, все три unit-а active,
+`NRestarts=0`, error-level journal пуст. Временный профиль сохранён в
+`/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261107-deterministic-campaign-safety`;
+backup состояния dry-run перед восстановлением —
+`/etc/tg-ai-bot/pvo-llm_profiles.toml.bak-20261107-postdeploy-dryrun`.
+
+Исправление #96 переводит все текущие детерминированные кампании в review-only:
+нейтральный сигнал сохраняется для аудита, но не создаёт System spam-label,
+не вызывает автобан или удаление и не является ban evidence. Независимые
+подтверждённые identity/template-сигналы сохраняют прежнюю политику. Перед
+любой автомодерацией проверяется последняя ручная метка `not_spam`, в том числе
+ещё раз перед вызовом Telegram ban API. После релиза #94 до временного dry-run
+не было новых spam-label или auto-enforcement событий в обеих БД.
+
 6 ноября 2026 в **19:21 UTC / 22:21 МСК** выпущен release
 [`deploy-2026-11-06-configurable-spam-features`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-06-configurable-spam-features)
 на merge commit `78e5a4f1d12a6e25614293d17976eff279586b5f` после PR
