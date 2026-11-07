@@ -72,8 +72,8 @@ impl McpClient {
         Self::start_for_scope(config, config.discussion_chat_id).await
     }
 
-    pub async fn start_for_scope(config: &Config, _scope_chat_id: i64) -> anyhow::Result<Self> {
-        let scope = config.mcp_read_scope()?;
+    pub async fn start_for_scope(config: &Config, scope_chat_id: i64) -> anyhow::Result<Self> {
+        let scope = config.mcp_read_scope_for_chat(scope_chat_id)?;
         let command = config
             .ask_db_mcp_command
             .as_deref()

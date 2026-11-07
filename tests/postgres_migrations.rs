@@ -4736,7 +4736,9 @@ async fn assert_public_mcp_scope(pool: &PgPool) {
 }
 
 async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
-    use tg_ai_bot_teloxide::features::chat_read_api::types::ChatReadScope;
+    use tg_ai_bot_teloxide::features::chat_read_api::types::{
+        ChatReadScope, MCP_INSTANCE_SCOPE_LOCK_KEY,
+    };
 
     let old_scope = query(
         "select instance_id, discussion_chat_id, source_channel_id from mcp_private.instance_scope where scope_key = true",
@@ -4747,6 +4749,73 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
     let old_instance: String = old_scope.get("instance_id");
     let old_chat: i64 = old_scope.get("discussion_chat_id");
     let old_source: Option<i64> = old_scope.get("source_channel_id");
+
+    tg_ai_bot_teloxide::features::chat_read_api::catalog::validate_public_view_scope(
+        pool,
+        "avatar_image_analyses",
+    )
+    .await
+    .expect("the reviewed inherited scope edge must validate through PostgreSQL dependencies");
+    query("create view mcp_public.mcp_scope_unscoped_fixture as select 1::bigint as id")
+        .execute(pool)
+        .await
+        .expect("scope validator fixture must be created");
+    assert!(
+        tg_ai_bot_teloxide::features::chat_read_api::catalog::validate_public_view_scope(
+            pool,
+            "mcp_scope_unscoped_fixture",
+        )
+        .await
+        .is_err(),
+        "an unscoped view must not pass startup validation"
+    );
+    query("drop view mcp_public.mcp_scope_unscoped_fixture")
+        .execute(pool)
+        .await
+        .expect("scope validator fixture must be removed");
+
+    let mut running_mcp = pool
+        .acquire()
+        .await
+        .expect("synthetic running MCP lease connection must be available");
+    query("select pg_advisory_lock_shared($1)")
+        .bind(MCP_INSTANCE_SCOPE_LOCK_KEY)
+        .execute(&mut *running_mcp)
+        .await
+        .expect("running MCP must acquire a shared scope lease");
+    let provision_lock_available: bool = query_scalar("select pg_try_advisory_lock($1)")
+        .bind(MCP_INSTANCE_SCOPE_LOCK_KEY)
+        .fetch_one(pool)
+        .await
+        .expect("provisioning lock check must run");
+    assert!(
+        !provision_lock_available,
+        "scope provisioning must fail while an MCP server is live"
+    );
+    query("select pg_advisory_unlock_shared($1)")
+        .bind(MCP_INSTANCE_SCOPE_LOCK_KEY)
+        .execute(&mut *running_mcp)
+        .await
+        .expect("test MCP lease must be released");
+    drop(running_mcp);
+    let unguarded_update =
+        query("update mcp_private.instance_scope set instance_id = $1 where scope_key = true")
+            .bind(&old_instance)
+            .execute(pool)
+            .await;
+    assert!(
+        unguarded_update.is_err(),
+        "scope mutation without the provisioner lock must be rejected by PostgreSQL"
+    );
+    let mut provisioner = pool
+        .acquire()
+        .await
+        .expect("scope provisioner connection must be available");
+    query("select pg_advisory_lock($1)")
+        .bind(MCP_INSTANCE_SCOPE_LOCK_KEY)
+        .execute(&mut *provisioner)
+        .await
+        .expect("test provisioner must acquire exclusive scope lock");
 
     let suffix = Uuid::new_v4().simple().to_string();
     let unique = i64::from_str_radix(&suffix[..12], 16).unwrap();
@@ -4817,7 +4886,7 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
             .bind(scope.instance_id())
             .bind(scope.discussion_chat_id())
             .bind(scope.source_channel_id())
-            .execute(pool)
+            .execute(&mut *provisioner)
             .await
             .expect("test owner must switch the synthetic instance scope");
 
@@ -4885,7 +4954,7 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
         .bind(old_instance)
         .bind(old_chat)
         .bind(old_source)
-        .execute(pool)
+        .execute(&mut *provisioner)
         .await
         .expect("the production-compatible NedoNews test scope must be restored");
     query("delete from telegram_messages where chat_id = any($1)")
@@ -4908,6 +4977,11 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("synthetic profiles must be removed");
+    query("select pg_advisory_unlock($1)")
+        .bind(MCP_INSTANCE_SCOPE_LOCK_KEY)
+        .execute(&mut *provisioner)
+        .await
+        .expect("test provisioner lock must be released");
 }
 
 async fn assert_chat_search_quality_path(pool: &PgPool) {

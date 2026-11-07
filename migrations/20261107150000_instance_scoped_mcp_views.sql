@@ -23,6 +23,39 @@ on conflict (scope_key) do nothing;
 
 revoke all on mcp_private.instance_scope from public;
 
+-- A running MCP server holds a session-level shared advisory lock. Only the
+-- provisioner, after obtaining the matching exclusive lock, may change scope.
+create or replace function mcp_private.require_instance_scope_provision_lock()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, mcp_private
+as $$
+begin
+    if not exists (
+        select 1
+        from pg_locks
+        where locktype = 'advisory'
+          and pid = pg_backend_pid()
+          and classid = 1296257107::oid
+          and objid = 1129271365::oid
+          and objsubid = 1
+          and mode = 'ExclusiveLock'
+          and granted
+    ) then
+        raise exception 'MCP instance scope may only be changed by the provisioner while no MCP server is running';
+    end if;
+    if tg_op = 'DELETE' then
+        return old;
+    end if;
+    return new;
+end
+$$;
+revoke all on function mcp_private.require_instance_scope_provision_lock() from public;
+create trigger instance_scope_requires_provision_lock
+before insert or update or delete on mcp_private.instance_scope
+for each row execute function mcp_private.require_instance_scope_provision_lock();
+
 create or replace function mcp_private.matches_instance_scope(
     requested_instance_id text,
     requested_discussion_chat_id bigint,
@@ -72,8 +105,9 @@ begin
     loop
         has_scope_literal := position('-1001932061163' in view_row.definition) > 0
             or position('-1001575496091' in view_row.definition) > 0;
-        inherits_scoped_view := view_row.definition like '%mcp_public.telegram_chat_users%'
-            or view_row.definition like '%mcp_public.telegram_user_profiles%';
+        inherits_scoped_view := view_row.schemaname = 'mcp_public'
+            and view_row.viewname = 'avatar_image_analyses'
+            and view_row.definition like '%telegram_user_profiles%';
         scoped_definition := replace(
             replace(
                 view_row.definition,

@@ -1,7 +1,8 @@
 //! Transport-neutral, reviewed read-model for the NedoNews public chat.
 
-use anyhow::bail;
-use sqlx::PgPool;
+use anyhow::{Context, bail};
+use sqlx::{PgConnection, PgPool};
+use tokio::sync::Mutex;
 
 pub mod catalog;
 pub mod policy;
@@ -22,6 +23,7 @@ pub struct ChatReadApi {
     scope: ChatReadScope,
     catalog: PublicCatalog,
     semantic_search: Option<SemanticSearchConfig>,
+    scope_lease: Mutex<Option<PgConnection>>,
 }
 
 impl ChatReadApi {
@@ -43,10 +45,21 @@ impl ChatReadApi {
             scope,
             catalog,
             semantic_search,
+            scope_lease: Mutex::new(None),
         })
     }
 
     pub async fn validate(&self) -> anyhow::Result<()> {
+        let mut lease = self.scope_lease.lock().await;
+        if lease.is_none() {
+            let mut connection = self.pool.acquire().await?;
+            sqlx::query("select pg_advisory_lock_shared($1)")
+                .bind(types::MCP_INSTANCE_SCOPE_LOCK_KEY)
+                .execute(&mut *connection)
+                .await
+                .context("cannot acquire MCP database scope lease")?;
+            *lease = Some(connection.detach());
+        }
         self.catalog.validate_instance_scope(&self.pool).await?;
         self.catalog.validate_views(&self.pool).await
     }

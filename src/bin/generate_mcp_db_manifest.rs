@@ -8,7 +8,8 @@ use serde::Serialize;
 use sqlx::{Row, postgres::PgPoolOptions};
 
 use tg_ai_bot_teloxide::{
-    config::load_mcp_instance_settings, features::chat_read_api::types::ChatReadScope,
+    config::load_mcp_instance_settings,
+    features::chat_read_api::{catalog::validate_public_view_scope, types::ChatReadScope},
 };
 
 #[derive(Serialize)]
@@ -90,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tables = BTreeMap::new();
     for row in rows {
         let name: String = row.get("table_name");
+        validate_public_view_scope(&pool, &name).await?;
         if RETIRED_LEGACY_VIEWS.contains(&name.as_str()) {
             continue;
         }

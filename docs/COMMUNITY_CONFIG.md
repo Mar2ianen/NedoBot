@@ -114,9 +114,14 @@ instead of silently ignoring that setting.
 Read-model scope берётся из authoritative community profile (`[instance].id`,
 primary `[chats.*].id` и source-channel активного route), а не из аргументов
 MCP-запроса. Каждому instance нужны отдельные PostgreSQL database, Telegram bot
-token, профиль и manifest. Не переиспользуйте NedoNews database, пользовательскую
-память или Telegram token для Linus AI. Числовые Telegram IDs Linus AI в коде и
-общем manifest не задаются: они читаются из его профиля.
+token, профиль и manifest. Не переиспользуйте базу, пользовательскую память или
+Telegram token между независимыми community instances. Числовые chat/channel IDs
+не задаются в общем коде или manifest: они читаются из profile конкретного
+instance.
+
+Пока DB read-model охватывает только primary chat instance-а, `/ask` в другом
+managed chat явно отклоняется до старта MCP retrieval. Ответы и сообщения бота
+по-прежнему адресуются исходному чату; его ID не меняет доверенный read scope.
 
 ### Подготовка новой базы
 
@@ -128,32 +133,35 @@ token, профиль и manifest. Не переиспользуйте NedoNews 
    таблица `mcp_private.instance_scope` останется закрыта. Миграция сохраняет прежний
    NedoNews scope при upgrade уже существующей базы; она не угадывает scope новой
    базы. У новой базы должен быть собственный набор таблиц и reviewed views.
-2. Создайте отдельный LLM/community profile для Linus AI с уникальным
-   `[instance].id`, его discussion chat ID в primary `[chats.*]` и source channel
-   ID в route при наличии. Добавьте Telegram token в секретное окружение этой
-   установки; токены не помещайте в profile, manifest или репозиторий.
-3. Один раз provision-ите scope от имени владельца этой базы. Команда сверяет
-   конфигурацию, требует явное подтверждение смены scope и не выдаёт права на
-   таблицу scope read-only MCP роли:
+2. Создайте отдельный LLM/community profile (например, для `community_a`) с
+   уникальным `[instance].id`, его discussion chat ID в primary `[chats.*]` и
+   source channel ID в route при наличии. Добавьте Telegram token в секретное
+   окружение этой установки; токены не помещайте в profile, manifest или
+   репозиторий.
+3. Один раз provision-ите scope от имени владельца этой базы. Перед сменой scope
+   остановите все MCP процессы, использующие эту базу: каждый живой сервер держит
+   shared advisory lease, а PostgreSQL отклоняет прямое изменение scope без
+   exclusive lock provisioner-а. Команда сверяет конфигурацию и не выдаёт права
+   на таблицу scope read-only MCP роли:
 
    ```bash
-   DATABASE_URL="$LINUS_DATABASE_URL" \
-   LLM_PROFILES_PATH=/etc/nedobot/linus/llm_profiles.toml \
+   DATABASE_URL="$INSTANCE_DATABASE_URL" \
+   LLM_PROFILES_PATH=/etc/nedobot/community_a/llm_profiles.toml \
    cargo run --release --bin provision_mcp_instance_scope -- --confirm-scope-change
    ```
 
    На новой базе `--confirm-scope-change` обязателен после установки migration;
-   для совпадающего scope команда безопасно завершится без изменений. Перед
-   повторным запуском после смены профиля проверьте, что база действительно
-   принадлежит этому instance.
+   для совпадающего scope команда безопасно завершится без изменений. После
+   перепривязки запустите MCP снова с обновлёнными profile и manifest: старый
+   процесс не даст выполнить provision, а новый сверит scope до публикации tools.
 4. Сгенерируйте и проверьте отдельный manifest на этой же базе и с тем же
    профилем:
 
    ```bash
-   DATABASE_URL="$LINUS_DATABASE_URL" \
-   LLM_PROFILES_PATH=/etc/nedobot/linus/llm_profiles.toml \
+   DATABASE_URL="$INSTANCE_DATABASE_URL" \
+   LLM_PROFILES_PATH=/etc/nedobot/community_a/llm_profiles.toml \
    cargo run --release --bin generate_mcp_db_manifest -- \
-     config/mcp_db_manifest.linus.toml
+     /etc/nedobot/community_a/mcp_db_manifest.toml
    ```
 
    Manifest фиксирует scope и точные имена, типы и nullable-статус колонок.
@@ -164,7 +172,7 @@ token, профиль и manifest. Не переиспользуйте NedoNews 
    allowlist окружения приложения, а instance scope — из профиля родительского
    бота, не из tool arguments. Для HTTP MCP задайте `ASK_DATABASE_URL`,
    `LLM_PROFILES_PATH`, `MCP_MANIFEST` и собственный статический `MCP_PATH`
-   (например, `/mcp/linus-ai/v2`). Его read-only роль должна иметь доступ только
+   (например, `/mcp/community-a/v2`). Его read-only роль должна иметь доступ только
    к reviewed `mcp_public` views и нужным безопасным внутренним функциям; права
    на `public.*`, базовые таблицы и `mcp_private.instance_scope` не выдавайте.
 

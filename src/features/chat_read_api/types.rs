@@ -66,8 +66,8 @@ mod scope_tests {
 
     #[test]
     fn scope_accepts_chat_without_source_channel() {
-        let scope = ChatReadScope::new("linus-ai", -2001, None).unwrap();
-        assert_eq!(scope.instance_id, "linus-ai");
+        let scope = ChatReadScope::new("community_a", -2001, None).unwrap();
+        assert_eq!(scope.instance_id, "community_a");
         assert_eq!(scope.discussion_chat_id, -2001);
         assert_eq!(scope.source_channel_id, None);
     }
@@ -77,6 +77,10 @@ pub const CHAT_EMBEDDING_URL_ENV: &str = "ASK_CHAT_EMBEDDING_URL";
 pub const CHAT_EMBEDDING_MODEL_ENV: &str = "ASK_CHAT_EMBEDDING_MODEL";
 pub const CHAT_EMBEDDING_TIMEOUT_ENV: &str = "ASK_CHAT_EMBEDDING_TIMEOUT_SEC";
 pub const CHAT_EMBEDDING_QUERY_PREFIX_ENV: &str = "ASK_CHAT_EMBEDDING_QUERY_PREFIX";
+
+/// Session advisory lock shared by running MCP servers and taken exclusively
+/// by scope provisioning. Its value is also used by the additive DB migration.
+pub const MCP_INSTANCE_SCOPE_LOCK_KEY: i64 = 5_567_381_882_901_844_037;
 
 #[derive(Clone, Debug)]
 pub struct SemanticSearchConfig {

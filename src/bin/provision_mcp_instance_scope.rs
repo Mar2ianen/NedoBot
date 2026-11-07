@@ -5,7 +5,8 @@ use std::env;
 use anyhow::{Context, bail};
 use sqlx::{Row, postgres::PgPoolOptions};
 use tg_ai_bot_teloxide::{
-    config::load_mcp_instance_settings, features::chat_read_api::types::ChatReadScope,
+    config::load_mcp_instance_settings,
+    features::chat_read_api::types::{ChatReadScope, MCP_INSTANCE_SCOPE_LOCK_KEY},
 };
 
 #[tokio::main]
@@ -53,6 +54,15 @@ async fn main() -> anyhow::Result<()> {
             "database scope is {current_scope:?}, profile scope is {configured_scope:?}; rerun with --confirm-scope-change to provision this database"
         );
     }
+
+    let lock_acquired: bool = sqlx::query_scalar("select pg_try_advisory_lock($1)")
+        .bind(MCP_INSTANCE_SCOPE_LOCK_KEY)
+        .fetch_one(&pool)
+        .await?;
+    anyhow::ensure!(
+        lock_acquired,
+        "a running MCP server holds this database scope; stop every MCP process for this database and retry provisioning"
+    );
 
     let can_update: bool = sqlx::query_scalar(
         "select has_table_privilege(current_user, 'mcp_private.instance_scope', 'UPDATE')",

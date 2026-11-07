@@ -65,7 +65,7 @@ git diff -- config/mcp_db_manifest.toml
 существующие reviewed views с исторических NedoNews literals на scope текущей
 базы. Исторические migrations не редактируются. Для новой установки сначала
 примените migration, затем provision-ите scope из community profile и
-сгенерируйте отдельный manifest; полный порядок для отдельного Linus AI instance
-описан в [Community configuration](COMMUNITY_CONFIG.md#mcp-для-отдельного-community-instance).
+сгенерируйте отдельный manifest; полный порядок для отдельного instance описан в
+[Community configuration](COMMUNITY_CONFIG.md#mcp-для-отдельного-community-instance).
 
 После review manifest обновить эту таблицу, README и раздел [«Публичный Read-only MCP»](TECHNICAL.md#публичный-read-only-mcp). Не публиковать новый view или колонку вместе с несвязанным рефакторингом transport-а.

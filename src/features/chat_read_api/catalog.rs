@@ -3,7 +3,7 @@
 //! Transport adapters load it and validate the actual `mcp_public` views before
 //! constructing `ChatReadApi`. It deliberately owns neither a pool nor a server.
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, future::Future, pin::Pin};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -169,31 +169,9 @@ impl PublicCatalog {
                     bail!("MCP manifest drift in {table}.{column}");
                 }
             }
-            let definition: Option<String> = sqlx::query_scalar(
-                "select pg_get_viewdef(format('%I.%I', 'mcp_public', $1)::regclass, true)",
-            )
-            .bind(table)
-            .fetch_one(pool)
-            .await?;
-            let definition = definition.ok_or_else(|| {
-                anyhow::anyhow!("required MCP view mcp_public.{table} is missing")
-            })?;
-            if !definition.contains("mcp_private.instance_scope") {
-                bail!("MCP view mcp_public.{table} is not bound to the database instance scope");
-            }
+            validate_public_view_scope(pool, table).await?;
         }
-        let media_definition: Option<String> = sqlx::query_scalar(
-            "select pg_get_viewdef('mcp_private.telegram_media'::regclass, true)",
-        )
-        .fetch_optional(pool)
-        .await
-        .context("required internal MCP media view mcp_private.telegram_media is missing")?;
-        if !media_definition
-            .as_deref()
-            .is_some_and(|definition| definition.contains("mcp_private.instance_scope"))
-        {
-            bail!("internal MCP media view is not bound to the database instance scope");
-        }
+        validate_scoped_view(pool, "mcp_private", "telegram_media", &mut Vec::new()).await?;
         Ok(())
     }
 
@@ -217,6 +195,73 @@ impl PublicCatalog {
         }
         Ok(())
     }
+}
+
+/// Checks that a view is directly tied to the per-database scope or inherits
+/// it through the reviewed dependency graph in `policy.rs`. PostgreSQL's
+/// rewrite dependencies verify that each declared edge exists in this DB.
+pub async fn validate_public_view_scope(pool: &PgPool, view: &str) -> anyhow::Result<()> {
+    validate_scoped_view(pool, "mcp_public", view, &mut Vec::new()).await
+}
+
+fn validate_scoped_view<'a>(
+    pool: &'a PgPool,
+    schema: &'a str,
+    view: &'a str,
+    visited: &'a mut Vec<String>,
+) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        ensure_identifier(schema)?;
+        ensure_identifier(view)?;
+        let qualified = format!("{schema}.{view}");
+        if visited.contains(&qualified) {
+            bail!("cycle in reviewed MCP scope dependencies at {qualified}");
+        }
+        visited.push(qualified.clone());
+        let definition: Option<String> =
+            sqlx::query_scalar("select pg_get_viewdef(to_regclass(format('%I.%I', $1, $2)), true)")
+                .bind(schema)
+                .bind(view)
+                .fetch_one(pool)
+                .await
+                .with_context(|| format!("required MCP view {qualified} is missing"))?;
+        let definition = definition
+            .ok_or_else(|| anyhow::anyhow!("required MCP view {qualified} is missing"))?;
+        if definition.contains("mcp_private.instance_scope") {
+            return Ok(());
+        }
+
+        let parent = if schema == "mcp_public" {
+            super::policy::inherited_scope_parent(view)
+        } else {
+            None
+        }
+        .ok_or_else(|| anyhow::anyhow!("MCP view {qualified} has no reviewed instance scope"))?;
+        let dependency_exists: bool = sqlx::query_scalar(
+            r#"
+            select exists (
+                select 1
+                from pg_rewrite rewrite
+                join pg_depend dependency
+                  on dependency.classid = 'pg_rewrite'::regclass
+                 and dependency.objid = rewrite.oid
+                 and dependency.refclassid = 'pg_class'::regclass
+                where rewrite.ev_class = to_regclass(format('%I.%I', $1, $2))
+                  and dependency.refobjid = to_regclass(format('%I.%I', $1, $3))
+            )
+            "#,
+        )
+        .bind(schema)
+        .bind(view)
+        .bind(parent)
+        .fetch_one(pool)
+        .await?;
+        anyhow::ensure!(
+            dependency_exists,
+            "MCP view {qualified} does not depend on its reviewed scope parent {schema}.{parent}"
+        );
+        validate_scoped_view(pool, schema, parent, visited).await
+    })
 }
 
 pub(crate) fn ensure_identifier(value: &str) -> anyhow::Result<()> {

@@ -162,6 +162,17 @@ impl Config {
         )
     }
 
+    /// The MCP database currently exposes only the configured primary chat.
+    /// Reject any other managed chat before starting retrieval.
+    pub fn mcp_read_scope_for_chat(&self, requested_chat_id: i64) -> anyhow::Result<ChatReadScope> {
+        let scope = self.mcp_read_scope()?;
+        anyhow::ensure!(
+            requested_chat_id == scope.discussion_chat_id(),
+            "MCP read-model scope is configured for the primary chat only; /ask retrieval is not enabled for this secondary chat"
+        );
+        Ok(scope)
+    }
+
     pub fn chat_by_id(&self, chat_id: i64) -> Option<crate::community::ChatRef<'_>> {
         self.chat_registry.chat_by_id(&self.community, chat_id)
     }
@@ -1718,6 +1729,30 @@ mod tests {
                 .unwrap()
                 .public_enabled
         );
+    }
+
+    #[test]
+    fn mcp_ask_scope_accepts_primary_and_rejects_secondary_managed_chat() {
+        let mut config = config();
+        let mut community = config.community.clone();
+        let mut secondary = community.chats["main"].clone();
+        secondary.id = -1003;
+        community.chats.insert("secondary".into(), secondary);
+        config.chat_registry = ChatRegistry::new(&community).unwrap();
+        config.community = community;
+
+        assert_eq!(
+            config
+                .mcp_read_scope_for_chat(config.discussion_chat_id)
+                .unwrap()
+                .discussion_chat_id(),
+            config.discussion_chat_id
+        );
+        let error = config
+            .mcp_read_scope_for_chat(-1003)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secondary chat"));
     }
 
     #[test]
