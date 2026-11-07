@@ -7,6 +7,22 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+7 ноября 2026 в **10:41 UTC / 13:41 МСК** выпущен release
+[`deploy-2026-11-07-casual-paid-task-signal`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-casual-paid-task-signal)
+на merge commit `cbf3de07216a0ef9e76fbf5395be28a8758631ee` после PR
+[#98](https://github.com/Mar2ianen/NedoBot/pull/98). [Release workflow
+42364376332](https://github.com/Mar2ianen/NedoBot/actions/runs/42364376332)
+успешно установил artifact в основной и PVO инстансы и перезапустил public MCP.
+SHA-256 обоих работающих bot executable —
+`721d8b094930b6ee3c9ee8b019fcab67203fdebfa6c840da81fa6b57e97d0c8f` — совпадает
+с artifact. Все три unit-а active; workflow подтвердил отсутствие прироста
+`NRestarts`, пустой error-level journal после выкладки и migration
+`20261105190000` в обеих БД. Добавлена review-only кампания для короткого
+неформального задания с конкретной суммой, сроком около часа, оплатой сразу
+после выполнения и приглашением написать в ответ. Совпадение создаёт audit
+candidate без LLM-вызова, но само по себе не ставит spam-label, не банит и не
+удаляет сообщения.
+
 6 ноября 2026 в **22:44 UTC / 7 ноября 01:44 МСК** выпущен release
 [`deploy-2026-11-07-review-campaign-safety`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-review-campaign-safety)
 на merge commit `43d94871a1bc1a78e14b06b3b5714d28e71d8edd` после PR
