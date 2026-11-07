@@ -320,17 +320,18 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 ## VPS Деплой
 
 Текущий production release на `vps-153` зафиксирован immutable annotated tag
-[`deploy-2026-11-07-review-campaign-safety`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-review-campaign-safety)
-на merge commit `43d94871a1bc1a78e14b06b3b5714d28e71d8edd` после PR #96.
-Release workflow [42305860555](https://github.com/Mar2ianen/NedoBot/actions/runs/42305860555)
+[`deploy-2026-11-07-casual-paid-task-signal`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-casual-paid-task-signal)
+на merge commit `cbf3de07216a0ef9e76fbf5395be28a8758631ee` после PR #98.
+Release workflow [42364376332](https://github.com/Mar2ianen/NedoBot/actions/runs/42364376332)
 установил binary в оба community-инстанса и public MCP; SHA-256 обоих ботов —
-`29886991d026d45b4e810252ad78d39327a62f39a025649d720d1e87edbf93b6`.
-После release workflow PVO `enforce_dry_run` временно оставался включён для
-проверки binary, затем был возвращён в `false` 2026-11-07 09:07 UTC. Все три
-unit-а active с `NRestarts=0`, совпадение bot hashes и пустой error-level
-journal перепроверены после рестарта PVO; migration `20261105190000` применена
-в обеих БД. Детерминированные кампании теперь создают review-only signals и не
-могут сами приводить к автоматической санкции или системной spam-метке.
+`721d8b094930b6ee3c9ee8b019fcab67203fdebfa6c840da81fa6b57e97d0c8f`.
+7 ноября 2026 в 10:41 UTC workflow подтвердил совпадение hashes с artifact,
+активность всех трёх unit-ов, отсутствие прироста `NRestarts`, пустой
+error-level journal после выкладки и migration `20261105190000` в обеих БД.
+Добавлен review-only campaign для короткого неформального оплачиваемого задания
+с суммой, скорым расчётом и CTA продолжить разговор. Как и другие
+детерминированные campaign rules, он сохраняет audit candidate, но не создаёт
+System spam-label и сам не запускает автобан или удаление.
 
 Предыдущий production release на `vps-153` зафиксирован immutable annotated tag [`deploy-2026-10-15-spam-patterns`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-10-15-spam-patterns) на merge commit `155c47bd3da5718def0fae601bc64844f7c175f3`. Код прошёл review через [PR #79](https://github.com/Mar2ianen/NedoBot/pull/79); artifact из [release workflow 38798335159](https://github.com/Mar2ianen/NedoBot/actions/runs/38798335159) установлен **2026-10-15 20:06 UTC / 23:06 МСК** в оба community-инстанса и public MCP. SHA-256 обоих работающих bot executable совпадает с artifact: `24b8d268a0a19c0cf0d654b1a10dd40cacc6ee277c075d67ffc150f19b073c08`. Все три unit-а active; error-level записей после рестарта и сообщений о пропущенных миграциях нет. PR CI [38797292117](https://github.com/Mar2ianen/NedoBot/actions/runs/38797292117) прошёл форматирование, тесты, Clippy и PostgreSQL integration suites. В fast path аудита новых пользователей добавлены два подтверждённых PVO шаблона: оплата «на руки» вместе с личным CTA и короткая задача с конкретной суммой в рублях после выполнения. Для второго правила обязательны все части шаблона, возраст аккаунта до 24 часов и не более трёх сообщений; последующее действие остаётся за общей moderation policy.
 
