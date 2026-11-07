@@ -1708,6 +1708,16 @@ mod tests {
         assert_eq!(settings.scope.discussion_chat_id, -1001932061163);
         assert_eq!(settings.scope.source_channel_id, Some(-1001575496091));
         assert!(!settings.public_enabled);
+
+        let production_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/llm_profiles.toml.production.example"
+        );
+        assert!(
+            load_mcp_instance_settings(production_path)
+                .unwrap()
+                .public_enabled
+        );
     }
 
     #[test]
