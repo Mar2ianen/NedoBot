@@ -28,6 +28,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
 
 use crate::community::ChatRegistry;
 use crate::config_file::{CommunityConfig, RiskProfile, TelegramIdRiskModel};
+use crate::features::chat_read_api::types::ChatReadScope;
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
 
 const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
@@ -151,6 +152,16 @@ pub struct Config {
 }
 
 impl Config {
+    /// The reviewed primary MCP scope is always derived from validated community
+    /// configuration, never from MCP tool arguments.
+    pub fn mcp_read_scope(&self) -> anyhow::Result<ChatReadScope> {
+        ChatReadScope::new(
+            self.community.instance.id.clone(),
+            self.discussion_chat_id,
+            (self.source_channel_id != 0).then_some(self.source_channel_id),
+        )
+    }
+
     pub fn chat_by_id(&self, chat_id: i64) -> Option<crate::community::ChatRef<'_>> {
         self.chat_registry.chat_by_id(&self.community, chat_id)
     }
@@ -1028,6 +1039,34 @@ impl Config {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct McpInstanceSettings {
+    pub scope: ChatReadScope,
+    pub public_enabled: bool,
+}
+
+/// Loads only non-secret MCP/community settings from the selected profile.
+/// The HTTP MCP process uses this instead of loading bot tokens or API keys.
+pub fn load_mcp_instance_settings(profile_path: &str) -> anyhow::Result<McpInstanceSettings> {
+    let profiles = LlmProfiles::from_path(profile_path)?;
+    let community = community_config_from_profiles(&profiles)?;
+    let registry = ChatRegistry::new(&community)?;
+    let discussion_chat_id = primary_chat_id(&community, &registry)?;
+    let source_channel_id = primary_first_comment_route(&community, &registry)
+        .map(|route| route.source_channel_id)
+        .or(profiles.runtime.source_channel_id)
+        .filter(|id| *id != 0);
+    let scope = ChatReadScope::new(
+        community.instance.id.clone(),
+        discussion_chat_id,
+        source_channel_id,
+    )?;
+    Ok(McpInstanceSettings {
+        scope,
+        public_enabled: community.public_mcp.enabled,
+    })
+}
+
 fn is_immutable_image_id(value: &str) -> bool {
     let Some(digest) = value.strip_prefix("sha256:") else {
         return false;
@@ -1656,6 +1695,19 @@ mod tests {
             community.chats.get("main").unwrap().reports,
             "the primary profile explicitly enables /report"
         );
+    }
+
+    #[test]
+    fn mcp_scope_and_public_gate_come_from_selected_community_profile() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/llm_profiles.toml.example"
+        );
+        let settings = load_mcp_instance_settings(path).unwrap();
+        assert_eq!(settings.scope.instance_id, "nedonews");
+        assert_eq!(settings.scope.discussion_chat_id, -1001932061163);
+        assert_eq!(settings.scope.source_channel_id, Some(-1001575496091));
+        assert!(!settings.public_enabled);
     }
 
     #[test]

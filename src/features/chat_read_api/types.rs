@@ -6,10 +6,71 @@ use sqlx::{
     types::chrono::{DateTime, Utc},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatReadScope {
-    pub discussion_chat_id: i64,
-    pub source_channel_id: i64,
+    pub(crate) instance_id: String,
+    pub(crate) discussion_chat_id: i64,
+    pub(crate) source_channel_id: Option<i64>,
+}
+
+impl ChatReadScope {
+    pub fn new(
+        instance_id: impl Into<String>,
+        discussion_chat_id: i64,
+        source_channel_id: Option<i64>,
+    ) -> anyhow::Result<Self> {
+        let instance_id = instance_id.into();
+        anyhow::ensure!(
+            !instance_id.trim().is_empty(),
+            "MCP instance id must not be empty"
+        );
+        anyhow::ensure!(
+            discussion_chat_id != 0,
+            "MCP discussion chat id must not be zero"
+        );
+        anyhow::ensure!(
+            source_channel_id.is_none_or(|chat_id| chat_id != 0 && chat_id != discussion_chat_id),
+            "MCP source channel id must be non-zero and differ from the discussion chat id"
+        );
+        Ok(Self {
+            instance_id,
+            discussion_chat_id,
+            source_channel_id,
+        })
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn discussion_chat_id(&self) -> i64 {
+        self.discussion_chat_id
+    }
+
+    pub fn source_channel_id(&self) -> Option<i64> {
+        self.source_channel_id
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::ChatReadScope;
+
+    #[test]
+    fn scope_rejects_invalid_ids_and_blank_instance_names() {
+        assert!(ChatReadScope::new("", -1001, None).is_err());
+        assert!(ChatReadScope::new("test", 0, None).is_err());
+        assert!(ChatReadScope::new("test", -1001, Some(0)).is_err());
+        assert!(ChatReadScope::new("test", -1001, Some(-1001)).is_err());
+    }
+
+    #[test]
+    fn scope_accepts_chat_without_source_channel() {
+        let scope = ChatReadScope::new("linus-ai", -2001, None).unwrap();
+        assert_eq!(scope.instance_id, "linus-ai");
+        assert_eq!(scope.discussion_chat_id, -2001);
+        assert_eq!(scope.source_channel_id, None);
+    }
 }
 
 pub const CHAT_EMBEDDING_URL_ENV: &str = "ASK_CHAT_EMBEDDING_URL";

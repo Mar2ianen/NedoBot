@@ -6,7 +6,7 @@ use std::{
 
 use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use sqlx::{PgPool, postgres::PgPoolOptions, query, query_as, query_scalar};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
 use teloxide_antispam::policy::AutoAction;
@@ -115,6 +115,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
     assert_public_mcp_scope(&pool).await;
+    assert_mcp_instance_scope_isolation(&pool).await;
     assert_chat_search_quality_path(&pool).await;
     assert_rich_backfill_and_exact_word_counts(&pool).await;
     assert_retention_keeps_true_first_seen(&pool).await;
@@ -4732,6 +4733,181 @@ async fn assert_public_mcp_scope(pool: &PgPool) {
     .expect("public MCP view query must succeed");
 
     assert_eq!(public_messages, vec!["discussion message"]);
+}
+
+async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
+    use tg_ai_bot_teloxide::features::chat_read_api::types::ChatReadScope;
+
+    let old_scope = query(
+        "select instance_id, discussion_chat_id, source_channel_id from mcp_private.instance_scope where scope_key = true",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the additive MCP scope migration must provision a singleton row");
+    let old_instance: String = old_scope.get("instance_id");
+    let old_chat: i64 = old_scope.get("discussion_chat_id");
+    let old_source: Option<i64> = old_scope.get("source_channel_id");
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let unique = i64::from_str_radix(&suffix[..12], 16).unwrap();
+    let chat_a = -800_000_000_000_000_000_i64 - unique;
+    let chat_b = chat_a - 1;
+    let source_a = chat_a - 2;
+    let user_a = 8_000_000_000_000_000_i64 + unique * 2;
+    let user_b = user_a + 1;
+    let marker_a = format!("scope-a-{suffix}");
+    let marker_b = format!("scope-b-{suffix}");
+
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, $2), ($3, $4)")
+        .bind(user_a)
+        .bind(&marker_a)
+        .bind(user_b)
+        .bind(&marker_b)
+        .execute(pool)
+        .await
+        .expect("synthetic instance profiles must be inserted");
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, 880001, $2, $3), ($4, 880002, $5, $6)")
+        .bind(chat_a)
+        .bind(user_a)
+        .bind(&marker_a)
+        .bind(chat_b)
+        .bind(user_b)
+        .bind(&marker_b)
+        .execute(pool)
+        .await
+        .expect("synthetic instance messages must be inserted");
+    query("insert into telegram_chat_notes (chat_id, note, created_by_user_id) values ($1, $2, 1), ($3, $4, 1)")
+        .bind(chat_a)
+        .bind(format!("chat-note-{suffix}-a"))
+        .bind(chat_b)
+        .bind(format!("chat-note-{suffix}-b"))
+        .execute(pool)
+        .await
+        .expect("synthetic chat notes must be inserted");
+    query("insert into telegram_user_notes (chat_id, telegram_user_id, note, created_by_user_id) values ($1, $2, $3, 1), ($4, $5, $6, 1)")
+        .bind(chat_a)
+        .bind(user_a)
+        .bind(format!("user-note-{suffix}-a"))
+        .bind(chat_b)
+        .bind(user_b)
+        .bind(format!("user-note-{suffix}-b"))
+        .execute(pool)
+        .await
+        .expect("synthetic user notes must be inserted");
+
+    let scope_a = ChatReadScope::new("synthetic-a", chat_a, Some(source_a)).unwrap();
+    let scope_b = ChatReadScope::new("synthetic-b", chat_b, None).unwrap();
+    for (scope, own_marker, foreign_marker, own_user, foreign_user) in [
+        (
+            &scope_a,
+            marker_a.as_str(),
+            marker_b.as_str(),
+            user_a,
+            user_b,
+        ),
+        (
+            &scope_b,
+            marker_b.as_str(),
+            marker_a.as_str(),
+            user_b,
+            user_a,
+        ),
+    ] {
+        query("update mcp_private.instance_scope set instance_id = $1, discussion_chat_id = $2, source_channel_id = $3 where scope_key = true")
+            .bind(scope.instance_id())
+            .bind(scope.discussion_chat_id())
+            .bind(scope.source_channel_id())
+            .execute(pool)
+            .await
+            .expect("test owner must switch the synthetic instance scope");
+
+        let configured_scope_matches: bool =
+            query_scalar("select mcp_private.matches_instance_scope($1, $2, $3)")
+                .bind(scope.instance_id())
+                .bind(scope.discussion_chat_id())
+                .bind(scope.source_channel_id())
+                .fetch_one(pool)
+                .await
+                .expect("read-only scope validator must be executable");
+        assert!(configured_scope_matches);
+        let forged_scope_matches: bool =
+            query_scalar("select mcp_private.matches_instance_scope('forged', $1, null)")
+                .bind(scope.discussion_chat_id() - 1)
+                .fetch_one(pool)
+                .await
+                .expect("forged scope validation must return a boolean");
+        assert!(!forged_scope_matches);
+
+        let messages: Vec<String> = query_scalar(
+            "select text from mcp_public.telegram_messages where text in ($1, $2) order by text",
+        )
+        .bind(&marker_a)
+        .bind(&marker_b)
+        .fetch_all(pool)
+        .await
+        .expect("messages must be readable through the scoped view");
+        assert_eq!(messages, vec![own_marker.to_owned()]);
+
+        let profiles: Vec<i64> = query_scalar("select telegram_user_id from mcp_public.telegram_user_profiles where telegram_user_id in ($1, $2) order by telegram_user_id")
+            .bind(own_user.min(foreign_user))
+            .bind(own_user.max(foreign_user))
+            .fetch_all(pool)
+            .await
+            .expect("profiles must be readable through the scoped view");
+        assert_eq!(profiles, vec![own_user]);
+
+        let chat_notes: Vec<String> =
+            query_scalar("select note from mcp_public.telegram_chat_notes where note like $1")
+                .bind(format!("chat-note-{suffix}-%"))
+                .fetch_all(pool)
+                .await
+                .expect("chat notes must be readable through the scoped view");
+        assert_eq!(
+            chat_notes,
+            vec![format!(
+                "chat-note-{suffix}-{}",
+                if own_marker == marker_a { "a" } else { "b" }
+            )]
+        );
+
+        let user_notes: Vec<String> =
+            query_scalar("select note from mcp_public.telegram_user_notes where note like $1")
+                .bind(format!("user-note-{suffix}-%"))
+                .fetch_all(pool)
+                .await
+                .expect("user notes must be readable through the scoped view");
+        assert_eq!(user_notes.len(), 1);
+        assert!(user_notes[0].contains(if own_marker == marker_a { "-a" } else { "-b" }));
+        assert!(!messages.iter().any(|message| message == foreign_marker));
+    }
+
+    query("update mcp_private.instance_scope set instance_id = $1, discussion_chat_id = $2, source_channel_id = $3 where scope_key = true")
+        .bind(old_instance)
+        .bind(old_chat)
+        .bind(old_source)
+        .execute(pool)
+        .await
+        .expect("the production-compatible NedoNews test scope must be restored");
+    query("delete from telegram_messages where chat_id = any($1)")
+        .bind(vec![chat_a, chat_b])
+        .execute(pool)
+        .await
+        .expect("synthetic messages must be removed");
+    query("delete from telegram_chat_notes where note like $1")
+        .bind(format!("chat-note-{suffix}-%"))
+        .execute(pool)
+        .await
+        .expect("synthetic chat notes must be removed");
+    query("delete from telegram_user_notes where note like $1")
+        .bind(format!("user-note-{suffix}-%"))
+        .execute(pool)
+        .await
+        .expect("synthetic user notes must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = any($1)")
+        .bind(vec![user_a, user_b])
+        .execute(pool)
+        .await
+        .expect("synthetic profiles must be removed");
 }
 
 async fn assert_chat_search_quality_path(pool: &PgPool) {

@@ -1,9 +1,10 @@
-version = 1
+version = 2
 generated_at = "2026-07-17T18:14:36.178064522+00:00"
 source_schema = "public"
 public_schema = "mcp_public"
 
 [scope]
+instance_id = "nedonews"
 discussion_chat_id = -1001932061163
 source_channel_id = -1001575496091
 

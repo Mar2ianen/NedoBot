@@ -7,6 +7,10 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use sqlx::{Row, postgres::PgPoolOptions};
 
+use tg_ai_bot_teloxide::{
+    config::load_mcp_instance_settings, features::chat_read_api::types::ChatReadScope,
+};
+
 #[derive(Serialize)]
 struct Manifest {
     version: u32,
@@ -18,8 +22,10 @@ struct Manifest {
 }
 #[derive(Serialize)]
 struct Scope {
+    instance_id: String,
     discussion_chat_id: i64,
-    source_channel_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_channel_id: Option<i64>,
 }
 #[derive(Serialize)]
 struct Table {
@@ -46,6 +52,12 @@ async fn main() -> anyhow::Result<()> {
     let database_url = env::var("DATABASE_URL")
         .or_else(|_| env::var("ASK_DATABASE_URL"))
         .context("DATABASE_URL or ASK_DATABASE_URL is required")?;
+    let profile_path =
+        env::var("LLM_PROFILES_PATH").unwrap_or_else(|_| "config/llm_profiles.toml.example".into());
+    if profile_path.trim().is_empty() {
+        bail!("LLM_PROFILES_PATH must not be empty");
+    }
+    let configured_scope = load_mcp_instance_settings(&profile_path)?.scope;
     let output = env::args()
         .nth(1)
         .unwrap_or_else(|| "config/mcp_db_manifest.toml".into());
@@ -53,6 +65,24 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(1)
         .connect(&database_url)
         .await?;
+    let scope_row = sqlx::query(
+        "select instance_id, discussion_chat_id, source_channel_id from mcp_private.instance_scope where scope_key = true",
+    )
+    .fetch_all(&pool)
+    .await
+    .context("MCP instance scope is not provisioned in this database")?;
+    if scope_row.len() != 1 {
+        bail!("MCP database must contain exactly one instance scope row");
+    }
+    let row = &scope_row[0];
+    let database_scope = ChatReadScope::new(
+        row.get::<String, _>("instance_id"),
+        row.get("discussion_chat_id"),
+        row.get("source_channel_id"),
+    )?;
+    if database_scope != configured_scope {
+        bail!("database scope does not match LLM_PROFILES_PATH community configuration");
+    }
     let rows = sqlx::query("select table_name from information_schema.views where table_schema = 'mcp_public' order by table_name").fetch_all(&pool).await?;
     if rows.is_empty() {
         bail!("mcp_public has no views; apply the MCP view migration first");
@@ -87,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         tables.insert(
             name.clone(),
             Table {
-                description: description(&name),
+                description: description(&name, configured_scope.instance_id()),
                 primary_key: primary_key(&name),
                 approximate_rows: estimate,
                 columns,
@@ -95,13 +125,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let manifest = Manifest {
-        version: 1,
+        version: 2,
         generated_at: sqlx::types::chrono::Utc::now().to_rfc3339(),
         source_schema: "public".into(),
         public_schema: "mcp_public".into(),
         scope: Scope {
-            discussion_chat_id: -1001932061163,
-            source_channel_id: -1001575496091,
+            instance_id: configured_scope.instance_id().to_owned(),
+            discussion_chat_id: configured_scope.discussion_chat_id(),
+            source_channel_id: configured_scope.source_channel_id(),
         },
         tables,
     };
@@ -173,10 +204,10 @@ fn primary_key(name: &str) -> Vec<String> {
     .collect()
 }
 
-fn description(name: &str) -> String {
+fn description(name: &str, instance_id: &str) -> String {
     match name {
-        "telegram_messages" => "Сообщения публичного НедоNews Chat".into(),
-        "telegram_chat_users" => "Участники и статистика публичного чата".into(),
+        "telegram_messages" => format!("Сообщения публичного чата instance {instance_id}"),
+        "telegram_chat_users" => format!("Участники и статистика instance {instance_id}"),
         "ask_runs" => "Публичные запуски /ask".into(),
         "ask_tool_calls" => "Безопасный аудит вызовов /ask".into(),
         "voice_transcription_jobs" => "Расшифровки голосовых публичного чата".into(),

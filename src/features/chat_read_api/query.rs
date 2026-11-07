@@ -229,6 +229,7 @@ pub fn validate_select(catalog: &PublicCatalog, request: &SelectRequest) -> anyh
 
     let mut sql = String::new();
     let mut binds = Vec::new();
+    validate_scope_filters(&catalog.scope(), &request.filters)?;
     append_filters(&mut sql, definition, &request.filters, &mut binds)?;
     validate_order_columns(&request.order_by)?;
     append_order(&mut sql, definition, &request.order_by)?;
@@ -244,6 +245,7 @@ pub fn validate_count(
     let definition = table(catalog, table_name)?;
     let mut sql = String::new();
     let mut binds = Vec::new();
+    validate_scope_filters(&catalog.scope(), filters)?;
     append_filters(&mut sql, definition, filters, &mut binds)
 }
 
@@ -275,7 +277,40 @@ pub fn validate_aggregate(
     }
     let mut sql = String::new();
     let mut binds = Vec::new();
+    validate_scope_filters(&catalog.scope(), &request.filters)?;
     append_filters(&mut sql, definition, &request.filters, &mut binds)
+}
+
+fn validate_scope_filters(
+    scope: &super::types::ChatReadScope,
+    filters: &[Filter],
+) -> anyhow::Result<()> {
+    for filter in filters {
+        let allowed = match filter.column.as_str() {
+            "chat_id" | "discussion_chat_id" => Some(scope.discussion_chat_id),
+            "source_channel_id" => scope.source_channel_id,
+            _ => continue,
+        };
+        ensure!(
+            matches!(filter.op, FilterOp::Eq | FilterOp::In),
+            "scope columns only allow exact in-scope equality filters"
+        );
+        let values = filter
+            .value
+            .iter()
+            .chain(filter.values.iter())
+            .collect::<Vec<_>>();
+        ensure!(
+            !values.is_empty(),
+            "scope filter requires an allowed chat id"
+        );
+        ensure!(
+            allowed
+                .is_some_and(|allowed| values.iter().all(|value| value.as_i64() == Some(allowed))),
+            "MCP query requested a chat outside the configured instance scope"
+        );
+    }
+    Ok(())
 }
 
 fn table<'a>(catalog: &'a PublicCatalog, name: &str) -> anyhow::Result<&'a CatalogTable> {
@@ -936,6 +971,7 @@ mod tests {
     use crate::features::chat_read_api::catalog::{
         CatalogColumn, CatalogScope, CatalogTable, PublicCatalog,
     };
+    use crate::features::chat_read_api::types::ChatReadScope;
 
     fn table(primary_key: &[&str]) -> CatalogTable {
         let mut columns = BTreeMap::new();
@@ -972,9 +1008,11 @@ mod tests {
             source_schema: "public".to_string(),
             public_schema: "mcp_public".to_string(),
             scope: CatalogScope {
+                instance_id: Some("test".to_string()),
                 discussion_chat_id: 1,
-                source_channel_id: 2,
+                source_channel_id: Some(2),
             },
+            runtime_scope: Some(ChatReadScope::new("test", 1, Some(2)).unwrap()),
             tables: BTreeMap::from([("test".to_string(), definition)]),
         }
     }
@@ -987,6 +1025,44 @@ mod tests {
             values,
             case_sensitive: false,
         }
+    }
+
+    #[test]
+    fn scope_filters_reject_forged_chat_ids_and_broad_operators() {
+        let scope = ChatReadScope::new("synthetic", -2001, Some(-2002)).unwrap();
+        assert!(
+            validate_scope_filters(
+                &scope,
+                &[filter("chat_id", FilterOp::Eq, Some(json!(-2003)), vec![])],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scope_filters(
+                &scope,
+                &[filter("chat_id", FilterOp::Ne, Some(json!(-2001)), vec![])],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scope_filters(
+                &scope,
+                &[filter(
+                    "source_channel_id",
+                    FilterOp::In,
+                    None,
+                    vec![json!(-2002), json!(-2003)]
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scope_filters(
+                &scope,
+                &[filter("chat_id", FilterOp::Eq, Some(json!(-2001)), vec![])],
+            )
+            .is_ok()
+        );
     }
 
     #[test]

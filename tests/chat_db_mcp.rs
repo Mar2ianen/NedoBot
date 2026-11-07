@@ -35,8 +35,8 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
             .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
         let manifest = manifest_path();
 
-        // McpClient clears the child environment. These are the only two inherited
-        // settings the real stdio server needs, so this also catches allowlist drift.
+        // McpClient clears the child environment. Database URL and manifest are
+        // inherited from the explicit allowlist; instance scope comes from Config.
         unsafe {
             std::env::set_var("ASK_DATABASE_URL", &database_url);
             std::env::set_var("MCP_MANIFEST", &manifest);

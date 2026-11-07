@@ -411,9 +411,13 @@ mod tests {
             source_schema: "public".into(),
             public_schema: "mcp_public".into(),
             scope: CatalogScope {
+                instance_id: Some("nedonews".into()),
                 discussion_chat_id: -1001932061163,
-                source_channel_id: -1001575496091,
+                source_channel_id: Some(-1001575496091),
             },
+            runtime_scope: Some(
+                ChatReadScope::new("nedonews", -1001932061163, Some(-1001575496091)).unwrap(),
+            ),
             tables: BTreeMap::from([(
                 "telegram_messages".into(),
                 CatalogTable {
@@ -436,8 +440,9 @@ mod tests {
         let api = ChatReadApi::new(
             pool,
             ChatReadScope {
+                instance_id: "nedonews".into(),
                 discussion_chat_id: -1001932061163,
-                source_channel_id: -1001575496091,
+                source_channel_id: Some(-1001575496091),
             },
             catalog,
         )

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
-use super::{policy, types::ChatReadScope};
+use super::types::ChatReadScope;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PublicCatalog {
@@ -19,12 +19,17 @@ pub struct PublicCatalog {
     pub(crate) public_schema: String,
     pub(crate) scope: CatalogScope,
     pub(crate) tables: BTreeMap<String, CatalogTable>,
+    #[serde(skip)]
+    pub(crate) runtime_scope: Option<ChatReadScope>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CatalogScope {
+    #[serde(default)]
+    pub(crate) instance_id: Option<String>,
     pub(crate) discussion_chat_id: i64,
-    pub(crate) source_channel_id: i64,
+    #[serde(default)]
+    pub(crate) source_channel_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,24 +44,41 @@ pub(crate) struct CatalogTable {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CatalogColumn {
     pub(crate) pg_type: String,
-    #[serde(default)]
     pub(crate) nullable: bool,
 }
 
 impl PublicCatalog {
-    pub fn load(path: &str) -> anyhow::Result<Self> {
+    pub fn load(path: &str, expected_scope: &ChatReadScope) -> anyhow::Result<Self> {
         let raw =
             fs::read_to_string(path).with_context(|| format!("cannot read MCP manifest {path}"))?;
-        let catalog: Self = toml::from_str(&raw).context("invalid MCP manifest TOML")?;
-        if catalog.version != 1
+        let mut catalog: Self = toml::from_str(&raw).context("invalid MCP manifest TOML")?;
+        if !matches!(catalog.version, 1 | 2)
             || catalog.source_schema != "public"
             || catalog.public_schema != "mcp_public"
-            || catalog.scope.discussion_chat_id != policy::DISCUSSION_CHAT_ID
-            || catalog.scope.source_channel_id != policy::SOURCE_CHANNEL_ID
             || catalog.tables.is_empty()
         {
             bail!("invalid MCP manifest metadata");
         }
+        if catalog.version == 2 && catalog.scope.instance_id.is_none() {
+            bail!("MCP manifest version 2 requires scope.instance_id");
+        }
+        if catalog
+            .scope
+            .instance_id
+            .as_deref()
+            .is_some_and(|instance_id| instance_id != expected_scope.instance_id)
+        {
+            bail!("MCP manifest instance does not match community configuration");
+        }
+        let manifest_scope = ChatReadScope::new(
+            expected_scope.instance_id.clone(),
+            catalog.scope.discussion_chat_id,
+            catalog.scope.source_channel_id,
+        )?;
+        if &manifest_scope != expected_scope {
+            bail!("MCP manifest scope does not match community configuration");
+        }
+        catalog.runtime_scope = Some(expected_scope.clone());
         for (table, definition) in &catalog.tables {
             ensure_identifier(table)?;
             if definition.columns.is_empty() || definition.primary_key.is_empty() {
@@ -77,10 +99,9 @@ impl PublicCatalog {
     }
 
     pub fn scope(&self) -> ChatReadScope {
-        ChatReadScope {
-            discussion_chat_id: self.scope.discussion_chat_id,
-            source_channel_id: self.scope.source_channel_id,
-        }
+        self.runtime_scope
+            .clone()
+            .expect("catalog scope is set during manifest loading")
     }
 
     /// Returns the reviewed public catalog without exposing its mutable internals.
@@ -118,7 +139,7 @@ impl PublicCatalog {
 
     pub async fn validate_views(&self, pool: &PgPool) -> anyhow::Result<()> {
         for (table, expected) in &self.tables {
-            let rows = sqlx::query("select column_name, data_type, udt_name from information_schema.columns where table_schema = 'mcp_public' and table_name = $1")
+            let rows = sqlx::query("select column_name, data_type, udt_name, is_nullable from information_schema.columns where table_schema = 'mcp_public' and table_name = $1")
                 .bind(table)
                 .fetch_all(pool)
                 .await?;
@@ -131,17 +152,68 @@ impl PublicCatalog {
                     let name: String = row.get("column_name");
                     let data_type: String = row.get("data_type");
                     let udt_name: String = row.get("udt_name");
-                    (name, normalize_pg_type(&data_type, &udt_name))
+                    let nullable: String = row.get("is_nullable");
+                    (
+                        name,
+                        (normalize_pg_type(&data_type, &udt_name), nullable == "YES"),
+                    )
                 })
                 .collect::<BTreeMap<_, _>>();
             if actual.len() != expected.columns.len() {
                 bail!("MCP manifest drift: unreviewed column in {table}");
             }
             for (column, expected_column) in &expected.columns {
-                if actual.get(column) != Some(&expected_column.pg_type) {
+                if actual.get(column)
+                    != Some(&(expected_column.pg_type.clone(), expected_column.nullable))
+                {
                     bail!("MCP manifest drift in {table}.{column}");
                 }
             }
+            let definition: Option<String> = sqlx::query_scalar(
+                "select pg_get_viewdef(format('%I.%I', 'mcp_public', $1)::regclass, true)",
+            )
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+            let definition = definition.ok_or_else(|| {
+                anyhow::anyhow!("required MCP view mcp_public.{table} is missing")
+            })?;
+            if !definition.contains("mcp_private.instance_scope") {
+                bail!("MCP view mcp_public.{table} is not bound to the database instance scope");
+            }
+        }
+        let media_definition: Option<String> = sqlx::query_scalar(
+            "select pg_get_viewdef('mcp_private.telegram_media'::regclass, true)",
+        )
+        .fetch_optional(pool)
+        .await
+        .context("required internal MCP media view mcp_private.telegram_media is missing")?;
+        if !media_definition
+            .as_deref()
+            .is_some_and(|definition| definition.contains("mcp_private.instance_scope"))
+        {
+            bail!("internal MCP media view is not bound to the database instance scope");
+        }
+        Ok(())
+    }
+
+    /// The database scope is the enforcement boundary used by every reviewed
+    /// view. A config/manifest mismatch prevents the server from advertising tools.
+    pub async fn validate_instance_scope(&self, pool: &PgPool) -> anyhow::Result<()> {
+        let configured_scope = self
+            .runtime_scope
+            .as_ref()
+            .context("MCP catalog has no runtime scope")?;
+        let matches: bool =
+            sqlx::query_scalar("select mcp_private.matches_instance_scope($1, $2, $3)")
+                .bind(&configured_scope.instance_id)
+                .bind(configured_scope.discussion_chat_id)
+                .bind(configured_scope.source_channel_id)
+                .fetch_one(pool)
+                .await
+                .context("MCP instance scope is not provisioned in this database")?;
+        if !matches {
+            bail!("MCP database scope does not match community configuration");
         }
         Ok(())
     }
@@ -240,6 +312,7 @@ mod tests {
     use std::io::Write;
 
     use super::{PublicCatalog, filter_operators};
+    use crate::features::chat_read_api::types::ChatReadScope;
 
     fn manifest(table: &str) -> String {
         format!(
@@ -258,6 +331,7 @@ primary_key = ["id"]
 
 [tables.{table}.columns.id]
 pg_type = "bigint"
+nullable = false
 "#
         )
     }
@@ -271,7 +345,8 @@ pg_type = "bigint"
                 .as_bytes(),
         )
         .unwrap();
-        let catalog = PublicCatalog::load(file.path().to_str().unwrap()).unwrap();
+        let scope = ChatReadScope::new("test", -1001932061163, Some(-1001575496091)).unwrap();
+        let catalog = PublicCatalog::load(file.path().to_str().unwrap(), &scope).unwrap();
         let description = catalog.describe_table("messages").unwrap();
         let operators = description["columns"][0]["filter_operators"]
             .as_array()
@@ -292,7 +367,8 @@ pg_type = "bigint"
                 .as_bytes(),
         )
         .unwrap();
-        assert!(PublicCatalog::load(file.path().to_str().unwrap()).is_err());
+        let scope = ChatReadScope::new("test", -1001932061163, Some(-1001575496091)).unwrap();
+        assert!(PublicCatalog::load(file.path().to_str().unwrap(), &scope).is_err());
     }
 
     #[test]
@@ -304,13 +380,15 @@ pg_type = "bigint"
                 .as_bytes(),
         )
         .unwrap();
-        assert!(PublicCatalog::load(file.path().to_str().unwrap()).is_err());
+        let scope = ChatReadScope::new("test", -1001932061163, Some(-1001575496091)).unwrap();
+        assert!(PublicCatalog::load(file.path().to_str().unwrap(), &scope).is_err());
     }
 
     #[test]
     fn committed_manifest_reviews_new_user_risk_columns() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/mcp_db_manifest.toml");
-        let catalog = PublicCatalog::load(path).unwrap();
+        let scope = ChatReadScope::new("nedonews", -1001932061163, Some(-1001575496091)).unwrap();
+        let catalog = PublicCatalog::load(path, &scope).unwrap();
         let audit = catalog
             .tables
             .get("telegram_new_user_profile_audits")

@@ -47,11 +47,12 @@ impl ChatReadApi {
     }
 
     pub async fn validate(&self) -> anyhow::Result<()> {
+        self.catalog.validate_instance_scope(&self.pool).await?;
         self.catalog.validate_views(&self.pool).await
     }
 
     pub fn scope(&self) -> ChatReadScope {
-        self.scope
+        self.scope.clone()
     }
 
     pub fn catalog(&self) -> &PublicCatalog {

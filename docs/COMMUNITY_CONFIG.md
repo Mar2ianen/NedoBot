@@ -108,3 +108,68 @@ cargo check --no-default-features --features "moderation,spam-sync" --all-target
 
 If a config enables a module that is absent from the binary, startup fails
 instead of silently ignoring that setting.
+
+## MCP для отдельного community instance
+
+Read-model scope берётся из authoritative community profile (`[instance].id`,
+primary `[chats.*].id` и source-channel активного route), а не из аргументов
+MCP-запроса. Каждому instance нужны отдельные PostgreSQL database, Telegram bot
+token, профиль и manifest. Не переиспользуйте NedoNews database, пользовательскую
+память или Telegram token для Linus AI. Числовые Telegram IDs Linus AI в коде и
+общем manifest не задаются: они читаются из его профиля.
+
+### Подготовка новой базы
+
+1. Создайте новую базу и отдельную read-only роль MCP до применения миграций.
+   Примените обычные миграции приложения, включая
+   `20261107150000_instance_scoped_mcp_views.sql`. Если роль `nedobot_mcp_ro`
+   уже существует в этой базе, миграции выдадут ей доступ только к reviewed
+   `mcp_public` views, `mcp_private.telegram_media` и функции проверки scope;
+   таблица `mcp_private.instance_scope` останется закрыта. Миграция сохраняет прежний
+   NedoNews scope при upgrade уже существующей базы; она не угадывает scope новой
+   базы. У новой базы должен быть собственный набор таблиц и reviewed views.
+2. Создайте отдельный LLM/community profile для Linus AI с уникальным
+   `[instance].id`, его discussion chat ID в primary `[chats.*]` и source channel
+   ID в route при наличии. Добавьте Telegram token в секретное окружение этой
+   установки; токены не помещайте в profile, manifest или репозиторий.
+3. Один раз provision-ите scope от имени владельца этой базы. Команда сверяет
+   конфигурацию, требует явное подтверждение смены scope и не выдаёт права на
+   таблицу scope read-only MCP роли:
+
+   ```bash
+   DATABASE_URL="$LINUS_DATABASE_URL" \
+   LLM_PROFILES_PATH=/etc/nedobot/linus/llm_profiles.toml \
+   cargo run --release --bin provision_mcp_instance_scope -- --confirm-scope-change
+   ```
+
+   На новой базе `--confirm-scope-change` обязателен после установки migration;
+   для совпадающего scope команда безопасно завершится без изменений. Перед
+   повторным запуском после смены профиля проверьте, что база действительно
+   принадлежит этому instance.
+4. Сгенерируйте и проверьте отдельный manifest на этой же базе и с тем же
+   профилем:
+
+   ```bash
+   DATABASE_URL="$LINUS_DATABASE_URL" \
+   LLM_PROFILES_PATH=/etc/nedobot/linus/llm_profiles.toml \
+   cargo run --release --bin generate_mcp_db_manifest -- \
+     config/mcp_db_manifest.linus.toml
+   ```
+
+   Manifest фиксирует scope и точные имена, типы и nullable-статус колонок.
+   Не коммитьте generated manifest, если он содержит приватную схему или данные;
+   сверяйте его с reviewed `mcp_public` контрактом.
+5. Запускайте bot и MCP с собственными `LLM_PROFILES_PATH` и database URL.
+   Internal stdio MCP получает `ASK_DATABASE_URL` и путь `MCP_MANIFEST` из
+   allowlist окружения приложения, а instance scope — из профиля родительского
+   бота, не из tool arguments. Для HTTP MCP задайте `ASK_DATABASE_URL`,
+   `LLM_PROFILES_PATH`, `MCP_MANIFEST` и собственный статический `MCP_PATH`
+   (например, `/mcp/linus-ai/v2`). Его read-only роль должна иметь доступ только
+   к reviewed `mcp_public` views и нужным безопасным внутренним функциям; права
+   на `public.*`, базовые таблицы и `mcp_private.instance_scope` не выдавайте.
+
+HTTP/public MCP по умолчанию выключен. Для отдельного публичного endpoint его
+можно включить только явным `[public_mcp] enabled = true` в профиле; HTTP
+bootstrap проверит профиль и совпадение профиля, manifest и database scope.
+Это отдельное решение о публикации содержимого сообщества, оно не включает
+публичный endpoint автоматически при запуске internal stdio MCP.

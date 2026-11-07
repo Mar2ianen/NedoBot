@@ -11,7 +11,7 @@ use crate::{
         catalog::PublicCatalog,
         types::{
             CHAT_EMBEDDING_MODEL_ENV, CHAT_EMBEDDING_QUERY_PREFIX_ENV, CHAT_EMBEDDING_TIMEOUT_ENV,
-            CHAT_EMBEDDING_URL_ENV, SemanticSearchConfig,
+            CHAT_EMBEDDING_URL_ENV, ChatReadScope, SemanticSearchConfig,
         },
     },
     mcp::server::ChatMcpServer,
@@ -20,11 +20,15 @@ use crate::{
 
 pub const DATABASE_URL_ENV: &str = "ASK_DATABASE_URL";
 pub const MANIFEST_PATH_ENV: &str = "MCP_MANIFEST";
+pub const INSTANCE_ID_ENV: &str = "MCP_INSTANCE_ID";
+pub const DISCUSSION_CHAT_ID_ENV: &str = "MCP_DISCUSSION_CHAT_ID";
+pub const SOURCE_CHANNEL_ID_ENV: &str = "MCP_SOURCE_CHANNEL_ID";
 
 /// Required runtime configuration for the standalone RMCP stdio server.
 pub struct RmcpStdioConfig {
     database_url: String,
     manifest_path: String,
+    scope: ChatReadScope,
     semantic_search: Option<SemanticSearchConfig>,
     youtube_subtitles: Option<YoutubeSubtitlesConfig>,
     telegram_media: Option<TelegramMediaConfig>,
@@ -36,19 +40,41 @@ impl RmcpStdioConfig {
         Self::new(
             required_env(DATABASE_URL_ENV)?,
             required_env(MANIFEST_PATH_ENV)?,
+            scope_from_env()?,
         )
     }
 
     /// Creates shared RMCP bootstrap settings after validating both required values.
-    pub fn new(database_url: String, manifest_path: String) -> anyhow::Result<Self> {
+    pub fn new(
+        database_url: String,
+        manifest_path: String,
+        scope: ChatReadScope,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             database_url: required_value(DATABASE_URL_ENV, database_url)?,
             manifest_path: required_value(MANIFEST_PATH_ENV, manifest_path)?,
+            scope,
             semantic_search: semantic_search_from_env()?,
             youtube_subtitles: YoutubeSubtitlesConfig::from_env()?,
             telegram_media: TelegramMediaConfig::from_env()?,
         })
     }
+}
+
+fn scope_from_env() -> anyhow::Result<ChatReadScope> {
+    let instance_id = required_env(INSTANCE_ID_ENV)?;
+    let discussion_chat_id = required_env(DISCUSSION_CHAT_ID_ENV)?
+        .parse::<i64>()
+        .with_context(|| format!("{DISCUSSION_CHAT_ID_ENV} must be an integer"))?;
+    let source_channel_id = env::var(SOURCE_CHANNEL_ID_ENV)
+        .ok()
+        .map(|value| {
+            value.parse::<i64>().with_context(|| {
+                format!("{SOURCE_CHANNEL_ID_ENV} must be an integer when provided")
+            })
+        })
+        .transpose()?;
+    ChatReadScope::new(instance_id, discussion_chat_id, source_channel_id)
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {
@@ -140,14 +166,10 @@ pub async fn build_readonly_pool(database_url: &str) -> anyhow::Result<PgPool> {
 
 /// Loads and validates the reviewed catalog before exposing any MCP tool.
 pub async fn build_chat_mcp_server(config: RmcpStdioConfig) -> anyhow::Result<ChatMcpServer> {
-    let catalog = PublicCatalog::load(&config.manifest_path)?;
+    let catalog = PublicCatalog::load(&config.manifest_path, &config.scope)?;
     let pool = build_readonly_pool(&config.database_url).await?;
-    let api = ChatReadApi::new_with_semantic_search(
-        pool,
-        catalog.scope(),
-        catalog,
-        config.semantic_search,
-    )?;
+    let api =
+        ChatReadApi::new_with_semantic_search(pool, config.scope, catalog, config.semantic_search)?;
     api.validate().await?;
     Ok(ChatMcpServer::new(Arc::new(api))
         .with_youtube_subtitles(config.youtube_subtitles)

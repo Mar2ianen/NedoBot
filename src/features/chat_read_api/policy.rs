@@ -1,4 +1,2 @@
-//! Константы публичного read-model scope.
-
-pub const DISCUSSION_CHAT_ID: i64 = -1001932061163;
-pub const SOURCE_CHANNEL_ID: i64 = -1001575496091;
+//! The scope is derived from `CommunityConfig`; this module intentionally has
+//! no compile-time community identifiers.
