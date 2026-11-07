@@ -55,6 +55,11 @@ reset_test_database() {
     podman exec "$CONTAINER_NAME" createdb \
         --username "$DATABASE_USER" \
         "$TEST_DATABASE_B"
+    podman exec "$CONTAINER_NAME" psql \
+        --username "$DATABASE_USER" \
+        --dbname postgres \
+        --set ON_ERROR_STOP=1 \
+        --command "do \$\$ begin if not exists (select from pg_roles where rolname = 'nedobot_mcp_ro') then create role nedobot_mcp_ro nologin; end if; end \$\$; grant nedobot_mcp_ro to $DATABASE_USER"
     echo "Local test databases $TEST_DATABASE and $TEST_DATABASE_B were recreated"
 }
 

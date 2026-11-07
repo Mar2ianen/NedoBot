@@ -42,6 +42,16 @@ jobs:
       - name: Check release installer isolation and concurrency
         run: python3 tests/release_install.py
 
+      - name: Prepare PostgreSQL integration databases and read-only role
+        env:
+          PGPASSWORD: tg_ai_bot_dev
+        run: |
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE tg_ai_bot_test_b'
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d tg_ai_bot_test -v ON_ERROR_STOP=1 \
+            -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'nedobot_mcp_ro') THEN CREATE ROLE nedobot_mcp_ro NOLOGIN; END IF; END \$\$" \
+            -c 'GRANT nedobot_mcp_ro TO tg_ai_bot_dev'
+
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
@@ -51,7 +61,10 @@ jobs:
       - name: Apply PostgreSQL migrations
         env:
           DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo run --bin migrate
+          TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
+        run: |
+          cargo run --bin migrate
+          DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --bin migrate
 
       - name: Run PostgreSQL integration tests
         env:
@@ -61,6 +74,7 @@ jobs:
       - name: Run RMCP PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+          TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
         run: cargo test --test chat_db_mcp -- --ignored
 
       - name: Run manual moderation PostgreSQL integration tests

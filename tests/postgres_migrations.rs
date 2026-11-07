@@ -4750,6 +4750,8 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
     let old_chat: i64 = old_scope.get("discussion_chat_id");
     let old_source: Option<i64> = old_scope.get("source_channel_id");
 
+    assert_mcp_readonly_role_permissions(pool, &old_instance, old_chat, old_source).await;
+
     tg_ai_bot_teloxide::features::chat_read_api::catalog::validate_public_view_scope(
         pool,
         "avatar_image_analyses",
@@ -4982,6 +4984,74 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
         .execute(&mut *provisioner)
         .await
         .expect("test provisioner lock must be released");
+}
+
+async fn assert_mcp_readonly_role_permissions(
+    pool: &PgPool,
+    instance_id: &str,
+    discussion_chat_id: i64,
+    source_channel_id: Option<i64>,
+) {
+    let role_exists: bool =
+        query_scalar("select exists (select 1 from pg_roles where rolname = 'nedobot_mcp_ro')")
+            .fetch_one(pool)
+            .await
+            .expect("MCP read-only role lookup must succeed");
+    assert!(
+        role_exists,
+        "test setup must create nedobot_mcp_ro before migrations"
+    );
+
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("MCP ACL test connection must be available");
+    query("set role nedobot_mcp_ro")
+        .execute(&mut *connection)
+        .await
+        .expect("test database owner must be allowed to assume MCP read-only role");
+    query_scalar::<_, i64>("select count(*) from mcp_public.telegram_messages")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("read-only MCP role must SELECT reviewed public views");
+    let scope_match: bool = query_scalar("select mcp_private.matches_instance_scope($1, $2, $3)")
+        .bind(instance_id)
+        .bind(discussion_chat_id)
+        .bind(source_channel_id)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("read-only MCP role must execute the scope-check function");
+    assert!(
+        scope_match,
+        "scope-check function must match configured scope"
+    );
+
+    let base_table_read = query_scalar::<_, i64>("select count(*) from public.telegram_messages")
+        .fetch_one(&mut *connection)
+        .await;
+    assert!(
+        base_table_read.is_err(),
+        "read-only MCP role must not read base tables"
+    );
+    let scope_table_read =
+        query_scalar::<_, i64>("select count(*) from mcp_private.instance_scope")
+            .fetch_one(&mut *connection)
+            .await;
+    assert!(
+        scope_table_read.is_err(),
+        "read-only MCP role must not read the scope table"
+    );
+    let base_table_write = query("delete from public.telegram_messages where false")
+        .execute(&mut *connection)
+        .await;
+    assert!(
+        base_table_write.is_err(),
+        "read-only MCP role must not write base tables"
+    );
+    query("reset role")
+        .execute(&mut *connection)
+        .await
+        .expect("MCP ACL test connection must return to owner role");
 }
 
 async fn assert_chat_search_quality_path(pool: &PgPool) {
