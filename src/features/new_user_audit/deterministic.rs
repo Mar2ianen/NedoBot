@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use teloxide_antispam::{preprocess::prepare_text, text::normalize_cyrillic_homoglyphs};
 
-pub(crate) const RULE_VERSION: &str = "new-user-features-v2";
+pub(crate) const RULE_VERSION: &str = "new-user-features-v3";
 const FEATURE_CONFIG: &str = include_str!("spam_features.toml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -747,6 +747,36 @@ mod tests {
     }
 
     #[test]
+    fn catches_casual_easy_task_with_large_immediate_payout_as_review_only() {
+        let message = "Сделать лёгкую тему 6500 сразу после, около часа, дай знать";
+        let campaign = classify_fresh(message).expect("missed casual paid task bait");
+        assert_eq!(
+            campaign.rule,
+            "fresh_casual_easy_task_with_immediate_payout"
+        );
+        assert_eq!(campaign.kind, CampaignKind::PaidShortTaskOffer);
+        assert!(!campaign.auto_ban_eligible);
+        assert_eq!(
+            campaign.score_signal()["label"],
+            "deterministic_campaign_review_candidate"
+        );
+    }
+
+    #[test]
+    fn casual_task_markers_need_amount_timing_and_contact_together() {
+        for message in [
+            "Надо сделать лёгкую тему, займёт около часа. Дай знать, если сможешь",
+            "6500 рублей за час работы — ставка по договору",
+            "Могу подсказать лёгкую тему, если интересно, дай знать",
+        ] {
+            assert!(
+                classify_fresh(message).is_none(),
+                "false positive: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn catches_repeated_free_audio_and_book_contact_campaigns() {
         for message in [
             "До жути понравилась книга «Время — деньги». Есть и в аудио, могу переслать, я сам и читал, и слушал.",
@@ -839,7 +869,7 @@ mod tests {
         );
         assert_eq!(
             campaign.score_signal()["feature_config_version"],
-            "new-user-features-v2"
+            "new-user-features-v3"
         );
         assert_eq!(
             campaign.score_signal()["label"],
