@@ -1,7 +1,24 @@
+use std::future::Future;
 use teloxide::types::{Message, MessageEntity, MessageEntityKind};
 
 use crate::state::TelegramBotIdentity;
 use sqlx::PgPool;
+
+/// Drops an in-flight generation immediately when its database lease is lost.
+pub async fn run_while_claimed<F>(
+    future: F,
+    mut lease_lost: tokio::sync::oneshot::Receiver<()>,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = &mut lease_lost => None,
+        result = &mut future => Some(result),
+    }
+}
 
 pub async fn claim_update(
     pool: &PgPool,
@@ -190,12 +207,41 @@ fn utf16_boundary(text: &str, target: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{invocation_question, utf16_range};
+    use super::{invocation_question, run_while_claimed, utf16_range};
     use crate::state::TelegramBotIdentity;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use teloxide::types::Message;
 
     fn message(value: serde_json::Value) -> Message {
         serde_json::from_value(value).expect("valid synthetic Telegram message")
+    }
+
+    #[tokio::test]
+    async fn losing_the_lease_cancels_the_in_flight_execution() {
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let was_dropped = Arc::new(AtomicBool::new(false));
+        let future_signal = Arc::clone(&was_dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let future = async move {
+            let _drop_signal = DropSignal(future_signal);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        };
+        let (lease_lost_tx, lease_lost_rx) = tokio::sync::oneshot::channel();
+        let execution = tokio::spawn(run_while_claimed(future, lease_lost_rx));
+        started_rx.await.unwrap();
+        lease_lost_tx.send(()).unwrap();
+        assert!(execution.await.unwrap().is_none());
+        assert!(was_dropped.load(Ordering::SeqCst));
     }
 
     fn identity() -> TelegramBotIdentity {

@@ -742,11 +742,13 @@ async fn handle_ask_command(
         return Ok(());
     };
     let (stop_heartbeat, mut heartbeat_stop) = tokio::sync::oneshot::channel();
+    let (lease_lost_tx, lease_lost_rx) = tokio::sync::oneshot::channel();
     let heartbeat_pool = state.pool.clone();
     let heartbeat_instance = instance_id.clone();
     let heartbeat_chat_id = msg.chat.id.0;
     let heartbeat_message_id = msg.id.0;
     let heartbeat = tokio::spawn(async move {
+        let mut lease_lost_tx = Some(lease_lost_tx);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -754,9 +756,17 @@ async fn handle_ask_command(
                         &heartbeat_pool, &heartbeat_instance, heartbeat_chat_id, heartbeat_message_id, claim_token,
                     ).await {
                         Ok(true) => {}
-                        Ok(false) => break,
+                        Ok(false) => {
+                            if let Some(sender) = lease_lost_tx.take() {
+                                let _ = sender.send(());
+                            }
+                            break;
+                        }
                         Err(error) => {
                             tracing::error!(%error, "failed to renew ask update idempotency lease");
+                            if let Some(sender) = lease_lost_tx.take() {
+                                let _ = sender.send(());
+                            }
                             break;
                         }
                     }
@@ -765,9 +775,32 @@ async fn handle_ask_command(
             }
         }
     });
-    let result = run_ask_command(bot, msg, state, question, claim_token).await;
+    let result = crate::features::ask::gateway::run_while_claimed(
+        run_ask_command(bot, msg, state, question, claim_token),
+        lease_lost_rx,
+    )
+    .await;
     let _ = stop_heartbeat.send(());
     let _ = heartbeat.await;
+    let Some(result) = result else {
+        tracing::error!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "cancelled ask generation after losing its idempotency lease"
+        );
+        if let Err(error) = crate::features::ask::gateway::release_update(
+            &state.pool,
+            instance_id,
+            msg.chat.id.0,
+            msg.id.0,
+            claim_token,
+        )
+        .await
+        {
+            tracing::warn!(%error, "could not release lost ask lease after cancelling generation");
+        }
+        return Ok(());
+    };
     let reservation_result = if result.is_ok() {
         crate::features::ask::gateway::complete_update(
             &state.pool,
@@ -851,11 +884,14 @@ async fn run_ask_command(
         release_ask_update(state, msg, claim_token).await;
         return Ok(());
     }
-    let scope_chat_id =
-        ask_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), private_scope_chat_id);
-    if config.mcp_read_scope_for_chat(scope_chat_id).is_err() {
+    let retrieval_scope_chat_id =
+        ask_retrieval_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), private_scope_chat_id);
+    if config
+        .mcp_read_scope_for_chat(retrieval_scope_chat_id)
+        .is_err()
+    {
         tracing::warn!(
-            scope_chat_id,
+            retrieval_scope_chat_id,
             "rejected /ask outside the configured primary MCP scope"
         );
         send_command_html(
@@ -932,10 +968,10 @@ async fn run_ask_command(
     } else {
         Vec::new()
     };
-    let reply_context = build_ask_reply_context(msg, scope_chat_id, &sandbox_files);
+    let reply_context = build_ask_reply_context(msg, retrieval_scope_chat_id, &sandbox_files);
     let input = AskCommandInput {
         chat_id: msg.chat.id.0,
-        scope_chat_id,
+        scope_chat_id: retrieval_scope_chat_id,
         command_message_id: msg.id.0,
         requester_user_id: user.id.0 as i64,
         requester_identity: requester_identity(user),
@@ -949,7 +985,7 @@ async fn run_ask_command(
     let ask_service = AskService::new(
         &state.pool,
         config,
-        scope_chat_id,
+        retrieval_scope_chat_id,
         &state.llm_formatter,
         &state.render_time,
     );
@@ -976,6 +1012,30 @@ async fn run_ask_command(
         }
     };
     drop(permit);
+    match crate::features::ask::gateway::renew_update(
+        &state.pool,
+        &state.config.community.instance.id,
+        msg.chat.id.0,
+        msg.id.0,
+        claim_token,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                message_id = msg.id.0,
+                "ask update lost its lease before delivery"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to fence ask answer delivery by lease ownership");
+            return Err(teloxide::RequestError::Io(
+                std::io::Error::other("ask delivery lease check failed").into(),
+            ));
+        }
+    }
     match answer {
         Ok(answer) => {
             let ask_run_id = answer.ask_run_id;
@@ -1094,15 +1154,25 @@ async fn handle_forget_command(
     if !config.ask_enabled || (!private_allowed && !chat_allowed) {
         return Ok(());
     }
-    let scope_chat_id = ask_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), default_chat);
-    if !msg.chat.is_private() && config.mcp_read_scope_for_chat(scope_chat_id).is_err() {
+    let retrieval_scope_chat_id =
+        ask_retrieval_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), default_chat);
+    if !msg.chat.is_private()
+        && config
+            .mcp_read_scope_for_chat(retrieval_scope_chat_id)
+            .is_err()
+    {
         send_command_html(bot, msg, state, "Не могу проверить область этого диалога.").await?;
         return Ok(());
     }
     let Some(profile) = config.agent_profile.as_ref() else {
         return Ok(());
     };
-    let thread_root_message_id = if let Some(reply) = msg.reply_to_message() {
+    // Private messages are never ingested into the group read model. Their
+    // memory is scoped to the actual DM chat with root 0, so /forget can never
+    // resolve a coincidentally equal group message ID.
+    let thread_root_message_id = if msg.chat.is_private() {
+        0
+    } else if let Some(reply) = msg.reply_to_message() {
         let root = sqlx::query_scalar::<_, i32>(
             r#"with recursive chain(message_id, reply_to_message_id, depth) as (
                    select message_id, reply_to_message_id, 0 from telegram_messages
@@ -1115,7 +1185,7 @@ async fn handle_forget_command(
                ) select message_id from chain where reply_to_message_id is null
                  order by depth desc limit 1"#,
         )
-        .bind(scope_chat_id)
+        .bind(retrieval_scope_chat_id)
         .bind(reply.id.0)
         .fetch_optional(&state.pool)
         .await;
@@ -1138,7 +1208,7 @@ async fn handle_forget_command(
     let mut scope = crate::features::ask::conversation_memory::ConversationScope {
         instance_id: config.community.instance.id.clone(),
         profile_key: profile.key.clone(),
-        chat_id: scope_chat_id,
+        chat_id: msg.chat.id.0,
         thread_root_message_id,
         participant_user_id: user.id.0 as i64,
         memory_epoch: 0,
@@ -1410,7 +1480,11 @@ fn build_ask_reply_context(
 }
 
 #[cfg(feature = "ask")]
-fn ask_scope_chat_id(chat_id: i64, is_private: bool, default_chat_id: Option<i64>) -> i64 {
+fn ask_retrieval_scope_chat_id(
+    chat_id: i64,
+    is_private: bool,
+    default_chat_id: Option<i64>,
+) -> i64 {
     if is_private {
         default_chat_id.unwrap_or(chat_id)
     } else {
@@ -1665,8 +1739,14 @@ mod tests {
     #[cfg(feature = "ask")]
     #[test]
     fn group_ask_uses_its_own_chat_and_rich_reply_is_visible() {
-        assert_eq!(ask_scope_chat_id(-100222, false, Some(-100111)), -100222);
-        assert_eq!(ask_scope_chat_id(42, true, Some(-100111)), -100111);
+        assert_eq!(
+            ask_retrieval_scope_chat_id(-100222, false, Some(-100111)),
+            -100222
+        );
+        assert_eq!(
+            ask_retrieval_scope_chat_id(42, true, Some(-100111)),
+            -100111
+        );
         let msg: Message = serde_json::from_value(serde_json::json!({
             "message_id":10,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},"text":"/ask и что?",
             "reply_to_message":{"message_id":9,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},

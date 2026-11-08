@@ -38,6 +38,9 @@ const MAX_CORRECTION_STEPS: usize = 3;
 
 pub struct AskRequest<'a> {
     pub reply_to_message_id: Option<i32>,
+    /// Telegram chat used only for participant conversation memory. MCP reads
+    /// continue to use `scope_chat_id`, which is the configured primary chat.
+    pub conversation_chat_id: i64,
     pub scope_chat_id: i64,
     pub command_message_id: i32,
     pub ask_run_id: Option<i64>,
@@ -170,6 +173,7 @@ async fn answer_within_deadline(
 ) -> anyhow::Result<AskAgentAnswer> {
     let AskRequest {
         reply_to_message_id,
+        conversation_chat_id,
         scope_chat_id,
         command_message_id,
         ask_run_id,
@@ -191,7 +195,7 @@ async fn answer_within_deadline(
     let mut conversation_scope = reply_to_message_id.is_none().then(|| ConversationScope {
         instance_id: config.community.instance.id.clone(),
         profile_key: profile.key.clone(),
-        chat_id: scope_chat_id,
+        chat_id: conversation_chat_id,
         thread_root_message_id: 0,
         participant_user_id: requester_user_id,
         memory_epoch: 0,
@@ -268,7 +272,7 @@ async fn answer_within_deadline(
                         let mut scope = ConversationScope {
                             instance_id: config.community.instance.id.clone(),
                             profile_key: profile.key.clone(),
-                            chat_id: scope_chat_id,
+                            chat_id: conversation_chat_id,
                             thread_root_message_id: root_message_id,
                             participant_user_id: requester_user_id,
                             memory_epoch: 0,
@@ -2517,6 +2521,7 @@ mod tests {
             &pool,
             AskRequest {
                 reply_to_message_id: None,
+                conversation_chat_id: config.discussion_chat_id,
                 command_message_id: 1,
                 ask_run_id: None,
                 requester_user_id,

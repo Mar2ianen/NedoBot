@@ -274,6 +274,10 @@ require `private_messages_enabled = true` and the existing explicit
 `ask_private_user_ids` allowlist, and use the configured `default_chat` scope.
 The agent never starts a conversation on its own. `/forget` clears only the
 requester's memory in the verified reply thread or their no-reply scope.
+Private Telegram messages are partitioned by their actual private chat ID;
+they never share group conversational memory. Since private messages are not
+part of the MCP group read model, `/forget` in a private chat clears that
+requester's private conversation scope without resolving a group message ID.
 
 The migration `20261108120000_ask_conversation_memory.sql` adds a private
 application table, absent from all `mcp_public` views. Apply ordinary migrations

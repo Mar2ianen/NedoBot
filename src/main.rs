@@ -442,17 +442,23 @@ async fn handle_message(
         tracing::debug!(chat_id = msg.chat.id.0, "ignored message from unknown chat");
         return Ok(());
     }
+    let mut message_ingested = false;
     if !msg.chat.is_private() {
         maybe_delete_join_leave_message(&bot, &msg, &state.config).await;
         match ingest_message(&state.pool, &msg, &state.config).await {
-            Ok(true) => {}
-            Ok(false) => return Ok(()),
+            Ok(true) => message_ingested = true,
+            // Ask activation is independently gated by ask_enabled and
+            // chats.<key>.ask, so ingest=false must not suppress an explicit
+            // mention or direct reply trigger.
+            Ok(false) => {}
             Err(err) => {
                 tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
                 return Ok(());
             }
         }
-        enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
+        if message_ingested {
+            enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
+        }
     }
 
     #[cfg(feature = "ask")]
@@ -477,6 +483,10 @@ async fn handle_message(
             telegram::command_handler::handle_gateway_ask(&bot, &msg, &state, &question).await?;
             return Ok(());
         }
+    }
+
+    if !message_ingested {
+        return Ok(());
     }
 
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
