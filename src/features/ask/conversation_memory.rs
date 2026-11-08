@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, types::Json};
+use std::collections::HashSet;
 
 use crate::features::ask::profile::AgentProfile;
 
@@ -16,6 +17,8 @@ pub struct ConversationScope {
     /// is additionally partitioned by participant_user_id.
     pub thread_root_message_id: i32,
     pub participant_user_id: i64,
+    /// Captured before generation; stale generations cannot write after /forget.
+    pub memory_epoch: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +46,7 @@ pub async fn load_recent(
     scope: &ConversationScope,
     exclude_command_message_id: i32,
     profile: &AgentProfile,
+    allowed_reply_to_ids: Option<&HashSet<i32>>,
 ) -> anyhow::Result<Vec<ConversationTurn>> {
     if !profile.memory.enabled {
         return Ok(Vec::new());
@@ -59,9 +63,10 @@ pub async fn load_recent(
             where instance_id = $1 and profile_key = $2 and chat_id = $3
               and thread_root_message_id = $4 and participant_user_id = $5
               and command_message_id <> $6
+              and ($7::integer[] is null or reply_to_message_id = any($7))
               and expires_at > now()
             order by created_at desc, command_message_id desc
-            limit $7
+            limit $8
         ) recent
         order by created_at asc, command_message_id asc
         "#,
@@ -72,6 +77,7 @@ pub async fn load_recent(
     .bind(scope.thread_root_message_id)
     .bind(scope.participant_user_id)
     .bind(exclude_command_message_id)
+    .bind(allowed_reply_to_ids.map(|ids| ids.iter().copied().collect::<Vec<_>>()))
     .bind(i64::try_from(profile.memory.max_turns).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await?;
@@ -116,6 +122,11 @@ pub async fn append_turn(
         .collect::<Vec<_>>();
     let mut transaction = pool.begin().await?;
     lock_scope(&mut transaction, scope).await?;
+    let current_epoch = read_epoch_in_transaction(&mut transaction, scope).await?;
+    if current_epoch != scope.memory_epoch {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
     let inserted = sqlx::query(
         r#"
         insert into ask_conversation_memory (
@@ -181,6 +192,22 @@ pub async fn append_turn(
 pub async fn forget_conversation(pool: &PgPool, scope: &ConversationScope) -> anyhow::Result<u64> {
     let mut transaction = pool.begin().await?;
     lock_scope(&mut transaction, scope).await?;
+    sqlx::query(
+        r#"
+        insert into ask_conversation_memory_epochs (
+            instance_id, profile_key, chat_id, thread_root_message_id, participant_user_id, epoch
+        ) values ($1, $2, $3, $4, $5, 1)
+        on conflict (instance_id, profile_key, chat_id, thread_root_message_id, participant_user_id)
+        do update set epoch = ask_conversation_memory_epochs.epoch + 1, updated_at = now()
+        "#,
+    )
+    .bind(&scope.instance_id)
+    .bind(&scope.profile_key)
+    .bind(scope.chat_id)
+    .bind(scope.thread_root_message_id)
+    .bind(scope.participant_user_id)
+    .execute(&mut *transaction)
+    .await?;
     let result = sqlx::query(
         r#"
         delete from ask_conversation_memory
@@ -199,12 +226,65 @@ pub async fn forget_conversation(pool: &PgPool, scope: &ConversationScope) -> an
     Ok(result.rows_affected())
 }
 
+pub async fn capture_epoch(pool: &PgPool, scope: &ConversationScope) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"
+        select coalesce((
+            select epoch from ask_conversation_memory_epochs
+            where instance_id = $1 and profile_key = $2 and chat_id = $3
+              and thread_root_message_id = $4 and participant_user_id = $5
+        ), 0)
+        "#,
+    )
+    .bind(&scope.instance_id)
+    .bind(&scope.profile_key)
+    .bind(scope.chat_id)
+    .bind(scope.thread_root_message_id)
+    .bind(scope.participant_user_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn read_epoch_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &ConversationScope,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"
+        select coalesce((
+            select epoch from ask_conversation_memory_epochs
+            where instance_id = $1 and profile_key = $2 and chat_id = $3
+              and thread_root_message_id = $4 and participant_user_id = $5
+        ), 0)
+        "#,
+    )
+    .bind(&scope.instance_id)
+    .bind(&scope.profile_key)
+    .bind(scope.chat_id)
+    .bind(scope.thread_root_message_id)
+    .bind(scope.participant_user_id)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
 /// Removes expired records across idle scopes, not just scopes receiving new turns.
 pub async fn purge_expired(pool: &PgPool) -> anyhow::Result<u64> {
-    let result = sqlx::query("delete from ask_conversation_memory where expires_at <= now()")
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    let mut transaction = pool.begin().await?;
+    let expired_turns =
+        sqlx::query("delete from ask_conversation_memory where expires_at <= now()")
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+    // Agent runs have a much shorter hard deadline; a week-old epoch cannot
+    // belong to a live request and can be discarded to bound tombstone growth.
+    let expired_epochs = sqlx::query(
+        "delete from ask_conversation_memory_epochs where updated_at < now() - interval '7 days'",
+    )
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    transaction.commit().await?;
+    Ok(expired_turns.saturating_add(expired_epochs))
 }
 
 async fn lock_scope(

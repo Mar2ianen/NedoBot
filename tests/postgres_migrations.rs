@@ -4002,6 +4002,7 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
         chat_id: -7_001,
         thread_root_message_id: 0,
         participant_user_id: 7_001,
+        memory_epoch: 0,
     };
     let scope_other_thread = ConversationScope {
         thread_root_message_id: 91,
@@ -4098,37 +4099,61 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
     // A new connection models process restart: the turn and provenance remain available.
     let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
     let restarted_pool = PgPool::connect(&database_url).await.unwrap();
-    let own = conversation_memory::load_recent(&restarted_pool, &scope_a, 71_004, &profile)
+    let own = conversation_memory::load_recent(&restarted_pool, &scope_a, 71_004, &profile, None)
         .await
         .unwrap();
     assert_eq!(own.len(), 1);
     assert_eq!(own[0].source_message_ids, [70_999]);
     assert_eq!(own[0].source_urls, ["https://example.test/source"]);
     assert!(
-        conversation_memory::load_recent(&restarted_pool, &scope_other_profile, 71_005, &profile)
-            .await
-            .unwrap()[0]
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_profile,
+            71_005,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
             .user_text
             .contains("Other profile")
     );
     assert!(
-        conversation_memory::load_recent(&restarted_pool, &scope_other_chat, 71_006, &profile)
-            .await
-            .unwrap()[0]
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_chat,
+            71_006,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
             .user_text
             .contains("Other chat")
     );
     assert!(
-        conversation_memory::load_recent(&restarted_pool, &scope_other_thread, 71_004, &profile)
-            .await
-            .unwrap()[0]
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_thread,
+            71_004,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
             .user_text
             .contains("Other reply branch")
     );
     assert!(
-        conversation_memory::load_recent(&restarted_pool, &scope_other_instance, 71_004, &profile)
-            .await
-            .unwrap()[0]
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_instance,
+            71_004,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
             .user_text
             .contains("Other instance")
     );
@@ -4150,7 +4175,7 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
             .unwrap();
     }
     let bounded =
-        conversation_memory::load_recent(&restarted_pool, &bounded_scope, 71_012, &profile)
+        conversation_memory::load_recent(&restarted_pool, &bounded_scope, 71_012, &profile, None)
             .await
             .unwrap();
     assert_eq!(bounded.len(), 1);
@@ -4191,10 +4216,16 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
         .unwrap();
     assert_eq!(forgotten, 1);
     assert_eq!(
-        conversation_memory::load_recent(&restarted_pool, &scope_other_instance, 71_004, &profile)
-            .await
-            .unwrap()
-            .len(),
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_instance,
+            71_004,
+            &profile,
+            None,
+        )
+        .await
+        .unwrap()
+        .len(),
         1,
         "forget only removes the exact instance/chat/thread/participant scope"
     );
@@ -4211,6 +4242,108 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
         .await
         .unwrap();
     conversation_memory::forget_conversation(&restarted_pool, &bounded_scope)
+        .await
+        .unwrap();
+
+    let reply_scope = ConversationScope {
+        thread_root_message_id: 90,
+        ..scope_a.clone()
+    };
+    for (id, reply_to, text) in [
+        (71_020, 12, "nested branch A"),
+        (71_021, 13, "nested branch B"),
+    ] {
+        let turn = ConversationTurn {
+            request_message_id: id,
+            reply_to_message_id: Some(reply_to),
+            user_text: text.to_owned(),
+            assistant_text: format!("answer {text}"),
+            source_message_ids: Vec::new(),
+            source_urls: Vec::new(),
+        };
+        conversation_memory::append_turn(&restarted_pool, &reply_scope, &turn, 30, 10)
+            .await
+            .unwrap();
+    }
+    let ancestry_a = [90, 11, 12].into_iter().collect();
+    let history_a = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_022,
+        &profile,
+        Some(&ancestry_a),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_a.len(), 1);
+    assert!(history_a[0].user_text.contains("branch A"));
+    let ancestry_b = [90, 11, 13].into_iter().collect();
+    let history_b = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_023,
+        &profile,
+        Some(&ancestry_b),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_b.len(), 1);
+    assert!(history_b[0].user_text.contains("branch B"));
+
+    let stale_turn = ConversationTurn {
+        request_message_id: 71_030,
+        user_text: "started before forget".to_owned(),
+        assistant_text: "must not return after forget".to_owned(),
+        ..first.clone()
+    };
+    let mut stale_scope = scope_a.clone();
+    stale_scope.memory_epoch = conversation_memory::capture_epoch(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    assert!(
+        conversation_memory::append_turn(&restarted_pool, &stale_scope, &stale_turn, 30, 10,)
+            .await
+            .unwrap()
+    );
+    conversation_memory::forget_conversation(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    assert!(
+        !conversation_memory::append_turn(&restarted_pool, &stale_scope, &stale_turn, 30, 10,)
+            .await
+            .unwrap()
+    );
+    assert!(
+        conversation_memory::load_recent(&restarted_pool, &scope_a, 71_031, &profile, None,)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut post_forget_scope = scope_a.clone();
+    post_forget_scope.memory_epoch = conversation_memory::capture_epoch(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    assert_eq!(post_forget_scope.memory_epoch, 2);
+    assert!(
+        conversation_memory::append_turn(
+            &restarted_pool,
+            &post_forget_scope,
+            &ConversationTurn {
+                request_message_id: 71_032,
+                user_text: "new request after forget".to_owned(),
+                assistant_text: "newly delivered answer".to_owned(),
+                ..first.clone()
+            },
+            30,
+            10,
+        )
+        .await
+        .unwrap()
+    );
+    conversation_memory::forget_conversation(&restarted_pool, &reply_scope)
+        .await
+        .unwrap();
+    conversation_memory::forget_conversation(&restarted_pool, &post_forget_scope)
         .await
         .unwrap();
 
@@ -5317,6 +5450,14 @@ async fn assert_mcp_readonly_role_permissions(
     assert!(
         conversation_memory_read.is_err(),
         "read-only MCP role must not read private conversational memory"
+    );
+    let conversation_epoch_read =
+        query_scalar::<_, i64>("select count(*) from public.ask_conversation_memory_epochs")
+            .fetch_one(&mut *connection)
+            .await;
+    assert!(
+        conversation_epoch_read.is_err(),
+        "read-only MCP role must not read private conversation forget epochs"
     );
     let base_table_write = query("delete from public.telegram_messages where false")
         .execute(&mut *connection)

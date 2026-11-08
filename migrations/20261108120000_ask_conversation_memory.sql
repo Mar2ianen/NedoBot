@@ -35,11 +35,30 @@ create index if not exists ask_conversation_memory_expiry_idx
 comment on table ask_conversation_memory is
     'Bounded private /ask conversational context; never publish through MCP views or treat as verified facts';
 
+create table if not exists ask_conversation_memory_epochs (
+    instance_id text not null,
+    profile_key text not null,
+    chat_id bigint not null,
+    thread_root_message_id integer not null,
+    participant_user_id bigint not null,
+    epoch bigint not null default 0 check (epoch >= 0),
+    updated_at timestamptz not null default now(),
+    primary key (instance_id, profile_key, chat_id, thread_root_message_id, participant_user_id)
+);
+
+create index if not exists ask_conversation_memory_epochs_updated_idx
+    on ask_conversation_memory_epochs (updated_at);
+
+comment on table ask_conversation_memory_epochs is
+    'Forget tombstones prevent in-flight /ask responses from restoring cleared conversation memory';
+
 revoke all on table ask_conversation_memory from public;
+revoke all on table ask_conversation_memory_epochs from public;
 do $$
 begin
     if exists (select 1 from pg_roles where rolname = 'nedobot_mcp_ro') then
         revoke all on table ask_conversation_memory from nedobot_mcp_ro;
+        revoke all on table ask_conversation_memory_epochs from nedobot_mcp_ro;
     end if;
 end
 $$;

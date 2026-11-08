@@ -194,6 +194,7 @@ async fn answer_within_deadline(
         chat_id: scope_chat_id,
         thread_root_message_id: 0,
         participant_user_id: requester_user_id,
+        memory_epoch: 0,
     });
     let mut conversation_history = Vec::new();
     report_progress(progress, AskProgress::Preparing);
@@ -261,21 +262,25 @@ async fn answer_within_deadline(
                         reply_ancestor_context(&result.value, message_id);
                     if memory_enabled
                         && ancestry_ids.contains(&message_id)
-                        && let Some(branch_message_id) =
-                            reply_memory_branch_id(&reply_history, message_id)
+                        && let Some(root_message_id) =
+                            reply_memory_root_id(&reply_history, message_id)
                     {
-                        let scope = ConversationScope {
+                        let mut scope = ConversationScope {
                             instance_id: config.community.instance.id.clone(),
                             profile_key: profile.key.clone(),
                             chat_id: scope_chat_id,
-                            thread_root_message_id: branch_message_id,
+                            thread_root_message_id: root_message_id,
                             participant_user_id: requester_user_id,
+                            memory_epoch: 0,
                         };
+                        scope.memory_epoch =
+                            conversation_memory::capture_epoch(pool, &scope).await?;
                         conversation_history = conversation_memory::load_recent(
                             pool,
                             &scope,
                             command_message_id,
                             profile,
+                            Some(&ancestry_ids),
                         )
                         .await?;
                         conversation_scope = Some(scope);
@@ -327,10 +332,12 @@ async fn answer_within_deadline(
 
     if memory_enabled
         && reply_to_message_id.is_none()
-        && let Some(scope) = conversation_scope.as_ref()
+        && let Some(scope) = conversation_scope.as_mut()
     {
+        scope.memory_epoch = conversation_memory::capture_epoch(pool, scope).await?;
         conversation_history =
-            conversation_memory::load_recent(pool, scope, command_message_id, profile).await?;
+            conversation_memory::load_recent(pool, scope, command_message_id, profile, None)
+                .await?;
     }
 
     let max_attempts = profile
@@ -1203,7 +1210,7 @@ fn reply_ancestor_context(value: &Value, target_message_id: i32) -> (Value, Hash
     )
 }
 
-fn reply_memory_branch_id(reply_history: &Value, target_message_id: i32) -> Option<i32> {
+fn reply_memory_root_id(reply_history: &Value, target_message_id: i32) -> Option<i32> {
     let path = reply_history.get("thread")?.as_array()?;
     let ids = path
         .iter()
@@ -1217,8 +1224,7 @@ fn reply_memory_branch_id(reply_history: &Value, target_message_id: i32) -> Opti
     if ids.last().copied() != Some(target_message_id) {
         return None;
     }
-    // The first child below the verified conversation root distinguishes sibling branches.
-    ids.get(1).copied().or_else(|| ids.first().copied())
+    ids.first().copied()
 }
 
 fn reply_thread_prefetch_allowed(profile: &AgentProfile) -> bool {
@@ -1958,20 +1964,16 @@ mod tests {
     }
 
     #[test]
-    fn sibling_reply_branches_have_distinct_memory_scopes() {
+    fn reply_memory_scope_uses_only_a_verified_chain_root() {
         let branch_a = json!({"thread":[
             {"message_id": 10}, {"message_id": 11}, {"message_id": 12}
         ]});
         let branch_b = json!({"thread":[
             {"message_id": 10}, {"message_id": 21}, {"message_id": 22}
         ]});
-        assert_eq!(reply_memory_branch_id(&branch_a, 12), Some(11));
-        assert_eq!(reply_memory_branch_id(&branch_b, 22), Some(21));
-        assert_ne!(
-            reply_memory_branch_id(&branch_a, 12),
-            reply_memory_branch_id(&branch_b, 22)
-        );
-        assert_eq!(reply_memory_branch_id(&branch_a, 12), Some(11));
+        assert_eq!(reply_memory_root_id(&branch_a, 12), Some(10));
+        assert_eq!(reply_memory_root_id(&branch_b, 22), Some(10));
+        assert_eq!(reply_memory_root_id(&branch_a, 11), None);
     }
 
     #[test]

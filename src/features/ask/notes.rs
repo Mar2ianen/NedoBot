@@ -168,10 +168,45 @@ pub fn explicit_note_is_safe(question: &str, note: &str) -> bool {
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .collect::<std::collections::HashSet<_>>();
-    note.to_lowercase()
+    let normalized_note_terms = note.to_lowercase();
+    let note_terms = normalized_note_terms
         .split(|character: char| !character.is_alphanumeric())
-        .filter(|token| token.chars().count() >= 3)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    note_terms
+        .iter()
         .all(|token| question_terms.contains(token))
+        && negation_signature(question) == negation_signature(note)
+}
+
+fn negation_signature(text: &str) -> Vec<String> {
+    const NEGATIONS: &[&str] = &[
+        "не",
+        "нет",
+        "никогда",
+        "ни",
+        "без",
+        "not",
+        "no",
+        "never",
+        "don't",
+        "dont",
+        "doesn't",
+        "doesnt",
+        "didn't",
+        "didnt",
+        "can't",
+        "cant",
+        "cannot",
+        "won't",
+        "wont",
+    ];
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric() && character != '\'')
+        .filter(|token| NEGATIONS.contains(token))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn secret_like_identifier(value: &str) -> bool {
@@ -232,6 +267,18 @@ mod tests {
         assert!(!explicit_note_is_safe(
             "Запомни мой API key abc-123",
             "мой API key abc-123"
+        ));
+        assert!(!explicit_note_is_safe(
+            "Запомни: я люблю Rust",
+            "я не люблю Rust"
+        ));
+        assert!(!explicit_note_is_safe(
+            "Запомни: я не люблю Rust",
+            "я люблю Rust"
+        ));
+        assert!(explicit_note_is_safe(
+            "Запомни: я не люблю Rust",
+            "не люблю Rust"
         ));
     }
 }

@@ -140,14 +140,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(pool, config);
     #[cfg(feature = "ask")]
-    if state
-        .config
-        .agent_profile
-        .as_ref()
-        .is_some_and(|profile| profile.memory.enabled)
-    {
-        spawn_ask_memory_expiry_worker(state.pool.clone());
-    }
+    spawn_ask_memory_expiry_worker(state.pool.clone());
     #[cfg(feature = "spam-sync")]
     let state = match spam_reputation_store {
         Some(store) => state.with_spam_reputation(store),
