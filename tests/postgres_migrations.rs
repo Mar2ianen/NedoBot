@@ -4265,7 +4265,7 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
             .await
             .unwrap();
     }
-    let ancestry_a = [90, 11, 12].into_iter().collect();
+    let ancestry_a = [90, 11, 12, 71_020].into_iter().collect();
     let history_a = conversation_memory::load_recent(
         &restarted_pool,
         &reply_scope,
@@ -4277,7 +4277,7 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
     .unwrap();
     assert_eq!(history_a.len(), 1);
     assert!(history_a[0].user_text.contains("branch A"));
-    let ancestry_b = [90, 11, 13].into_iter().collect();
+    let ancestry_b = [90, 11, 13, 71_021].into_iter().collect();
     let history_b = conversation_memory::load_recent(
         &restarted_pool,
         &reply_scope,
@@ -4289,6 +4289,49 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
     .unwrap();
     assert_eq!(history_b.len(), 1);
     assert!(history_b[0].user_text.contains("branch B"));
+
+    // Distinct /ask commands that reply to the same parent are not each
+    // other's ancestors; the command ID itself must be present in the chain.
+    for (id, text) in [
+        (71_024, "same-parent command A"),
+        (71_025, "same-parent command B"),
+    ] {
+        let turn = ConversationTurn {
+            request_message_id: id,
+            reply_to_message_id: Some(11),
+            user_text: text.to_owned(),
+            assistant_text: format!("answer {text}"),
+            source_message_ids: Vec::new(),
+            source_urls: Vec::new(),
+        };
+        conversation_memory::append_turn(&restarted_pool, &reply_scope, &turn, 30, 10)
+            .await
+            .unwrap();
+    }
+    let ancestry_command_a = [90, 11, 71_024].into_iter().collect();
+    let history_command_a = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_026,
+        &profile,
+        Some(&ancestry_command_a),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_command_a.len(), 1);
+    assert!(history_command_a[0].user_text.contains("command A"));
+    let ancestry_command_b = [90, 11, 71_025].into_iter().collect();
+    let history_command_b = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_027,
+        &profile,
+        Some(&ancestry_command_b),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_command_b.len(), 1);
+    assert!(history_command_b[0].user_text.contains("command B"));
 
     let stale_turn = ConversationTurn {
         request_message_id: 71_030,

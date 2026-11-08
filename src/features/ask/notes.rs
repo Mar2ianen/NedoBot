@@ -162,22 +162,43 @@ pub fn explicit_note_is_safe(question: &str, note: &str) -> bool {
     {
         return false;
     }
-    let question_terms = question
-        .to_lowercase()
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect::<std::collections::HashSet<_>>();
+    let normalized_question = question.to_lowercase();
     let normalized_note_terms = note.to_lowercase();
     let note_terms = normalized_note_terms
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    note_terms
-        .iter()
-        .all(|token| question_terms.contains(token))
-        && negation_signature(question) == negation_signature(note)
+    let mut clause = Vec::new();
+    for token in normalized_question.split(|character: char| !character.is_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if is_fact_clause_separator(token) {
+            if note_matches_clause(&clause, &note_terms, note) {
+                return true;
+            }
+            clause.clear();
+        } else {
+            clause.push(token.to_owned());
+        }
+    }
+    note_matches_clause(&clause, &note_terms, note)
+}
+
+fn is_fact_clause_separator(token: &str) -> bool {
+    matches!(
+        token,
+        "но" | "а" | "и" | "или" | "либо" | "but" | "and" | "or" | "however"
+    )
+}
+
+fn note_matches_clause(clause: &[String], note_terms: &[String], note: &str) -> bool {
+    !note_terms.is_empty()
+        && clause
+            .windows(note_terms.len())
+            .any(|window| window == note_terms)
+        && negation_signature(&clause.join(" ")) == negation_signature(note)
 }
 
 fn negation_signature(text: &str) -> Vec<String> {
@@ -280,5 +301,9 @@ mod tests {
             "Запомни: я не люблю Rust",
             "не люблю Rust"
         ));
+        let multi_fact_request = "Запомни: я не люблю Rust, но люблю Go";
+        assert!(explicit_note_is_safe(multi_fact_request, "не люблю Rust"));
+        assert!(explicit_note_is_safe(multi_fact_request, "люблю Go"));
+        assert!(!explicit_note_is_safe(multi_fact_request, "не люблю Go"));
     }
 }

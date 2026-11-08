@@ -46,7 +46,7 @@ pub async fn load_recent(
     scope: &ConversationScope,
     exclude_command_message_id: i32,
     profile: &AgentProfile,
-    allowed_reply_to_ids: Option<&HashSet<i32>>,
+    allowed_command_ids: Option<&HashSet<i32>>,
 ) -> anyhow::Result<Vec<ConversationTurn>> {
     if !profile.memory.enabled {
         return Ok(Vec::new());
@@ -63,7 +63,7 @@ pub async fn load_recent(
             where instance_id = $1 and profile_key = $2 and chat_id = $3
               and thread_root_message_id = $4 and participant_user_id = $5
               and command_message_id <> $6
-              and ($7::integer[] is null or reply_to_message_id = any($7))
+              and ($7::integer[] is null or command_message_id = any($7))
               and expires_at > now()
             order by created_at desc, command_message_id desc
             limit $8
@@ -77,7 +77,7 @@ pub async fn load_recent(
     .bind(scope.thread_root_message_id)
     .bind(scope.participant_user_id)
     .bind(exclude_command_message_id)
-    .bind(allowed_reply_to_ids.map(|ids| ids.iter().copied().collect::<Vec<_>>()))
+    .bind(allowed_command_ids.map(|ids| ids.iter().copied().collect::<Vec<_>>()))
     .bind(i64::try_from(profile.memory.max_turns).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await?;
