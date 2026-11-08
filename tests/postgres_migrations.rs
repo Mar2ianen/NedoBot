@@ -3994,6 +3994,103 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
 }
 
 async fn assert_ask_conversation_memory(pool: &PgPool) {
+    let invocation_instance = format!("gateway-test-{}", Uuid::new_v4());
+    let (first_claim, duplicate_claim) = tokio::join!(
+        tg_ai_bot_teloxide::features::ask::gateway::claim_update(
+            pool,
+            &invocation_instance,
+            -7001,
+            501
+        ),
+        tg_ai_bot_teloxide::features::ask::gateway::claim_update(
+            pool,
+            &invocation_instance,
+            -7001,
+            501
+        ),
+    );
+    let claims = [first_claim.unwrap(), duplicate_claim.unwrap()];
+    assert_eq!(
+        claims.iter().filter(|claimed| claimed.is_some()).count(),
+        1,
+        "concurrent duplicate Telegram updates must have exactly one claimant"
+    );
+    let token = claims.into_iter().flatten().next().unwrap();
+    assert!(
+        tg_ai_bot_teloxide::features::ask::gateway::renew_update(
+            pool,
+            &invocation_instance,
+            -7001,
+            501,
+            token,
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        tg_ai_bot_teloxide::features::ask::gateway::claim_update(
+            pool,
+            &invocation_instance,
+            -7001,
+            501
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "an in-flight update must not be claimed twice"
+    );
+    tg_ai_bot_teloxide::features::ask::gateway::complete_update(
+        pool,
+        &invocation_instance,
+        -7001,
+        501,
+        token,
+    )
+    .await
+    .unwrap();
+    assert!(
+        tg_ai_bot_teloxide::features::ask::gateway::claim_update(
+            pool,
+            &invocation_instance,
+            -7001,
+            501
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a completed update must remain idempotent"
+    );
+    let retry_token = tg_ai_bot_teloxide::features::ask::gateway::claim_update(
+        pool,
+        &invocation_instance,
+        -7001,
+        502,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tg_ai_bot_teloxide::features::ask::gateway::release_update(
+        pool,
+        &invocation_instance,
+        -7001,
+        502,
+        retry_token,
+    )
+    .await
+    .unwrap();
+    assert!(
+        tg_ai_bot_teloxide::features::ask::gateway::claim_update(
+            pool,
+            &invocation_instance,
+            -7001,
+            502
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "released failed work must be retryable"
+    );
+
     let instance_a = format!("memory-test-{}", Uuid::new_v4());
     let instance_b = format!("memory-test-b-{}", Uuid::new_v4());
     let scope_a = ConversationScope {
@@ -5501,6 +5598,14 @@ async fn assert_mcp_readonly_role_permissions(
     assert!(
         conversation_epoch_read.is_err(),
         "read-only MCP role must not read private conversation forget epochs"
+    );
+    let gateway_idempotency_read =
+        query_scalar::<_, i64>("select count(*) from public.ask_gateway_invocations")
+            .fetch_one(&mut *connection)
+            .await;
+    assert!(
+        gateway_idempotency_read.is_err(),
+        "read-only MCP role must not read private gateway idempotency records"
     );
     let base_table_write = query("delete from public.telegram_messages where false")
         .execute(&mut *connection)

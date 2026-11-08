@@ -189,6 +189,19 @@ pub struct AskConfig {
     /// Named operator-configured agent profile selected for this community.
     #[serde(default)]
     pub agent_profile: Option<String>,
+    #[serde(default)]
+    pub gateway: AskGatewayConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskGatewayConfig {
+    #[serde(default)]
+    pub mention_enabled: bool,
+    #[serde(default)]
+    pub reply_to_bot_enabled: bool,
+    #[serde(default)]
+    pub private_messages_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -524,7 +537,15 @@ impl Default for RuntimeSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatConfig, RuntimeSettings};
+    use super::{AskConfig, ChatConfig, RuntimeSettings};
+
+    #[test]
+    fn ask_gateway_modes_are_disabled_by_default() {
+        let gateway = AskConfig::default().gateway;
+        assert!(!gateway.mention_enabled);
+        assert!(!gateway.reply_to_bot_enabled);
+        assert!(!gateway.private_messages_enabled);
+    }
 
     #[test]
     fn moderation_message_deletion_is_disabled_when_omitted() {

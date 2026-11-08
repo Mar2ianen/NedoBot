@@ -218,6 +218,12 @@ ask = true
 enabled = true
 agent_profile = "agent_default"
 
+[ask.gateway]
+# Every trigger is disabled unless explicitly enabled here.
+mention_enabled = true
+reply_to_bot_enabled = true
+private_messages_enabled = false
+
 [agent_profiles.agent_default]
 identity = "Agent A"
 display_name = "Agent A"
@@ -257,6 +263,17 @@ bounded by `max_turns`, `max_context_chars` and `retention_days`;
 expired entries are removed during writes and excluded from reads. Diagnostic
 replay (`allow_mutations = false`) does not read or write conversational
 memory. Remembered text is always untrusted context, not a verified fact.
+
+With the opt-in gateway, a group message invokes the agent only when it has an
+exact Telegram `mention` entity for the bot username or directly replies to a
+message authored by the bot's authenticated `getMe` user ID. The bot removes
+only the matching mention entity. Ordinary messages and unknown slash commands
+do not invoke it. Activation is limited to chats with `ask = true`; the current
+MCP read model rejects secondary chats before generation. Private messages
+require `private_messages_enabled = true` and the existing explicit
+`ask_private_user_ids` allowlist, and use the configured `default_chat` scope.
+The agent never starts a conversation on its own. `/forget` clears only the
+requester's memory in the verified reply thread or their no-reply scope.
 
 The migration `20261108120000_ask_conversation_memory.sql` adds a private
 application table, absent from all `mcp_public` views. Apply ordinary migrations

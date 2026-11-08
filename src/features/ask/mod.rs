@@ -4,6 +4,7 @@ pub mod conversation_memory;
 pub use crate::features::ask_metrics as metrics;
 #[allow(unused_imports)]
 pub use crate::features::chat_search;
+pub mod gateway;
 pub mod mcp_client;
 pub mod notes;
 pub mod profile;

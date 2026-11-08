@@ -12,6 +12,19 @@ mod top_word_tests {
             Ok(Command::TopWord(args)) if args == "амудятел -p"
         ));
     }
+
+    #[cfg(feature = "ask")]
+    #[test]
+    fn forget_command_has_no_target_argument() {
+        assert!(matches!(
+            Command::parse("/forget", "nedobot"),
+            Ok(Command::Forget(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            Command::parse("/forget 123", "nedobot"),
+            Ok(Command::Forget(args)) if !args.is_empty()
+        ));
+    }
 }
 
 #[derive(BotCommands, Clone)]
@@ -36,6 +49,9 @@ pub enum Command {
     #[cfg(feature = "ask")]
     #[command(description = "спросить помощника по истории чата; /ask <вопрос>")]
     Ask(String),
+    #[cfg(feature = "ask")]
+    #[command(description = "забыть твою память этого диалога")]
+    Forget(String),
     #[cfg(feature = "ask")]
     #[command(description = "добавить общую заметку чата; /chat_note <текст>")]
     ChatNote(String),
