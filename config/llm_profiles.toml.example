@@ -546,7 +546,7 @@ tool_allowlist = [
   "chat.resolve_user", "chat.get_user_profile", "chat.count_messages",
   "chat.count_word_occurrences", "chat.search_messages", "chat.search_messages_batch",
   "chat.get_recent_messages", "chat.get_message", "chat.get_message_context",
-  "chat.get_reply_thread", "chat.get_user_interactions", "notes.list_chat",
+  "chat.get_reply_thread", "chat.get_user_interactions", "sandbox.python", "notes.list_chat",
   "notes.list_user", "notes.add_user", "web.search", "github.search"
 ]
 

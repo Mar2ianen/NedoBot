@@ -4,6 +4,8 @@ use sqlx::{FromRow, PgPool, types::Json};
 use crate::features::ask::profile::AgentProfile;
 
 const MAX_STORED_TURN_CHARS: usize = 16_000;
+const MAX_STORED_SOURCE_MESSAGE_IDS: usize = 256;
+const MAX_STORED_SOURCE_URLS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationScope {
@@ -45,6 +47,7 @@ pub async fn load_recent(
     if !profile.memory.enabled {
         return Ok(Vec::new());
     }
+    let _ = purge_expired(pool).await?;
     let rows = sqlx::query_as::<_, ConversationTurnRow>(
         r#"
         select command_message_id, reply_to_message_id, user_text, assistant_text,
@@ -56,9 +59,9 @@ pub async fn load_recent(
             where instance_id = $1 and profile_key = $2 and chat_id = $3
               and thread_root_message_id = $4 and participant_user_id = $5
               and command_message_id <> $6
-              and created_at >= now() - ($7::bigint * interval '1 day')
+              and expires_at > now()
             order by created_at desc, command_message_id desc
-            limit $8
+            limit $7
         ) recent
         order by created_at asc, command_message_id asc
         "#,
@@ -69,7 +72,6 @@ pub async fn load_recent(
     .bind(scope.thread_root_message_id)
     .bind(scope.participant_user_id)
     .bind(exclude_command_message_id)
-    .bind(i64::from(profile.memory.retention_days))
     .bind(i64::try_from(profile.memory.max_turns).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await?;
@@ -100,42 +102,37 @@ pub async fn append_turn(
         &turn.assistant_text,
         MAX_STORED_TURN_CHARS - user_text.chars().count(),
     );
+    let source_message_ids = turn
+        .source_message_ids
+        .iter()
+        .copied()
+        .take(MAX_STORED_SOURCE_MESSAGE_IDS)
+        .collect::<Vec<_>>();
+    let source_urls = turn
+        .source_urls
+        .iter()
+        .take(MAX_STORED_SOURCE_URLS)
+        .map(|url| truncate_text(url, 2048))
+        .collect::<Vec<_>>();
     let mut transaction = pool.begin().await?;
-    sqlx::query(
-        "select pg_advisory_xact_lock(hashtextextended($1 || ':' || $2 || ':' || $3::text || ':' || $4::text || ':' || $5::text, 0))",
-    )
-    .bind(&scope.instance_id)
-    .bind(&scope.profile_key)
-    .bind(scope.chat_id)
-    .bind(scope.thread_root_message_id)
-    .bind(scope.participant_user_id)
-    .execute(&mut *transaction)
-    .await?;
-    sqlx::query(
-        r#"
-        delete from ask_conversation_memory
-        where instance_id = $1 and profile_key = $2 and chat_id = $3 and thread_root_message_id = $4
-          and participant_user_id = $5
-          and created_at < now() - ($6::bigint * interval '1 day')
-        "#,
-    )
-    .bind(&scope.instance_id)
-    .bind(&scope.profile_key)
-    .bind(scope.chat_id)
-    .bind(scope.thread_root_message_id)
-    .bind(scope.participant_user_id)
-    .bind(i64::from(retention_days))
-    .execute(&mut *transaction)
-    .await?;
+    lock_scope(&mut transaction, scope).await?;
     let inserted = sqlx::query(
         r#"
         insert into ask_conversation_memory (
             instance_id, profile_key, chat_id, thread_root_message_id, participant_user_id,
             command_message_id, reply_to_message_id, user_text, assistant_text,
-            source_message_ids, source_urls
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            source_message_ids, source_urls, expires_at
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                  now() + ($12::bigint * interval '1 day'))
         on conflict (instance_id, profile_key, chat_id, thread_root_message_id,
-                     participant_user_id, command_message_id) do nothing
+                     participant_user_id, command_message_id) do update
+          set reply_to_message_id = excluded.reply_to_message_id,
+              user_text = excluded.user_text,
+              assistant_text = excluded.assistant_text,
+              source_message_ids = excluded.source_message_ids,
+              source_urls = excluded.source_urls,
+              created_at = now(), expires_at = excluded.expires_at
+          where ask_conversation_memory.expires_at <= now()
         "#,
     )
     .bind(&scope.instance_id)
@@ -147,8 +144,9 @@ pub async fn append_turn(
     .bind(turn.reply_to_message_id)
     .bind(user_text)
     .bind(assistant_text)
-    .bind(Json(&turn.source_message_ids))
-    .bind(Json(&turn.source_urls))
+    .bind(Json(&source_message_ids))
+    .bind(Json(&source_urls))
+    .bind(i64::from(retention_days))
     .execute(&mut *transaction)
     .await?
     .rows_affected()
@@ -181,6 +179,8 @@ pub async fn append_turn(
 
 /// Explicitly forgets one participant's history in one verified chat/thread.
 pub async fn forget_conversation(pool: &PgPool, scope: &ConversationScope) -> anyhow::Result<u64> {
+    let mut transaction = pool.begin().await?;
+    lock_scope(&mut transaction, scope).await?;
     let result = sqlx::query(
         r#"
         delete from ask_conversation_memory
@@ -193,9 +193,35 @@ pub async fn forget_conversation(pool: &PgPool, scope: &ConversationScope) -> an
     .bind(scope.chat_id)
     .bind(scope.thread_root_message_id)
     .bind(scope.participant_user_id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    transaction.commit().await?;
     Ok(result.rows_affected())
+}
+
+/// Removes expired records across idle scopes, not just scopes receiving new turns.
+pub async fn purge_expired(pool: &PgPool) -> anyhow::Result<u64> {
+    let result = sqlx::query("delete from ask_conversation_memory where expires_at <= now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn lock_scope(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &ConversationScope,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "select pg_advisory_xact_lock(hashtextextended($1 || ':' || $2 || ':' || $3::text || ':' || $4::text || ':' || $5::text, 0))",
+    )
+    .bind(&scope.instance_id)
+    .bind(&scope.profile_key)
+    .bind(scope.chat_id)
+    .bind(scope.thread_root_message_id)
+    .bind(scope.participant_user_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 pub fn bound_turns(

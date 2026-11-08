@@ -139,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState::new(pool, config);
+    #[cfg(feature = "ask")]
+    if state
+        .config
+        .agent_profile
+        .as_ref()
+        .is_some_and(|profile| profile.memory.enabled)
+    {
+        spawn_ask_memory_expiry_worker(state.pool.clone());
+    }
     #[cfg(feature = "spam-sync")]
     let state = match spam_reputation_store {
         Some(store) => state.with_spam_reputation(store),
@@ -216,6 +225,25 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+#[cfg(feature = "ask")]
+fn spawn_ask_memory_expiry_worker(pool: sqlx::PgPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            match features::ask::conversation_memory::purge_expired(&pool).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "purged expired /ask conversation memory turns");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to purge expired /ask conversation memory")
+                }
+            }
+        }
+    });
 }
 
 #[cfg(feature = "spam-sync")]

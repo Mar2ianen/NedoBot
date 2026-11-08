@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 #[cfg(feature = "ask")]
 use crate::features::ask::chat_search::message_url;
 #[cfg(feature = "ask")]
+use crate::features::ask::conversation_memory::append_turn as append_conversation_turn;
+#[cfg(feature = "ask")]
 use crate::features::ask::notes::{add_chat_note, add_user_note};
 #[cfg(feature = "ask")]
 use crate::features::ask::repo;
@@ -22,6 +24,7 @@ use crate::features::ask::service::AskService;
 #[cfg(feature = "ask")]
 use crate::features::ask::types::{
     AskCommandInput, AskFailureKind, AskProgress, AskRunStatus, AskSandboxFile,
+    PendingConversationMemory,
 };
 #[cfg(feature = "auto-comment")]
 use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_comment};
@@ -845,6 +848,8 @@ async fn handle_ask_command(
     drop(permit);
     match answer {
         Ok(answer) => {
+            let ask_run_id = answer.ask_run_id;
+            let pending_conversation_memory = answer.pending_conversation_memory;
             let rendered = answer.rendered;
             match drafter
                 .finish(rendered.rich_message.skip_entity_detection(true))
@@ -867,12 +872,13 @@ async fn handle_ask_command(
                     }
                     record_ask_delivery(
                         state,
-                        answer.ask_run_id,
+                        ask_run_id,
                         AskRunStatus::Completed,
                         "rich_delivered",
                         None,
                     )
                     .await;
+                    commit_delivered_conversation_memory(state, pending_conversation_memory).await;
                     Ok(())
                 }
                 Err(err) => {
@@ -880,9 +886,12 @@ async fn handle_ask_command(
                         bot,
                         msg,
                         state,
-                        answer.ask_run_id,
-                        AskRunStatus::Completed,
-                        &rendered.fallback_text,
+                        ask_run_id,
+                        AskFallback {
+                            status: AskRunStatus::Completed,
+                            text: rendered.fallback_text.clone(),
+                            pending_conversation_memory,
+                        },
                         err,
                     )
                     .await
@@ -917,8 +926,11 @@ async fn handle_ask_command(
                         msg,
                         state,
                         ask_run_id,
-                        AskRunStatus::Failed,
-                        failure_message,
+                        AskFallback {
+                            status: AskRunStatus::Failed,
+                            text: failure_message.to_owned(),
+                            pending_conversation_memory: None,
+                        },
                         finish_err,
                     )
                     .await
@@ -951,13 +963,19 @@ fn finish_error_certainty<E>(error: &DraftFinishError<E>) -> DeliveryCertainty {
 }
 
 #[cfg(feature = "ask")]
+struct AskFallback {
+    status: AskRunStatus,
+    text: String,
+    pending_conversation_memory: Option<PendingConversationMemory>,
+}
+
+#[cfg(feature = "ask")]
 async fn fallback_after_finish_error(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     command: &Message,
     state: &AppState,
     ask_run_id: Option<i64>,
-    fallback_status: AskRunStatus,
-    fallback_text: &str,
+    fallback: AskFallback,
     error: DraftFinishError<teloxide::drafter::DrafterRequestError>,
 ) -> ResponseResult<()> {
     let certainty = finish_error_certainty(&error);
@@ -973,14 +991,42 @@ async fn fallback_after_finish_error(
     }
     apply_finish_error_policy(
         certainty,
-        fallback_status,
-        || send_ask_fallback(bot, command, state, fallback_text),
+        fallback.status,
+        || async {
+            let sent = send_ask_fallback(bot, command, state, &fallback.text).await;
+            if sent.is_ok() {
+                commit_delivered_conversation_memory(state, fallback.pending_conversation_memory)
+                    .await;
+            }
+            sent
+        },
         || state.ask_delivery_metrics.record_unknown_delivery_failure(),
         |status, outcome, certainty| {
             record_ask_delivery(state, ask_run_id, status, outcome, certainty)
         },
     )
     .await
+}
+
+#[cfg(feature = "ask")]
+async fn commit_delivered_conversation_memory(
+    state: &AppState,
+    pending: Option<PendingConversationMemory>,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if let Err(error) = append_conversation_turn(
+        &state.pool,
+        &pending.scope,
+        &pending.turn,
+        pending.retention_days,
+        pending.max_turns,
+    )
+    .await
+    {
+        tracing::error!(%error, "failed to persist delivered ask conversation turn");
+    }
 }
 
 #[cfg(feature = "ask")]

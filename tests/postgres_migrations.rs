@@ -19,7 +19,7 @@ use tg_ai_bot_teloxide::{
     features::{
         ask::{
             conversation_memory::{self, ConversationScope, ConversationTurn},
-            notes::add_user_note_from_search,
+            notes::{add_user_note_from_explicit_request, add_user_note_from_search},
             profile::AgentProfile,
         },
         ask::{
@@ -4157,21 +4157,33 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
     assert_eq!(bounded[0].request_message_id, 71_011);
     profile.memory.max_turns = 10;
 
-    let aged: i64 = query(
-        "update ask_conversation_memory set created_at = now() - interval '31 days' where instance_id = $1 and command_message_id = $2",
+    let aged = query(
+        "update ask_conversation_memory set expires_at = now() - interval '1 second' where instance_id = $1 and command_message_id = $2",
     )
     .bind(&instance_a)
     .bind(first.request_message_id)
     .execute(&restarted_pool)
     .await
     .unwrap()
-    .rows_affected() as i64;
-    assert_eq!(aged, 1);
-    assert!(
-        conversation_memory::load_recent(&restarted_pool, &scope_a, 71_004, &profile)
+    ;
+    assert_eq!(aged.rows_affected(), 1);
+    assert_eq!(
+        conversation_memory::purge_expired(&restarted_pool)
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        1
+    );
+    let expired_count: i64 = query_scalar(
+        "select count(*) from ask_conversation_memory where instance_id = $1 and command_message_id = $2",
+    )
+    .bind(&instance_a)
+    .bind(first.request_message_id)
+    .fetch_one(&restarted_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        expired_count, 0,
+        "expiry cleanup physically deletes idle rows"
     );
 
     let forgotten = conversation_memory::forget_conversation(&restarted_pool, &scope_other_thread)
@@ -4199,6 +4211,47 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
         .await
         .unwrap();
     conversation_memory::forget_conversation(&restarted_pool, &bounded_scope)
+        .await
+        .unwrap();
+
+    let explicit_request_id = 71_099;
+    let note_user_id = 700_000_000_000 + (Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Explicit note test')")
+        .bind(note_user_id)
+        .execute(&restarted_pool)
+        .await
+        .unwrap();
+    add_user_note_from_explicit_request(
+        &restarted_pool,
+        scope_a.chat_id,
+        note_user_id,
+        note_user_id,
+        "предпочитаю короткие ответы",
+        "Запомни: я предпочитаю короткие ответы",
+        explicit_request_id,
+    )
+    .await
+    .unwrap();
+    let explicit_source: serde_json::Value = query_scalar(
+        "select source_message_ids from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and note = $3",
+    )
+    .bind(scope_a.chat_id)
+    .bind(note_user_id)
+    .bind("предпочитаю короткие ответы")
+    .fetch_one(&restarted_pool)
+    .await
+    .unwrap();
+    assert_eq!(explicit_source, serde_json::json!([explicit_request_id]));
+    query("delete from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and note = $3")
+        .bind(scope_a.chat_id)
+        .bind(note_user_id)
+        .bind("предпочитаю короткие ответы")
+        .execute(&restarted_pool)
+        .await
+        .unwrap();
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(note_user_id)
+        .execute(&restarted_pool)
         .await
         .unwrap();
     restarted_pool.close().await;

@@ -1,6 +1,8 @@
 use serde_json::Value;
 use teloxide::utils::rich_text::RenderedMessage;
 
+use crate::features::ask::conversation_memory::{ConversationScope, ConversationTurn};
+
 #[derive(Clone, Debug)]
 pub struct AskSandboxFile {
     pub name: String,
@@ -37,6 +39,14 @@ pub struct AskAnswer {
     pub markdown: String,
     pub rendered: RenderedMessage,
     pub ask_run_id: Option<i64>,
+    pub pending_conversation_memory: Option<PendingConversationMemory>,
+}
+
+pub struct PendingConversationMemory {
+    pub scope: ConversationScope,
+    pub turn: ConversationTurn,
+    pub retention_days: u32,
+    pub max_turns: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

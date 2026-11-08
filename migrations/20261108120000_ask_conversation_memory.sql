@@ -16,6 +16,7 @@ create table if not exists ask_conversation_memory (
     source_urls jsonb not null default '[]'::jsonb
         check (jsonb_typeof(source_urls) = 'array'),
     created_at timestamptz not null default now(),
+    expires_at timestamptz not null,
     primary key (
         instance_id, profile_key, chat_id, thread_root_message_id,
         participant_user_id, command_message_id
@@ -27,6 +28,9 @@ create index if not exists ask_conversation_memory_recent_idx
         instance_id, profile_key, chat_id, thread_root_message_id, participant_user_id,
         created_at desc, command_message_id desc
     );
+
+create index if not exists ask_conversation_memory_expiry_idx
+    on ask_conversation_memory (expires_at);
 
 comment on table ask_conversation_memory is
     'Bounded private /ask conversational context; never publish through MCP views or treat as verified facts';

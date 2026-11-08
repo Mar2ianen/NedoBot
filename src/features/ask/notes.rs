@@ -50,6 +50,29 @@ pub async fn add_user_note_from_search(
     Ok(())
 }
 
+pub async fn add_user_note_from_explicit_request(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+    author_id: i64,
+    note: &str,
+    question: &str,
+    command_message_id: i32,
+) -> anyhow::Result<()> {
+    if !explicit_note_is_safe(question, note) {
+        anyhow::bail!("explicit note is not supported by a safe memory request");
+    }
+    add_user_note_from_search(
+        pool,
+        chat_id,
+        user_id,
+        author_id,
+        note,
+        &[command_message_id],
+    )
+    .await
+}
+
 pub fn explicit_memory_request(question: &str) -> bool {
     let normalized = question
         .trim()
@@ -110,6 +133,20 @@ pub fn explicit_note_is_safe(question: &str, note: &str) -> bool {
         "political",
         "сексуал",
         "sexual",
+        "api key",
+        "api-key",
+        "api_key",
+        "api token",
+        "auth token",
+        "access token",
+        "refresh token",
+        "token",
+        "bearer",
+        "secret",
+        "секрет",
+        "токен",
+        "ключ api",
+        "api ключ",
     ];
     let normalized_note = note.to_lowercase();
     if sensitive_markers
@@ -117,7 +154,11 @@ pub fn explicit_note_is_safe(question: &str, note: &str) -> bool {
         .any(|marker| normalized_note.contains(marker))
         || note
             .split(|character: char| !character.is_alphanumeric())
-            .any(|token| token.chars().filter(char::is_ascii_digit).count() >= 7)
+            .any(|token| {
+                let digits = token.chars().filter(char::is_ascii_digit).count();
+                token.chars().count() >= 7 && digits >= 3
+            })
+        || note.split_whitespace().any(secret_like_identifier)
     {
         return false;
     }
@@ -131,6 +172,17 @@ pub fn explicit_note_is_safe(question: &str, note: &str) -> bool {
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| token.chars().count() >= 3)
         .all(|token| question_terms.contains(token))
+}
+
+fn secret_like_identifier(value: &str) -> bool {
+    let value = value.trim_matches(|character: char| !character.is_alphanumeric());
+    let has_separator = value.contains('-') || value.contains('_');
+    has_separator
+        && value.chars().count() >= 6
+        && value
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+        && value.chars().any(|character| character.is_ascii_digit())
 }
 
 fn normalize_note(note: &str) -> anyhow::Result<String> {
@@ -172,6 +224,14 @@ mod tests {
         assert!(!explicit_note_is_safe(
             "Запомни мой номер телефона 123456789",
             "номер телефона 123456789"
+        ));
+        assert!(!explicit_note_is_safe(
+            "Запомни мой тестовый идентификатор abc-123",
+            "тестовый идентификатор abc-123"
+        ));
+        assert!(!explicit_note_is_safe(
+            "Запомни мой API key abc-123",
+            "мой API key abc-123"
         ));
     }
 }
