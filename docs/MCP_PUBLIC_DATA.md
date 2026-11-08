@@ -1,10 +1,10 @@
 # Публичный data surface MCP
 
-Этот документ — human-readable inventory текущего `mcp_public` read-model. Он сгенерирован по [`config/mcp_db_manifest.toml`](../config/mcp_db_manifest.toml) (manifest version 1, `generated_at = 2026-07-17T18:14:36.178064522+00:00`); manifest остаётся исчерпывающим машиночитаемым источником имён колонок, PostgreSQL-типов и nullable-статуса.
+Этот документ — human-readable inventory текущего `mcp_public` read-model. Он описывает reviewed NedoNews projection; [`config/mcp_db_manifest.toml`](../config/mcp_db_manifest.toml) — его машиночитаемый источник имён колонок, PostgreSQL-типов, nullable-статуса и scope. Для каждого другого instance manifest генерируется отдельно по его профилю и базе.
 
 ## Границы публикации
 
-- Scope сообщений: `discussion_chat_id = -1001932061163`; одного совпадения `source_channel_id` недостаточно.
+- Scope сообщений задаёт одна строка `mcp_private.instance_scope` конкретной базы. Для этой копии manifest (`nedonews`) это `discussion_chat_id = -1001932061163`; одного совпадения `source_channel_id` недостаточно.
 - MCP принимает только структурированные read-only tools и только view из manifest: произвольного SQL, write-операций и доступа к `public.*` нет.
 - Новая колонка базовой таблицы не становится публичной автоматически: её нужно явно добавить в view, regenerated manifest и этот inventory отдельным review.
 - Поля с текстом, заметками, ASR-расшифровками, результатами `/ask` и unified антиспам-аудитом являются частью опубликованного contract. Потребитель обязан считать их данными публичного чата и не использовать для идентификации или профилирования вне назначения endpoint.
@@ -60,5 +60,12 @@ Telegram `file_id`, используемый для скачивания вло�
 cargo run --release --bin generate_mcp_db_manifest -- config/mcp_db_manifest.toml
 git diff -- config/mcp_db_manifest.toml
 ```
+
+Новая migration `20261107150000_instance_scoped_mcp_views.sql` переводит
+существующие reviewed views с исторических NedoNews literals на scope текущей
+базы. Исторические migrations не редактируются. Для новой установки сначала
+примените migration, затем provision-ите scope из community profile и
+сгенерируйте отдельный manifest; полный порядок для отдельного instance описан в
+[Community configuration](COMMUNITY_CONFIG.md#mcp-для-отдельного-community-instance).
 
 После review manifest обновить эту таблицу, README и раздел [«Публичный Read-only MCP»](TECHNICAL.md#публичный-read-only-mcp). Не публиковать новый view или колонку вместе с несвязанным рефакторингом transport-а.

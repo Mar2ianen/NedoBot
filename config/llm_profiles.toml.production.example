@@ -438,7 +438,7 @@ invite_url_env = "CHAT_INVITE_URL"
 prompt_profile = "nedonews"
 
 [public_mcp]
-enabled = false
+enabled = true
 
 [risk_profiles.ru_general_v1]
 version = "ru-general-v1"

@@ -1,10 +1,13 @@
-use std::{collections::BTreeSet, future::Future, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, future::Future, path::PathBuf, process::Output, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use sqlx::{postgres::PgPoolOptions, query};
 use tg_ai_bot_teloxide::{config::Config, features::ask::mcp_client::McpClient};
 
 const E2E_TIMEOUT: Duration = Duration::from_secs(10);
+const TWO_INSTANCE_TIMEOUT: Duration = Duration::from_secs(120);
+static MCP_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn within_timeout<T>(scenario: &str, future: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(E2E_TIMEOUT, future)
@@ -30,13 +33,14 @@ async fn call_object(client: &McpClient, tool: &str, arguments: Value) -> Result
 #[ignore = "requires TEST_DATABASE_URL and a migrated local PostgreSQL database"]
 #[tokio::test]
 async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -> Result<()> {
+    let _env_guard = MCP_TEST_ENV_LOCK.lock().await;
     within_timeout("McpClient real RMCP child lifecycle", async {
         let database_url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
         let manifest = manifest_path();
 
-        // McpClient clears the child environment. These are the only two inherited
-        // settings the real stdio server needs, so this also catches allowlist drift.
+        // McpClient clears the child environment. Database URL and manifest are
+        // inherited from the explicit allowlist; instance scope comes from Config.
         unsafe {
             std::env::set_var("ASK_DATABASE_URL", &database_url);
             std::env::set_var("MCP_MANIFEST", &manifest);
@@ -190,4 +194,400 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         Ok(())
     })
     .await
+}
+
+#[ignore = "requires two clean migrated TEST_DATABASE_URL instances and local MCP binaries"]
+#[tokio::test]
+async fn independent_community_databases_generate_manifests_and_start_isolated_mcp_servers()
+-> Result<()> {
+    let _env_guard = MCP_TEST_ENV_LOCK.lock().await;
+    tokio::time::timeout(TWO_INSTANCE_TIMEOUT, async {
+        let database_a = std::env::var("TEST_DATABASE_URL")
+            .context("TEST_DATABASE_URL must be set by scripts/test.sh")?;
+        let database_b = std::env::var("TEST_DATABASE_URL_B")
+            .context("TEST_DATABASE_URL_B must be set by scripts/test.sh")?;
+        let temp = tempfile::tempdir()?;
+        let profile_a =
+            write_instance_profile(temp.path(), "community_a", -900_000_101, -900_000_102)?;
+        let profile_b =
+            write_instance_profile(temp.path(), "community_b", -900_000_201, -900_000_202)?;
+        let manifest_a = temp.path().join("community_a_manifest.toml");
+        let manifest_b = temp.path().join("community_b_manifest.toml");
+
+        provision_instance(&database_a, &profile_a).await?;
+        provision_instance(&database_b, &profile_b).await?;
+        generate_manifest(&database_a, &profile_a, &manifest_a).await?;
+        generate_manifest(&database_b, &profile_b, &manifest_b).await?;
+
+        let user_a = unique_user_id();
+        let user_b = unique_user_id();
+        let message_id_a = unique_message_id();
+        let message_id_b = unique_message_id();
+        let marker_a = format!("community-a-marker-{}", uuid::Uuid::new_v4());
+        let marker_b = format!("community-b-marker-{}", uuid::Uuid::new_v4());
+        seed_instance_data(
+            &database_a,
+            -900_000_101,
+            message_id_a,
+            user_a,
+            &marker_a,
+            "community-a-chat-note",
+            "community-a-user-note",
+        )
+        .await?;
+        seed_instance_data(
+            &database_b,
+            -900_000_201,
+            message_id_b,
+            user_b,
+            &marker_b,
+            "community-b-chat-note",
+            "community-b-user-note",
+        )
+        .await?;
+
+        let config_a = config_for_instance(&profile_a, &database_a, &manifest_a)?;
+        ensure!(
+            McpClient::start_for_scope(&config_a, -900_000_102)
+                .await
+                .is_err(),
+            "/ask must reject a secondary chat before starting MCP retrieval"
+        );
+        let client_a = McpClient::start_for_scope(&config_a, -900_000_101).await?;
+        let config_b = config_for_instance(&profile_b, &database_b, &manifest_b)?;
+        let client_b = McpClient::start_for_scope(&config_b, -900_000_201).await?;
+        ensure!(client_a.has_tool("chat.search_messages"));
+        ensure!(client_b.has_tool("chat.search_messages"));
+
+        assert_instance_reads(
+            &client_a,
+            &marker_a,
+            user_a,
+            "community-a-chat-note",
+            "community-a-user-note",
+        )
+        .await?;
+        assert_instance_reads(
+            &client_b,
+            &marker_b,
+            user_b,
+            "community-b-chat-note",
+            "community-b-user-note",
+        )
+        .await?;
+        assert_instance_hides(
+            &client_a,
+            &marker_b,
+            user_b,
+            "community-b-chat-note",
+            "community-b-user-note",
+        )
+        .await?;
+        assert_instance_hides(
+            &client_b,
+            &marker_a,
+            user_a,
+            "community-a-chat-note",
+            "community-a-user-note",
+        )
+        .await?;
+        let cross_search = call_object(
+            &client_a,
+            "chat.search_messages",
+            json!({"query": marker_b, "match_mode": "literal", "limit": 5}),
+        )
+        .await?;
+        ensure!(
+            cross_search["total_count"].as_i64() == Some(0),
+            "community A must not find community B messages"
+        );
+
+        // A running server holds a database shared lease. The provisioner must
+        // refuse a scope change instead of retargeting this process in place.
+        let changed_live_scope = provision_instance_to_scope(&database_a, &profile_b, true).await?;
+        ensure!(
+            !changed_live_scope.status.success(),
+            "scope reprovisioning must fail while an MCP server is running"
+        );
+        assert_instance_reads(
+            &client_a,
+            &marker_a,
+            user_a,
+            "community-a-chat-note",
+            "community-a-user-note",
+        )
+        .await?;
+
+        client_a.shutdown().await;
+        client_b.shutdown().await;
+
+        // A valid scope paired with the other database or manifest must fail
+        // during MCP initialization before any tool can be used.
+        let wrong_database = config_for_instance(&profile_a, &database_b, &manifest_a)?;
+        ensure!(
+            McpClient::start_for_scope(&wrong_database, -900_000_101)
+                .await
+                .is_err(),
+            "community A config must not start against community B database"
+        );
+        let wrong_manifest = config_for_instance(&profile_a, &database_a, &manifest_b)?;
+        ensure!(
+            McpClient::start_for_scope(&wrong_manifest, -900_000_101)
+                .await
+                .is_err(),
+            "community A config must not start with community B manifest"
+        );
+
+        restore_example_scope(&database_a).await?;
+        restore_example_scope(&database_b).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("two-instance MCP isolation exceeded {TWO_INSTANCE_TIMEOUT:?}"))?
+}
+
+fn write_instance_profile(
+    directory: &std::path::Path,
+    instance_id: &str,
+    chat_id: i64,
+    source_channel_id: i64,
+) -> Result<PathBuf> {
+    let example = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/llm_profiles.toml.example"),
+    )?;
+    let instance_replaced =
+        example.replace("id = \"nedonews\"", &format!("id = \"{instance_id}\""));
+    ensure!(
+        instance_replaced != example,
+        "example profile instance marker must exist"
+    );
+    let chat_replaced =
+        instance_replaced.replace("id = -1001932061163", &format!("id = {chat_id}"));
+    ensure!(
+        chat_replaced != instance_replaced,
+        "example profile chat marker must exist"
+    );
+    let profile = chat_replaced.replace(
+        "source_channel_id = -1001575496091",
+        &format!("source_channel_id = {source_channel_id}"),
+    );
+    ensure!(
+        profile != chat_replaced,
+        "example profile source marker must exist"
+    );
+    let path = directory.join(format!("{instance_id}_profile.toml"));
+    std::fs::write(&path, profile)?;
+    Ok(path)
+}
+
+fn config_for_instance(profile: &PathBuf, database: &str, manifest: &PathBuf) -> Result<Config> {
+    unsafe {
+        std::env::set_var("LLM_PROFILES_PATH", profile);
+        std::env::set_var("ASK_DATABASE_URL", database);
+        std::env::set_var("MCP_MANIFEST", manifest);
+    }
+    let mut config = Config::from_env()?;
+    config.ask_db_mcp_command = Some(env!("CARGO_BIN_EXE_chat_db_mcp").to_owned());
+    config.ask_db_mcp_args.clear();
+    config.ask_db_mcp_env = vec!["ASK_DATABASE_URL".into(), "MCP_MANIFEST".into()];
+    config.ask_db_mcp_timeout_sec = E2E_TIMEOUT.as_secs();
+    Ok(config)
+}
+
+async fn provision_instance(database: &str, profile: &PathBuf) -> Result<()> {
+    let output = provision_instance_to_scope(database, profile, true).await?;
+    ensure!(
+        output.status.success(),
+        "instance provisioning failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+async fn provision_instance_to_scope(
+    database: &str,
+    profile: &PathBuf,
+    confirm: bool,
+) -> Result<Output> {
+    let mut command =
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_provision_mcp_instance_scope"));
+    command
+        .env("DATABASE_URL", database)
+        .env("LLM_PROFILES_PATH", profile);
+    if confirm {
+        command.arg("--confirm-scope-change");
+    }
+    Ok(command.output().await?)
+}
+
+async fn generate_manifest(
+    database: &str,
+    profile: &PathBuf,
+    output: &std::path::Path,
+) -> Result<()> {
+    let result = tokio::process::Command::new(env!("CARGO_BIN_EXE_generate_mcp_db_manifest"))
+        .arg(output)
+        .env("DATABASE_URL", database)
+        .env("LLM_PROFILES_PATH", profile)
+        .output()
+        .await?;
+    ensure!(
+        result.status.success(),
+        "manifest generation failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    ensure!(output.is_file(), "generator must write its output manifest");
+    Ok(())
+}
+
+async fn seed_instance_data(
+    database: &str,
+    chat_id: i64,
+    message_id: i32,
+    user_id: i64,
+    message: &str,
+    chat_note: &str,
+    user_note: &str,
+) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database)
+        .await?;
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, $2)")
+        .bind(user_id)
+        .bind(message)
+        .execute(&pool)
+        .await?;
+    query("insert into telegram_messages (chat_id, message_id, user_id, text) values ($1, $2, $3, $4)")
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(user_id)
+        .bind(message)
+        .execute(&pool)
+        .await?;
+    query("insert into telegram_chat_notes (chat_id, note, created_by_user_id) values ($1, $2, 1)")
+        .bind(chat_id)
+        .bind(chat_note)
+        .execute(&pool)
+        .await?;
+    query("insert into telegram_user_notes (chat_id, telegram_user_id, note, created_by_user_id) values ($1, $2, $3, 1)")
+        .bind(chat_id)
+        .bind(user_id)
+        .bind(user_note)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+fn unique_user_id() -> i64 {
+    let bytes = uuid::Uuid::new_v4();
+    let mut id_bytes = [0_u8; 8];
+    id_bytes[1..].copy_from_slice(&bytes.as_bytes()[..7]);
+    i64::from_be_bytes(id_bytes).max(1)
+}
+
+fn unique_message_id() -> i32 {
+    let bytes = uuid::Uuid::new_v4();
+    i32::from_be_bytes([
+        0,
+        bytes.as_bytes()[0],
+        bytes.as_bytes()[1],
+        bytes.as_bytes()[2],
+    ])
+    .max(1)
+}
+
+async fn assert_instance_reads(
+    client: &McpClient,
+    marker: &str,
+    user_id: i64,
+    chat_note: &str,
+    user_note: &str,
+) -> Result<()> {
+    let search = call_object(
+        client,
+        "chat.search_messages",
+        json!({"query": marker, "match_mode": "literal", "limit": 5}),
+    )
+    .await?;
+    ensure!(search["total_count"].as_i64() == Some(1));
+    ensure!(search["messages"][0]["text"] == marker);
+    let profile = call_object(
+        client,
+        "chat.get_user_profile",
+        json!({"telegram_user_id": user_id}),
+    )
+    .await?;
+    ensure!(profile["found"] == true);
+    let chat_notes = call_object(client, "notes.list_chat", json!({})).await?;
+    ensure!(
+        chat_notes["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note["note"] == chat_note))
+    );
+    let user_notes = call_object(
+        client,
+        "notes.list_user",
+        json!({"telegram_user_id": user_id}),
+    )
+    .await?;
+    ensure!(
+        user_notes["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note["note"] == user_note))
+    );
+    Ok(())
+}
+
+async fn assert_instance_hides(
+    client: &McpClient,
+    marker: &str,
+    user_id: i64,
+    chat_note: &str,
+    user_note: &str,
+) -> Result<()> {
+    let search = call_object(
+        client,
+        "chat.search_messages",
+        json!({"query": marker, "match_mode": "literal", "limit": 5}),
+    )
+    .await?;
+    ensure!(search["total_count"].as_i64() == Some(0));
+    let profile = call_object(
+        client,
+        "chat.get_user_profile",
+        json!({"telegram_user_id": user_id}),
+    )
+    .await?;
+    ensure!(profile["found"] == false);
+    let chat_notes = call_object(client, "notes.list_chat", json!({})).await?;
+    ensure!(
+        chat_notes["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().all(|note| note["note"] != chat_note))
+    );
+    let user_notes = call_object(
+        client,
+        "notes.list_user",
+        json!({"telegram_user_id": user_id}),
+    )
+    .await?;
+    ensure!(
+        user_notes["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().all(|note| note["note"] != user_note))
+    );
+    Ok(())
+}
+
+async fn restore_example_scope(database: &str) -> Result<()> {
+    let example =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/llm_profiles.toml.example");
+    let output = provision_instance_to_scope(database, &example, true).await?;
+    ensure!(
+        output.status.success(),
+        "cannot restore test DB scope: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }

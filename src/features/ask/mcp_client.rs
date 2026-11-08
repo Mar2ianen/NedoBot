@@ -18,6 +18,7 @@ use crate::features::chat_read_api::types::{
     CHAT_EMBEDDING_MODEL_ENV, CHAT_EMBEDDING_QUERY_PREFIX_ENV, CHAT_EMBEDDING_TIMEOUT_ENV,
     CHAT_EMBEDDING_URL_ENV,
 };
+use crate::mcp::bootstrap::{DISCUSSION_CHAT_ID_ENV, INSTANCE_ID_ENV, SOURCE_CHANNEL_ID_ENV};
 
 // Reserve space for the agent's untrusted-result envelope; never raw-truncate JSON there.
 const MAX_TOOL_RESULT_CHARS: usize = 11_000;
@@ -72,6 +73,7 @@ impl McpClient {
     }
 
     pub async fn start_for_scope(config: &Config, scope_chat_id: i64) -> anyhow::Result<Self> {
+        let scope = config.mcp_read_scope_for_chat(scope_chat_id)?;
         let command = config
             .ask_db_mcp_command
             .as_deref()
@@ -87,7 +89,12 @@ impl McpClient {
                 command.env(name, value);
             }
         }
-        command.env("DISCUSSION_CHAT_ID", scope_chat_id.to_string());
+        command
+            .env(INSTANCE_ID_ENV, &scope.instance_id)
+            .env(DISCUSSION_CHAT_ID_ENV, scope.discussion_chat_id.to_string());
+        if let Some(source_channel_id) = scope.source_channel_id {
+            command.env(SOURCE_CHANNEL_ID_ENV, source_channel_id.to_string());
+        }
         if config.chat_retrieval_embeddings_enabled {
             command
                 .env(CHAT_EMBEDDING_URL_ENV, &config.chat_retrieval_embedding_url)

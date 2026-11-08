@@ -6,6 +6,7 @@ VOLUME_NAME=tg-ai-bot-postgres-dev-data
 IMAGE=pgvector/pgvector:0.8.2-pg16-bookworm
 DEV_DATABASE=tg_ai_bot_dev
 TEST_DATABASE=tg_ai_bot_test
+TEST_DATABASE_B=tg_ai_bot_test_b
 DATABASE_USER=tg_ai_bot_dev
 DATABASE_PASSWORD=tg_ai_bot_dev
 
@@ -46,7 +47,20 @@ reset_test_database() {
     podman exec "$CONTAINER_NAME" createdb \
         --username "$DATABASE_USER" \
         "$TEST_DATABASE"
-    echo "Local test database $TEST_DATABASE was recreated"
+    podman exec "$CONTAINER_NAME" psql \
+        --username "$DATABASE_USER" \
+        --dbname postgres \
+        --set ON_ERROR_STOP=1 \
+        --command "drop database if exists $TEST_DATABASE_B with (force)"
+    podman exec "$CONTAINER_NAME" createdb \
+        --username "$DATABASE_USER" \
+        "$TEST_DATABASE_B"
+    podman exec "$CONTAINER_NAME" psql \
+        --username "$DATABASE_USER" \
+        --dbname postgres \
+        --set ON_ERROR_STOP=1 \
+        --command "do \$\$ begin if not exists (select from pg_roles where rolname = 'nedobot_mcp_ro') then create role nedobot_mcp_ro nologin; end if; end \$\$; grant nedobot_mcp_ro to $DATABASE_USER"
+    echo "Local test databases $TEST_DATABASE and $TEST_DATABASE_B were recreated"
 }
 
 case "${1:-start}" in

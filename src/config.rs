@@ -28,6 +28,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
 
 use crate::community::ChatRegistry;
 use crate::config_file::{CommunityConfig, RiskProfile, TelegramIdRiskModel};
+use crate::features::chat_read_api::types::ChatReadScope;
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
 
 const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
@@ -151,6 +152,27 @@ pub struct Config {
 }
 
 impl Config {
+    /// The reviewed primary MCP scope is always derived from validated community
+    /// configuration, never from MCP tool arguments.
+    pub fn mcp_read_scope(&self) -> anyhow::Result<ChatReadScope> {
+        ChatReadScope::new(
+            self.community.instance.id.clone(),
+            self.discussion_chat_id,
+            (self.source_channel_id != 0).then_some(self.source_channel_id),
+        )
+    }
+
+    /// The MCP database currently exposes only the configured primary chat.
+    /// Reject any other managed chat before starting retrieval.
+    pub fn mcp_read_scope_for_chat(&self, requested_chat_id: i64) -> anyhow::Result<ChatReadScope> {
+        let scope = self.mcp_read_scope()?;
+        anyhow::ensure!(
+            requested_chat_id == scope.discussion_chat_id(),
+            "MCP read-model scope is configured for the primary chat only; /ask retrieval is not enabled for this secondary chat"
+        );
+        Ok(scope)
+    }
+
     pub fn chat_by_id(&self, chat_id: i64) -> Option<crate::community::ChatRef<'_>> {
         self.chat_registry.chat_by_id(&self.community, chat_id)
     }
@@ -1028,6 +1050,34 @@ impl Config {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct McpInstanceSettings {
+    pub scope: ChatReadScope,
+    pub public_enabled: bool,
+}
+
+/// Loads only non-secret MCP/community settings from the selected profile.
+/// The HTTP MCP process uses this instead of loading bot tokens or API keys.
+pub fn load_mcp_instance_settings(profile_path: &str) -> anyhow::Result<McpInstanceSettings> {
+    let profiles = LlmProfiles::from_path(profile_path)?;
+    let community = community_config_from_profiles(&profiles)?;
+    let registry = ChatRegistry::new(&community)?;
+    let discussion_chat_id = primary_chat_id(&community, &registry)?;
+    let source_channel_id = primary_first_comment_route(&community, &registry)
+        .map(|route| route.source_channel_id)
+        .or(profiles.runtime.source_channel_id)
+        .filter(|id| *id != 0);
+    let scope = ChatReadScope::new(
+        community.instance.id.clone(),
+        discussion_chat_id,
+        source_channel_id,
+    )?;
+    Ok(McpInstanceSettings {
+        scope,
+        public_enabled: community.public_mcp.enabled,
+    })
+}
+
 fn is_immutable_image_id(value: &str) -> bool {
     let Some(digest) = value.strip_prefix("sha256:") else {
         return false;
@@ -1656,6 +1706,53 @@ mod tests {
             community.chats.get("main").unwrap().reports,
             "the primary profile explicitly enables /report"
         );
+    }
+
+    #[test]
+    fn mcp_scope_and_public_gate_come_from_selected_community_profile() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/llm_profiles.toml.example"
+        );
+        let settings = load_mcp_instance_settings(path).unwrap();
+        assert_eq!(settings.scope.instance_id, "nedonews");
+        assert_eq!(settings.scope.discussion_chat_id, -1001932061163);
+        assert_eq!(settings.scope.source_channel_id, Some(-1001575496091));
+        assert!(!settings.public_enabled);
+
+        let production_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config/llm_profiles.toml.production.example"
+        );
+        assert!(
+            load_mcp_instance_settings(production_path)
+                .unwrap()
+                .public_enabled
+        );
+    }
+
+    #[test]
+    fn mcp_ask_scope_accepts_primary_and_rejects_secondary_managed_chat() {
+        let mut config = config();
+        let mut community = config.community.clone();
+        let mut secondary = community.chats["main"].clone();
+        secondary.id = -1003;
+        community.chats.insert("secondary".into(), secondary);
+        config.chat_registry = ChatRegistry::new(&community).unwrap();
+        config.community = community;
+
+        assert_eq!(
+            config
+                .mcp_read_scope_for_chat(config.discussion_chat_id)
+                .unwrap()
+                .discussion_chat_id(),
+            config.discussion_chat_id
+        );
+        let error = config
+            .mcp_read_scope_for_chat(-1003)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secondary chat"));
     }
 
     #[test]

@@ -24,11 +24,13 @@ use super::{
     bootstrap::{DATABASE_URL_ENV, MANIFEST_PATH_ENV, RmcpStdioConfig, build_chat_mcp_server},
     server::ChatMcpServer,
 };
+use crate::config::load_mcp_instance_settings;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 // RMCP заменяет несовместимый legacy-контракт, поэтому URL содержит версию API.
 const DEFAULT_PATH: &str = "/mcp/nedonews/v2";
 const DEFAULT_MANIFEST_PATH: &str = "config/mcp_db_manifest.toml";
+const DEFAULT_PROFILE_PATH: &str = "config/llm_profiles.toml.example";
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
@@ -44,6 +46,16 @@ struct RmcpHttpConfig {
 impl RmcpHttpConfig {
     fn from_env() -> anyhow::Result<Self> {
         let database_url = required_env(DATABASE_URL_ENV)?;
+        let profile_path =
+            env::var("LLM_PROFILES_PATH").unwrap_or_else(|_| DEFAULT_PROFILE_PATH.to_owned());
+        if profile_path.trim().is_empty() {
+            bail!("LLM_PROFILES_PATH must not be empty");
+        }
+        let instance = load_mcp_instance_settings(&profile_path)?;
+        anyhow::ensure!(
+            instance.public_enabled,
+            "public MCP is disabled; set [public_mcp].enabled = true in the community profile to expose HTTP tools"
+        );
         let manifest_path =
             env::var(MANIFEST_PATH_ENV).unwrap_or_else(|_| DEFAULT_MANIFEST_PATH.to_owned());
         let bind = env::var("MCP_BIND")
@@ -57,7 +69,7 @@ impl RmcpHttpConfig {
             parse_allowed_origins(env::var("MCP_ALLOWED_ORIGINS").ok().as_deref())?;
 
         Ok(Self {
-            bootstrap: RmcpStdioConfig::new(database_url, manifest_path)?,
+            bootstrap: RmcpStdioConfig::new(database_url, manifest_path, instance.scope)?,
             bind,
             path,
             allowed_hosts,
@@ -246,9 +258,13 @@ mod tests {
             source_schema: "public".into(),
             public_schema: "mcp_public".into(),
             scope: CatalogScope {
+                instance_id: Some("nedonews".into()),
                 discussion_chat_id: -1001932061163,
-                source_channel_id: -1001575496091,
+                source_channel_id: Some(-1001575496091),
             },
+            runtime_scope: Some(
+                ChatReadScope::new("nedonews", -1001932061163, Some(-1001575496091)).unwrap(),
+            ),
             tables: BTreeMap::from([(
                 "telegram_messages".into(),
                 CatalogTable {
@@ -271,8 +287,9 @@ mod tests {
         let api = ChatReadApi::new(
             pool,
             ChatReadScope {
+                instance_id: "nedonews".into(),
                 discussion_chat_id: -1001932061163,
-                source_channel_id: -1001575496091,
+                source_channel_id: Some(-1001575496091),
             },
             catalog,
         )
