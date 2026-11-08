@@ -50,6 +50,89 @@ pub async fn add_user_note_from_search(
     Ok(())
 }
 
+pub fn explicit_memory_request(question: &str) -> bool {
+    let normalized = question
+        .trim()
+        .trim_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase();
+    if normalized.starts_with("не ")
+        || normalized.starts_with("don't ")
+        || normalized.starts_with("do not ")
+        || normalized.starts_with("не надо ")
+    {
+        return false;
+    }
+    [
+        "запомни",
+        "запиши в память",
+        "сохрани в памяти",
+        "можешь запомнить",
+        "пожалуйста запомни",
+        "remember",
+        "please remember",
+        "make a note",
+    ]
+    .iter()
+    .any(|phrase| normalized.starts_with(phrase))
+}
+
+/// Conservatively accepts only notes restated in an explicit request, and
+/// rejects obvious sensitive-data categories before a model-generated note is stored.
+pub fn explicit_note_is_safe(question: &str, note: &str) -> bool {
+    if !explicit_memory_request(question) || note.trim().is_empty() {
+        return false;
+    }
+    let sensitive_markers = [
+        "парол",
+        "password",
+        "телефон",
+        "phone number",
+        "адрес",
+        "address",
+        "паспорт",
+        "passport",
+        "диагноз",
+        "болезн",
+        "здоров",
+        "medical",
+        "salary",
+        "зарплат",
+        "доход",
+        "income",
+        "кредит",
+        "credit card",
+        "карта",
+        "ssn",
+        "социальн",
+        "религи",
+        "religion",
+        "политическ",
+        "political",
+        "сексуал",
+        "sexual",
+    ];
+    let normalized_note = note.to_lowercase();
+    if sensitive_markers
+        .iter()
+        .any(|marker| normalized_note.contains(marker))
+        || note
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|token| token.chars().filter(char::is_ascii_digit).count() >= 7)
+    {
+        return false;
+    }
+    let question_terms = question
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+    note.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 3)
+        .all(|token| question_terms.contains(token))
+}
+
 fn normalize_note(note: &str) -> anyhow::Result<String> {
     let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
     if note.is_empty() {
@@ -67,5 +150,28 @@ mod tests {
     #[test]
     fn normalizes_note() {
         assert_eq!(normalize_note("  важный\n факт ").unwrap(), "важный факт");
+    }
+
+    #[test]
+    fn durable_note_write_requires_a_clear_unnegated_request() {
+        assert!(explicit_memory_request(
+            "Запомни: я предпочитаю короткие ответы"
+        ));
+        assert!(explicit_memory_request("Please remember that I use Rust"));
+        assert!(!explicit_memory_request("Я обычно отвечаю коротко"));
+        assert!(!explicit_memory_request("Не запоминай это"));
+        assert!(!explicit_memory_request("The quote says: remember this"));
+        assert!(explicit_note_is_safe(
+            "Запомни: я предпочитаю короткие ответы",
+            "предпочитаю короткие ответы"
+        ));
+        assert!(!explicit_note_is_safe(
+            "Запомни: я предпочитаю короткие ответы",
+            "работает врачом и любит путешествия"
+        ));
+        assert!(!explicit_note_is_safe(
+            "Запомни мой номер телефона 123456789",
+            "номер телефона 123456789"
+        ));
     }
 }

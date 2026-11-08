@@ -32,6 +32,17 @@ pub const RESERVED_LOCAL_AGENT_TOOLS: &[&str] = &[
     "github.search",
     "sandbox.python",
 ];
+
+pub fn compiled_agent_tool_names() -> Vec<String> {
+    let mut names = ASK_MCP_TOOL_ALLOWLIST
+        .iter()
+        .chain(RESERVED_LOCAL_AGENT_TOOLS.iter())
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
 pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
     "chat.resolve_user",
     "chat.get_user_profile",

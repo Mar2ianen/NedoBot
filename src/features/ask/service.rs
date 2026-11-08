@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::config::Config;
 use crate::features::ask::agent::{self, AskRequest};
+use crate::features::ask::conversation_memory::{self, ConversationTurn};
 use crate::features::ask::repo::{self, CreateAskRunParams, RenderAudit};
 use crate::features::ask::rich_markdown;
 use crate::features::ask::types::{
@@ -63,6 +64,7 @@ impl<'a> AskService<'a> {
                     .then_some(input.reply_to_message_id)
                     .flatten(),
                 scope_chat_id: input.scope_chat_id,
+                command_message_id: input.command_message_id,
                 ask_run_id,
                 requester_user_id: input.requester_user_id,
                 requester_identity: &input.requester_identity,
@@ -160,6 +162,43 @@ impl<'a> AskService<'a> {
                                     ask_run_id,
                                 ))
                             } else {
+                                if input.allow_mutations
+                                    && let (Some(scope), Some(profile)) = (
+                                        answer.conversation_scope.as_ref(),
+                                        self.config.agent_profile.as_ref(),
+                                    )
+                                    && profile.memory.enabled
+                                {
+                                    let turn = ConversationTurn {
+                                        request_message_id: input.command_message_id,
+                                        reply_to_message_id: input.reply_to_message_id,
+                                        user_text: input.question.clone(),
+                                        assistant_text: markdown.clone(),
+                                        source_message_ids: answer.observed_message_ids.clone(),
+                                        source_urls: answer.observed_source_urls.clone(),
+                                    };
+                                    if let Err(err) = conversation_memory::append_turn(
+                                        self.pool,
+                                        scope,
+                                        &turn,
+                                        profile.memory.retention_days,
+                                        profile.memory.max_turns,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(%err, "failed to persist validated ask conversation turn");
+                                        let kind = AskFailureKind::ToolError;
+                                        self.finish_run(
+                                            ask_run_id,
+                                            AskRunStatus::Failed,
+                                            Some(&markdown),
+                                            render,
+                                            Some(kind),
+                                        )
+                                        .await;
+                                        return Err(AskServiceError::new(kind, err, ask_run_id));
+                                    }
+                                }
                                 self.finish_run(
                                     ask_run_id,
                                     AskRunStatus::DeliveryPending,
@@ -231,7 +270,7 @@ impl<'a> AskService<'a> {
             .and_then(|profiles| {
                 profiles
                     .resolve_route(
-                        "ask",
+                        self.config.ask_agent_route(),
                         &RouteRequirements {
                             requires_images: input.reply_image_base64.is_some(),
                             requires_tools: true,

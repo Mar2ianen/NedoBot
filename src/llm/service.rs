@@ -480,6 +480,7 @@ mod tests {
             post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
+            agent_profile: None,
             llm_temperature: 0.35,
             llm_max_tokens: 90,
             llm_proxy_url: None,

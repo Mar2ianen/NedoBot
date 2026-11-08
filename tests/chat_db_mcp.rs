@@ -375,6 +375,41 @@ fn write_instance_profile(
         profile != chat_replaced,
         "example profile source marker must exist"
     );
+    let profile = profile
+        .replace(
+            "agent_profile = \"nedonews_default\"",
+            "agent_profile = \"agent_default\"",
+        )
+        .replace(
+            "[agent_profiles.nedonews_default]",
+            "[agent_profiles.agent_default]",
+        )
+        .replace("identity = \"NedoBot\"", "identity = \"Test Agent\"")
+        .replace(
+            "display_name = \"NedoBot\"",
+            "display_name = \"Test Agent\"",
+        )
+        .replace(
+            "community_context = \"НедоNews Chat (разрешена только его история)\"",
+            "community_context = \"Synthetic community\"",
+        )
+        .replace(
+            "system_prompt_file = \"builtin:nedonews_ask\"",
+            "system_prompt_file = \"agent_prompt.md\"",
+        )
+        .replace(
+            "capability_document_file = \"builtin:nedonews_changelog\"\n",
+            "",
+        )
+        .replace(
+            "[agent_profiles.nedonews_default.budgets]",
+            "[agent_profiles.agent_default.budgets]",
+        )
+        .replace(
+            "[agent_profiles.nedonews_default.memory]",
+            "[agent_profiles.agent_default.memory]",
+        );
+    std::fs::write(directory.join("agent_prompt.md"), "Synthetic test agent.")?;
     let path = directory.join(format!("{instance_id}_profile.toml"));
     std::fs::write(&path, profile)?;
     Ok(path)

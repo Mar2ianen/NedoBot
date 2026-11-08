@@ -28,6 +28,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
 
 use crate::community::ChatRegistry;
 use crate::config_file::{CommunityConfig, RiskProfile, TelegramIdRiskModel};
+use crate::features::ask::profile::AgentProfile;
 use crate::features::chat_read_api::types::ChatReadScope;
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
 
@@ -48,6 +49,7 @@ pub struct Config {
     pub post_signature_aliases: Vec<String>,
     pub llm_profiles_path: Option<String>,
     pub llm_profiles: Option<LlmProfiles>,
+    pub agent_profile: Option<AgentProfile>,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
     pub llm_proxy_url: Option<String>,
@@ -160,6 +162,12 @@ impl Config {
             self.discussion_chat_id,
             (self.source_channel_id != 0).then_some(self.source_channel_id),
         )
+    }
+
+    pub fn ask_agent_route(&self) -> &str {
+        self.agent_profile
+            .as_ref()
+            .map_or("ask", |profile| profile.model_route.as_str())
     }
 
     /// The MCP database currently exposes only the configured primary chat.
@@ -324,6 +332,21 @@ impl Config {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("LLM profiles are not configured"))?;
         let community = community_config_from_profiles(profiles)?;
+        let agent_profile = if community.ask.agent_profile.is_some()
+            || community.ask.enabled
+            || runtime.ask_enabled
+        {
+            Some(AgentProfile::resolve(
+                profiles,
+                llm_profiles_path
+                    .as_deref()
+                    .expect("profile path is configured when profiles loaded"),
+                &community.instance.id,
+                community.ask.agent_profile.as_deref(),
+            )?)
+        } else {
+            None
+        };
         let chat_registry = ChatRegistry::new(&community)?;
         let primary_chat_id = primary_chat_id(&community, &chat_registry)?;
         let first_comment_route = primary_first_comment_route(&community, &chat_registry);
@@ -389,6 +412,7 @@ impl Config {
             post_signature_aliases,
             llm_profiles_path,
             llm_profiles,
+            agent_profile,
             llm_temperature: runtime.llm_temperature,
             llm_max_tokens: runtime.llm_max_tokens,
             llm_proxy_url: env_optional("LLM_PROXY_URL"),
@@ -701,6 +725,18 @@ impl Config {
             errors.push("LLM_PROFILES_PATH must configure authoritative LLM routes".to_string());
         }
 
+        if let Some(profile) = &self.agent_profile {
+            let compiled_tools = crate::features::ask::mcp_client::compiled_agent_tool_names();
+            for tool in &profile.tool_allowlist {
+                if !compiled_tools.iter().any(|compiled| compiled == tool) {
+                    errors.push(format!(
+                        "agent profile {:?} requests tool {tool:?} outside the compiled /ask policy",
+                        profile.key
+                    ));
+                }
+            }
+        }
+
         if self.search_enabled {
             validate_search_config(&mut errors, self);
         }
@@ -896,7 +932,7 @@ impl Config {
         if self.ask_enabled {
             for requires_images in [false, true] {
                 routes.push((
-                    "ask",
+                    self.ask_agent_route(),
                     RouteRequirements {
                         requires_images,
                         requires_tools: true,
@@ -1858,6 +1894,7 @@ mod tests {
             post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
+            agent_profile: None,
             llm_temperature: 0.35,
             llm_max_tokens: 90,
             llm_proxy_url: None,

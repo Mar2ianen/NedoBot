@@ -186,6 +186,9 @@ pub struct AskConfig {
     pub enabled: bool,
     #[serde(default)]
     pub default_chat: Option<String>,
+    /// Named operator-configured agent profile selected for this community.
+    #[serde(default)]
+    pub agent_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
