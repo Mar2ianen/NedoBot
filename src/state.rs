@@ -18,6 +18,7 @@ pub struct AppState {
     pub ask_slots: Arc<Semaphore>,
     pub drafter_limiter: InProcessRateLimiter,
     pub ask_delivery_metrics: Arc<AskDeliveryMetrics>,
+    pub telegram_bot_identity: Option<TelegramBotIdentity>,
     #[cfg(feature = "spam-sync")]
     pub spam_reputation: Option<Arc<SpamReputationStore>>,
 }
@@ -36,9 +37,15 @@ impl AppState {
             ask_slots: Arc::new(Semaphore::new(ask_concurrency)),
             drafter_limiter: InProcessRateLimiter::default(),
             ask_delivery_metrics: Arc::new(AskDeliveryMetrics::default()),
+            telegram_bot_identity: None,
             #[cfg(feature = "spam-sync")]
             spam_reputation: None,
         }
+    }
+
+    pub fn with_telegram_bot_identity(mut self, identity: TelegramBotIdentity) -> Self {
+        self.telegram_bot_identity = Some(identity);
+        self
     }
 
     #[cfg(feature = "spam-sync")]
@@ -46,4 +53,10 @@ impl AppState {
         self.spam_reputation = Some(Arc::new(store));
         self
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramBotIdentity {
+    pub user_id: i64,
+    pub username: Option<String>,
 }

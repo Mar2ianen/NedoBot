@@ -92,6 +92,23 @@ async fn main() -> anyhow::Result<()> {
     }
     GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
+    #[cfg(feature = "ask")]
+    let bot_identity = if config.community.ask.gateway.mention_enabled
+        || config.community.ask.gateway.reply_to_bot_enabled
+    {
+        let me = bot.get_me().await?;
+        if config.community.ask.gateway.mention_enabled && me.username().is_empty() {
+            anyhow::bail!(
+                "ask.gateway.mention_enabled requires a Telegram bot username from getMe"
+            );
+        }
+        Some(state::TelegramBotIdentity {
+            user_id: me.id.0 as i64,
+            username: Some(me.username().to_owned()),
+        })
+    } else {
+        None
+    };
     preflight_managed_chats(&bot, &config).await?;
     preflight_moderation_message_deletion(&bot, &config).await?;
     #[cfg(feature = "moderation")]
@@ -139,6 +156,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState::new(pool, config);
+    #[cfg(feature = "ask")]
+    let state = match bot_identity {
+        Some(identity) => state.with_telegram_bot_identity(identity),
+        None => state,
+    };
     #[cfg(feature = "ask")]
     spawn_ask_memory_expiry_worker(state.pool.clone());
     #[cfg(feature = "spam-sync")]
@@ -408,20 +430,64 @@ async fn handle_message(
     state: AppState,
     profile_refresh_queue: ProfileRefreshQueue,
 ) -> ResponseResult<()> {
-    if !is_managed_chat(&state.config, msg.chat.id.0) {
+    let private_gateway_allowed = msg.chat.is_private()
+        && state.config.community.ask.gateway.private_messages_enabled
+        && msg.from.as_ref().is_some_and(|user| {
+            state
+                .config
+                .ask_private_user_ids
+                .contains(&(user.id.0 as i64))
+        });
+    if !is_managed_chat(&state.config, msg.chat.id.0) && !private_gateway_allowed {
         tracing::debug!(chat_id = msg.chat.id.0, "ignored message from unknown chat");
         return Ok(());
     }
-    maybe_delete_join_leave_message(&bot, &msg, &state.config).await;
-    match ingest_message(&state.pool, &msg, &state.config).await {
-        Ok(true) => {}
-        Ok(false) => return Ok(()),
-        Err(err) => {
-            tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
+    let mut message_ingested = false;
+    if !msg.chat.is_private() {
+        maybe_delete_join_leave_message(&bot, &msg, &state.config).await;
+        match ingest_message(&state.pool, &msg, &state.config).await {
+            Ok(true) => message_ingested = true,
+            // Ask activation is independently gated by ask_enabled and
+            // chats.<key>.ask, so ingest=false must not suppress an explicit
+            // mention or direct reply trigger.
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
+                return Ok(());
+            }
+        }
+        if message_ingested {
+            enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
+        }
+    }
+
+    #[cfg(feature = "ask")]
+    if !msg.chat.is_private() || private_gateway_allowed {
+        let gateway = &state.config.community.ask.gateway;
+        let chat_gateway_allowed = state.config.ask_enabled
+            && managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ask);
+        if (chat_gateway_allowed || private_gateway_allowed)
+            && let Some(question) = features::ask::gateway::invocation_question(
+                &msg,
+                state.telegram_bot_identity.as_ref(),
+                gateway.mention_enabled,
+                gateway.reply_to_bot_enabled,
+                private_gateway_allowed && gateway.private_messages_enabled,
+            )
+        {
+            if !msg.chat.is_private()
+                && state.config.mcp_read_scope_for_chat(msg.chat.id.0).is_err()
+            {
+                return Ok(());
+            }
+            telegram::command_handler::handle_gateway_ask(&bot, &msg, &state, &question).await?;
             return Ok(());
         }
     }
-    enqueue_message_author_profile_refresh(&msg, &state, &profile_refresh_queue);
+
+    if !message_ingested {
+        return Ok(());
+    }
 
     if handle_reply_user_stats_command(bot.clone(), msg.clone(), state.clone()).await? {
         return Ok(());

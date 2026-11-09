@@ -169,6 +169,12 @@ pub async fn handle_command(
             handle_ask_command(&bot, &msg, &state, &question).await?;
         }
         #[cfg(feature = "ask")]
+        Command::Forget(args) => {
+            if args.trim().is_empty() {
+                handle_forget_command(&bot, &msg, &state).await?;
+            }
+        }
+        #[cfg(feature = "ask")]
         Command::ChatNote(note) => {
             handle_note_command(&bot, &msg, &state, &note, None).await?;
         }
@@ -715,8 +721,147 @@ async fn handle_ask_command(
     state: &AppState,
     question: &str,
 ) -> ResponseResult<()> {
+    let instance_id = &state.config.community.instance.id;
+    let claim_token = crate::features::ask::gateway::claim_update(
+        &state.pool,
+        instance_id,
+        msg.chat.id.0,
+        msg.id.0,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "failed to reserve ask update idempotently");
+        teloxide::RequestError::Io(std::io::Error::other("ask update reservation failed").into())
+    })?;
+    let Some(claim_token) = claim_token else {
+        tracing::debug!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "ignored duplicate ask update"
+        );
+        return Ok(());
+    };
+    let (stop_heartbeat, mut heartbeat_stop) = tokio::sync::oneshot::channel();
+    let (lease_lost_tx, lease_lost_rx) = tokio::sync::oneshot::channel();
+    let heartbeat_pool = state.pool.clone();
+    let heartbeat_instance = instance_id.clone();
+    let heartbeat_chat_id = msg.chat.id.0;
+    let heartbeat_message_id = msg.id.0;
+    let heartbeat = tokio::spawn(async move {
+        let mut lease_lost_tx = Some(lease_lost_tx);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    match crate::features::ask::gateway::renew_update(
+                        &heartbeat_pool, &heartbeat_instance, heartbeat_chat_id, heartbeat_message_id, claim_token,
+                    ).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Some(sender) = lease_lost_tx.take() {
+                                let _ = sender.send(());
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "failed to renew ask update idempotency lease");
+                            if let Some(sender) = lease_lost_tx.take() {
+                                let _ = sender.send(());
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = &mut heartbeat_stop => break,
+            }
+        }
+    });
+    let result = crate::features::ask::gateway::run_while_claimed(
+        run_ask_command(bot, msg, state, question, claim_token),
+        lease_lost_rx,
+    )
+    .await;
+    let _ = stop_heartbeat.send(());
+    let _ = heartbeat.await;
+    let Some(result) = result else {
+        tracing::error!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "cancelled ask generation after losing its idempotency lease"
+        );
+        if let Err(error) = crate::features::ask::gateway::release_update(
+            &state.pool,
+            instance_id,
+            msg.chat.id.0,
+            msg.id.0,
+            claim_token,
+        )
+        .await
+        {
+            tracing::warn!(%error, "could not release lost ask lease after cancelling generation");
+        }
+        return Ok(());
+    };
+    let reservation_result = if result.is_ok() {
+        crate::features::ask::gateway::complete_update(
+            &state.pool,
+            instance_id,
+            msg.chat.id.0,
+            msg.id.0,
+            claim_token,
+        )
+        .await
+    } else {
+        crate::features::ask::gateway::release_update(
+            &state.pool,
+            instance_id,
+            msg.chat.id.0,
+            msg.id.0,
+            claim_token,
+        )
+        .await
+    };
+    if let Err(error) = reservation_result {
+        tracing::error!(%error, "failed to finalize ask update idempotency reservation");
+    }
+    result
+}
+
+#[cfg(feature = "ask")]
+pub async fn handle_gateway_ask(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    question: &str,
+) -> ResponseResult<()> {
+    handle_ask_command(bot, msg, state, question).await
+}
+
+#[cfg(feature = "ask")]
+async fn release_ask_update(state: &AppState, msg: &Message, claim_token: uuid::Uuid) {
+    if let Err(error) = crate::features::ask::gateway::release_update(
+        &state.pool,
+        &state.config.community.instance.id,
+        msg.chat.id.0,
+        msg.id.0,
+        claim_token,
+    )
+    .await
+    {
+        tracing::error!(%error, "failed to release unstarted ask update reservation");
+    }
+}
+
+#[cfg(feature = "ask")]
+async fn run_ask_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+    question: &str,
+    claim_token: uuid::Uuid,
+) -> ResponseResult<()> {
     let config = &state.config;
     let Some(user) = msg.from.as_ref() else {
+        release_ask_update(state, msg, claim_token).await;
         return Ok(());
     };
     let private_scope_chat_id = config
@@ -731,14 +876,34 @@ async fn handle_ask_command(
         && config.ask_private_user_ids.contains(&(user.id.0 as i64));
     let is_ask_chat = managed_chat_allows(config, msg.chat.id.0, |chat| chat.ask);
     if !config.ask_enabled || (!is_ask_chat && !is_private_allowed) {
+        release_ask_update(state, msg, claim_token).await;
         return Ok(());
     }
     if question.trim().is_empty() {
         send_command_html(bot, msg, state, "Напиши вопрос: /ask &lt;вопрос&gt;.").await?;
+        release_ask_update(state, msg, claim_token).await;
         return Ok(());
     }
-    let scope_chat_id =
-        ask_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), private_scope_chat_id);
+    let retrieval_scope_chat_id =
+        ask_retrieval_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), private_scope_chat_id);
+    if config
+        .mcp_read_scope_for_chat(retrieval_scope_chat_id)
+        .is_err()
+    {
+        tracing::warn!(
+            retrieval_scope_chat_id,
+            "rejected /ask outside the configured primary MCP scope"
+        );
+        send_command_html(
+            bot,
+            msg,
+            state,
+            "Помощник пока доступен только в основном чате.",
+        )
+        .await?;
+        release_ask_update(state, msg, claim_token).await;
+        return Ok(());
+    }
 
     let use_native_draft = msg.chat.is_private();
     let Ok(permit) = state.ask_slots.clone().try_acquire_owned() else {
@@ -749,6 +914,7 @@ async fn handle_ask_command(
             "Сейчас отвечаю на другой вопрос. Попробуй /ask чуть позже.",
         )
         .await?;
+        release_ask_update(state, msg, claim_token).await;
         return Ok(());
     };
     let backend = AskDrafterBackend::new(
@@ -802,10 +968,10 @@ async fn handle_ask_command(
     } else {
         Vec::new()
     };
-    let reply_context = build_ask_reply_context(msg, scope_chat_id, &sandbox_files);
+    let reply_context = build_ask_reply_context(msg, retrieval_scope_chat_id, &sandbox_files);
     let input = AskCommandInput {
         chat_id: msg.chat.id.0,
-        scope_chat_id,
+        scope_chat_id: retrieval_scope_chat_id,
         command_message_id: msg.id.0,
         requester_user_id: user.id.0 as i64,
         requester_identity: requester_identity(user),
@@ -819,7 +985,7 @@ async fn handle_ask_command(
     let ask_service = AskService::new(
         &state.pool,
         config,
-        scope_chat_id,
+        retrieval_scope_chat_id,
         &state.llm_formatter,
         &state.render_time,
     );
@@ -846,6 +1012,30 @@ async fn handle_ask_command(
         }
     };
     drop(permit);
+    match crate::features::ask::gateway::renew_update(
+        &state.pool,
+        &state.config.community.instance.id,
+        msg.chat.id.0,
+        msg.id.0,
+        claim_token,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                message_id = msg.id.0,
+                "ask update lost its lease before delivery"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to fence ask answer delivery by lease ownership");
+            return Err(teloxide::RequestError::Io(
+                std::io::Error::other("ask delivery lease check failed").into(),
+            ));
+        }
+    }
     match answer {
         Ok(answer) => {
             let ask_run_id = answer.ask_run_id;
@@ -938,6 +1128,108 @@ async fn handle_ask_command(
             }
         }
     }
+}
+
+#[cfg(feature = "ask")]
+async fn handle_forget_command(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    msg: &Message,
+    state: &AppState,
+) -> ResponseResult<()> {
+    let Some(user) = msg.from.as_ref().filter(|user| !user.is_bot) else {
+        return Ok(());
+    };
+    let config = &state.config;
+    let default_chat = config
+        .community
+        .ask
+        .default_chat
+        .as_deref()
+        .and_then(|key| config.chat_by_key(key))
+        .map(|chat| chat.config.id);
+    let private_allowed = msg.chat.is_private()
+        && default_chat.is_some()
+        && config.ask_private_user_ids.contains(&(user.id.0 as i64));
+    let chat_allowed = managed_chat_allows(config, msg.chat.id.0, |chat| chat.ask);
+    if !config.ask_enabled || (!private_allowed && !chat_allowed) {
+        return Ok(());
+    }
+    let retrieval_scope_chat_id =
+        ask_retrieval_scope_chat_id(msg.chat.id.0, msg.chat.is_private(), default_chat);
+    if !msg.chat.is_private()
+        && config
+            .mcp_read_scope_for_chat(retrieval_scope_chat_id)
+            .is_err()
+    {
+        send_command_html(bot, msg, state, "Не могу проверить область этого диалога.").await?;
+        return Ok(());
+    }
+    let Some(profile) = config.agent_profile.as_ref() else {
+        return Ok(());
+    };
+    // Private messages are never ingested into the group read model. Their
+    // memory is scoped to the actual DM chat with root 0, so /forget can never
+    // resolve a coincidentally equal group message ID.
+    let thread_root_message_id = if msg.chat.is_private() {
+        0
+    } else if let Some(reply) = msg.reply_to_message() {
+        let root = sqlx::query_scalar::<_, i32>(
+            r#"with recursive chain(message_id, reply_to_message_id, depth) as (
+                   select message_id, reply_to_message_id, 0 from telegram_messages
+                   where chat_id = $1 and message_id = $2 and not is_automatic_forward
+                   union all
+                   select parent.message_id, parent.reply_to_message_id, child.depth + 1
+                   from telegram_messages parent join chain child
+                     on parent.message_id = child.reply_to_message_id
+                   where parent.chat_id = $1 and not parent.is_automatic_forward and child.depth < 100
+               ) select message_id from chain where reply_to_message_id is null
+                 order by depth desc limit 1"#,
+        )
+        .bind(retrieval_scope_chat_id)
+        .bind(reply.id.0)
+        .fetch_optional(&state.pool)
+        .await;
+        match root {
+            Ok(Some(root)) => root,
+            _ => {
+                send_command_html(
+                    bot,
+                    msg,
+                    state,
+                    "Не могу подтвердить цепочку ответа; память не изменена.",
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        0
+    };
+    let mut scope = crate::features::ask::conversation_memory::ConversationScope {
+        instance_id: config.community.instance.id.clone(),
+        profile_key: profile.key.clone(),
+        chat_id: msg.chat.id.0,
+        thread_root_message_id,
+        participant_user_id: user.id.0 as i64,
+        memory_epoch: 0,
+    };
+    scope.memory_epoch =
+        crate::features::ask::conversation_memory::capture_epoch(&state.pool, &scope)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to capture conversation memory epoch for /forget");
+                teloxide::RequestError::Io(
+                    std::io::Error::other("forget scope validation failed").into(),
+                )
+            })?;
+    crate::features::ask::conversation_memory::forget_conversation(&state.pool, &scope)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to forget conversation memory");
+            teloxide::RequestError::Io(std::io::Error::other("forget failed").into())
+        })?;
+    send_command_html(bot, msg, state, "Память этого диалога забыта.").await?;
+    Ok(())
 }
 
 #[cfg(feature = "ask")]
@@ -1188,7 +1480,11 @@ fn build_ask_reply_context(
 }
 
 #[cfg(feature = "ask")]
-fn ask_scope_chat_id(chat_id: i64, is_private: bool, default_chat_id: Option<i64>) -> i64 {
+fn ask_retrieval_scope_chat_id(
+    chat_id: i64,
+    is_private: bool,
+    default_chat_id: Option<i64>,
+) -> i64 {
     if is_private {
         default_chat_id.unwrap_or(chat_id)
     } else {
@@ -1443,8 +1739,14 @@ mod tests {
     #[cfg(feature = "ask")]
     #[test]
     fn group_ask_uses_its_own_chat_and_rich_reply_is_visible() {
-        assert_eq!(ask_scope_chat_id(-100222, false, Some(-100111)), -100222);
-        assert_eq!(ask_scope_chat_id(42, true, Some(-100111)), -100111);
+        assert_eq!(
+            ask_retrieval_scope_chat_id(-100222, false, Some(-100111)),
+            -100222
+        );
+        assert_eq!(
+            ask_retrieval_scope_chat_id(42, true, Some(-100111)),
+            -100111
+        );
         let msg: Message = serde_json::from_value(serde_json::json!({
             "message_id":10,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},"text":"/ask и что?",
             "reply_to_message":{"message_id":9,"date":1,"chat":{"id":-100111,"type":"supergroup","title":"Тест"},

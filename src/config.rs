@@ -695,6 +695,27 @@ impl Config {
         if self.ask_enabled && !cfg!(feature = "ask") {
             errors.push("ASK_ENABLED=true but binary lacks cargo feature ask".to_string());
         }
+        let gateway = &self.community.ask.gateway;
+        if gateway.mention_enabled
+            || gateway.reply_to_bot_enabled
+            || gateway.private_messages_enabled
+        {
+            if !self.ask_enabled || self.agent_profile.is_none() {
+                errors.push(
+                    "ask.gateway requires ask.enabled=true and a valid AgentProfile".to_string(),
+                );
+            }
+            if !self.community.chats.values().any(|chat| chat.ask) {
+                errors
+                    .push("ask.gateway requires at least one ask-enabled managed chat".to_string());
+            }
+            if gateway.private_messages_enabled
+                && (self.community.ask.default_chat.is_none()
+                    || self.ask_private_user_ids.is_empty())
+            {
+                errors.push("ask.gateway.private_messages_enabled requires ask.default_chat and an explicit private user allowlist".to_string());
+            }
+        }
         if self.voice_transcription_enabled && !cfg!(feature = "voice") {
             errors.push(
                 "voice transcription is enabled but binary lacks cargo feature voice".to_string(),

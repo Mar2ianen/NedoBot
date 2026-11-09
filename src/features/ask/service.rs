@@ -63,6 +63,7 @@ impl<'a> AskService<'a> {
                 reply_to_message_id: (input.chat_id == input.scope_chat_id)
                     .then_some(input.reply_to_message_id)
                     .flatten(),
+                conversation_chat_id: input.chat_id,
                 scope_chat_id: input.scope_chat_id,
                 command_message_id: input.command_message_id,
                 ask_run_id,
