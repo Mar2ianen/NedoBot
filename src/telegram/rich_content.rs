@@ -58,6 +58,7 @@ impl RichProjection {
                 RichTextObject::EmailAddress(v) => self.inline(&v.text),
                 RichTextObject::PhoneNumber(v) => self.inline(&v.text),
                 RichTextObject::BankCardNumber(v) => self.inline(&v.text),
+                RichTextObject::TonAddress(v) => self.inline(&v.text),
                 RichTextObject::Mention(v) => self.inline(&v.text),
                 RichTextObject::Hashtag(v) => self.inline(&v.text),
                 RichTextObject::Cashtag(v) => self.inline(&v.text),
@@ -172,6 +173,14 @@ impl RichProjection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn preserves_ton_address_text_in_the_ingested_projection() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks": [
+            {"type":"paragraph", "text":{"type":"ton_address", "address":"EQsynthetic", "text":"Получатель"}}
+        ]})).unwrap();
+        assert_eq!(project(&rich).text, "Получатель");
+    }
 
     #[test]
     fn projects_nested_text_links_emoji_and_tables_without_private_metadata() {

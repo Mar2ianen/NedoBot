@@ -1,6 +1,7 @@
 use anyhow::Context;
 use teloxide::{
     Bot,
+    payloads::SendMessageSetters,
     prelude::{Request, Requester},
     types::ChatId,
 };
@@ -13,10 +14,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let bot = Bot::from_env();
     let message = bot
-        .send_message(
-            ChatId(config.discussion_chat_id),
-            "✅ dev bot smoke test: Telegram API send succeeded.",
-        )
+        .send_message("✅ dev bot smoke test: Telegram API send succeeded.")
+        .chat_id(ChatId(config.discussion_chat_id))
         .send()
         .await
         .context("Telegram dev-bot smoke send failed")?;

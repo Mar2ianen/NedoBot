@@ -163,10 +163,10 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         .unwrap_or(Value::Null);
     let material_revision =
         project_unified_user_audit_material_revision(&features, &analysis_config);
-    let snapshot_hash = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&material_revision)?)
-    );
+    let snapshot_hash = Sha256::digest(serde_json::to_vec(&material_revision)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
 
     let params = NewUserAuditJobParams {
         chat_id,
@@ -371,10 +371,12 @@ fn audit_trigger_fingerprint(
         "latest_link_message": latest_link_evidence,
         "channel": channel_evidence,
     });
-    Some(format!(
-        "{:x}",
+    Some(
         Sha256::digest(serde_json::to_vec(&evidence).unwrap_or_default())
-    ))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn has_long_first_comment(features: &NewUserFeatures) -> bool {

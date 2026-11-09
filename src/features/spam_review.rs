@@ -413,7 +413,8 @@ async fn send_review_message(
         .map(|_| message_id)
     } else {
         let mut request = bot
-            .send_message(ChatId(review.destination_chat_id), &review.text)
+            .send_message(&review.text)
+            .chat_id(ChatId(review.destination_chat_id))
             .parse_mode(ParseMode::Html)
             .link_preview_options(disabled_link_preview())
             .reply_markup(review_keyboard(review.id));
@@ -452,7 +453,8 @@ async fn send_review_message(
                 .map(|_| message_id)
             } else {
                 let mut request = bot
-                    .send_message(ChatId(review.destination_chat_id), text)
+                    .send_message(text)
+                    .chat_id(ChatId(review.destination_chat_id))
                     .link_preview_options(disabled_link_preview())
                     .reply_markup(review_keyboard(review.id));
                 if review.destination_chat_id == review.chat_id

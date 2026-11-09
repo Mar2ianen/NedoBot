@@ -19,6 +19,10 @@ BINARIES=(
     tg_ai_bot_teloxide
     nedonews_mcp_http
     chat_db_mcp
+    migrate
+    provision_mcp_instance_scope
+    generate_mcp_db_manifest
+    validate_instance_config
     retry_pending_comments
     reconcile_comment_delivery
     backfill_rich_messages

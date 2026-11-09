@@ -330,7 +330,8 @@ fn classify_voice_delivery_error(error: &RequestError) -> VoiceDeliveryFailure {
         RequestError::RetryAfter(_)
         | RequestError::Api(_)
         | RequestError::MigrateToChatId(_)
-        | RequestError::Validation(_) => VoiceDeliveryFailure::Rejected,
+        | RequestError::Validation(_)
+        | RequestError::Serialization(_) => VoiceDeliveryFailure::Rejected,
         RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_) => {
             VoiceDeliveryFailure::Unknown
         }
@@ -595,9 +596,9 @@ async fn send_regular_transcript(
                 .map_err(|error| classify_voice_delivery_error(&error))?;
             let sent = bot
                 .send_document(
-                    chat_id,
                     InputFile::memory(body.clone().into_bytes()).file_name(filename.clone()),
                 )
+                .chat_id(chat_id)
                 .reply_parameters(
                     ReplyParameters::new(source_message_id).allow_sending_without_reply(),
                 )

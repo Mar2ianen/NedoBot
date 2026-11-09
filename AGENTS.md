@@ -6,7 +6,7 @@
 
 Rust-бот для Telegram-чата `НедоNews Chat`. Первый комментарий под постом канала, память контекста, статистика, расшифровка голосовых.
 
-- **Стек**: Rust 2024 edition, fork teloxide 0.18 / teloxide-core 0.14 (Bot API 10.2), sqlx 0.8 (PostgreSQL), reqwest 0.13
+- **Стек**: Rust 2024 edition, fork teloxide 0.21.0-rc.1 / teloxide-core 0.17.0-rc.1 (Bot API 10.4), sqlx 0.9 (PostgreSQL), reqwest 0.13
 - **LLM-провайдеры**: Gemini (основной), Groq, Cerebras, OpenRouter, Ollama, OpenAI-compatible
 - **ASR**: Groq Whisper
 - **Бот**: `@nedostraj_bot`, чат `-1001932061163`, канал `-1001575496091`
@@ -143,7 +143,7 @@ migrations/                            — sqlx compile-time миграции
 - **Не логировать** response bodies от внешних API при ошибках. Raw body и URL с секретами не должны попадать в ошибки.
 - Telegram API вызывается через typed методы teloxide fork-а; application code не должен собирать token-bearing URLs или дублировать Telegram payload/response модели.
 
-### Telegram Bot API 10.2
+### Telegram Bot API 10.4
 - `Bot::send_rich_message` / `InputRichMessage` используются в production для rich stats, `/ask` и длинных расшифровок голосовых; при ошибке доступен безопасный HTML/file fallback.
 - `Bot::get_user_personal_chat_messages` используется в profile refresh.
 - `chatFullInfo` поля (`emoji_status_custom_emoji_id`, `profile_accent_color_id`) — используются.
@@ -323,9 +323,9 @@ docs: update TECHNICAL.md with voice pipeline details
 - Если меняем Config (новые поля) — обновить struct + from_env + все test fixtures + техническую документацию и tracked config template, если он добавлен в репозиторий.
 - Commit message тело (если нужно): описать контекст, мотивацию, что пробовалось. Не dump diff.
 
-## Bot API 10.2 — typed fork methods
+## Bot API 10.4 — typed fork methods
 
-Fork teloxide 0.18 / teloxide-core 0.14 предоставляет typed методы для используемых расширений Bot API. Не добавлять для них raw HTTP-обёртки или самодельные wire-модели.
+Fork teloxide 0.21.0-rc.1 / teloxide-core 0.17.0-rc.1 предоставляет typed методы для используемых расширений Bot API. Не добавлять для них raw HTTP-обёртки или самодельные wire-модели.
 
 ### `get_user_personal_chat_messages`
 **Где:** `src/features/user_profiles/service.rs:224-232`

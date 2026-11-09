@@ -93,7 +93,7 @@ pub fn classify_send_error(error: &RequestError) -> SendFailure {
         RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_) => {
             SendFailure::DeliveryUnknown
         }
-        RequestError::Validation(_) => SendFailure::Confirmed {
+        RequestError::Validation(_) | RequestError::Serialization(_) => SendFailure::Confirmed {
             error_kind: CommentErrorKind::InvalidInput,
             retry_after_seconds: None,
         },

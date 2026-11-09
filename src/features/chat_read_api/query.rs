@@ -145,7 +145,9 @@ pub async fn count(
     let mut sql = format!("select count(*)::bigint as count from mcp_public.{table_name}");
     let mut binds = Vec::new();
     append_filters(&mut sql, definition, &filters, &mut binds)?;
-    let row = bind_all(sqlx::query(&sql), &binds).fetch_one(pool).await?;
+    let row = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), &binds)
+        .fetch_one(pool)
+        .await?;
     row.try_get("count").map_err(Into::into)
 }
 
@@ -803,9 +805,11 @@ fn escape_like_literal(value: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
+// Вызывающие функции сверяют имена и операторы с reviewed catalog;
+// значения фильтров остаются позиционными bind-параметрами.
 async fn json_rows(pool: &PgPool, sql: &str, binds: &[String]) -> anyhow::Result<Vec<Value>> {
     let sql = format!("select to_jsonb(result_row) as row from ({sql}) result_row");
-    bind_all(sqlx::query(&sql), binds)
+    bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
         .fetch_all(pool)
         .await?
         .into_iter()

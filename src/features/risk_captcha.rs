@@ -214,7 +214,7 @@ async fn deliver_challenge(
         ttl_seconds.saturating_add(59) / 60
     );
     let sent = with_captcha_ephemeral_parameters(
-        bot.send_message(ChatId(challenge.chat_id), text),
+        bot.send_message(text).chat_id(ChatId(challenge.chat_id)),
         UserId(challenge.user_id as u64),
     )
     .reply_markup(keyboard(challenge))
@@ -1021,6 +1021,7 @@ mod tests {
         with_captcha_ephemeral_parameters,
     };
     use teloxide::{
+        payloads::SendMessageSetters,
         prelude::{Bot, ChatId, Requester},
         requests::HasPayload,
         types::UserId,
@@ -1031,7 +1032,9 @@ mod tests {
     fn captcha_message_is_visible_only_to_its_challenged_user() {
         let recipient = UserId(42);
         let request = with_captcha_ephemeral_parameters(
-            Bot::new("123456:TEST_TOKEN").send_message(ChatId(-1001), "solve this"),
+            Bot::new("123456:TEST_TOKEN")
+                .send_message("solve this")
+                .chat_id(ChatId(-1001)),
             recipient,
         );
 
@@ -1040,7 +1043,7 @@ mod tests {
                 .payload_ref()
                 .ephemeral_message_parameters
                 .as_ref()
-                .map(|parameters| parameters.receiver_user_id),
+                .and_then(|parameters| parameters.receiver_user_id),
             Some(recipient)
         );
         assert!(request.payload_ref().reply_parameters.is_none());

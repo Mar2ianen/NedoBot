@@ -623,7 +623,8 @@ async fn claim_embedding_jobs_matching(
         returning e.status, e.chat_id, e.message_id, m.text, e.attempts
         "#
     );
-    let rows = sqlx::query(&sql)
+    // Predicate и порядок заданы внутренними static-фрагментами; лимиты — bind.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(batch_size.clamp(1, 64) as i64)
         .bind(CHAT_EMBEDDING_LEASE.seconds())
         .fetch_all(pool)
