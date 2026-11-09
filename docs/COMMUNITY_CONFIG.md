@@ -278,6 +278,11 @@ Private Telegram messages are partitioned by their actual private chat ID;
 they never share group conversational memory. Since private messages are not
 part of the MCP group read model, `/forget` in a private chat clears that
 requester's private conversation scope without resolving a group message ID.
+The `notes.add_user` tool writes shared chat facts and is denied from a private
+conversation, even for an explicit “remember” request or when retrieval found
+group source IDs. Both note persistence helpers verify the actual conversation
+chat against the retrieval scope before inserting anything. Private bounded
+conversational memory remains separate from these shared notes.
 
 The migration `20261108120000_ask_conversation_memory.sql` adds a private
 application table, absent from all `mcp_public` views. Apply ordinary migrations

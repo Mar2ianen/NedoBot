@@ -19,7 +19,9 @@ use tg_ai_bot_teloxide::{
     features::{
         ask::{
             conversation_memory::{self, ConversationScope, ConversationTurn},
-            notes::{add_user_note_from_explicit_request, add_user_note_from_search},
+            notes::{
+                AgentNoteScope, add_user_note_from_explicit_request, add_user_note_from_search,
+            },
             profile::AgentProfile,
         },
         ask::{
@@ -4584,7 +4586,10 @@ async fn assert_ask_conversation_memory(pool: &PgPool) {
         .unwrap();
     add_user_note_from_explicit_request(
         &restarted_pool,
-        scope_a.chat_id,
+        &AgentNoteScope {
+            conversation_chat_id: scope_a.chat_id,
+            retrieval_scope_chat_id: scope_a.chat_id,
+        },
         note_user_id,
         note_user_id,
         "предпочитаю короткие ответы",
@@ -6920,6 +6925,14 @@ async fn assert_agent_note_contract(pool: &PgPool) {
     const CHAT_ID: i64 = -1001932061163;
     const USER_ID: i64 = 2001;
     const AUTHOR_ID: i64 = 3001;
+    let note_scope = AgentNoteScope {
+        conversation_chat_id: CHAT_ID,
+        retrieval_scope_chat_id: CHAT_ID,
+    };
+    let private_scope = AgentNoteScope {
+        conversation_chat_id: USER_ID,
+        retrieval_scope_chat_id: CHAT_ID,
+    };
 
     query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Notes')")
         .bind(USER_ID)
@@ -6927,9 +6940,56 @@ async fn assert_agent_note_contract(pool: &PgPool) {
         .await
         .expect("note target profile must be inserted");
 
-    let missing_sources = add_user_note_from_search(pool, CHAT_ID, USER_ID, AUTHOR_ID, "факт", &[])
-        .await
-        .expect_err("automatic note without source messages must fail");
+    for scope in [
+        private_scope,
+        AgentNoteScope {
+            conversation_chat_id: -2002,
+            retrieval_scope_chat_id: CHAT_ID,
+        },
+    ] {
+        assert!(
+            add_user_note_from_explicit_request(
+                pool,
+                &scope,
+                USER_ID,
+                AUTHOR_ID,
+                "люблю Rust",
+                "Запомни: я люблю Rust",
+                401,
+            )
+            .await
+            .is_err(),
+            "a private or foreign conversation must not publish an explicit note"
+        );
+        assert!(
+            add_user_note_from_search(
+                pool,
+                &scope,
+                USER_ID,
+                AUTHOR_ID,
+                "приватный факт",
+                &[401, 402],
+            )
+            .await
+            .is_err(),
+            "borrowed group message IDs must not authorize a private note"
+        );
+    }
+    let rejected_count: i64 =
+        query_scalar("select count(*) from telegram_user_notes where telegram_user_id = $1")
+            .bind(USER_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rejected_count, 0,
+        "rejected writes must leave no public note rows"
+    );
+
+    let missing_sources =
+        add_user_note_from_search(pool, &note_scope, USER_ID, AUTHOR_ID, "факт", &[])
+            .await
+            .expect_err("automatic note without source messages must fail");
     assert!(
         missing_sources
             .to_string()
@@ -6938,7 +6998,7 @@ async fn assert_agent_note_contract(pool: &PgPool) {
 
     add_user_note_from_search(
         pool,
-        CHAT_ID,
+        &note_scope,
         USER_ID,
         AUTHOR_ID,
         "  важный\nфакт ",
@@ -6946,7 +7006,7 @@ async fn assert_agent_note_contract(pool: &PgPool) {
     )
     .await
     .expect("sourced note must be inserted");
-    add_user_note_from_search(pool, CHAT_ID, USER_ID, 9999, "важный факт", &[403])
+    add_user_note_from_search(pool, &note_scope, USER_ID, 9999, "важный факт", &[403])
         .await
         .expect("identical sourced note must deduplicate");
 

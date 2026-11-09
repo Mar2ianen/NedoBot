@@ -2,6 +2,24 @@ use sqlx::PgPool;
 
 const MAX_NOTE_CHARS: usize = 1200;
 
+/// Область сообщения и доверенная область retrieval передаются независимо.
+/// Общие заметки не являются backend-ом для приватной conversational memory.
+#[derive(Clone, Copy)]
+pub struct AgentNoteScope {
+    pub conversation_chat_id: i64,
+    pub retrieval_scope_chat_id: i64,
+}
+
+impl AgentNoteScope {
+    pub fn shared_chat_id(&self) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            self.conversation_chat_id == self.retrieval_scope_chat_id,
+            "private conversations cannot write notes into a shared retrieval scope"
+        );
+        Ok(self.conversation_chat_id)
+    }
+}
+
 pub async fn add_chat_note(
     pool: &PgPool,
     chat_id: i64,
@@ -35,12 +53,13 @@ pub async fn add_user_note(
 
 pub async fn add_user_note_from_search(
     pool: &PgPool,
-    chat_id: i64,
+    scope: &AgentNoteScope,
     user_id: i64,
     author_id: i64,
     note: &str,
     source_message_ids: &[i32],
 ) -> anyhow::Result<()> {
+    let chat_id = scope.shared_chat_id()?;
     let note = normalize_note(note)?;
     if source_message_ids.is_empty() {
         anyhow::bail!("automatic user notes require message sources");
@@ -52,25 +71,18 @@ pub async fn add_user_note_from_search(
 
 pub async fn add_user_note_from_explicit_request(
     pool: &PgPool,
-    chat_id: i64,
+    scope: &AgentNoteScope,
     user_id: i64,
     author_id: i64,
     note: &str,
     question: &str,
     command_message_id: i32,
 ) -> anyhow::Result<()> {
+    scope.shared_chat_id()?;
     if !explicit_note_is_safe(question, note) {
         anyhow::bail!("explicit note is not supported by a safe memory request");
     }
-    add_user_note_from_search(
-        pool,
-        chat_id,
-        user_id,
-        author_id,
-        note,
-        &[command_message_id],
-    )
-    .await
+    add_user_note_from_search(pool, scope, user_id, author_id, note, &[command_message_id]).await
 }
 
 pub fn explicit_memory_request(question: &str) -> bool {

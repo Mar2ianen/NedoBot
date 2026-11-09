@@ -18,7 +18,9 @@ use crate::features::ask::conversation_memory::{self, ConversationScope, Convers
 use crate::features::ask::mcp_client::{
     McpClient, RESERVED_LOCAL_AGENT_TOOLS, structured_preview, wire_tool_name,
 };
-use crate::features::ask::notes::{add_user_note_from_explicit_request, add_user_note_from_search};
+use crate::features::ask::notes::{
+    AgentNoteScope, add_user_note_from_explicit_request, add_user_note_from_search,
+};
 use crate::features::ask::profile::AgentProfile;
 use crate::features::ask::python_sandbox::AskPythonSandbox;
 use crate::features::ask::repo;
@@ -86,6 +88,7 @@ struct ToolCallContext<'a> {
     config: &'a Config,
     pool: &'a PgPool,
     scope_chat_id: i64,
+    conversation_chat_id: i64,
     requester_user_id: i64,
     command_message_id: i32,
     question: &'a str,
@@ -605,6 +608,7 @@ async fn answer_within_deadline(
                     config,
                     pool,
                     scope_chat_id,
+                    conversation_chat_id,
                     requester_user_id,
                     command_message_id,
                     question,
@@ -1641,6 +1645,16 @@ async fn call_tool(
             })
         }
         "notes.add_user" => {
+            let note_scope = AgentNoteScope {
+                conversation_chat_id: context.conversation_chat_id,
+                retrieval_scope_chat_id: context.scope_chat_id,
+            };
+            if note_scope.shared_chat_id().is_err() {
+                return ToolResult::from_value(json!({
+                    "saved": false,
+                    "reason": "Личный диалог не может записывать факты в общие заметки чата."
+                }));
+            }
             if let Some(reason) = durable_note_write_denial(
                 context.allow_mutations,
                 context.memory_write_policy,
@@ -1681,7 +1695,7 @@ async fn call_tool(
             if source_message_ids.is_empty() {
                 add_user_note_from_explicit_request(
                     context.pool,
-                    context.scope_chat_id,
+                    &note_scope,
                     user_id,
                     context.requester_user_id,
                     note,
@@ -1692,7 +1706,7 @@ async fn call_tool(
             } else {
                 add_user_note_from_search(
                     context.pool,
-                    context.scope_chat_id,
+                    &note_scope,
                     user_id,
                     context.requester_user_id,
                     note,
