@@ -7,6 +7,67 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+9 ноября 2026 в **20:25:48 UTC / 23:25:48 МСК** выпущен release
+[`deploy-2026-11-09-dependencies-agent-gateway`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-09-dependencies-agent-gateway)
+на merge commit `5e7f43501a0c1ae1ac3cdb685dcf6a2ed3b8715e` после
+[#101](https://github.com/Mar2ianen/NedoBot/pull/101),
+[#102](https://github.com/Mar2ianen/NedoBot/pull/102) и
+[#103](https://github.com/Mar2ianen/NedoBot/pull/103).
+[Release workflow 42691285757](https://github.com/Mar2ianen/NedoBot/actions/runs/42691285757)
+собрал default-features binary на Ubuntu 24.04, проверил glibc ≤ 2.39,
+валидировал оба operator-owned профиля, установил artifact и перезапустил
+основной бот, PVO и public MCP.
+
+SHA-256 обоих работающих bot executable:
+`97d6d35c9376e3e05a3b935d35cf9c5690975de1d223deb853f6c5d6eb201544`.
+SHA-256 public MCP:
+`704bac908a1c9094c2821e7c7ce6459081f57d302ddb8eaeaa9ad883c407eca4`.
+Running hashes сверены с artifact; internal `chat_db_mcp` в обоих checkout
+также соответствует artifact. В обеих БД применена последняя миграция
+`20261108130000`, failed migrations = 0. Historical migrations сохранены.
+
+Перед restart оператор отдельно применил миграции и provision-ил каждый MCP
+scope из собственного профиля; новые manifest проверены по точным именам,
+типам и nullable-статусу колонок reviewed repository manifest. NedoNews
+использует `/etc/tg-ai-bot/mcp_db_manifest.toml`, PVO —
+`/etc/tg-ai-bot/pvo-mcp_db_manifest.toml`. Для существующего NedoNews HTTP
+endpoint явно включён `public_mcp.enabled`; в PVO он выключен. Профиль и manifest
+для `nedonews-mcp` передаются через systemd `LoadCredential`, без расширения
+прав на `/etc/tg-ai-bot`. Gateway и conversation memory доставлены как opt-in
+возможности; их runtime включение не менялось, PVO `/ask` остаётся выключенным.
+
+**Источник ручного initial smoke:** SSH-проверка 9 ноября в **20:26:59 UTC**,
+окно журнала **20:25:48–20:26:59 UTC** (72 секунды), отдельно от workflow.
+`systemctl show` подтвердил active/running и `NRestarts=0` у всех трёх unit;
+SHA-256 `/proc/<MainPID>/exe` совпали с `SHA256SUMS` artifact. Проверены как
+`journalctl -p err`, так и Rust `ERROR` в полном журнале трёх сервисов — 0.
+`nedobot-rag-embedding` active. Это initial smoke, не заявление о десятиминутном
+окне в CI.
+
+После restart выполнены реальные stdio initialize/tools/select для обеих БД;
+чужой chat filter, поддельный bootstrap scope и доступ к conversation memory
+отклонены. Public HTTP через подключённый NedoNews v2 connector вернул только
+свой chat ID и отклонил foreign scope/private memory. Отдельный SQL smoke через
+`SET ROLE nedobot_mcp_ro` в обеих БД подтвердил доступ к reviewed views и отказ
+на raw messages, private scope, conversation memory и write-запросы. Native
+vision/tool preflight на CI artifact с тем же runtime tree вернул ожидаемый
+`inspect(query=test)` через фактический `ask` route. Сообщения-smoke в Telegram
+чаты не отправлялись.
+
+Сохранены согласованные PostgreSQL dump обоих инстансов (каталоги прочитаны
+`pg_restore --list`, checksums записаны вне Git), а также копии профилей,
+manifest, env и прежних бинарников в
+`/var/backups/nedobot/2026-11-09-dependency-refresh` на VPS.
+Ограничения отката после новых миграций описаны в
+[инструкции обновления зависимостей](DEPENDENCY_REFRESH_2026-11-09.md).
+
+Проверки #103: [CI 42689237802](https://github.com/Mar2ianen/NedoBot/actions/runs/42689237802)
+и [CI 42689276022](https://github.com/Mar2ianen/NedoBot/actions/runs/42689276022)
+успешны, включая workspace tests, Clippy, fresh migrations двух БД и MCP/ACL
+integration. План сокращения ручных lexical rules и LLM calls:
+[ANTISPAM_LEARNING_PLAN.md](ANTISPAM_LEARNING_PLAN.md).
+
+
 7 ноября 2026 в **10:41 UTC / 13:41 МСК** выпущен release
 [`deploy-2026-11-07-casual-paid-task-signal`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-casual-paid-task-signal)
 на merge commit `cbf3de07216a0ef9e76fbf5395be28a8758631ee` после PR
