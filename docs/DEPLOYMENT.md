@@ -7,6 +7,59 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+9 ноября 2026 в **20:46:38 UTC / 23:46:38 МСК** установлен correction release
+[`deploy-2026-11-09-private-note-scope`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-09-private-note-scope)
+с source commit `d3b931deeff79cc3ef2714adb2875707c87f8f47` после
+[PR #104](https://github.com/Mar2ianen/NedoBot/pull/104). Этот commit входит в
+`main` через merge `0d8920fc12a10ebe59eadb11c59e9418a1d763cc`; перед установкой
+проверены ancestry и полное совпадение trees source commit и merged main.
+
+[Workflow 42694657594](https://github.com/Mar2ianen/NedoBot/actions/runs/42694657594)
+**только собрал** artifact на Ubuntu 24.04 и проверил glibc ≤ 2.39
+(`deploy=false`). Установка выполнена оператором через SSH с тем же
+`install_release_binaries.sh`, а не deploy-job этого workflow. Проверены все
+`SHA256SUMS`, оба runtime-профиля и совпадение DB scope; installer атомарно
+обновил оба checkout, затем перезапущены оба бота и public MCP. Новых миграций,
+scope changes или правок конфигурации в correction pass нет.
+
+SHA-256 обоих running bot executable:
+`659a9fccbd59034f6b94e8d59213705d2d18ffd71e04f9dececbbe522f010558`.
+SHA-256 running public MCP:
+`d0854d8f4b036a2c2a957537f756eb654e7d2e2170d5a06e79b3375e6060c7f8`.
+В обеих БД по-прежнему последняя migration `20261108130000`, failed = 0.
+Совместимый предыдущий набор бинарников, текущие профили/env/manifest и
+systemd drop-in сохранены в
+`/var/backups/nedobot/2026-11-09-private-note-scope`; `previous-release/`
+содержит полный installer-набор и checksums для возврата к `5e7f435` без
+изменения БД.
+
+**Ручной initial smoke:** 9 ноября в **20:47:59 UTC**, около 82 секунд с
+рестарта в 20:46:38. `systemctl show` подтвердил active/running,
+`NRestarts=0` у всех трёх unit; `/proc/<MainPID>/exe` и оба `chat_db_mcp`
+совпадают с artifact. В полном журнале с рестарта нет Rust `ERROR`,
+`journalctl -p err` также пуст; embedding unit active. Это отдельная
+SSH-проверка, не утверждение о coverage build-only workflow.
+
+После restart повторены stdio initialize/tools/select для обеих БД, отказ
+на чужой chat filter, forged bootstrap scope и private conversation memory.
+PostgreSQL ACL smoke подтвердил reviewed-view access и запрет raw messages,
+private scope, conversation memory и записи от `nedobot_mcp_ro` в обеих БД.
+Подключённый public HTTP connector также успешно выполнил scoped SELECT.
+Проверочные сообщения в Telegram чаты не отправлялись.
+
+Исправление запрещает `notes.add_user` публиковать факт из private/foreign
+conversation в shared retrieval scope — и на границе agent tool, и в обоих
+persistence helpers. Разрешённые групповые notes и private conversational
+memory сохраняют прежнюю семантику. На проверке после выкладки в обеих БД
+нет исторических `notes.add_user` tool calls из private `ask_runs` и нет новых
+user notes с первого restart в 20:25:48; пользовательские данные не удалялись.
+
+[CI 42694490354](https://github.com/Mar2ianen/NedoBot/actions/runs/42694490354)
+для точного `d3b931d` успешен: workspace tests, strict Clippy, fresh migrations,
+PostgreSQL negative note-write regression и MCP/ACL integration. Те же проверки
+прошли локально через `scripts/test.sh`.
+
+
 9 ноября 2026 в **20:25:48 UTC / 23:25:48 МСК** выпущен release
 [`deploy-2026-11-09-dependencies-agent-gateway`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-09-dependencies-agent-gateway)
 на merge commit `5e7f43501a0c1ae1ac3cdb685dcf6a2ed3b8715e` после
@@ -37,7 +90,7 @@ endpoint явно включён `public_mcp.enabled`; в PVO он выключ�
 возможности; их runtime включение не менялось, PVO `/ask` остаётся выключенным.
 
 **Источник ручного initial smoke:** SSH-проверка 9 ноября в **20:26:59 UTC**,
-окно журнала **20:25:48–20:26:59 UTC** (72 секунды), отдельно от workflow.
+окно журнала **20:25:48–20:27:00 UTC** (72 секунды), отдельно от workflow.
 `systemctl show` подтвердил active/running и `NRestarts=0` у всех трёх unit;
 SHA-256 `/proc/<MainPID>/exe` совпали с `SHA256SUMS` artifact. Проверены как
 `journalctl -p err`, так и Rust `ERROR` в полном журнале трёх сервисов — 0.
