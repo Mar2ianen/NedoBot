@@ -110,9 +110,14 @@ async fn main() -> anyhow::Result<()> {
                 ))
             })
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-        let explain_sql = format!("explain (format json) select * from mcp_public.\"{name}\"");
+        // Имена проверены catalog-валидатором выше; кавычки имени экранируются отдельно.
+        let quoted_name = name.replace('"', "\"\"");
+        let explain_sql =
+            format!("explain (format json) select * from mcp_public.\"{quoted_name}\"");
         let explain: sqlx::types::Json<serde_json::Value> =
-            sqlx::query_scalar(&explain_sql).fetch_one(&pool).await?;
+            sqlx::query_scalar(sqlx::AssertSqlSafe(explain_sql))
+                .fetch_one(&pool)
+                .await?;
         let estimate = explain.0[0]["Plan"]["Plan Rows"]
             .as_i64()
             .unwrap_or_default();

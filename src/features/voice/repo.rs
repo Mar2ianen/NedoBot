@@ -130,7 +130,7 @@ pub async fn create_voice_job(pool: &PgPool, media: &VoiceMedia) -> anyhow::Resu
 }
 
 pub async fn claim_voice_job(pool: &PgPool, job_id: i64) -> anyhow::Result<Option<VoiceJob>> {
-    let row = sqlx::query_as::<_, VoiceJobRow>(&format!(
+    let row = sqlx::query_as::<_, VoiceJobRow>(sqlx::AssertSqlSafe(format!(
         r#"
         update voice_transcription_jobs
         set status = 'processing',
@@ -149,7 +149,7 @@ pub async fn claim_voice_job(pool: &PgPool, job_id: i64) -> anyhow::Result<Optio
         returning {JOB_COLUMNS}
         "#,
         JOB_COLUMNS = JOB_COLUMNS
-    ))
+    )))
     .bind(job_id)
     .bind(VOICE_TRANSCRIPTION_LEASE.seconds())
     .fetch_optional(pool)
@@ -159,7 +159,7 @@ pub async fn claim_voice_job(pool: &PgPool, job_id: i64) -> anyhow::Result<Optio
 }
 
 pub async fn claim_next_voice_job(pool: &PgPool) -> anyhow::Result<Option<VoiceJob>> {
-    let row = sqlx::query_as::<_, VoiceJobRow>(&format!(
+    let row = sqlx::query_as::<_, VoiceJobRow>(sqlx::AssertSqlSafe(format!(
         r#"
         with candidate as (
             select id
@@ -186,7 +186,7 @@ pub async fn claim_next_voice_job(pool: &PgPool) -> anyhow::Result<Option<VoiceJ
         returning {JOB_COLUMNS_QUALIFIED}
         "#,
         JOB_COLUMNS_QUALIFIED = JOB_COLUMNS_QUALIFIED
-    ))
+    )))
     .bind(VOICE_TRANSCRIPTION_LEASE.seconds())
     .fetch_optional(pool)
     .await?;

@@ -71,11 +71,20 @@ static TRANSPORTS: LazyLock<Mutex<HashMap<Option<String>, Arc<GenAiTransport>>>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl GenAiTransport {
-    pub fn new(direct_http: reqwest::Client, proxied_http: Option<reqwest::Client>) -> Self {
-        Self {
-            direct: Client::builder().with_reqwest(direct_http).build(),
-            proxied: proxied_http.map(|http| Client::builder().with_reqwest(http).build()),
-        }
+    pub fn new(
+        direct_http: reqwest::Client,
+        proxied_http: Option<reqwest::Client>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            direct: Client::builder()
+                .with_reqwest(direct_http)
+                .build()
+                .map_err(|_| anyhow::anyhow!("failed to initialize direct LLM client"))?,
+            proxied: proxied_http
+                .map(|http| Client::builder().with_reqwest(http).build())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("failed to initialize proxied LLM client"))?,
+        })
     }
 
     /// Получает долгоживущий transport из process-local cache. Ключом служит только proxy URL;
@@ -97,7 +106,7 @@ impl GenAiTransport {
             .as_deref()
             .map(|proxy| http::client_with_proxy(GENAI_HTTP_TIMEOUT, Some(proxy)))
             .transpose()?;
-        let transport = Arc::new(Self::new(direct_http, proxied_http));
+        let transport = Arc::new(Self::new(direct_http, proxied_http)?);
         transports.insert(proxy_url, Arc::clone(&transport));
         Ok(transport)
     }
@@ -188,22 +197,12 @@ impl GenAiTransport {
     async fn exec_chat(
         &self,
         model: ModelTarget<'_>,
-        mut request: ChatRequest,
+        request: ChatRequest,
         options: ChatOptions,
         timeout_duration: Duration,
         egress: Egress,
         structured_output: bool,
     ) -> Result<ChatResponse, LlmTransportError> {
-        // genai 0.6.5 сохраняет additionalProperties в function.parameters,
-        // но Gemini Schema отклоняет этот JSON Schema keyword с HTTP 400.
-        // Остальную конвертацию выполняет SDK; строгие схемы других adapter-ов сохраняем.
-        if matches!(model.adapter, GenAiAdapter::Gemini) {
-            for tool in request.tools.iter_mut().flatten() {
-                if let Some(schema) = tool.schema.as_mut() {
-                    remove_gemini_additional_properties(schema);
-                }
-            }
-        }
         let endpoint = format!("{}/", model.endpoint.trim_end_matches('/'));
         let target = ServiceTarget {
             endpoint: Endpoint::from_owned(endpoint),
@@ -224,36 +223,6 @@ impl GenAiTransport {
         .await
         .map_err(|_| LlmTransportError::timeout())?;
         result.map_err(|error| map_genai_error(error, structured_output))
-    }
-}
-
-fn remove_gemini_additional_properties(schema: &mut serde_json::Value) {
-    let Some(object) = schema.as_object_mut() else {
-        return;
-    };
-    object.remove("additionalProperties");
-    // Имена свойств не являются schema keywords: параметр с таким же
-    // именем сохраняется, а ограничение снимается только внутри его схемы.
-    for key in ["properties", "$defs", "definitions"] {
-        if let Some(children) = object
-            .get_mut(key)
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            for child in children.values_mut() {
-                remove_gemini_additional_properties(child);
-            }
-        }
-    }
-    for key in ["items", "allOf", "anyOf", "oneOf", "prefixItems"] {
-        match object.get_mut(key) {
-            Some(serde_json::Value::Array(children)) => {
-                for child in children {
-                    remove_gemini_additional_properties(child);
-                }
-            }
-            Some(child) => remove_gemini_additional_properties(child),
-            None => {}
-        }
     }
 }
 
@@ -642,7 +611,7 @@ mod tests {
             .unwrap();
         });
 
-        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let transport = GenAiTransport::new(reqwest::Client::new(), None).unwrap();
         let endpoint = format!("http://{address}/v1");
         let response = transport
             .generate(GenAiRequest {
@@ -726,7 +695,7 @@ mod tests {
         });
 
         let schema = serde_json::json!({"type": "object", "required": ["ok"]});
-        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let transport = GenAiTransport::new(reqwest::Client::new(), None).unwrap();
         let endpoint = format!("http://{address}");
         let response = transport
             .generate(GenAiRequest {
@@ -801,7 +770,7 @@ mod tests {
             .unwrap();
         });
         let schema = serde_json::json!({"type": "object"});
-        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let transport = GenAiTransport::new(reqwest::Client::new(), None).unwrap();
         let endpoint = format!("http://{address}/v1");
         let error = transport
             .generate(GenAiRequest {
@@ -836,7 +805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_native_tools_remove_unsupported_keywords_and_keep_parameter_names() {
+    async fn gemini_native_tools_preserve_full_json_schema_and_parameter_names() {
         async fn response(
             State(captured): State<CapturedRequest>,
             headers: HeaderMap,
@@ -867,7 +836,7 @@ mod tests {
             .unwrap();
         });
         let endpoint = format!("http://{address}/v1beta");
-        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let transport = GenAiTransport::new(reqwest::Client::new(), None).unwrap();
         let result = transport.chat(GenAiChatRequest {
             model: ModelTarget {adapter: GenAiAdapter::Gemini, endpoint: &endpoint, api_key: "test-key", model: "gemini-3.5-flash"},
             system_prompt: None,
@@ -883,15 +852,19 @@ mod tests {
         }).await.unwrap();
         assert_eq!(result.tool_calls()[0].fn_name, "inspect");
         let request = captured.lock().unwrap().take().unwrap().1;
-        let schema = &request["tools"][0]["functionDeclarations"][0]["parameters"];
-        assert!(schema.get("additionalProperties").is_none());
+        let declaration = &request["tools"][0]["functionDeclarations"][0];
+        assert!(declaration.get("parameters").is_none());
+        let schema = &declaration["parametersJsonSchema"];
+        assert_eq!(schema["additionalProperties"], false);
         assert!(schema["properties"]["additionalProperties"].is_object());
-        assert!(
-            schema["properties"]["additionalProperties"]
-                .get("additionalProperties")
-                .is_none()
+        assert_eq!(
+            schema["properties"]["additionalProperties"]["additionalProperties"],
+            false
         );
-        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["query"]["type"],
+            serde_json::json!(["string", "null"])
+        );
         server.abort();
     }
 
@@ -938,7 +911,7 @@ mod tests {
         });
 
         let endpoint = format!("http://{address}/v1");
-        let transport = GenAiTransport::new(reqwest::Client::new(), None);
+        let transport = GenAiTransport::new(reqwest::Client::new(), None).unwrap();
         let response = transport
             .chat(GenAiChatRequest {
                 model: ModelTarget {

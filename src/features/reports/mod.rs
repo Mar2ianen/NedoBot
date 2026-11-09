@@ -366,7 +366,8 @@ async fn send_report_notification(
     let chat_id = ChatId(admin_user_id);
     let keyboard = render_report_keyboard(report);
     match bot
-        .send_rich_message(chat_id, render_report(report))
+        .send_rich_message(render_report(report))
+        .chat_id(chat_id)
         .reply_markup(keyboard.clone())
         .await
     {
@@ -383,7 +384,7 @@ async fn send_report_notification(
             );
             let html = render_report_html_fallback(report);
             match bot
-                .send_message(chat_id, html.clone())
+                .send_message(html.clone()).chat_id(chat_id)
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await
@@ -399,10 +400,7 @@ async fn send_report_notification(
                         report_id = report.id,
                         "Telegram rejected compact HTML report; retrying as plain text"
                     );
-                    bot.send_message(
-                        chat_id,
-                        crate::telegram::service_messages::html_to_plain_text(&html),
-                    )
+                    bot.send_message(crate::telegram::service_messages::html_to_plain_text(&html),).chat_id(chat_id)
                     .reply_markup(render_report_keyboard(report))
                     .await
                 }

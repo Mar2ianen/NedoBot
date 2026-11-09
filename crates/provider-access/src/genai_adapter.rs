@@ -15,7 +15,10 @@ pub async fn chat_openrouter_free(
     request: ChatRequest,
 ) -> Result<ChatResponse> {
     provider.validate()?;
-    let client = Client::builder().with_reqwest(http).build();
+    let client = Client::builder()
+        .with_reqwest(http)
+        .build()
+        .map_err(|_| ProviderError::GenAi)?;
     let target = ServiceTarget {
         endpoint: Endpoint::from_static(OPENROUTER_BASE_URL),
         auth: AuthData::from_single(provider.api_key()),

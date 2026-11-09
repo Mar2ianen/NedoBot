@@ -68,6 +68,7 @@ jobs:
         run: |
           mkdir -p dist
           for binary in tg_ai_bot_teloxide nedonews_mcp_http chat_db_mcp \
+              migrate provision_mcp_instance_scope generate_mcp_db_manifest validate_instance_config \
               retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
               backfill_post_history_embeddings backfill_audit_embeddings \
               backfill_chat_embeddings import_telegram_export probe_ask_route; do
@@ -97,6 +98,7 @@ jobs:
           ( cd dist && sha256sum -c SHA256SUMS )
           # Скачанные из artifact файлы теряют exec-бит — возвращаем явно.
           chmod +x dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
+            dist/migrate dist/provision_mcp_instance_scope dist/generate_mcp_db_manifest dist/validate_instance_config \
             dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
             dist/backfill_post_history_embeddings dist/backfill_audit_embeddings \
             dist/backfill_chat_embeddings \
@@ -122,6 +124,7 @@ jobs:
           stage="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" 'mktemp -d')"
           scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
+            dist/migrate dist/provision_mcp_instance_scope dist/generate_mcp_db_manifest dist/validate_instance_config \
             dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
             dist/backfill_post_history_embeddings dist/backfill_audit_embeddings \
             dist/backfill_chat_embeddings \
@@ -151,6 +154,20 @@ jobs:
           mcp_restarts_before=$(systemctl show nedonews-mcp -p NRestarts --value)
           bash "$stage_dir/install_release_binaries.sh" "$stage_dir"
           rm -rf "$stage_dir"
+          # Preflight uses systemd's EnvironmentFile parser, exactly like each service.
+          # Profiles and secrets are operator-owned and are never overwritten by CI.
+          for instance in tg-ai-bot-teloxide nedobot-pvo; do
+            if [ "$instance" = tg-ai-bot-teloxide ]; then
+              profile=/etc/tg-ai-bot/llm_profiles.toml
+            else
+              profile=/etc/tg-ai-bot/pvo-llm_profiles.toml
+            fi
+            systemd-run --quiet --wait --pipe --collect \
+              --property="WorkingDirectory=/opt/$instance" \
+              --property="EnvironmentFile=/opt/$instance/.env" \
+              --setenv="LLM_PROFILES_PATH=$profile" \
+              "/opt/$instance/target/release/validate_instance_config"
+          done
           systemctl restart tg-ai-bot-teloxide nedobot-pvo
           systemctl is-active tg-ai-bot-teloxide nedobot-pvo
 

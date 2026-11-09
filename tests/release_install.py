@@ -10,7 +10,8 @@ BINARIES = ("tg_ai_bot_teloxide", "nedonews_mcp_http", "chat_db_mcp",
             "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages",
             "backfill_post_history_embeddings", "backfill_audit_embeddings",
             "backfill_chat_embeddings",
-            "import_telegram_export")
+            "import_telegram_export", "migrate", "provision_mcp_instance_scope",
+            "generate_mcp_db_manifest", "validate_instance_config")
 
 
 class ReleaseInstall(unittest.TestCase):

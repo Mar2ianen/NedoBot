@@ -1385,9 +1385,9 @@ async fn send_ask_fallback(
         crate::telegram::render::send_html_reply(bot, command.chat.id, command.id, html).await?
     } else {
         bot.send_document(
-            command.chat.id,
             InputFile::memory(markdown.as_bytes().to_vec()).file_name("ask-answer.md"),
         )
+        .chat_id(command.chat.id)
         .reply_parameters(ReplyParameters::new(command.id).allow_sending_without_reply())
         .await?
     };

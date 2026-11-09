@@ -61,7 +61,7 @@ pub async fn send_rich_message(
     chat_id: ChatId,
     rich_message: InputRichMessage,
 ) -> ResponseResult<Message> {
-    bot.send_rich_message(chat_id, rich_message).await
+    bot.send_rich_message(rich_message).chat_id(chat_id).await
 }
 
 pub async fn send_rich_message_reply(
@@ -70,7 +70,8 @@ pub async fn send_rich_message_reply(
     reply_to_message_id: MessageId,
     rich_message: InputRichMessage,
 ) -> ResponseResult<Message> {
-    bot.send_rich_message(chat_id, rich_message)
+    bot.send_rich_message(rich_message)
+        .chat_id(chat_id)
         .reply_parameters(ReplyParameters::new(reply_to_message_id).allow_sending_without_reply())
         .await
 }

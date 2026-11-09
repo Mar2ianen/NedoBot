@@ -272,6 +272,8 @@ pub async fn user_moderation_summary(
     })
 }
 
+// SQL-фрагменты заданы статическими period/filter/aggregate policies;
+// пользовательские значения остаются bind-параметрами (проверка SQLx 0.9).
 /// Resolves the editorial period once so all report queries use identical bounds.
 pub async fn report_window(pool: &PgPool, period: StatsPeriod) -> anyhow::Result<ReportWindow> {
     #[derive(sqlx::FromRow)]
@@ -286,7 +288,9 @@ pub async fn report_window(pool: &PgPool, period: StatsPeriod) -> anyhow::Result
          (date_trunc('day', now() at time zone 'Europe/Moscow' - interval '5 hours')::date - date '1970-01-01')::bigint as chat_day_index",
         period_start_sql(period)
     );
-    let row: ReportWindowRow = sqlx::query_as(&sql).fetch_one(pool).await?;
+    let row: ReportWindowRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_one(pool)
+        .await?;
     Ok(ReportWindow::new(
         row.start_at,
         row.end_at,
@@ -372,7 +376,7 @@ pub async fn chat_stats_summary(
         "#;
     let sql = with_user_activity_aggregates(&with_human_message_filter(sql, "$2"));
 
-    let row: ChatStatsSummaryRow = sqlx::query_as(&sql)
+    let row: ChatStatsSummaryRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(window.start_at)
@@ -420,7 +424,7 @@ pub async fn chat_attraction_metrics(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(window.start_at)
@@ -453,7 +457,7 @@ pub async fn period_top_users(
         "#;
     let sql = with_user_activity_aggregates(&with_human_message_filter(sql, "$2"));
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(window.start_at)
@@ -500,7 +504,7 @@ pub async fn bot_comments_for_period(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(window.start_at)
@@ -569,7 +573,7 @@ pub async fn top_word_users(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(word)
@@ -619,7 +623,7 @@ async fn ranked_message_users(
     );
     let sql = with_human_message_filter(&sql, "$2");
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(limit)
@@ -667,7 +671,7 @@ pub async fn daily_active_users(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    let rows: Vec<DayRow> = sqlx::query_as(&sql)
+    let rows: Vec<DayRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(window.start_at)
@@ -709,7 +713,7 @@ pub async fn cohort_activity(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    let rows: Vec<ActivityRow> = sqlx::query_as(&sql)
+    let rows: Vec<ActivityRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(since)
@@ -782,7 +786,7 @@ pub async fn top_reacted_messages(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(limit)
@@ -804,7 +808,7 @@ pub async fn top_message_user_ids(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    let rows: Vec<(i64,)> = sqlx::query_as(&sql)
+    let rows: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(limit)
@@ -827,7 +831,7 @@ pub async fn top_reacted_user_ids(
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
-    let rows: Vec<(i64,)> = sqlx::query_as(&sql)
+    let rows: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
         .bind(limit)
@@ -944,7 +948,7 @@ pub async fn user_activity(
         from message_counts mc
         "#;
     let sql = with_user_activity_aggregates(&with_human_message_filter(sql, "$3"));
-    let row: UserActivityCountsRow = sqlx::query_as(&sql)
+    let row: UserActivityCountsRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(user_id)
         .bind(TELEGRAM_SERVICE_USER_ID)
@@ -1033,7 +1037,7 @@ pub async fn user_top_words(
         "#;
     let sql = with_human_message_filter(sql, "$5");
 
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(discussion_chat_id)
         .bind(user_id)
         .bind(stop_words)

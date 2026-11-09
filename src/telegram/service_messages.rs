@@ -69,7 +69,8 @@ pub async fn send_html(
     };
     let result = match audience {
         MessageAudience::Public => {
-            bot.send_message(chat_id, text)
+            bot.send_message(text)
+                .chat_id(chat_id)
                 .link_preview_options(disabled_link_preview())
                 .await
         }
@@ -78,7 +79,7 @@ pub async fn send_html(
             message_thread_id,
         } if chat_id.0 < 0 => {
             with_ephemeral_parameters(
-                bot.send_message(chat_id, text),
+                bot.send_message(text).chat_id(chat_id),
                 receiver_user_id,
                 message_thread_id,
             )
@@ -86,7 +87,8 @@ pub async fn send_html(
             .await
         }
         MessageAudience::Ephemeral { .. } => {
-            bot.send_message(chat_id, text)
+            bot.send_message(text)
+                .chat_id(chat_id)
                 .link_preview_options(disabled_link_preview())
                 .await
         }
@@ -124,7 +126,8 @@ pub async fn send_html_reply(
     };
     let result = match audience {
         MessageAudience::Public => {
-            bot.send_message(chat_id, text)
+            bot.send_message(text)
+                .chat_id(chat_id)
                 .reply_parameters(
                     teloxide::types::ReplyParameters::new(reply_to_message_id)
                         .allow_sending_without_reply(),
@@ -139,7 +142,7 @@ pub async fn send_html_reply(
             message_thread_id,
         } if chat_id.0 < 0 => {
             with_ephemeral_parameters(
-                bot.send_message(chat_id, text),
+                bot.send_message(text).chat_id(chat_id),
                 receiver_user_id,
                 message_thread_id,
             )
@@ -147,7 +150,8 @@ pub async fn send_html_reply(
             .await
         }
         MessageAudience::Ephemeral { .. } => {
-            bot.send_message(chat_id, text)
+            bot.send_message(text)
+                .chat_id(chat_id)
                 .reply_parameters(
                     teloxide::types::ReplyParameters::new(reply_to_message_id)
                         .allow_sending_without_reply(),
@@ -193,7 +197,8 @@ async fn send_plain_fallback(
     );
     let bot = bot.inner();
     let request = bot
-        .send_message(chat_id, plain)
+        .send_message(plain)
+        .chat_id(chat_id)
         .link_preview_options(disabled_link_preview());
     match audience {
         MessageAudience::Public => match reply_to_message_id {
@@ -291,13 +296,14 @@ pub async fn send_rich_html(
     let html = normalize_rich_text(html)?;
     let message = InputRichMessage::html(html.clone());
     let result = match audience {
-        MessageAudience::Public => bot.send_rich_message(chat_id, message).await,
+        MessageAudience::Public => bot.send_rich_message(message).chat_id(chat_id).await,
         MessageAudience::Ephemeral {
             receiver_user_id,
             message_thread_id,
         } if chat_id.0 < 0 => {
             let request = bot
-                .send_rich_message(chat_id, message)
+                .send_rich_message(message)
+                .chat_id(chat_id)
                 .ephemeral_message_parameters(EphemeralMessageParameters::new(receiver_user_id));
             let request = match message_thread_id {
                 Some(thread_id) => request.message_thread_id(thread_id),
@@ -305,7 +311,7 @@ pub async fn send_rich_html(
             };
             request.await
         }
-        MessageAudience::Ephemeral { .. } => bot.send_rich_message(chat_id, message).await,
+        MessageAudience::Ephemeral { .. } => bot.send_rich_message(message).chat_id(chat_id).await,
     };
 
     match result {
@@ -323,7 +329,7 @@ pub async fn send_rich_html(
 /// can mean the original message was accepted, so callers must not send again.
 pub fn should_fallback_after_payload_rejection(error: &RequestError) -> bool {
     match error {
-        RequestError::Validation(_) => true,
+        RequestError::Validation(_) | RequestError::Serialization(_) => true,
         RequestError::Api(ApiError::CantParseEntities(_) | ApiError::MessageIsTooLong) => true,
         RequestError::Api(ApiError::Unknown(description)) => {
             description.starts_with("Bad Request:")
@@ -369,6 +375,7 @@ mod tests {
     };
     use teloxide::{
         errors::{ApiError, RequestError},
+        payloads::SendMessageSetters,
         prelude::{Bot, ChatId, Requester, RequesterExt},
         requests::HasPayload,
         types::{MessageId, ParseMode, ThreadId, UserId},
@@ -379,7 +386,9 @@ mod tests {
         let receiver_user_id = UserId(42);
         let thread_id = ThreadId(MessageId(987));
         let request = with_ephemeral_parameters(
-            Bot::new("123456:TEST_TOKEN").send_message(ChatId(-1001), "private result"),
+            Bot::new("123456:TEST_TOKEN")
+                .send_message("private result")
+                .chat_id(ChatId(-1001)),
             receiver_user_id,
             Some(thread_id),
         );
@@ -391,7 +400,7 @@ mod tests {
             payload
                 .ephemeral_message_parameters
                 .as_ref()
-                .map(|parameters| parameters.receiver_user_id),
+                .and_then(|parameters| parameters.receiver_user_id),
             Some(receiver_user_id)
         );
     }
@@ -434,6 +443,25 @@ mod tests {
         assert_eq!(
             audience_for_command(true, true, None, false, false, None),
             Some(MessageAudience::Public)
+        );
+    }
+
+    #[cfg(feature = "auto-comment")]
+    #[test]
+    fn local_serialization_failure_is_safe_to_fallback_without_duplicate_delivery() {
+        let error = RequestError::Serialization(
+            serde_json::from_str::<serde_json::Value>("invalid JSON")
+                .unwrap_err()
+                .into(),
+        );
+        assert!(should_fallback_after_payload_rejection(&error));
+        assert!(!delivery_outcome_is_unknown(&error));
+        assert_eq!(
+            crate::features::first_comment::repo::classify_send_error(&error),
+            crate::features::first_comment::repo::SendFailure::Confirmed {
+                error_kind: crate::features::first_comment::repo::CommentErrorKind::InvalidInput,
+                retry_after_seconds: None,
+            }
         );
     }
 
