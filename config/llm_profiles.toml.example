@@ -504,6 +504,7 @@ private_enabled = false
 [ask]
 enabled = false
 default_chat = "main"
+agent_profile = "nedonews_default"
 
 [first_comment]
 enabled = true
@@ -532,3 +533,33 @@ ceil = 1.0
 k = 3.20435
 midpoint_billion = 8.45919
 version = "4pl-prod-2026-09-21"
+
+[agent_profiles.nedonews_default]
+identity = "NedoBot"
+display_name = "NedoBot"
+community_context = "НедоNews Chat (разрешена только его история)"
+system_prompt_file = "builtin:nedonews_ask"
+capability_document_file = "builtin:nedonews_changelog"
+response_style = ""
+model_route = "ask"
+tool_allowlist = [
+  "chat.resolve_user", "chat.get_user_profile", "chat.count_messages",
+  "chat.count_word_occurrences", "chat.search_messages", "chat.search_messages_batch",
+  "chat.get_recent_messages", "chat.get_message", "chat.get_message_context",
+  "chat.get_reply_thread", "chat.get_user_interactions", "sandbox.python", "notes.list_chat",
+  "notes.list_user", "notes.add_user", "web.search", "github.search"
+]
+
+[agent_profiles.nedonews_default.budgets]
+max_steps = 64
+max_tool_calls = 64
+action_timeout_sec = 180
+total_timeout_sec = 1800
+max_output_tokens = 16384
+
+[agent_profiles.nedonews_default.memory]
+enabled = false
+max_turns = 20
+retention_days = 30
+max_context_chars = 8000
+write_policy = "explicit_only"

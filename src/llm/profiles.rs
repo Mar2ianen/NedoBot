@@ -14,6 +14,10 @@ pub struct LlmProfiles {
     pub providers: BTreeMap<String, ProviderProfile>,
     pub models: BTreeMap<String, ModelProfile>,
     pub routes: BTreeMap<String, RouteProfile>,
+    /// Named, operator-configured agents. Community `[ask].agent_profile`
+    /// selects exactly one profile at runtime.
+    #[serde(default)]
+    pub agent_profiles: BTreeMap<String, AgentProfileConfig>,
     pub runtime: RuntimeSettings,
     /// Community policy is kept beside the LLM topology for the existing
     /// deployment contract, but is intentionally separate from provider
@@ -41,6 +45,64 @@ pub struct LlmProfiles {
     pub public_mcp: Option<PublicMcpConfig>,
     #[serde(default)]
     pub risk_profiles: BTreeMap<String, RiskProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileConfig {
+    pub identity: String,
+    pub display_name: String,
+    pub community_context: String,
+    pub system_prompt_file: String,
+    #[serde(default)]
+    pub response_style: String,
+    pub model_route: String,
+    pub tool_allowlist: Vec<String>,
+    pub budgets: AgentBudgets,
+    #[serde(default)]
+    pub memory: AgentMemoryConfig,
+    #[serde(default)]
+    pub capability_document_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBudgets {
+    pub max_steps: usize,
+    pub max_tool_calls: usize,
+    pub action_timeout_sec: u64,
+    pub total_timeout_sec: u64,
+    pub max_output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentMemoryConfig {
+    pub enabled: bool,
+    pub max_turns: usize,
+    pub retention_days: u32,
+    pub max_context_chars: usize,
+    pub write_policy: AgentMemoryWritePolicy,
+}
+
+impl Default for AgentMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_turns: 20,
+            retention_days: 30,
+            max_context_chars: 8_000,
+            write_policy: AgentMemoryWritePolicy::Disabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMemoryWritePolicy {
+    #[default]
+    Disabled,
+    ExplicitOnly,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,6 +290,53 @@ impl LlmProfiles {
                 }
             }
             self.resolve_route(name, &RouteRequirements::default())?;
+        }
+
+        for (name, profile) in &self.agent_profiles {
+            validate_profile_name("agent", name)?;
+            for (field, value) in [
+                ("identity", profile.identity.as_str()),
+                ("display_name", profile.display_name.as_str()),
+                ("community_context", profile.community_context.as_str()),
+                ("system_prompt_file", profile.system_prompt_file.as_str()),
+                ("model_route", profile.model_route.as_str()),
+            ] {
+                require_non_empty("agent", name, field, value)?;
+            }
+            if profile.tool_allowlist.is_empty() {
+                anyhow::bail!("agent profile {name:?} must allow at least one tool");
+            }
+            let mut tools = BTreeSet::new();
+            for tool in &profile.tool_allowlist {
+                require_non_empty("agent", name, "tool_allowlist entry", tool)?;
+                if !tools.insert(tool) {
+                    anyhow::bail!("agent profile {name:?} repeats tool {tool:?}");
+                }
+            }
+            let budgets = &profile.budgets;
+            if !(1..=128).contains(&budgets.max_steps)
+                || !(1..=256).contains(&budgets.max_tool_calls)
+                || !(1..=600).contains(&budgets.action_timeout_sec)
+                || !(1..=3600).contains(&budgets.total_timeout_sec)
+                || !(1..=32_768).contains(&budgets.max_output_tokens)
+            {
+                anyhow::bail!("agent profile {name:?} has an invalid execution budget");
+            }
+            if !(1..=100).contains(&profile.memory.max_turns)
+                || !(1..=3650).contains(&profile.memory.retention_days)
+                || !(256..=32_768).contains(&profile.memory.max_context_chars)
+            {
+                anyhow::bail!("agent profile {name:?} has invalid conversation memory limits");
+            }
+            self.resolve_route(
+                &profile.model_route,
+                &RouteRequirements {
+                    requires_images: true,
+                    requires_tools: true,
+                    requires_system_prompt: true,
+                    ..RouteRequirements::default()
+                },
+            )?;
         }
 
         Ok(())
@@ -442,6 +551,25 @@ models = ["ollama_memory"]
                 .unwrap()
                 .fallback_on_validation_failure
         );
+    }
+
+    #[test]
+    fn agent_profiles_reject_unknown_routes_and_routes_without_required_capabilities() {
+        let unknown_route =
+            EXAMPLE_PROFILES.replace("model_route = \"ask\"", "model_route = \"missing_route\"");
+        assert!(LlmProfiles::from_toml(&unknown_route).is_err());
+
+        let no_image_model = EXAMPLE_PROFILES
+            .replace(
+                "[agent_profiles.nedonews_default]",
+                "[routes.only_no_image]\nmodels = [\"gemini_ask\"]\n\n[agent_profiles.nedonews_default]",
+            )
+            .replace("model_route = \"ask\"", "model_route = \"only_no_image\"")
+            .replace(
+                "[models.gemini_ask.capabilities]\nsupports_images = true",
+                "[models.gemini_ask.capabilities]\nsupports_images = false",
+            );
+        assert!(LlmProfiles::from_toml(&no_image_model).is_err());
     }
 
     #[test]

@@ -181,3 +181,95 @@ HTTP/public MCP по умолчанию выключен. Для отдельн�
 bootstrap проверит профиль и совпадение профиля, manifest и database scope.
 Это отдельное решение о публикации содержимого сообщества, оно не включает
 публичный endpoint автоматически при запуске internal stdio MCP.
+
+## Agent profiles and conversational memory
+
+`[ask].agent_profile` selects a named profile from the same TOML file. Each
+community instance must select its own profile when `/ask` is enabled. The
+profile owns the identity, system prompt, response style, model route, compiled
+tool allowlist and execution budgets. Tool names in TOML only restrict compiled
+capabilities; unknown names fail startup, and the allowlist is checked again
+when dispatching a tool.
+
+Keep private prompt files in operator-controlled directories outside the
+repository. Paths are resolved relative to the configured TOML file, or may be
+absolute. Missing, invalid or unreadable prompt files fail startup. Example
+operator-only configuration (replace synthetic values locally):
+
+```toml
+[instance]
+id = "community_a"
+display_name = "Community A"
+timezone = "UTC"
+
+[telegram]
+unknown_chat_policy = "ignore"
+owners = [123456]
+
+[chats.main]
+id = -1000000000001
+ingest = true
+moderation = false
+stats = false
+voice = false
+ask = true
+
+[ask]
+enabled = true
+agent_profile = "agent_default"
+
+[agent_profiles.agent_default]
+identity = "Agent A"
+display_name = "Agent A"
+community_context = "Community A"
+system_prompt_file = "./prompts/agent.txt"
+response_style = "Answer concisely and cite retrieved evidence."
+model_route = "ask"
+tool_allowlist = ["chat.search_messages", "chat.get_message", "notes.list_user"]
+
+[agent_profiles.agent_default.budgets]
+max_steps = 20
+max_tool_calls = 30
+action_timeout_sec = 120
+total_timeout_sec = 600
+max_output_tokens = 8192
+
+[agent_profiles.agent_default.memory]
+enabled = true
+max_turns = 20
+retention_days = 30
+max_context_chars = 8000
+write_policy = "explicit_only"
+```
+
+`capability_document_file` is optional and is only added to the trusted prompt
+for direct questions about the agent's identity, features or changes. It is
+not a source for facts about chat history. Existing NedoNews installations
+retain their historical prompt/changelog resources when no profile is selected;
+the checked-in sample selects the explicit compatibility profile.
+
+When enabled, conversational memory stores the user's request, the validated
+assistant answer and source IDs/URLs. It is partitioned by community instance,
+Telegram chat, participant, and either the verified reply-chain root or the
+participant's no-reply conversation. It never joins branches based on topic.
+History is partitioned by the selected profile as well as instance, and is
+bounded by `max_turns`, `max_context_chars` and `retention_days`;
+expired entries are removed during writes and excluded from reads. Diagnostic
+replay (`allow_mutations = false`) does not read or write conversational
+memory. Remembered text is always untrusted context, not a verified fact.
+
+The migration `20261108120000_ask_conversation_memory.sql` adds a private
+application table, absent from all `mcp_public` views. Apply ordinary migrations
+before starting the updated binary. No backfill is needed. For an explicit
+session reset, the service API is
+`features::ask::conversation_memory::forget_conversation(pool, verified_scope)`;
+callers must construct the scope from the authenticated instance/chat and the
+verified reply root. This PR adds no Telegram command or trigger for forgetting.
+
+Long-term factual notes remain separate. `write_policy = "disabled"` rejects
+note writes; `"explicit_only"` additionally requires a direct user request to
+remember a fact, only permits notes about that requester, rejects obvious
+sensitive-data categories and model-added note terms absent from the request,
+and retains the existing source-evidence checks. Notes are
+still instance-scoped by the MCP database scope and are not copied from
+conversation history.

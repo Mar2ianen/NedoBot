@@ -17,7 +17,11 @@ use tg_ai_bot_teloxide::{
     community::ChatRegistry,
     config::Config,
     features::{
-        ask::notes::add_user_note_from_search,
+        ask::{
+            conversation_memory::{self, ConversationScope, ConversationTurn},
+            notes::{add_user_note_from_explicit_request, add_user_note_from_search},
+            profile::AgentProfile,
+        },
         ask::{
             repo::{CreateAskRunParams, RenderAudit, finish_delivery, finish_run},
             types::AskRunStatus,
@@ -122,6 +126,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stats_renderers_share_period_data(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
+    assert_ask_conversation_memory(&pool).await;
     assert_review_deduplication(&pool).await;
     assert_review_delivery_tolerates_missing_profile_rows(&pool).await;
     assert_low_risk_review_delivery_is_blocked_by_database(&pool).await;
@@ -3988,6 +3993,446 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
     );
 }
 
+async fn assert_ask_conversation_memory(pool: &PgPool) {
+    let instance_a = format!("memory-test-{}", Uuid::new_v4());
+    let instance_b = format!("memory-test-b-{}", Uuid::new_v4());
+    let scope_a = ConversationScope {
+        instance_id: instance_a.clone(),
+        profile_key: "agent_test".to_owned(),
+        chat_id: -7_001,
+        thread_root_message_id: 0,
+        participant_user_id: 7_001,
+        memory_epoch: 0,
+    };
+    let scope_other_thread = ConversationScope {
+        thread_root_message_id: 91,
+        ..scope_a.clone()
+    };
+    let scope_other_profile = ConversationScope {
+        profile_key: "agent_other".to_owned(),
+        ..scope_a.clone()
+    };
+    let scope_other_chat = ConversationScope {
+        chat_id: -7_002,
+        ..scope_a.clone()
+    };
+    let scope_other_instance = ConversationScope {
+        instance_id: instance_b,
+        ..scope_a.clone()
+    };
+    let mut profile = AgentProfile {
+        key: "agent_test".to_owned(),
+        identity: "Test agent".to_owned(),
+        display_name: "Test agent".to_owned(),
+        community_context: "Synthetic".to_owned(),
+        system_prompt: String::new(),
+        response_style: String::new(),
+        capability_document: None,
+        model_route: "test".to_owned(),
+        tool_allowlist: Vec::new(),
+        budgets: tg_ai_bot_teloxide::llm::profiles::AgentBudgets {
+            max_steps: 1,
+            max_tool_calls: 1,
+            action_timeout_sec: 1,
+            total_timeout_sec: 1,
+            max_output_tokens: 1,
+        },
+        memory: tg_ai_bot_teloxide::llm::profiles::AgentMemoryConfig::default(),
+    };
+    profile.memory.enabled = true;
+    profile.memory.max_turns = 10;
+    profile.memory.max_context_chars = 8_000;
+    profile.memory.retention_days = 30;
+
+    let first = ConversationTurn {
+        request_message_id: 71_001,
+        reply_to_message_id: None,
+        user_text: "Remembered question".to_owned(),
+        assistant_text: "Answer with provenance".to_owned(),
+        source_message_ids: vec![70_999],
+        source_urls: vec!["https://example.test/source".to_owned()],
+    };
+    let (first_write, duplicate_write) = tokio::join!(
+        conversation_memory::append_turn(pool, &scope_a, &first, 30, 10),
+        conversation_memory::append_turn(pool, &scope_a, &first, 30, 10),
+    );
+    let writes = [first_write.unwrap(), duplicate_write.unwrap()];
+    assert_eq!(writes.into_iter().filter(|inserted| *inserted).count(), 1);
+
+    let thread_turn = ConversationTurn {
+        request_message_id: 71_002,
+        user_text: "Other reply branch".to_owned(),
+        assistant_text: "Other thread answer".to_owned(),
+        ..first.clone()
+    };
+    conversation_memory::append_turn(pool, &scope_other_thread, &thread_turn, 30, 10)
+        .await
+        .unwrap();
+    let instance_turn = ConversationTurn {
+        request_message_id: 71_003,
+        user_text: "Other instance".to_owned(),
+        assistant_text: "Private answer".to_owned(),
+        ..first.clone()
+    };
+    conversation_memory::append_turn(pool, &scope_other_instance, &instance_turn, 30, 10)
+        .await
+        .unwrap();
+    let other_profile_turn = ConversationTurn {
+        request_message_id: 71_004,
+        user_text: "Other profile memory".to_owned(),
+        assistant_text: "isolated".to_owned(),
+        ..first.clone()
+    };
+    conversation_memory::append_turn(pool, &scope_other_profile, &other_profile_turn, 30, 10)
+        .await
+        .unwrap();
+    let other_chat_turn = ConversationTurn {
+        request_message_id: 71_005,
+        user_text: "Other chat memory".to_owned(),
+        assistant_text: "separate chat".to_owned(),
+        ..first.clone()
+    };
+    conversation_memory::append_turn(pool, &scope_other_chat, &other_chat_turn, 30, 10)
+        .await
+        .unwrap();
+
+    // A new connection models process restart: the turn and provenance remain available.
+    let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let restarted_pool = PgPool::connect(&database_url).await.unwrap();
+    let own = conversation_memory::load_recent(&restarted_pool, &scope_a, 71_004, &profile, None)
+        .await
+        .unwrap();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].source_message_ids, [70_999]);
+    assert_eq!(own[0].source_urls, ["https://example.test/source"]);
+    assert!(
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_profile,
+            71_005,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
+            .user_text
+            .contains("Other profile")
+    );
+    assert!(
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_chat,
+            71_006,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
+            .user_text
+            .contains("Other chat")
+    );
+    assert!(
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_thread,
+            71_004,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
+            .user_text
+            .contains("Other reply branch")
+    );
+    assert!(
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_instance,
+            71_004,
+            &profile,
+            None
+        )
+        .await
+        .unwrap()[0]
+            .user_text
+            .contains("Other instance")
+    );
+
+    profile.memory.max_turns = 1;
+    let bounded_scope = ConversationScope {
+        thread_root_message_id: 92,
+        ..scope_a.clone()
+    };
+    for id in [71_010, 71_011] {
+        let turn = ConversationTurn {
+            request_message_id: id,
+            user_text: format!("bounded question {id}"),
+            assistant_text: "bounded answer".to_owned(),
+            ..first.clone()
+        };
+        conversation_memory::append_turn(&restarted_pool, &bounded_scope, &turn, 30, 1)
+            .await
+            .unwrap();
+    }
+    let bounded =
+        conversation_memory::load_recent(&restarted_pool, &bounded_scope, 71_012, &profile, None)
+            .await
+            .unwrap();
+    assert_eq!(bounded.len(), 1);
+    assert_eq!(bounded[0].request_message_id, 71_011);
+    profile.memory.max_turns = 10;
+
+    let aged = query(
+        "update ask_conversation_memory set expires_at = now() - interval '1 second' where instance_id = $1 and command_message_id = $2",
+    )
+    .bind(&instance_a)
+    .bind(first.request_message_id)
+    .execute(&restarted_pool)
+    .await
+    .unwrap()
+    ;
+    assert_eq!(aged.rows_affected(), 1);
+    assert_eq!(
+        conversation_memory::purge_expired(&restarted_pool)
+            .await
+            .unwrap(),
+        1
+    );
+    let expired_count: i64 = query_scalar(
+        "select count(*) from ask_conversation_memory where instance_id = $1 and command_message_id = $2",
+    )
+    .bind(&instance_a)
+    .bind(first.request_message_id)
+    .fetch_one(&restarted_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        expired_count, 0,
+        "expiry cleanup physically deletes idle rows"
+    );
+
+    let forgotten = conversation_memory::forget_conversation(&restarted_pool, &scope_other_thread)
+        .await
+        .unwrap();
+    assert_eq!(forgotten, 1);
+    assert_eq!(
+        conversation_memory::load_recent(
+            &restarted_pool,
+            &scope_other_instance,
+            71_004,
+            &profile,
+            None,
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "forget only removes the exact instance/chat/thread/participant scope"
+    );
+    conversation_memory::forget_conversation(&restarted_pool, &scope_other_instance)
+        .await
+        .unwrap();
+    conversation_memory::forget_conversation(&restarted_pool, &scope_other_profile)
+        .await
+        .unwrap();
+    conversation_memory::forget_conversation(&restarted_pool, &scope_other_chat)
+        .await
+        .unwrap();
+    conversation_memory::forget_conversation(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    conversation_memory::forget_conversation(&restarted_pool, &bounded_scope)
+        .await
+        .unwrap();
+
+    let reply_scope = ConversationScope {
+        thread_root_message_id: 90,
+        ..scope_a.clone()
+    };
+    for (id, reply_to, text) in [
+        (71_020, 12, "nested branch A"),
+        (71_021, 13, "nested branch B"),
+    ] {
+        let turn = ConversationTurn {
+            request_message_id: id,
+            reply_to_message_id: Some(reply_to),
+            user_text: text.to_owned(),
+            assistant_text: format!("answer {text}"),
+            source_message_ids: Vec::new(),
+            source_urls: Vec::new(),
+        };
+        conversation_memory::append_turn(&restarted_pool, &reply_scope, &turn, 30, 10)
+            .await
+            .unwrap();
+    }
+    let ancestry_a = [90, 11, 12, 71_020].into_iter().collect();
+    let history_a = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_022,
+        &profile,
+        Some(&ancestry_a),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_a.len(), 1);
+    assert!(history_a[0].user_text.contains("branch A"));
+    let ancestry_b = [90, 11, 13, 71_021].into_iter().collect();
+    let history_b = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_023,
+        &profile,
+        Some(&ancestry_b),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_b.len(), 1);
+    assert!(history_b[0].user_text.contains("branch B"));
+
+    // Distinct /ask commands that reply to the same parent are not each
+    // other's ancestors; the command ID itself must be present in the chain.
+    for (id, text) in [
+        (71_024, "same-parent command A"),
+        (71_025, "same-parent command B"),
+    ] {
+        let turn = ConversationTurn {
+            request_message_id: id,
+            reply_to_message_id: Some(11),
+            user_text: text.to_owned(),
+            assistant_text: format!("answer {text}"),
+            source_message_ids: Vec::new(),
+            source_urls: Vec::new(),
+        };
+        conversation_memory::append_turn(&restarted_pool, &reply_scope, &turn, 30, 10)
+            .await
+            .unwrap();
+    }
+    let ancestry_command_a = [90, 11, 71_024].into_iter().collect();
+    let history_command_a = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_026,
+        &profile,
+        Some(&ancestry_command_a),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_command_a.len(), 1);
+    assert!(history_command_a[0].user_text.contains("command A"));
+    let ancestry_command_b = [90, 11, 71_025].into_iter().collect();
+    let history_command_b = conversation_memory::load_recent(
+        &restarted_pool,
+        &reply_scope,
+        71_027,
+        &profile,
+        Some(&ancestry_command_b),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_command_b.len(), 1);
+    assert!(history_command_b[0].user_text.contains("command B"));
+
+    let stale_turn = ConversationTurn {
+        request_message_id: 71_030,
+        user_text: "started before forget".to_owned(),
+        assistant_text: "must not return after forget".to_owned(),
+        ..first.clone()
+    };
+    let mut stale_scope = scope_a.clone();
+    stale_scope.memory_epoch = conversation_memory::capture_epoch(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    assert!(
+        conversation_memory::append_turn(&restarted_pool, &stale_scope, &stale_turn, 30, 10,)
+            .await
+            .unwrap()
+    );
+    conversation_memory::forget_conversation(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    assert!(
+        !conversation_memory::append_turn(&restarted_pool, &stale_scope, &stale_turn, 30, 10,)
+            .await
+            .unwrap()
+    );
+    assert!(
+        conversation_memory::load_recent(&restarted_pool, &scope_a, 71_031, &profile, None,)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut post_forget_scope = scope_a.clone();
+    post_forget_scope.memory_epoch = conversation_memory::capture_epoch(&restarted_pool, &scope_a)
+        .await
+        .unwrap();
+    assert_eq!(post_forget_scope.memory_epoch, 2);
+    assert!(
+        conversation_memory::append_turn(
+            &restarted_pool,
+            &post_forget_scope,
+            &ConversationTurn {
+                request_message_id: 71_032,
+                user_text: "new request after forget".to_owned(),
+                assistant_text: "newly delivered answer".to_owned(),
+                ..first.clone()
+            },
+            30,
+            10,
+        )
+        .await
+        .unwrap()
+    );
+    conversation_memory::forget_conversation(&restarted_pool, &reply_scope)
+        .await
+        .unwrap();
+    conversation_memory::forget_conversation(&restarted_pool, &post_forget_scope)
+        .await
+        .unwrap();
+
+    let explicit_request_id = 71_099;
+    let note_user_id = 700_000_000_000 + (Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+    query("insert into telegram_user_profiles (telegram_user_id, first_name) values ($1, 'Explicit note test')")
+        .bind(note_user_id)
+        .execute(&restarted_pool)
+        .await
+        .unwrap();
+    add_user_note_from_explicit_request(
+        &restarted_pool,
+        scope_a.chat_id,
+        note_user_id,
+        note_user_id,
+        "предпочитаю короткие ответы",
+        "Запомни: я предпочитаю короткие ответы",
+        explicit_request_id,
+    )
+    .await
+    .unwrap();
+    let explicit_source: serde_json::Value = query_scalar(
+        "select source_message_ids from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and note = $3",
+    )
+    .bind(scope_a.chat_id)
+    .bind(note_user_id)
+    .bind("предпочитаю короткие ответы")
+    .fetch_one(&restarted_pool)
+    .await
+    .unwrap();
+    assert_eq!(explicit_source, serde_json::json!([explicit_request_id]));
+    query("delete from telegram_user_notes where chat_id = $1 and telegram_user_id = $2 and note = $3")
+        .bind(scope_a.chat_id)
+        .bind(note_user_id)
+        .bind("предпочитаю короткие ответы")
+        .execute(&restarted_pool)
+        .await
+        .unwrap();
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(note_user_id)
+        .execute(&restarted_pool)
+        .await
+        .unwrap();
+    restarted_pool.close().await;
+}
+
 async fn assert_userstatus_post_comment_count_backfill(pool: &PgPool) {
     const CHAT_ID: i64 = -900_000_000_000_001;
     const SOURCE_CHANNEL_ID: i64 = -900_000_000_000_002;
@@ -5040,6 +5485,22 @@ async fn assert_mcp_readonly_role_permissions(
     assert!(
         scope_table_read.is_err(),
         "read-only MCP role must not read the scope table"
+    );
+    let conversation_memory_read =
+        query_scalar::<_, i64>("select count(*) from public.ask_conversation_memory")
+            .fetch_one(&mut *connection)
+            .await;
+    assert!(
+        conversation_memory_read.is_err(),
+        "read-only MCP role must not read private conversational memory"
+    );
+    let conversation_epoch_read =
+        query_scalar::<_, i64>("select count(*) from public.ask_conversation_memory_epochs")
+            .fetch_one(&mut *connection)
+            .await;
+    assert!(
+        conversation_epoch_read.is_err(),
+        "read-only MCP role must not read private conversation forget epochs"
     );
     let base_table_write = query("delete from public.telegram_messages where false")
         .execute(&mut *connection)

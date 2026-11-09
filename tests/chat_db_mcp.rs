@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, future::Future, path::PathBuf, process::Output, time::Duration};
+use std::{
+    collections::BTreeSet, ffi::OsString, future::Future, path::PathBuf, process::Output,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -8,6 +11,32 @@ use tg_ai_bot_teloxide::{config::Config, features::ask::mcp_client::McpClient};
 const E2E_TIMEOUT: Duration = Duration::from_secs(10);
 const TWO_INSTANCE_TIMEOUT: Duration = Duration::from_secs(120);
 static MCP_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct TestEnvironmentRestore(Vec<(&'static str, Option<OsString>)>);
+
+impl TestEnvironmentRestore {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        )
+    }
+}
+
+impl Drop for TestEnvironmentRestore {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
 
 async fn within_timeout<T>(scenario: &str, future: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(E2E_TIMEOUT, future)
@@ -34,6 +63,8 @@ async fn call_object(client: &McpClient, tool: &str, arguments: Value) -> Result
 #[tokio::test]
 async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -> Result<()> {
     let _env_guard = MCP_TEST_ENV_LOCK.lock().await;
+    let _restore_env =
+        TestEnvironmentRestore::capture(&["LLM_PROFILES_PATH", "ASK_DATABASE_URL", "MCP_MANIFEST"]);
     within_timeout("McpClient real RMCP child lifecycle", async {
         let database_url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
@@ -201,6 +232,8 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
 async fn independent_community_databases_generate_manifests_and_start_isolated_mcp_servers()
 -> Result<()> {
     let _env_guard = MCP_TEST_ENV_LOCK.lock().await;
+    let _restore_env =
+        TestEnvironmentRestore::capture(&["LLM_PROFILES_PATH", "ASK_DATABASE_URL", "MCP_MANIFEST"]);
     tokio::time::timeout(TWO_INSTANCE_TIMEOUT, async {
         let database_a = std::env::var("TEST_DATABASE_URL")
             .context("TEST_DATABASE_URL must be set by scripts/test.sh")?;
@@ -375,6 +408,41 @@ fn write_instance_profile(
         profile != chat_replaced,
         "example profile source marker must exist"
     );
+    let profile = profile
+        .replace(
+            "agent_profile = \"nedonews_default\"",
+            "agent_profile = \"agent_default\"",
+        )
+        .replace(
+            "[agent_profiles.nedonews_default]",
+            "[agent_profiles.agent_default]",
+        )
+        .replace("identity = \"NedoBot\"", "identity = \"Test Agent\"")
+        .replace(
+            "display_name = \"NedoBot\"",
+            "display_name = \"Test Agent\"",
+        )
+        .replace(
+            "community_context = \"НедоNews Chat (разрешена только его история)\"",
+            "community_context = \"Synthetic community\"",
+        )
+        .replace(
+            "system_prompt_file = \"builtin:nedonews_ask\"",
+            "system_prompt_file = \"agent_prompt.md\"",
+        )
+        .replace(
+            "capability_document_file = \"builtin:nedonews_changelog\"\n",
+            "",
+        )
+        .replace(
+            "[agent_profiles.nedonews_default.budgets]",
+            "[agent_profiles.agent_default.budgets]",
+        )
+        .replace(
+            "[agent_profiles.nedonews_default.memory]",
+            "[agent_profiles.agent_default.memory]",
+        );
+    std::fs::write(directory.join("agent_prompt.md"), "Synthetic test agent.")?;
     let path = directory.join(format!("{instance_id}_profile.toml"));
     std::fs::write(&path, profile)?;
     Ok(path)
