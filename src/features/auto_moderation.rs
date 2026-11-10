@@ -53,6 +53,11 @@ pub async fn maybe_enforce_audit(
     job: &NewUserAuditJob,
     score: i32,
 ) -> anyhow::Result<()> {
+    if crate::features::new_user_audit::local_cascade::blocks_enforcement(
+        job.assessment_json.as_ref(),
+    ) {
+        return Ok(());
+    }
     let moderation = &config.community.moderation;
     if !moderation.enforce_enabled && !moderation.captcha_enabled {
         return Ok(());
@@ -296,7 +301,7 @@ pub async fn decide_enforcement_for_audit(
     })
 }
 
-fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
+pub(crate) fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
     signals
         .as_array()
         .into_iter()

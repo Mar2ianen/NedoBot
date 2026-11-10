@@ -1,6 +1,8 @@
 # Антиспам без постоянного добавления фраз
 
-Это предложение следующего этапа, а не описание включённого автообучения.
+Ранний локальный каскад, export/replay и offline candidate training реализованы;
+[режимы и operational runbook](LOCAL_ANTISPAM_CASCADE.md). Автоматической
+замены модели и фонового переобучения пока нет. Ниже — дальнейший план.
 Сейчас есть нормализация гомоглифов, конфигурируемые lexical campaign rules,
 локальный линейный классификатор, embedding head/similarity и журнал
 `spam_label_events`. Campaign rules включены через `include_str!`: добавление
@@ -12,10 +14,9 @@ char_wb 3–5 поддерживаются текущим backend. Основн�
 Уже есть и DB-backed template-корпус: `scoring::template_match_count()` выбирает
 подтверждённые тексты и считает token Jaccard с фиксированным порогом 0.5.
 Сейчас он загружает весь подходящий корпус, а linear/template/embedding scores
-считаются в materialization сохранённого assessment. Поэтому эти сигналы сами
-по себе не заменяют предыдущий LLM generation. Следующий шаг — использовать
-существующие сигналы до генерации и индексировать retrieval, а не создать ещё
-один параллельный список spam-фраз.
+считаются в materialization сохранённого assessment. Новый opt-in local cascade использует linear и более строгие DB templates до
+генерации для review-only кандидатов; остальные идут по прежнему pipeline.
+Следующий шаг — индексировать retrieval, а не создавать ещё один список фраз.
 
 На 9 ноября 2026 в двух production БД есть 196 ручных событий `spam`
 (130 NedoNews + 66 PVO) и 21 ручное `not_spam` (19 + 2). Это числа событий,

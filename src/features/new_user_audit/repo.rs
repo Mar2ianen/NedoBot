@@ -1040,6 +1040,29 @@ pub async fn mark_new_user_audit_failed(
     CasResult::from_rows_affected(update.rows_affected())
 }
 
+/// Отозванный источник/изменившаяся policy заново открывает generation.
+/// Fence сохраняет монотонность: старый local worker уже не финализирует запись.
+pub async fn restart_revoked_local_assessment(
+    pool: &PgPool,
+    job: &NewUserAuditJob,
+) -> anyhow::Result<CasResult> {
+    let result=sqlx::query(
+        r#"update new_user_audit_jobs set status='retry_wait', assessment_json=null,
+           provider=null,model=null,attempts=0,generation_fence=generation_fence+1,
+           next_attempt_at=now(),processing_started_at=null,lease_expires_at=null,completed_at=null,
+           error_kind='local_evidence_revoked',materialization_status='pending',
+           materialization_fence=materialization_fence+1,
+           materialization_processing_started_at=null,materialization_lease_expires_at=null,updated_at=now()
+           where id=$1 and status='succeeded' and materialization_status='processing'
+             and materialization_fence=$2 and generation_fence=$3
+             and materialization_version=$4 and materialization_lease_expires_at>now()
+             and assessment_json #>> '{_local_cascade,applied}'='true'
+             and assessment_json #>> '{_local_cascade,version}'=$5"#
+    ).bind(job.id).bind(job.materialization_fence).bind(job.generation_fence)
+        .bind(CURRENT_MATERIALIZATION_VERSION).bind(super::local_cascade::VERSION).execute(pool).await?;
+    CasResult::from_rows_affected(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

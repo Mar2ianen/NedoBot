@@ -40,7 +40,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check release installer isolation and concurrency
-        run: python3 tests/release_install.py
+        run: |
+          python3 tests/release_install.py
+          python3 tests/reviewed_spam_training.py
 
       - name: Prepare PostgreSQL integration databases and read-only role
         env:

@@ -727,6 +727,12 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.community.moderation.local_cascade.mode
+            != crate::config_file::LocalCascadeMode::Disabled
+            && !self.new_user_audit_enabled
+        {
+            errors.push("local_cascade requires new_user_audit_enabled=true".to_owned());
+        }
         if self.community.moderation.captcha_enabled && !self.new_user_audit_enabled {
             errors.push(
                 "moderation.captcha_enabled=true requires new_user_audit_enabled=true".to_string(),
@@ -1457,6 +1463,13 @@ fn validate_community_config(
                 "moderation.captcha_enabled=true requires at least one chat with moderation=true"
             );
         }
+    }
+    community.moderation.local_cascade.validate()?;
+    if community.moderation.local_cascade.mode != crate::config_file::LocalCascadeMode::Disabled {
+        anyhow::ensure!(
+            community.moderation.enabled,
+            "local_cascade requires moderation"
+        );
     }
     if community.moderation.linear_spam_enabled {
         let path = community
