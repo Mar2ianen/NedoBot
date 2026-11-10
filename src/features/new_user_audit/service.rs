@@ -259,6 +259,13 @@ async fn materialize_local_review(
     job: &NewUserAuditJob,
     stored: &local_cascade::LocalEvidence,
 ) -> anyhow::Result<Option<i32>> {
+    let is_current: bool = sqlx::query_scalar("select exists(select 1 from telegram_new_user_profile_audits where chat_id=$1 and telegram_user_id=$2 and unified_audit_snapshot_hash=$3 and unified_audit_generation=$4)")
+        .bind(job.chat_id).bind(job.telegram_user_id).bind(&job.snapshot_hash).bind(job.audit_generation)
+        .fetch_one(pool).await?;
+    if !is_current {
+        mark_new_user_audit_materialization_stale(pool, job, "snapshot_stale").await?;
+        return Ok(None);
+    }
     let current = local_cascade::evaluate_job(pool, config, job).await?;
     let Some(current) = current.filter(|e| e.applied && e.text_hash == stored.text_hash) else {
         crate::features::new_user_audit::repo::restart_revoked_local_assessment(pool, job).await?;

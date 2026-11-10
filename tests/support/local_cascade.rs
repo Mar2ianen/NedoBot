@@ -6,7 +6,7 @@ use tg_ai_bot_teloxide::{
     community::ChatRegistry,
     config::Config,
     features::{
-        auto_moderation::maybe_enforce_audit,
+        auto_moderation::{decide_enforcement_for_audit, maybe_enforce_audit},
         jobs::claim::CasResult,
         labels::{LabelSource, SpamLabel, record_not_spam, record_spam},
         new_user_audit::{
@@ -133,6 +133,15 @@ pub async fn assert_local_cascade(pool: &PgPool) {
         ("succeeded", 70, 12, 3)
     );
     assert_eq!(signals[0]["auto_ban_eligible"], false);
+    for action in [
+        teloxide_antispam::policy::AutoAction::DeleteMessages,
+        teloxide_antispam::policy::AutoAction::Ban,
+    ] {
+        let decision = decide_enforcement_for_audit(pool, CHAT, CANDIDATE, action, true)
+            .await
+            .unwrap();
+        assert_eq!(decision.action, teloxide_antispam::policy::AutoAction::None);
+    }
     let labels: i64 = query_scalar(
         "select count(*) from spam_label_events where chat_id=$1 and telegram_user_id=$2",
     )
@@ -144,6 +153,23 @@ pub async fn assert_local_cascade(pool: &PgPool) {
     assert_eq!(labels, 0);
     let reviews:i64=query_scalar("select count(*) from spam_review_requests where chat_id=$1 and telegram_user_id=$2 and status='pending'").bind(CHAT).bind(CANDIDATE).fetch_one(pool).await.unwrap();
     assert_eq!(reviews, 1);
+    // Superseded snapshot нельзя заново отправить в платную generation.
+    let stale_id = enqueue(pool, CANDIDATE + 2).await;
+    assert!(
+        process_next_new_user_audit_job(&bot, pool, &config)
+            .await
+            .unwrap()
+    );
+    query("update telegram_new_user_profile_audits set unified_audit_snapshot_hash='superseded-local-fixture',unified_audit_generation=unified_audit_generation+1 where chat_id=$1 and telegram_user_id=$2")
+        .bind(CHAT).bind(CANDIDATE+2).execute(pool).await.unwrap();
+    assert!(
+        process_next_new_user_audit_job(&bot, pool, &config)
+            .await
+            .unwrap()
+    );
+    let stale:(String,String,bool)=query_as("select status,materialization_status,assessment_json is not null from new_user_audit_jobs where id=$1")
+        .bind(stale_id).fetch_one(pool).await.unwrap();
+    assert_eq!(stale, ("succeeded".into(), "stale".into(), true));
     // Старый worker не должен оживить отозванное локальное решение.
     let revoked_id = enqueue(pool, CANDIDATE + 1).await;
     assert!(
