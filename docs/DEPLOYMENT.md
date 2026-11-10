@@ -7,6 +7,39 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+10 ноября 2026 в **16:27:35 UTC / 19:27:35 МСК** применён config-only follow-up
+[deploy-2026-11-10-cloudflare-memory](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-cloudflare-memory)
+на том же source 4afef1add94e56e9f4eba4eae5eb9491a5a4e2ab. Binaries,
+SHA-256, manifests, scope и миграции соответствуют описанному ниже release.
+
+В extended observation после первоначального audit rollout обнаружены две
+Rust ERROR записи NedoNews в 16:01:16 и 16:02:06 UTC: post-history задачи
+упали на старом memory route с HTTP 402 от Ollama. Поэтому первоначальное
+33-секундное окно без ошибок не означает, что весь первый период был чистым.
+Ошибок Cloudflare audit в этих двух записях нет.
+
+Оба memory route теперь используют cloudflare_gemma_memory: та же Gemma,
+JSON Object вместо JSON Schema, прежний typed output validator, images=false,
+thinking=false, timeout=60s, runtime.memory_llm_max_tokens=512. Audit сохраняет
+JSON Schema и бюджет 900; все прочие поля профилей сравнены с backup и сохранены.
+Причина выбора режима и synthetic probes описаны в [runbook](CLOUDFLARE_GEMMA.md).
+Оба candidate profiles прошли validate_instance_config; оба бота и public MCP
+перезапущены, LoadCredential public MCP совпадает с текущим NedoNews profile.
+
+После root-only snapshot двух failed history rows они однократно поставлены
+на повтор с проверкой instance scope. Attempts не сбрасывался (10 → 11).
+В 16:31:06 UTC обе задачи подтверждены ready от Cloudflare, с summary и
+embedding_gemma2; error_kind=null. Это реальная проверка штатного Rust-worker,
+не только synthetic HTTP probe. Telegram сообщения не отправлялись.
+Старые failed new-user audits пакетно не переоткрывались.
+
+Backup профилей перед memory change и private recovery evidence:
+ /var/backups/nedobot/2026-11-10-cloudflare-gemma/memory-followup.
+Для отката только follow-up восстановить nedonews-audit-profile.toml и
+pvo-audit-profile.toml в соответствующие рабочие profile paths и перезапустить
+оба бота и public MCP; текущие binaries поддерживают оба варианта.
+Историю сводок и attempts не откатывать. Credentials и billing plan сохранены.
+
 
 10 ноября 2026 в **15:56:43 UTC / 18:56:43 МСК** установлен
 [deploy-2026-11-10-cloudflare-gemma](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-cloudflare-gemma)
