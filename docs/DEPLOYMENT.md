@@ -33,6 +33,13 @@ embedding_gemma2; error_kind=null. Это реальная проверка шт
 не только synthetic HTTP probe. Telegram сообщения не отправлялись.
 Старые failed new-user audits пакетно не переоткрывались.
 
+**SSH health после follow-up — 16:33:09 UTC, окно 335 секунд** с нового
+рестарта: все три unit active/running, NRestarts=0; running hashes совпадают
+с release artifact. Rust ERROR и journal priority err отсутствуют, embedding
+unit active; latest migration обеих БД 20261108130000, failed=0. После рестарта
+повторно прошли stdio scope/forged scope/private memory и read-only ACL probes
+обеих БД. Это отдельное окно, оно не скрывает две ошибки первого rollout.
+
 Backup профилей перед memory change и private recovery evidence:
  /var/backups/nedobot/2026-11-10-cloudflare-gemma/memory-followup.
 Для отката только follow-up восстановить nedonews-audit-profile.toml и
