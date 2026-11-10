@@ -64,6 +64,7 @@ pub struct GenAiChatRequest<'a> {
     pub timeout: Duration,
     pub reasoning: ThinkingMode,
     pub reasoning_budget: Option<u32>,
+    pub extra_body: Option<serde_json::Value>,
     pub egress: Egress,
 }
 
@@ -181,7 +182,7 @@ impl GenAiTransport {
             request.reasoning_budget,
             StructuredOutputMode::PromptOnly,
             None,
-            None,
+            request.extra_body,
         );
         self.exec_chat(
             request.model,
@@ -848,7 +849,7 @@ mod tests {
                 }
             })).with_strict(true)]),
             previous_response_id: None, temperature: 0.0, max_tokens: 128,
-            timeout: Duration::from_secs(5), reasoning: ThinkingMode::None, reasoning_budget: None, egress: Egress::Direct,
+            timeout: Duration::from_secs(5), reasoning: ThinkingMode::None, reasoning_budget: None, extra_body: None, egress: Egress::Direct,
         }).await.unwrap();
         assert_eq!(result.tool_calls()[0].fn_name, "inspect");
         let request = captured.lock().unwrap().take().unwrap().1;
@@ -938,6 +939,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 reasoning: ThinkingMode::None,
                 reasoning_budget: None,
+                extra_body: None,
                 egress: Egress::Direct,
             })
             .await

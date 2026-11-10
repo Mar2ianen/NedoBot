@@ -69,7 +69,7 @@ jobs:
           mkdir -p dist
           for binary in tg_ai_bot_teloxide nedonews_mcp_http chat_db_mcp \
               migrate provision_mcp_instance_scope generate_mcp_db_manifest validate_instance_config \
-              spam_cascade retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
+              probe_new_user_audit spam_cascade retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
               backfill_post_history_embeddings backfill_audit_embeddings \
               backfill_chat_embeddings import_telegram_export probe_ask_route; do
             cp "target/release/$binary" dist/
@@ -99,7 +99,7 @@ jobs:
           # Скачанные из artifact файлы теряют exec-бит — возвращаем явно.
           chmod +x dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
             dist/migrate dist/provision_mcp_instance_scope dist/generate_mcp_db_manifest dist/validate_instance_config \
-            dist/spam_cascade dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
+            dist/probe_new_user_audit dist/spam_cascade dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
             dist/backfill_post_history_embeddings dist/backfill_audit_embeddings \
             dist/backfill_chat_embeddings \
             dist/import_telegram_export \
@@ -125,7 +125,7 @@ jobs:
           scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
             dist/migrate dist/provision_mcp_instance_scope dist/generate_mcp_db_manifest dist/validate_instance_config \
-            dist/spam_cascade dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
+            dist/probe_new_user_audit dist/spam_cascade dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
             dist/backfill_post_history_embeddings dist/backfill_audit_embeddings \
             dist/backfill_chat_embeddings \
             dist/import_telegram_export \

@@ -47,6 +47,30 @@ egress = "direct"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_COMPAT_API_KEY"
 
+# Опциональный Workers AI; заменить ACCOUNT_ID собственным ID в private profile.
+# Добавление provider/model не включает его в routes автоматически.
+[providers.cloudflare]
+driver = "openai_compatible"
+adapter = "open_ai"
+egress = "direct"
+base_url = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
+api_key_env = "CLOUDFLARE_API_TOKEN"
+
+[models.cloudflare_gemma_audit]
+provider = "cloudflare"
+model = "@cf/google/gemma-4-26b-a4b-it"
+chat_template_kwargs = { enable_thinking = false }
+
+[models.cloudflare_gemma_audit.capabilities]
+supports_images = true
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 256000
+max_output_tokens = 4096
+request_timeout_sec = 60
+thinking = "none"
+
 [models.gemini_38_comment]
 provider = "gemini"
 model = "gemini-3.8-flash"

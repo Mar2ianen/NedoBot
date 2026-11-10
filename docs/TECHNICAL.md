@@ -1012,3 +1012,9 @@ Legacy ASR profiles не включают comparative shadow автоматич�
 автоматически обновляемый корпус последних ручных меток и offline export/replay/
 candidate training описаны в [runbook](LOCAL_ANTISPAM_CASCADE.md). Локальный
 review-only assessment не даёт права на бан, удаление или капчу.
+
+## Cloudflare Gemma vision
+
+Опциональный профиль Workers AI и типизированный model.chat_template_kwargs
+для отключения reasoning описаны в [Cloudflare runbook](CLOUDFLARE_GEMMA.md).
+Полный multimodal audit проверяется probe_new_user_audit без Telegram/БД.
