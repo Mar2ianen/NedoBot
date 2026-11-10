@@ -53,6 +53,11 @@ pub async fn maybe_enforce_audit(
     job: &NewUserAuditJob,
     score: i32,
 ) -> anyhow::Result<()> {
+    if crate::features::new_user_audit::local_cascade::blocks_enforcement(
+        job.assessment_json.as_ref(),
+    ) {
+        return Ok(());
+    }
     let moderation = &config.community.moderation;
     if !moderation.enforce_enabled && !moderation.captcha_enabled {
         return Ok(());
@@ -296,7 +301,7 @@ pub async fn decide_enforcement_for_audit(
     })
 }
 
-fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
+pub(crate) fn qualifying_auto_ban_evidence(signals: &Value) -> Vec<String> {
     signals
         .as_array()
         .into_iter()
@@ -330,16 +335,21 @@ fn enforcement_for_signals(
     signals: &Value,
 ) -> (AutoAction, &'static str, Vec<String>) {
     let auto_ban_evidence = qualifying_auto_ban_evidence(signals);
-    let (action, safety_gate) =
-        if has_review_only_campaign_signal(signals) && auto_ban_evidence.is_empty() {
-            (AutoAction::None, "deterministic_campaign_review_only")
-        } else {
-            effective_action(
-                proposed_action,
-                review_delivery_enabled,
-                !auto_ban_evidence.is_empty(),
-            )
-        };
+    let has_local_review = signals.as_array().into_iter().flatten().any(|signal| {
+        signal.get("label").and_then(Value::as_str)
+            == Some(crate::features::new_user_audit::local_cascade::REVIEW_LABEL)
+    });
+    let (action, safety_gate) = if has_local_review && auto_ban_evidence.is_empty() {
+        (AutoAction::None, "local_cascade_review_only")
+    } else if has_review_only_campaign_signal(signals) && auto_ban_evidence.is_empty() {
+        (AutoAction::None, "deterministic_campaign_review_only")
+    } else {
+        effective_action(
+            proposed_action,
+            review_delivery_enabled,
+            !auto_ban_evidence.is_empty(),
+        )
+    };
     (action, safety_gate, auto_ban_evidence)
 }
 
@@ -548,6 +558,24 @@ mod tests {
             assert_eq!(gate, "deterministic_campaign_review_only");
             assert!(evidence.is_empty());
         }
+    }
+
+    #[test]
+    fn local_review_signal_cannot_authorize_actions_but_preserves_independent_evidence() {
+        let mut signals = json!([{"label":crate::features::new_user_audit::local_cascade::REVIEW_LABEL,"auto_ban_eligible":false}]);
+        for proposed in [AutoAction::DeleteMessages, AutoAction::Ban] {
+            let (action, gate, evidence) = enforcement_for_signals(proposed, true, &signals);
+            assert_eq!(action, AutoAction::None);
+            assert_eq!(gate, "local_cascade_review_only");
+            assert!(evidence.is_empty());
+        }
+        signals
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"label":"local_spammer_identity"}));
+        let (action, gate, _) = enforcement_for_signals(AutoAction::Ban, true, &signals);
+        assert_eq!(action, AutoAction::Ban);
+        assert_eq!(gate, "confirmed_ban_evidence");
     }
 
     #[test]

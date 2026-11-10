@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::features::jobs::claim::CasResult;
 use crate::features::memory::embedding::{embed_classification_text, pgvector_literal};
 use crate::features::new_user_audit::deterministic::{self, CampaignMatch};
+use crate::features::new_user_audit::local_cascade;
 use crate::features::new_user_audit::prompt::{build_input, output_schema, system_prompt};
 use crate::features::new_user_audit::repo::{
     NewUserAuditJob, NewUserAuditOutcome, claim_next_new_user_audit_job,
@@ -147,6 +148,11 @@ async fn materialize_stored_assessment(
         .context("materialization replay requires stored assessment")?;
     let assessment = parse_stored_assessment(job, assessment_json)
         .map_err(|error| MalformedStoredAssessment(error.to_string()))?;
+    if let Some(evidence) = local_cascade::metadata(assessment_json)?
+        && evidence.applied
+    {
+        return materialize_local_review(pool, config, job, &evidence).await;
+    }
     let (baseline_score, baseline_signals) = load_baseline_component(pool, job).await?;
     let (mut first_message_context, reputation_inputs) =
         load_first_message_score_context(pool, config, job, &assessment).await?;
@@ -245,6 +251,53 @@ async fn materialize_stored_assessment(
     Ok(Some(components.final_score()))
 }
 
+/// Локальная ветка создаёт только review candidate: не скачивает аватар,
+/// не вызывает embedding/LLM/CAS и не меняет уже известные компоненты профиля.
+async fn materialize_local_review(
+    pool: &PgPool,
+    config: &Config,
+    job: &NewUserAuditJob,
+    stored: &local_cascade::LocalEvidence,
+) -> anyhow::Result<Option<i32>> {
+    let is_current: bool = sqlx::query_scalar("select exists(select 1 from telegram_new_user_profile_audits where chat_id=$1 and telegram_user_id=$2 and unified_audit_snapshot_hash=$3 and unified_audit_generation=$4)")
+        .bind(job.chat_id).bind(job.telegram_user_id).bind(&job.snapshot_hash).bind(job.audit_generation)
+        .fetch_one(pool).await?;
+    if !is_current {
+        mark_new_user_audit_materialization_stale(pool, job, "snapshot_stale").await?;
+        return Ok(None);
+    }
+    let current = local_cascade::evaluate_job(pool, config, job).await?;
+    let Some(current) = current.filter(|e| e.applied && e.text_hash == stored.text_hash) else {
+        crate::features::new_user_audit::repo::restart_revoked_local_assessment(pool, job).await?;
+        return Ok(None);
+    };
+    let row=sqlx::query("select risk_baseline_score,risk_baseline_signals,risk_avatar_score,risk_avatar_signals,risk_personal_channel_score,risk_personal_channel_signals,risk_external_score,risk_external_signals from telegram_new_user_profile_audits where chat_id=$1 and telegram_user_id=$2")
+        .bind(job.chat_id).bind(job.telegram_user_id).fetch_one(pool).await?;
+    let mut components = teloxide_antispam::scoring::ScoreComponents {
+        baseline_score: row.get("risk_baseline_score"),
+        baseline_signals: row.get("risk_baseline_signals"),
+        first_message_score: 0,
+        first_message_signals: serde_json::json!([{
+            "class":"local_cascade","label":local_cascade::REVIEW_LABEL,
+            "reason":"Локальные текстовые признаки требуют ручной проверки.",
+            "auto_ban_eligible":false,"evidence":current
+        }]),
+        avatar_score: row.get("risk_avatar_score"),
+        avatar_signals: row.get("risk_avatar_signals"),
+        personal_channel_score: row.get("risk_personal_channel_score"),
+        personal_channel_signals: row.get("risk_personal_channel_signals"),
+        external_score: row.get("risk_external_score"),
+        external_signals: row.get("risk_external_signals"),
+        review_threshold: job.review_threshold,
+        first_message_embedding: None,
+    };
+    components.first_message_score = (job.review_threshold - components.final_score()).max(0);
+    materialize_new_user_audit_job(pool, job, &components, &config.rag_embedding_model, None)
+        .await?;
+    // Возврат None запрещает переход в enforcement даже при высоком baseline.
+    Ok(None)
+}
+
 fn log_materialization_failure(
     result: anyhow::Result<CasResult>,
     job: &NewUserAuditJob,
@@ -307,6 +360,31 @@ async fn generate_and_finalize(
         return Ok(());
     }
 
+    let local_evidence = local_cascade::evaluate_job(pool, config, job).await?;
+    if let Some(evidence) = local_evidence.as_ref().filter(|e| e.applied) {
+        let assessment = local_cascade::review_assessment(evidence);
+        parse_stored_assessment(job, &assessment)?;
+        let finalized = finalize_new_user_audit_job(
+            pool,
+            job,
+            NewUserAuditOutcome {
+                assessment_json: &assessment,
+                provider: "local_cascade",
+                model: local_cascade::VERSION,
+            },
+        )
+        .await?;
+        if finalized == CasResult::Applied {
+            tracing::info!(
+                job_id = job.id,
+                reason = evidence.reason,
+                template_authors = evidence.template_authors,
+                "new-user audit used local review cascade; LLM skipped"
+            );
+        }
+        return Ok(());
+    }
+
     let image_base64 = load_avatar_input(bot, config, job).await?;
     let has_avatar_input = image_base64.is_some();
     let mut input_json = job.input_json.clone();
@@ -349,7 +427,16 @@ async fn generate_and_finalize(
         has_avatar_input,
         has_first_message_input,
     )?;
-    let assessment_json = serde_json::from_str(&generation.content)?;
+    let mut assessment_json: Value = serde_json::from_str(&generation.content)?;
+    if let Some(evidence) = local_evidence {
+        assessment_json
+            .as_object_mut()
+            .context("assessment must be an object")?
+            .insert(
+                local_cascade::METADATA_KEY.into(),
+                serde_json::to_value(evidence)?,
+            );
+    }
     let outcome = NewUserAuditOutcome {
         assessment_json: &assessment_json,
         provider: &generation.provider,
@@ -424,8 +511,12 @@ fn parse_stored_assessment(
     job: &NewUserAuditJob,
     assessment_json: &Value,
 ) -> anyhow::Result<NewUserAuditAssessment> {
-    let assessment =
-        NewUserAuditAssessment::parse_stored(&serde_json::to_string(assessment_json)?)?;
+    local_cascade::metadata(assessment_json)?;
+    let mut payload = assessment_json.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove(local_cascade::METADATA_KEY);
+    }
+    let assessment = NewUserAuditAssessment::parse_stored(&serde_json::to_string(&payload)?)?;
 
     if has_first_message_input(&job.input_json) && assessment.first_message_assessment.is_none() {
         anyhow::bail!(

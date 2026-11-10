@@ -68,6 +68,8 @@ pub struct ChatConfig {
 #[serde(deny_unknown_fields)]
 pub struct ModerationConfig {
     #[serde(default)]
+    pub local_cascade: LocalCascadeConfig,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_review_delivery_enabled")]
     pub review_delivery_enabled: bool,
@@ -128,6 +130,70 @@ pub struct ModerationConfig {
     pub reputation_enabled: bool,
     #[serde(default)]
     pub reputation_model_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalCascadeMode {
+    #[default]
+    Disabled,
+    Shadow,
+    ReviewOnly,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalCascadeConfig {
+    pub mode: LocalCascadeMode,
+    pub template_similarity: f64,
+    pub normal_veto_similarity: f64,
+    pub min_template_authors: usize,
+    pub linear_review_threshold: f64,
+    pub min_text_chars: usize,
+    pub min_tokens: usize,
+    pub max_messages: i64,
+    pub max_chat_age_seconds: i64,
+    pub max_corpus_examples: usize,
+}
+impl Default for LocalCascadeConfig {
+    fn default() -> Self {
+        Self {
+            mode: LocalCascadeMode::Disabled,
+            template_similarity: 0.85,
+            normal_veto_similarity: 0.8,
+            min_template_authors: 2,
+            linear_review_threshold: 0.99,
+            min_text_chars: 32,
+            min_tokens: 5,
+            max_messages: 10,
+            max_chat_age_seconds: 259_200,
+            max_corpus_examples: 5_000,
+        }
+    }
+}
+impl LocalCascadeConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            [
+                self.template_similarity,
+                self.normal_veto_similarity,
+                self.linear_review_threshold
+            ]
+            .into_iter()
+            .all(|v| v.is_finite() && (0.5..=1.0).contains(&v)),
+            "local_cascade probabilities must be finite and between 0.5 and 1"
+        );
+        anyhow::ensure!(
+            (1..=20).contains(&self.min_template_authors)
+                && (16..=6000).contains(&self.min_text_chars)
+                && (3..=100).contains(&self.min_tokens)
+                && (1..=20).contains(&self.max_messages)
+                && (60..=604_800).contains(&self.max_chat_age_seconds)
+                && (10..=50_000).contains(&self.max_corpus_examples),
+            "invalid local_cascade bounds"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

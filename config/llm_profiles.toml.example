@@ -490,6 +490,19 @@ embedding_spam_model_path = "/opt/tg-ai-bot-teloxide/models/embeddinggemma2_q4_c
 reputation_enabled = false
 reputation_model_path = "/opt/tg-ai-bot-teloxide/models/rep_v2_2026-10-04.json"
 
+# Дешёвый текстовый каскад перед LLM; никогда не даёт права на autoban/captcha.
+[moderation.local_cascade]
+mode = "disabled" # disabled | shadow | review_only
+template_similarity = 0.85
+normal_veto_similarity = 0.80
+min_template_authors = 2
+linear_review_threshold = 0.99
+min_text_chars = 32
+min_tokens = 5
+max_messages = 10
+max_chat_age_seconds = 259200
+max_corpus_examples = 5000
+
 [manual_moderation]
 enabled = false
 

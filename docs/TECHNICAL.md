@@ -1005,3 +1005,10 @@ System prompt вшит из `prompts/ask.md`; журнал выпущенных 
 У `routes.ask` есть Gemini vision fallback, независимый от текстовых profiles. `probe_ask_route [--image]` проверяет native tool call без Telegram/БД. `backfill_rich_messages <chat-id> [--apply]` восстанавливает старые rich-тексты; без `--apply` делает dry run. См. [аудит](ASK_AUDIT_2026-10-06.md) и [выкладку](DEPLOYMENT.md).
 
 Legacy ASR profiles не включают comparative shadow автоматически. Для Gemini primary видео-кружки используют Groq media fallback и настроенный `voice_asr_shadow_model`, даже при выключенном comparative shadow; Groq key обязателен. ASR errors очищаются от URL, Gemini request chain ограничена 420 секундами, cleanup — 10 секундами; смена job phase продлевает lease.
+
+## Локальный антиспам перед LLM
+
+Опциональный moderation.local_cascade: disabled/shadow/review_only,
+автоматически обновляемый корпус последних ручных меток и offline export/replay/
+candidate training описаны в [runbook](LOCAL_ANTISPAM_CASCADE.md). Локальный
+review-only assessment не даёт права на бан, удаление или капчу.

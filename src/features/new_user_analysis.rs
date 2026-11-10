@@ -527,7 +527,7 @@ fn project_unified_user_audit_snapshot(
     })
 }
 
-fn bounded_audit_text(value: Option<&str>) -> Option<String> {
+pub(crate) fn bounded_audit_text(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
     if value.is_empty() {
         return None;
