@@ -7,6 +7,101 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+10 ноября 2026 в **16:27:35 UTC / 19:27:35 МСК** применён config-only follow-up
+[deploy-2026-11-10-cloudflare-memory](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-cloudflare-memory)
+на том же source 4afef1add94e56e9f4eba4eae5eb9491a5a4e2ab. Binaries,
+SHA-256, manifests, scope и миграции соответствуют описанному ниже release.
+
+В extended observation после первоначального audit rollout обнаружены две
+Rust ERROR записи NedoNews в 16:01:16 и 16:02:06 UTC: post-history задачи
+упали на старом memory route с HTTP 402 от Ollama. Поэтому первоначальное
+33-секундное окно без ошибок не означает, что весь первый период был чистым.
+Ошибок Cloudflare audit в этих двух записях нет.
+
+Оба memory route теперь используют cloudflare_gemma_memory: та же Gemma,
+JSON Object вместо JSON Schema, прежний typed output validator, images=false,
+thinking=false, timeout=60s, runtime.memory_llm_max_tokens=512. Audit сохраняет
+JSON Schema и бюджет 900; все прочие поля профилей сравнены с backup и сохранены.
+Причина выбора режима и synthetic probes описаны в [runbook](CLOUDFLARE_GEMMA.md).
+Оба candidate profiles прошли validate_instance_config; оба бота и public MCP
+перезапущены, LoadCredential public MCP совпадает с текущим NedoNews profile.
+
+После root-only snapshot двух failed history rows они однократно поставлены
+на повтор с проверкой instance scope. Attempts не сбрасывался (10 → 11).
+В 16:31:06 UTC обе задачи подтверждены ready от Cloudflare, с summary и
+embedding_gemma2; error_kind=null. Это реальная проверка штатного Rust-worker,
+не только synthetic HTTP probe. Telegram сообщения не отправлялись.
+Старые failed new-user audits пакетно не переоткрывались.
+
+**SSH health после follow-up — 16:33:09 UTC, окно 335 секунд** с нового
+рестарта: все три unit active/running, NRestarts=0; running hashes совпадают
+с release artifact. Rust ERROR и journal priority err отсутствуют, embedding
+unit active; latest migration обеих БД 20261108130000, failed=0. После рестарта
+повторно прошли stdio scope/forged scope/private memory и read-only ACL probes
+обеих БД. Это отдельное окно, оно не скрывает две ошибки первого rollout.
+
+Backup профилей перед memory change и private recovery evidence:
+ /var/backups/nedobot/2026-11-10-cloudflare-gemma/memory-followup.
+Для отката только follow-up восстановить nedonews-audit-profile.toml и
+pvo-audit-profile.toml в соответствующие рабочие profile paths и перезапустить
+оба бота и public MCP; текущие binaries поддерживают оба варианта.
+Историю сводок и attempts не откатывать. Credentials и billing plan сохранены.
+
+
+10 ноября 2026 в **15:56:43 UTC / 18:56:43 МСК** установлен
+[deploy-2026-11-10-cloudflare-gemma](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-cloudflare-gemma)
+из source 4afef1add94e56e9f4eba4eae5eb9491a5a4e2ab после
+[PR #108](https://github.com/Mar2ianen/NedoBot/pull/108). До install проверены
+ancestry и совпадение полного tree с merged main
+218d75838264a920e6fcfdb44934ac5dee771ed4.
+
+[Workflow 42847089914](https://github.com/Mar2ianen/NedoBot/actions/runs/42847089914)
+успешно **собрал** artifact на Ubuntu 24.04 с glibc guard ≤ 2.39, deploy=false.
+Установка выполнена по SSH installer-ом из artifact после SHA256SUMS,
+preflight обоих candidate profiles и live Rust transport probe. В **15:55:53 UTC**
+завершились все 12 synthetic probes: переставленные цвета двух JPEG и полный
+audit schema во всех сочетаниях наличия картинки/первого сообщения, отдельно
+с profile и EnvironmentFile каждого инстанса. Чужие fallback providers в probe
+исключались; Telegram/БД и реальные сообщения не использовались.
+
+SHA-256 обоих running bot executable:
+ce454935a9794e6f959b8048d10ece05ced534aa9a6adad05a4745e9cd24f569.
+Running public MCP:
+26be9adc40da790e44753669a3c1749f4c612a6545e0058d5af86cb865a76d31.
+Оба internal chat_db_mcp:
+f6f5d55ee875fe08627ff103b6650df2cfd9875538d103a6bd70c16e9a029152.
+Новых миграций нет: в обеих БД latest=20261108130000, failed=0.
+
+В обоих private profiles добавлены Cloudflare provider/model и изменён только
+routes.new_user_audit: primary — @cf/google/gemma-4-26b-a4b-it, images=true,
+JSON Schema, timeout=60s, chat_template_kwargs.enable_thinking=false.
+Прежние Ollama profiles удалены только из audit route из-за HTTP 402.
+Текстовые Groq fallbacks PVO сохранены; при изображении resolver их пропускает,
+сохраняя исходную modality. Другие routes, local cascade, enforcement,
+captcha и delivery flags не менялись. Credentials и billing plan не менялись.
+Подробности wire contract и общей account quota: [runbook](CLOUDFLARE_GEMMA.md).
+
+**Initial SSH smoke — 15:57:15 UTC, окно 33 секунды:** все три unit
+active/running, NRestarts=0, running hashes совпали с artifact; Rust ERROR и
+journal priority err отсутствуют, embedding unit active. Этот smoke выполнен
+отдельно от build-only CI. Stdio и ACL probes обеих БД подтвердили allowed SELECT,
+отказ foreign scope/forged bootstrap/private memory и запрет raw tables/scope/
+writes. Manifest файлы и actual ASK_DATABASE_URL role nedobot_mcp_ro сохранены;
+public MCP использует обновлённый profile через прежний LoadCredential.
+
+Backup совместимого предыдущего installer-набора, profiles/env/manifest/drop-in:
+ /var/backups/nedobot/2026-11-10-cloudflare-gemma. Для rollback восстановить
+предыдущие profiles вместе с binaries: старый parser не знает новое model поле.
+DB rollback не нужен. Native preflight и health evidence сохраняются там же.
+Telegram smoke-сообщения не отправлялись, старые failed audits не переоткрывались
+пакетно. Проверка подключения не является измерением качества классификации
+или точности новой модели на независимом spam holdout.
+
+[CI 42847084034](https://github.com/Mar2ianen/NedoBot/actions/runs/42847084034)
+для точного 4afef1a прошёл: workspace tests, strict Clippy, fresh migrations,
+PostgreSQL/MCP/ACL. Локально те же проверки и installer tests прошли,
+включая 527 unit tests приложения.
+
 
 10 ноября 2026 в **14:27:11 UTC / 17:27:11 МСК** установлен
 [deploy-2026-11-10-local-audit-cascade](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-local-audit-cascade):

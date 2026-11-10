@@ -29,7 +29,7 @@ Startup validation отклоняет native/несовместимый adapter 
 
 Пример provider/model есть в config/llm_profiles.toml.example и не включён
 в default routes автоматически. Нужный private profile выбирает модель
-в routes.new_user_audit. Для production замена ограничена этим маршрутом:
+в routes.new_user_audit. Первоначальная production замена ограничена этим маршрутом:
 Cloudflare становится primary для текста и изображений, прежний Ollama
 удаляется из audit route из-за HTTP 402; другие task routes не меняются.
 Существующие текстовые fallback-модели можно сохранить после Cloudflare:
@@ -56,6 +56,28 @@ provider/model, modality и прошедшая проверка.
 понимать новое model поле. При rollback восстанавливать предыдущие binary
 и оба профиля совместно, сохраняя прочие изменения оператора.
 
+## Отдельный маршрут сводок постов
+
+10 ноября 2026 в 16:27:35 UTC маршрут memory обоих инстансов также переведён
+с недоступного Ollama на отдельный model profile cloudflare_gemma_memory.
+Это сводки post_history_entries для RAG, а не private conversation memory.
+Модель и endpoint те же; images=false, tools=false, thinking выключен,
+structured_output="json_object", runtime.memory_llm_max_tokens=512.
+Режим audit остаётся JSON Schema с прежним бюджетом 900.
+
+Для memory schema synthetic probe в JSON Schema возвращал незавершённый
+JSON при бюджетах 220, 512 и 1024. JSON Object завершился за 72 output tokens
+и прошёл существующий контракт memory parser. Поэтому увеличение бюджета
+само по себе не считается исправлением. Ответ по-прежнему проверяется
+типизированным MemorySummaryOutput с deny_unknown_fields, проверками summary
+и external_fact; JSON Object не заменяет эту валидацию.
+
+После preflight и рестарта штатный Rust-worker успешно обработал две ранее
+failed задачи: ready, provider=cloudflare, summary и embedding_gemma2 сохранены.
+Повтор ограничен этими двумя задачами, attempts сохранён как монотонный fence
+(10 → 11). Бюджет 512 — ограничение запроса, не измерение точности сводок.
+Другие маршруты, credentials и billing не менялись.
+
 ## Цена и общая квота
 
 Оба production instance используют один Cloudflare account. Бесплатная
@@ -66,7 +88,8 @@ plan, не добавляет credits и не создаёт AI Gateway.
 Профиль audit ограничивает output 900 tokens из runtime, timeout 60 секунд;
 thinking выключен. Это ограничение одного запроса, не дневной денежный cap.
 Нужно наблюдать фактическое потребление общей квоты, особенно если тот же
-аккаунт используется другими Workers. Error/invalid JSON следует обычной
+аккаунт используется другими Workers. Маршрут memory расходует ту же общую
+квоту. Error/invalid JSON следует обычной
 fenced job policy, scope/ban evidence и review-only ограничения сохраняются.
 
 Официальные источники:
