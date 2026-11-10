@@ -159,6 +159,20 @@ pub struct ModelProfile {
     pub provider: String,
     pub model: String,
     pub capabilities: ModelCapabilities,
+    /// Типизированная настройка chat template для совместимых vLLM endpoint-ов.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatTemplateKwargs {
+    pub enable_thinking: bool,
+}
+impl ModelProfile {
+    pub fn extra_body(&self) -> Option<serde_json::Value> {
+        self.chat_template_kwargs
+            .map(|options| serde_json::json!({"chat_template_kwargs":options}))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,6 +280,20 @@ impl LlmProfiles {
             require_non_empty("model", name, "model", &model.model)?;
             let provider = &self.providers[&model.provider];
             validate_capabilities(name, provider, &model.capabilities)?;
+            if model.chat_template_kwargs.is_some() {
+                anyhow::ensure!(
+                    provider.driver == LlmDriver::OpenaiCompatible
+                        && matches!(
+                            provider.genai_adapter(),
+                            GenAiAdapter::OpenAi | GenAiAdapter::OpenRouter | GenAiAdapter::Groq
+                        ),
+                    "model profile {name:?} chat_template_kwargs requires an OpenAI-compatible transport"
+                );
+                anyhow::ensure!(
+                    model.capabilities.thinking == ThinkingMode::None,
+                    "model profile {name:?} must choose one thinking control"
+                );
+            }
         }
         for (name, route) in &self.routes {
             validate_profile_name("route", name)?;
@@ -719,6 +747,50 @@ models = ["ollama_memory"]
                 .capabilities
                 .max_output_tokens,
             4_096
+        );
+    }
+
+    #[test]
+    fn chat_template_controls_are_typed_optional_and_reject_conflicts() {
+        let mut profiles = LlmProfiles::from_toml(VALID_PROFILES).unwrap();
+        assert!(profiles.models["ollama_memory"].extra_body().is_none());
+        profiles
+            .models
+            .get_mut("ollama_memory")
+            .unwrap()
+            .chat_template_kwargs = Some(ChatTemplateKwargs {
+            enable_thinking: false,
+        });
+        assert!(
+            profiles.validate().is_err(),
+            "native protocols must not receive compatible-only options"
+        );
+        let provider = profiles.providers.get_mut("ollama_cloud").unwrap();
+        provider.driver = LlmDriver::OpenaiCompatible;
+        provider.adapter = Some(GenAiAdapter::OpenAi);
+        profiles.validate().unwrap();
+        profiles.providers.get_mut("ollama_cloud").unwrap().adapter = Some(GenAiAdapter::Gemini);
+        assert!(profiles.validate().is_err());
+        profiles.providers.get_mut("ollama_cloud").unwrap().adapter = Some(GenAiAdapter::OpenAi);
+        assert_eq!(
+            profiles.models["ollama_memory"].extra_body(),
+            Some(serde_json::json!({"chat_template_kwargs":{"enable_thinking":false}}))
+        );
+        profiles
+            .models
+            .get_mut("ollama_memory")
+            .unwrap()
+            .capabilities
+            .thinking = ThinkingMode::LevelLow;
+        assert!(
+            profiles.validate().is_err(),
+            "two thinking controls must not be combined"
+        );
+        assert!(
+            serde_json::from_value::<ChatTemplateKwargs>(
+                serde_json::json!({"enable_thinking":false,"messages":[]})
+            )
+            .is_err()
         );
     }
 

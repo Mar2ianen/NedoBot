@@ -330,6 +330,7 @@ async fn generate_chat_profile_once(
             timeout: std::time::Duration::from_secs(selection.capabilities.request_timeout_sec),
             reasoning: selection.capabilities.thinking,
             reasoning_budget: Some(config.gemini_thinking_budget),
+            extra_body: selection.model.extra_body(),
             egress: selection.provider.egress,
         })
         .await
@@ -397,7 +398,7 @@ async fn generate_profile_once(
             reasoning_budget: Some(config.gemini_thinking_budget),
             structured_output_mode: selection.capabilities.structured_output,
             structured_output,
-            extra_body: None,
+            extra_body: selection.model.extra_body(),
             egress: selection.provider.egress,
         })
         .await
@@ -859,6 +860,129 @@ models = ["test"]
         assert!(request.get("response_format").is_none());
         assert_eq!(request["model"], "profile-model");
         unsafe { std::env::remove_var("PROFILE_PROMPT_ONLY_TEST_KEY") };
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn profile_template_options_preserve_image_json_and_chat_wire_contract() {
+        async fn capture(
+            State(sender): State<mpsc::UnboundedSender<Value>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            sender.send(body).unwrap();
+            Json(
+                json!({"id":"cf-contract","object":"chat.completion","created":0,"model":"@cf/test/vision",
+                "choices":[{"index":0,"message":{"role":"assistant","content":r#"{"ok":true}"#},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/client/v4/accounts/fixture/ai/v1/chat/completions",
+                        post(capture),
+                    )
+                    .with_state(sender),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = config();
+        config.llm_profiles = Some(
+            LlmProfiles::from_toml(&format!(
+                r#"
+[providers.cloudflare]
+driver="openai_compatible"
+adapter="open_ai"
+base_url="http://{address}/client/v4/accounts/fixture/ai/v1"
+api_key_env="CLOUDFLARE_WIRE_TEST_KEY"
+[models.vision]
+provider="cloudflare"
+model="@cf/test/vision"
+chat_template_kwargs={{enable_thinking=false}}
+[models.vision.capabilities]
+supports_images=true
+supports_tools=false
+supports_system_prompt=true
+structured_output="json_schema"
+context_window_tokens=4096
+max_output_tokens=256
+request_timeout_sec=5
+thinking="none"
+[routes.profile_test]
+models=["vision"]
+[runtime]
+"#
+            ))
+            .unwrap(),
+        );
+        unsafe {
+            std::env::set_var("CLOUDFLARE_WIRE_TEST_KEY", "test-key");
+        }
+        let schema = json!({"type":"object","additionalProperties":false,"properties":{"ok":{"type":"boolean"}},"required":["ok"]});
+        for image in [None, Some("encoded-image")] {
+            let output = generate_text_checked(
+                &config,
+                GenerateTextOptions {
+                    route: "profile_test",
+                    system_prompt: Some("JSON only"),
+                    prompt: "Synthetic input",
+                    image_base64: image,
+                    temperature: 0.0,
+                    num_predict: 64,
+                    output_validator: None,
+                    structured_output: Some(StructuredOutput {
+                        name: "probe",
+                        schema: &schema,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.provider, "cloudflare");
+            assert_eq!(output.image_used, image.is_some());
+            let request = receiver.recv().await.unwrap();
+            assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+            assert_eq!(request["response_format"]["json_schema"]["schema"], schema);
+            assert_eq!(request["max_tokens"], 64);
+            assert!(request.get("reasoning_effort").is_none());
+            assert_eq!(request["model"], "@cf/test/vision");
+            if image.is_some() {
+                assert_eq!(
+                    request["messages"][1]["content"][1]["image_url"]["url"],
+                    "data:image/jpeg;base64,encoded-image"
+                );
+            }
+        }
+        generate_chat_checked(
+            &config,
+            GenerateChatOptions {
+                fallback_offset: 0,
+                route: "profile_test",
+                system_prompt: Some("test"),
+                messages: vec![ChatMessage::user("Synthetic input")],
+                tools: None,
+                requires_images: false,
+                requires_tools: false,
+                previous_response_id: None,
+                temperature: 0.0,
+                num_predict: 64,
+                output_budget_policy: OutputBudgetPolicy::Fixed,
+            },
+        )
+        .await
+        .unwrap();
+        let request = receiver.recv().await.unwrap();
+        assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(request.get("response_format").is_none());
+        unsafe {
+            std::env::remove_var("CLOUDFLARE_WIRE_TEST_KEY");
+        }
         server.abort();
     }
 

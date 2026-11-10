@@ -7,7 +7,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/install_release_binaries.sh"
 BINARIES = ("tg_ai_bot_teloxide", "nedonews_mcp_http", "chat_db_mcp",
-            "spam_cascade", "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages",
+            "probe_new_user_audit", "spam_cascade", "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages",
             "backfill_post_history_embeddings", "backfill_audit_embeddings",
             "backfill_chat_embeddings",
             "import_telegram_export", "migrate", "provision_mcp_instance_scope",

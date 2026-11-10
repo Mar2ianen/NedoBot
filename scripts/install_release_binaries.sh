@@ -23,6 +23,7 @@ BINARIES=(
     provision_mcp_instance_scope
     generate_mcp_db_manifest
     validate_instance_config
+    probe_new_user_audit
     spam_cascade
     retry_pending_comments
     reconcile_comment_delivery
