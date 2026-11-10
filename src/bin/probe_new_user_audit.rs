@@ -83,16 +83,16 @@ async fn main() -> anyhow::Result<()> {
             json!({"provider":output.provider,"model":output.model,"probe":"vision_colors","expected_left":left,"passed":true})
         );
     }
-    for has_image in [false, true] {
+    for (has_image, has_message) in [(false, true), (true, true), (true, false), (false, false)] {
         let encoded = image.encode(include_bytes!("../../tests/fixtures/vision-red-blue.jpg"));
         let input = prompt::build_input(&json!({
             "schema_version":"synthetic-provider-probe",
             "profile":{"display_name":"Synthetic Fixture","is_bot":false,"avatar_image_available":has_image},
-            "text":{"first_message_preview":"В Rust вышло обновление компилятора. Какие изменения в проверке типов?","first_message_reply_context_preview":"Обсуждение Rust."},
+            "text":{"first_message_preview":has_message.then_some("В Rust вышло обновление компилятора. Какие изменения в проверке типов?"),"first_message_reply_context_preview":has_message.then_some("Обсуждение Rust.")},
             "personal_channel":{"present":false},"activity":{"message_count":1,"chat_age_sec":60}
         }))?;
         let validator = move |text: &str| -> anyhow::Result<()> {
-            NewUserAuditAssessment::parse_for_modalities(text, has_image, true)?;
+            NewUserAuditAssessment::parse_for_modalities(text, has_image, has_message)?;
             Ok(())
         };
         let output = generate_text_checked(
@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
         );
         println!(
             "{}",
-            json!({"provider":output.provider,"model":output.model,"probe":"full_audit_schema","image":has_image,"passed":true})
+            json!({"provider":output.provider,"model":output.model,"probe":"full_audit_schema","image":has_image,"first_message":has_message,"passed":true})
         );
     }
     Ok(())
