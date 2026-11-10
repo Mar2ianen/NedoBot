@@ -7,6 +7,67 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+
+10 ноября 2026 в **14:27:11 UTC / 17:27:11 МСК** установлен
+[deploy-2026-11-10-local-audit-cascade](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-local-audit-cascade):
+source commit 8fafcbf190a98c7cbc143b2b02c2d2f5a1bad930 после
+[PR #106](https://github.com/Mar2ianen/NedoBot/pull/106). Ancestry и полное
+совпадение tree с merged main 791d380124f07ed22bb715c9a7890e1896f8076b
+проверены до установки.
+
+[Release workflow 42831798569](https://github.com/Mar2ianen/NedoBot/actions/runs/42831798569)
+только собрал artifact на Ubuntu 24.04 и проверил glibc ≤ 2.39, deploy=false.
+Установка выполнена через SSH тем же installer из artifact. Все SHA256SUMS
+сверены локально и на VPS; preflight обоих candidate profiles, private export
+и replay выполнены самим release binary на production БД до рестарта.
+Export дал 233 NedoNews и 110 PVO сообщений. Это read-only проверка без LLM/API.
+
+SHA-256 обоих running bot executable:
+4fcdae922e4a77b67c15bb2d1aaf4f896427aa70ddfabaf4fbbdb6aa19c5aa08.
+Running public MCP:
+e897745b327992cb978d7ad0965131366fe4e176516b0e57cf682eb0b4ca9293.
+Оба internal chat_db_mcp:
+1881e6822e635c1f3c7ae01c5c1933d270faa1ff51ea72afa1e3071eeadd4cda.
+Обе БД: latest migration 20261108130000, failed=0; новых миграций нет.
+
+В каждом operator-owned profile добавлена только moderation.local_cascade:
+review_only, similarity=0.85, два автора, normal-veto=0.80, linear=0.99,
+окно до 10 сообщений/трёх дней. NedoNews сохраняет прежнюю word/char модель,
+PVO использует template-only. Существующие enforcement/captcha флаги и
+выключенная доставка review-карточек сохранены. Local candidate не разрешает
+бан, удаление или капчу. Автоматически обновляется корпус ручных меток;
+новый offline candidate не продвигался. См. [runbook](LOCAL_ANTISPAM_CASCADE.md)
+и [ограничения replay](ANTISPAM_CASCADE_EVAL_2026-11-10.md).
+
+**Initial SSH smoke: 14:28:24 UTC**, окно **73 секунды** с рестарта.
+Все три unit active/running, NRestarts=0, process hashes совпали с artifact;
+Rust ERROR и journal priority err отсутствуют, embedding unit active.
+Это отдельная ручная проверка, а не утверждение о coverage build-only CI.
+Повторены stdio initialize/tools/select, отказ на foreign chat/private memory
+и forged bootstrap для обеих БД. ACL smoke подтвердил reviewed-view access
+и запрет raw messages, private scope, conversation memory и writes.
+Фактический ASK_DATABASE_URL обоих ботов использует nedobot_mcp_ro,
+manifest файлы не менялись; public MCP загрузил текущий профиль через прежний
+LoadCredential. Telegram smoke-сообщения не отправлялись.
+
+Совместимые предыдущие binaries, installer, profiles/env/manifest/drop-in:
+ /var/backups/nedobot/2026-11-10-local-cascade. Private validation exports/reports
+лежат там же в validation/. Для rollback восстановить предыдущие profiles
+вместе с предыдущим installer-набором: старый parser не понимает новую секцию.
+DB rollback не нужен; credentials не менялись.
+
+[CI 42831798359](https://github.com/Mar2ianen/NedoBot/actions/runs/42831798359)
+и [CI 42831813946](https://github.com/Mar2ianen/NedoBot/actions/runs/42831813946)
+для точного 8fafcbf прошли: workspace tests, strict Clippy, fresh PostgreSQL,
+MCP/ACL и отрицательные local-review/fencing сценарии. Локально scripts/test.sh,
+format и Clippy также прошли, включая 525 unit tests приложения.
+
+Отдельное прежнее ограничение: до этого деплоя 12 NedoNews audits за сутки
+завершились HTTP 402 от ollama_cloud / gemma4:31b (05:59–12:28 UTC).
+Это не runtime-регрессия нового release. Эти terminal jobs не переоткрывались
+вслепую с повторными платными вызовами; local shortcut помогает совпадениям,
+остальной audit зависит от доступности configured provider.
+
 9 ноября 2026 в **20:46:38 UTC / 23:46:38 МСК** установлен correction release
 [`deploy-2026-11-09-private-note-scope`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-09-private-note-scope)
 с source commit `d3b931deeff79cc3ef2714adb2875707c87f8f47` после
