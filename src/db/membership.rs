@@ -2,7 +2,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
-use teloxide::types::{ChatMemberKind, Message};
+use teloxide::types::{ChatMember, ChatMemberKind, Message};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,14 +74,15 @@ pub async fn load_membership_context(
     Ok(MembershipContext::from_snapshot(status, present, confirmed))
 }
 
-pub async fn observe_member_kind(
+pub async fn observe_member(
     pool: &PgPool,
     chat_id: i64,
-    user_id: i64,
-    kind: &ChatMemberKind,
+    member: &ChatMember,
 ) -> anyhow::Result<MembershipContext> {
+    let kind = &member.kind;
+    let user_id = member.user.id.0 as i64;
+    super::telegram::save_chat_member_snapshot(pool, chat_id, member, Utc::now()).await?;
     if kind.is_present() {
-        record_confirmed_membership(pool, chat_id, user_id, Utc::now()).await?;
         return Ok(MembershipContext::CurrentMember);
     }
     let status = if matches!(kind, ChatMemberKind::Banned(_)) {

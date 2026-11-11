@@ -6,6 +6,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
 use crate::{
     config::Config,
+    db::membership::MembershipContext,
     features::new_user_audit::{
         deterministic,
         prompt::PROMPT_VERSION,
@@ -61,7 +62,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     chat_id: i64,
     telegram_user_id: i64,
 ) -> anyhow::Result<()> {
-    let Some(features) = load_features(
+    let Some((features, membership_context)) = load_features(
         pool,
         chat_id,
         telegram_user_id,
@@ -136,6 +137,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         _ => false,
     };
     let mut input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
+    input_json["membership"]["context"] = serde_json::to_value(membership_context)?;
     input_json["audit_trigger_fingerprint"] = trigger_fingerprint
         .map(Value::String)
         .unwrap_or(Value::Null);
@@ -161,8 +163,9 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         .as_ref()
         .map(deterministic::CampaignMatch::score_signal)
         .unwrap_or(Value::Null);
-    let material_revision =
+    let mut material_revision =
         project_unified_user_audit_material_revision(&features, &analysis_config);
+    material_revision["membership"]["context"] = serde_json::to_value(membership_context)?;
     let snapshot_hash = Sha256::digest(serde_json::to_vec(&material_revision)?)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -569,7 +572,7 @@ async fn load_features(
     chat_id: i64,
     telegram_user_id: i64,
     instance_id: &str,
-) -> anyhow::Result<Option<NewUserFeatures>> {
+) -> anyhow::Result<Option<(NewUserFeatures, MembershipContext)>> {
     let row = sqlx::query(
         r#"
         with user_messages as (
@@ -641,7 +644,13 @@ async fn load_features(
             select invite_link, via_chat_folder_invite_link
             from telegram_chat_member_events
             where chat_id = $1 and telegram_user_id = $2
-            order by event_at desc
+              and (old_status in ('left','banned','kicked')
+                   or (old_status='restricted'
+                       and raw_json #> '{old_chat_member,is_member}' = 'false'::jsonb))
+              and (new_status in ('member','administrator','creator','owner')
+                   or (new_status='restricted'
+                       and raw_json #> '{new_chat_member,is_member}' = 'true'::jsonb))
+            order by event_at desc, id desc
             limit 1
         )
         select
@@ -730,13 +739,10 @@ async fn load_features(
             p.personal_channel_refreshed_at,
             p.personal_channel_fetch_error,
             s.status as member_status,
+            cu.membership_first_confirmed_at is not null as membership_confirmed,
             s.is_present as member_is_present,
             s.is_admin as member_is_admin,
-            exists (
-                select 1
-                from telegram_chat_member_events e
-                where e.chat_id = $1 and e.telegram_user_id = $2
-            ) as join_event_seen,
+            exists (select 1 from latest_join_event) as join_event_seen,
             lje.invite_link,
             coalesce(lje.via_chat_folder_invite_link, false) as via_chat_folder_invite_link
         from telegram_chat_users cu
@@ -828,6 +834,12 @@ async fn load_features(
     .await?;
 
     Ok(row.map(|row| {
+        let status: Option<String> = row.get("member_status");
+        let membership_context = MembershipContext::from_snapshot(
+            status.as_deref(),
+            row.get("member_is_present"),
+            row.get("membership_confirmed"),
+        );
         let recent_message_texts = row.get::<Vec<String>, _>("recent_message_texts");
         let message_style = message_style(&recent_message_texts);
         let max_pairwise_similarity = max_pairwise_message_similarity(&recent_message_texts);
@@ -837,7 +849,7 @@ async fn load_features(
             || max_reuse_count > 1
             || max_pairwise_similarity.is_some_and(|similarity| similarity >= 0.86);
 
-        NewUserFeatures {
+        let features = NewUserFeatures {
             chat_id: row.get("chat_id"),
             telegram_user_id: row.get("telegram_user_id"),
             first_seen_at: row.get("first_seen_at"),
@@ -924,7 +936,8 @@ async fn load_features(
             join_event_seen: row.get("join_event_seen"),
             invite_link: row.get("invite_link"),
             via_chat_folder_invite_link: row.get("via_chat_folder_invite_link"),
-        }
+        };
+        (features, membership_context)
     }))
 }
 

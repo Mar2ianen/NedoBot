@@ -234,13 +234,41 @@ pub async fn assert_membership_history(pool: &PgPool) {
             .unwrap(),
         MembershipContext::NonMemberHistoryUnknown
     );
+    assert_audit_join_input(pool).await;
     assert_upgrade_backfill(pool, t).await;
+    for sql in [
+        "delete from new_user_audit_jobs where chat_id=$1",
+        "delete from telegram_new_user_profile_audits where chat_id=$1",
+    ] {
+        query(sql).bind(CHAT).execute(pool).await.unwrap();
+    }
     for sql in [
         "delete from telegram_chat_member_events where chat_id in ($1,$1-1)",
         "delete from telegram_chat_member_snapshots where chat_id in ($1,$1-1)",
         "delete from telegram_chat_users where chat_id in ($1,$1-1)",
     ] {
         query(sql).bind(CHAT).execute(pool).await.unwrap();
+    }
+}
+
+async fn assert_audit_join_input(pool: &PgPool) {
+    let config = tg_ai_bot_teloxide::config::Config::from_env().unwrap();
+    for (user, seen, context) in [
+        (USER, true, "former_member"),
+        (USER + 1, false, "non_member_history_unknown"),
+        (USER + 2, false, "former_member"),
+        (USER + 3, false, "former_member"),
+        (USER + 4, true, "current_member"),
+    ] {
+        tg_ai_bot_teloxide::features::new_user_analysis::enqueue_new_user_audit_for_profile_refresh(pool,&config,CHAT,user).await.unwrap();
+        let (join_seen,input):(bool,Value)=query_as("select a.join_event_seen,j.input_json from telegram_new_user_profile_audits a join new_user_audit_jobs j on j.chat_id=a.chat_id and j.telegram_user_id=a.telegram_user_id where a.chat_id=$1 and a.telegram_user_id=$2 order by j.id desc limit 1")
+            .bind(CHAT).bind(user).fetch_one(pool).await.unwrap();
+        assert_eq!(
+            join_seen, seen,
+            "only an observed transition into membership proves a join event"
+        );
+        assert_eq!(input["membership"]["join_event_seen"], seen);
+        assert_eq!(input["membership"]["context"], context);
     }
 }
 
