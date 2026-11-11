@@ -7,6 +7,62 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+11 ноября 2026 в **08:43:51 UTC / 11:43:51 МСК** установлен
+[deploy-2026-11-11-ephemeral-captcha-replies](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-ephemeral-captcha-replies)
+из source 3e5434b86b7d00ec3b665a0ad42bbaa874d1a34e после
+[PR #110](https://github.com/Mar2ianen/NedoBot/pull/110). До install проверены
+ancestry и совпадение полного tree с merged main
+d360dbf6e255dc0dd8252cabe4529a6f551b5fa4.
+
+[Workflow 42987934895](https://github.com/Mar2ianen/NedoBot/actions/runs/42987934895)
+собрал artifact на Ubuntu 24.04 с glibc guard ≤ 2.39, deploy=false.
+Установка выполнена по SSH installer-ом из artifact после проверки SHA256SUMS
+и validate_instance_config обоих candidate profiles. Общий release lock покрывал
+замену binaries, profiles и restart; подготовлен rollback предыдущего набора.
+
+SHA-256 обоих running bot executable:
+a190ae7c283ed1dcc7bb026c720d18876c0fcfba24a97f6c06f30586be821a5a.
+Running public MCP:
+aacb9e54531d5d1c845d650c7b4972dadb41f4c4309adf4b8bbd44c27840977f.
+Оба internal chat_db_mcp:
+78c8466cd11873a54a2864d6c1d92005a2d648bb04bc18679e4e28ee766d492b.
+Новых миграций нет: latest=20261108130000, failed=0 в обеих БД.
+
+Капча остаётся только ephemeral; reply на собственный комментарий отправляется
+и сохраняется до cleanup. При отказе API нет TTL или публичной замены.
+Background retry удаляет сообщения без повторной карточки, продления TTL
+или нового mute. Non-member delivery имеет ограничения Telegram и не объявлена
+live-доказанной: [runbook](EPHEMERAL_CAPTCHA.md).
+
+Единственная config delta — model/route search_extract NedoNews с Ollama на
+Cloudflare Gemma JSON Object, прежние 900 output tokens, thinking=false.
+Два synthetic research-plan HTTP probe прошли до активации; native route
+validation прошла новым binary. PVO profile побайтно сохранён. Другие routes,
+модель/пороги подозрения, cascade, enforcement/captcha/review-delivery flags,
+manifests и env обоих инстансов сохранены. Public MCP LoadCredential совпал
+с текущим NedoNews profile. Billing plan/credentials не менялись.
+
+**Initial SSH smoke — 08:44:15 UTC, окно 25 секунд:** все три unit
+active/running, NRestarts=0; running hashes совпали с artifact, Rust ERROR и
+journal priority err отсутствуют, embedding active. После restart повторены
+stdio scope/forged scope/private memory и PostgreSQL read-only ACL probes обеих
+БД; public HTTP connector выполнил scoped SELECT. Это ручная проверка отдельно
+от build-only workflow; она не означает чистый журнал предыдущих 16 часов.
+
+[CI 42987933651](https://github.com/Mar2ianen/NedoBot/actions/runs/42987933651)
+и [CI 42987941093](https://github.com/Mar2ianen/NedoBot/actions/runs/42987941093)
+точного 3e5434b прошли workspace tests, strict Clippy, fresh migrations,
+PostgreSQL captcha lifecycle, MCP/ACL и manual moderation. Локально те же
+проверки, format и installer tests прошли, включая 527 unit tests приложения.
+
+Backup 16 совместимых предыдущих binaries, installer/checksums, profiles,
+env и manifests: /var/backups/nedobot/2026-11-11-ephemeral-comment-captcha.
+Rollback — вернуть previous-release installer-набор и прежние profiles,
+сохранив исходные owner/mode из profile-metadata.json, затем restart всех трёх
+unit. DB rollback не нужен; восстановленные audit attempts/fences не сбрасывать.
+Дневной срез, исторические ошибки, recovery пяти актуальных failed audits и
+границы оценки полноты: [отчёт](POST_RELEASE_AUDIT_2026-11-11.md).
+
 10 ноября 2026 в **16:27:35 UTC / 19:27:35 МСК** применён config-only follow-up
 [deploy-2026-11-10-cloudflare-memory](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-10-cloudflare-memory)
 на том же source 4afef1add94e56e9f4eba4eae5eb9491a5a4e2ab. Binaries,
