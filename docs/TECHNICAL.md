@@ -323,13 +323,15 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 ## VPS Деплой
 
 Текущий production release —
-[`deploy-2026-11-11-membership-history`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-membership-history),
-source `87a1af943bfc878974369d3da3d90db5f0440c86`. Один artifact установлен в оба community-инстанса и public MCP;
-migration `20261111100000` подтверждена в обеих БД. Exact hashes, время и окно
-SSH health, CI/build evidence и совместимый rollback описаны в
-[DEPLOYMENT.md](DEPLOYMENT.md). Членство и его положительная история разделены:
-`left` без доказательства прежнего членства означает неизвестную историю,
-а не «никогда не вступал». [Контракт и исследование ботов](MEMBERSHIP_HISTORY.md).
+[`deploy-2026-11-11-mcp-native-subtitles`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-mcp-native-subtitles),
+source `119b987e4c3a23ae33b4185aa9196658ba72a372` после PR #115/#116.
+Один artifact установлен в оба community-инстанса и public MCP. Новых migrations
+нет; `20261111100000` подтверждена в обеих БД. [Exact release evidence и rollback](DEPLOYMENT.md).
+MCP дочитывает полные YouTube subtitle tracks и reviewed text по страницам;
+NedoNews `/ask` использует Cloudflare Gemma с native tools/vision и бюджетом
+3600 секунд. [Контракт, пределы и обновление клиентской схемы](MCP_LONG_TEXT.md).
+Членство по-прежнему отделено от положительной истории: `left` без доказательства
+не означает «никогда не вступал». [Контракт членства](MEMBERSHIP_HISTORY.md).
 
 Ранее релиз 7 ноября зафиксирован tag
 [`deploy-2026-11-07-casual-paid-task-signal`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-casual-paid-task-signal)

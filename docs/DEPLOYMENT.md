@@ -7,6 +7,93 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+11 ноября 2026 в **14:21:22 UTC / 17:21:22 МСК** установлен
+[deploy-2026-11-11-mcp-native-subtitles](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-mcp-native-subtitles),
+source 119b987e4c3a23ae33b4185aa9196658ba72a372 после
+[PR #115](https://github.com/Mar2ianen/NedoBot/pull/115) и
+[PR #116](https://github.com/Mar2ianen/NedoBot/pull/116). Проверены ancestry и
+полное совпадение tree со слитым main b5f2478f0bb46c310bdc580b77be1a6d40ab27d9.
+[Release 43035734887](https://github.com/Mar2ianen/NedoBot/actions/runs/43035734887)
+собрал artifact на Ubuntu 24.04, glibc ≤ 2.39, deploy=false. Установка и
+последующие проверки выполнены отдельно по SSH, не самим build workflow.
+
+SHA-256 обоих running bot executable: 6c3c4cd4b49d26e9607d8bae70aa4aa6fdb94101a9c6feaf3c957445673d620e.
+Public MCP: 031585dcc671284365106493705802e912ef0e6216e683b42bbfc2511ef2c27a.
+Оба internal MCP: dc61eabea149304f2adddacf01e0f7ba40fe1ba4bfefbc984b9bc7b17dd4ca68.
+Новых migrations/manifest changes/grants нет: latest=20261111100000,
+failed=0 подтверждены SQL в обеих БД.
+
+**SSH health — 2026-11-11T14:25:36.050549+00:00, окно 254 секунд**
+от 2026-11-11T14:21:22+00:00: все три unit active/running, NRestarts=0;
+running hashes совпали с artifact, Rust ERROR и journal priority err отсутствуют,
+embedding active. Пройдены stdio own-scope SELECT, foreign/forged scope/private
+memory rejection и реальные read-only ACL обеих БД.
+
+**Публичный HTTPS MCP — 2026-11-11T14:22:48.062908+00:00:** H37hGVoz3ko прочитан до конца
+выбранной ru-дорожки: 42383 символа, 8 страниц,
+последний cue 00:52:47.725. Все offset непрерывны, checksum полного склеенного
+текста совпал с transcript_id 8ff05ff34287437392bcef48df5944307356970b94d5b671de2955b27e38bd8c.
+Первый запрос 3.837 с, максимальное продолжение из кеша
+0.14 с. Discovery: 29 tools;
+db.read_text также прошёл сквозное чтение и проверку revision.
+Это проверка subtitle track, не просмотр видеоряда и не обещание длительности
+всего видео по последнему cue. [Контракт](MCP_LONG_TEXT.md).
+
+В NedoNews включён runtime YouTube и общий legacy ask budget 3600 с.
+Маршрут ask теперь явно выбирает cloudflare_gemma_ask
+(@cf/google/gemma-4-26b-a4b-it), native tools и vision, thinking выключен;
+cap 16384 output tokens и 64 tool calls сохранён. Прежние model definitions
+не удалены, остальные routes не менялись. Native SDK probes с текстом и
+картинкой выполнены в **точном Environment живого systemd-процесса**, с тем же
+profile SHA-256 2d7e42c6705c1336b5dd2de83eab56937d016281629adaa19b0e394f36436207; оба вернули native_tool_verified=true.
+Полноценный Telegram /ask-ответ этими probes не отправлялся.
+
+PVO profile, env/secrets обоих ботов, базовый public MCP env и оба manifests
+побайтно сохранены. Public LoadCredential совпал с новым NedoNews profile.
+Для public subtitle provider добавлен отдельный не содержащий секретов
+runtime env с timeout=60; Nginx upstream=650 с покрывает application deadline
+630 с. Body timeout 15 с, body size/rate/connection limits и SQL timeouts
+сохранены. Mounted nginx.conf изменён с сохранением inode, nginx -t пройден
+до reload. Ключи, account, billing plan и moderation flags не менялись.
+
+**Промежуточная выкладка:** tag
+[deploy-2026-11-11-mcp-transcripts](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-mcp-transcripts),
+source adb234f81c53d895e6a62c21ac888b04e167c525, процессы запущены в 13:56:34 UTC,
+build [43031973499](https://github.com/Mar2ianen/NedoBot/actions/runs/43031973499).
+Live full-video probe обнаружил отдельный 429: yt-dlp скачивал ru, затем
+падал на другой дорожке. #116 выбирает одну исходную дорожку по приоритету,
+с общим deadline и без автопереводов. Неуспешные/частичные файлы не принимаются.
+Изолированные SDK-запуски только с EnvironmentFile дали 402, но использовали
+другой default profile: это **не доказательство сбоя боевого ask route**.
+Их не подменять успешными проверками точного service Environment выше.
+
+Текущий подключённый клиент сохранил старую schema только с urls: переданный
+через него offset=6000 был отброшен и вернулась страница offset=0. Серверный
+HTTPS tools/list содержит новые параметры и db.read_text; прямое чтение всех
+страниц подтверждено. Клиенту требуется обновить tools/list/подключение.
+
+[CI push](https://github.com/Mar2ianen/NedoBot/actions/runs/43035652126) и
+[CI PR](https://github.com/Mar2ianen/NedoBot/actions/runs/43035732905) точного
+119b987 успешны. Локально: fmt, locked workspace/all-target tests
+(537 app tests passed, 1 ignored), strict Clippy, реальный stdio child probe.
+#115 отдельно прошёл PostgreSQL fresh/upgrade, Unicode text pages под
+nedobot_mcp_ro в двух scopes, private/forged/redacted-field rejection,
+MCP и существующие moderation suites.
+
+Backup финальной/промежуточной конфигурации:
+/var/backups/nedobot/2026-11-11-mcp-native-subtitles.
+Полный pre-task rollback: /var/backups/nedobot/2026-11-11-mcp-full-transcripts,
+previous-release source 87a1af943bfc878974369d3da3d90db5f0440c86. Под общим
+release lock выполнить mcp_config_install.py restore из этого original backup,
+установить его previous-release installer-набор, daemon-reload и restart всех
+трёх unit; затем nginx -t/reload и повторный health/MCP smoke. Restore возвращает
+исходный NedoNews profile, upstream timeout и удаляет только созданные этой
+выкладкой runtime override/drop-in. Наблюдения членства и DB history не удалять.
+Промежуточный adb234f сохранён для расследования; его multi-language 429
+известен. Старый source 3e5434b для rollback непригоден из-за SQLx migration.
+
+## Предыдущая выкладка: membership history
+
 11 ноября 2026 установлен
 [deploy-2026-11-11-membership-history](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-membership-history)
 из source 87a1af943bfc878974369d3da3d90db5f0440c86 после
