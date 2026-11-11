@@ -26,8 +26,8 @@ struct MemberSnapshot {
 struct ChatUserMemberEvent<'a> {
     chat_id: i64,
     user_id: i64,
-    old_status: &'a str,
-    new_status: &'a str,
+    was_present: bool,
+    is_present: bool,
     invite_link: Option<&'a str>,
     via_chat_folder_invite_link: bool,
     event_at: DateTime<Utc>,
@@ -213,6 +213,8 @@ pub async fn save_telegram_message(
         )
         .await?;
     }
+
+    super::membership::observe_service_message(pool, msg).await?;
 
     Ok(())
 }
@@ -746,6 +748,7 @@ pub async fn save_chat_member_event(
     let new_status = chat_member_status(&member.new_chat_member.kind);
     let is_admin = member.new_chat_member.kind.is_privileged();
     let is_present = member.new_chat_member.kind.is_present();
+    let was_present = member.old_chat_member.kind.is_present();
 
     sqlx::query(
         r#"
@@ -793,8 +796,8 @@ pub async fn save_chat_member_event(
         ChatUserMemberEvent {
             chat_id: member.chat.id.0,
             user_id: member.new_chat_member.user.id.0 as i64,
-            old_status: &old_status,
-            new_status: &new_status,
+            was_present,
+            is_present,
             invite_link: member
                 .invite_link
                 .as_ref()
@@ -804,6 +807,18 @@ pub async fn save_chat_member_event(
         },
     )
     .await?;
+
+    // Само событие выхода тоже подтверждает предыдущее членство, даже если
+    // вступление произошло до появления бота. Ban -> left этого не доказывает.
+    if was_present && !is_present {
+        super::membership::record_confirmed_membership(
+            pool,
+            member.chat.id.0,
+            member.new_chat_member.user.id.0 as i64,
+            member.date,
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -878,21 +893,28 @@ pub async fn refresh_chat_member_snapshot(
         .await?;
 
     upsert_user_profile(pool, &member.user).await?;
+    save_chat_member_snapshot(pool, chat_id, &member, Utc::now()).await
+}
+
+pub async fn save_chat_member_snapshot(
+    pool: &PgPool,
+    chat_id: i64,
+    member: &teloxide::types::ChatMember,
+    observed_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
     upsert_member_snapshot(
         pool,
         MemberSnapshot {
             chat_id,
-            user_id,
+            user_id: member.user.id.0 as i64,
             status: chat_member_status(&member.kind),
             is_admin: member.kind.is_privileged(),
             is_present: member.kind.is_present(),
-            raw_json: serde_json::to_value(&member)?,
-            observed_at: Utc::now(),
+            raw_json: serde_json::to_value(member)?,
+            observed_at,
         },
     )
-    .await?;
-
-    Ok(())
+    .await
 }
 
 async fn upsert_member_snapshot(pool: &PgPool, snapshot: MemberSnapshot) -> anyhow::Result<()> {
@@ -907,6 +929,7 @@ async fn upsert_member_snapshot(pool: &PgPool, snapshot: MemberSnapshot) -> anyh
             is_present = excluded.is_present,
             raw_json = excluded.raw_json,
             observed_at = excluded.observed_at
+        where excluded.observed_at >= telegram_chat_member_snapshots.observed_at
         "#,
     )
     .bind(snapshot.chat_id)
@@ -924,14 +947,18 @@ async fn upsert_member_snapshot(pool: &PgPool, snapshot: MemberSnapshot) -> anyh
         insert into telegram_chat_users
             (
                 chat_id, telegram_user_id, member_status, is_admin,
-                is_present, member_observed_at, updated_at
+                is_present, member_observed_at, updated_at,
+                membership_first_confirmed_at, membership_last_confirmed_at
             )
-        values ($1, $2, $3, $4, $5, $6, now())
+        values ($1, $2, $3, $4, $5, $6, now(),
+                case when $5 then $6 else null end,case when $5 then $6 else null end)
         on conflict (chat_id, telegram_user_id) do update set
-            member_status = excluded.member_status,
-            is_admin = excluded.is_admin,
-            is_present = excluded.is_present,
-            member_observed_at = excluded.member_observed_at,
+            member_status = case when telegram_chat_users.member_observed_at is null or excluded.member_observed_at >= telegram_chat_users.member_observed_at then excluded.member_status else telegram_chat_users.member_status end,
+            is_admin = case when telegram_chat_users.member_observed_at is null or excluded.member_observed_at >= telegram_chat_users.member_observed_at then excluded.is_admin else telegram_chat_users.is_admin end,
+            is_present = case when telegram_chat_users.member_observed_at is null or excluded.member_observed_at >= telegram_chat_users.member_observed_at then excluded.is_present else telegram_chat_users.is_present end,
+            member_observed_at = greatest(telegram_chat_users.member_observed_at,excluded.member_observed_at),
+            membership_first_confirmed_at = least(telegram_chat_users.membership_first_confirmed_at,excluded.membership_first_confirmed_at),
+            membership_last_confirmed_at = greatest(telegram_chat_users.membership_last_confirmed_at,excluded.membership_last_confirmed_at),
             updated_at = now()
         "#,
     )
@@ -951,10 +978,8 @@ async fn update_chat_user_member_event(
     pool: &PgPool,
     event: ChatUserMemberEvent<'_>,
 ) -> anyhow::Result<()> {
-    let was_present = !matches!(event.old_status, "left" | "banned");
-    let is_present = !matches!(event.new_status, "left" | "banned");
-    let is_join = !was_present && is_present;
-    let is_leave = was_present && !is_present;
+    let is_join = !event.was_present && event.is_present;
+    let is_leave = event.was_present && !event.is_present;
 
     sqlx::query(
         r#"
@@ -975,16 +1000,13 @@ async fn update_chat_user_member_event(
             now()
         )
         on conflict (chat_id, telegram_user_id) do update set
-            first_joined_at = case
-                when $3 and telegram_chat_users.first_joined_at is null then $4
-                else telegram_chat_users.first_joined_at
-            end,
+            first_joined_at = least(telegram_chat_users.first_joined_at,excluded.first_joined_at),
             last_joined_at = case
-                when $3 then $4
+                when $3 then greatest(telegram_chat_users.last_joined_at,$4)
                 else telegram_chat_users.last_joined_at
             end,
             last_left_at = case
-                when $7 then $4
+                when $7 then greatest(telegram_chat_users.last_left_at,$4)
                 else telegram_chat_users.last_left_at
             end,
             last_invite_link = coalesce(excluded.last_invite_link, telegram_chat_users.last_invite_link),

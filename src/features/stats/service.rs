@@ -301,6 +301,18 @@ pub async fn user_stats_report_data(
     };
 
     let user = user_presentation(user_id, profile.as_ref(), member.as_ref());
+    let membership_context = timed_user_stats_query(
+        trace_id,
+        "sql_membership_context",
+        crate::db::membership::load_membership_context(
+            pool,
+            chat_id,
+            user_id,
+            user.status.as_deref(),
+            user.is_present,
+        ),
+    )
+    .await?;
     let has_human_activity = activity.messages > 0;
     if has_human_activity && let Some(stats) = cached.as_ref() {
         activity_extras.post_comments = activity_extras
@@ -361,6 +373,7 @@ pub async fn user_stats_report_data(
     );
 
     Ok(Some(UserStatsReportData {
+        membership_context,
         username: profile.as_ref().and_then(|value| value.username.clone()),
         bio: profile.as_ref().and_then(|value| value.bio.clone()),
         avatar_url: None,

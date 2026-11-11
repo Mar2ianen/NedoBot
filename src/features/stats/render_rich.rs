@@ -465,6 +465,13 @@ pub fn user_stats(
         strings.moderation_row.into(),
         moderation_summary(&data.moderation, strings),
     ]);
+    profile_rows.push(vec![
+        strings.membership_row.into(),
+        escape_html(super::document::membership_summary(
+            data.membership_context,
+            strings,
+        )),
+    ]);
     if let Some(tag) = data
         .written_tag
         .as_deref()
@@ -743,7 +750,8 @@ mod tests {
 
     #[test]
     fn rich_user_stats_omits_unattached_avatar_media() {
-        let data = UserStatsReportData {
+        let mut data = UserStatsReportData {
+            membership_context: crate::db::membership::MembershipContext::CurrentMember,
             user: UserPresentation {
                 user_id: 7,
                 display_name: "Артём".to_string(),
@@ -780,5 +788,28 @@ mod tests {
 
         assert!(report.contains("Артём"));
         assert!(!report.contains("<img"));
+        data.user.status = Some("left".into());
+        data.user.is_present = Some(false);
+        for (context, expected) in [
+            (
+                crate::db::membership::MembershipContext::FormerMember,
+                "Ранее состоял; сейчас не в чате",
+            ),
+            (
+                crate::db::membership::MembershipContext::NonMemberHistoryUnknown,
+                "Не в чате; история вступления неизвестна",
+            ),
+        ] {
+            data.membership_context = context;
+            let rich = user_stats(Some(&data), None, -1001, &StatsStrings::russian());
+            let html = crate::features::stats::render_html::user_stats(
+                Some(&data),
+                None,
+                -1001,
+                &StatsStrings::russian(),
+            );
+            assert!(rich.contains(expected) && html.contains(expected));
+            assert!(!rich.contains("никогда не вступал") && !html.contains("никогда не вступал"));
+        }
     }
 }

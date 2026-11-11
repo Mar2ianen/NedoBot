@@ -1,6 +1,7 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::collections::HashSet;
 
+pub mod membership;
 pub mod telegram;
 
 pub async fn build_pool() -> anyhow::Result<PgPool> {

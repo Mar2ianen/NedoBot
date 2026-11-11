@@ -90,6 +90,9 @@ use tg_ai_bot_teloxide::{
 #[path = "support/local_cascade.rs"]
 mod local_cascade;
 
+#[path = "support/membership_history.rs"]
+mod membership_history;
+
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
 
 #[path = "support/risk_captcha_cleanup.rs"]
@@ -108,6 +111,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    membership_history::assert_membership_history(&pool).await;
     local_cascade::assert_local_cascade(&pool).await;
     assert_userstatus_post_comment_count_backfill(&pool).await;
     assert_userstatus_totals_covering_index(&pool).await;
