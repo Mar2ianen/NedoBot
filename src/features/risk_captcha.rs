@@ -106,19 +106,22 @@ enum VerificationState {
 
 async fn can_offer_challenge(
     pool: &PgPool,
-    kind: &ChatMemberKind,
+    member: &teloxide::types::ChatMember,
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<bool> {
-    let membership_context =
-        crate::db::membership::observe_member_kind(pool, chat_id, user_id, kind).await?;
+    anyhow::ensure!(
+        member.user.id.0 as i64 == user_id,
+        "captcha member response has a different user"
+    );
+    let membership_context = crate::db::membership::observe_member(pool, chat_id, member).await?;
     tracing::debug!(
         chat_id,
         user_id,
         ?membership_context,
         "risk captcha membership context"
     );
-    Ok(match kind {
+    Ok(match &member.kind {
         ChatMemberKind::Member(_) => true,
         // Left не означает отсутствие комментариев в linked discussion.
         // Случайному non-member без своего свежего сообщения проверку не шлём.
@@ -143,7 +146,7 @@ pub async fn apply_risk_captcha(
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
                 .await?;
-            if !can_offer_challenge(pool, &member.kind, job.chat_id, job.telegram_user_id).await? {
+            if !can_offer_challenge(pool, &member, job.chat_id, job.telegram_user_id).await? {
                 return Ok(CaptchaOutcome::Expired);
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
@@ -157,7 +160,7 @@ pub async fn apply_risk_captcha(
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
                 .await?;
-            if !can_offer_challenge(pool, &member.kind, job.chat_id, job.telegram_user_id).await? {
+            if !can_offer_challenge(pool, &member, job.chat_id, job.telegram_user_id).await? {
                 return Ok(CaptchaOutcome::Ineligible);
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
