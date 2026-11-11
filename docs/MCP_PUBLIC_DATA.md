@@ -7,6 +7,7 @@
 - Scope сообщений задаёт одна строка `mcp_private.instance_scope` конкретной базы. Для этой копии manifest (`nedonews`) это `discussion_chat_id = -1001932061163`; одного совпадения `source_channel_id` недостаточно.
 - MCP принимает только структурированные read-only tools и только view из manifest: произвольного SQL, write-операций и доступа к `public.*` нет.
 - Новая колонка базовой таблицы не становится публичной автоматически: её нужно явно добавить в view, regenerated manifest и этот inventory отдельным review.
+- `db.read_text` читает полный reviewed text по частям по полному primary key. Он не расширяет набор разрешённых колонок/строк. `voice.list_transcripts` и `memory.list_notes` поддерживают query/limit/cursor; [контракт страниц и версий](MCP_LONG_TEXT.md).
 - Поля с текстом, заметками, ASR-расшифровками, результатами `/ask` и unified антиспам-аудитом являются частью опубликованного contract. Потребитель обязан считать их данными публичного чата и не использовать для идентификации или профилирования вне назначения endpoint.
 - Raw Telegram JSON не опубликован. Полный список фактически опубликованных идентификаторов и полей находится в manifest; он важнее обобщающих описаний ниже.
 - `chat.get_media` отдельно отдаёт одно фото или небольшой документ публичного чата (до 5 MiB). Telegram `file_id`, нужный для скачивания, находится только во внутренней `mcp_private.telegram_media`, не входит в `mcp_public`, manifest или generic `db.*` tools. Ранее опубликованный `file_unique_id` профиля остаётся частью reviewed manifest.

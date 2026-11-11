@@ -15,7 +15,7 @@ use crate::features::chat_read_api::ChatReadApi;
 
 use super::tools::{
     catalog, chat, db, media, semantic,
-    youtube_subtitles::{self, YoutubeSubtitlesConfig},
+    youtube_subtitles::{self, YoutubeSubtitlesConfig, YoutubeSubtitlesService},
 };
 
 /// A tools-only RMCP server over the reviewed, scoped chat read-model.
@@ -25,7 +25,7 @@ use super::tools::{
 #[derive(Clone)]
 pub struct ChatMcpServer {
     api: Arc<ChatReadApi>,
-    youtube_subtitles: Option<Arc<YoutubeSubtitlesConfig>>,
+    youtube_subtitles: Option<Arc<YoutubeSubtitlesService>>,
     telegram_media: Option<media::TelegramMediaConfig>,
 }
 
@@ -39,7 +39,8 @@ impl ChatMcpServer {
     }
 
     pub fn with_youtube_subtitles(mut self, config: Option<YoutubeSubtitlesConfig>) -> Self {
-        self.youtube_subtitles = config.map(Arc::new);
+        self.youtube_subtitles =
+            config.map(|config| Arc::new(YoutubeSubtitlesService::new(config)));
         self
     }
 
@@ -86,6 +87,17 @@ impl ChatMcpServer {
         Parameters(input): Parameters<db::SelectInput>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
         db::select(&self.api, input).await.map(Json)
+    }
+
+    #[tool(
+        name = "db.read_text",
+        description = "Читает длинное text-поле reviewed view без потери окончания: нужен полный primary key из db.describe_table. Передавайте next_offset и revision для продолжения. Работает для сообщений, расшифровок и RAG-карточек; не принимает SQL и не открывает закрытые таблицы."
+    )]
+    async fn read_text(
+        &self,
+        Parameters(input): Parameters<db::ReadTextInput>,
+    ) -> Result<Json<Value>, rmcp::ErrorData> {
+        db::read_text(&self.api, input).await.map(Json)
     }
 
     #[tool(
@@ -145,7 +157,7 @@ impl ChatMcpServer {
 
     #[tool(
         name = "youtube.get_subtitles",
-        description = "Извлекает ограниченный по длине текст субтитров из прямых YouTube-видео URL через локальный yt-dlp; плейлисты и произвольные URL не принимаются."
+        description = "Читает субтитры длинных YouTube-роликов постранично через yt-dlp. Полный текст кешируется на час. Пока has_more=true, продолжайте с next_offset и transcript_id для того же URL; первая страница не равнозначна целому ролику. offset измеряется в символах Unicode, max_chars ограничивает только страницу. Произвольные URL и плейлисты запрещены."
     )]
     async fn get_youtube_subtitles(
         &self,
@@ -342,26 +354,31 @@ impl ChatMcpServer {
 
     #[tool(
         name = "voice.list_transcripts",
-        description = "Возвращает расшифровки голосовых публичного чата."
+        description = "Ищет расшифровки голосовых публичного чата по подстроке raw_transcript или message_id. limit/cursor позволяют листать выдачу. Длинные поля целиком доступны через db.read_text."
     )]
     async fn list_voice_transcripts(
         &self,
-        Parameters(_): Parameters<semantic::EmptyInput>,
+        Parameters(input): Parameters<semantic::ContentListInput>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        semantic::list_view(&self.api, "voice_transcription_jobs", "created_at", vec![])
-            .await
-            .map(Json)
+        semantic::list_content(
+            &self.api,
+            "voice_transcription_jobs",
+            "raw_transcript",
+            input,
+        )
+        .await
+        .map(Json)
     }
 
     #[tool(
         name = "memory.list_notes",
-        description = "Возвращает атомарные RAG-карточки публичных постов."
+        description = "Ищет публичные RAG-карточки постов по подстроке summary; limit/cursor позволяют листать выдачу. Это память публичных постов, не личных разговоров. Длинные поля доступны через db.read_text."
     )]
     async fn list_memory_notes(
         &self,
-        Parameters(_): Parameters<semantic::EmptyInput>,
+        Parameters(input): Parameters<semantic::ContentListInput>,
     ) -> Result<Json<Value>, rmcp::ErrorData> {
-        semantic::list_view(&self.api, "post_history_entries", "created_at", vec![])
+        semantic::list_content(&self.api, "post_history_entries", "summary", input)
             .await
             .map(Json)
     }
@@ -495,6 +512,7 @@ mod tests {
                 "db.describe_table",
                 "db.fetch_row",
                 "db.list_tables",
+                "db.read_text",
                 "db.search_text",
                 "db.select",
                 "llm.list_generations",

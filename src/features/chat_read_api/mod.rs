@@ -190,6 +190,13 @@ impl ChatReadApi {
         query::select(&self.pool, &self.catalog, request).await
     }
 
+    pub async fn read_public_text(
+        &self,
+        request: query::TextReadRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        query::read_text(&self.pool, &self.catalog, request).await
+    }
+
     pub async fn count_public(
         &self,
         table: String,

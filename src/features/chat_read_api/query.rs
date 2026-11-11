@@ -10,6 +10,9 @@ pub const DEFAULT_LIMIT: i64 = 50;
 pub const MAX_LIMIT: i64 = 200;
 const MAX_FILTERS: usize = 12;
 pub const MAX_COLUMNS: usize = 40;
+pub const DEFAULT_TEXT_PAGE_CHARS: i64 = 6000;
+pub const MAX_TEXT_PAGE_CHARS: i64 = 12000;
+const MAX_TEXT_OFFSET: i64 = 1_000_000_000;
 pub const MAX_ORDER_COLUMNS: usize = 8;
 const MAX_GROUPS: usize = 3;
 const MAX_TEXT_CELL_CHARS: usize = 8_192;
@@ -95,6 +98,105 @@ pub struct Page {
     pub rows: Vec<Value>,
     pub next_offset: Option<i64>,
     pub has_more: bool,
+}
+
+pub struct TextReadRequest {
+    pub table: String,
+    pub column: String,
+    pub key: std::collections::BTreeMap<String, Value>,
+    pub offset: i64,
+    pub limit: i64,
+    pub revision: Option<String>,
+}
+
+pub fn validate_text_read(
+    catalog: &PublicCatalog,
+    request: &TextReadRequest,
+) -> anyhow::Result<()> {
+    let definition = table(catalog, &request.table)?;
+    ensure!(!is_sensitive_key(&request.column), "column is redacted");
+    ensure!(
+        request.key.len() == definition.primary_key.len()
+            && definition
+                .primary_key
+                .iter()
+                .all(|key| request.key.contains_key(key)),
+        "key must contain exactly the full primary key"
+    );
+    ensure!(
+        matches!(
+            column(definition, &request.column)?.pg_type.as_str(),
+            "text" | "character varying" | "character"
+        ),
+        "column must be reviewed text"
+    );
+    ensure!(
+        (0..MAX_TEXT_OFFSET).contains(&request.offset),
+        "invalid text offset"
+    );
+    ensure!(
+        (1..=MAX_TEXT_PAGE_CHARS).contains(&request.limit),
+        "text page limit must be in 1..=12000"
+    );
+    validate_count(catalog, &request.table, &text_key_filters(request))
+}
+
+fn text_key_filters(request: &TextReadRequest) -> Vec<Filter> {
+    request
+        .key
+        .iter()
+        .map(|(column, value)| Filter {
+            column: column.clone(),
+            op: FilterOp::Eq,
+            value: Some(value.clone()),
+            values: vec![],
+            case_sensitive: true,
+        })
+        .collect()
+}
+
+/// Читаем полный reviewed text по частям; generic SELECT остаётся ограниченным.
+pub async fn read_text(
+    pool: &PgPool,
+    catalog: &PublicCatalog,
+    request: TextReadRequest,
+) -> anyhow::Result<Value> {
+    validate_text_read(catalog, &request)?;
+    let definition = table(catalog, &request.table)?;
+    let name = quote(&request.column);
+    let mut sql = format!(
+        "select substring({name} from $1::text::integer for $2::text::integer) as text, char_length({name})::bigint as total_chars, md5({name}) as revision from mcp_public.{}",
+        quote(&request.table)
+    );
+    let mut binds = vec![(request.offset + 1).to_string(), request.limit.to_string()];
+    append_filters(
+        &mut sql,
+        definition,
+        &text_key_filters(&request),
+        &mut binds,
+    )?;
+    let row = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), &binds)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(json!({"found":false,"text":null,"has_more":false,"next_offset":null}));
+    };
+    let text: Option<String> = row.try_get("text")?;
+    let total: Option<i64> = row.try_get("total_chars")?;
+    let revision: Option<String> = row.try_get("revision")?;
+    ensure!(
+        request.revision.is_none() || request.revision == revision,
+        "text revision changed; restart at offset 0"
+    );
+    ensure!(
+        total.is_none_or(|total| request.offset <= total),
+        "offset exceeds text length"
+    );
+    let returned_chars = text.as_ref().map_or(0, |text| text.chars().count() as i64);
+    let has_more = total.is_some_and(|total| request.offset + returned_chars < total);
+    Ok(
+        json!({"found":true,"table":request.table,"column":request.column,"key":request.key,"text":text,"offset":request.offset,"total_chars":total,"returned_chars":returned_chars,"revision":revision,"has_more":has_more,"next_offset":has_more.then_some(request.offset+returned_chars)}),
+    )
 }
 
 pub async fn select(
@@ -1072,6 +1174,21 @@ mod tests {
     #[test]
     fn cursor_round_trip() {
         assert_eq!(decode_cursor(Some(&encode_cursor(42))).unwrap(), 42);
+    }
+
+    #[test]
+    fn text_pages_cannot_bypass_sensitive_field_redaction() {
+        let catalog = catalog(&[("api_token", "text")]);
+        let request = TextReadRequest {
+            table: "test".into(),
+            column: "api_token".into(),
+            key: BTreeMap::from([("id".into(), json!(1))]),
+            offset: 0,
+            limit: 100,
+            revision: None,
+        };
+        let error = validate_text_read(&catalog, &request).unwrap_err();
+        assert!(error.to_string().contains("redacted"));
     }
 
     #[test]

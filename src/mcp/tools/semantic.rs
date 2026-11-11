@@ -22,6 +22,71 @@ pub struct UserNotesInput {
 #[serde(deny_unknown_fields)]
 pub struct EmptyInput {}
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContentListInput {
+    /// Подстрока текста расшифровки или summary RAG-карточки.
+    pub query: Option<String>,
+    /// Только для голосовых: message_id оригинального сообщения.
+    pub message_id: Option<i64>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+pub async fn list_content(
+    api: &ChatReadApi,
+    table: &'static str,
+    text_column: &'static str,
+    input: ContentListInput,
+) -> Result<Value, rmcp::ErrorData> {
+    let mut filters = Vec::new();
+    if let Some(text) = input.query {
+        if text.trim().is_empty() || text.chars().count() > 256 {
+            return Err(invalid_arguments("query must contain 1..=256 characters"));
+        }
+        filters.push(query::Filter {
+            column: text_column.into(),
+            op: query::FilterOp::Contains,
+            value: Some(json!(text)),
+            values: vec![],
+            case_sensitive: false,
+        });
+    }
+    if let Some(message_id) = input.message_id {
+        if table != "voice_transcription_jobs" || message_id <= 0 {
+            return Err(invalid_arguments(
+                "message_id is only supported for voice transcripts",
+            ));
+        }
+        filters.push(query::Filter {
+            column: "message_id".into(),
+            op: query::FilterOp::Eq,
+            value: Some(json!(message_id)),
+            values: vec![],
+            case_sensitive: false,
+        });
+    }
+    let request = query::SelectRequest {
+        table: table.into(),
+        columns: list_view_columns(api, table, "created_at")?,
+        filters,
+        order_by: vec![query::OrderBy {
+            column: "created_at".into(),
+            direction: query::OrderDirection::Desc,
+        }],
+        limit: Some(input.limit.unwrap_or(10)),
+        offset: query::decode_cursor(input.cursor.as_deref())
+            .map_err(|error| invalid_arguments(error.to_string()))?,
+    };
+    query::validate_select(api.catalog(), &request)
+        .map_err(|error| invalid_arguments(error.to_string()))?;
+    let page = api
+        .select_public(request)
+        .await
+        .map_err(|_| read_error("public content list failed"))?;
+    Ok(query::page_json(page))
+}
+
 pub async fn resolve_user(
     api: &ChatReadApi,
     input: ResolveUserInput,

@@ -81,10 +81,12 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         config.ask_db_mcp_args = Vec::new();
         config.ask_db_mcp_env = vec!["ASK_DATABASE_URL".to_string(), "MCP_MANIFEST".to_string()];
         config.ask_db_mcp_timeout_sec = E2E_TIMEOUT.as_secs();
+        config.youtube_subtitles_enabled = false;
 
         let client = McpClient::start(&config).await?;
         assert!(client.has_tool("chat.resolve_user"));
         assert!(!client.has_tool("db.list_tables"));
+        assert!(!client.has_tool("youtube.get_subtitles"));
 
         let recent = call_object(&client, "chat.get_recent_messages", json!({"limit": 20})).await?;
         let messages = recent["messages"]
@@ -222,9 +224,71 @@ async fn ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist() -
         assert!(user_notes["notes"].is_array());
 
         client.shutdown().await;
+        assert_youtube_child(&mut config).await?;
         Ok(())
     })
     .await
+}
+
+#[cfg(unix)]
+async fn assert_youtube_child(config: &mut Config) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let text = "Полная расшифровка через настоящий MCP 🦀. ".repeat(1000);
+    std::fs::write(
+        temp.path().join("source.vtt"),
+        format!("WEBVTT\n\n00:00:00.000 --> 01:40:00.000\n{text}\n"),
+    )?;
+    let command = temp.path().join("fixture-yt-dlp");
+    std::fs::write(
+        &command,
+        r##"#!/bin/sh
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then shift; output="$1"; fi
+  shift
+done
+printf x >> "$root/calls"
+cp "$root/source.vtt" "$(dirname -- "$output")/fixture.ru.vtt"
+"##,
+    )?;
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))?;
+    config.youtube_subtitles_enabled = true;
+    config.youtube_subtitles_command = Some(command.to_str().unwrap().to_owned());
+    config.youtube_subtitles_languages = vec!["ru".into()];
+    config.youtube_subtitles_timeout_sec = 5;
+    config.youtube_subtitles_max_chars = 12000;
+    config.youtube_subtitles_max_videos = 2;
+    let client = McpClient::start(config).await?;
+    ensure!(client.has_tool("youtube.get_subtitles"));
+    ensure!(client.has_tool("voice.list_transcripts"));
+    ensure!(client.has_tool("memory.list_notes"));
+    // Generic DB tools остаются вне ASK allowlist даже после расширения MCP.
+    ensure!(!client.has_tool("db.read_text"));
+    let mut offset = 0;
+    let mut version = Value::Null;
+    let mut recovered = String::new();
+    loop {
+        let value = call_object(&client,"youtube.get_subtitles",json!({"urls":["https://youtu.be/abcdefghijk"],"offset":offset,"max_chars":3000,"transcript_id":version})).await?;
+        let page = &value["videos"][0];
+        recovered.push_str(
+            page["transcript"]
+                .as_str()
+                .context("subtitle page required")?,
+        );
+        ensure!(page["subtitle_end_seconds"] == 6000.0);
+        version = page["transcript_id"].clone();
+        if page["has_more"] == false {
+            break;
+        }
+        offset = page["next_offset"]
+            .as_u64()
+            .context("continuation required")?;
+    }
+    ensure!(recovered == text.trim());
+    ensure!(std::fs::read_to_string(temp.path().join("calls"))? == "x");
+    client.shutdown().await;
+    Ok(())
 }
 
 #[ignore = "requires two clean migrated TEST_DATABASE_URL instances and local MCP binaries"]
@@ -459,6 +523,7 @@ fn config_for_instance(profile: &PathBuf, database: &str, manifest: &PathBuf) ->
     config.ask_db_mcp_args.clear();
     config.ask_db_mcp_env = vec!["ASK_DATABASE_URL".into(), "MCP_MANIFEST".into()];
     config.ask_db_mcp_timeout_sec = E2E_TIMEOUT.as_secs();
+    config.youtube_subtitles_enabled = false;
     Ok(config)
 }
 

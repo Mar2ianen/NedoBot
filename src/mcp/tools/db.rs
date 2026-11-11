@@ -30,6 +30,38 @@ pub struct FetchRowInput {
     #[serde(default)]
     pub columns: Vec<String>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadTextInput {
+    pub table: String,
+    pub column: String,
+    /// Только полный primary key строки разрешённой view.
+    pub key: BTreeMap<String, Value>,
+    /// Смещение в символах Unicode, не байтах.
+    #[serde(default)]
+    pub offset: i64,
+    /// От 1 до 12000 символов; по умолчанию 6000.
+    pub limit: Option<i64>,
+    /// revision предыдущей страницы, чтобы не смешивать отредактированные версии.
+    pub revision: Option<String>,
+}
+
+pub async fn read_text(api: &ChatReadApi, input: ReadTextInput) -> Result<Value, rmcp::ErrorData> {
+    let request = query::TextReadRequest {
+        table: input.table,
+        column: input.column,
+        key: input.key,
+        offset: input.offset,
+        limit: input.limit.unwrap_or(query::DEFAULT_TEXT_PAGE_CHARS),
+        revision: input.revision,
+    };
+    query::validate_text_read(api.catalog(), &request)
+        .map_err(|error| invalid_arguments(error.to_string()))?;
+    api.read_public_text(request)
+        .await
+        .map_err(|_| read_error("text page unavailable or revision changed; restart at offset 0"))
+}
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CountInput {

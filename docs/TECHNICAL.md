@@ -150,7 +150,7 @@ Civil date/time и bare clock нормализуются через эту зо�
 В tracked profiles бюджет исследования расширен: `ask_max_steps=64`
 ограничивает число фактических вызовов tools (включая предварительную
 подгрузку reply), а модель получает до 68 turns: 64 основных, 3 коррекционных
-и 1 для финального ответа. `ask_total_timeout_sec=1800` — общий потолок;
+и 1 для финального ответа. `ask_total_timeout_sec=3600` — общий потолок legacy-профиля;
 `ask_action_timeout_sec=180` — одна LLM-попытка, с transport timeout
 из model capabilities (для Groq ask — 180 секунд, для OpenRouter Free — 120 секунд);
 `ask_db_mcp_timeout_sec=30` — один MCP request.
@@ -199,6 +199,7 @@ clean post -> extract JSON queries -> lazy MCP process -> SearchContext -> build
 - При включённой функции отсутствие команды/бинарника или некорректные limits — startup error; при отсутствии субтитров, timeout или ошибке конкретного ролика исходный search result сохраняется без transcript.
 - Внешний RMCP дополнительно предоставляет `youtube.get_subtitles`: он принимает только public URL конкретного YouTube-видео и возвращает найденный язык и очищенный текст субтитров. Настройки отдельного RMCP-сервиса задаются через `MCP_YOUTUBE_SUBTITLES_*`; по умолчанию инструмент выключен, а включение требует установленного `yt-dlp`.
 - RMCP вызывает `yt-dlp` без shell, с `--skip-download` и `--no-playlist`, ограничивает один вызов timeout/размером текста и удаляет временные VTT-файлы после чтения. Плейлисты, credentials в URL и произвольные домены отклоняются до запуска subprocess.
+- `youtube.get_subtitles` хранит полный текст и возвращает страницы с явными `has_more`, `next_offset`, `transcript_id`. Длина ролика не ограничена прежними 12000 символами. `/ask` получает этот инструмент только при включённом runtime feature gate и разрешении AgentProfile; [полный контракт и пределы](MCP_LONG_TEXT.md).
 - Ошибка extract превращается в skipped `SearchContext`; ошибка или таймаут отдельного MCP source оставляет успешные результаты других источников доступными для комментария.
 - Результаты поиска добавляются в JSON-контекст без raw URL и имеют приоритет ниже текста поста. В промпт помещается до 24 результатов, до 16 000 символов на результат и до 160 000 символов суммарно; URL остаётся только в `SearchContext` для безопасного рендера.
 - Каждый search-run сохраняется в `search_runs` для аналитики: статус, skipped reason, latency, queries/results как `jsonb`. Кэша результатов пока нет — запись аналитическая, не влияет на генерацию.
@@ -499,7 +500,7 @@ podman exec -i tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot \
   -f - < deploy/nedonews-mcp/bootstrap-role.sql
 ```
 
-Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; Telegram token не передаётся, пока выдача медиа выключена. Для включения `chat.get_media` туда отдельно добавляются `MCP_MEDIA_ENABLED=true` и `MCP_TELEGRAM_BOT_TOKEN` из secret store; token не коммитится и не логируется. Для semantic leg `chat.search_messages` в env задаются `ASK_CHAT_EMBEDDING_URL`, `ASK_CHAT_EMBEDDING_MODEL`, `ASK_CHAT_EMBEDDING_TIMEOUT_SEC` и `ASK_CHAT_EMBEDDING_QUERY_PREFIX`; роль MCP получает column-level `SELECT` только на нужные поля `telegram_message_embeddings_gemma2`. MCP использует общий pinned encoder на `127.0.0.1:8788`; старый отдельный GGUF service не входит в активный runtime. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 70 секунд — дольше 60-секундного application deadline.
+Unit `deploy/nedonews-mcp/nedonews-mcp.service` читает только `/etc/nedobot/nedonews-mcp.env`; Telegram token не передаётся, пока выдача медиа выключена. Для включения `chat.get_media` туда отдельно добавляются `MCP_MEDIA_ENABLED=true` и `MCP_TELEGRAM_BOT_TOKEN` из secret store; token не коммитится и не логируется. Для semantic leg `chat.search_messages` в env задаются `ASK_CHAT_EMBEDDING_URL`, `ASK_CHAT_EMBEDDING_MODEL`, `ASK_CHAT_EMBEDDING_TIMEOUT_SEC` и `ASK_CHAT_EMBEDDING_QUERY_PREFIX`; роль MCP получает column-level `SELECT` только на нужные поля `telegram_message_embeddings_gemma2`. MCP использует общий pinned encoder на `127.0.0.1:8788`; старый отдельный GGUF service не входит в активный runtime. Nginx проксирует исключительно `/mcp/nedonews/v2` на `127.0.0.1:8787`, принимает body не больше 64 KiB и ждёт upstream 650 секунд — дольше 630-секундного application deadline для нескольких загрузок субтитров. Body timeout остаётся 15 секунд; внешние клиенты могут устанавливать более короткий deadline.
 
 Ручной redeploy из локальной папки выполняется только после dry-run и проверки production profile; не использовать старую сокращённую команду без exclusions:
 

@@ -22,7 +22,7 @@ use crate::mcp::bootstrap::{DISCUSSION_CHAT_ID_ENV, INSTANCE_ID_ENV, SOURCE_CHAN
 
 // Reserve space for the agent's untrusted-result envelope; never raw-truncate JSON there.
 const MAX_TOOL_RESULT_CHARS: usize = 11_000;
-const MAX_TOOL_CATALOG_CHARS: usize = 12_000;
+const MAX_TOOL_CATALOG_CHARS: usize = 24_000;
 const PROVIDER_TOOL_NAME_SEPARATOR: &str = "__";
 
 pub const LOCAL_AGENT_TOOLS: &[&str] = &["notes.add_user", "web.search", "github.search"];
@@ -57,6 +57,9 @@ pub const ASK_MCP_TOOL_ALLOWLIST: &[&str] = &[
     "chat.get_user_interactions",
     "notes.list_chat",
     "notes.list_user",
+    "youtube.get_subtitles",
+    "voice.list_transcripts",
+    "memory.list_notes",
 ];
 
 /// Full MCP value for policy, audit, and evidence processing plus a bounded,
@@ -76,6 +79,7 @@ pub struct McpClient {
     genai_tools: Vec<GenAiTool>,
     wire_to_canonical: HashMap<String, String>,
     timeout: Duration,
+    subtitle_timeout: Duration,
 }
 
 impl McpClient {
@@ -100,6 +104,7 @@ impl McpClient {
                 command.env(name, value);
             }
         }
+        configure_youtube_child(&mut command, config)?;
         command
             .env(INSTANCE_ID_ENV, &scope.instance_id)
             .env(DISCUSSION_CHAT_ID_ENV, scope.discussion_chat_id.to_string());
@@ -130,9 +135,12 @@ impl McpClient {
         let service = timeout(timeout_duration, ().serve(transport))
             .await
             .map_err(|_| anyhow::anyhow!("chat DB MCP initialization timed out"))??;
-        let tools = timeout(timeout_duration, service.list_all_tools())
+        let mut tools = timeout(timeout_duration, service.list_all_tools())
             .await
             .map_err(|_| anyhow::anyhow!("chat DB MCP tools/list timed out"))??;
+        if !config.youtube_subtitles_enabled {
+            tools.retain(|tool| tool.name != "youtube.get_subtitles");
+        }
         reject_local_tool_collisions(&tools)?;
         let catalog = format_tool_catalog(&tools)?;
         ensure_required_ask_tools(&catalog)?;
@@ -147,6 +155,12 @@ impl McpClient {
             genai_tools: catalog.genai_tools,
             wire_to_canonical: catalog.wire_to_canonical,
             timeout: timeout_duration,
+            subtitle_timeout: Duration::from_secs(
+                config
+                    .youtube_subtitles_timeout_sec
+                    .saturating_mul(config.youtube_subtitles_max_videos as u64)
+                    .saturating_add(5),
+            ),
         })
     }
 
@@ -182,11 +196,72 @@ impl McpClient {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("MCP tool arguments must be an object"))?;
         let request = CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments);
-        let result = timeout(self.timeout, self.service.call_tool(request))
+        let call_timeout = if tool == "youtube.get_subtitles" {
+            self.subtitle_timeout
+        } else {
+            self.timeout
+        };
+        let result = timeout(call_timeout, self.service.call_tool(request))
             .await
             .map_err(|_| anyhow::anyhow!("chat DB MCP tool call timed out"))??;
         parse_tool_result(result)
     }
+}
+
+fn configure_youtube_child(command: &mut Command, config: &Config) -> anyhow::Result<()> {
+    use crate::mcp::tools::youtube_subtitles as yt;
+    // Runtime feature gate авторитетнее случайно унаследованных MCP env.
+    for name in [
+        yt::ENABLED_ENV,
+        yt::COMMAND_ENV,
+        yt::LANGUAGES_ENV,
+        yt::TIMEOUT_ENV,
+        yt::MAX_CHARS_ENV,
+        yt::MAX_VIDEOS_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    command.env(
+        yt::ENABLED_ENV,
+        config.youtube_subtitles_enabled.to_string(),
+    );
+    if !config.youtube_subtitles_enabled {
+        return Ok(());
+    }
+    let executable = config
+        .youtube_subtitles_command
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("YouTube subtitles command is not configured"))?;
+    let path = if std::path::Path::new(executable).is_absolute() {
+        std::path::PathBuf::from(executable)
+    } else {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .map(|directory| directory.join(executable))
+            .find(|path| path.is_file())
+            .ok_or_else(|| anyhow::anyhow!("YouTube subtitles command was not found on PATH"))?
+    };
+    let path = path.canonicalize()?;
+    command
+        .env(yt::COMMAND_ENV, path)
+        .env(
+            yt::LANGUAGES_ENV,
+            config.youtube_subtitles_languages.join(","),
+        )
+        .env(
+            yt::TIMEOUT_ENV,
+            config.youtube_subtitles_timeout_sec.to_string(),
+        )
+        .env(
+            yt::MAX_CHARS_ENV,
+            config.youtube_subtitles_max_chars.to_string(),
+        )
+        .env(
+            yt::MAX_VIDEOS_ENV,
+            config.youtube_subtitles_max_videos.to_string(),
+        );
+    Ok(())
 }
 
 struct ToolCatalog {

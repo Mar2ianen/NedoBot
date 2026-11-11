@@ -398,7 +398,7 @@ search_fetch_max_chars = 16000
 youtube_subtitles_enabled = true
 youtube_subtitles_command = "yt-dlp"
 youtube_subtitles_languages = ["ru", "ru.*", "en", "en.*"]
-youtube_subtitles_timeout_sec = 15
+youtube_subtitles_timeout_sec = 60
 youtube_subtitles_max_chars = 12000
 youtube_subtitles_max_videos = 2
 comment_blocked_source_domains = [
@@ -428,7 +428,7 @@ ask_llm_temperature = 0.2
 ask_llm_max_tokens = 16384
 ask_max_steps = 64
 ask_action_timeout_sec = 180
-ask_total_timeout_sec = 1800
+ask_total_timeout_sec = 3600
 ask_max_concurrency = 4
 ask_db_mcp_args = []
 ask_db_mcp_env = ["ASK_DATABASE_URL", "MCP_MANIFEST"]
@@ -584,14 +584,15 @@ tool_allowlist = [
   "chat.count_word_occurrences", "chat.search_messages", "chat.search_messages_batch",
   "chat.get_recent_messages", "chat.get_message", "chat.get_message_context",
   "chat.get_reply_thread", "chat.get_user_interactions", "sandbox.python", "notes.list_chat",
-  "notes.list_user", "notes.add_user", "web.search", "github.search"
+  "notes.list_user", "notes.add_user", "web.search", "github.search",
+  "youtube.get_subtitles", "voice.list_transcripts", "memory.list_notes"
 ]
 
 [agent_profiles.nedonews_default.budgets]
 max_steps = 64
 max_tool_calls = 64
 action_timeout_sec = 180
-total_timeout_sec = 1800
+total_timeout_sec = 3600
 max_output_tokens = 16384
 
 [agent_profiles.nedonews_default.memory]

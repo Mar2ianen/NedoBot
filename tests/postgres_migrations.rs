@@ -90,6 +90,8 @@ use tg_ai_bot_teloxide::{
 #[path = "support/local_cascade.rs"]
 mod local_cascade;
 
+#[path = "support/mcp_text_pages.rs"]
+mod mcp_text_pages;
 #[path = "support/membership_history.rs"]
 mod membership_history;
 
@@ -5544,6 +5546,13 @@ async fn assert_mcp_instance_scope_isolation(pool: &PgPool) {
                 .await
                 .expect("read-only scope validator must be executable");
         assert!(configured_scope_matches);
+        mcp_text_pages::assert_text_pages(
+            pool,
+            scope,
+            if scope == &scope_a { chat_b } else { chat_a },
+            own_user,
+        )
+        .await;
         let forged_scope_matches: bool =
             query_scalar("select mcp_private.matches_instance_scope('forged', $1, null)")
                 .bind(scope.discussion_chat_id() - 1)

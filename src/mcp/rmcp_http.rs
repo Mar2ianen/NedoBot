@@ -32,7 +32,12 @@ const DEFAULT_PATH: &str = "/mcp/nedonews/v2";
 const DEFAULT_MANIFEST_PATH: &str = "config/mcp_db_manifest.toml";
 const DEFAULT_PROFILE_PATH: &str = "config/llm_profiles.toml.example";
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// Несколько последовательных yt-dlp загрузок должны помещаться в HTTP budget.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(
+    crate::config::YOUTUBE_SUBTITLES_MAX_TIMEOUT_SEC
+        * crate::config::YOUTUBE_SUBTITLES_MAX_VIDEOS as u64
+        + 30,
+);
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
 
 struct RmcpHttpConfig {
