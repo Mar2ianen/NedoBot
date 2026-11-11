@@ -21,6 +21,13 @@ Embedding service также active. После correction release начина�
 Автосанкции NedoNews выключены, как и прежде; review delivery выключена в
 обоих инстансах. Эти флаги проверка не включает.
 
+Дополнительный срез в 08:52 UTC: один реальный /ask завершён без error_kind,
+delivery_outcome=rich_delivered. Новых voice jobs и captcha challenges в обеих
+БД нет — live-проверку этих сценариев такой срез не доказывает. В LLM journal
+также есть WARN 429/503 и output-validation warnings; это не равнозначно
+terminal failure запроса. Восемь новых post-comment jobs NedoNews на основном
+срезе все sent. Все предупреждения периода не объявляются отсутствующими.
+
 ## Найденные ошибки и восстановление
 
 - Два старых post-history HTTP 402 в 16:01 и 16:02 UTC 10 ноября относятся
