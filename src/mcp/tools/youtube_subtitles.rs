@@ -378,6 +378,30 @@ async fn fetch_one(
     config: &YoutubeSubtitlesConfig,
     canonical_url: &str,
 ) -> Result<Option<Transcript>, rmcp::ErrorData> {
+    let deadline = Instant::now() + config.timeout;
+    // yt-dlp скачивает ВСЕ запрошенные языки. Ошибка перевода en после успешного
+    // ru не должна ломать результат: выбираем первую доступную исходную дорожку.
+    for language in config.languages.split(',') {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| read_error("subtitle provider timed out"))?;
+        let single = YoutubeSubtitlesConfig {
+            languages: language.to_owned(),
+            timeout: remaining,
+            ..config.clone()
+        };
+        if let Some(transcript) = fetch_one_language(&single, canonical_url).await? {
+            return Ok(Some(transcript));
+        }
+    }
+    Ok(None)
+}
+
+async fn fetch_one_language(
+    config: &YoutubeSubtitlesConfig,
+    canonical_url: &str,
+) -> Result<Option<Transcript>, rmcp::ErrorData> {
     let temp_dir =
         tempfile::tempdir().map_err(|_| read_error("subtitle temp directory unavailable"))?;
     let output_template = temp_dir.path().join("%(id)s.%(language)s.%(ext)s");
@@ -392,6 +416,8 @@ async fn fetch_one(
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
+            "--extractor-args",
+            "youtube:skip=translated_subs",
             "--sub-langs",
             &config.languages,
             "--sub-format",
@@ -718,6 +744,54 @@ exit {exit_code}
         assert_eq!(
             std::fs::read_to_string(directory.path().join("calls")).unwrap(),
             "x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tries_native_languages_in_order_and_stops_after_the_first_success() {
+        let (directory, service) = fixture_provider(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nOriginal English track\n",
+            0,
+        );
+        std::fs::write(
+            &service.config.command,
+            r##"#!/bin/sh
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) shift; output="$1" ;;
+    --sub-langs) shift; language="$1" ;;
+    --extractor-args) shift; extractor="$1" ;;
+  esac
+  shift
+done
+test "$extractor" = youtube:skip=translated_subs || exit 2
+printf '%s\n' "$language" >> "$root/calls"
+if [ "$language" = en ]; then
+  cp "$root/source.vtt" "$(dirname -- "$output")/fixture.en.vtt"
+fi
+"##,
+        )
+        .unwrap();
+        let output = get_subtitles(Some(&service), page_input(0, None))
+            .await
+            .unwrap();
+        assert_eq!(output.videos[0].language.as_deref(), Some("en"));
+        assert_eq!(
+            output.videos[0].transcript.as_deref(),
+            Some("Original English track")
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "ru\nen\n"
+        );
+        let _ = get_subtitles(Some(&service), page_input(0, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "ru\nen\n"
         );
     }
 
