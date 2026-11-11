@@ -8,7 +8,7 @@ use teloxide::{
     prelude::{Bot, Requester},
     types::{
         ChatId, ChatMemberKind, ChatPermissions, EphemeralMessageParameters, InlineKeyboardButton,
-        InlineKeyboardMarkup, MessageId, UserId,
+        InlineKeyboardMarkup, MessageId, ReplyParameters, UserId,
     },
 };
 use uuid::Uuid;
@@ -36,6 +36,7 @@ pub enum CaptchaOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptchaCallbackOutcome {
     Passed,
+    PassedWithoutRestriction,
     PassedButOtherRestrictionRemains,
     Wrong { attempts_left: i32 },
     Failed,
@@ -48,6 +49,7 @@ impl CaptchaCallbackOutcome {
     pub fn success_message(self) -> Option<&'static str> {
         match self {
             Self::Passed => Some("Проверка пройдена. Ограничения сняты."),
+            Self::PassedWithoutRestriction => Some("Проверка пройдена."),
             Self::PassedButOtherRestrictionRemains => {
                 Some("Проверка пройдена. Другое ограничение остаётся.")
             }
@@ -63,6 +65,7 @@ impl CaptchaCallbackOutcome {
         matches!(
             self,
             Self::Passed
+                | Self::PassedWithoutRestriction
                 | Self::PassedButOtherRestrictionRemains
                 | Self::Failed
                 | Self::Expired
@@ -96,6 +99,28 @@ struct CaptchaChallenge {
     setup_attempts: i32,
 }
 
+enum VerificationState {
+    RestrictedMember,
+    Commenter,
+}
+
+async fn can_offer_challenge(
+    pool: &PgPool,
+    kind: &ChatMemberKind,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(match kind {
+        ChatMemberKind::Member(_) => true,
+        // Left не означает отсутствие комментариев в linked discussion.
+        // Случайному non-member без своего свежего сообщения проверку не шлём.
+        ChatMemberKind::Left => load_reply_message_id(pool, chat_id, user_id)
+            .await?
+            .is_some(),
+        _ => false,
+    })
+}
+
 /// Создаёт durable challenge и запускает его доставку. Незавершённая настройка
 /// также подхватывается отдельным bounded worker после рестарта процесса.
 pub async fn apply_risk_captcha(
@@ -110,7 +135,7 @@ pub async fn apply_risk_captcha(
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
                 .await?;
-            if !matches!(member.kind, ChatMemberKind::Member(_)) {
+            if !can_offer_challenge(pool, &member.kind, job.chat_id, job.telegram_user_id).await? {
                 return Ok(CaptchaOutcome::Expired);
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
@@ -124,7 +149,7 @@ pub async fn apply_risk_captcha(
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
                 .await?;
-            if !matches!(member.kind, ChatMemberKind::Member(_)) {
+            if !can_offer_challenge(pool, &member.kind, job.chat_id, job.telegram_user_id).await? {
                 return Ok(CaptchaOutcome::Ineligible);
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
@@ -143,7 +168,10 @@ pub async fn apply_risk_captcha(
         "expired" => return Ok(CaptchaOutcome::Expired),
         "solving" => return Ok(CaptchaOutcome::AlreadyPending),
         "pending" if challenge.message_id.is_some() => {
-            if !ensure_restricted(bot, pool, &challenge).await? {
+            if ensure_verification_state(bot, pool, &challenge)
+                .await?
+                .is_none()
+            {
                 return Ok(CaptchaOutcome::Overridden);
             }
             delete_audited_messages(bot, pool, &challenge).await?;
@@ -203,22 +231,39 @@ async fn deliver_challenge(
     challenge: &CaptchaChallenge,
     ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
-    if !ensure_restricted(bot, pool, challenge).await? {
+    let reply_message_id =
+        load_reply_message_id(pool, challenge.chat_id, challenge.user_id).await?;
+    let Some(state) = ensure_verification_state(bot, pool, challenge).await? else {
         return Ok(CaptchaOutcome::Overridden);
-    }
+    };
+    anyhow::ensure!(
+        reply_message_id.is_some() || matches!(state, VerificationState::RestrictedMember),
+        "non-member captcha requires a fresh comment reply target"
+    );
 
-    delete_audited_messages(bot, pool, challenge).await?;
+    let consequence = match state {
+        VerificationState::RestrictedMember => {
+            "До успешного ответа отправка сообщений ограничена; после истечения времени бот удалит вас из чата."
+        }
+        VerificationState::Commenter => "После успешного ответа проверка будет завершена.",
+    };
     let text = format!(
-        "Проверка нового участника\nРешите пример: {}.\nУ вас {} мин. До успешного ответа отправка сообщений ограничена; после истечения времени бот удалит вас из чата.",
+        "Проверка комментария\nРешите пример: {}.\nУ вас {} мин. {consequence}",
         challenge.question,
         ttl_seconds.saturating_add(59) / 60
     );
     let sent = with_captcha_ephemeral_parameters(
         bot.send_message(text).chat_id(ChatId(challenge.chat_id)),
         UserId(challenge.user_id as u64),
-    )
-    .reply_markup(keyboard(challenge))
-    .await?;
+        reply_message_id,
+    );
+    let sent = sent.reply_markup(keyboard(challenge)).await?;
+    // Успех sendMessage не является read receipt. Но отсутствие ephemeral ID
+    // не позволяет активировать проверку или удалять исходный комментарий.
+    anyhow::ensure!(
+        sent.ephemeral_message_id.is_some(),
+        "captcha response is not ephemeral"
+    );
     set_message_sent(
         pool,
         challenge.id,
@@ -227,7 +272,43 @@ async fn deliver_challenge(
         ttl_seconds,
     )
     .await?;
+    // Reply должен быть принят до удаления anchor. Ошибка cleanup не должна
+    // переотправлять уже сохранённую карточку или продлевать её TTL.
+    if delete_audited_messages(bot, pool, challenge).await.is_err() {
+        tracing::warn!(
+            chat_id = challenge.chat_id,
+            user_id = challenge.user_id,
+            "risk captcha cleanup failed after ephemeral delivery; pending audit may retry cleanup"
+        );
+    }
     Ok(CaptchaOutcome::Issued)
+}
+
+async fn load_reply_message_id(
+    pool: &PgPool,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<Option<i32>> {
+    Ok(sqlx::query_scalar(
+        r#"select m.message_id from telegram_messages m
+           join telegram_new_user_profile_audits a
+             on a.chat_id=m.chat_id and a.telegram_user_id=m.user_id
+           where m.chat_id=$1 and m.user_id=$2
+             and m.message_id between a.first_message_id and a.last_message_id
+             and m.source_channel_id is null and m.deleted_by_bot_at is null
+             and m.created_at >= now() - ($3 * interval '1 second')
+             and (nullif(btrim(m.text), '') is not null
+                  or m.has_photo or m.has_video or m.has_document or m.has_audio
+                  or m.has_voice or m.has_sticker or m.has_animation
+                  or m.raw_json ?| array['poll','video_note','contact','location',
+                                        'venue','dice','paid_media','story','game'])
+           order by m.message_id desc limit 1"#,
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .bind(crate::features::auto_moderation::ENFORCE_FRESHNESS.num_seconds())
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// После мута очищаем всю свежую пачку пользователя в границах аудита.
@@ -395,6 +476,10 @@ pub async fn handle_callback(
         .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
         .await?;
     match member.kind {
+        ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => {
+            set_passed(pool, challenge.id).await?;
+            Ok(CaptchaCallbackOutcome::PassedWithoutRestriction)
+        }
         ChatMemberKind::Member(_) => {
             set_passed(pool, challenge.id).await?;
             Ok(CaptchaCallbackOutcome::Passed)
@@ -417,11 +502,11 @@ pub async fn handle_callback(
     }
 }
 
-async fn ensure_restricted(
+async fn ensure_verification_state(
     bot: &Bot,
     pool: &PgPool,
     challenge: &CaptchaChallenge,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<VerificationState>> {
     let member = bot
         .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
         .await?;
@@ -429,7 +514,7 @@ async fn ensure_restricted(
         ChatMemberKind::Member(_) => {
             if challenge.restriction_applied_at.is_some() {
                 set_status(pool, challenge.id, "overridden").await?;
-                return Ok(false);
+                return Ok(None);
             }
             bot.restrict_chat_member(
                 ChatId(challenge.chat_id),
@@ -439,20 +524,25 @@ async fn ensure_restricted(
             .use_independent_chat_permissions(true)
             .await?;
             mark_restriction_applied(pool, challenge.id).await?;
-            Ok(true)
+            Ok(Some(VerificationState::RestrictedMember))
         }
         ChatMemberKind::Restricted(restricted)
             if restricted.is_member && has_no_permissions(&restricted) =>
         {
             if challenge.restriction_applied_at.is_none() {
                 set_status(pool, challenge.id, "overridden").await?;
-                return Ok(false);
+                return Ok(None);
             }
-            Ok(true)
+            Ok(Some(VerificationState::RestrictedMember))
+        }
+        ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => {
+            // Не пытаемся мутить/вступать за non-member. Доставка ephemeral
+            // reply проверяется отдельно; отказ API не запускает TTL.
+            Ok(Some(VerificationState::Commenter))
         }
         _ => {
             set_status(pool, challenge.id, "overridden").await?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -490,6 +580,7 @@ async fn restore_after_failed_delivery(
         .await?;
     match member.kind {
         ChatMemberKind::Member(_) => Ok(true),
+        ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => Ok(true),
         ChatMemberKind::Restricted(restricted)
             if restricted.is_member && has_no_permissions(&restricted) =>
         {
@@ -849,8 +940,16 @@ pub async fn finish_captcha_card(
     }
 }
 
-fn with_captcha_ephemeral_parameters<R: SendMessageSetters>(request: R, user_id: UserId) -> R {
-    request.ephemeral_message_parameters(EphemeralMessageParameters::new(user_id))
+fn with_captcha_ephemeral_parameters<R: SendMessageSetters>(
+    request: R,
+    user_id: UserId,
+    reply_message_id: Option<i32>,
+) -> R {
+    let request = request.ephemeral_message_parameters(EphemeralMessageParameters::new(user_id));
+    match reply_message_id {
+        Some(id) => request.reply_parameters(ReplyParameters::new(MessageId(id))),
+        None => request,
+    }
 }
 
 async fn load_user_challenge(
@@ -1036,6 +1135,7 @@ mod tests {
                 .send_message("solve this")
                 .chat_id(ChatId(-1001)),
             recipient,
+            Some(17),
         );
 
         assert_eq!(
@@ -1046,7 +1146,10 @@ mod tests {
                 .and_then(|parameters| parameters.receiver_user_id),
             Some(recipient)
         );
-        assert!(request.payload_ref().reply_parameters.is_none());
+        let reply = request.payload_ref().reply_parameters.as_ref().unwrap();
+        assert_eq!(reply.message_id, Some(teloxide::types::MessageId(17)));
+        assert_ne!(reply.allow_sending_without_reply, Some(true));
+        assert!(reply.chat_id.is_none());
     }
 
     #[test]
