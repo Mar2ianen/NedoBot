@@ -49,6 +49,10 @@ stdio scope/forged scope/private memory и PostgreSQL read-only ACL probes об�
 БД; public HTTP connector выполнил scoped SELECT. Это ручная проверка отдельно
 от build-only workflow; она не означает чистый журнал предыдущих 16 часов.
 
+**Extended SSH health — 08:48:03 UTC, окно 253 секунды:** все три unit
+по-прежнему active/running, NRestarts=0, hashes совпадают; Rust ERROR и journal
+priority err отсутствуют. Embedding active, миграции и scope обеих БД сохранены.
+
 [CI 42987933651](https://github.com/Mar2ianen/NedoBot/actions/runs/42987933651)
 и [CI 42987941093](https://github.com/Mar2ianen/NedoBot/actions/runs/42987941093)
 точного 3e5434b прошли workspace tests, strict Clippy, fresh migrations,
