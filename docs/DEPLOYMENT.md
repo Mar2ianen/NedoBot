@@ -7,6 +7,57 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+11 ноября 2026 установлен
+[deploy-2026-11-11-membership-history](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-membership-history)
+из source 87a1af943bfc878974369d3da3d90db5f0440c86 после
+[PR #112](https://github.com/Mar2ianen/NedoBot/pull/112) и
+[PR #113](https://github.com/Mar2ianen/NedoBot/pull/113). Полный tree совпал
+со слитым main; ancestry проверена до установки.
+
+[Release 43023752816](https://github.com/Mar2ianen/NedoBot/actions/runs/43023752816)
+собрал проверенный SHA256SUMS artifact на Ubuntu 24.04, glibc ≤ 2.39,
+deploy=false. Установка и следующие проверки выполнены отдельно по SSH.
+Начало окна работающих процессов: 2026-11-11T12:59:06+00:00.
+
+SHA-256 обоих running bot executable: 549c752b55dae88d5241f2426acb9d0db627df51d8621df3b784067f92802ea1.
+Public MCP: 7bafdb24e163fd9f543bf01a0865c18b57fd39b2c307c9c51f033179b390da24.
+Оба internal MCP: 9621e27d191a35b7df00985c29e90a75575ad395233080d051d023a41c5ed384.
+Миграция 20261111100000 подтверждена SQL в обеих БД, failed=0.
+
+**SSH health — 2026-11-11T13:00:33.154161+00:00, окно 87 секунд:**
+все три unit active/running, NRestarts=0, running hashes совпали с artifact;
+Rust ERROR и journal priority err за это окно отсутствуют, embedding active.
+Повторены scoped stdio SELECT, отказ foreign scope/private memory/forged scope,
+реальные read-only ACL обеих БД и public HTTP SELECT. Profiles, env и manifests
+обоих инстансов побайтно совпали с backup; public LoadCredential актуален.
+Никакие credentials, billing, веса, пороги или feature flags не менялись.
+Капча остаётся ephemeral-only, публичных уведомлений не добавлено.
+
+Backfill сначала проверен на изолированных копиях production-данных.
+После установки среди текущих left snapshots подтверждённые бывшие участники:
+21 в NedoNews, 47 в PVO;
+неизвестная история: 100 / 9.
+Это не статистика «никогда не вступавших» и не доказательство добровольного выхода.
+[Семантика, источники и ограничения](MEMBERSHIP_HISTORY.md).
+
+[CI push](https://github.com/Mar2ianen/NedoBot/actions/runs/43023683721) и
+[CI PR](https://github.com/Mar2ianen/NedoBot/actions/runs/43023729337) точного source
+успешны. Локально прошли locked workspace/all-target tests, strict Clippy,
+format и ./scripts/test.sh (fresh/upgrade migrations, membership/restricted,
+ban/unban, out-of-order events, audit input, MCP/ACL обеих тестовых БД).
+
+Backup: /var/backups/nedobot/2026-11-11-membership-history.
+**Rollback только через rollback-release source
+3af0d9223b4a0d2a61ded2c309b6329f99532cff**, build
+[43017698674](https://github.com/Mar2ianen/NedoBot/actions/runs/43017698674):
+прежнее runtime поведение с тем же checksum новой migration. Старый
+previous-release source 3e5434b после новой migration не запустится из-за
+SQLx validation; он сохранён только для сравнения/расследования. Запустить
+installer из rollback-release и restart всех трёх unit; конфиги сохранены,
+DB migration и накопленные наблюдения не откатывать.
+
+## Предыдущая выкладка
+
 11 ноября 2026 в **08:43:51 UTC / 11:43:51 МСК** установлен
 [deploy-2026-11-11-ephemeral-captcha-replies](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-ephemeral-captcha-replies)
 из source 3e5434b86b7d00ec3b665a0ad42bbaa874d1a34e после

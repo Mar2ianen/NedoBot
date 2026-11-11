@@ -321,7 +321,16 @@ Runner запускает локальный Podman PostgreSQL, пересозд
 
 ## VPS Деплой
 
-Текущий production release на `vps-153` зафиксирован immutable annotated tag
+Текущий production release —
+[`deploy-2026-11-11-membership-history`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-membership-history),
+source `87a1af943bfc878974369d3da3d90db5f0440c86`. Один artifact установлен в оба community-инстанса и public MCP;
+migration `20261111100000` подтверждена в обеих БД. Exact hashes, время и окно
+SSH health, CI/build evidence и совместимый rollback описаны в
+[DEPLOYMENT.md](DEPLOYMENT.md). Членство и его положительная история разделены:
+`left` без доказательства прежнего членства означает неизвестную историю,
+а не «никогда не вступал». [Контракт и исследование ботов](MEMBERSHIP_HISTORY.md).
+
+Ранее релиз 7 ноября зафиксирован tag
 [`deploy-2026-11-07-casual-paid-task-signal`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-07-casual-paid-task-signal)
 на merge commit `cbf3de07216a0ef9e76fbf5395be28a8758631ee` после PR #98.
 Release workflow [42364376332](https://github.com/Mar2ianen/NedoBot/actions/runs/42364376332)
