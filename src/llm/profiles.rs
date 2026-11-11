@@ -670,7 +670,7 @@ models = ["ollama_memory"]
         let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
         assert_eq!(profiles.runtime.ask_llm_max_tokens, 16_384);
         assert_eq!(profiles.runtime.ask_max_steps, 64);
-        assert_eq!(profiles.runtime.ask_total_timeout_sec, 1_800);
+        assert_eq!(profiles.runtime.ask_total_timeout_sec, 3_600);
 
         let selections = profiles
             .resolve_route("ask", &RouteRequirements::default())

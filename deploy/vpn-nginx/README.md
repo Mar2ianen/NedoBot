@@ -16,4 +16,4 @@ The committed starting policy is deliberately soft:
 - 40 simultaneous connections/IP;
 - 8 simultaneous connections across the public MCP virtual host.
 
-The endpoint and Nginx both enforce a 64 KiB request-body limit. The 70-second Nginx read timeout is deliberately longer than the 60-second application deadline, so clients receive the controlled application response. Tune the limits from access logs and DB pool saturation before raising them.
+The endpoint and Nginx both enforce a 64 KiB request-body limit. Nginx retains the 15-second body timeout and the existing connection/rate limits. The 650-second upstream read timeout covers the 630-second application deadline (at most five 120-second subtitle downloads plus overhead). PostgreSQL statement and lock timeouts stay unchanged. MCP clients may impose a shorter timeout independently; transcript pagination keeps cached continuation requests short.

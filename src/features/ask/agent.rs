@@ -753,7 +753,9 @@ fn progress_for_tool(tool: &str) -> AskProgress {
     match tool {
         "chat.resolve_user" | "chat.get_user_profile" => AskProgress::ResolvingPerson,
         "notes.list_chat" | "notes.list_user" | "notes.add_user" => AskProgress::CheckingNotes,
-        "web.search" | "github.search" => AskProgress::CheckingExternalSources,
+        "web.search" | "github.search" | "youtube.get_subtitles" => {
+            AskProgress::CheckingExternalSources
+        }
         "sandbox.python" => AskProgress::Computing,
         _ => AskProgress::SearchingChat,
     }
@@ -1101,7 +1103,12 @@ fn agent_tool_preview(tool: &str, arguments: &Value, result: &ToolResult, limit:
     let value_limit = limit
         .saturating_sub(MAX_TOOL_ARGUMENTS_PREVIEW_CHARS)
         .max(256);
-    let value = structured_preview(&result.value, value_limit)
+    let preview_value = if tool == "youtube.get_subtitles" {
+        subtitle_preview(&result.value, value_limit)
+    } else {
+        result.value.clone()
+    };
+    let value = structured_preview(&preview_value, value_limit)
         .ok()
         .and_then(|preview| serde_json::from_str::<Value>(&preview).ok())
         .unwrap_or_else(|| json!({"error":"tool preview unavailable"}));
@@ -1116,6 +1123,42 @@ fn agent_tool_preview(tool: &str, arguments: &Value, result: &ToolResult, limit:
         "arguments": arguments,
         "result": value,
     }))
+}
+
+/// При обрезке для модели курсор указывает на реально показанный текст,
+/// а не на конец исходной MCP-страницы: иначе часть ролика терялась бы навсегда.
+fn subtitle_preview(value: &Value, limit: usize) -> Value {
+    let mut preview = value.clone();
+    while serialize_prompt_json(&preview).chars().count() > limit {
+        let Some(videos) = preview.get_mut("videos").and_then(Value::as_array_mut) else {
+            break;
+        };
+        let mut changed = false;
+        for video in videos {
+            let Some(text) = video.get("transcript").and_then(Value::as_str) else {
+                continue;
+            };
+            let count = text.chars().count();
+            if count == 0 {
+                continue;
+            }
+            let text = truncate_chars(text, count / 2);
+            let shown = text.chars().count();
+            let offset = video["offset"].as_u64().unwrap_or(0);
+            video["transcript"] = json!(text);
+            video["returned_chars"] = json!(shown);
+            video["has_more"] = json!(true);
+            video["next_offset"] = json!(offset + shown as u64);
+            video["note"] = json!(
+                "Страница сокращена для контекста. Продолжите с next_offset и transcript_id."
+            );
+            changed = true;
+        }
+        if !changed {
+            return json!({"error":"Недостаточно места для страницы субтитров. Запросите один URL отдельным вызовом."});
+        }
+    }
+    preview
 }
 
 fn count_scope_verified(arguments: &Value, evidence: &Evidence) -> bool {
@@ -1247,6 +1290,13 @@ fn filter_reply_scoped_result(tool: &str, value: &Value, allowed_ids: &HashSet<i
     match tool {
         "chat.search_messages" | "chat.get_recent_messages" => {
             filter_message_page(&mut filtered, "messages", allowed_ids);
+        }
+        "voice.list_transcripts" => {
+            filter_message_page(&mut filtered, "rows", allowed_ids);
+            filtered["reply_scope_filter_applied"] = json!(true);
+        }
+        "memory.list_notes" => {
+            return json!({"rows":[],"reply_scope_filter_applied":true,"note":"Общие RAG-карточки вне цепочки ответа не подгружаются без запроса по всему чату."});
         }
         "chat.search_messages_batch" => {
             if let Some(results) = filtered.get_mut("results").and_then(Value::as_array_mut) {
@@ -1638,7 +1688,18 @@ async fn call_tool(
             };
             collect_message_evidence_value(&value, context.evidence);
             collect_url_field_evidence(&value, "author_url", context.evidence);
-            let agent_preview = structured_preview(&value, MAX_TOOL_PREVIEW_CHARS)?;
+            if tool == "youtube.get_subtitles" {
+                collect_source_evidence_value(&value, context.evidence);
+            }
+            if tool == "memory.list_notes" {
+                collect_url_field_evidence(&value, "external_source_url", context.evidence);
+            }
+            let preview = if tool == "youtube.get_subtitles" {
+                subtitle_preview(&value, MAX_TOOL_PREVIEW_CHARS)
+            } else {
+                value.clone()
+            };
+            let agent_preview = structured_preview(&preview, MAX_TOOL_PREVIEW_CHARS)?;
             Ok(ToolResult {
                 value,
                 agent_preview,
@@ -1930,6 +1991,40 @@ mod tests {
             agent_tool_preview("sandbox.python", &python_arguments, &python_result, 3000);
         assert!(python_preview.contains("code_redacted"));
         assert!(!python_preview.contains("answer from another thread"));
+    }
+
+    #[test]
+    fn subtitle_preview_cursor_tracks_the_text_actually_shown_to_the_model() {
+        let text = "Кириллица 🦀 <>&\n".repeat(1800);
+        let value = json!({"videos":[{"video_id":"abcdefghijk","url":"https://youtu.be/abcdefghijk","transcript":text,"total_chars":50000,"offset":100,"returned_chars":27000,"has_more":true,"next_offset":27100,"transcript_id":"a".repeat(64)}]});
+        let preview = subtitle_preview(&value, 2400);
+        assert!(serialize_prompt_json(&preview).chars().count() <= 2400);
+        let page = &preview["videos"][0];
+        let shown = page["transcript"].as_str().unwrap().chars().count();
+        assert!(shown > 0 && shown < text.chars().count());
+        assert_eq!(page["returned_chars"], shown);
+        assert_eq!(page["next_offset"], 100 + shown);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["transcript_id"], "a".repeat(64));
+    }
+
+    #[test]
+    fn new_read_tools_preserve_reply_branch_isolation() {
+        let allowed = HashSet::from([11]);
+        let voice = filter_reply_scoped_result(
+            "voice.list_transcripts",
+            &json!({"rows":[{"message_id":11,"raw_transcript":"Свой"},{"message_id":12,"raw_transcript":"Соседний"}],"has_more":false}),
+            &allowed,
+        );
+        assert_eq!(voice["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(voice["rows"][0]["message_id"], 11);
+        let memory = filter_reply_scoped_result(
+            "memory.list_notes",
+            &json!({"rows":[{"summary":"Чужая ветка"}]}),
+            &allowed,
+        );
+        assert!(memory["rows"].as_array().unwrap().is_empty());
+        assert_eq!(memory["reply_scope_filter_applied"], true);
     }
 
     #[test]

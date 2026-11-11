@@ -1199,6 +1199,21 @@ fn validate_search_config(errors: &mut Vec<String>, config: &Config) {
     }
 }
 
+pub const YOUTUBE_SUBTITLES_MAX_TIMEOUT_SEC: u64 = 120;
+pub const YOUTUBE_SUBTITLES_MIN_PAGE_CHARS: usize = 256;
+pub const YOUTUBE_SUBTITLES_MAX_PAGE_CHARS: usize = 50_000;
+pub const YOUTUBE_SUBTITLES_MAX_VIDEOS: usize = 5;
+
+pub(crate) fn youtube_language_selectors_are_valid(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.split(',').all(|language| {
+            !language.is_empty()
+                && language
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'*' | b'-'))
+        })
+}
+
 fn validate_youtube_subtitles_config(errors: &mut Vec<String>, config: &Config) {
     match config.youtube_subtitles_command.as_deref() {
         None | Some("") => errors.push(
@@ -1225,14 +1240,19 @@ fn validate_youtube_subtitles_config(errors: &mut Vec<String>, config: &Config) 
                 .to_string(),
         );
     }
-    if config.youtube_subtitles_timeout_sec == 0 {
-        errors.push("YOUTUBE_SUBTITLES_TIMEOUT_SEC must be greater than 0".to_string());
+    if !(1..=YOUTUBE_SUBTITLES_MAX_TIMEOUT_SEC).contains(&config.youtube_subtitles_timeout_sec) {
+        errors.push("YOUTUBE_SUBTITLES_TIMEOUT_SEC must be in 1..=120".to_string());
     }
-    if config.youtube_subtitles_max_chars == 0 {
-        errors.push("YOUTUBE_SUBTITLES_MAX_CHARS must be greater than 0".to_string());
+    if !(YOUTUBE_SUBTITLES_MIN_PAGE_CHARS..=YOUTUBE_SUBTITLES_MAX_PAGE_CHARS)
+        .contains(&config.youtube_subtitles_max_chars)
+    {
+        errors.push("YOUTUBE_SUBTITLES_MAX_CHARS must be in 256..=50000".to_string());
     }
-    if config.youtube_subtitles_max_videos == 0 {
-        errors.push("YOUTUBE_SUBTITLES_MAX_VIDEOS must be greater than 0".to_string());
+    if !(1..=YOUTUBE_SUBTITLES_MAX_VIDEOS).contains(&config.youtube_subtitles_max_videos) {
+        errors.push("YOUTUBE_SUBTITLES_MAX_VIDEOS must be in 1..=5".to_string());
+    }
+    if !youtube_language_selectors_are_valid(&config.youtube_subtitles_languages.join(",")) {
+        errors.push("YOUTUBE_SUBTITLES_LANGUAGES contains invalid selectors".to_string());
     }
 }
 
@@ -2575,9 +2595,9 @@ models = ["primary", "fallback"]
 
         assert!(err.contains("YOUTUBE_SUBTITLES_ENABLED=true requires"));
         assert!(err.contains("YOUTUBE_SUBTITLES_LANGUAGES"));
-        assert!(err.contains("YOUTUBE_SUBTITLES_TIMEOUT_SEC must be greater than 0"));
-        assert!(err.contains("YOUTUBE_SUBTITLES_MAX_CHARS must be greater than 0"));
-        assert!(err.contains("YOUTUBE_SUBTITLES_MAX_VIDEOS must be greater than 0"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_TIMEOUT_SEC must be in 1..=120"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_MAX_CHARS must be in 256..=50000"));
+        assert!(err.contains("YOUTUBE_SUBTITLES_MAX_VIDEOS must be in 1..=5"));
     }
 
     #[test]

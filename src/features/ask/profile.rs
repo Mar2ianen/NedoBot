@@ -38,7 +38,7 @@ impl AgentProfile {
             })?;
 
         if legacy_nedonews_default && !profiles.agent_profiles.contains_key(&key) {
-            return Self::legacy_nedonews(profile_path);
+            return Self::legacy_nedonews(profile_path, profiles.runtime.ask_total_timeout_sec);
         }
         let profile = profiles
             .agent_profiles
@@ -80,7 +80,7 @@ impl AgentProfile {
         })
     }
 
-    fn legacy_nedonews(profile_path: &str) -> anyhow::Result<Self> {
+    fn legacy_nedonews(profile_path: &str, total_timeout_sec: u64) -> anyhow::Result<Self> {
         let base_dir = profile_base_dir(profile_path)?;
         Ok(Self {
             key: NEDONEWS_DEFAULT_PROFILE.to_owned(),
@@ -106,7 +106,7 @@ impl AgentProfile {
                 max_steps: 64,
                 max_tool_calls: 64,
                 action_timeout_sec: 180,
-                total_timeout_sec: 1800,
+                total_timeout_sec,
                 max_output_tokens: 16_384,
             },
             memory: AgentMemoryConfig {
@@ -172,6 +172,21 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn legacy_agent_uses_the_configured_total_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("profile.toml");
+        fs::write(&path, "# fixture").unwrap();
+        let mut profiles =
+            LlmProfiles::from_toml(include_str!("../../../config/llm_profiles.toml.example"))
+                .unwrap();
+        profiles.agent_profiles.clear();
+        profiles.runtime.ask_total_timeout_sec = 2345;
+        let profile =
+            AgentProfile::resolve(&profiles, path.to_str().unwrap(), "nedonews", None).unwrap();
+        assert_eq!(profile.budgets.total_timeout_sec, 2345);
+    }
 
     #[test]
     fn named_profiles_resolve_independent_prompts_routes_and_identities() {
