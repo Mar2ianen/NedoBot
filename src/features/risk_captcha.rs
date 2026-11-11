@@ -196,6 +196,28 @@ pub async fn process_next_setup(
     let Some(challenge) = claim_next_setup(pool).await? else {
         return Ok(false);
     };
+    if challenge.status == "pending" && challenge.message_id.is_some() {
+        // Cleanup retry не должен накладывать новый mute, если автор успел
+        // вступить в группу, пройти проверку или был размучен администратором.
+        let member = bot
+            .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+            .await?;
+        let unchanged = match member.kind {
+            ChatMemberKind::Left => challenge.restriction_applied_at.is_none(),
+            ChatMemberKind::Restricted(restricted) => {
+                restricted.is_member
+                    && has_no_permissions(&restricted)
+                    && challenge.restriction_applied_at.is_some()
+            }
+            _ => false,
+        };
+        if unchanged {
+            cleanup_after_delivery(bot, pool, &challenge).await?;
+        } else {
+            set_status(pool, challenge.id, "overridden").await?;
+        }
+        return Ok(true);
+    }
     run_claimed_setup(bot, pool, &challenge, ttl_seconds).await?;
     Ok(true)
 }
@@ -274,14 +296,42 @@ async fn deliver_challenge(
     .await?;
     // Reply должен быть принят до удаления anchor. Ошибка cleanup не должна
     // переотправлять уже сохранённую карточку или продлевать её TTL.
-    if delete_audited_messages(bot, pool, challenge).await.is_err() {
+    cleanup_after_delivery(bot, pool, challenge).await?;
+    Ok(CaptchaOutcome::Issued)
+}
+
+async fn cleanup_after_delivery(
+    bot: &Bot,
+    pool: &PgPool,
+    challenge: &CaptchaChallenge,
+) -> anyhow::Result<()> {
+    let failed = challenge.setup_attempts > MAX_SETUP_ATTEMPTS
+        || delete_audited_messages(bot, pool, challenge).await.is_err();
+    let error_kind = if !failed {
+        None
+    } else if challenge.setup_attempts < MAX_SETUP_ATTEMPTS {
+        Some("cleanup_pending")
+    } else {
+        Some("cleanup_failed")
+    };
+    // Карточка уже принята: ошибка cleanup не переводит её обратно в setup
+    // и не восстанавливает права. Воркер повторит только удаление, bounded.
+    sqlx::query("update telegram_risk_captcha_challenges set setup_error_kind=$3, setup_next_attempt_at=now()+($4*interval '1 second'), setup_lease_expires_at=null, updated_at=now() where id=$1 and status='pending' and setup_attempts=$2")
+        .bind(challenge.id).bind(challenge.setup_attempts).bind(error_kind)
+        .bind(setup_retry_delay_seconds(challenge.setup_attempts)).execute(pool).await?;
+    if failed {
         tracing::warn!(
             chat_id = challenge.chat_id,
             user_id = challenge.user_id,
-            "risk captcha cleanup failed after ephemeral delivery; pending audit may retry cleanup"
+            error_kind,
+            "risk captcha cleanup deferred after ephemeral delivery"
         );
     }
-    Ok(CaptchaOutcome::Issued)
+    Ok(())
+}
+
+fn setup_retry_delay_seconds(attempts: i32) -> i64 {
+    2_i64.pow(attempts.clamp(1, 6) as u32).min(60)
 }
 
 async fn load_reply_message_id(
@@ -397,9 +447,7 @@ async fn retry_or_finish_setup(
         return Ok(());
     }
 
-    let delay_seconds = 2_i64
-        .pow(challenge.setup_attempts.clamp(1, 6) as u32)
-        .min(60);
+    let delay_seconds = setup_retry_delay_seconds(challenge.setup_attempts);
     sqlx::query(
         "update telegram_risk_captcha_challenges set status = 'preparing', setup_next_attempt_at = now() + ($2 * interval '1 second'), setup_lease_expires_at = null, setup_error_kind = 'setup_attempt_failed', updated_at = now() where id = $1 and status = 'setting_up'",
     )
@@ -779,19 +827,27 @@ async fn claim_setup_by_id(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<Cap
 async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
         r#"with candidate as (
-               select id
+               select id, status, message_id
                from telegram_risk_captcha_challenges
                where (status = 'preparing' and setup_next_attempt_at <= now())
                   or (status = 'pending' and message_id is null)
                   or (status = 'setting_up' and setup_lease_expires_at <= now())
+                  or (status = 'pending' and message_id is not null
+                      and setup_error_kind = 'cleanup_pending'
+                      and setup_next_attempt_at <= now() and expires_at > now()
+                      and (setup_lease_expires_at is null or setup_lease_expires_at <= now()))
                order by setup_next_attempt_at, created_at, id
                for update skip locked
                limit 1
            )
            update telegram_risk_captcha_challenges challenge
-           set status = 'setting_up', setup_attempts = setup_attempts + 1,
+           set status = case when candidate.status = 'pending' and candidate.message_id is not null
+                             then 'pending' else 'setting_up' end,
+               setup_attempts = setup_attempts + 1,
                setup_lease_expires_at = now() + ($1 * interval '1 second'),
-               setup_error_kind = null, updated_at = now()
+               setup_error_kind = case when candidate.status = 'pending' and candidate.message_id is not null
+                                       then 'cleanup_pending' else null end,
+               updated_at = now()
            from candidate
            where challenge.id = candidate.id
            returning challenge.id, challenge.chat_id, challenge.telegram_user_id,

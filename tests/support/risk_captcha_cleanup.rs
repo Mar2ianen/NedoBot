@@ -11,7 +11,7 @@ use tg_ai_bot_teloxide::features::{
     new_user_audit::repo::NewUserAuditJob,
     risk_captcha::{
         CaptchaCallbackOutcome, CaptchaOutcome, apply_risk_captcha, handle_callback,
-        process_next_expired,
+        process_next_expired, process_next_setup,
     },
 };
 use uuid::Uuid;
@@ -420,12 +420,18 @@ pub async fn assert_cleanup(pool: &PgPool) {
         }
     }
     // После ошибки удаления повторяем только cleanup, сохраняя карточку и TTL.
-    assert_eq!(
-        apply_risk_captcha(&bot, pool, &job, 100, 600)
+    let initial_expiry: chrono::DateTime<chrono::Utc> =
+        query_scalar("select expires_at from telegram_risk_captcha_challenges where id=$1")
+            .bind(id)
+            .fetch_one(pool)
             .await
-            .unwrap(),
-        CaptchaOutcome::AlreadyPending
-    );
+            .unwrap();
+    query("update telegram_risk_captcha_challenges set setup_next_attempt_at=now() where id=$1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(process_next_setup(&bot, pool, 600).await.unwrap());
     assert_eq!(send_count(&stub), 2);
     let expiry: chrono::DateTime<chrono::Utc> =
         query_scalar("select expires_at from telegram_risk_captcha_challenges where id = $1")
@@ -433,6 +439,10 @@ pub async fn assert_cleanup(pool: &PgPool) {
             .fetch_one(pool)
             .await
             .unwrap();
+    assert_eq!(
+        initial_expiry, expiry,
+        "worker cleanup must preserve expiry"
+    );
     let incorrectly_deleted: i64 = query_scalar(
         "select count(*) from telegram_messages where chat_id in ($1, $1 - 1) and deleted_by_bot_at is not null and message_id not in (101,102,103,104)",
     )
