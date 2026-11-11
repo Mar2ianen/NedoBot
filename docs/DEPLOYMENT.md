@@ -36,8 +36,8 @@ live-доказанной: [runbook](EPHEMERAL_CAPTCHA.md).
 
 Единственная config delta — model/route search_extract NedoNews с Ollama на
 Cloudflare Gemma JSON Object, прежние 900 output tokens, thinking=false.
-Два synthetic research-plan HTTP probe прошли до активации; native route
-validation прошла новым binary. PVO profile побайтно сохранён. Другие routes,
+Два synthetic research-plan HTTP probe прошли до активации; Конфигурационный preflight
+validate_instance_config выполнен новым binary. PVO profile побайтно сохранён. Другие routes,
 модель/пороги подозрения, cascade, enforcement/captcha/review-delivery flags,
 manifests и env обоих инстансов сохранены. Public MCP LoadCredential совпал
 с текущим NedoNews profile. Billing plan/credentials не менялись.
