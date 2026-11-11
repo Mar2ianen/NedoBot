@@ -110,6 +110,14 @@ async fn can_offer_challenge(
     chat_id: i64,
     user_id: i64,
 ) -> anyhow::Result<bool> {
+    let membership_context =
+        crate::db::membership::observe_member_kind(pool, chat_id, user_id, kind).await?;
+    tracing::debug!(
+        chat_id,
+        user_id,
+        ?membership_context,
+        "risk captcha membership context"
+    );
     Ok(match kind {
         ChatMemberKind::Member(_) => true,
         // Left не означает отсутствие комментариев в linked discussion.

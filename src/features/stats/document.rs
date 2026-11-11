@@ -11,6 +11,20 @@ pub struct Kv<'a> {
     pub value: String,
 }
 
+pub fn membership_summary(
+    context: crate::db::membership::MembershipContext,
+    strings: &super::strings::StatsStrings,
+) -> &'static str {
+    use crate::db::membership::MembershipContext;
+    match context {
+        MembershipContext::CurrentMember => strings.membership_current,
+        MembershipContext::FormerMember => strings.membership_former,
+        MembershipContext::NonMemberHistoryUnknown => strings.membership_history_unknown,
+        MembershipContext::Banned => strings.membership_banned,
+        MembershipContext::Unknown => strings.membership_unknown,
+    }
+}
+
 /// A titled block of rows. `title == None` emits bare rows (used for the
 /// report header where the title line is custom).
 pub struct Section<'a> {

@@ -414,6 +414,13 @@ pub fn user_stats(
                 value: moderation_summary(&data.moderation, strings),
             },
             Kv {
+                label: strings.membership_row,
+                value: escape_html(super::document::membership_summary(
+                    data.membership_context,
+                    strings,
+                )),
+            },
+            Kv {
                 label: strings.first_message,
                 value: linked_message(
                     discussion_chat_id,

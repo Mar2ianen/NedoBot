@@ -205,6 +205,7 @@ pub struct MessageMediaPreview {
 #[derive(Clone)]
 pub struct UserStatsReportData {
     pub user: UserPresentation,
+    pub membership_context: crate::db::membership::MembershipContext,
     pub username: Option<String>,
     pub bio: Option<String>,
     pub avatar_url: Option<String>,
