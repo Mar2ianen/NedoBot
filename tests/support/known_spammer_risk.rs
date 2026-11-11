@@ -79,7 +79,7 @@ async fn telegram_api(
             json!(true)
         }
         "sendmessage" => json!({
-            "message_id": 900, "date": 1_700_000_000,
+            "message_id": 900, "ephemeral_message_id": 901, "date": 1_700_000_000,
             "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "captcha"
         }),
         _ => panic!("unexpected Telegram method: {method}"),

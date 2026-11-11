@@ -9,17 +9,169 @@ use sqlx::{PgPool, query, query_scalar};
 use teloxide::Bot;
 use tg_ai_bot_teloxide::features::{
     new_user_audit::repo::NewUserAuditJob,
-    risk_captcha::{CaptchaOutcome, apply_risk_captcha},
+    risk_captcha::{
+        CaptchaCallbackOutcome, CaptchaOutcome, apply_risk_captcha, handle_callback,
+        process_next_expired, process_next_setup,
+    },
 };
 use uuid::Uuid;
 
 const CHAT_ID: i64 = -1_009_000_099_321;
 const USER_ID: i64 = 9_000_099_321;
 
+async fn reset_commenter(pool: &PgPool) {
+    query("delete from telegram_risk_captcha_challenges where chat_id=$1")
+        .bind(CHAT_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+    query(
+        "update telegram_messages set deleted_by_bot_at=null where chat_id=$1 and message_id=103",
+    )
+    .bind(CHAT_ID)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn assert_non_member_reply(
+    pool: &PgPool,
+    bot: &Bot,
+    job: &NewUserAuditJob,
+    stub: &TelegramStub,
+) {
+    reset_commenter(pool).await;
+    stub.non_member.store(true, Ordering::SeqCst);
+    stub.calls.lock().unwrap().clear();
+    assert_eq!(
+        apply_risk_captcha(bot, pool, job, 100, 600).await.unwrap(),
+        CaptchaOutcome::Issued
+    );
+    let (id,option,unrestricted):(Uuid,i16,bool)=sqlx::query_as("select id,correct_option,restriction_applied_at is null from telegram_risk_captcha_challenges where chat_id=$1")
+        .bind(CHAT_ID).fetch_one(pool).await.unwrap();
+    assert!(unrestricted);
+    {
+        let calls = stub.calls.lock().unwrap();
+        assert!(!calls.iter().any(|(m, _)| matches!(
+            m.as_str(),
+            "restrictchatmember" | "banchatmember" | "unbanchatmember"
+        )));
+        let sent = calls.iter().find(|(m, _)| m == "sendmessage").unwrap();
+        assert_eq!(sent.1["reply_parameters"]["message_id"], 103);
+        assert_eq!(
+            sent.1["ephemeral_message_parameters"]["receiver_user_id"],
+            USER_ID
+        );
+    }
+    let data = format!("rc:{id}:{option}");
+    assert_eq!(
+        handle_callback(bot, pool, Some(CHAT_ID - 1), USER_ID, &data)
+            .await
+            .unwrap(),
+        CaptchaCallbackOutcome::Stale
+    );
+    assert_eq!(
+        handle_callback(bot, pool, Some(CHAT_ID), USER_ID + 1, &data)
+            .await
+            .unwrap(),
+        CaptchaCallbackOutcome::NotForThisUser
+    );
+    assert_eq!(
+        handle_callback(bot, pool, Some(CHAT_ID), USER_ID, &data)
+            .await
+            .unwrap(),
+        CaptchaCallbackOutcome::PassedWithoutRestriction
+    );
+
+    // Отклонённая отправка сохраняет комментарий, не запускает TTL и публичный fallback.
+    reset_commenter(pool).await;
+    stub.calls.lock().unwrap().clear();
+    for _ in 0..5 {
+        stub.fail_send.store(true, Ordering::SeqCst);
+        query("update telegram_risk_captcha_challenges set setup_next_attempt_at=now() where chat_id=$1")
+            .bind(CHAT_ID).execute(pool).await.unwrap();
+        assert!(apply_risk_captcha(bot, pool, job, 100, 600).await.is_err());
+    }
+    let state:(String,bool,bool)=sqlx::query_as("select status,expires_at is null,restriction_applied_at is null from telegram_risk_captcha_challenges where chat_id=$1")
+        .bind(CHAT_ID).fetch_one(pool).await.unwrap();
+    assert_eq!(state, ("setup_failed".into(), true, true));
+    {
+        let calls = stub.calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|(m, _)| m == "sendmessage").count(), 5);
+        assert!(!calls.iter().any(|(m, _)| matches!(
+            m.as_str(),
+            "deletemessages" | "restrictchatmember" | "banchatmember" | "unbanchatmember"
+        )));
+        assert!(
+            calls
+                .iter()
+                .filter(|(m, _)| m == "sendmessage")
+                .all(|(_, p)| p["ephemeral_message_parameters"]["receiver_user_id"] == USER_ID)
+        );
+    }
+    let preserved:bool=query_scalar("select deleted_by_bot_at is null from telegram_messages where chat_id=$1 and message_id=103")
+        .bind(CHAT_ID).fetch_one(pool).await.unwrap();
+    assert!(preserved);
+
+    // Ответ без ephemeral ID не подтверждает отправку персональной капчи.
+    reset_commenter(pool).await;
+    stub.calls.lock().unwrap().clear();
+    stub.omit_ephemeral_id.store(true, Ordering::SeqCst);
+    assert!(apply_risk_captcha(bot, pool, job, 100, 600).await.is_err());
+    let no_timer: bool = query_scalar(
+        "select expires_at is null from telegram_risk_captcha_challenges where chat_id=$1",
+    )
+    .bind(CHAT_ID)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(no_timer);
+    assert!(delete_batches(stub).is_empty());
+    stub.omit_ephemeral_id.store(false, Ordering::SeqCst);
+
+    // Истечение проверки non-member не меняет членство и не вызывает ban/unban.
+    reset_commenter(pool).await;
+    stub.calls.lock().unwrap().clear();
+    assert_eq!(
+        apply_risk_captcha(bot, pool, job, 100, 600).await.unwrap(),
+        CaptchaOutcome::Issued
+    );
+    query("update telegram_risk_captcha_challenges set expires_at=now()-interval '1 second' where chat_id=$1")
+        .bind(CHAT_ID).execute(pool).await.unwrap();
+    assert!(process_next_expired(bot, pool).await.unwrap());
+    let status: String =
+        query_scalar("select status from telegram_risk_captcha_challenges where chat_id=$1")
+            .bind(CHAT_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "expired");
+    assert!(!stub.calls.lock().unwrap().iter().any(|(m, _)| matches!(
+        m.as_str(),
+        "restrictchatmember" | "banchatmember" | "unbanchatmember"
+    )));
+
+    // Без своего комментария нельзя создать проверку по сообщению чужого чата/автора.
+    query("delete from telegram_risk_captcha_challenges where chat_id=$1")
+        .bind(CHAT_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+    stub.calls.lock().unwrap().clear();
+    assert_eq!(
+        apply_risk_captcha(bot, pool, job, 100, 600).await.unwrap(),
+        CaptchaOutcome::Ineligible
+    );
+    assert_eq!(send_count(stub), 0);
+}
+
 #[derive(Default)]
 struct TelegramStub {
     calls: Mutex<Vec<(String, Value)>>,
     fail_delete: AtomicBool,
+    fail_send: AtomicBool,
+    non_member: AtomicBool,
+    omit_ephemeral_id: AtomicBool,
     restricted: AtomicBool,
 }
 
@@ -31,6 +183,10 @@ async fn telegram_api(
     let method = uri.path().rsplit('/').next().unwrap().to_lowercase();
     stub.calls.lock().unwrap().push((method.clone(), payload));
     let result = match method.as_str() {
+        "getchatmember" if stub.non_member.load(Ordering::SeqCst) => json!({
+            "status": "left",
+            "user": {"id": USER_ID, "is_bot": false, "first_name": "Fixture"}
+        }),
         "getchatmember" if stub.restricted.load(Ordering::SeqCst) => json!({
             "status": "restricted", "is_member": true, "until_date": 0,
             "user": {"id": USER_ID, "is_bot": false, "first_name": "Fixture"},
@@ -54,10 +210,26 @@ async fn telegram_api(
             }));
         }
         "deletemessages" => json!(true),
-        "sendmessage" => json!({
-            "message_id": 900, "date": 1_700_000_000,
-            "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "captcha"
-        }),
+        "sendmessage" if stub.fail_send.swap(false, Ordering::SeqCst) => {
+            return Json(json!({"ok": false, "error_code":400,
+                "description":"Bad Request: reply message not found"}));
+        }
+        "sendmessage" => {
+            let mut message = json!({
+                "message_id": 900, "date": 1_700_000_000,
+                "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "captcha"
+            });
+            if !stub.omit_ephemeral_id.load(Ordering::SeqCst) {
+                message["ephemeral_message_id"] = json!(901);
+            }
+            message
+        }
+        "getchat" => {
+            json!({"id":CHAT_ID,"type":"supergroup","title":"Fixture", "accent_color_id":0,"max_reaction_count":1,
+                "accepted_gift_types":{"unlimited_gifts":false,"limited_gifts":false,"unique_gifts":false,"premium_subscription":false},
+                "permissions":{"can_send_messages":true}})
+        }
+        "deleteephemeralmessage" => json!(true),
         _ => panic!("unexpected Telegram method: {method}"),
     };
     Json(json!({"ok": true, "result": result}))
@@ -158,6 +330,7 @@ pub async fn assert_cleanup(pool: &PgPool) {
         is_materialization_replay: true,
     };
     let stub = Arc::new(TelegramStub::default());
+    stub.fail_send.store(true, Ordering::SeqCst);
     stub.fail_delete.store(true, Ordering::SeqCst);
     stub.restricted.store(true, Ordering::SeqCst);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -173,11 +346,11 @@ pub async fn assert_cleanup(pool: &PgPool) {
             .await
             .is_err()
     );
-    assert_eq!(delete_batches(&stub), vec![vec![103, 102, 101]]);
+    assert!(delete_batches(&stub).is_empty());
     assert_eq!(
         send_count(&stub),
-        0,
-        "failed cleanup must precede captcha delivery"
+        1,
+        "failed delivery must preserve the comment reply target"
     );
     let state: (String, Option<String>) = sqlx::query_as(
         "select status, setup_error_kind from telegram_risk_captcha_challenges where id = $1",
@@ -190,6 +363,13 @@ pub async fn assert_cleanup(pool: &PgPool) {
         state,
         ("preparing".into(), Some("setup_attempt_failed".into()))
     );
+    let no_timer: bool =
+        query_scalar("select expires_at is null from telegram_risk_captcha_challenges where id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(no_timer, "rejected ephemeral reply must not start expiry");
     let unmarked: i64 = query_scalar(
         "select count(*) from telegram_messages where chat_id = $1 and message_id between 101 and 103 and deleted_by_bot_at is null",
     )
@@ -214,13 +394,55 @@ pub async fn assert_cleanup(pool: &PgPool) {
             .unwrap(),
         CaptchaOutcome::Issued
     );
-    assert_eq!(send_count(&stub), 1);
+    assert_eq!(send_count(&stub), 2);
+    assert_eq!(delete_batches(&stub), vec![vec![103, 102, 101]]);
+    {
+        let calls = stub.calls.lock().unwrap();
+        let first_delete = calls
+            .iter()
+            .position(|(m, _)| m == "deletemessages")
+            .unwrap();
+        assert!(
+            calls[..first_delete]
+                .iter()
+                .any(|(m, _)| m == "sendmessage")
+        );
+        for (_, payload) in calls.iter().filter(|(m, _)| m == "sendmessage") {
+            assert_eq!(
+                payload["ephemeral_message_parameters"]["receiver_user_id"],
+                USER_ID
+            );
+            assert_eq!(payload["reply_parameters"]["message_id"], 103);
+            assert_ne!(
+                payload["reply_parameters"]["allow_sending_without_reply"],
+                true
+            );
+        }
+    }
+    // После ошибки удаления повторяем только cleanup, сохраняя карточку и TTL.
+    let initial_expiry: chrono::DateTime<chrono::Utc> =
+        query_scalar("select expires_at from telegram_risk_captcha_challenges where id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    query("update telegram_risk_captcha_challenges set setup_next_attempt_at=now() where id=$1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(process_next_setup(&bot, pool, 600).await.unwrap());
+    assert_eq!(send_count(&stub), 2);
     let expiry: chrono::DateTime<chrono::Utc> =
         query_scalar("select expires_at from telegram_risk_captcha_challenges where id = $1")
             .bind(id)
             .fetch_one(pool)
             .await
             .unwrap();
+    assert_eq!(
+        initial_expiry, expiry,
+        "worker cleanup must preserve expiry"
+    );
     let incorrectly_deleted: i64 = query_scalar(
         "select count(*) from telegram_messages where chat_id in ($1, $1 - 1) and deleted_by_bot_at is not null and message_id not in (101,102,103,104)",
     )
@@ -271,7 +493,7 @@ pub async fn assert_cleanup(pool: &PgPool) {
     assert_eq!(batches[previous_batches + 1], vec![200]);
     assert_eq!(
         send_count(&stub),
-        1,
+        2,
         "pending captcha must not be sent twice"
     );
     let current_expiry: chrono::DateTime<chrono::Utc> =
@@ -315,9 +537,10 @@ pub async fn assert_cleanup(pool: &PgPool) {
         CaptchaOutcome::AlreadyPassed
     );
     assert_eq!(stub.calls.lock().unwrap().len(), before_passed);
+    assert_non_member_reply(pool, &bot, &job, &stub).await;
     server.abort();
-    query("delete from telegram_risk_captcha_challenges where id = $1")
-        .bind(id)
+    query("delete from telegram_risk_captcha_challenges where chat_id = $1")
+        .bind(CHAT_ID)
         .execute(pool)
         .await
         .unwrap();
