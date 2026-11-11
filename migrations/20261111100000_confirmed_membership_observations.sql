@@ -37,7 +37,9 @@ with service_messages as materialized (
         ))
     )
     union all
-    select m.chat_id, (u ->> 'id')::bigint, m.created_at
+    select m.chat_id,
+           case when u ->> 'id' ~ '^[1-9][0-9]{0,17}$' then (u ->> 'id')::bigint end,
+           m.created_at
     from service_messages m
     cross join lateral jsonb_array_elements(
         case when jsonb_typeof(m.raw_json -> 'new_chat_members') = 'array'
@@ -45,7 +47,10 @@ with service_messages as materialized (
     ) u
     where u ->> 'id' ~ '^[1-9][0-9]{0,17}$'
     union all
-    select chat_id, (raw_json #>> '{left_chat_member,id}')::bigint, created_at
+    select chat_id,
+           case when raw_json #>> '{left_chat_member,id}' ~ '^[1-9][0-9]{0,17}$'
+                then (raw_json #>> '{left_chat_member,id}')::bigint end,
+           created_at
     from service_messages
     where raw_json #>> '{left_chat_member,id}' ~ '^[1-9][0-9]{0,17}$'
 ), confirmed as (
