@@ -527,6 +527,20 @@ max_messages = 10
 max_chat_age_seconds = 259200
 max_corpus_examples = 5000
 
+# Нативный Decisions API; не является generative route и не выдаёт санкции.
+[moderation.decision]
+enabled = false
+external_processing_allowed = false
+avatar_enabled = false
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+model = "gemini-decision-1"
+timeout_sec = 15
+max_calls_per_hour = 30
+max_pending_jobs = 100
+max_input_chars = 2000
+chat_policy = "Тематика и разрешения чата неизвестны. Не предполагай запрета предложений работы."
+
 [manual_moderation]
 enabled = false
 

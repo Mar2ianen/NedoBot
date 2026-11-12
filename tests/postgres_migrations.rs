@@ -95,6 +95,9 @@ mod mcp_text_pages;
 #[path = "support/membership_history.rs"]
 mod membership_history;
 
+#[path = "support/decision_shadow.rs"]
+mod decision_shadow;
+
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
 
 #[path = "support/risk_captcha_cleanup.rs"]
@@ -114,6 +117,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
 
     assert_clean_database_migrations(&pool).await;
     membership_history::assert_membership_history(&pool).await;
+    decision_shadow::assert_decision_shadow(&pool).await;
     local_cascade::assert_local_cascade(&pool).await;
     assert_userstatus_post_comment_count_backfill(&pool).await;
     assert_userstatus_totals_covering_index(&pool).await;

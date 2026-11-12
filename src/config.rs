@@ -641,6 +641,12 @@ impl Config {
 
     pub fn validate_runtime_secrets(&self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
+        if self.community.moderation.decision.enabled
+            && std::env::var(&self.community.moderation.decision.api_key_env)
+                .map_or(true, |value| value.trim().is_empty())
+        {
+            errors.push("decision enabled but its API key is missing".to_owned());
+        }
 
         if let Err(error) = validate_community_config(&self.community, &self.chat_registry) {
             errors.push(error.to_string());
@@ -1483,6 +1489,20 @@ fn validate_community_config(
                 "moderation.captcha_enabled=true requires at least one chat with moderation=true"
             );
         }
+    }
+    community.moderation.decision.validate()?;
+    if community.moderation.decision.enabled {
+        anyhow::ensure!(
+            cfg!(feature = "moderation") && community.moderation.enabled,
+            "decision requires moderation module and moderation.enabled=true"
+        );
+        anyhow::ensure!(
+            community
+                .chats
+                .values()
+                .any(|chat| chat.ingest && chat.moderation),
+            "decision requires an ingested moderation chat"
+        );
     }
     community.moderation.local_cascade.validate()?;
     if community.moderation.local_cascade.mode != crate::config_file::LocalCascadeMode::Disabled {

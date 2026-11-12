@@ -1,0 +1,56 @@
+{
+  "answers": {
+    "unsolicited_promotion": {
+      "type": "noul",
+      "noul": 0.01,
+      "confidence": 0.99
+    },
+    "work_solicitation": {
+      "type": "noul",
+      "noul": 0.01,
+      "confidence": 0.99
+    },
+    "private_contact_funnel": {
+      "type": "noul",
+      "noul": 0.01,
+      "confidence": 0.99
+    },
+    "contextual_relevance": {
+      "type": "score",
+      "score": 2.0,
+      "probabilities": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 1.0
+      },
+      "legend": {
+        "0": "Явно посторонняя реклама, не относящаяся к теме и разрешениям чата",
+        "1": "Контекст неизвестен или связь с темой неоднозначна",
+        "2": "Сообщение по теме чата или разрешённое предложение"
+      },
+      "confidence": 0.99
+    },
+    "spam_campaign_type": {
+      "type": "choice",
+      "choice": "none",
+      "probabilities": {
+        "work_dm_bait": 0.0,
+        "financial_promotion": 0.0,
+        "adult_promotion": 0.0,
+        "other_promotion": 0.0,
+        "none": 1.0
+      },
+      "confidence": 0.99
+    },
+    "quoted_or_discussed_spam": {
+      "type": "noul",
+      "noul": 0.01,
+      "confidence": 0.99
+    }
+  },
+  "usage": {
+    "total_input_tokens": 800,
+    "total_output_tokens": 0,
+    "total_tokens": 800
+  }
+}

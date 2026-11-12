@@ -27,6 +27,22 @@ pub async fn ingest_message(pool: &PgPool, msg: &Message, config: &Config) -> an
         return Ok(false);
     }
     save_telegram_message(pool, msg, config).await?;
+    #[cfg(feature = "moderation")]
+    if let Err(_error) = crate::features::decision_audit::service::observe_message(
+        pool,
+        config,
+        msg.chat.id.0,
+        msg.id.0,
+    )
+    .await
+    {
+        // Ошибка наблюдения не останавливает основной ingest и локальную модерацию.
+        tracing::warn!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            "cheap moderation observation failed"
+        );
+    }
     Ok(true)
 }
 
