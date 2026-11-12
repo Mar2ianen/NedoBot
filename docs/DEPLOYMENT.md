@@ -63,7 +63,7 @@ Backup: `/var/backups/nedobot/2026-11-12-antispam-decision`, до миграци
 
 Одноразовый systemd health-check назначен на **2026-11-13 15:02:05 UTC /
 18:02:05 МСК**, timer `nedobot-decision-day-after-check.timer`, Persistent=true.
-Он читает health/queue/ACL metadata и пишет private отчёт, Telegram-сообщений
+Он читает health/queue/migration metadata и пишет private отчёт, Telegram-сообщений
 не отправляет. Перед этой выкладкой отдельная проверка предыдущего релиза
 охватила 86514 секунд: 3 active, NRestarts=0, 11 recoverable Telegram polling
 network errors, прочих Rust/system errors и failed migrations не было.
