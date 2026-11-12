@@ -388,6 +388,11 @@ async fn generate_and_finalize(
     let image_base64 = load_avatar_input(bot, config, job).await?;
     let has_avatar_input = image_base64.is_some();
     let mut input_json = job.input_json.clone();
+    // Новое слабое наблюдение хранится для review/replay, но не подталкивает
+    // прежнего generative judge к санкциям и не меняет его входные evidence.
+    if let Some(object) = input_json.as_object_mut() {
+        object.remove("work_contact_review");
+    }
     if let Some(profile) = input_json.get_mut("profile").and_then(Value::as_object_mut) {
         profile.insert(
             "avatar_image_available".to_string(),
