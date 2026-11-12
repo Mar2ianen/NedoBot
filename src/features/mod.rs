@@ -40,3 +40,6 @@ pub mod stats;
 pub mod user_profiles;
 #[cfg(feature = "voice")]
 pub mod voice;
+
+#[cfg(feature = "moderation")]
+pub mod decision_audit;

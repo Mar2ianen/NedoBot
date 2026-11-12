@@ -25,6 +25,7 @@ BINARIES=(
     validate_instance_config
     probe_new_user_audit
     spam_cascade
+    spam_decision
     retry_pending_comments
     reconcile_comment_delivery
     backfill_rich_messages

@@ -170,6 +170,12 @@ async fn main() -> anyhow::Result<()> {
     };
     #[cfg(feature = "spam-sync")]
     spawn_spam_reputation_worker(state.clone());
+    #[cfg(feature = "moderation")]
+    features::decision_audit::service::spawn_worker(
+        bot.inner().clone(),
+        state.pool.clone(),
+        state.config.clone(),
+    )?;
     let profile_refresh_queue = spawn_profile_refresh_workers(
         bot.inner().clone(),
         state.pool.clone(),

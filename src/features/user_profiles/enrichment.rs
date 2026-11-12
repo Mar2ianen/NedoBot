@@ -160,6 +160,22 @@ async fn process_profile_audit(pool: &PgPool, config: &Config, job: ProfileRefre
     let _ = (pool, config, job);
 
     #[cfg(feature = "moderation")]
+    if crate::features::decision_audit::service::observe_latest_author_message(
+        pool,
+        config,
+        job.chat_id,
+        job.user_id,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            user_id = job.user_id,
+            "decision shadow avatar refresh observation failed"
+        );
+    }
+
+    #[cfg(feature = "moderation")]
     if config.new_user_audit_enabled
         && config.chat_allows(job.chat_id, |chat| chat.moderation)
         && let Err(err) =

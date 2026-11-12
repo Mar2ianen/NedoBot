@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,9 +64,89 @@ pub struct ChatConfig {
     pub invite_label: Option<String>,
 }
 
+/// Независимый закрытый классификатор. Только shadow; без права создавать санкции.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecisionConfig {
+    pub enabled: bool,
+    /// Явное подтверждение условий внешней обработки именно этого инстанса.
+    pub external_processing_allowed: bool,
+    pub avatar_enabled: bool,
+    pub chat_policy: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub model: String,
+    pub timeout_sec: u64,
+    pub max_calls_per_hour: i32,
+    pub max_pending_jobs: i64,
+    pub max_input_chars: usize,
+}
+impl Default for DecisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            external_processing_allowed: false,
+            avatar_enabled: false,
+            base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            api_key_env: "GEMINI_API_KEY".into(),
+            model: "gemini-decision-1".into(),
+            chat_policy:
+                "Тематика и разрешения чата неизвестны. Не предполагай запрета предложений работы."
+                    .into(),
+            timeout_sec: 15,
+            max_calls_per_hour: 30,
+            max_pending_jobs: 100,
+            max_input_chars: 2_000,
+        }
+    }
+}
+impl DecisionConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.external_processing_allowed,
+            "decision requires explicit external_processing_allowed for this instance"
+        );
+        anyhow::ensure!(
+            (1..=60).contains(&self.timeout_sec)
+                && (1..=1_000).contains(&self.max_calls_per_hour)
+                && (1..=1_000).contains(&self.max_pending_jobs)
+                && (64..=4_096).contains(&self.max_input_chars)
+                && (1..=2_000).contains(&self.chat_policy.chars().count()),
+            "invalid decision bounds"
+        );
+        let url = reqwest::Url::parse(&self.base_url)
+            .map_err(|_| anyhow::anyhow!("invalid decision base_url"))?;
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "invalid decision endpoint"
+        );
+        anyhow::ensure!(
+            !self.model.trim().is_empty()
+                && self.model.len() <= 128
+                && !self.api_key_env.is_empty()
+                && self
+                    .api_key_env
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "invalid decision model/key reference"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModerationConfig {
+    #[serde(default)]
+    pub decision: DecisionConfig,
     #[serde(default)]
     pub local_cascade: LocalCascadeConfig,
     #[serde(default)]
@@ -637,5 +717,32 @@ mod tests {
         let explicit: RuntimeSettings = toml::from_str("voice_asr_provider = 'groq'\nvoice_asr_shadow_enabled = true\nvoice_asr_shadow_model = 'gemini-3.5-transcribe'").unwrap();
         assert!(explicit.voice_asr_shadow_enabled);
         assert_eq!(explicit.voice_asr_shadow_model, "gemini-3.5-transcribe");
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::DecisionConfig;
+    #[test]
+    fn explicit_gate_bounds_and_secret_reference_fail_closed() {
+        let mut c = DecisionConfig::default();
+        assert!(c.validate().is_ok());
+        c.enabled = true;
+        assert!(c.validate().is_err());
+        c.external_processing_allowed = true;
+        assert!(c.validate().is_ok());
+        c.base_url = "http://example.org".into();
+        assert!(c.validate().is_err());
+        c.base_url = "https://example.org?key=secret".into();
+        assert!(c.validate().is_err());
+        c.base_url = "https://example.org".into();
+        c.max_calls_per_hour = 0;
+        assert!(c.validate().is_err());
+        c.max_calls_per_hour = 30;
+        c.timeout_sec = 601;
+        assert!(c.validate().is_err());
+        c.timeout_sec = 15;
+        c.api_key_env = "GEMINI_API_KEY=secret".into();
+        assert!(c.validate().is_err());
     }
 }

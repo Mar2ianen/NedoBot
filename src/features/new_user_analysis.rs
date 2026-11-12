@@ -149,20 +149,8 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         .as_ref()
         .map(|(message_id, _)| Value::from(*message_id))
         .unwrap_or(Value::Null);
-    let deterministic_campaign = deterministic::classify(
-        features.first_message_text.as_deref(),
-        features.message_count,
-        features.chat_age_sec,
-        features.personal_channel_has_adult_links,
-    );
-    input_json["deterministic_campaign_rule"] = deterministic_campaign
-        .as_ref()
-        .map(|campaign| Value::String(campaign.rule.clone()))
-        .unwrap_or(Value::Null);
-    input_json["deterministic_campaign_evidence"] = deterministic_campaign
-        .as_ref()
-        .map(deterministic::CampaignMatch::score_signal)
-        .unwrap_or(Value::Null);
+    let deterministic_campaign = deterministic_campaign_from_features(&features);
+    record_campaign_snapshot(&mut input_json, deterministic_campaign.as_ref());
     let mut material_revision =
         project_unified_user_audit_material_revision(&features, &analysis_config);
     material_revision["membership"]["context"] = serde_json::to_value(membership_context)?;
@@ -245,6 +233,46 @@ fn should_enqueue_new_user_audit_job(
     )
 }
 
+fn record_campaign_snapshot(input: &mut Value, campaign: Option<&deterministic::CampaignMatch>) {
+    input["work_contact_review"] = campaign
+        .filter(|c| !c.can_short_circuit_audit())
+        .map(deterministic::CampaignMatch::score_signal)
+        .unwrap_or(Value::Null);
+    let legacy = campaign.filter(|c| c.can_short_circuit_audit());
+    input["deterministic_campaign_rule"] = legacy
+        .map(|c| Value::String(c.rule.clone()))
+        .unwrap_or(Value::Null);
+    input["deterministic_campaign_evidence"] = legacy
+        .map(deterministic::CampaignMatch::score_signal)
+        .unwrap_or(Value::Null);
+}
+
+fn deterministic_campaign_from_features(
+    features: &NewUserFeatures,
+) -> Option<deterministic::CampaignMatch> {
+    deterministic::classify(
+        features.first_message_text.as_deref(),
+        features.message_count,
+        features.chat_age_sec,
+        features.personal_channel_has_adult_links,
+    )
+    .or_else(|| {
+        features
+            .recent_message_texts
+            .iter()
+            .take(5)
+            .find_map(|text| {
+                deterministic::classify(
+                    Some(text),
+                    features.message_count,
+                    features.chat_age_sec,
+                    false,
+                )
+                .filter(|c| c.kind == deterministic::CampaignKind::WorkContactFunnel)
+            })
+    })
+}
+
 fn should_enqueue_new_user_audit_job_with_link(
     features: &NewUserFeatures,
     risk: &RiskAnalysis,
@@ -254,13 +282,7 @@ fn should_enqueue_new_user_audit_job_with_link(
     link_evidence_changed: bool,
     needs_initial_audit: bool,
 ) -> bool {
-    let has_deterministic_campaign = deterministic::classify(
-        features.first_message_text.as_deref(),
-        features.message_count,
-        features.chat_age_sec,
-        features.personal_channel_has_adult_links,
-    )
-    .is_some();
+    let has_deterministic_campaign = deterministic_campaign_from_features(features).is_some();
     has_deterministic_campaign
         || should_run_new_user_llm_audit(
             features,
@@ -531,6 +553,10 @@ fn project_unified_user_audit_snapshot(
 }
 
 pub(crate) fn bounded_audit_text(value: Option<&str>) -> Option<String> {
+    bounded_audit_text_with_limit(value, UNIFIED_AUDIT_TEXT_LIMIT)
+}
+
+pub(crate) fn bounded_audit_text_with_limit(value: Option<&str>, limit: usize) -> Option<String> {
     let value = value?.trim();
     if value.is_empty() {
         return None;
@@ -538,11 +564,8 @@ pub(crate) fn bounded_audit_text(value: Option<&str>) -> Option<String> {
 
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let redacted = redact_urls(&normalized);
-    let mut preview = redacted
-        .chars()
-        .take(UNIFIED_AUDIT_TEXT_LIMIT)
-        .collect::<String>();
-    if redacted.chars().count() > UNIFIED_AUDIT_TEXT_LIMIT {
+    let mut preview = redacted.chars().take(limit).collect::<String>();
+    if redacted.chars().count() > limit {
         preview.push('…');
     }
     Some(preview)
@@ -1765,5 +1788,26 @@ mod tests {
 
         assert_eq!(preview.chars().count(), UNIFIED_AUDIT_TEXT_LIMIT + 1);
         assert!(preview.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod work_review_compatibility_tests {
+    use super::*;
+    #[test]
+    fn weak_work_signal_does_not_replace_existing_llm_or_suppress_its_captcha() {
+        let work =
+            deterministic::classify(Some("Есть подработка, пиши мне"), 1, Some(0), false).unwrap();
+        let mut snapshot = json!({});
+        record_campaign_snapshot(&mut snapshot, Some(&work));
+        assert_eq!(snapshot["work_contact_review"]["auto_ban_eligible"], false);
+        assert!(snapshot["deterministic_campaign_rule"].is_null());
+        assert!(snapshot["deterministic_campaign_evidence"].is_null());
+        assert!(!work.can_short_circuit_audit());
+        let old =
+            deterministic::classify(Some("Нужны срочно деньги??? Пиши мне!"), 1, Some(0), false)
+                .unwrap();
+        record_campaign_snapshot(&mut snapshot, Some(&old));
+        assert!(snapshot["deterministic_campaign_rule"].is_string());
     }
 }

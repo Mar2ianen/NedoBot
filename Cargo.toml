@@ -74,6 +74,11 @@ name = "rmcp_transport"
 path = "tests/rmcp_transport.rs"
 required-features = ["public-mcp"]
 
+[[bin]]
+name = "spam_decision"
+path = "src/bin/spam_decision.rs"
+required-features = ["moderation"]
+
 [dependencies]
 agent-runtime = { path = "crates/agent-runtime" }
 anyhow = "1"

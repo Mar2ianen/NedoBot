@@ -69,7 +69,7 @@ jobs:
           mkdir -p dist
           for binary in tg_ai_bot_teloxide nedonews_mcp_http chat_db_mcp \
               migrate provision_mcp_instance_scope generate_mcp_db_manifest validate_instance_config \
-              probe_new_user_audit spam_cascade retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
+              probe_new_user_audit spam_cascade spam_decision retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
               backfill_post_history_embeddings backfill_audit_embeddings \
               backfill_chat_embeddings import_telegram_export probe_ask_route; do
             cp "target/release/$binary" dist/
