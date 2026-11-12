@@ -107,7 +107,7 @@ pub async fn claim(pool: &PgPool, config: &Config) -> anyhow::Result<Option<Deci
         .map(|c| c.id)
         .collect();
     let mut tx = pool.begin().await?;
-    sqlx::query("update moderation_decision_jobs set status='stale',completed_at=now(),lease_expires_at=null,error_kind='obsolete_version' where instance_id=$1 and chat_id=any($2) and status in ('pending','retry_wait','processing') and (model<>$3 or question_version<>$4 or policy_version<>$5 or input_json->>'configuration_hash' is distinct from $6 or normalization_version<>$7 or created_at<now()-interval '24 hours')")
+    sqlx::query("update moderation_decision_jobs set status='stale',completed_at=now(),lease_expires_at=null,error_kind='obsolete_version' where instance_id=$1 and status in ('pending','retry_wait','processing') and (not(chat_id=any($2)) or model<>$3 or question_version<>$4 or policy_version<>$5 or input_json->>'configuration_hash' is distinct from $6 or normalization_version<>$7 or created_at<now()-interval '24 hours')")
         .bind(&config.community.instance.id).bind(&chats).bind(&config.community.moderation.decision.model)
         .bind(hash_bytes(super::client::QUESTIONS.as_bytes())).bind(super::client::POLICY_VERSION)
         .bind(super::service::configuration_hash(config)).bind(teloxide_antispam::preprocess::PREPROCESSING_VERSION)
@@ -164,11 +164,17 @@ async fn current_in_tx(
 ) -> anyhow::Result<bool> {
     let current: Option<(String,Option<DateTime<Utc>>,i64,bool)> = sqlx::query_as(r#"
         select coalesce(m.text,''),m.edited_at,coalesce(l.id,0),coalesce(l.label='not_spam',false)
-        from telegram_messages m left join lateral (
+        from telegram_messages m
+        join telegram_chat_users u on u.chat_id=m.chat_id and u.telegram_user_id=m.user_id
+        left join lateral (
           select id,label from spam_label_events where chat_id=m.chat_id and telegram_user_id=m.user_id
           order by created_at desc,id desc limit 1) l on true
         where m.chat_id=$1 and m.message_id=$2 and m.user_id=$3 and m.source_channel_id is null
           and m.created_at>now()-interval '24 hours'
+          and u.message_count between 1 and $5
+          and u.first_seen_at between now()-make_interval(secs=>$6::double precision) and now()
+          and not exists(select 1 from telegram_chat_member_snapshots s where s.chat_id=m.chat_id and s.telegram_user_id=m.user_id and s.is_admin)
+          and not exists(select 1 from telegram_user_profiles p where p.telegram_user_id=m.user_id and p.is_bot)
           and ($4::text is null or exists(select 1 from telegram_user_profiles p where p.telegram_user_id=m.user_id and p.profile_photo_file_unique_id=$4))
         for share of m"#)
         .bind(job.chat_id).bind(job.message_id).bind(job.user_id).bind(&job.avatar_unique_id)

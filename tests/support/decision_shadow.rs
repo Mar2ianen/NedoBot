@@ -133,6 +133,21 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
             .await
             .unwrap();
     assert_eq!(calls, 30);
+    // Eligibility повторяется перед внешним запросом, а не только во время ingest.
+    source(pool, USER + 5, 6).await;
+    observe_message(pool, &c, CHAT, 6).await.unwrap();
+    query(
+        "update telegram_chat_users set message_count=11 where chat_id=$1 and telegram_user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(USER + 5)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert!(repo::claim(pool, &c).await.unwrap().is_none());
+    let status:String=query_scalar("select status from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=6")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert_eq!(status, "stale");
     // Другой instance не видит/не claims очередь предыдущего.
     c.community.instance.id = "other_fixture".into();
     assert!(repo::claim(pool, &c).await.unwrap().is_none());
