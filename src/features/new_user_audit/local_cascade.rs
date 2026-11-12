@@ -157,7 +157,12 @@ impl PreparedCorpus {
             evidence.reason = "corpus_limit".into();
             return Ok(evidence);
         }
-        if normalized.chars().count() < policy.min_text_chars || tokens.len() < policy.min_tokens {
+        let short_work_funnel = super::structure::extract(&input).obfuscation_score >= 35
+            && super::deterministic::classify(Some(&input), 1, Some(0), false)
+                .is_some_and(|c| c.kind == super::deterministic::CampaignKind::WorkContactFunnel);
+        if (normalized.chars().count() < policy.min_text_chars || tokens.len() < policy.min_tokens)
+            && !short_work_funnel
+        {
             evidence.reason = "short_text".into();
             return Ok(evidence);
         }

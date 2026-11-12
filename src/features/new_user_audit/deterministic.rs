@@ -4,12 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use teloxide_antispam::{preprocess::prepare_text, text::normalize_cyrillic_homoglyphs};
 
-pub(crate) const RULE_VERSION: &str = "new-user-features-v3";
+pub(crate) const RULE_VERSION: &str = "new-user-features-v4";
 const FEATURE_CONFIG: &str = include_str!("spam_features.toml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CampaignKind {
+    WorkContactFunnel,
     MoneyDmFunnel,
     PaidShortTaskOffer,
     PaidWorkOpportunity,
@@ -30,6 +31,8 @@ struct FeatureDefinition {
 
 #[derive(Debug, Clone, Deserialize)]
 struct CampaignDefinition {
+    #[serde(default)]
+    exclude_any: Vec<String>,
     rule: String,
     kind: CampaignKind,
     #[serde(default)]
@@ -277,7 +280,8 @@ impl CampaignMatch {
         };
 
         let evidence_source = match self.kind {
-            CampaignKind::MoneyDmFunnel
+            CampaignKind::WorkContactFunnel
+            | CampaignKind::MoneyDmFunnel
             | CampaignKind::PaidShortTaskOffer
             | CampaignKind::LimitedProductTrial => "first_message",
             CampaignKind::PaidWorkOpportunity
@@ -380,6 +384,16 @@ impl ExtractedFeatures {
     }
 }
 
+pub(crate) fn text_stream_limits() -> (i64, i64) {
+    (config().max_messages, config().max_chat_age_seconds)
+}
+
+pub(crate) fn text_stream_eligible(message_count: i64, age_seconds: i64) -> bool {
+    let config = config();
+    (1..=config.max_messages).contains(&message_count)
+        && (0..=config.max_chat_age_seconds).contains(&age_seconds)
+}
+
 pub(crate) fn classify(
     first_message: Option<&str>,
     message_count: i64,
@@ -398,14 +412,35 @@ pub(crate) fn classify(
         return CampaignMatch::from_rule("fresh_adult_personal_channel");
     }
 
-    let normalized = first_message?;
-    let normalized = normalize_mixed_script_homoglyphs(normalized);
+    let bounded: String = first_message?
+        .chars()
+        .take(super::structure::MAX_INPUT_CHARS)
+        .collect();
+    // Старые правила сохраняют прежний lexical view; новая нормализация не
+    // расширяет их authority или положительные срабатывания задним числом.
+    let legacy = prepare_text(&normalize_mixed_script_homoglyphs(&bounded)).model_text();
+    let features = extract_features(&legacy, config);
+    if let Some(campaign) = config.campaigns.iter().find(|campaign| {
+        campaign.kind != CampaignKind::WorkContactFunnel && features.satisfies(campaign)
+    }) {
+        return Some(CampaignMatch::from_definition(
+            campaign,
+            features.score,
+            features.matched,
+        ));
+    }
+    let cleaned = prepare_text(&bounded).canonical;
+    let normalized = normalize_mixed_script_homoglyphs(&normalize_spread_homoglyphs(&cleaned));
     let normalized = prepare_text(&normalized).model_text();
     let features = extract_features(&normalized, config);
     config
         .campaigns
         .iter()
-        .find(|campaign| features.satisfies(campaign))
+        .find(|campaign| {
+            campaign.kind == CampaignKind::WorkContactFunnel
+                && features.satisfies(campaign)
+                && !campaign.exclude_any.iter().any(|s| normalized.contains(s))
+        })
         .map(|campaign| CampaignMatch::from_definition(campaign, features.score, features.matched))
 }
 
@@ -454,6 +489,64 @@ fn matches_feature_matcher(text: &str, matcher: &str) -> bool {
             .any(|(amount, _)| amount >= 100),
         _ => false,
     }
+}
+
+// Только вспомогательный lexical view: TF-IDF canonical/model_text не меняется.
+fn normalize_spread_homoglyphs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let mut end = i + 1;
+        let mut letters = 1;
+        if chars[i].is_alphabetic()
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && (end == chars.len() || !chars[end].is_alphanumeric())
+        {
+            loop {
+                let mut next = end;
+                while next < chars.len()
+                    && (chars[next].is_whitespace()
+                        || matches!(chars[next], '.' | '_' | '·' | '•' | '-'))
+                {
+                    next += 1;
+                }
+                if next == end
+                    || next == chars.len()
+                    || !chars[next].is_alphabetic()
+                    || (next + 1 < chars.len() && chars[next + 1].is_alphanumeric())
+                {
+                    break;
+                }
+                letters += 1;
+                end = next + 1;
+            }
+        }
+        let map = letters >= 5 && chars[i..end].iter().filter(|c| is_cyrillic(**c)).count() >= 3;
+        for c in &chars[i..end] {
+            output.push(if map {
+                match c.to_ascii_lowercase() {
+                    'a' => 'а',
+                    'c' => 'с',
+                    'e' => 'е',
+                    'o' => 'о',
+                    'p' => 'р',
+                    'x' => 'х',
+                    'y' => 'у',
+                    'k' => 'к',
+                    'm' => 'м',
+                    'b' => 'в',
+                    't' => 'т',
+                    'h' => 'н',
+                    _ => *c,
+                }
+            } else {
+                *c
+            });
+        }
+        i = end;
+    }
+    output
 }
 
 fn normalize_mixed_script_homoglyphs(text: &str) -> String {
@@ -869,7 +962,7 @@ mod tests {
         );
         assert_eq!(
             campaign.score_signal()["feature_config_version"],
-            "new-user-features-v3"
+            RULE_VERSION
         );
         assert_eq!(
             campaign.score_signal()["label"],

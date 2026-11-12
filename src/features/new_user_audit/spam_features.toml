@@ -1,7 +1,7 @@
 # Versioned lexical features used by the new-user deterministic classifier.
 # Keep lexical evidence and calibration data here; the Rust code only extracts
 # these features and evaluates the combinations below.
-version = "new-user-features-v3"
+version = "new-user-features-v4"
 max_messages = 10
 max_chat_age_seconds = 259200
 
@@ -223,3 +223,16 @@ priority = 30
 minimum_score = 70
 require_all = ["product", "trial", "scarcity", "offer"]
 require_any = []
+
+# Слабая review-комбинация: отсутствие суммы не делает предложение безопасным.
+[[campaigns]]
+rule = "fresh_work_dm_funnel"
+kind = "work_contact_funnel"
+auto_ban_eligible = false
+subtype = "work_dm_bait"
+reason = "Предложение работы с переводом общения в личные сообщения; требуется проверка контекста."
+priority = 5
+minimum_score = 45
+require_all = ["work", "private_contact"]
+require_any = []
+exclude_any = ["ищу подработ", "подработку ищу", "ищу работ", "где смотреть вакансии", "спам", "мошенни", "прислали", "цитат", "логи", "логов", "посмотрим баг", "заработало", "работает", "работало"]

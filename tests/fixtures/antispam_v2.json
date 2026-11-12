@@ -1,0 +1,17 @@
+{
+ "version":"antispam-regression-v1",
+ "cases":[
+  {"id":"spaced_work","text":"Есть П О Д Р А Б О Т К А, ПИШИ МНЕ!","review":true,"campaign":"work_dm_bait"},
+  {"id":"plain_work","text":"Есть подработка, пиши мне","review":true,"campaign":"work_dm_bait"},
+  {"id":"punct_work","text":"Есть п.о.д.р.а.б.о.т.к.а, напиши","review":true,"campaign":"work_dm_bait"},
+  {"id":"hours_work","text":"Работа на пару часов, детали в ЛС","review":true,"campaign":"work_dm_bait"},
+  {"id":"fixed_program","text":"У меня заработало, спасибо","review":false,"campaign":"normal_programming"},
+  {"id":"job_seeker","text":"Подработку ищу, где смотреть вакансии?","review":false,"campaign":"normal_job_search"},
+  {"id":"logs_help","text":"Пиши мне логи, посмотрим баг","review":false,"campaign":"normal_help"},
+  {"id":"rgb_gpu","text":"Р Г Б, GPU RTX 5090","review":false,"campaign":"normal_hardware"},
+  {"id":"quoted_spam","text":"Вот какой спам мне прислали: «Есть подработка, пиши мне»","review":false,"campaign":"normal_quote"},
+  {"id":"technical_work","text":"Проект работает, пиши мне логи, посмотрим баг","review":false,"campaign":"normal_help"},
+  {"id":"job_seeker_dm","text":"Ищу подработку, напиши мне если есть варианты","review":false,"campaign":"normal_job_search"},
+  {"id":"hackathon","text":"Ищем людей на хакатон, пишите в ЛС","review":true,"campaign":"contextual_hackathon"}
+ ]
+}

@@ -149,12 +149,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         .as_ref()
         .map(|(message_id, _)| Value::from(*message_id))
         .unwrap_or(Value::Null);
-    let deterministic_campaign = deterministic::classify(
-        features.first_message_text.as_deref(),
-        features.message_count,
-        features.chat_age_sec,
-        features.personal_channel_has_adult_links,
-    );
+    let deterministic_campaign = deterministic_campaign_from_features(&features);
     input_json["deterministic_campaign_rule"] = deterministic_campaign
         .as_ref()
         .map(|campaign| Value::String(campaign.rule.clone()))
@@ -245,6 +240,32 @@ fn should_enqueue_new_user_audit_job(
     )
 }
 
+fn deterministic_campaign_from_features(
+    features: &NewUserFeatures,
+) -> Option<deterministic::CampaignMatch> {
+    deterministic::classify(
+        features.first_message_text.as_deref(),
+        features.message_count,
+        features.chat_age_sec,
+        features.personal_channel_has_adult_links,
+    )
+    .or_else(|| {
+        features
+            .recent_message_texts
+            .iter()
+            .take(5)
+            .find_map(|text| {
+                deterministic::classify(
+                    Some(text),
+                    features.message_count,
+                    features.chat_age_sec,
+                    false,
+                )
+                .filter(|c| c.kind == deterministic::CampaignKind::WorkContactFunnel)
+            })
+    })
+}
+
 fn should_enqueue_new_user_audit_job_with_link(
     features: &NewUserFeatures,
     risk: &RiskAnalysis,
@@ -254,13 +275,7 @@ fn should_enqueue_new_user_audit_job_with_link(
     link_evidence_changed: bool,
     needs_initial_audit: bool,
 ) -> bool {
-    let has_deterministic_campaign = deterministic::classify(
-        features.first_message_text.as_deref(),
-        features.message_count,
-        features.chat_age_sec,
-        features.personal_channel_has_adult_links,
-    )
-    .is_some();
+    let has_deterministic_campaign = deterministic_campaign_from_features(features).is_some();
     has_deterministic_campaign
         || should_run_new_user_llm_audit(
             features,
@@ -531,6 +546,10 @@ fn project_unified_user_audit_snapshot(
 }
 
 pub(crate) fn bounded_audit_text(value: Option<&str>) -> Option<String> {
+    bounded_audit_text_with_limit(value, UNIFIED_AUDIT_TEXT_LIMIT)
+}
+
+pub(crate) fn bounded_audit_text_with_limit(value: Option<&str>, limit: usize) -> Option<String> {
     let value = value?.trim();
     if value.is_empty() {
         return None;
@@ -538,11 +557,8 @@ pub(crate) fn bounded_audit_text(value: Option<&str>) -> Option<String> {
 
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let redacted = redact_urls(&normalized);
-    let mut preview = redacted
-        .chars()
-        .take(UNIFIED_AUDIT_TEXT_LIMIT)
-        .collect::<String>();
-    if redacted.chars().count() > UNIFIED_AUDIT_TEXT_LIMIT {
+    let mut preview = redacted.chars().take(limit).collect::<String>();
+    if redacted.chars().count() > limit {
         preview.push('…');
     }
     Some(preview)
