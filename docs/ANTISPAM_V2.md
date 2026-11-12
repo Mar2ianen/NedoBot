@@ -119,7 +119,8 @@ tracked regression fixtures, не читает чаты и не создаёт �
 `spam_decision compare FROZEN_JSONL OUTPUT` сравнивает A/B/C/D на одинаковых
 снимках: baseline берётся из замороженного решения, остальные варианты добавляют
 local/Decision candidates; manual veto действует для всех. Проверяются instance,
-source/question/model/policy/normalization versions, утечка групп между
+source/question/model/policy/normalization versions и общий `context_hash`
+(policy/avatar/доступный контекст), утечка групп между
 partitions и дублирование источников. Выводятся recall/FPR/precision, FN по
 campaign group, recall при review budget 5/10/25/50 в порядке поступления,
 покрытие/abstentions, token usage, отдельные API/queue/action p50/p95/p99.

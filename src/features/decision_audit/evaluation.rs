@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[serde(deny_unknown_fields)]
 pub struct FrozenExample {
     pub instance_id: String,
+    /// Общий frozen context (policy/avatar/доступные данные), не только текст.
+    pub context_hash: String,
     pub author_group: String,
     pub campaign_group: String,
     pub partition: String,
@@ -30,6 +32,7 @@ pub struct FrozenExample {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenDecision {
+    pub context_hash: String,
     pub source_hash: String,
     pub question_version: String,
     pub normalization_version: String,
@@ -133,6 +136,10 @@ pub fn compare(rows: &[FrozenExample], instance: &str, model: &str) -> anyhow::R
     ordered.sort_by_key(|r| (r.message_at, hash_bytes(r.text.as_bytes())));
     for row in ordered {
         anyhow::ensure!(row.instance_id == instance, "mixed instance dataset");
+        anyhow::ensure!(
+            row.context_hash.len() == 64 && row.context_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "invalid frozen context hash"
+        );
         anyhow::ensure!(row.message_at <= row.label_at, "label precedes message");
         anyhow::ensure!(
             !row.author_group.is_empty() && !row.campaign_group.is_empty(),
@@ -156,7 +163,8 @@ pub fn compare(rows: &[FrozenExample], instance: &str, model: &str) -> anyhow::R
         let mut decision_candidate = false;
         if let Some(d) = &row.decision {
             anyhow::ensure!(
-                d.source_hash == hash
+                d.context_hash == row.context_hash
+                    && d.source_hash == hash
                     && d.question_version == hash_bytes(QUESTIONS.as_bytes())
                     && d.policy_version == POLICY_VERSION
                     && d.normalization_version
@@ -252,6 +260,7 @@ mod tests {
     fn row(text: &str, author: &str, label: Option<bool>) -> FrozenExample {
         FrozenExample {
             instance_id: "fixture".into(),
+            context_hash: hash_bytes(text.as_bytes()),
             author_group: author.into(),
             campaign_group: author.into(),
             partition: "holdout".into(),
@@ -294,7 +303,26 @@ mod tests {
         assert!(compare(&[a, b], "fixture", "model").is_err());
         let mut a = row("text", "a", Some(false));
         a.decision = Some(FrozenDecision {
+            context_hash: a.context_hash.clone(),
             source_hash: "wrong".into(),
+            question_version: hash_bytes(QUESTIONS.as_bytes()),
+            normalization_version: teloxide_antispam::preprocess::PREPROCESSING_VERSION.into(),
+            policy_version: POLICY_VERSION.into(),
+            model: "model".into(),
+            assessment: None,
+            error_kind: Some("timeout".into()),
+            api_latency_ms: None,
+            queue_latency_ms: None,
+            action_latency_ms: None,
+        });
+        assert!(compare(&[a], "fixture", "model").is_err());
+    }
+    #[test]
+    fn identical_text_does_not_allow_reusing_a_different_context_assessment() {
+        let mut a = row("text", "a", Some(false));
+        a.decision = Some(FrozenDecision {
+            context_hash: hash_bytes(b"other-policy-or-avatar"),
+            source_hash: hash_bytes(a.text.as_bytes()),
             question_version: hash_bytes(QUESTIONS.as_bytes()),
             normalization_version: teloxide_antispam::preprocess::PREPROCESSING_VERSION.into(),
             policy_version: POLICY_VERSION.into(),
