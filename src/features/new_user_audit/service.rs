@@ -472,6 +472,7 @@ async fn deterministic_campaign_for_job(
                 rule,
                 job.input_json.get("deterministic_campaign_evidence"),
             )
+            .filter(CampaignMatch::can_short_circuit_audit)
         }));
     }
     let row = sqlx::query(
@@ -498,7 +499,8 @@ async fn deterministic_campaign_for_job(
         row.get("message_count"),
         chat_age_seconds,
         row.get("personal_channel_has_adult_links"),
-    ))
+    )
+    .filter(CampaignMatch::can_short_circuit_audit))
 }
 
 /// Валидирует сохранённый результат перед materialization replay.

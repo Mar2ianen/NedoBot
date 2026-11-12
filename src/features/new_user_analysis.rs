@@ -150,14 +150,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         .map(|(message_id, _)| Value::from(*message_id))
         .unwrap_or(Value::Null);
     let deterministic_campaign = deterministic_campaign_from_features(&features);
-    input_json["deterministic_campaign_rule"] = deterministic_campaign
-        .as_ref()
-        .map(|campaign| Value::String(campaign.rule.clone()))
-        .unwrap_or(Value::Null);
-    input_json["deterministic_campaign_evidence"] = deterministic_campaign
-        .as_ref()
-        .map(deterministic::CampaignMatch::score_signal)
-        .unwrap_or(Value::Null);
+    record_campaign_snapshot(&mut input_json, deterministic_campaign.as_ref());
     let mut material_revision =
         project_unified_user_audit_material_revision(&features, &analysis_config);
     material_revision["membership"]["context"] = serde_json::to_value(membership_context)?;
@@ -238,6 +231,20 @@ fn should_enqueue_new_user_audit_job(
         false,
         needs_initial_audit,
     )
+}
+
+fn record_campaign_snapshot(input: &mut Value, campaign: Option<&deterministic::CampaignMatch>) {
+    input["work_contact_review"] = campaign
+        .filter(|c| !c.can_short_circuit_audit())
+        .map(deterministic::CampaignMatch::score_signal)
+        .unwrap_or(Value::Null);
+    let legacy = campaign.filter(|c| c.can_short_circuit_audit());
+    input["deterministic_campaign_rule"] = legacy
+        .map(|c| Value::String(c.rule.clone()))
+        .unwrap_or(Value::Null);
+    input["deterministic_campaign_evidence"] = legacy
+        .map(deterministic::CampaignMatch::score_signal)
+        .unwrap_or(Value::Null);
 }
 
 fn deterministic_campaign_from_features(
@@ -1781,5 +1788,26 @@ mod tests {
 
         assert_eq!(preview.chars().count(), UNIFIED_AUDIT_TEXT_LIMIT + 1);
         assert!(preview.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod work_review_compatibility_tests {
+    use super::*;
+    #[test]
+    fn weak_work_signal_does_not_replace_existing_llm_or_suppress_its_captcha() {
+        let work =
+            deterministic::classify(Some("Есть подработка, пиши мне"), 1, Some(0), false).unwrap();
+        let mut snapshot = json!({});
+        record_campaign_snapshot(&mut snapshot, Some(&work));
+        assert_eq!(snapshot["work_contact_review"]["auto_ban_eligible"], false);
+        assert!(snapshot["deterministic_campaign_rule"].is_null());
+        assert!(snapshot["deterministic_campaign_evidence"].is_null());
+        assert!(!work.can_short_circuit_audit());
+        let old =
+            deterministic::classify(Some("Нужны срочно деньги??? Пиши мне!"), 1, Some(0), false)
+                .unwrap();
+        record_campaign_snapshot(&mut snapshot, Some(&old));
+        assert!(snapshot["deterministic_campaign_rule"].is_string());
     }
 }

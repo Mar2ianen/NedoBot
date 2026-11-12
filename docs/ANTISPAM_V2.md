@@ -14,6 +14,9 @@ Decision работает только в shadow. Его очередь и `Deci
 Новый `fresh_work_dm_funnel` — только review, включая разреженные/обфусцированные
 предложения работы без суммы. Глобальный `min_text_chars=32` не снижен.
 Для обфусцированного work/contact сочетания есть узкое исключение из shortcut.
+Новое слабое правило и это исключение сохраняются как review observations,
+не short-circuit старый генеративный аудит и не выключают его captcha/safety
+policy. Старые deterministic fast paths остаются прежними.
 
 Новый lexical view не меняет `unicode-spam-v2 model_text` обученного TF-IDF
 и не расширяет старые правила дополнительной нормализацией. Структурные признаки

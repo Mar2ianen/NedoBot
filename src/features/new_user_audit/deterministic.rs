@@ -83,6 +83,11 @@ pub(crate) struct CampaignMatch {
 }
 
 impl CampaignMatch {
+    /// Новая слабая эвристика не заменяет существующий аудит и его captcha policy.
+    pub(crate) fn can_short_circuit_audit(&self) -> bool {
+        self.kind != CampaignKind::WorkContactFunnel
+    }
+
     pub fn from_rule(rule: &str) -> Option<Self> {
         if rule == "fresh_adult_personal_channel" {
             return Some(Self {
