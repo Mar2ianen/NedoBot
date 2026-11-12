@@ -7,6 +7,69 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+12 ноября 2026 в **15:02:05 UTC / 18:02:05 МСК** завершена установка
+[deploy-2026-11-12-antispam-decision](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-12-antispam-decision),
+source `86b6df73f10de81e87901040d6ec96a51fb73648` после
+[PR #118](https://github.com/Mar2ianen/NedoBot/pull/118). Ancestry и полное
+совпадение tree проверены со слитым main `4620108bae3ce8bbab439b3b168ffafb6e18b5d7`.
+[Release 43240774443](https://github.com/Mar2ianen/NedoBot/actions/runs/43240774443)
+собрал default-feature artifact на Ubuntu 24.04, glibc ≤ 2.39, deploy=false;
+установка и health выполнены отдельно по SSH, не build workflow.
+
+SHA-256 обоих running bots: `afbdf697de2e4126ba405353159a1b589b5d14c70f2d535c1538c6f5e2ccd314`.
+Public MCP: `39412c0b97b266b59a03dadd487e89917b3508c48cbb34ca29f6feb345c1c873`.
+Оба internal MCP: `2d3e7af6f8e08dc8801eb913bb5e6cd1703554812ad5ed867a9c3cafe38f2184`.
+SQL обеих БД подтвердил latest migration `20261112100000`, failed=0;
+исторические migrations/views/manifest/grants не переписывались.
+
+**Ручной SSH health — 2026-11-12T15:19:44.348762+00:00, окно 1064 секунд**
+от `2026-11-12T15:02:01+00:00`: все три unit active/running, NRestarts=0,
+running/internal hashes совпали с artifact, Rust ERROR и journal priority err
+отсутствуют; embedding active. В обеих БД пройдены реальные read-only ACL,
+включая отказ к трём новым private tables; stdio own-scope SELECT,
+foreign/forged scope и private memory rejection. Подключённый публичный HTTPS
+MCP также выполнил own-scope SELECT.
+
+В **обоих публичных community** включён нативный `gemini-decision-1` в shadow,
+с аватаром при доступной versioned фотографии, budget=30 попыток/час/instance,
+backlog≤100. Existing env/secrets, billing, generative routes, enforcement,
+captcha и review-delivery flags сохранены. Слабый work/contact сигнал не
+short-circuit прежний аудит и не передаётся generative judge.
+
+После deploy реальные shadow jobs: NedoNews — 1 succeeded с аватаром, abstain;
+ПВО — 3 succeeded, review_candidate; provider failures=0. API latency этих
+четырёх запросов: 1355 мс и 375–534 мс соответственно; это не SLO и не latency
+всего moderation pipeline. Текст+image REST probe отдельно подтвердил image
+usage обоими ключами; native Rust preflight дал 12/12 валидных ответов на
+синтетике в каждом instance. Все четыре work/DM-приманки стали review candidates,
+цитаты/обычные сообщения дали abstain, хакатон — no_signal. Эти функциональные
+fixtures не являются независимым production holdout или доказательством FPR.
+
+Frozen lexical replay 233/110 author-weak сообщений: candidates 46→52 и
+94→97, новые авторы 6/3, новых кандидатов среди 42/2 not_spam сообщений нет.
+Bulk author stamps не превращены в message gold. Синтетический A/B/C/D replay
+на одинаковом context дал 0/5/4/5 кандидатов; A здесь только старый lexical
+компонент, **не весь production baseline**. Message FPR/recall не заявляются;
+Brier/ECE считаются только для явно заданных synthetic noul labels.
+[Контракт и инструкции rollback](ANTISPAM_V2.md).
+
+Backup: `/var/backups/nedobot/2026-11-12-antispam-decision`, до миграции
+подготовлен compatibility artifact source `35388be2afa26154ab7d2836983a51439e157ee0`
+([build 43230658254](https://github.com/Mar2ianen/NedoBot/actions/runs/43230658254)).
+Полные custom-format dumps обеих БД сохранены в private Codex archive,
+проверены pg_restore TOC и SHA-256; метаданные расположения есть в VPS backup.
+Два старых октябрьских backup перенесены туда же и сверены по каждому файлу,
+освобождено около 4.8 GiB; текущие rollback binaries остались на VPS.
+
+Одноразовый systemd health-check назначен на **2026-11-13 15:02:05 UTC /
+18:02:05 МСК**, timer `nedobot-decision-day-after-check.timer`, Persistent=true.
+Он читает health/queue/migration metadata и пишет private отчёт, Telegram-сообщений
+не отправляет. Перед этой выкладкой отдельная проверка предыдущего релиза
+охватила 86514 секунд: 3 active, NRestarts=0, 11 recoverable Telegram polling
+network errors, прочих Rust/system errors и failed migrations не было.
+
+## Предыдущая выкладка: native subtitles
+
 11 ноября 2026 в **14:21:22 UTC / 17:21:22 МСК** установлен
 [deploy-2026-11-11-mcp-native-subtitles](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-11-mcp-native-subtitles),
 source 119b987e4c3a23ae33b4185aa9196658ba72a372 после
