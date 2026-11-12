@@ -144,7 +144,10 @@ impl PreparedCorpus {
             candidate: false,
             reason: "insufficient_evidence".into(),
             text_hash: hash_bytes(text.as_bytes()),
-            policy_hash: hash_bytes(&serde_json::to_vec(policy)?),
+            policy_hash: hash_bytes(&serde_json::to_vec(&json!({
+                "config":policy,"structure":super::structure::VERSION,
+                "rules":super::deterministic::RULE_VERSION,"short_text":"observe_without_short_circuit_v1"
+            }))?),
             model_version: model.map(|m| m.version.clone()),
             linear_probability: probability,
             template_authors: 0,
