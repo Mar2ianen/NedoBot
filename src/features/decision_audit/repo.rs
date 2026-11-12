@@ -178,6 +178,8 @@ async fn current_in_tx(
           and ($4::text is null or exists(select 1 from telegram_user_profiles p where p.telegram_user_id=m.user_id and p.profile_photo_file_unique_id=$4))
         for share of m"#)
         .bind(job.chat_id).bind(job.message_id).bind(job.user_id).bind(&job.avatar_unique_id)
+        .bind(crate::features::new_user_audit::diagnostics::newcomer_limits().0)
+        .bind(crate::features::new_user_audit::diagnostics::newcomer_limits().1 as f64)
         .fetch_optional(&mut **tx).await?;
     Ok(current.is_some_and(|(text, edit, label, normal)| {
         hash_bytes(text.as_bytes()) == job.source_hash
