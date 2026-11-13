@@ -268,7 +268,7 @@ fn deterministic_campaign_from_features(
                     features.chat_age_sec,
                     false,
                 )
-                .filter(|c| c.kind == deterministic::CampaignKind::WorkContactFunnel)
+                .filter(|c| !c.can_short_circuit_audit())
             })
     })
 }
@@ -1794,6 +1794,36 @@ mod tests {
 #[cfg(test)]
 mod work_review_compatibility_tests {
     use super::*;
+    #[test]
+    fn later_paid_engagement_offer_enqueues_without_legacy_campaign_authority() {
+        let features = NewUserFeatures {
+            first_message_text: Some("Всем привет".into()),
+            recent_message_texts: vec!["плачу за отзывы, 10к за 10 отзывов💵😉".into()],
+            message_count: 4,
+            chat_age_sec: Some(3600),
+            ..NewUserFeatures::default()
+        };
+        let campaign = deterministic_campaign_from_features(&features).unwrap();
+        assert_eq!(
+            campaign.kind,
+            deterministic::CampaignKind::PaidEngagementOffer
+        );
+        assert!(!campaign.auto_ban_eligible);
+        assert!(!campaign.can_short_circuit_audit());
+        let mut snapshot = json!({});
+        record_campaign_snapshot(&mut snapshot, Some(&campaign));
+        assert_eq!(
+            snapshot["work_contact_review"]["kind"],
+            "paid_engagement_offer"
+        );
+        assert!(snapshot["deterministic_campaign_rule"].is_null());
+        assert!(snapshot["deterministic_campaign_evidence"].is_null());
+        let risk = analyze_risk(&features, &NewUserAnalysisConfig::default(), false);
+        assert!(should_enqueue_new_user_audit_job(
+            &features, &risk, false, false, false, false
+        ));
+    }
+
     #[test]
     fn weak_work_signal_does_not_replace_existing_llm_or_suppress_its_captcha() {
         let work =

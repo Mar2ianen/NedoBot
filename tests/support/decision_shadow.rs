@@ -151,6 +151,8 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
     // Другой instance не видит/не claims очередь предыдущего.
     c.community.instance.id = "other_fixture".into();
     assert!(repo::claim(pool, &c).await.unwrap().is_none());
+    c.community.instance.id = "decision_fixture".into();
+    assert_first_author_text_sampling(pool, &c).await;
     // Новые таблицы недоступны настоящей MCP роли и не входят в public views.
     let mut tx = pool.begin().await.unwrap();
     query("set local role nedobot_mcp_ro")
@@ -172,4 +174,75 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
         .await
         .unwrap();
     assert_eq!(audits, 0);
+}
+
+/// Service update не расходует слот первого текста; последующий слабый сигнал
+/// включает анализ, но обычные соседние сообщения не создают API jobs.
+async fn assert_first_author_text_sampling(pool: &PgPool, config: &Config) {
+    let user = USER + 10;
+    source(pool, user, 100).await;
+    query("update telegram_messages set text=null where chat_id=$1 and message_id=100")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    source(pool, user, 101).await;
+    query("update telegram_messages set text='Всем привет' where chat_id=$1 and message_id=101")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    query(
+        "update telegram_chat_users set message_count=2 where chat_id=$1 and telegram_user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(user)
+    .execute(pool)
+    .await
+    .unwrap();
+    observe_message(pool, config, CHAT, 100).await.unwrap();
+    observe_message(pool, config, CHAT, 101).await.unwrap();
+    observe_message(pool, config, CHAT, 101).await.unwrap();
+    source(pool, user, 102).await;
+    query("update telegram_messages set text='Хороший день' where chat_id=$1 and message_id=102")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    source(pool, user, 103).await;
+    query("update telegram_messages set text=$2 where chat_id=$1 and message_id=103")
+        .bind(CHAT)
+        .bind("плачу за отзывы, 10к за 10 отзывов💵😉")
+        .execute(pool)
+        .await
+        .unwrap();
+    query(
+        "update telegram_chat_users set message_count=4 where chat_id=$1 and telegram_user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(user)
+    .execute(pool)
+    .await
+    .unwrap();
+    observe_message(pool, config, CHAT, 102).await.unwrap();
+    observe_message(pool, config, CHAT, 103).await.unwrap();
+    let jobs: Vec<i32> = query_scalar("select message_id from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and user_id=$3 order by message_id")
+        .bind(&config.community.instance.id).bind(CHAT).bind(user).fetch_all(pool).await.unwrap();
+    assert_eq!(jobs, vec![101, 103]);
+    let candidates: Vec<(i32, bool)> = sqlx::query_as("select message_id,local_candidate from moderation_text_observations where instance_id=$1 and chat_id=$2 and user_id=$3 order by message_id")
+        .bind(&config.community.instance.id).bind(CHAT).bind(user).fetch_all(pool).await.unwrap();
+    assert_eq!(
+        candidates,
+        vec![(100, false), (101, false), (102, false), (103, true)]
+    );
+    let calls: i32 =
+        query_scalar("select calls from moderation_decision_budget where instance_id=$1")
+            .bind(&config.community.instance.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        calls, 30,
+        "enqueue не расходует API-квоту и не выполняет санкции"
+    );
 }

@@ -35,17 +35,20 @@ pub struct GenerateChatOptions<'a> {
     pub requires_tools: bool,
     pub previous_response_id: Option<String>,
     pub temperature: f32,
-    /// Запрошенный максимум; `AdaptToModel` ограничивает его cap-ом выбранной модели.
+    /// Базовый output-бюджет до добавления profile thinking headroom.
+    /// Итоговый общий лимит (thinking + ответ) ограничен profile cap.
     pub num_predict: u32,
     pub output_budget_policy: OutputBudgetPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputBudgetPolicy {
-    /// Не менять запрошенный максимум; route resolution проверит профиль модели.
+    /// Требовать профиль с cap >= базового бюджета; иначе исключить его из route.
+    /// Затем добавить thinking headroom, ограничив общий лимит profile cap.
     #[default]
     Fixed,
-    /// Передавать каждой fallback-модели min(запрошенный максимум, её profile cap).
+    /// Разрешать fallback с меньшим cap и ограничивать им базовый бюджет.
+    /// Thinking headroom добавляется после адаптации; profile cap остаётся общим потолком.
     AdaptToModel,
 }
 

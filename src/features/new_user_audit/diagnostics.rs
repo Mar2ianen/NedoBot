@@ -29,7 +29,7 @@ pub fn analyze_text(text: &str, count: i64, age_seconds: Option<i64>) -> Value {
     json!({"eligible":age_seconds.is_some_and(|age|deterministic::text_stream_eligible(count,age)),"normalization_version":PREPROCESSING_VERSION,"canonical":prepared.canonical,
         "compact_variant":prepared.compact_variant,"normalization_flags":prepared.flags,
         "structure":structure::extract(&bounded),"rule_version":deterministic::RULE_VERSION,
-        "lexical_baseline_candidate":campaign.as_ref().is_some_and(|c|c.kind!=deterministic::CampaignKind::WorkContactFunnel),
+        "lexical_baseline_candidate":campaign.as_ref().is_some_and(|c|c.can_short_circuit_audit()),
         "local_plus_candidate":campaign.is_some(),"campaign":campaign.as_ref().map(|c|c.score_signal()),
         "new_auto_ban_authority":false})
 }
