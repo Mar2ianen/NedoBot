@@ -7,6 +7,67 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+13 ноября 2026 в **09:00:19 UTC / 12:00:19 МСК** установлен
+[deploy-2026-11-13-author-text-audit](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-13-author-text-audit),
+source `4cf97b5ea6daa1a2ddc2c7123cd4f87eb0dc8f05` после
+[PR #122](https://github.com/Mar2ianen/NedoBot/pull/122).
+[Release 43395002947](https://github.com/Mar2ianen/NedoBot/actions/runs/43395002947)
+собрал default-feature artifact на Ubuntu 24.04 с glibc ≤ 2.39, deploy=false.
+Установка и проверки выполнены по SSH. До установки подтверждены ancestry
+и равенство полного дерева source с merged main `83298757` (tree `e0d72323`).
+
+| Артефакт | SHA-256 |
+| --- | --- |
+| Оба running bots | `9b4a4ef8b4452c2d775e475a61cae3fd8a0cd8ca60a22140b835e04dac794751` |
+| Public MCP | `8a2f3f10e8a39fc9c0edcf990cad9d7afc428564e423d9f7976443d4f173d99a` |
+| Internal `chat_db_mcp` обоих инстансов | `1bf1e120e3b1419fbb4df683bdd4ebebf0175321679fe4c8510673fd103e5251` |
+| `validate_instance_config` | `ccc7dae824a76d95d94d0af9a319bbf396495766b18324df479bf46a93fc92a1` |
+
+Оба профиля сохранены побайтно: NedoNews
+`7a8e3a99f01e198f8e04bbcc6061a605b5d86565f911fa68d76cc888ba14e1d3`, ПВО
+`8f09d3587ab603659e8005ba1ced7a50f756f2905b6dc52a1e3d97da85e4dc8b`.
+В NedoNews уже действовала config delta [PR #121](https://github.com/Mar2ianen/NedoBot/pull/121):
+Gemini 3.x comment fallback cap 16384, headroom 8192, effective budget 8332 при
+`llm_max_tokens=140`. В текущей выкладке конфигурация и credentials не менялись.
+Миграций нет: SQL обеих БД до и после подтвердил latest `20261112100000`, failed=0
+и одинаковое число записей ledger; staged `migrate` выполнен для обеих БД.
+
+Перед установкой оба профиля прошли staged `validate_instance_config` с
+фактическим окружением процессов; offline replay подтвердил оплату отзывов
+как review-кандидата и отрицательный пример как no-signal, без API-вызовов.
+RO trace сообщения `65657` новым binary после установки подтвердил
+`new-user-features-v5`, `paid_engagement_offer`, `auto_ban_eligible=false`.
+Production-пороги 70/85/90 и Decision shadow authority сохранены;
+[разбор пропуска](ANTISPAM_MISS_2026-11-13.md) описывает остающуюся policy-границу.
+
+SSH health в **09:01:05 UTC / 12:01:05 МСК**, окно **47 секунд** после старта:
+все три units active/running, `NRestarts=0`, running exe SHA совпадают,
+Rust ERROR=0 и journal priority err=0. Это отдельная SSH-проверка, а не
+утверждение о десятиминутном наблюдении из workflow. Read-only stdio smoke
+обоих инстансов подтвердил initialize/tools/own SELECT, отказ foreign scope,
+private memory и forged bootstrap scope; embedding unit active.
+
+Backup бинарников обоих инстансов, профилей, source proof, preflight/replay
+и install logs: `/var/backups/nedobot/2026-11-13-author-text-audit` (root-only).
+Rollback — атомарно вернуть сохранённые binary из `*.binaries.before` в
+соответствующие `target/release` и перезапустить оба бота и public MCP;
+схема и профили совместимы с предыдущими binary, DB restore не требуется.
+
+По явному запросу владельца в **08:52:56 UTC / 11:52:56 МСК** отдельно
+проверены все 29 новичков за 72 часа и недавние баны обоих primary чатов:
+14 NedoNews, 15 ПВО, 50 сохранённых сообщений. Ручная проверка текстов,
+reply-контекста и профилей дала 12 spam (2/10 по инстансам), 5 normal (NedoNews),
+12 без достаточных данных. Фото `464533` просмотрено через MCP; три видео
+отдельно не проигрывались, normal-выводы основаны на собственных текстах и контексте.
+Через существующий `apply_review_labels` / единый writer добавлено ровно
+17 событий; latest labels, флаги и ручные message stamps повторно проверены.
+Пять прежних system-only spam-авторов получили ручное подтверждение для корпуса.
+Поздняя сверка не обнаружила новых авторов или изменённых сообщений в выборке.
+Private receipts, основания и before/after snapshots:
+`/var/backups/nedobot/2026-11-13-manual-newcomers` (root-only).
+
+## Предыдущая выкладка: Gemini 4 pipeline
+
 13 ноября 2026 в **06:45:04 UTC / 09:45:04 МСК** завершена установка
 [deploy-2026-11-13-gemini4-pipeline](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-13-gemini4-pipeline),
 source `8e55bcb49257e1a3d9c3b771c5852e78b510cfc9` после
