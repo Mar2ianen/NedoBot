@@ -23,6 +23,7 @@ struct Source {
     text: String,
     edited_at: Option<DateTime<Utc>>,
     message_count: i64,
+    first_text_message: bool,
     age_seconds: i64,
     label_id: i64,
     normal_veto: bool,
@@ -51,6 +52,12 @@ pub async fn observe_message(
     }
     let source: Option<Source> = sqlx::query_as(r#"
         select m.user_id,coalesce(m.text,'') as text,m.edited_at,u.message_count,
+          not exists (
+            select 1 from telegram_messages earlier
+            where earlier.chat_id=m.chat_id and earlier.user_id=m.user_id
+              and earlier.message_id<m.message_id and earlier.source_channel_id is null
+              and earlier.sender_chat_id is null and nullif(trim(earlier.text),'') is not null
+          ) as first_text_message,
           extract(epoch from (now()-u.first_seen_at))::bigint as age_seconds,
           coalesce(l.id,0) as label_id,coalesce(l.label='not_spam',false) as normal_veto,
           (coalesce(p.is_bot,false) or coalesce(s.is_admin,false)) as trusted,
@@ -102,10 +109,11 @@ pub async fn observe_message(
     sqlx::query("insert into moderation_text_observations (instance_id,chat_id,message_id,user_id,source_hash,eligible,reason,local_candidate,features) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (instance_id,chat_id,message_id) do update set source_hash=excluded.source_hash,eligible=excluded.eligible,reason=excluded.reason,local_candidate=excluded.local_candidate,features=excluded.features,observed_at=now()")
         .bind(&config.community.instance.id).bind(chat_id).bind(message_id).bind(source.user_id).bind(&source_hash)
         .bind(eligible).bind(reason).bind(local_candidate).bind(&observation).execute(pool).await?;
-    // Первый текст — ограниченная контрольная выборка; следующие — только с конкретным сигналом.
+    // Первый авторский текст — контрольная выборка: service/media updates
+    // не расходуют её слот. Следующие тексты — только с конкретным сигналом.
     if !repo::enabled_for_chat(config, chat_id)
         || source.text.trim().is_empty()
-        || (source.message_count != 1 && !local_candidate && features.obfuscation_score < 40)
+        || (!source.first_text_message && !local_candidate && features.obfuscation_score < 40)
     {
         return Ok(());
     }

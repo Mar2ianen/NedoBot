@@ -12,6 +12,14 @@
   {"id":"quoted_spam","text":"Вот какой спам мне прислали: «Есть подработка, пиши мне»","review":false,"campaign":"normal_quote"},
   {"id":"technical_work","text":"Проект работает, пиши мне логи, посмотрим баг","review":false,"campaign":"normal_help"},
   {"id":"job_seeker_dm","text":"Ищу подработку, напиши мне если есть варианты","review":false,"campaign":"normal_job_search"},
+  {"id":"paid_reviews","text":"плачу за отзывы, 10к за 10 отзывов💵😉","review":true,"campaign":"paid_engagement_bait"},
+  {"id":"paid_likes","text":"Платим за лайки, 500 рублей за десяток","review":true,"campaign":"paid_engagement_bait"},
+  {"id":"paid_subscription","text":"Заплачу за подписку, 300 ₽","review":true,"campaign":"paid_engagement_bait"},
+  {"id":"paid_rating","text":"Оплачу оценку, без вложений","review":true,"campaign":"paid_engagement_bait"},
+  {"id":"reviews_discussion","text":"Я читаю отзывы перед покупкой, рейтинг важен","review":false,"campaign":"normal_reviews"},
+  {"id":"reviews_quote","text":"Мне прислали спам: «плачу за отзывы, 10к за 10 отзывов»","review":false,"campaign":"normal_quote"},
+  {"id":"reviews_negated","text":"Я не плачу за отзывы и не предлагаю оплату","review":false,"campaign":"normal_negation"},
+  {"id":"subscription_buyer","text":"Плачу за подписку на GitHub, а отзывы читаю бесплатно","review":true,"campaign":"contextual_subscription_purchase"},
   {"id":"hackathon","text":"Ищем людей на хакатон, пишите в ЛС","review":true,"campaign":"contextual_hackathon"}
  ]
 }

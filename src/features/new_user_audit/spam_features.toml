@@ -1,7 +1,7 @@
 # Versioned lexical features used by the new-user deterministic classifier.
 # Keep lexical evidence and calibration data here; the Rust code only extracts
 # these features and evaluates the combinations below.
-version = "new-user-features-v4"
+version = "new-user-features-v5"
 max_messages = 10
 max_chat_age_seconds = 259200
 
@@ -236,3 +236,34 @@ minimum_score = 45
 require_all = ["work", "private_contact"]
 require_any = []
 exclude_any = ["ищу подработ", "подработку ищу", "ищу работ", "где смотреть вакансии", "спам", "мошенни", "прислали", "цитат", "логи", "логов", "посмотрим баг", "заработало", "работает", "работало"]
+
+# Авторское предложение оплаты за вовлечённость; сумма и призыв в ЛС не обязательны.
+# Это повод проверить контекст, не доказательство спама и не право на санкцию.
+[[features]]
+name = "engagement_action"
+weight = 20
+markers = ["отзыв", "лайк", "подписк", "комментар", "оценк", "рейтинг"]
+
+[[features]]
+name = "engagement_payment_offer"
+weight = 25
+markers = [
+    "плачу", "платим", "заплачу", "заплатим", "оплачу", "оплатим",
+    "оплачиваю", "оплачиваем", "оплата за", "вознаграждение за",
+]
+
+[[campaigns]]
+rule = "fresh_paid_engagement_offer"
+kind = "paid_engagement_offer"
+auto_ban_eligible = false
+subtype = "paid_engagement_bait"
+reason = "Автор предлагает оплату за отзывы, оценки или другую вовлечённость; требуется проверка контекста."
+priority = 5
+minimum_score = 45
+require_all = ["engagement_action", "engagement_payment_offer"]
+require_any = []
+exclude_any = [
+    "не плачу", "не платим", "не заплачу", "не заплатим", "не оплачу", "не оплатим",
+    "не оплачиваю", "не оплачиваем", "спам", "мошенни", "прислали", "цитат",
+    "предложили", "мне написали", "обсуждаем", "в отчете", "в отчёте",
+]

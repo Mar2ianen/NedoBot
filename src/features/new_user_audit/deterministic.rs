@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use teloxide_antispam::{preprocess::prepare_text, text::normalize_cyrillic_homoglyphs};
 
-pub(crate) const RULE_VERSION: &str = "new-user-features-v4";
+pub(crate) const RULE_VERSION: &str = "new-user-features-v5";
 const FEATURE_CONFIG: &str = include_str!("spam_features.toml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CampaignKind {
     WorkContactFunnel,
+    PaidEngagementOffer,
     MoneyDmFunnel,
     PaidShortTaskOffer,
     PaidWorkOpportunity,
@@ -18,6 +19,12 @@ pub(crate) enum CampaignKind {
     LimitedProductTrial,
     ContentShareFunnel,
     AdultPersonalChannel,
+}
+
+impl CampaignKind {
+    fn review_only(self) -> bool {
+        matches!(self, Self::WorkContactFunnel | Self::PaidEngagementOffer)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,7 +92,7 @@ pub(crate) struct CampaignMatch {
 impl CampaignMatch {
     /// Новая слабая эвристика не заменяет существующий аудит и его captcha policy.
     pub(crate) fn can_short_circuit_audit(&self) -> bool {
-        self.kind != CampaignKind::WorkContactFunnel
+        !self.kind.review_only()
     }
 
     pub fn from_rule(rule: &str) -> Option<Self> {
@@ -286,6 +293,7 @@ impl CampaignMatch {
 
         let evidence_source = match self.kind {
             CampaignKind::WorkContactFunnel
+            | CampaignKind::PaidEngagementOffer
             | CampaignKind::MoneyDmFunnel
             | CampaignKind::PaidShortTaskOffer
             | CampaignKind::LimitedProductTrial => "first_message",
@@ -421,13 +429,15 @@ pub(crate) fn classify(
         .chars()
         .take(super::structure::MAX_INPUT_CHARS)
         .collect();
-    // Старые правила сохраняют прежний lexical view; новая нормализация не
-    // расширяет их authority или положительные срабатывания задним числом.
+    // Старые правила сохраняют прежний lexical view; новые review-семейства
+    // и нормализация не расширяют их authority задним числом.
     let legacy = prepare_text(&normalize_mixed_script_homoglyphs(&bounded)).model_text();
     let features = extract_features(&legacy, config);
-    if let Some(campaign) = config.campaigns.iter().find(|campaign| {
-        campaign.kind != CampaignKind::WorkContactFunnel && features.satisfies(campaign)
-    }) {
+    if let Some(campaign) = config
+        .campaigns
+        .iter()
+        .find(|campaign| !campaign.kind.review_only() && features.satisfies(campaign))
+    {
         return Some(CampaignMatch::from_definition(
             campaign,
             features.score,
@@ -442,7 +452,7 @@ pub(crate) fn classify(
         .campaigns
         .iter()
         .find(|campaign| {
-            campaign.kind == CampaignKind::WorkContactFunnel
+            campaign.kind.review_only()
                 && features.satisfies(campaign)
                 && !campaign.exclude_any.iter().any(|s| normalized.contains(s))
         })
