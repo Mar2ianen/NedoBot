@@ -271,7 +271,9 @@ fn build_chat_options(
         ThinkingMode::Budget => options.with_reasoning_effort(ReasoningEffort::Budget(
             reasoning_budget.unwrap_or_default(),
         )),
+        ThinkingMode::LevelMinimal => options.with_reasoning_effort(ReasoningEffort::Minimal),
         ThinkingMode::LevelLow => options.with_reasoning_effort(ReasoningEffort::Low),
+        ThinkingMode::LevelMedium => options.with_reasoning_effort(ReasoningEffort::Medium),
         ThinkingMode::LevelHigh => options.with_reasoning_effort(ReasoningEffort::High),
     };
     let extra_body = match reasoning {

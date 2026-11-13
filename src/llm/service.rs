@@ -312,6 +312,9 @@ async fn generate_chat_profile_once(
         options.output_budget_policy,
         selection.capabilities.max_output_tokens,
     );
+    let max_tokens = selection
+        .capabilities
+        .effective_max_output_tokens(max_tokens);
     let transport = GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     transport
         .chat(GenAiChatRequest {
@@ -392,7 +395,9 @@ async fn generate_profile_once(
             prompt,
             image,
             temperature,
-            max_tokens: num_predict,
+            max_tokens: selection
+                .capabilities
+                .effective_max_output_tokens(num_predict),
             timeout,
             reasoning: selection.capabilities.thinking,
             reasoning_budget: Some(config.gemini_thinking_budget),
@@ -864,7 +869,8 @@ models = ["test"]
     }
 
     #[tokio::test]
-    async fn profile_template_options_preserve_image_json_and_chat_wire_contract() {
+    async fn profile_template_options_preserve_image_json_chat_and_thinking_headroom_wire_contract()
+    {
         async fn capture(
             State(sender): State<mpsc::UnboundedSender<Value>>,
             Json(body): Json<Value>,
@@ -912,6 +918,7 @@ supports_system_prompt=true
 structured_output="json_schema"
 context_window_tokens=4096
 max_output_tokens=256
+thinking_headroom_tokens=128
 request_timeout_sec=5
 thinking="none"
 [routes.profile_test]
@@ -949,7 +956,7 @@ models=["vision"]
             let request = receiver.recv().await.unwrap();
             assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
             assert_eq!(request["response_format"]["json_schema"]["schema"], schema);
-            assert_eq!(request["max_tokens"], 64);
+            assert_eq!(request["max_tokens"], 192);
             assert!(request.get("reasoning_effort").is_none());
             assert_eq!(request["model"], "@cf/test/vision");
             if image.is_some() {
@@ -979,6 +986,7 @@ models=["vision"]
         .unwrap();
         let request = receiver.recv().await.unwrap();
         assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(request["max_tokens"], 192);
         assert!(request.get("response_format").is_none());
         unsafe {
             std::env::remove_var("CLOUDFLARE_WIRE_TEST_KEY");

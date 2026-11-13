@@ -47,6 +47,69 @@ egress = "direct"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_COMPAT_API_KEY"
 
+# Workers AI: account ID подставляется оператором в private profile.
+[providers.cloudflare]
+driver = "openai_compatible"
+adapter = "open_ai"
+egress = "direct"
+base_url = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
+api_key_env = "CLOUDFLARE_API_TOKEN"
+
+# Резервный research-план: Cloudflare Workers AI Gemma 4. JSON Object вместо
+# JSON Schema, потому что schema-ответ на коротком бюджете обрывался; typed
+# validator в search_extract по-прежнему проверяет полный контракт.
+[models.cloudflare_gemma_search]
+provider = "cloudflare"
+model = "@cf/google/gemma-4-26b-a4b-it"
+chat_template_kwargs = { enable_thinking = false }
+
+[models.cloudflare_gemma_search.capabilities]
+supports_images = false
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_object"
+context_window_tokens = 256000
+max_output_tokens = 4096
+request_timeout_sec = 60
+thinking = "none"
+
+# Gemini 4 Hydrogen: бесплатная модель Gemini API. Reasoning входит в
+# maxOutputTokens, поэтому thinking_headroom_tokens добавляет запас поверх
+# короткого runtime.llm_max_tokens и не даёт ответу оборваться на MAX_TOKENS.
+# thinking=medium — обычный уровень, без экономии на reasoning.
+[models.gemini_hydrogen_comment]
+provider = "gemini"
+model = "gemini-4-hydrogen"
+
+[models.gemini_hydrogen_comment.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1048576
+max_output_tokens = 65536
+thinking_headroom_tokens = 8192
+request_timeout_sec = 60
+thinking = "level_medium"
+
+# Gemma 4 на Gemini API: hosted-профиль для research-плана первого комментария.
+# Google Search grounding для Gemma 4 на free tier недоступен; веб-поиск
+# выполняет отдельный MCP provider. thinking=high — не экономим на reasoning.
+[models.gemini_gemma4_extract]
+provider = "gemini"
+model = "gemma-4-31b-it"
+
+[models.gemini_gemma4_extract.capabilities]
+supports_images = true
+supports_tools = true
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 262144
+max_output_tokens = 16384
+thinking_headroom_tokens = 8192
+request_timeout_sec = 120
+thinking = "level_high"
+
 [models.gemini_comment]
 provider = "gemini"
 model = "gemini-3.6-flash"
@@ -59,7 +122,7 @@ structured_output = "json_schema"
 context_window_tokens = 1000000
 max_output_tokens = 8192
 request_timeout_sec = 60
-thinking = "level_low"
+thinking = "level_medium"
 
 [models.gemini_flash_comment]
 provider = "gemini"
@@ -73,7 +136,7 @@ structured_output = "json_schema"
 context_window_tokens = 1000000
 max_output_tokens = 8192
 request_timeout_sec = 60
-thinking = "level_low"
+thinking = "level_medium"
 
 # Отдельный timeout для /ask; профиль комментариев имеет собственный бюджет.
 [models.gemini_ask]
@@ -102,7 +165,7 @@ structured_output = "json_schema"
 context_window_tokens = 1000000
 max_output_tokens = 8192
 request_timeout_sec = 60
-thinking = "level_low"
+thinking = "level_medium"
 
 [models.ollama_memory]
 provider = "ollama_cloud"
@@ -233,12 +296,13 @@ thinking = "none"
 
 [routes.first_comment]
 models = [
+  "gemini_hydrogen_comment",
   "gemini_comment",
   "gemini_flash_comment",
   "gemini_flash_lite_comment",
-  "ollama_memory",
 ]
-fallback_on_validation_failure = false
+# Строгий product-validator: ошибка Hydrogen не должна отменять комментарий.
+fallback_on_validation_failure = true
 
 [routes.memory]
 models = ["ollama_memory"]
@@ -250,7 +314,10 @@ models = ["groq_cleanup", "ollama_memory"]
 models = ["ollama_audit"]
 
 [routes.search_extract]
-models = ["ollama_memory"]
+models = ["gemini_gemma4_extract", "cloudflare_gemma_search"]
+# Если Gemma 4 нарушит JSON-контракт research-плана или упрётся в лимит,
+# поиск не должен останавливаться: план строит Cloudflare Gemma 4.
+fallback_on_validation_failure = true
 
 [routes.ask]
 models = [
