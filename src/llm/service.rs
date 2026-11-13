@@ -1121,6 +1121,100 @@ fallback_on_validation_failure = {fallback_on_validation_failure}
     }
 
     #[tokio::test]
+    async fn gemini_comment_fallbacks_keep_thinking_headroom_after_rate_limit() {
+        let _env_lock = PROFILE_ENV_LOCK.lock().await;
+        async fn capture(
+            State((target, sender)): State<(String, mpsc::UnboundedSender<(String, Value)>)>,
+            axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let path = uri.path().to_owned();
+            sender.send((path.clone(), body)).unwrap();
+            if !path.contains(&format!("/models/{target}:")) {
+                return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+            }
+            Json(json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "synthetic comment"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 2, "totalTokenCount": 3}
+            })).into_response()
+        }
+
+        let templates = [
+            include_str!("../../config/llm_profiles.toml.example"),
+            include_str!("../../config/llm_profiles.toml.production.example"),
+        ];
+        unsafe { std::env::set_var("PROFILE_GEMINI_HEADROOM_TEST_KEY", "synthetic-key") };
+        for template in templates {
+            let profiles = LlmProfiles::from_toml(template).unwrap();
+            let models = profiles.routes["first_comment"].models.clone();
+            // Каждый fallback реально выбирается после 429 всех предыдущих моделей.
+            for (index, model_key) in models.iter().enumerate().skip(1) {
+                let target = profiles.models[model_key].model.clone();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let app = Router::new()
+                    .route("/{*path}", post(capture))
+                    .with_state((target.clone(), sender));
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut selected_profiles = profiles.clone();
+                let provider = selected_profiles.providers.get_mut("gemini").unwrap();
+                provider.base_url = format!("http://{address}/v1beta");
+                provider.api_key_env = "PROFILE_GEMINI_HEADROOM_TEST_KEY".to_owned();
+                let mut config = config();
+                config.llm_profiles = Some(selected_profiles);
+                let result = generate_text_checked(
+                    &config,
+                    GenerateTextOptions {
+                        route: "first_comment",
+                        system_prompt: Some("synthetic test"),
+                        prompt: "synthetic post",
+                        image_base64: None,
+                        temperature: 0.2,
+                        num_predict: 140,
+                        output_validator: None,
+                        structured_output: None,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.model, target);
+                assert_eq!(result.attempts.len(), index + 1);
+                assert!(
+                    result.attempts[..index]
+                        .iter()
+                        .all(|a| a.outcome == "http_429")
+                );
+                assert_eq!(result.attempts[index].outcome, "success");
+                for key in &models[..=index] {
+                    let (path, request) = receiver.try_recv().unwrap();
+                    let model = &profiles.models[key];
+                    assert!(path.contains(&format!("/models/{}:", model.model)));
+                    assert_eq!(
+                        request["generationConfig"]["maxOutputTokens"], 8332,
+                        "{key}"
+                    );
+                    let level = match model.capabilities.thinking {
+                        crate::llm::profiles::ThinkingMode::LevelHigh => "HIGH",
+                        crate::llm::profiles::ThinkingMode::LevelMedium => "MEDIUM",
+                        other => panic!("unexpected comment thinking mode: {other:?}"),
+                    };
+                    assert_eq!(
+                        request["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                        level
+                    );
+                }
+                assert!(receiver.try_recv().is_err());
+                server.abort();
+            }
+        }
+        unsafe { std::env::remove_var("PROFILE_GEMINI_HEADROOM_TEST_KEY") };
+    }
+
+    #[tokio::test]
     async fn profile_validation_fallback_obeys_route_flag() {
         let _env_lock = PROFILE_ENV_LOCK.lock().await;
         async fn invalid() -> Json<Value> {
