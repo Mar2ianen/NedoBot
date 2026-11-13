@@ -140,11 +140,13 @@ pub async fn claim(pool: &PgPool, config: &Config) -> anyhow::Result<Option<Deci
         tx.commit().await?;
         return Ok(None);
     }
-    let available: Option<i32> = sqlx::query_scalar(r#"insert into moderation_decision_budget (instance_id,window_start,calls)
-        values ($1,date_trunc('hour',now()),1) on conflict (instance_id,window_start)
-        do update set calls=moderation_decision_budget.calls+1 where moderation_decision_budget.calls<$2 returning calls"#)
-        .bind(&job.instance_id).bind(config.community.moderation.decision.max_calls_per_hour).fetch_optional(&mut *tx).await?;
-    if available.is_none() {
+    if !reserve_call_in_tx(
+        &mut tx,
+        &job.instance_id,
+        config.community.moderation.decision.max_calls_per_hour,
+    )
+    .await?
+    {
         sqlx::query("update moderation_decision_jobs set status='retry_wait',next_attempt_at=date_trunc('hour',now())+interval '1 hour',lease_expires_at=null,error_kind='budget' where id=$1")
             .bind(job.id).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -158,7 +160,7 @@ pub async fn claim(pool: &PgPool, config: &Config) -> anyhow::Result<Option<Deci
     Ok(Some(job))
 }
 
-async fn current_in_tx(
+pub(crate) async fn current_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job: &DecisionJob,
 ) -> anyhow::Result<bool> {
@@ -170,7 +172,7 @@ async fn current_in_tx(
           select id,label from spam_label_events where chat_id=m.chat_id and telegram_user_id=m.user_id
           order by created_at desc,id desc limit 1) l on true
         where m.chat_id=$1 and m.message_id=$2 and m.user_id=$3 and m.source_channel_id is null
-          and m.created_at>now()-interval '24 hours'
+          and m.sender_chat_id is null and m.created_at>now()-interval '24 hours'
           and u.message_count between 1 and $5
           and u.first_seen_at between now()-make_interval(secs=>$6::double precision) and now()
           and not exists(select 1 from telegram_chat_member_snapshots s where s.chat_id=m.chat_id and s.telegram_user_id=m.user_id and s.is_admin)
@@ -189,7 +191,7 @@ async fn current_in_tx(
     }))
 }
 
-/// CAS и повторная проверка источника/ручной метки; никакой записи в audit/review/enforcement.
+/// CAS и повторная проверка источника/ручной метки; action outbox только в score_captcha.
 pub async fn complete(
     pool: &PgPool,
     job: &DecisionJob,
@@ -206,10 +208,14 @@ pub async fn complete(
         return Ok(false);
     }
     let current = current_in_tx(&mut tx, job).await?;
-    let verdict = serde_json::to_value(assessment.verdict())?;
-    sqlx::query("update moderation_decision_jobs set status=$2,assessment_json=$3,shadow_verdict=$4,api_latency_ms=$5,completed_at=now(),lease_expires_at=null,error_kind=$6 where id=$1")
+    let verdict = serde_json::to_value(if job.input_json["score_captcha"] == true {
+        assessment.captcha_verdict()
+    } else {
+        assessment.verdict()
+    })?;
+    sqlx::query("update moderation_decision_jobs set status=$2,assessment_json=$3,shadow_verdict=$4,api_latency_ms=$5,completed_at=now(),lease_expires_at=null,error_kind=$6,action_status=case when $7 then 'pending' else 'not_requested' end where id=$1")
         .bind(job.id).bind(if current {"succeeded"} else {"stale"}).bind(serde_json::to_value(assessment)?)
-        .bind(verdict.as_str()).bind(latency_ms as i64).bind(if current {None} else {Some("source_or_label_changed")}).execute(&mut *tx).await?;
+        .bind(verdict.as_str()).bind(latency_ms as i64).bind(if current {None} else {Some("source_or_label_changed")}).bind(current && job.input_json["score_captcha"]==true).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(current)
 }
@@ -223,4 +229,55 @@ pub async fn fail(pool: &PgPool, job: &DecisionJob, error: Failure) -> anyhow::R
         .bind(job.id).bind(&job.instance_id).bind(job.fence).bind(if delay.is_some(){"retry_wait"}else{"failed"})
         .bind(error.kind()).bind(delay.unwrap_or_default() as f64).execute(pool).await?.rows_affected()>0;
     Ok(changed)
+}
+
+async fn reserve_call_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &str,
+    limit: i32,
+) -> anyhow::Result<bool> {
+    let value:Option<i32>=sqlx::query_scalar(r#"insert into moderation_decision_budget (instance_id,window_start,calls)
+        values ($1,date_trunc('hour',now()),1) on conflict (instance_id,window_start)
+        do update set calls=moderation_decision_budget.calls+1 where moderation_decision_budget.calls<$2 returning calls"#)
+        .bind(instance).bind(limit).fetch_optional(&mut **tx).await?;
+    Ok(value.is_some())
+}
+/// Проверка перед внешним действием; completion и actuation имеют разные leases.
+pub async fn source_is_current(pool: &PgPool, job: &DecisionJob) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let current = current_in_tx(&mut tx, job).await?;
+    tx.commit().await?;
+    Ok(current)
+}
+#[derive(FromRow)]
+struct CaptchaSource {
+    source_hash: String,
+    source_edited_at: Option<DateTime<Utc>>,
+    current_text: String,
+    current_edit: Option<DateTime<Utc>>,
+    normal_veto: bool,
+}
+/// После доставки challenge рост счётчика сообщений не отменяет проверку.
+/// Edit/delete/normal/admin/bot отзывают её; положительная ручная метка — нет.
+pub async fn captcha_source_is_current(
+    pool: &PgPool,
+    id: i64,
+    chat: i64,
+    user: i64,
+) -> anyhow::Result<bool> {
+    let row:Option<CaptchaSource>=sqlx::query_as(r#"
+        select j.source_hash,j.source_edited_at,coalesce(m.text,'') as current_text,m.edited_at as current_edit,coalesce(l.label='not_spam',false) as normal_veto
+        from moderation_decision_jobs j join telegram_messages m on m.chat_id=j.chat_id and m.message_id=j.message_id and m.user_id=j.user_id
+        left join lateral(select label from spam_label_events where chat_id=j.chat_id and telegram_user_id=j.user_id order by created_at desc,id desc limit 1)l on true
+        where j.id=$1 and j.chat_id=$2 and j.user_id=$3 and j.status='succeeded' and j.shadow_verdict='review_candidate' and j.input_json->'score_captcha'='true'::jsonb
+        and not exists(select 1 from moderation_decision_jobs newer where newer.chat_id=j.chat_id and newer.message_id=j.message_id and newer.user_id=j.user_id and newer.id>j.id and newer.status='succeeded' and newer.shadow_verdict<>'review_candidate')
+        and m.source_channel_id is null and m.sender_chat_id is null
+        and not exists(select 1 from telegram_chat_member_snapshots s where s.chat_id=j.chat_id and s.telegram_user_id=j.user_id and s.is_admin)
+        and not exists(select 1 from telegram_user_profiles p where p.telegram_user_id=j.user_id and p.is_bot)"#)
+        .bind(id).bind(chat).bind(user).fetch_optional(pool).await?;
+    Ok(row.is_some_and(|r| {
+        !r.normal_veto
+            && r.source_edited_at == r.current_edit
+            && hash_bytes(r.current_text.as_bytes()) == r.source_hash
+    }))
 }

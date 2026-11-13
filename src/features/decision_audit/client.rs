@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 pub const QUESTIONS: &str = include_str!("questions.json");
-pub const POLICY_VERSION: &str = "decision-shadow-v1";
+pub const POLICY_VERSION: &str = "decision-score-v2";
 const MAX_RESPONSE_BYTES: usize = 256 * 1_024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -118,7 +118,39 @@ impl DecisionAssessment {
         }
         Ok(())
     }
-    /// Независимые marginal probabilities не перемножаются. Это только shadow.
+    /// Для общей метрики учитываем суммарную массу рекламных классов:
+    /// неопределённость между двумя типами рекламы не равна вероятности «не спам».
+    pub fn captcha_verdict(&self) -> ShadowVerdict {
+        if self.validate().is_err() {
+            return ShadowVerdict::Abstain;
+        }
+        let probability = |id: &str| match &self.answers[id] {
+            Answer::Noul { noul, .. } => *noul,
+            _ => 0.0,
+        };
+        if probability("quoted_or_discussed_spam") >= 0.2 {
+            return ShadowVerdict::Abstain;
+        }
+        let promotional_mass = match &self.answers["spam_campaign_type"] {
+            Answer::Choice { probabilities, .. } => 1.0 - probabilities["none"],
+            _ => return ShadowVerdict::Abstain,
+        };
+        let relevance = match &self.answers["contextual_relevance"] {
+            Answer::Score { score, .. } => *score,
+            _ => return ShadowVerdict::Abstain,
+        };
+        if promotional_mass >= 0.8
+            && relevance <= 0.8
+            && (probability("unsolicited_promotion") >= 0.8
+                || (probability("work_solicitation") >= 0.8
+                    && probability("private_contact_funnel") >= 0.8))
+        {
+            ShadowVerdict::ReviewCandidate
+        } else {
+            ShadowVerdict::NoSignal
+        }
+    }
+    /// Независимые marginal probabilities не перемножаются. Сам по себе verdict не разрешает санкцию.
     pub fn verdict(&self) -> ShadowVerdict {
         if self.validate().is_err() {
             return ShadowVerdict::Abstain;

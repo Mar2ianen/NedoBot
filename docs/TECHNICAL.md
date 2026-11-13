@@ -1056,3 +1056,6 @@ review-only assessment не даёт права на бан, удаление и
 имя env-переменной ключа и bounded бюджеты. Новый shadow не меняет generative
 routes и не даёт права на санкции. Транспорт, версии, диагностика, evaluation CLI
 и migration-aware rollback описаны в [ANTISPAM_V2.md](ANTISPAM_V2.md).
+
+Decision может участвовать в общей метрике с ephemeral captcha: [контракт,
+настройки и migration-aware rollback](DECISION_SCORING.md). Shadow остаётся default.

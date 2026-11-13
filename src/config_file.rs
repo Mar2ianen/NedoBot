@@ -65,10 +65,27 @@ pub struct ChatConfig {
 }
 
 /// Независимый закрытый классификатор. Только shadow; без права создавать санкции.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionMode {
+    #[default]
+    Shadow,
+    ScoreCaptcha,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DecisionConfig {
     pub enabled: bool,
+    pub mode: DecisionMode,
+    /// Основной content-вклад; два классификатора текста объединяются максимумом.
+    pub score_weight: i32,
+    /// Supporting-вклад контакта, не самостоятельное право на капчу.
+    pub external_contact_weight: i32,
+    /// Первые N авторских текстов проверяются независимо от lexical rules.
+    pub initial_texts: i64,
+    pub ban_on_failure: bool,
+    pub captcha_max_message_age_sec: i64,
     /// Явное подтверждение условий внешней обработки именно этого инстанса.
     pub external_processing_allowed: bool,
     pub avatar_enabled: bool,
@@ -85,6 +102,12 @@ impl Default for DecisionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: DecisionMode::Shadow,
+            score_weight: 90,
+            external_contact_weight: 8,
+            initial_texts: 1,
+            ban_on_failure: false,
+            captcha_max_message_age_sec: 600,
             external_processing_allowed: false,
             avatar_enabled: false,
             base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
@@ -116,6 +139,13 @@ impl DecisionConfig {
                 && (64..=4_096).contains(&self.max_input_chars)
                 && (1..=2_000).contains(&self.chat_policy.chars().count()),
             "invalid decision bounds"
+        );
+        anyhow::ensure!(
+            (1..=100).contains(&self.score_weight)
+                && (0..=15).contains(&self.external_contact_weight)
+                && (1..=10).contains(&self.initial_texts)
+                && (60..=3600).contains(&self.captcha_max_message_age_sec),
+            "invalid decision scoring/sampling bounds"
         );
         let url = reqwest::Url::parse(&self.base_url)
             .map_err(|_| anyhow::anyhow!("invalid decision base_url"))?;
@@ -742,6 +772,18 @@ mod decision_tests {
         c.timeout_sec = 601;
         assert!(c.validate().is_err());
         c.timeout_sec = 15;
+        c.initial_texts = 11;
+        assert!(c.validate().is_err());
+        c.initial_texts = 10;
+        c.external_contact_weight = 16;
+        assert!(c.validate().is_err());
+        c.external_contact_weight = 8;
+        c.score_weight = 101;
+        assert!(c.validate().is_err());
+        c.score_weight = 90;
+        c.captcha_max_message_age_sec = 59;
+        assert!(c.validate().is_err());
+        c.captcha_max_message_age_sec = 600;
         c.api_key_env = "GEMINI_API_KEY=secret".into();
         assert!(c.validate().is_err());
     }

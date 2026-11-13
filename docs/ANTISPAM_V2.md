@@ -7,9 +7,12 @@ Gemma. Native transport отправляет `POST /v1beta/decisions` с
 
 ## Границы rollout
 
-Decision работает только в shadow. Его очередь и `DecisionAssessment` отделены
+По умолчанию Decision работает в shadow. Режим `score_captcha` и его общая
+метрика описаны в [Decision scoring](DECISION_SCORING.md); он явно включается
+отдельно и разрешает только ephemeral captcha, а не прямой бан по модели.
+Его очередь и `DecisionAssessment` отделены
 от `new_user_audit_jobs`; результаты не конвертируются в legacy assessment,
-не создают `auto_ban_evidence`, review, captcha, spam labels или Telegram actions.
+в shadow не создают `auto_ban_evidence`, review, captcha, spam labels или Telegram actions.
 Старый аудит и его generation/materialization fences сохраняются.
 Новый `fresh_work_dm_funnel` — только review, включая разреженные/обфусцированные
 предложения работы без суммы. Глобальный `min_text_chars=32` не снижен.
@@ -34,7 +37,8 @@ shadow jobs. Первый авторский текст новичка даёт 
 служебные сообщения и media без текста не расходуют этот слот. Он определяется
 по предыдущим непустым авторским текстам в том же чате, а не по общему
 `message_count==1`. Последующие сообщения ставятся в очередь только при
-lexical/obfuscation сигнале.
+lexical/obfuscation/contact сигнале. `initial_texts` позволяет расширить
+контрольную выборку до первых десяти текстов без лексического условия.
 
 `new-user-features-v5` добавляет слабое семейство `paid_engagement_offer`:
 авторское предложение оплаты за отзывы, оценки, лайки, подписки или комментарии.
