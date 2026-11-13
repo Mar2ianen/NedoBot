@@ -189,6 +189,13 @@ pub async fn assert_policy(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
     // Реальный handoff: карточка reply отправляется раньше удаления только отмеченного текста.
     reset(pool, stub).await;
     c.community.moderation.captcha_dry_run = false;
+    // Ранее разрешённое удаление другого сообщения отзывается даже при edit без timestamp.
+    query("insert into telegram_messages(chat_id,message_id,user_id,text,created_at) values($1,502,$2,'Рекламный текст',now())").bind(CHAT_ID).bind(USER_ID).execute(pool).await.unwrap();
+    observe_message(pool, &c, CHAT_ID, 502).await.unwrap();
+    let earlier = repo::claim(pool, &c).await.unwrap().unwrap();
+    repo::complete(pool, &earlier, &a, 1).await.unwrap();
+    query("update moderation_decision_jobs set metrics_json='{\"captcha_authorized\":true}',action_status='done' where id=$1").bind(earlier.id).execute(pool).await.unwrap();
+    query("update telegram_messages set text='Обычный исправленный текст' where chat_id=$1 and message_id=502").bind(CHAT_ID).execute(pool).await.unwrap();
     let j = completed(pool, &c, &a).await;
     query("update moderation_decision_jobs set action_status='processing',action_fence=5,action_lease_expires_at=now()-interval '1 second' where id=$1").bind(j.id).execute(pool).await.unwrap();
     assert!(actions::process_next(bot, pool, &c).await.unwrap());
@@ -252,6 +259,23 @@ pub async fn assert_policy(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
     assert_eq!(status(pool).await, "passed");
     assert!(!stub.restricted.load(Ordering::SeqCst));
     assert!(!stub.banned.load(Ordering::SeqCst));
+    // Ручной unmute администратора не разрешает следующей Decision вернуть mute.
+    reset(pool, stub).await;
+    let manual = completed(pool, &c, &a).await;
+    actions::process_next(bot, pool, &c).await.unwrap();
+    stub.restricted.store(false, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(
+            tg_ai_bot_teloxide::features::risk_captcha::apply_decision_captcha(
+                bot, pool, &manual, 100, 600, true
+            )
+            .await
+            .unwrap(),
+            CaptchaOutcome::Overridden
+        );
+    }
+    assert!(!stub.restricted.load(Ordering::SeqCst));
+    assert_eq!(send_count(stub), 1);
     // Общая baseline-оценка, завершившаяся позже модели, тоже активирует handoff.
     reset(pool, stub).await;
     query("update telegram_messages set raw_json='{}' where chat_id=$1 and message_id=500")

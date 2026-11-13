@@ -99,6 +99,7 @@ struct CaptchaChallenge {
     setup_attempts: i32,
     decision_job_id: Option<i64>,
     ban_on_failure: bool,
+    setup_error_kind: Option<String>,
 }
 
 enum VerificationState {
@@ -225,6 +226,8 @@ async fn apply_captcha(
             if challenge.status == "expired"
                 || (challenge.status == "overridden"
                     && challenge.decision_job_id.is_some()
+                    && challenge.setup_error_kind.as_deref()
+                        == Some("decision_source_changed")
                     && job.decision_job_id.is_some()) =>
         {
             let member = bot
@@ -1003,7 +1006,7 @@ async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallen
                      challenge.restore_permissions, challenge.restriction_applied_at,
                      challenge.message_id, challenge.ephemeral_message_id,
                      challenge.expires_at,
-                     challenge.status, challenge.setup_attempts,challenge.decision_job_id,challenge.ban_on_failure"#,
+                     challenge.status, challenge.setup_attempts,challenge.decision_job_id,challenge.ban_on_failure,challenge.setup_error_kind"#,
     )
     .bind(SETUP_LEASE_SECONDS)
     .fetch_optional(pool)
@@ -1035,7 +1038,7 @@ async fn claim_next_expired(pool: &PgPool) -> anyhow::Result<Option<CaptchaChall
                      challenge.restore_permissions, challenge.restriction_applied_at,
                      challenge.message_id, challenge.ephemeral_message_id,
                      challenge.expires_at,
-                     challenge.status, challenge.setup_attempts,challenge.decision_job_id,challenge.ban_on_failure"#,
+                     challenge.status, challenge.setup_attempts,challenge.decision_job_id,challenge.ban_on_failure,challenge.setup_error_kind"#,
     )
     .bind(SETUP_LEASE_SECONDS)
     .fetch_optional(pool)
@@ -1192,7 +1195,7 @@ async fn load_user_challenge(
     user_id: i64,
 ) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure,setup_error_kind from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(chat_id)
     .bind(user_id)
@@ -1203,7 +1206,7 @@ async fn load_user_challenge(
 
 async fn load_challenge(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure,setup_error_kind from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1216,7 +1219,7 @@ async fn select_challenge_by_id(
     id: Uuid,
 ) -> anyhow::Result<PgRow> {
     Ok(sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure,setup_error_kind from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_one(&mut **tx)
@@ -1240,6 +1243,7 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         setup_attempts: row.try_get("setup_attempts")?,
         decision_job_id: row.try_get("decision_job_id")?,
         ban_on_failure: row.try_get("ban_on_failure")?,
+        setup_error_kind: row.try_get("setup_error_kind")?,
     })
 }
 
@@ -1388,6 +1392,7 @@ async fn decision_message_ids(
         where m.chat_id=$1 and m.user_id=$2 and m.source_channel_id is null and m.sender_chat_id is null
           and m.deleted_by_bot_at is null and j.status='succeeded' and j.shadow_verdict='review_candidate'
           and j.source_edited_at is not distinct from m.edited_at
+          and encode(sha256(convert_to(coalesce(m.text,''),'UTF8')),'hex')=j.source_hash
           and (j.id=$3 or j.metrics_json->'captcha_authorized'='true'::jsonb)
           and m.created_at>now()-interval '24 hours'
           and not exists(select 1 from moderation_decision_jobs newer where newer.chat_id=j.chat_id
