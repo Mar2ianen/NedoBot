@@ -1504,6 +1504,12 @@ fn validate_community_config(
             "decision requires an ingested moderation chat"
         );
     }
+    if community.moderation.decision.mode == crate::config_file::DecisionMode::ScoreCaptcha {
+        anyhow::ensure!(
+            community.moderation.decision.enabled && community.moderation.captcha_enabled,
+            "decision score_captcha requires enabled Decision and risk captcha"
+        );
+    }
     community.moderation.local_cascade.validate()?;
     if community.moderation.local_cascade.mode != crate::config_file::LocalCascadeMode::Disabled {
         anyhow::ensure!(

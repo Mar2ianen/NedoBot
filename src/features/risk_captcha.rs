@@ -97,6 +97,9 @@ struct CaptchaChallenge {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     status: String,
     setup_attempts: i32,
+    decision_job_id: Option<i64>,
+    ban_on_failure: bool,
+    setup_error_kind: Option<String>,
 }
 
 enum VerificationState {
@@ -109,6 +112,7 @@ async fn can_offer_challenge(
     member: &teloxide::types::ChatMember,
     chat_id: i64,
     user_id: i64,
+    decision_job_id: Option<i64>,
 ) -> anyhow::Result<bool> {
     anyhow::ensure!(
         member.user.id.0 as i64 == user_id,
@@ -125,11 +129,60 @@ async fn can_offer_challenge(
         ChatMemberKind::Member(_) => true,
         // Left не означает отсутствие комментариев в linked discussion.
         // Случайному non-member без своего свежего сообщения проверку не шлём.
-        ChatMemberKind::Left => load_reply_message_id(pool, chat_id, user_id)
-            .await?
-            .is_some(),
+        ChatMemberKind::Left => {
+            if let Some(id) = decision_job_id {
+                sqlx::query_scalar("select exists(select 1 from moderation_decision_jobs j join telegram_messages m on m.chat_id=j.chat_id and m.message_id=j.message_id and m.user_id=j.user_id where j.id=$1 and j.chat_id=$2 and j.user_id=$3 and m.created_at>now()-interval '24 hours' and m.deleted_by_bot_at is null)")
+                .bind(id).bind(chat_id).bind(user_id).fetch_one(pool).await?
+            } else {
+                load_reply_message_id(pool, chat_id, user_id)
+                    .await?
+                    .is_some()
+            }
+        }
         _ => false,
     })
+}
+
+struct CaptchaRequest {
+    chat_id: i64,
+    telegram_user_id: i64,
+    audit_job_id: Option<i64>,
+    decision_job_id: Option<i64>,
+    ban_on_failure: bool,
+}
+
+pub async fn apply_decision_captcha(
+    bot: &Bot,
+    pool: &PgPool,
+    job: &crate::features::decision_audit::repo::DecisionJob,
+    risk_score: i32,
+    ttl_seconds: i64,
+    ban_on_failure: bool,
+) -> anyhow::Result<CaptchaOutcome> {
+    if !crate::features::decision_audit::repo::captcha_source_is_current(
+        pool,
+        job.id,
+        job.chat_id,
+        job.user_id,
+    )
+    .await?
+    {
+        return Ok(CaptchaOutcome::Overridden);
+    }
+    apply_captcha(
+        bot,
+        pool,
+        &CaptchaRequest {
+            chat_id: job.chat_id,
+            telegram_user_id: job.user_id,
+            audit_job_id: None,
+            decision_job_id: Some(job.id),
+            ban_on_failure,
+        },
+        risk_score,
+        ttl_seconds,
+    )
+    .await
 }
 
 /// Создаёт durable challenge и запускает его доставку. Незавершённая настройка
@@ -141,12 +194,54 @@ pub async fn apply_risk_captcha(
     risk_score: i32,
     ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
+    apply_captcha(
+        bot,
+        pool,
+        &CaptchaRequest {
+            chat_id: job.chat_id,
+            telegram_user_id: job.telegram_user_id,
+            audit_job_id: Some(job.id),
+            decision_job_id: None,
+            ban_on_failure: false,
+        },
+        risk_score,
+        ttl_seconds,
+    )
+    .await
+}
+
+async fn apply_captcha(
+    bot: &Bot,
+    pool: &PgPool,
+    job: &CaptchaRequest,
+    risk_score: i32,
+    ttl_seconds: i64,
+) -> anyhow::Result<CaptchaOutcome> {
+    let existing = load_user_challenge(pool, job.chat_id, job.telegram_user_id).await?;
+    if let Some(challenge) = existing.as_ref() {
+        decision_source_valid(bot, pool, challenge).await?;
+    }
     let challenge = match load_user_challenge(pool, job.chat_id, job.telegram_user_id).await? {
-        Some(challenge) if challenge.status == "expired" => {
+        Some(challenge)
+            if challenge.status == "expired"
+                || (challenge.status == "overridden"
+                    && challenge.decision_job_id.is_some()
+                    && challenge.setup_error_kind.as_deref()
+                        == Some("decision_source_changed")
+                    && job.decision_job_id.is_some()) =>
+        {
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
                 .await?;
-            if !can_offer_challenge(pool, &member, job.chat_id, job.telegram_user_id).await? {
+            if !can_offer_challenge(
+                pool,
+                &member,
+                job.chat_id,
+                job.telegram_user_id,
+                job.decision_job_id,
+            )
+            .await?
+            {
                 return Ok(CaptchaOutcome::Expired);
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
@@ -160,7 +255,15 @@ pub async fn apply_risk_captcha(
             let member = bot
                 .get_chat_member(ChatId(job.chat_id), UserId(job.telegram_user_id as u64))
                 .await?;
-            if !can_offer_challenge(pool, &member, job.chat_id, job.telegram_user_id).await? {
+            if !can_offer_challenge(
+                pool,
+                &member,
+                job.chat_id,
+                job.telegram_user_id,
+                job.decision_job_id,
+            )
+            .await?
+            {
                 return Ok(CaptchaOutcome::Ineligible);
             }
             let chat = bot.get_chat(ChatId(job.chat_id)).await?;
@@ -207,6 +310,9 @@ pub async fn process_next_setup(
     let Some(challenge) = claim_next_setup(pool).await? else {
         return Ok(false);
     };
+    if !decision_source_valid(bot, pool, &challenge).await? {
+        return Ok(true);
+    }
     if challenge.status == "pending" && challenge.message_id.is_some() {
         // Cleanup retry не должен накладывать новый mute, если автор успел
         // вступить в группу, пройти проверку или был размучен администратором.
@@ -264,8 +370,14 @@ async fn deliver_challenge(
     challenge: &CaptchaChallenge,
     ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
-    let reply_message_id =
-        load_reply_message_id(pool, challenge.chat_id, challenge.user_id).await?;
+    let reply_message_id = if challenge.decision_job_id.is_some() {
+        decision_message_ids(pool, challenge, 1)
+            .await?
+            .first()
+            .copied()
+    } else {
+        load_reply_message_id(pool, challenge.chat_id, challenge.user_id).await?
+    };
     let Some(state) = ensure_verification_state(bot, pool, challenge).await? else {
         return Ok(CaptchaOutcome::Overridden);
     };
@@ -274,11 +386,17 @@ async fn deliver_challenge(
         "non-member captcha requires a fresh comment reply target"
     );
 
-    let consequence = match state {
-        VerificationState::RestrictedMember => {
+    let consequence = match (challenge.ban_on_failure, state) {
+        (true, VerificationState::RestrictedMember) => {
+            "До успешного ответа отправка сообщений ограничена; если проверка не пройдена вовремя, доступ к чату будет заблокирован."
+        }
+        (true, VerificationState::Commenter) => {
+            "После успешного ответа проверка будет завершена; если её не пройти вовремя, доступ к комментариям будет заблокирован."
+        }
+        (false, VerificationState::RestrictedMember) => {
             "До успешного ответа отправка сообщений ограничена; после истечения времени бот удалит вас из чата."
         }
-        VerificationState::Commenter => "После успешного ответа проверка будет завершена.",
+        (false, VerificationState::Commenter) => "После успешного ответа проверка будет завершена.",
     };
     let text = format!(
         "Проверка комментария\nРешите пример: {}.\nУ вас {} мин. {consequence}",
@@ -305,6 +423,14 @@ async fn deliver_challenge(
         ttl_seconds,
     )
     .await?;
+    if challenge.decision_job_id.is_some() {
+        let delivered = load_challenge(pool, challenge.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("captcha disappeared after delivery"))?;
+        if !decision_source_valid(bot, pool, &delivered).await? {
+            return Ok(CaptchaOutcome::Overridden);
+        }
+    }
     // Reply должен быть принят до удаления anchor. Ошибка cleanup не должна
     // переотправлять уже сохранённую карточку или продлевать её TTL.
     cleanup_after_delivery(bot, pool, challenge).await?;
@@ -380,8 +506,11 @@ async fn delete_audited_messages(
     pool: &PgPool,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<()> {
-    let message_ids: Vec<i32> = sqlx::query_scalar(
-        r#"select m.message_id
+    let message_ids: Vec<i32> = if challenge.decision_job_id.is_some() {
+        decision_message_ids(pool, challenge, MAX_CAPTCHA_CLEANUP_MESSAGES).await?
+    } else {
+        sqlx::query_scalar(
+            r#"select m.message_id
            from telegram_messages m
            join telegram_new_user_profile_audits a
              on a.chat_id = m.chat_id and a.telegram_user_id = m.user_id
@@ -395,13 +524,14 @@ async fn delete_audited_messages(
                   or m.raw_json ?| array['poll', 'video_note', 'contact', 'location',
                                         'venue', 'dice', 'paid_media', 'story', 'game'])
            order by m.message_id desc limit $4"#,
-    )
-    .bind(challenge.chat_id)
-    .bind(challenge.user_id)
-    .bind(crate::features::auto_moderation::ENFORCE_FRESHNESS.num_seconds())
-    .bind(MAX_CAPTCHA_CLEANUP_MESSAGES)
-    .fetch_all(pool)
-    .await?;
+        )
+        .bind(challenge.chat_id)
+        .bind(challenge.user_id)
+        .bind(crate::features::auto_moderation::ENFORCE_FRESHNESS.num_seconds())
+        .bind(MAX_CAPTCHA_CLEANUP_MESSAGES)
+        .fetch_all(pool)
+        .await?
+    };
     for batch in message_ids.chunks(TELEGRAM_DELETE_BATCH_SIZE) {
         bot.delete_messages(
             ChatId(challenge.chat_id),
@@ -495,6 +625,9 @@ pub async fn handle_callback(
     if actor_user_id != challenge.user_id {
         return Ok(CaptchaCallbackOutcome::NotForThisUser);
     }
+    if !decision_source_valid(bot, pool, &challenge).await? {
+        return Ok(CaptchaCallbackOutcome::Stale);
+    }
     if challenge
         .expires_at
         .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
@@ -566,6 +699,9 @@ async fn ensure_verification_state(
     pool: &PgPool,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<Option<VerificationState>> {
+    if !decision_source_valid(bot, pool, challenge).await? {
+        return Ok(None);
+    }
     let member = bot
         .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
         .await?;
@@ -729,7 +865,7 @@ fn parse_callback_data(data: &str) -> Option<(Uuid, i16)> {
 
 async fn create_or_load_challenge(
     pool: &PgPool,
-    job: &NewUserAuditJob,
+    job: &CaptchaRequest,
     risk_score: i32,
     math: &MathChallenge,
     restore_permissions: &Value,
@@ -739,20 +875,22 @@ async fn create_or_load_challenge(
     let inserted = sqlx::query(
         r#"insert into telegram_risk_captcha_challenges
                (id, chat_id, telegram_user_id, audit_job_id, risk_score,
-                question, options, correct_option, restore_permissions)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                question, options, correct_option, restore_permissions,decision_job_id,ban_on_failure)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9,$10,$11)
            on conflict (chat_id, telegram_user_id) do nothing
            returning id"#,
     )
     .bind(math.id)
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
-    .bind(job.id)
+    .bind(job.audit_job_id)
     .bind(risk_score)
     .bind(&math.question)
     .bind(options)
     .bind(math.correct_option)
     .bind(restore_permissions)
+    .bind(job.decision_job_id)
+    .bind(job.ban_on_failure)
     .fetch_optional(&mut *tx)
     .await?;
     let challenge_id = if let Some(row) = inserted {
@@ -773,7 +911,7 @@ async fn create_or_load_challenge(
 
 async fn reopen_expired_challenge(
     pool: &PgPool,
-    job: &NewUserAuditJob,
+    job: &CaptchaRequest,
     risk_score: i32,
     math: &MathChallenge,
     restore_permissions: &Value,
@@ -781,7 +919,7 @@ async fn reopen_expired_challenge(
     let options = serde_json::to_value(&math.options)?;
     let updated_id = sqlx::query_scalar::<_, Uuid>(
         r#"update telegram_risk_captcha_challenges
-           set id = $1, audit_job_id = $2, risk_score = $3, question = $4,
+           set id = $1, audit_job_id = $2, risk_score = $3, question = $4,decision_job_id=$10,ban_on_failure=$11,
                options = $5, correct_option = $6, restore_permissions = $7,
                restriction_applied_at = null, message_id = null,
                ephemeral_message_id = null, expires_at = null,
@@ -789,17 +927,19 @@ async fn reopen_expired_challenge(
                setup_next_attempt_at = now(), setup_lease_expires_at = null,
                setup_error_kind = null, created_at = now(), updated_at = now(),
                solved_at = null
-           where chat_id = $8 and telegram_user_id = $9 and status = 'expired'
+           where chat_id = $8 and telegram_user_id = $9 and (status='expired' or (status='overridden' and setup_error_kind='decision_source_changed' and $10::bigint is not null))
            returning id"#,
     )
     .bind(math.id)
-    .bind(job.id)
+    .bind(job.audit_job_id)
     .bind(risk_score)
     .bind(&math.question)
     .bind(options)
     .bind(restore_permissions)
     .bind(job.chat_id)
     .bind(job.telegram_user_id)
+    .bind(job.decision_job_id)
+    .bind(job.ban_on_failure)
     .fetch_optional(pool)
     .await?;
     match updated_id {
@@ -844,7 +984,7 @@ async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallen
                   or (status = 'pending' and message_id is null)
                   or (status = 'setting_up' and setup_lease_expires_at <= now())
                   or (status = 'pending' and message_id is not null
-                      and setup_error_kind = 'cleanup_pending'
+                      and setup_error_kind in ('cleanup_pending','decision_recheck')
                       and setup_next_attempt_at <= now() and expires_at > now()
                       and (setup_lease_expires_at is null or setup_lease_expires_at <= now()))
                order by setup_next_attempt_at, created_at, id
@@ -866,7 +1006,7 @@ async fn claim_next_setup(pool: &PgPool) -> anyhow::Result<Option<CaptchaChallen
                      challenge.restore_permissions, challenge.restriction_applied_at,
                      challenge.message_id, challenge.ephemeral_message_id,
                      challenge.expires_at,
-                     challenge.status, challenge.setup_attempts"#,
+                     challenge.status, challenge.setup_attempts,challenge.decision_job_id,challenge.ban_on_failure,challenge.setup_error_kind"#,
     )
     .bind(SETUP_LEASE_SECONDS)
     .fetch_optional(pool)
@@ -898,7 +1038,7 @@ async fn claim_next_expired(pool: &PgPool) -> anyhow::Result<Option<CaptchaChall
                      challenge.restore_permissions, challenge.restriction_applied_at,
                      challenge.message_id, challenge.ephemeral_message_id,
                      challenge.expires_at,
-                     challenge.status, challenge.setup_attempts"#,
+                     challenge.status, challenge.setup_attempts,challenge.decision_job_id,challenge.ban_on_failure,challenge.setup_error_kind"#,
     )
     .bind(SETUP_LEASE_SECONDS)
     .fetch_optional(pool)
@@ -925,9 +1065,39 @@ async fn expire_claimed_challenge(
         return Ok(());
     }
 
+    if !decision_source_valid(bot, pool, challenge).await? {
+        return Ok(());
+    }
     let member = bot
         .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
         .await?;
+    if challenge.ban_on_failure {
+        let may_ban = match &member.kind {
+            ChatMemberKind::Restricted(r) => {
+                r.is_member && has_no_permissions(r) && challenge.restriction_applied_at.is_some()
+            }
+            ChatMemberKind::Left => true,
+            ChatMemberKind::Member(_) => challenge.restriction_applied_at.is_none(),
+            ChatMemberKind::Banned(_) => false,
+            _ => {
+                set_status(pool, challenge.id, "overridden").await?;
+                remove_captcha_card(bot, challenge).await;
+                return Ok(());
+            }
+        };
+        if may_ban {
+            // Старый source/normal label проверяются повторно непосредственно перед баном.
+            if !decision_source_valid(bot, pool, challenge).await? {
+                return Ok(());
+            }
+            bot.ban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+                .await?;
+        }
+        set_expired(pool, challenge.id).await?;
+        tracing::warn!(chat_id=challenge.chat_id,user_id=challenge.user_id,challenge_id=%challenge.id,decision_job_id=challenge.decision_job_id,"Decision captcha failed; chat access blocked");
+        remove_captcha_card(bot, challenge).await;
+        return Ok(());
+    }
     match member.kind {
         ChatMemberKind::Restricted(restricted)
             if restricted.is_member
@@ -1025,7 +1195,7 @@ async fn load_user_challenge(
     user_id: i64,
 ) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure,setup_error_kind from telegram_risk_captcha_challenges where chat_id = $1 and telegram_user_id = $2",
     )
     .bind(chat_id)
     .bind(user_id)
@@ -1036,7 +1206,7 @@ async fn load_user_challenge(
 
 async fn load_challenge(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<CaptchaChallenge>> {
     let row = sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure,setup_error_kind from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1049,7 +1219,7 @@ async fn select_challenge_by_id(
     id: Uuid,
 ) -> anyhow::Result<PgRow> {
     Ok(sqlx::query(
-        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts from telegram_risk_captcha_challenges where id = $1",
+        "select id, chat_id, telegram_user_id, question, options, correct_option, restore_permissions, restriction_applied_at, message_id, ephemeral_message_id, expires_at, status, setup_attempts,decision_job_id,ban_on_failure,setup_error_kind from telegram_risk_captcha_challenges where id = $1",
     )
     .bind(id)
     .fetch_one(&mut **tx)
@@ -1071,6 +1241,9 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         expires_at: row.try_get("expires_at")?,
         status: row.try_get("status")?,
         setup_attempts: row.try_get("setup_attempts")?,
+        decision_job_id: row.try_get("decision_job_id")?,
+        ban_on_failure: row.try_get("ban_on_failure")?,
+        setup_error_kind: row.try_get("setup_error_kind")?,
     })
 }
 
@@ -1178,6 +1351,55 @@ pub async fn record_wrong_answer(
             attempts_left: MAX_WRONG_ANSWERS - attempts,
         })
     }
+}
+
+async fn decision_source_valid(
+    bot: &Bot,
+    pool: &PgPool,
+    c: &CaptchaChallenge,
+) -> anyhow::Result<bool> {
+    if matches!(c.status.as_str(), "passed" | "expired") {
+        return Ok(true);
+    }
+    if matches!(c.status.as_str(), "overridden" | "setup_failed") {
+        return Ok(false);
+    }
+    let Some(id) = c.decision_job_id else {
+        return Ok(true);
+    };
+    if crate::features::decision_audit::repo::captcha_source_is_current(
+        pool, id, c.chat_id, c.user_id,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    restore_after_failed_delivery(bot, pool, c).await?;
+    sqlx::query("update telegram_risk_captcha_challenges set status='overridden',setup_error_kind='decision_source_changed',setup_lease_expires_at=null,updated_at=now() where id=$1 and status not in ('passed','expired')")
+        .bind(c.id).execute(pool).await?;
+    remove_captcha_card(bot, c).await;
+    Ok(false)
+}
+
+/// Decision удаляет только собственные проверенные кандидаты, не соседнюю беседу.
+async fn decision_message_ids(
+    pool: &PgPool,
+    c: &CaptchaChallenge,
+    limit: i64,
+) -> anyhow::Result<Vec<i32>> {
+    Ok(sqlx::query_scalar(r#"select distinct m.message_id from telegram_messages m
+        join moderation_decision_jobs j on j.chat_id=m.chat_id and j.message_id=m.message_id and j.user_id=m.user_id
+        where m.chat_id=$1 and m.user_id=$2 and m.source_channel_id is null and m.sender_chat_id is null
+          and m.deleted_by_bot_at is null and j.status='succeeded' and j.shadow_verdict='review_candidate'
+          and j.source_edited_at is not distinct from m.edited_at
+          and encode(sha256(convert_to(coalesce(m.text,''),'UTF8')),'hex')=j.source_hash
+          and (j.id=$3 or j.metrics_json->'captcha_authorized'='true'::jsonb)
+          and m.created_at>now()-interval '24 hours'
+          and not exists(select 1 from moderation_decision_jobs newer where newer.chat_id=j.chat_id
+              and newer.message_id=j.message_id and newer.user_id=j.user_id and newer.id>j.id
+              and newer.status='succeeded' and newer.shadow_verdict<>'review_candidate')
+        order by m.message_id desc limit $4"#)
+        .bind(c.chat_id).bind(c.user_id).bind(c.decision_job_id).bind(limit).fetch_all(pool).await?)
 }
 
 #[cfg(test)]

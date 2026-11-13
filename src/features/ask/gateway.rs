@@ -1,3 +1,4 @@
+use crate::telegram::entities::utf16_range;
 use std::future::Future;
 use teloxide::types::{Message, MessageEntity, MessageEntityKind};
 
@@ -184,25 +185,6 @@ fn matching_mentions(
 
 fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
-}
-
-fn utf16_range(text: &str, offset: usize, length: usize) -> Option<std::ops::Range<usize>> {
-    let end_units = offset.checked_add(length)?;
-    Some(utf16_boundary(text, offset)?..utf16_boundary(text, end_units)?)
-}
-
-fn utf16_boundary(text: &str, target: usize) -> Option<usize> {
-    let mut units = 0usize;
-    for (byte, character) in text.char_indices() {
-        if units == target {
-            return Some(byte);
-        }
-        units = units.checked_add(character.len_utf16())?;
-        if units > target {
-            return None;
-        }
-    }
-    (units == target).then_some(text.len())
 }
 
 #[cfg(test)]

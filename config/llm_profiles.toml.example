@@ -592,6 +592,13 @@ max_corpus_examples = 5000
 
 # Нативный Decisions API; не является generative route и не выдаёт санкции.
 [moderation.decision]
+# shadow — только наблюдения; score_captcha — общие метрики и ephemeral captcha.
+mode = "shadow"
+score_weight = 90
+external_contact_weight = 8
+initial_texts = 1
+ban_on_failure = false
+captcha_max_message_age_sec = 600
 enabled = false
 external_processing_allowed = false
 avatar_enabled = false

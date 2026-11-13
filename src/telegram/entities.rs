@@ -57,3 +57,26 @@ pub fn message_has_links(msg: &Message) -> bool {
                 )
             })
 }
+
+/// Диапазон Telegram entity: offsets/length заданы в UTF-16, не UTF-8 байтах.
+pub(crate) fn utf16_range(
+    text: &str,
+    offset: usize,
+    length: usize,
+) -> Option<std::ops::Range<usize>> {
+    let end = offset.checked_add(length)?;
+    fn boundary(text: &str, target: usize) -> Option<usize> {
+        let mut units = 0usize;
+        for (byte, character) in text.char_indices() {
+            if units == target {
+                return Some(byte);
+            }
+            units = units.checked_add(character.len_utf16())?;
+            if units > target {
+                return None;
+            }
+        }
+        (units == target).then_some(text.len())
+    }
+    Some(boundary(text, offset)?..boundary(text, end)?)
+}

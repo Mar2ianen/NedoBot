@@ -173,6 +173,8 @@ struct TelegramStub {
     non_member: AtomicBool,
     omit_ephemeral_id: AtomicBool,
     restricted: AtomicBool,
+    stateful: AtomicBool,
+    banned: AtomicBool,
 }
 
 async fn telegram_api(
@@ -181,8 +183,30 @@ async fn telegram_api(
     Json(payload): Json<Value>,
 ) -> Json<Value> {
     let method = uri.path().rsplit('/').next().unwrap().to_lowercase();
-    stub.calls.lock().unwrap().push((method.clone(), payload));
+    stub.calls
+        .lock()
+        .unwrap()
+        .push((method.clone(), payload.clone()));
     let result = match method.as_str() {
+        "getchatmember" if stub.banned.load(Ordering::SeqCst) => json!({
+            "status":"kicked","until_date":0,
+            "user":{"id":USER_ID,"is_bot":false,"first_name":"Fixture"}
+        }),
+        "restrictchatmember" if stub.stateful.load(Ordering::SeqCst) => {
+            stub.restricted.store(
+                payload["permissions"]["can_send_messages"] != true,
+                Ordering::SeqCst,
+            );
+            json!(true)
+        }
+        "banchatmember" if stub.stateful.load(Ordering::SeqCst) => {
+            stub.banned.store(true, Ordering::SeqCst);
+            json!(true)
+        }
+        "unbanchatmember" if stub.stateful.load(Ordering::SeqCst) => {
+            stub.banned.store(false, Ordering::SeqCst);
+            json!(true)
+        }
         "getchatmember" if stub.non_member.load(Ordering::SeqCst) => json!({
             "status": "left",
             "user": {"id": USER_ID, "is_bot": false, "first_name": "Fixture"}
@@ -538,6 +562,7 @@ pub async fn assert_cleanup(pool: &PgPool) {
     );
     assert_eq!(stub.calls.lock().unwrap().len(), before_passed);
     assert_non_member_reply(pool, &bot, &job, &stub).await;
+    decision_policy::assert_policy(pool, &bot, &stub).await;
     server.abort();
     query("delete from telegram_risk_captcha_challenges where chat_id = $1")
         .bind(CHAT_ID)
@@ -554,4 +579,9 @@ pub async fn assert_cleanup(pool: &PgPool) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+mod decision_policy {
+    use super::*;
+    include!("decision_captcha.rs");
 }

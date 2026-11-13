@@ -23,7 +23,8 @@ struct Source {
     text: String,
     edited_at: Option<DateTime<Utc>>,
     message_count: i64,
-    first_text_message: bool,
+    text_ordinal: i64,
+    entities: serde_json::Value,
     age_seconds: i64,
     label_id: i64,
     normal_veto: bool,
@@ -52,12 +53,12 @@ pub async fn observe_message(
     }
     let source: Option<Source> = sqlx::query_as(r#"
         select m.user_id,coalesce(m.text,'') as text,m.edited_at,u.message_count,
-          not exists (
-            select 1 from telegram_messages earlier
+          (select count(*)+1 from (select 1 from telegram_messages earlier
             where earlier.chat_id=m.chat_id and earlier.user_id=m.user_id
               and earlier.message_id<m.message_id and earlier.source_channel_id is null
-              and earlier.sender_chat_id is null and nullif(trim(earlier.text),'') is not null
-          ) as first_text_message,
+              and earlier.sender_chat_id is null and nullif(trim(earlier.text),'') is not null limit 10
+          ) prior_texts) as text_ordinal,
+          coalesce(m.raw_json->'entities',m.raw_json->'caption_entities','[]'::jsonb) as entities,
           extract(epoch from (now()-u.first_seen_at))::bigint as age_seconds,
           coalesce(l.id,0) as label_id,coalesce(l.label='not_spam',false) as normal_veto,
           (coalesce(p.is_bot,false) or coalesce(s.is_admin,false)) as trusted,
@@ -85,6 +86,18 @@ pub async fn observe_message(
             )
         })
         .flatten();
+    let contacts = if eligible {
+        super::contacts::extract(
+            pool,
+            chat_id,
+            source.user_id,
+            &source.text,
+            &source.entities,
+        )
+        .await?
+    } else {
+        Default::default()
+    };
     let local_candidate = campaign.is_some();
     let reason = if source.normal_veto {
         "manual_not_spam"
@@ -92,6 +105,8 @@ pub async fn observe_message(
         "trusted"
     } else if !eligible {
         "not_eligible"
+    } else if contacts.external_candidate() {
+        "external_contact"
     } else if local_candidate {
         "local_candidate"
     } else {
@@ -105,21 +120,24 @@ pub async fn observe_message(
     let features = structure::extract(&source.text);
     let source_hash = hash_bytes(source.text.as_bytes());
     let observation = json!({"structure":features,"normalization":prepare_text(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()).flags,
-        "normalization_version":PREPROCESSING_VERSION,"rule":campaign.as_ref().map(|c|&c.rule),"rule_version":deterministic::RULE_VERSION});
+        "external_contacts":contacts,"normalization_version":PREPROCESSING_VERSION,"rule":campaign.as_ref().map(|c|&c.rule),"rule_version":deterministic::RULE_VERSION});
     sqlx::query("insert into moderation_text_observations (instance_id,chat_id,message_id,user_id,source_hash,eligible,reason,local_candidate,features) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (instance_id,chat_id,message_id) do update set source_hash=excluded.source_hash,eligible=excluded.eligible,reason=excluded.reason,local_candidate=excluded.local_candidate,features=excluded.features,observed_at=now()")
         .bind(&config.community.instance.id).bind(chat_id).bind(message_id).bind(source.user_id).bind(&source_hash)
         .bind(eligible).bind(reason).bind(local_candidate).bind(&observation).execute(pool).await?;
-    // Первый авторский текст — контрольная выборка: service/media updates
-    // не расходуют её слот. Следующие тексты — только с конкретным сигналом.
+    // Первые initial_texts авторских текстов проверяются без словарного сигнала;
+    // service/media updates не расходуют слоты. Дальше нужен дешёвый сигнал.
     if !repo::enabled_for_chat(config, chat_id)
         || source.text.trim().is_empty()
-        || (!source.first_text_message && !local_candidate && features.obfuscation_score < 40)
+        || (source.text_ordinal > config.community.moderation.decision.initial_texts
+            && !local_candidate
+            && !contacts.external_candidate()
+            && features.obfuscation_score < 40)
     {
         return Ok(());
     }
     let settings = &config.community.moderation.decision;
     let input = json!({"author_message":crate::features::new_user_analysis::bounded_audit_text_with_limit(Some(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()), settings.max_input_chars),
-        "chat_policy":settings.chat_policy,"structural_features":features,
+        "chat_policy":settings.chat_policy,"structural_features":features,"external_contacts":contacts,"score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
         "configuration_hash":configuration_hash(config)});
     let (avatar_file_id, avatar_unique_id) = match (
         settings.avatar_enabled,
@@ -194,10 +212,11 @@ pub async fn observe_latest_author_message(
 }
 
 pub fn configuration_hash(config: &Config) -> String {
-    hash_bytes(
-        &serde_json::to_vec(&config.community.moderation.decision)
-            .expect("validated serializable decision configuration"),
-    )
+    let moderation = &config.community.moderation;
+    hash_bytes(&serde_json::to_vec(&json!({"decision":moderation.decision,
+        "captcha_enabled":moderation.captcha_enabled,"captcha_dry_run":moderation.captcha_dry_run,
+        "captcha_threshold":moderation.captcha_threshold,"captcha_ttl_sec":moderation.captcha_ttl_sec}))
+        .expect("validated serializable decision configuration"))
 }
 
 pub fn spawn_worker(bot: Bot, pool: PgPool, config: Config) -> anyhow::Result<()> {
@@ -207,6 +226,11 @@ pub fn spawn_worker(bot: Bot, pool: PgPool, config: Config) -> anyhow::Result<()
     let client = DecisionClient::new(&config.community.moderation.decision)?;
     tokio::spawn(async move {
         loop {
+            match super::actions::process_next(&bot, &pool, &config).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => tracing::warn!("Decision captcha outbox operation failed"),
+            }
             let seconds = match process_next(&bot, &pool, &config, &client).await {
                 Ok(true) => continue,
                 Ok(false) => EXTERNAL_ANALYSIS_POLL.idle_seconds(),
