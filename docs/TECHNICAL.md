@@ -136,7 +136,22 @@ Civil date/time и bare clock нормализуются через эту зо�
 
 `LLM_PROXY_URL` остаётся опциональной настройкой для явно проксируемых LLM routes. На текущем `vps-153` все активные routes и Gemini ASR используют прямой egress; Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят.
 
-Для Gemini 3 и новее (включая Gemini 4 Hydrogen) и Gemma 4 genai передаёт `thinkingLevel` и не отправляет устаревшие `temperature` и числовой `thinkingBudget`. Уровни задаются профилем: Hydrogen принимает `low`, `medium`, `high`, `xhigh` (но не `minimal`), Gemma 4 — `minimal` или `high`. Reasoning-токены входят в `maxOutputTokens`, поэтому профиль может задать `thinking_headroom_tokens`: бот отправляет `maxOutputTokens = min(запрошенный лимит + headroom, max_output_tokens профиля)`. Для Hydrogen и всех Gemini 3.x fallback-профилей в `first_comment` это 8192 токена поверх `runtime.llm_max_tokens` (при `llm_max_tokens=140` в API уходит 8332 токена; потолок профилей Gemini 3.x — 16384); для Gemma 4 в `search_extract` — тоже 8192, иначе reasoning может съесть JSON-бюджет и ответ оборвётся на `MAX_TOKENS`. Cloudflare fallback работает без thinking и без headroom. Для старых Gemini-моделей сохраняется `runtime.gemini_thinking_budget` как числовой `thinkingBudget`.
+Для Gemini 3 и новее (включая Gemini 4 Hydrogen) и Gemma 4 genai передаёт `thinkingLevel` и не отправляет устаревшие `temperature` и числовой `thinkingBudget`. Уровни задаются профилем: Hydrogen принимает `low`, `medium`, `high`, `xhigh` (но не `minimal`), Gemma 4 — `minimal` или `high`. Для старых Gemini-моделей сохраняется `runtime.gemini_thinking_budget` как числовой `thinkingBudget`.
+
+**Бюджет генерации и thinking.** `num_predict` — базовый бюджет задачи до добавления `thinking_headroom_tokens`. Провайдер получает общий потолок `maxOutputTokens = min(saturating_add(num_predict, thinking_headroom_tokens), max_output_tokens профиля)`. Reasoning и видимый ответ расходуют этот общий бюджет: headroom не является отдельной зарезервированной квотой и не гарантирует, что модель оставит базовое число токенов на ответ. `max_output_tokens` профиля всегда остаётся жёстким общим потолком; сложение не переполняет `u32`. Без headroom передаётся прежний бюджет.
+
+Для chat-вызовов `OutputBudgetPolicy` определяет совместимость профиля с базовым бюджетом:
+
+| Политика | Выбор fallback | Бюджет перед добавлением headroom |
+| --- | --- | --- |
+| `Fixed` | Профиль с `max_output_tokens < num_predict` исключается | Запрошенный `num_predict` |
+| `AdaptToModel` | Разрешён профиль с меньшим потолком | `min(num_predict, max_output_tokens профиля)` |
+
+Обе политики затем добавляют headroom и ограничивают результат общим потолком профиля. Таким образом, `Fixed` фиксирует базовый бюджет, а не запрещает дополнительный thinking-бюджет. Например, при базе 64, headroom 128 и profile cap 1024 в API уходит 192 для обеих политик. При базе 16384 и profile cap 4096 `Fixed` исключит профиль, а `AdaptToModel` передаст не более 4096, независимо от headroom. Text-вызовы (`generate_text_checked`) также требуют профиль с достаточным cap для базового бюджета, затем добавляют его headroom.
+
+Для Hydrogen и всех Gemini 3.x fallback-профилей `first_comment` headroom равен 8192. В production при `runtime.llm_max_tokens=140` в API уходит **8332**, включая thinking; profile cap Gemini 3.x равен 16384, Hydrogen — 65536. Размер публикуемого комментария независимо проверяет `validate_comment_output`: добавление headroom не разрешает длинные комментарии. Для hosted Gemma 4 в `search_extract` headroom тоже 8192 (при базе 900 — общий лимит 9092, cap 16384). Cloudflare fallback работает без thinking и headroom. Слишком большой reasoning всё равно может исчерпать общий лимит: transport отклоняет text-ответ с `MAX_TOKENS`, а route переходит к доступному fallback.
+
+Для строгого общего лимита задачи следует использовать профиль с `thinking_headroom_tokens=0` либо соответствующим `max_output_tokens`: одна политика `Fixed` общего лимита без надбавки не задаёт. Эти настройки не меняют квоты запросов провайдера и не гарантируют доступность модели после 429. Deployment-профиль обновляется отдельно с резервной копией, preflight установленным `validate_instance_config` и перезапуском; изменение шаблона в Git само по себе работающий процесс не обновляет.
 
 На старте основной сервис и `retry_pending_comments` делают fail-fast проверку секретов для включённых функций:
 
@@ -156,9 +171,9 @@ Civil date/time и bare clock нормализуются через эту зо�
 `ask_action_timeout_sec=180` — одна LLM-попытка, с transport timeout
 из model capabilities (для Groq ask — 180 секунд, для OpenRouter Free — 120 секунд);
 `ask_db_mcp_timeout_sec=30` — один MCP request.
-`ask_llm_max_tokens=16384` задаёт верхний бюджет генерации на один LLM-вызов, включая reasoning.
+`ask_llm_max_tokens=16384` задаёт базовый бюджет legacy `/ask` на один LLM-вызов; конфигурируемый агент берёт его из `AgentProfile.budgets.max_output_tokens`. Общий лимит включает thinking и профильный headroom по правилам выше.
 Для `/ask` каждый выбранный fallback получает динамический параметр
-`min(ask_llm_max_tokens, model.capabilities.max_output_tokens)`: Qwen получает до 16k,
+`min(базовый бюджет, model.capabilities.max_output_tokens)` до добавления headroom. Для ask-профилей без headroom Qwen получает до 16k,
 OpenRouter Free — до 4k, Ollama Minimax — до 8k. Нижний профильный предел больше не
 исключает fallback из route. Для Qwen включён `thinking="level_high"` (effort `high`),
 `ask_max_concurrency=4` — число одновременно исполняемых `/ask` в инстансе.
