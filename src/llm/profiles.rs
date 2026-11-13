@@ -184,8 +184,24 @@ pub struct ModelCapabilities {
     pub structured_output: StructuredOutputMode,
     pub context_window_tokens: u32,
     pub max_output_tokens: u32,
+    /// Дополнительный бюджет на thinking-токены сверх видимого ответа.
+    ///
+    /// Gemini считает reasoning-токены внутри `maxOutputTokens`, поэтому без
+    /// запаса короткий видимый лимит (`runtime.llm_max_tokens`) уходит целиком
+    /// в thinking и ответ обрывается на `MAX_TOKENS`.
+    #[serde(default)]
+    pub thinking_headroom_tokens: u32,
     pub request_timeout_sec: u64,
     pub thinking: ThinkingMode,
+}
+
+impl ModelCapabilities {
+    /// Итоговый `maxOutputTokens` с запасом на thinking, ограниченный profile cap.
+    pub fn effective_max_output_tokens(&self, requested: u32) -> u32 {
+        requested
+            .saturating_add(self.thinking_headroom_tokens)
+            .min(self.max_output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -202,7 +218,9 @@ pub enum ThinkingMode {
     None,
     Default,
     Budget,
+    LevelMinimal,
     LevelLow,
+    LevelMedium,
     LevelHigh,
 }
 
@@ -512,7 +530,10 @@ fn validate_capabilities(
         && matches!(adapter, GenAiAdapter::OpenAi | GenAiAdapter::OpenRouter)
         && matches!(
             capabilities.thinking,
-            ThinkingMode::LevelLow | ThinkingMode::LevelHigh
+            ThinkingMode::LevelMinimal
+                | ThinkingMode::LevelLow
+                | ThinkingMode::LevelMedium
+                | ThinkingMode::LevelHigh
         );
     if capabilities.thinking != ThinkingMode::None
         && !matches!(adapter, GenAiAdapter::Gemini | GenAiAdapter::Groq)
@@ -579,6 +600,160 @@ models = ["ollama_memory"]
                 .unwrap()
                 .fallback_on_validation_failure
         );
+    }
+
+    #[test]
+    fn example_profiles_route_comments_through_hydrogen_and_extract_through_gemma4() {
+        let profiles = LlmProfiles::from_toml(EXAMPLE_PROFILES).unwrap();
+
+        assert_eq!(
+            profiles.routes["first_comment"].models,
+            [
+                "gemini_hydrogen_comment",
+                "gemini_38_comment",
+                "gemini_37_comment",
+                "gemini_comment",
+                "gemini_flash_comment",
+                "gemini_flash_lite_comment",
+            ]
+        );
+        assert!(!profiles.models.contains_key("gemini_gemma4_comment"));
+        let hydrogen = &profiles.models["gemini_hydrogen_comment"];
+        assert_eq!(hydrogen.model, "gemini-4-hydrogen");
+        assert_eq!(hydrogen.capabilities.thinking, ThinkingMode::LevelMedium);
+        assert_eq!(hydrogen.capabilities.thinking_headroom_tokens, 8192);
+        assert_eq!(
+            profiles.models["gemini_38_comment"].capabilities.thinking,
+            ThinkingMode::LevelMedium
+        );
+        assert_eq!(
+            profiles.models["gemini_37_comment"].capabilities.thinking,
+            ThinkingMode::LevelHigh
+        );
+
+        assert_eq!(
+            profiles.routes["search_extract"].models,
+            ["gemini_gemma4_extract", "cloudflare_gemma_search"]
+        );
+        assert!(profiles.routes["search_extract"].fallback_on_validation_failure);
+        let gemma_extract = &profiles.models["gemini_gemma4_extract"];
+        assert_eq!(gemma_extract.model, "gemma-4-31b-it");
+        assert_eq!(gemma_extract.capabilities.thinking, ThinkingMode::LevelHigh);
+        assert_eq!(gemma_extract.capabilities.thinking_headroom_tokens, 8192);
+        let cloudflare_search = &profiles.models["cloudflare_gemma_search"];
+        assert_eq!(cloudflare_search.model, "@cf/google/gemma-4-26b-a4b-it");
+        assert_eq!(
+            cloudflare_search.capabilities.structured_output,
+            StructuredOutputMode::JsonObject
+        );
+        assert_eq!(cloudflare_search.capabilities.thinking, ThinkingMode::None);
+
+        let search_route = profiles
+            .resolve_route(
+                "search_extract",
+                &RouteRequirements {
+                    requires_system_prompt: true,
+                    num_predict: Some(900),
+                    ..RouteRequirements::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(search_route.selections[0].model.model, "gemma-4-31b-it");
+        assert_eq!(
+            search_route.selections[1].model.model,
+            "@cf/google/gemma-4-26b-a4b-it"
+        );
+    }
+
+    #[test]
+    fn production_profile_routes_first_comments_through_hydrogen_and_extract_through_gemma4() {
+        let profiles = LlmProfiles::from_toml(include_str!(
+            "../../config/llm_profiles.toml.production.example"
+        ))
+        .unwrap();
+
+        let route = &profiles.routes["first_comment"];
+        assert_eq!(
+            route.models,
+            [
+                "gemini_hydrogen_comment",
+                "gemini_comment",
+                "gemini_flash_comment",
+                "gemini_flash_lite_comment",
+            ]
+        );
+        assert!(route.fallback_on_validation_failure);
+        assert_eq!(
+            profiles.routes["search_extract"].models,
+            ["gemini_gemma4_extract", "cloudflare_gemma_search"]
+        );
+        assert!(profiles.routes["search_extract"].fallback_on_validation_failure);
+        assert_eq!(
+            profiles.models["gemini_hydrogen_comment"]
+                .capabilities
+                .thinking,
+            ThinkingMode::LevelMedium
+        );
+        assert_eq!(
+            profiles.models["gemini_comment"].capabilities.thinking,
+            ThinkingMode::LevelMedium
+        );
+        assert_eq!(
+            profiles.models["gemini_gemma4_extract"]
+                .capabilities
+                .thinking,
+            ThinkingMode::LevelHigh
+        );
+        assert_eq!(
+            profiles.models["cloudflare_gemma_search"]
+                .capabilities
+                .structured_output,
+            StructuredOutputMode::JsonObject
+        );
+        assert_eq!(
+            profiles.models["cloudflare_gemma_search"]
+                .capabilities
+                .thinking,
+            ThinkingMode::None
+        );
+    }
+
+    #[test]
+    fn thinking_headroom_extends_output_budget_within_model_cap() {
+        let profiles = LlmProfiles::from_toml(VALID_PROFILES).unwrap();
+        let mut capabilities = profiles.models["ollama_memory"].capabilities.clone();
+
+        assert_eq!(capabilities.effective_max_output_tokens(140), 140);
+        capabilities.thinking_headroom_tokens = 2048;
+        assert_eq!(capabilities.effective_max_output_tokens(140), 2188);
+        assert_eq!(capabilities.effective_max_output_tokens(4096), 4096);
+        assert_eq!(capabilities.effective_max_output_tokens(u32::MAX), 4096);
+    }
+
+    #[test]
+    fn thinking_level_names_parse_from_capabilities() {
+        for (name, expected) in [
+            ("level_minimal", ThinkingMode::LevelMinimal),
+            ("level_low", ThinkingMode::LevelLow),
+            ("level_medium", ThinkingMode::LevelMedium),
+            ("level_high", ThinkingMode::LevelHigh),
+        ] {
+            let capabilities: ModelCapabilities = toml::from_str(&format!(
+                r#"
+supports_images = false
+supports_tools = false
+supports_system_prompt = true
+structured_output = "json_schema"
+context_window_tokens = 1024
+max_output_tokens = 256
+request_timeout_sec = 60
+thinking = "{name}"
+"#
+            ))
+            .unwrap();
+            assert_eq!(capabilities.thinking, expected);
+            assert_eq!(capabilities.thinking_headroom_tokens, 0);
+        }
     }
 
     #[test]
@@ -810,7 +985,12 @@ models = ["ollama_memory"]
                 adapter: Some(adapter),
                 egress: Egress::Direct,
             };
-            for thinking in [ThinkingMode::LevelLow, ThinkingMode::LevelHigh] {
+            for thinking in [
+                ThinkingMode::LevelMinimal,
+                ThinkingMode::LevelLow,
+                ThinkingMode::LevelMedium,
+                ThinkingMode::LevelHigh,
+            ] {
                 capabilities.thinking = thinking;
                 validate_capabilities("ask", &provider, &capabilities).unwrap();
             }
@@ -860,6 +1040,7 @@ models = ["ollama_memory"]
         assert_eq!(
             image_models,
             [
+                ("gemini", "gemini-4-hydrogen"),
                 ("gemini", "gemini-3.8-flash"),
                 ("gemini", "gemini-3.7-flash"),
                 ("gemini", "gemini-3.6-flash"),
@@ -881,12 +1062,12 @@ models = ["ollama_memory"]
         assert_eq!(
             text_models,
             [
+                ("gemini", "gemini-4-hydrogen"),
                 ("gemini", "gemini-3.8-flash"),
                 ("gemini", "gemini-3.7-flash"),
                 ("gemini", "gemini-3.6-flash"),
                 ("gemini", "gemini-3.5-flash"),
                 ("gemini", "gemini-3.5-flash-lite"),
-                ("ollama_cloud", "gemma4:31b"),
             ]
         );
     }
