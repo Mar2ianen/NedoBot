@@ -136,7 +136,8 @@ supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 1000000
-max_output_tokens = 8192
+max_output_tokens = 16384
+thinking_headroom_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_medium"
 
@@ -150,7 +151,8 @@ supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 1000000
-max_output_tokens = 8192
+max_output_tokens = 16384
+thinking_headroom_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_high"
 
@@ -164,7 +166,8 @@ supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 1000000
-max_output_tokens = 8192
+max_output_tokens = 16384
+thinking_headroom_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_medium"
 
@@ -178,7 +181,8 @@ supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 1000000
-max_output_tokens = 8192
+max_output_tokens = 16384
+thinking_headroom_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_medium"
 
@@ -207,7 +211,8 @@ supports_tools = true
 supports_system_prompt = true
 structured_output = "json_schema"
 context_window_tokens = 1000000
-max_output_tokens = 8192
+max_output_tokens = 16384
+thinking_headroom_tokens = 8192
 request_timeout_sec = 60
 thinking = "level_medium"
 
