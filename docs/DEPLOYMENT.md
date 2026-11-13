@@ -7,6 +7,59 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+13 ноября 2026 в **06:45:04 UTC / 09:45:04 МСК** завершена установка
+[deploy-2026-11-13-gemini4-pipeline](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-13-gemini4-pipeline),
+source `8e55bcb49257e1a3d9c3b771c5852e78b510cfc9` после
+[PR #120](https://github.com/Mar2ianen/NedoBot/pull/120).
+[Release 43379585364](https://github.com/Mar2ianen/NedoBot/actions/runs/43379585364)
+собрал default-feature artifact на Ubuntu 24.04, glibc ≤ 2.39, deploy=false;
+установка, preflight и health выполнены отдельно по SSH, не deploy-job.
+
+SHA-256 обоих running bots: `15444e04e5c57d2eaa16c45876b526cd3e45f9896eccd1152aabaf74d8fd8fc5`.
+Public MCP: `58837c39fcf663c68923c34b64b624ad022d98d8c12733099056fd1586b944b7`.
+`validate_instance_config`: `dada173e9a8547a538dd06c0bc5fd9cbef986edcb5b2c0bcca43cb579011bf0d`.
+SQL обеих БД подтвердил latest migration `20261112100000`, failed=0.
+
+Единственная config delta — NedoNews profile
+`/etc/tg-ai-bot/llm_profiles.toml` (sha256 до
+`66b6b6ecd4ddc496f78604db4aa3de220b66ad330bf451ab8b89933490b57872`,
+после
+`81fbb56caa3bed5de214e2d7f1df6399b63521f4f4806e96ccf6aa686b5c2534`).
+`first_comment` теперь начинает с Gemini 4 Hydrogen
+(`gemini-4-hydrogen`, `thinkingLevel=medium`, headroom 8192), затем идёт
+прежняя цепочка Gemini 3.6/3.5/3.5-lite с `thinkingLevel=medium`; Ollama
+удалена, `fallback_on_validation_failure=true`. `search_extract` строит
+research-план через hosted Gemma 4 (`gemma-4-31b-it`, `thinkingLevel=high`,
+headroom 8192), затем падает на существующий `cloudflare_gemma_search`
+(`@cf/google/gemma-4-26b-a4b-it`, JSON Object, thinking выключен);
+`fallback_on_validation_failure=true`. PVO profile побайтно сохранён
+(sha256
+`8f09d3587ab603659e8005ba1ced7a50f756f2905b6dc52a1e3d97da85e4dc8b`),
+его `first_comment` остаётся выключенным.
+
+Preflight `validate_instance_config` новым binary прошёл для обоих instance.
+Restart всех трёх unit: active/running, NRestarts=0, running hashes совпали
+с artifact, journal priority err и Rust ERROR отсутствуют; embedding active.
+У `nedonews-mcp` ручной restart сбросил прежний счётчик NRestarts=1 в 0.
+
+**End-to-end smoke — 06:56:26 UTC:** реальный пост создал comment job 1445;
+генерация прошла с первой попытки `gemini-4-hydrogen` (`success`), MCP
+web-search выполнил 4 запроса, комментарий отправлен. Прямой probe
+`gemini-4-hydrogen` с `thinkingLevel=MEDIUM` в 06:52 вернул 429
+`RESOURCE_EXHAUSTED`, но через четыре минуты production-генерация прошла:
+это кратковременный free-tier rate limit, не дневная блокировка. Probe
+`gemma-4-31b-it` с `thinkingLevel=HIGH` вернул 200 STOP,
+`thoughtsTokenCount=68`. При дневном исчерпании квоты comment route штатно
+уходит на Gemini 3.x, а extract — на Cloudflare.
+
+Backup: `/var/backups/nedobot/2026-11-13-gemini4-pipeline`
+(`llm_profiles.toml.before`, `pvo-llm_profiles.toml.before`, rollback
+binaries `tg_ai_bot_teloxide`, `nedonews_mcp_http`,
+`validate_instance_config`). Rollback: вернуть profile и три binary из
+backup, затем restart `tg-ai-bot-teloxide`, `nedobot-pvo` и `nedonews-mcp`.
+
+## Предыдущая выкладка: antispam decision
+
 12 ноября 2026 в **15:02:05 UTC / 18:02:05 МСК** завершена установка
 [deploy-2026-11-12-antispam-decision](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-12-antispam-decision),
 source `86b6df73f10de81e87901040d6ec96a51fb73648` после
