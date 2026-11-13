@@ -7,6 +7,94 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+13 ноября 2026 в **14:55:17 UTC / 17:55:17 МСК** установлен
+[deploy-2026-11-13-decision-score-captcha](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-13-decision-score-captcha),
+source `a0274a48be792661482e85ac3b721cd7420838bb` после
+[PR #124](https://github.com/Mar2ianen/NedoBot/pull/124).
+[Release 43445073812](https://github.com/Mar2ianen/NedoBot/actions/runs/43445073812)
+собрал default-feature artifact на Ubuntu 24.04 с glibc ≤ 2.39, deploy=false.
+Установка и проверки выполнены отдельно по SSH. До установки подтверждены
+ancestry и равенство полного дерева source с merged main `b734cbec`
+(tree `8e4151b61d9cb770fac74af4c65da90db3dd4119`).
+
+**Активная captcha policy включена только в ПВО.** Итоговое состояние:
+
+| Инстанс | Decision | Капча | Порог / TTL | Начальная выборка |
+| --- | --- | --- | --- | --- |
+| ПВО | `score_captcha`, weight 90, contact 8 | enabled, dry-run=false, ban-on-failure=true | 85 / 600 сек | первые 10 авторских текстов |
+| NedoNews | прежний `shadow` | выключена | прежние defaults | прежняя выборка первого текста |
+
+Бюджет обоих инстансов сохранён: 30 API attempts/hour, bounded backlog 100.
+Новых credentials, публичных views или MCP grants нет. Формула, source gates,
+ограничения и результаты небольшого API benchmark: [Decision scoring](DECISION_SCORING.md).
+
+| Артефакт | SHA-256 |
+| --- | --- |
+| Оба running bots | `8182409c286fc852cbe1e068e7e119dbddcbcd2eb348dfb6260a3b18e6f9412e` |
+| Public MCP | `ef13f7d00e930938f297dcf38f5d05eb5f9a07d372aa0e84c7a0643730a833bb` |
+| Internal `chat_db_mcp` обоих инстансов | `eb787f5c8b01156c35406a7638c1e9b46399365891fa47351e71d58422c5b2ed` |
+| `validate_instance_config` | `b21a24c0bdf133c980b5b27616353eebc9db892e9e61b66e2344a781c7075b38` |
+
+Обе БД получили additive migrations `20261113130000`, `20261113131500`;
+проверены latest `20261113131500`, failed=0 и прирост ledger ровно на две строки.
+До установки оба proposed profile прошли staged `validate_instance_config`
+с фактическим окружением процессов. Эта проверка локальная: она **не проверяет
+Telegram admin permissions**. Перед включением captcha обязательно отдельно
+подтвердить `can_delete_messages` и `can_restrict_members` для нужного чата.
+
+При первоначальном включении капчи в NedoNews startup permission check
+отклонил запуск: у бота нет этих прав. До исправления systemd накопил
+19 автоматических рестартов. В **14:57:06 UTC / 17:57:06 МСК** его профиль
+восстановлен побайтно из backup, капча выключена, Decision снова shadow.
+SQL подтвердил **0 Decision actions и 0 Decision challenges** в NedoNews.
+Текущий binary и additive migration ledger сохранены; новая active policy там
+не включена. Этот инцидент нельзя описывать как `NRestarts=0` для всех units.
+
+Итоговый SHA профиля ПВО:
+`42db19210164b18fdf7869ff6fed3135ee6f52d6388531c11d42056e1928b883`.
+Профиль NedoNews совпадает с исходным:
+`7a8e3a99f01e198f8e04bbcc6061a605b5d86565f911fa68d76cc888ba14e1d3`.
+В ПВО изменены только шесть Decision scoring/sampling полей; существующие
+captcha enabled/dry-run/threshold/TTL сохранены. Секреты и остальные routes не менялись.
+
+SSH health в **14:58:48 UTC / 17:58:48 МСК** подтвердил все три units
+active/running и exe SHA против artifact. ПВО и public MCP: `NRestarts=0`,
+окно после старта 212 секунд. NedoNews: `NRestarts=19` после описанного инцидента,
+102 секунды после восстановления, счётчик больше не растёт. В общем окне
+**14:57:06–14:58:48 UTC** Rust ERROR=0, journal priority err=0; embedding unit active.
+Это отдельно измеренное SSH-окно, а не десятиминутный health из CI.
+Read-only smoke обоих stdio MCP подтвердил own SELECT и отказ foreign/private/
+forged scope. Настоящая PostgreSQL RO роль читает reviewed view, но не базовые
+таблицы, memory, scope, Decision/observations/budget и не пишет через view.
+
+Оба CI финального head зелёные:
+[43445051244](https://github.com/Mar2ianen/NedoBot/actions/runs/43445051244),
+[43445060753](https://github.com/Mar2ianen/NedoBot/actions/runs/43445060753).
+Локально: fmt, 624 workspace tests, strict Clippy, fresh PostgreSQL lifecycle
+suite, 2 MCP PostgreSQL tests, 3 manual-moderation tests. Последние два набора
+также повторены в CI финального head.
+
+Root-only evidence/backup:
+`/var/backups/nedobot/2026-11-13-decision-score-captcha` — профили, binary обоих
+инстансов, schema и data-only snapshots затронутых moderation tables обеих БД,
+source proof, checksums, preflight/install/migration logs, receipt восстановления
+NedoNews. Это backup затронутых таблиц, **не полный дамп всех сообщений**.
+Небольшой native SDK benchmark без Telegram actions сохранён отдельно в
+`/var/backups/nedobot/2026-11-13-decision-score-eval`.
+
+Migration-compatible rollback artifact со старым runtime и обеими миграциями:
+source `b4e7b4494ca19387d2f213ab27761a4664ab1c21`,
+[release 43442703444](https://github.com/Mar2ianen/NedoBot/actions/runs/43442703444),
+проверен на VPS в `/var/tmp/nedobot-release-b4e7b44`; старый `migrate` успешно
+проверил новый ledger в локальной тестовой БД. При rollback active policy
+восстановить **только профиль ПВО** и атомарно установить совместимые binaries
+только в `/opt/nedobot-pvo/target/release`, перезапустить только `nedobot-pvo`.
+NedoNews больше не менять; общий installer затрагивает оба инстанса и для такого
+частичного rollback не подходит. Applied migrations не удалять. Binary
+предыдущей выкладки без новых embedded migrations использовать нельзя.
+
+## Предыдущая выкладка: author text audit
+
 13 ноября 2026 в **09:00:19 UTC / 12:00:19 МСК** установлен
 [deploy-2026-11-13-author-text-audit](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-13-author-text-audit),
 source `4cf97b5ea6daa1a2ddc2c7123cd4f87eb0dc8f05` после
