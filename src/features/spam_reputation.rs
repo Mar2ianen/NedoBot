@@ -1,11 +1,19 @@
-use std::{collections::HashSet, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use anyhow::Context;
-use sqlx::{PgPool, QueryBuilder, Row, SqlitePool, sqlite::SqlitePoolOptions};
+use anyhow::{Context, bail};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, QueryBuilder, Row};
 
 #[derive(Clone)]
 pub struct SpamReputationStore {
-    pool: SqlitePool,
+    path: PathBuf,
+    lock_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,61 +22,49 @@ pub struct SyncSummary {
     pub source_decision_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Ledger {
+    version: u8,
+    decisions: Vec<Decision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Decision {
+    instance_id: String,
+    telegram_user_id: i64,
+    is_spammer: bool,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            decisions: Vec::new(),
+        }
+    }
+}
+
 impl SpamReputationStore {
     pub async fn connect(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
+        let path = path.as_ref().to_owned();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("create spam reputation directory {}", parent.display())
             })?;
         }
-
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(10))
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .with_context(|| format!("open shared spam reputation database {}", path.display()))?;
-
-        sqlx::query(
-            "create table if not exists spammer_decisions (
-                instance_id text not null,
-                telegram_user_id integer not null,
-                is_spammer integer not null check (is_spammer in (0, 1)),
-                updated_at integer not null default (cast(strftime('%s', 'now') as integer)),
-                primary key (instance_id, telegram_user_id)
-            )",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query(
-            "create index if not exists spammer_decisions_active_idx
-             on spammer_decisions (telegram_user_id, instance_id) where is_spammer = 1",
-        )
-        .execute(&pool)
-        .await?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(path, permissions)
-                .await
-                .with_context(|| {
-                    format!(
-                        "restrict permissions on spam reputation database {}",
-                        path.display()
-                    )
-                })?;
-        }
-
-        Ok(Self { pool })
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let store = Self {
+            path,
+            lock_path: PathBuf::from(lock_path),
+        };
+        let path_for_init = store.path.clone();
+        let lock_for_init = store.lock_path.clone();
+        tokio::task::spawn_blocking(move || {
+            with_ledger(&path_for_init, &lock_for_init, true, |_| Ok(()))
+        })
+        .await??;
+        Ok(store)
     }
 
     pub async fn synchronize_instance(
@@ -125,59 +121,146 @@ impl SpamReputationStore {
         instance_id: &str,
         local_decisions: &[(i64, bool)],
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let previously_active = sqlx::query_scalar::<_, i64>(
-            "select telegram_user_id from spammer_decisions
-             where instance_id = ? and is_spammer = 1",
-        )
-        .bind(instance_id)
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .collect::<HashSet<_>>();
+        let path = self.path.clone();
+        let lock_path = self.lock_path.clone();
+        let instance_id = instance_id.to_owned();
+        let local_decisions = local_decisions.to_vec();
+        tokio::task::spawn_blocking(move || {
+            with_ledger(&path, &lock_path, true, |ledger| {
+                let previous_active = ledger
+                    .decisions
+                    .iter()
+                    .filter(|decision| decision.instance_id == instance_id && decision.is_spammer)
+                    .map(|decision| decision.telegram_user_id)
+                    .collect::<HashSet<_>>();
 
-        for (telegram_user_id, is_spammer) in local_decisions {
-            if *is_spammer {
-                sqlx::query(
-                    "insert into spammer_decisions (instance_id, telegram_user_id, is_spammer)
-                     values (?, ?, 1)
-                     on conflict (instance_id, telegram_user_id) do update set
-                         is_spammer = 1,
-                         updated_at = cast(strftime('%s', 'now') as integer)
-                     where spammer_decisions.is_spammer <> 1",
-                )
-                .bind(instance_id)
-                .bind(telegram_user_id)
-                .execute(&mut *tx)
-                .await?;
-            } else if previously_active.contains(telegram_user_id) {
-                sqlx::query(
-                    "update spammer_decisions
-                     set is_spammer = 0, updated_at = cast(strftime('%s', 'now') as integer)
-                     where instance_id = ? and telegram_user_id = ? and is_spammer = 1",
-                )
-                .bind(instance_id)
-                .bind(telegram_user_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-        tx.commit().await?;
+                for (telegram_user_id, is_spammer) in local_decisions {
+                    let existing = ledger.decisions.iter_mut().find(|decision| {
+                        decision.instance_id == instance_id
+                            && decision.telegram_user_id == telegram_user_id
+                    });
+                    if is_spammer {
+                        match existing {
+                            Some(decision) => decision.is_spammer = true,
+                            None => ledger.decisions.push(Decision {
+                                instance_id: instance_id.clone(),
+                                telegram_user_id,
+                                is_spammer: true,
+                            }),
+                        }
+                    } else if previous_active.contains(&telegram_user_id)
+                        && let Some(decision) = existing
+                    {
+                        decision.is_spammer = false;
+                    }
+                }
+                ledger.decisions.sort_by(|left, right| {
+                    (&left.instance_id, left.telegram_user_id)
+                        .cmp(&(&right.instance_id, right.telegram_user_id))
+                });
+                Ok(())
+            })
+        })
+        .await??;
         Ok(())
     }
 
     async fn active_decisions(&self) -> anyhow::Result<Vec<(i64, String)>> {
-        let rows = sqlx::query(
-            "select telegram_user_id, instance_id from spammer_decisions
-             where is_spammer = 1 order by telegram_user_id, instance_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get("telegram_user_id"), row.get("instance_id")))
-            .collect())
+        let path = self.path.clone();
+        let lock_path = self.lock_path.clone();
+        tokio::task::spawn_blocking(move || {
+            with_ledger(&path, &lock_path, false, |ledger| {
+                Ok(ledger
+                    .decisions
+                    .iter()
+                    .filter(|decision| decision.is_spammer)
+                    .map(|decision| (decision.telegram_user_id, decision.instance_id.clone()))
+                    .collect())
+            })
+        })
+        .await?
     }
+}
+
+fn with_ledger<T>(
+    path: &Path,
+    lock_path: &Path,
+    write: bool,
+    operation: impl FnOnce(&mut Ledger) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .with_context(|| format!("open spam reputation lock {}", lock_path.display()))?;
+    if write {
+        FileExt::lock_exclusive(&lock)?;
+    } else {
+        FileExt::lock_shared(&lock)?;
+    }
+    set_private_permissions(lock_path)?;
+
+    let mut ledger = match fs::read(path) {
+        Ok(bytes) if bytes.starts_with(b"SQLite format 3\0") => bail!(
+            "{} is a legacy SQLite reputation database; export it with scripts/export_spam_reputation.py before starting this version",
+            path.display()
+        ),
+        Ok(bytes) => serde_json::from_slice::<Ledger>(&bytes)
+            .with_context(|| format!("parse spam reputation ledger {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read spam reputation ledger {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        ledger.version == 1,
+        "unsupported spam reputation ledger version"
+    );
+    let before = ledger.clone();
+    let result = operation(&mut ledger)?;
+    if write && ledger != before {
+        ledger.decisions.sort_by(|left, right| {
+            (&left.instance_id, left.telegram_user_id)
+                .cmp(&(&right.instance_id, right.telegram_user_id))
+        });
+        write_ledger_atomically(path, &ledger)?;
+    } else if write && !path.exists() {
+        write_ledger_atomically(path, &ledger)?;
+    }
+    FileExt::unlock(&lock)?;
+    Ok(result)
+}
+
+fn write_ledger_atomically(path: &Path, ledger: &Ledger) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(&mut temporary, ledger)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    set_private_permissions(temporary.path())?;
+    temporary
+        .persist(path)
+        .with_context(|| format!("replace spam reputation ledger {}", path.display()))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 async fn replace_postgres_snapshot(
@@ -223,6 +306,8 @@ async fn replace_postgres_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::SpamReputationStore;
@@ -230,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn unions_sources_and_retracts_only_the_source_that_changed() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("shared.sqlite");
+        let path = directory.path().join("shared.json");
         let main = SpamReputationStore::connect(&path).await.unwrap();
         let pvo = SpamReputationStore::connect(&path).await.unwrap();
 
@@ -256,11 +341,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_without_changes_is_idempotent() {
+    async fn polling_without_changes_is_idempotent_and_file_is_private() {
         let directory = tempdir().unwrap();
-        let store = SpamReputationStore::connect(directory.path().join("shared.sqlite"))
-            .await
-            .unwrap();
+        let path = directory.path().join("shared.json");
+        let store = SpamReputationStore::connect(&path).await.unwrap();
 
         for _ in 0..3 {
             store
@@ -273,5 +357,27 @@ mod tests {
             store.active_decisions().await.unwrap(),
             vec![(7, "main".to_string())]
         );
+        assert!(fs::read_to_string(path).unwrap().contains("\"version\":1"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&store.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_sqlite_file_instead_of_overwriting_it() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        fs::write(&path, b"SQLite format 3\0legacy data").unwrap();
+        let error = match SpamReputationStore::connect(&path).await {
+            Ok(_) => panic!("legacy database must not be overwritten"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("legacy SQLite"));
+        assert!(fs::read(&path).unwrap().starts_with(b"SQLite format 3\0"));
     }
 }

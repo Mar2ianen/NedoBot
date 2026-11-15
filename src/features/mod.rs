@@ -36,6 +36,7 @@ pub mod search;
 pub mod service_message_cleanup;
 #[cfg(feature = "spam-sync")]
 pub mod spam_reputation;
+#[cfg(feature = "moderation")]
 pub mod spam_review;
 pub mod spammer_avatar_embeddings;
 pub mod stats;

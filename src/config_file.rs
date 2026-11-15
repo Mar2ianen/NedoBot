@@ -362,7 +362,8 @@ pub struct SpamReputationConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub sqlite_path: Option<String>,
+    #[serde(alias = "sqlite_path")]
+    pub ledger_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

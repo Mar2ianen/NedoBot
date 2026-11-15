@@ -616,7 +616,7 @@ enabled = false
 
 [spam_reputation]
 enabled = false
-sqlite_path = "/var/lib/nedobot/spam-reputation.sqlite"
+ledger_path = "/var/lib/nedobot/spam-reputation.json"
 
 [voice]
 enabled = false

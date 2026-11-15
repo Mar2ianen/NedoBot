@@ -1,6 +1,5 @@
 use std::{collections::HashSet, time::Duration};
 
-use sqlx::PgPool;
 use teloxide::{net::Download, prelude::*, types::FileId};
 
 use crate::{
@@ -15,7 +14,7 @@ use crate::{
 pub fn spawn_worker(bot: Bot, state: AppState) {
     tokio::spawn(async move {
         loop {
-            match process_next_job(&bot, &state.pool).await {
+            match process_next_job(&bot, &state).await {
                 Ok(true) => continue,
                 Ok(false) => tokio::time::sleep(Duration::from_secs(3)).await,
                 Err(error_kind) => {
@@ -27,8 +26,8 @@ pub fn spawn_worker(bot: Bot, state: AppState) {
     });
 }
 
-async fn process_next_job(bot: &Bot, pool: &PgPool) -> Result<bool, &'static str> {
-    let job = claim_next_qr_scan_job(pool)
+async fn process_next_job(bot: &Bot, state: &AppState) -> Result<bool, &'static str> {
+    let job = claim_next_qr_scan_job(&state.pool)
         .await
         .map_err(|_| "claim_failed")?;
     let Some(job) = job else {
@@ -36,10 +35,10 @@ async fn process_next_job(bot: &Bot, pool: &PgPool) -> Result<bool, &'static str
     };
 
     let processing =
-        tokio::time::timeout(Duration::from_secs(120), process_job(bot, pool, &job)).await;
+        tokio::time::timeout(Duration::from_secs(120), process_job(bot, state, &job)).await;
     match processing {
         Ok(Ok(Some(reference_count))) => {
-            finish_qr_scan_job(pool, &job, Some(reference_count), None)
+            finish_qr_scan_job(&state.pool, &job, Some(reference_count), None)
                 .await
                 .map_err(|_| "finish_failed")?;
             tracing::debug!(
@@ -55,7 +54,7 @@ async fn process_next_job(bot: &Bot, pool: &PgPool) -> Result<bool, &'static str
             );
         }
         Ok(Err(error_kind)) => {
-            finish_qr_scan_job(pool, &job, None, Some(error_kind))
+            finish_qr_scan_job(&state.pool, &job, None, Some(error_kind))
                 .await
                 .map_err(|_| "finish_failed")?;
             tracing::warn!(
@@ -65,7 +64,7 @@ async fn process_next_job(bot: &Bot, pool: &PgPool) -> Result<bool, &'static str
             );
         }
         Err(_) => {
-            finish_qr_scan_job(pool, &job, None, Some("processing_timeout"))
+            finish_qr_scan_job(&state.pool, &job, None, Some("processing_timeout"))
                 .await
                 .map_err(|_| "finish_failed")?;
             tracing::warn!(job_id = job.id, "QR message evidence scan timed out");
@@ -76,9 +75,10 @@ async fn process_next_job(bot: &Bot, pool: &PgPool) -> Result<bool, &'static str
 
 async fn process_job(
     bot: &Bot,
-    pool: &PgPool,
+    state: &AppState,
     job: &QrScanJob,
 ) -> Result<Option<usize>, &'static str> {
+    let pool = &state.pool;
     let file = bot
         .get_file(FileId(job.file_id.clone()))
         .await
@@ -118,7 +118,34 @@ async fn process_job(
         }
     }
 
-    replace_qr_evidence_for_job(pool, job, &urls)
+    let materialized = replace_qr_evidence_for_job(pool, job, &urls)
         .await
-        .map_err(|_| "evidence_write_failed")
+        .map_err(|_| "evidence_write_failed")?;
+    if materialized.is_some() {
+        let user_id: Option<i64> = sqlx::query_scalar(
+            "select user_id from public.telegram_messages where chat_id = $1 and message_id = $2",
+        )
+        .bind(job.chat_id)
+        .bind(job.message_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| "message_lookup_failed")?
+        .flatten();
+        if let Some(user_id) = user_id {
+            let url_feed = state.url_feed_snapshot.read().await.clone();
+            if let Err(error) =
+                crate::features::new_user_analysis::refresh_url_shadow_observation_from_links(
+                    pool,
+                    &state.config,
+                    job.chat_id,
+                    user_id,
+                    url_feed.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(%error, chat_id = job.chat_id, user_id, "failed to refresh URL shadow after QR evidence materialization");
+            }
+        }
+    }
+    Ok(materialized)
 }

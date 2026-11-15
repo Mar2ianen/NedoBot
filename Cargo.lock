@@ -51,20 +51,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "aquamarine"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f50776554130342de4836ba542aa85a4ddb361690d7e8df13774d7284c3d5c2"
-dependencies = [
- "include_dir",
- "itertools",
- "proc-macro-error2",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1527,25 +1513,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "include_dir"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
-dependencies = [
- "include_dir_macros",
-]
-
-[[package]]
-name = "include_dir_macros"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
-dependencies = [
- "proc-macro2",
- "quote",
-]
-
-[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1573,15 +1540,6 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
-
-[[package]]
-name = "itertools"
-version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
 
 [[package]]
 name = "itoa"
@@ -1762,7 +1720,6 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
- "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -1942,7 +1899,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "quircs",
- "teloxide-url",
+ "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=b3897a91aad4b4d8a44aade68977c33dc3ad6a04)",
 ]
 
 [[package]]
@@ -2292,27 +2249,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
 dependencies = [
  "elliptic-curve",
-]
-
-[[package]]
-name = "proc-macro-error-attr2"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
-dependencies = [
- "proc-macro2",
- "quote",
-]
-
-[[package]]
-name = "proc-macro-error2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
-dependencies = [
- "proc-macro-error-attr2",
- "proc-macro2",
- "quote",
 ]
 
 [[package]]
@@ -3561,9 +3497,8 @@ checksum = "07dd1d452d2c3dc94a4e1c5c3c9a3cc88c2ef5926674b75881e454c4dc3a14c4"
 [[package]]
 name = "teloxide"
 version = "0.21.0-rc.1"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=91ec68b19efd5e490fb27341a039ce0175b16929#91ec68b19efd5e490fb27341a039ce0175b16929"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=f05b90be#f05b90be40e9838e009281182abfcc3db2319c41"
 dependencies = [
- "aquamarine",
  "bytes",
  "derive_more",
  "dptree",
@@ -3587,7 +3522,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=b3897a91aad4b4d8a44aade68977c33dc3ad6a04#b3897a91aad4b4d8a44aade68977c33dc3ad6a04"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=934dd89#934dd8936b6c430339a7be0121a1f33f4dcbc08b"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3596,7 +3531,7 @@ dependencies = [
  "serde",
  "serde_json",
  "teloxide-statistics",
- "teloxide-url",
+ "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=934dd89)",
  "tracing",
  "unicode-normalization",
  "unicode-properties",
@@ -3606,7 +3541,7 @@ dependencies = [
 [[package]]
 name = "teloxide-core"
 version = "0.17.0-rc.1"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=91ec68b19efd5e490fb27341a039ce0175b16929#91ec68b19efd5e490fb27341a039ce0175b16929"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=f05b90be#f05b90be40e9838e009281182abfcc3db2319c41"
 dependencies = [
  "bitflags",
  "bytes",
@@ -3638,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "teloxide-macros"
 version = "0.11.2-rc.1"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=91ec68b19efd5e490fb27341a039ce0175b16929#91ec68b19efd5e490fb27341a039ce0175b16929"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=f05b90be#f05b90be40e9838e009281182abfcc3db2319c41"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3659,10 +3594,19 @@ dependencies = [
 [[package]]
 name = "teloxide-url"
 version = "0.1.0"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=b3897a91aad4b4d8a44aade68977c33dc3ad6a04#b3897a91aad4b4d8a44aade68977c33dc3ad6a04"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=934dd89#934dd8936b6c430339a7be0121a1f33f4dcbc08b"
 dependencies = [
  "linkify",
  "teloxide",
+ "url",
+]
+
+[[package]]
+name = "teloxide-url"
+version = "0.1.0"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=b3897a91aad4b4d8a44aade68977c33dc3ad6a04#b3897a91aad4b4d8a44aade68977c33dc3ad6a04"
+dependencies = [
+ "linkify",
  "url",
 ]
 
@@ -3690,6 +3634,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dotenvy",
+ "fs2",
  "genai",
  "jiff",
  "nedobot-qr",
@@ -3702,7 +3647,7 @@ dependencies = [
  "teloxide",
  "teloxide-antispam",
  "teloxide-statistics",
- "teloxide-url",
+ "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=934dd89)",
  "tempfile",
  "tokio",
  "toml",

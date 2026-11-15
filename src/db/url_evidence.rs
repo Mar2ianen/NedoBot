@@ -5,7 +5,7 @@ use teloxide_url::{
     Found, Kind, Source, TelegramLink, TelegramPeer, parse_telegram_link, parse_url,
 };
 
-pub const URL_EVIDENCE_PARSER_VERSION: i16 = 1;
+pub const URL_EVIDENCE_PARSER_VERSION: i16 = 2;
 pub const MAX_QR_URLS_PER_MESSAGE: usize = 64;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -201,10 +201,13 @@ fn encode(found: &Found, index: usize) -> anyhow::Result<EvidenceRow> {
     let parsed = (found.kind == Kind::Url)
         .then(|| parse_url(&found.value))
         .flatten();
-    let normalized = parsed
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| found.value.trim().to_lowercase());
+    let normalized = match found.kind {
+        Kind::UserId(id) => format!("telegram-user-id:{id}"),
+        _ => parsed
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| found.value.trim().to_lowercase()),
+    };
     let mut digest = Sha256::new();
     digest.update(b"nedobot-url-evidence-v1\0");
     digest.update(kind.as_bytes());
@@ -254,6 +257,26 @@ fn encode(found: &Found, index: usize) -> anyhow::Result<EvidenceRow> {
         display_hint,
         privacy_sensitive: telegram_sensitive || url_sensitive,
     })
+}
+
+#[cfg(test)]
+mod target_identity_tests {
+    use teloxide_url::{Found, Kind};
+
+    use super::encode;
+
+    #[test]
+    fn native_user_mentions_hash_the_telegram_id_not_the_visible_label() {
+        let alice_42 = encode(&Found::new("Alice", Kind::UserId(42)), 0).unwrap();
+        let alice_43 = encode(&Found::new("Alice", Kind::UserId(43)), 0).unwrap();
+        let different_label_same_id = encode(&Found::new("A.", Kind::UserId(42)), 0).unwrap();
+
+        assert_ne!(alice_42.target_sha256, alice_43.target_sha256);
+        assert_eq!(
+            alice_42.target_sha256,
+            different_label_same_id.target_sha256
+        );
+    }
 }
 
 fn source_name(source: Source) -> &'static str {
@@ -367,11 +390,11 @@ async fn materialize_message_url_evidence(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut delete = sqlx::query(
-        "delete from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version = $3",
+        "delete from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version <= $3",
     );
     if qr_urls.is_none() {
         delete = sqlx::query(
-            "delete from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version = $3 and source <> 'qr'",
+            "delete from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version <= $3 and (parser_version < $3 or source <> 'qr')",
         );
     }
     delete

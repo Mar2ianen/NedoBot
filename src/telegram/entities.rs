@@ -67,6 +67,7 @@ pub fn message_url_targets(msg: &Message) -> Vec<teloxide_url::Found> {
 }
 
 /// Диапазон Telegram entity: offsets/length заданы в UTF-16, не UTF-8 байтах.
+#[cfg(any(feature = "ask", feature = "moderation"))]
 pub(crate) fn utf16_range(
     text: &str,
     offset: usize,

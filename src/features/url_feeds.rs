@@ -58,6 +58,7 @@ impl FeedSnapshot {
         raw: &str,
     ) -> Result<Self, &'static str> {
         let mut entries = HashSet::new();
+        let mut evidence_hashes = HashSet::new();
         if raw.len() > 64 * 1024 * 1024 {
             return Err("feed too large");
         }
@@ -96,6 +97,9 @@ impl FeedSnapshot {
                     host.to_owned()
                 }
             };
+            if scope == MatchScope::ExactUrl {
+                evidence_hashes.insert(url_evidence_hash(&item));
+            }
             entries.insert(item);
         }
         Ok(Self {
@@ -106,7 +110,7 @@ impl FeedSnapshot {
             max_age_seconds,
             scope,
             entries,
-            evidence_hashes: HashSet::new(),
+            evidence_hashes,
         })
     }
 

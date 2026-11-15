@@ -28,6 +28,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
 
 use crate::community::ChatRegistry;
 use crate::config_file::{CommunityConfig, RiskProfile, TelegramIdRiskModel};
+#[cfg(feature = "ask")]
 use crate::features::ask::profile::AgentProfile;
 use crate::features::chat_read_api::types::ChatReadScope;
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
@@ -49,6 +50,7 @@ pub struct Config {
     pub post_signature_aliases: Vec<String>,
     pub llm_profiles_path: Option<String>,
     pub llm_profiles: Option<LlmProfiles>,
+    #[cfg(feature = "ask")]
     pub agent_profile: Option<AgentProfile>,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
@@ -164,6 +166,7 @@ impl Config {
         )
     }
 
+    #[cfg(feature = "ask")]
     pub fn ask_agent_route(&self) -> &str {
         self.agent_profile
             .as_ref()
@@ -332,6 +335,7 @@ impl Config {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("LLM profiles are not configured"))?;
         let community = community_config_from_profiles(profiles)?;
+        #[cfg(feature = "ask")]
         let agent_profile = if community.ask.agent_profile.is_some()
             || community.ask.enabled
             || runtime.ask_enabled
@@ -412,6 +416,7 @@ impl Config {
             post_signature_aliases,
             llm_profiles_path,
             llm_profiles,
+            #[cfg(feature = "ask")]
             agent_profile,
             llm_temperature: runtime.llm_temperature,
             llm_max_tokens: runtime.llm_max_tokens,
@@ -599,6 +604,11 @@ impl Config {
             );
             config.embedding_spam_model = Some(std::sync::Arc::new(model));
         }
+        #[cfg(not(feature = "moderation"))]
+        if config.community.moderation.reputation_enabled {
+            anyhow::bail!("moderation.reputation_enabled requires cargo feature moderation");
+        }
+        #[cfg(feature = "moderation")]
         if config.community.moderation.reputation_enabled {
             let path = config
                 .community
@@ -665,6 +675,7 @@ impl Config {
                     .to_string(),
             );
         }
+        #[cfg(feature = "ask")]
         if self.ask_enabled {
             let missing_ask_chat_invites = self
                 .community
@@ -706,7 +717,11 @@ impl Config {
             || gateway.reply_to_bot_enabled
             || gateway.private_messages_enabled
         {
-            if !self.ask_enabled || self.agent_profile.is_none() {
+            #[cfg(feature = "ask")]
+            let missing_agent_profile = self.agent_profile.is_none();
+            #[cfg(not(feature = "ask"))]
+            let missing_agent_profile = true;
+            if !self.ask_enabled || missing_agent_profile {
                 errors.push(
                     "ask.gateway requires ask.enabled=true and a valid AgentProfile".to_string(),
                 );
@@ -758,6 +773,7 @@ impl Config {
             errors.push("LLM_PROFILES_PATH must configure authoritative LLM routes".to_string());
         }
 
+        #[cfg(feature = "ask")]
         if let Some(profile) = &self.agent_profile {
             let compiled_tools = crate::features::ask::mcp_client::compiled_agent_tool_names();
             for tool in &profile.tool_allowlist {
@@ -842,6 +858,7 @@ impl Config {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
 
+        #[cfg(feature = "ask")]
         if self.ask_enabled {
             if self.owner_telegram_id.is_none() {
                 errors.push("ASK_ENABLED=true requires OWNER_TELEGRAM_ID".to_string());
@@ -962,6 +979,7 @@ impl Config {
                 ));
             }
         }
+        #[cfg(feature = "ask")]
         if self.ask_enabled {
             for requires_images in [false, true] {
                 routes.push((
@@ -1590,20 +1608,20 @@ fn validate_community_config(
     if community.spam_reputation.enabled
         && community
             .spam_reputation
-            .sqlite_path
+            .ledger_path
             .as_deref()
             .is_none_or(|path| path.trim().is_empty())
     {
-        anyhow::bail!("spam_reputation.enabled=true requires sqlite_path");
+        anyhow::bail!("spam_reputation.enabled=true requires ledger_path");
     }
     if community.spam_reputation.enabled {
         let path = community
             .spam_reputation
-            .sqlite_path
+            .ledger_path
             .as_deref()
             .expect("enabled spam reputation config was checked above");
         if !std::path::Path::new(path).is_absolute() {
-            anyhow::bail!("spam_reputation.sqlite_path must be an absolute path");
+            anyhow::bail!("spam_reputation.ledger_path must be an absolute path");
         }
         require_compiled_feature("spam-sync", cfg!(feature = "spam-sync"))?;
     }
@@ -2004,6 +2022,7 @@ mod tests {
             post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
+            #[cfg(feature = "ask")]
             agent_profile: None,
             llm_temperature: 0.35,
             llm_max_tokens: 90,
@@ -2737,13 +2756,13 @@ models = ["primary", "fallback"]
 
     #[cfg(feature = "spam-sync")]
     #[test]
-    fn spam_reputation_requires_an_absolute_sqlite_path() {
+    fn spam_reputation_requires_an_absolute_ledger_path() {
         let mut config = config();
         config.community.spam_reputation.enabled = true;
-        config.community.spam_reputation.sqlite_path = Some("var/spammers.sqlite".to_string());
+        config.community.spam_reputation.ledger_path = Some("var/spammers.json".to_string());
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
-        assert!(error.contains("spam_reputation.sqlite_path must be an absolute path"));
+        assert!(error.contains("spam_reputation.ledger_path must be an absolute path"));
     }
 }

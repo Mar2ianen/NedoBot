@@ -12,7 +12,9 @@ use teloxide::{
     prelude::{Bot, Requester},
     types::ChatId,
 };
-use teloxide_url::{TelegramLink, TelegramPeer, find_urls, parse_telegram_link};
+use teloxide_url::{
+    Found, Kind, Source, TelegramLink, TelegramPeer, find_urls, parse_telegram_link,
+};
 use tokio::time::MissedTickBehavior;
 
 use crate::features::url_feeds::FeedSnapshot;
@@ -174,28 +176,30 @@ pub async fn recent_link_relationship_summary(
     let mut verified_threat_feed_hit = false;
     let mut user_target_ids = HashSet::new();
     let mut scanned_targets = 0usize;
+    let mut native_user_id_entity_count = 0u16;
+    let mut uri_user_id_count = 0u16;
     for (text, raw_json) in rows {
-        let targets = serde_json::from_value::<teloxide::types::Message>(raw_json)
-            .ok()
-            .map(|message| {
-                crate::telegram::entities::message_url_targets(&message)
-                    .into_iter()
-                    .map(|target| target.value)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                text.as_deref()
-                    .map(find_urls)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|target| target.value)
-                    .collect()
-            });
+        let targets = relation_targets(raw_json, text.as_deref());
         for target in targets {
             if scanned_targets >= MAX_TARGETS {
                 break;
             }
             scanned_targets += 1;
+            if let Kind::UserId(id) = target.kind {
+                if let Ok(id) = i64::try_from(id) {
+                    user_target_ids.insert(id);
+                    if target.source == Source::TelegramEntity {
+                        native_user_id_entity_count = native_user_id_entity_count.saturating_add(1);
+                    } else {
+                        uri_user_id_count = uri_user_id_count.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+            if target.kind != Kind::Url {
+                continue;
+            }
+            let target = target.value;
             if let Some(parsed) = teloxide_url::parse_url(&target)
                 && matches!(parsed.scheme(), "http" | "https")
                 && parse_telegram_link(&target).is_none()
@@ -307,6 +311,20 @@ pub async fn recent_link_relationship_summary(
             .iter()
             .any(|hash| feed.contains_evidence_hash(hash, unix_now()));
     }
+    let external_qr_url_count: i64 = sqlx::query_scalar(
+        r#"select count(*)
+           from public.telegram_message_url_evidence evidence
+           join public.telegram_messages message
+             on message.chat_id = evidence.chat_id and message.message_id = evidence.message_id
+           where message.chat_id = $1 and message.user_id = $2
+             and message.created_at >= now() - interval '24 hours'
+             and evidence.parser_version = $3 and evidence.source = 'qr' and evidence.kind = 'url'"#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
+    .fetch_one(pool)
+    .await?;
 
     Ok(json!({
         "mode": "observational_only",
@@ -318,7 +336,12 @@ pub async fn recent_link_relationship_summary(
         "external_telegram_message_links": external_message_links,
         "unresolved_telegram_links": unresolved_telegram_links,
         "external_web_url_count": external_web_url_count,
+        "external_qr_url_count": external_qr_url_count.min(u16::MAX as i64),
         "verified_threat_feed_hit": verified_threat_feed_hit,
+        "user_id_target_provenance": {
+            "telegram_text_mention_entities": native_user_id_entity_count,
+            "telegram_user_uri_links": uri_user_id_count,
+        },
         "feed_snapshot": feed.map(|snapshot| json!({
             "source": snapshot.source,
             "license": snapshot.license,
@@ -336,6 +359,13 @@ pub async fn recent_link_relationship_summary(
             "snapshot_max_age_days": 30,
         },
     }))
+}
+
+fn relation_targets(raw_json: Value, text: Option<&str>) -> Vec<Found> {
+    serde_json::from_value::<teloxide::types::Message>(raw_json)
+        .ok()
+        .map(|message| teloxide_url::adapter::extract_from_message(&message))
+        .unwrap_or_else(|| text.map(find_urls).unwrap_or_default())
 }
 
 fn unix_now() -> u64 {
@@ -379,6 +409,26 @@ pub fn relation(link: &TelegramLink, context: &RelationContext<'_>) -> LinkRelat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relationship_target_extraction_keeps_native_text_mention_identity() {
+        let message = serde_json::json!({
+            "message_id": 7,
+            "date": 1_700_000_000,
+            "chat": {"id": -1001, "type": "supergroup"},
+            "from": {"id": 9, "is_bot": false, "first_name": "Sender"},
+            "text": "Alice",
+            "entities": [{
+                "type": "text_mention", "offset": 0, "length": 5,
+                "user": {"id": 42, "is_bot": false, "first_name": "Alice"}
+            }]
+        });
+        let targets = relation_targets(message, Some("Alice"));
+
+        assert!(targets.iter().any(|target| {
+            target.kind == Kind::UserId(42) && target.source == Source::TelegramEntity
+        }));
+    }
 
     #[test]
     fn usernames_and_invites_never_gain_guessed_identity() {

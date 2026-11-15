@@ -170,6 +170,10 @@ pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
                 .as_u64()
                 .unwrap_or_default()
                 .min(u16::MAX as u64) as u16,
+            external_qr_url_count: url_relationship_observation["external_qr_url_count"]
+                .as_u64()
+                .unwrap_or_default()
+                .min(u16::MAX as u64) as u16,
             promotional_content: deterministic_campaign_from_features(&features).is_some()
                 || features.personal_channel_has_adult_links,
             verified_threat_feed_hit: url_relationship_observation["verified_threat_feed_hit"]
@@ -178,15 +182,19 @@ pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
             ..teloxide_antispam::url_shadow::UrlShadowEvidence::default()
         },
     );
-    let url_shadow_fingerprint = trigger_fingerprint.as_ref().map(|fingerprint| {
+    // Always materialize the current URL state, including an empty/zero result.
+    // Otherwise a previously positive observation would survive after a user
+    // edits or removes their only link.
+    let url_shadow_fingerprint = {
         let material = serde_json::to_vec(&(
-            fingerprint,
+            trigger_fingerprint.as_deref(),
+            latest_link_evidence.as_ref(),
             url_relationship_observation["feed_snapshot"]["revision"].clone(),
             url_relationship_observation.clone(),
         ))
         .unwrap_or_default();
         hex_digest(&material)
-    });
+    };
     input_json["audit_trigger_fingerprint"] = trigger_fingerprint
         .map(Value::String)
         .unwrap_or(Value::Null);
@@ -219,18 +227,16 @@ pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
         review_threshold: analysis_config.review_threshold,
     };
     let mut tx = pool.begin().await?;
-    if let Some(fingerprint) = url_shadow_fingerprint.as_deref() {
-        record_url_shadow_observation_in_transaction(
-            &mut tx,
-            chat_id,
-            telegram_user_id,
-            fingerprint,
-            url_shadow.suggested_delta,
-            &url_relationship_observation,
-            &serde_json::to_value(&url_shadow)?,
-        )
-        .await?;
-    }
+    record_url_shadow_observation_in_transaction(
+        &mut tx,
+        chat_id,
+        telegram_user_id,
+        &url_shadow_fingerprint,
+        url_shadow.suggested_delta,
+        &url_relationship_observation,
+        &serde_json::to_value(&url_shadow)?,
+    )
+    .await?;
     // Authoritative transactions consistently lock job, then audit, then review.
     let preserved_in_flight = if run_audit_job || same_fingerprint_in_flight {
         let reused_in_flight =
@@ -336,6 +342,74 @@ async fn record_url_shadow_observation_in_transaction(
     Ok(())
 }
 
+/// Recomputes only the URL shadow projection. It performs bounded PostgreSQL
+/// reads and never enqueues or invokes the LLM audit.
+pub async fn refresh_url_shadow_observation_from_links(
+    pool: &PgPool,
+    runtime_config: &Config,
+    chat_id: i64,
+    telegram_user_id: i64,
+    url_feed: Option<&crate::features::url_feeds::FeedSnapshot>,
+) -> anyhow::Result<()> {
+    let latest_link_evidence = load_latest_link_evidence(pool, chat_id, telegram_user_id).await?;
+    let relationships = crate::features::url_relations::recent_link_relationship_summary(
+        pool,
+        runtime_config,
+        chat_id,
+        telegram_user_id,
+        url_feed,
+    )
+    .await?;
+    let promotional_content = load_features(
+        pool,
+        chat_id,
+        telegram_user_id,
+        &runtime_config.community.instance.id,
+    )
+    .await?
+    .is_some_and(|(features, _)| {
+        deterministic_campaign_from_features(&features).is_some()
+            || features.personal_channel_has_adult_links
+    });
+    let analysis = teloxide_antispam::url_shadow::analyze_url_shadow(
+        teloxide_antispam::url_shadow::UrlShadowEvidence {
+            external_url_count: relationships["external_web_url_count"]
+                .as_u64()
+                .unwrap_or_default()
+                .min(u16::MAX as u64) as u16,
+            external_qr_url_count: relationships["external_qr_url_count"]
+                .as_u64()
+                .unwrap_or_default()
+                .min(u16::MAX as u64) as u16,
+            promotional_content,
+            verified_threat_feed_hit: relationships["verified_threat_feed_hit"]
+                .as_bool()
+                .unwrap_or(false),
+            ..teloxide_antispam::url_shadow::UrlShadowEvidence::default()
+        },
+    );
+    let source_fingerprint = hex_digest(&serde_json::to_vec(&(
+        "url-shadow-links-v1",
+        latest_link_evidence,
+        relationships["feed_snapshot"]["revision"].clone(),
+        relationships.clone(),
+        promotional_content,
+    ))?);
+    let mut tx = pool.begin().await?;
+    record_url_shadow_observation_in_transaction(
+        &mut tx,
+        chat_id,
+        telegram_user_id,
+        &source_fingerprint,
+        analysis.suggested_delta,
+        &relationships,
+        &serde_json::to_value(&analysis)?,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 fn hex_digest(material: &[u8]) -> String {
     Sha256::digest(material)
         .iter()
@@ -427,56 +501,47 @@ async fn load_latest_link_evidence(
     telegram_user_id: i64,
 ) -> anyhow::Result<Option<(i32, Option<String>)>> {
     const MAX_RECENT_MESSAGES_TO_SCAN: i64 = 64;
-    let rows: Vec<(i32, Option<String>, Value)> = sqlx::query_as(
-        r#"select message_id, text, raw_json
-           from telegram_messages
-           where chat_id = $1 and user_id = $2 and source_channel_id is null
-             and created_at >= now() - interval '24 hours'
-           order by created_at desc, message_id desc
+    let rows: Vec<(i32, Option<String>, Vec<String>)> = sqlx::query_as(
+        r#"select message.message_id, message.text,
+                  array_agg(evidence.target_sha256::text order by evidence.source, evidence.item_index)
+           from public.telegram_messages message
+           join public.telegram_message_url_evidence evidence
+             on evidence.chat_id = message.chat_id and evidence.message_id = message.message_id
+           where message.chat_id = $1 and message.user_id = $2 and message.source_channel_id is null
+             and message.created_at >= now() - interval '24 hours'
+             and evidence.parser_version = $4 and evidence.kind = 'url'
+           group by message.message_id, message.text, message.created_at
+           order by message.created_at desc, message.message_id desc
            limit $3"#,
     )
     .bind(chat_id)
     .bind(telegram_user_id)
     .bind(MAX_RECENT_MESSAGES_TO_SCAN)
+    .bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
     .fetch_all(pool)
     .await?;
-    for (message_id, text, raw_json) in rows {
-        let targets = serde_json::from_value::<teloxide::types::Message>(raw_json)
-            .ok()
-            .map(|message| {
-                crate::telegram::entities::message_url_targets(&message)
-                    .into_iter()
-                    .map(|target| target.value)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                text.as_deref()
-                    .map(teloxide_url::find_urls)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|target| target.value)
-                    .collect()
-            });
-        if targets.is_empty() {
+    for (message_id, text, target_hashes) in rows {
+        if target_hashes.is_empty() {
             continue;
         }
-        let fingerprint = link_target_fingerprint(text.as_deref(), targets);
+        let fingerprint = link_target_fingerprint(text.as_deref(), target_hashes);
         return Ok(Some((message_id, Some(fingerprint))));
     }
     Ok(None)
 }
 
-fn link_target_fingerprint(text: Option<&str>, mut targets: Vec<String>) -> String {
-    targets.sort();
-    targets.dedup();
-    // В отпечаток аудита попадает только дайджест: исходные цели могут
-    // содержать приватные токены приглашений и deep-link.
-    let evidence = serde_json::to_vec(&("url-evidence-v1", text, targets)).unwrap_or_default();
+fn link_target_fingerprint(text: Option<&str>, mut target_hashes: Vec<String>) -> String {
+    target_hashes.sort();
+    target_hashes.dedup();
+    // В отпечаток попадают только digest-ы уже materialized evidence;
+    // исходные URL могут содержать invite-токены и deep-link.
+    let evidence =
+        serde_json::to_vec(&("url-evidence-v2", text, target_hashes)).unwrap_or_default();
     let digest = Sha256::digest(evidence)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("url-evidence-v1:{digest}")
+    format!("url-evidence-v2:{digest}")
 }
 
 async fn load_latest_long_message_evidence(
@@ -1605,24 +1670,135 @@ mod tests {
         pool.close().await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point at a disposable test database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        const CHAT_ID: i64 = -100_991_223_442;
+        const USER_ID: i64 = 9_912_235;
+        const MESSAGE_ID: i32 = 9_123_001;
+        const QR_URL: &str = "https://qr-threat.example/payload";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let feed = crate::features::url_feeds::FeedSnapshot::from_lines(
+            "fixture",
+            "CC0",
+            "qr-test-revision",
+            now,
+            3600,
+            crate::features::url_feeds::MatchScope::ExactUrl,
+            QR_URL,
+        )
+        .unwrap();
+        let mut target_hash = Sha256::new();
+        target_hash.update(b"nedobot-url-evidence-v1\0url\0");
+        target_hash.update(QR_URL);
+        let target_hash = target_hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(feed.contains_evidence_hash(&target_hash, now));
+        sqlx::query("delete from telegram_url_shadow_observations where chat_id = $1 and telegram_user_id = $2")
+            .bind(CHAT_ID).bind(USER_ID).execute(&pool).await.unwrap();
+        sqlx::query("delete from telegram_messages where chat_id = $1 and message_id = $2")
+            .bind(CHAT_ID)
+            .bind(MESSAGE_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into telegram_chat_users(chat_id,telegram_user_id,first_seen_at,message_count) values($1,$2,now(),1) on conflict do nothing")
+            .bind(CHAT_ID).bind(USER_ID).execute(&pool).await.unwrap();
+        sqlx::query("insert into telegram_messages(chat_id,message_id,user_id,text,raw_json,created_at) values($1,$2,$3,null,'{}',now())")
+            .bind(CHAT_ID).bind(MESSAGE_ID).bind(USER_ID).execute(&pool).await.unwrap();
+        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,display_hint,privacy_sensitive) values($1,$2,$3,0,'url','qr',$4,'https://example.invalid/…',true)")
+            .bind(CHAT_ID).bind(MESSAGE_ID).bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
+            .bind(target_hash).execute(&pool).await.unwrap();
+
+        let mut config = Config::from_env().unwrap();
+        config.community.instance.id = "url_shadow_fixture".into();
+        let chat = config.community.chats.get_mut("main").unwrap();
+        chat.id = CHAT_ID;
+        chat.moderation = true;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        refresh_url_shadow_observation_from_links(&pool, &config, CHAT_ID, USER_ID, Some(&feed))
+            .await
+            .unwrap();
+        let first: (i16, Value, String) = sqlx::query_as(
+            "select shadow_score,evidence,source_fingerprint::text from telegram_url_shadow_observations where chat_id=$1 and telegram_user_id=$2",
+        )
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first.0, 24);
+        assert_eq!(first.1["relationships"]["external_qr_url_count"], 1);
+        assert!(
+            load_latest_link_evidence(&pool, CHAT_ID, USER_ID)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        sqlx::query("delete from telegram_message_url_evidence where chat_id=$1 and message_id=$2")
+            .bind(CHAT_ID)
+            .bind(MESSAGE_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        refresh_url_shadow_observation_from_links(&pool, &config, CHAT_ID, USER_ID, Some(&feed))
+            .await
+            .unwrap();
+        let cleared: (i16, Value, String) = sqlx::query_as(
+            "select shadow_score,evidence,source_fingerprint::text from telegram_url_shadow_observations where chat_id=$1 and telegram_user_id=$2",
+        )
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cleared.0, 0);
+        assert_eq!(cleared.1["relationships"]["external_qr_url_count"], 0);
+        assert_ne!(first.2, cleared.2);
+        assert!(
+            load_latest_link_evidence(&pool, CHAT_ID, USER_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        sqlx::query(
+            "delete from telegram_url_shadow_observations where chat_id=$1 and telegram_user_id=$2",
+        )
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("delete from telegram_chat_users where chat_id=$1 and telegram_user_id=$2")
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
     #[test]
     fn hidden_link_target_changes_fingerprint_without_leaking_target() {
-        let first = link_target_fingerprint(
-            Some("нажми сюда"),
-            vec!["https://t.me/+SYNTHETIC_SECRET_A".into()],
-        );
-        let same = link_target_fingerprint(
-            Some("нажми сюда"),
-            vec!["https://t.me/+SYNTHETIC_SECRET_A".into()],
-        );
-        let edited = link_target_fingerprint(
-            Some("нажми сюда"),
-            vec!["https://t.me/+SYNTHETIC_SECRET_B".into()],
-        );
+        let first = link_target_fingerprint(Some("нажми сюда"), vec!["a".repeat(64)]);
+        let same = link_target_fingerprint(Some("нажми сюда"), vec!["a".repeat(64)]);
+        let edited = link_target_fingerprint(Some("нажми сюда"), vec!["b".repeat(64)]);
 
         assert_eq!(first, same);
         assert_ne!(first, edited);
-        assert!(first.starts_with("url-evidence-v1:"));
+        assert!(first.starts_with("url-evidence-v2:"));
         assert!(!first.contains("SYNTHETIC_SECRET"));
     }
 
@@ -1644,20 +1820,8 @@ mod tests {
 
         let first = message("https://t.me/+SYNTHETIC_SECRET_A");
         let edited = message("https://t.me/+SYNTHETIC_SECRET_B");
-        let before = link_target_fingerprint(
-            first.text(),
-            crate::telegram::entities::message_url_targets(&first)
-                .into_iter()
-                .map(|target| target.value)
-                .collect(),
-        );
-        let after = link_target_fingerprint(
-            edited.text(),
-            crate::telegram::entities::message_url_targets(&edited)
-                .into_iter()
-                .map(|target| target.value)
-                .collect(),
-        );
+        let before = link_target_fingerprint(first.text(), vec![hex_digest(b"SYNTHETIC_SECRET_A")]);
+        let after = link_target_fingerprint(edited.text(), vec![hex_digest(b"SYNTHETIC_SECRET_B")]);
 
         assert_ne!(before, after);
         assert!(!before.contains("SYNTHETIC_SECRET"));
