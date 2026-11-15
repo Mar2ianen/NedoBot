@@ -68,6 +68,11 @@ jobs:
           cargo run --bin migrate
           DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --bin migrate
 
+      - name: Run URL evidence PostgreSQL integration test
+        env:
+          TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+        run: cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
+
       - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
