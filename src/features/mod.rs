@@ -37,6 +37,11 @@ pub mod spam_reputation;
 pub mod spam_review;
 pub mod spammer_avatar_embeddings;
 pub mod stats;
+/// Только локальное сопоставление; загрузка списка и политика остаются в приложении.
+#[cfg(feature = "moderation")]
+pub mod url_feeds;
+#[cfg(feature = "moderation")]
+pub mod url_relations;
 pub mod user_profiles;
 #[cfg(feature = "voice")]
 pub mod voice;

@@ -88,8 +88,9 @@ base64 = "0.23"
 chrono = "0.4"
 jiff = "0.2"
 dotenvy = "0.15"
-teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "90520abd37154e8c48a54e5daded4d64ef1f9e0c", default-features = false, features = ["scoring", "classifier", "embedding", "cas"] }
-teloxide-statistics = { git = "https://github.com/Mar2ianen/teloxide-statistics", rev = "e21824229982afead049fc121842565f2618790d", default-features = false, features = ["sentiment", "engagement", "reputation"] }
+teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "6c13709b941984608820a961744574c314b07088", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "6c13709b941984608820a961744574c314b07088", default-features = false, features = ["teloxide"] }
+teloxide-statistics = { git = "https://github.com/Mar2ianen/teloxide-statistics", rev = "7e2a5859849044121b9e693bc1ed36e7440db139", default-features = false, features = ["sentiment", "engagement", "reputation"] }
 genai = { version = "=0.7.3", default-features = false, features = ["native-tls"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "query", "socks"] }
 rmcp = { version = "=3.9.0", default-features = false, features = ["server", "client", "macros", "schemars", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }

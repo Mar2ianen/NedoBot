@@ -1727,6 +1727,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkify"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92f9ae2f3d31697697311f016320fe984127e636b45cf5eb5c175b7eb103dadb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3461,7 +3470,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=90520abd37154e8c48a54e5daded4d64ef1f9e0c#90520abd37154e8c48a54e5daded4d64ef1f9e0c"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=6c13709b941984608820a961744574c314b07088#6c13709b941984608820a961744574c314b07088"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3470,6 +3479,7 @@ dependencies = [
  "serde",
  "serde_json",
  "teloxide-statistics",
+ "teloxide-url",
  "tracing",
  "unicode-normalization",
  "unicode-properties",
@@ -3522,11 +3532,21 @@ dependencies = [
 [[package]]
 name = "teloxide-statistics"
 version = "0.2.0"
-source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=e21824229982afead049fc121842565f2618790d#e21824229982afead049fc121842565f2618790d"
+source = "git+https://github.com/Mar2ianen/teloxide-statistics?rev=7e2a5859849044121b9e693bc1ed36e7440db139#7e2a5859849044121b9e693bc1ed36e7440db139"
 dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "teloxide-url"
+version = "0.1.0"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=6c13709b941984608820a961744574c314b07088#6c13709b941984608820a961744574c314b07088"
+dependencies = [
+ "linkify",
+ "teloxide",
+ "url",
 ]
 
 [[package]]
@@ -3564,6 +3584,7 @@ dependencies = [
  "teloxide",
  "teloxide-antispam",
  "teloxide-statistics",
+ "teloxide-url",
  "tempfile",
  "tokio",
  "toml",

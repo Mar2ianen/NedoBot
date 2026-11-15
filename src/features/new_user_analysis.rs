@@ -330,18 +330,57 @@ async fn load_latest_link_evidence(
     chat_id: i64,
     telegram_user_id: i64,
 ) -> anyhow::Result<Option<(i32, Option<String>)>> {
-    Ok(sqlx::query_as(
-        r#"select message_id, text
+    const MAX_RECENT_MESSAGES_TO_SCAN: i64 = 64;
+    let rows: Vec<(i32, Option<String>, Value)> = sqlx::query_as(
+        r#"select message_id, text, raw_json
            from telegram_messages
            where chat_id = $1 and user_id = $2 and source_channel_id is null
-             and has_links and created_at >= now() - interval '24 hours'
+             and created_at >= now() - interval '24 hours'
            order by created_at desc, message_id desc
-           limit 1"#,
+           limit $3"#,
     )
     .bind(chat_id)
     .bind(telegram_user_id)
-    .fetch_optional(pool)
-    .await?)
+    .bind(MAX_RECENT_MESSAGES_TO_SCAN)
+    .fetch_all(pool)
+    .await?;
+    for (message_id, text, raw_json) in rows {
+        let targets = serde_json::from_value::<teloxide::types::Message>(raw_json)
+            .ok()
+            .map(|message| {
+                crate::telegram::entities::message_url_targets(&message)
+                    .into_iter()
+                    .map(|target| target.value)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                text.as_deref()
+                    .map(teloxide_url::find_urls)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|target| target.value)
+                    .collect()
+            });
+        if targets.is_empty() {
+            continue;
+        }
+        let fingerprint = link_target_fingerprint(text.as_deref(), targets);
+        return Ok(Some((message_id, Some(fingerprint))));
+    }
+    Ok(None)
+}
+
+fn link_target_fingerprint(text: Option<&str>, mut targets: Vec<String>) -> String {
+    targets.sort();
+    targets.dedup();
+    // В отпечаток аудита попадает только дайджест: исходные цели могут
+    // содержать приватные токены приглашений и deep-link.
+    let evidence = serde_json::to_vec(&("url-evidence-v1", text, targets)).unwrap_or_default();
+    let digest = Sha256::digest(evidence)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("url-evidence-v1:{digest}")
 }
 
 async fn load_latest_long_message_evidence(
@@ -1413,6 +1452,65 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 mod tests {
     use super::*;
     use teloxide_antispam::signals::analyze_new_or_low_activity_user;
+
+    #[test]
+    fn hidden_link_target_changes_fingerprint_without_leaking_target() {
+        let first = link_target_fingerprint(
+            Some("нажми сюда"),
+            vec!["https://t.me/+SYNTHETIC_SECRET_A".into()],
+        );
+        let same = link_target_fingerprint(
+            Some("нажми сюда"),
+            vec!["https://t.me/+SYNTHETIC_SECRET_A".into()],
+        );
+        let edited = link_target_fingerprint(
+            Some("нажми сюда"),
+            vec!["https://t.me/+SYNTHETIC_SECRET_B".into()],
+        );
+
+        assert_eq!(first, same);
+        assert_ne!(first, edited);
+        assert!(first.starts_with("url-evidence-v1:"));
+        assert!(!first.contains("SYNTHETIC_SECRET"));
+    }
+
+    #[test]
+    fn hidden_entity_target_edit_changes_audit_fingerprint_at_same_anchor() {
+        fn message(target: &str) -> teloxide::types::Message {
+            serde_json::from_value(json!({
+                "message_id": 7,
+                "date": 1_700_000_000,
+                "chat": {"id": -1001, "type": "supergroup"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Test"},
+                "text": "нажми сюда",
+                "entities": [{
+                    "type": "text_link", "offset": 0, "length": 10, "url": target
+                }]
+            }))
+            .unwrap()
+        }
+
+        let first = message("https://t.me/+SYNTHETIC_SECRET_A");
+        let edited = message("https://t.me/+SYNTHETIC_SECRET_B");
+        let before = link_target_fingerprint(
+            first.text(),
+            crate::telegram::entities::message_url_targets(&first)
+                .into_iter()
+                .map(|target| target.value)
+                .collect(),
+        );
+        let after = link_target_fingerprint(
+            edited.text(),
+            crate::telegram::entities::message_url_targets(&edited)
+                .into_iter()
+                .map(|target| target.value)
+                .collect(),
+        );
+
+        assert_ne!(before, after);
+        assert!(!before.contains("SYNTHETIC_SECRET"));
+        assert!(!after.contains("SYNTHETIC_SECRET"));
+    }
 
     fn risk_with_score(score: i32) -> RiskAnalysis {
         RiskAnalysis {
