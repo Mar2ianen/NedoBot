@@ -4,8 +4,8 @@ use teloxide::{net::Download, prelude::*, types::FileId};
 
 use crate::{
     db::url_evidence::{
-        MAX_QR_URLS_PER_MESSAGE, QrScanJob, claim_next_qr_scan_job, finish_qr_scan_job,
-        replace_qr_evidence_for_job,
+        MAX_QR_URLS_PER_MESSAGE, QrScanJob, QrUrlEvidence, claim_next_qr_scan_job,
+        finish_qr_scan_job, replace_qr_evidence_for_job,
     },
     state::AppState,
     telegram::media::LimitedBytesWriter,
@@ -118,7 +118,22 @@ async fn process_job(
         }
     }
 
-    let materialized = replace_qr_evidence_for_job(pool, job, &urls)
+    let affiliated =
+        crate::features::url_relations::load_affiliated_peer_ids(pool, &state.config, job.chat_id)
+            .await
+            .map_err(|_| "affiliated_channels_lookup_failed")?;
+    let classified_urls = urls
+        .into_iter()
+        .map(|target| QrUrlEvidence {
+            relation: crate::features::url_relations::classify_qr_url(
+                &target,
+                job.chat_id,
+                &affiliated,
+            ),
+            target,
+        })
+        .collect::<Vec<_>>();
+    let materialized = replace_qr_evidence_for_job(pool, job, &classified_urls)
         .await
         .map_err(|_| "evidence_write_failed")?;
     if materialized.is_some() {
@@ -144,6 +159,7 @@ async fn process_job(
                 .await
             {
                 tracing::warn!(%error, chat_id = job.chat_id, user_id, "failed to refresh URL shadow after QR evidence materialization");
+                return Err("shadow_refresh_failed");
             }
         }
     }

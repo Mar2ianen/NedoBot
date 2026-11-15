@@ -351,6 +351,40 @@ pub async fn refresh_url_shadow_observation_from_links(
     telegram_user_id: i64,
     url_feed: Option<&crate::features::url_feeds::FeedSnapshot>,
 ) -> anyhow::Result<()> {
+    static URL_SHADOW_REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _refresh_gate = URL_SHADOW_REFRESH_GATE.lock().await;
+    // Keep concurrent QR, edit, and event-driven refreshes ordered per user.
+    // The lock is held while the latest source evidence is read and the
+    // resulting projection is written, so an older computation cannot win
+    // merely because it finished last.
+    let mut lock_tx = pool.begin().await?;
+    sqlx::query(
+        "select pg_advisory_xact_lock(hashtextextended($1 || ':' || $2::text || ':' || $3::text, 0))",
+    )
+    .bind(&runtime_config.community.instance.id)
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .execute(&mut *lock_tx)
+    .await?;
+    refresh_url_shadow_observation_from_links_locked(
+        pool,
+        runtime_config,
+        chat_id,
+        telegram_user_id,
+        url_feed,
+    )
+    .await?;
+    lock_tx.commit().await?;
+    Ok(())
+}
+
+async fn refresh_url_shadow_observation_from_links_locked(
+    pool: &PgPool,
+    runtime_config: &Config,
+    chat_id: i64,
+    telegram_user_id: i64,
+    url_feed: Option<&crate::features::url_feeds::FeedSnapshot>,
+) -> anyhow::Result<()> {
     let latest_link_evidence = load_latest_link_evidence(pool, chat_id, telegram_user_id).await?;
     let relationships = crate::features::url_relations::recent_link_relationship_summary(
         pool,
@@ -389,7 +423,7 @@ pub async fn refresh_url_shadow_observation_from_links(
         },
     );
     let source_fingerprint = hex_digest(&serde_json::to_vec(&(
-        "url-shadow-links-v1",
+        "url-shadow-links-v2",
         latest_link_evidence,
         relationships["feed_snapshot"]["revision"].clone(),
         relationships.clone(),
@@ -1716,9 +1750,12 @@ mod tests {
             .bind(CHAT_ID).bind(USER_ID).execute(&pool).await.unwrap();
         sqlx::query("insert into telegram_messages(chat_id,message_id,user_id,text,raw_json,created_at) values($1,$2,$3,null,'{}',now())")
             .bind(CHAT_ID).bind(MESSAGE_ID).bind(USER_ID).execute(&pool).await.unwrap();
-        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,display_hint,privacy_sensitive) values($1,$2,$3,0,'url','qr',$4,'https://example.invalid/…',true)")
+        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,display_hint,privacy_sensitive,qr_relation) values($1,$2,$3,0,'url','qr',$4,'https://example.invalid/…',true,'external')")
             .bind(CHAT_ID).bind(MESSAGE_ID).bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
             .bind(target_hash).execute(&pool).await.unwrap();
+        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,display_hint,privacy_sensitive,qr_relation) values($1,$2,$3,1,'url','qr',$4,'https://t.me/…',true,'affiliated')")
+            .bind(CHAT_ID).bind(MESSAGE_ID).bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
+            .bind("0".repeat(64)).execute(&pool).await.unwrap();
 
         let mut config = Config::from_env().unwrap();
         config.community.instance.id = "url_shadow_fixture".into();
@@ -1726,9 +1763,24 @@ mod tests {
         chat.id = CHAT_ID;
         chat.moderation = true;
         config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
-        refresh_url_shadow_observation_from_links(&pool, &config, CHAT_ID, USER_ID, Some(&feed))
-            .await
-            .unwrap();
+        let (refresh_a, refresh_b) = tokio::join!(
+            refresh_url_shadow_observation_from_links(
+                &pool,
+                &config,
+                CHAT_ID,
+                USER_ID,
+                Some(&feed)
+            ),
+            refresh_url_shadow_observation_from_links(
+                &pool,
+                &config,
+                CHAT_ID,
+                USER_ID,
+                Some(&feed)
+            )
+        );
+        refresh_a.unwrap();
+        refresh_b.unwrap();
         let first: (i16, Value, String) = sqlx::query_as(
             "select shadow_score,evidence,source_fingerprint::text from telegram_url_shadow_observations where chat_id=$1 and telegram_user_id=$2",
         )

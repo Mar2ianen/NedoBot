@@ -369,6 +369,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_instance_writers_keep_both_decision_sets() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("shared.json");
+        let nedonews = SpamReputationStore::connect(&path).await.unwrap();
+        let pvo = SpamReputationStore::connect(&path).await.unwrap();
+
+        let (first, second) = tokio::join!(
+            nedonews.reconcile_instance_decisions("nedonews", &[(42, true), (43, true)]),
+            pvo.reconcile_instance_decisions("pvo", &[(42, true), (44, true)])
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let mut decisions = nedonews.active_decisions().await.unwrap();
+        decisions.sort();
+        assert_eq!(
+            decisions,
+            vec![
+                (42, "nedonews".to_string()),
+                (42, "pvo".to_string()),
+                (43, "nedonews".to_string()),
+                (44, "pvo".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_legacy_sqlite_file_instead_of_overwriting_it() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("legacy.sqlite");

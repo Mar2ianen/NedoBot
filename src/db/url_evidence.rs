@@ -186,9 +186,37 @@ struct EvidenceRow {
     host: Option<String>,
     display_hint: String,
     privacy_sensitive: bool,
+    qr_relation: Option<&'static str>,
 }
 
-fn encode(found: &Found, index: usize) -> anyhow::Result<EvidenceRow> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrUrlRelation {
+    Affiliated,
+    External,
+    Unresolved,
+}
+
+impl QrUrlRelation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Affiliated => "affiliated",
+            Self::External => "external",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QrUrlEvidence {
+    pub target: String,
+    pub relation: QrUrlRelation,
+}
+
+fn encode(
+    found: &Found,
+    index: usize,
+    qr_relation: Option<&'static str>,
+) -> anyhow::Result<EvidenceRow> {
     let kind = match found.kind {
         Kind::Url => "url",
         Kind::Mention => "mention",
@@ -256,6 +284,7 @@ fn encode(found: &Found, index: usize) -> anyhow::Result<EvidenceRow> {
         host,
         display_hint,
         privacy_sensitive: telegram_sensitive || url_sensitive,
+        qr_relation,
     })
 }
 
@@ -267,9 +296,9 @@ mod target_identity_tests {
 
     #[test]
     fn native_user_mentions_hash_the_telegram_id_not_the_visible_label() {
-        let alice_42 = encode(&Found::new("Alice", Kind::UserId(42)), 0).unwrap();
-        let alice_43 = encode(&Found::new("Alice", Kind::UserId(43)), 0).unwrap();
-        let different_label_same_id = encode(&Found::new("A.", Kind::UserId(42)), 0).unwrap();
+        let alice_42 = encode(&Found::new("Alice", Kind::UserId(42)), 0, None).unwrap();
+        let alice_43 = encode(&Found::new("Alice", Kind::UserId(43)), 0, None).unwrap();
+        let different_label_same_id = encode(&Found::new("A.", Kind::UserId(42)), 0, None).unwrap();
 
         assert_ne!(alice_42.target_sha256, alice_43.target_sha256);
         assert_eq!(
@@ -301,8 +330,18 @@ pub async fn replace_message_url_evidence_with_qr(
     message: &Message,
     qr_urls: Option<&[String]>,
 ) -> anyhow::Result<usize> {
+    let classified_qr_urls = qr_urls.map(|urls| {
+        urls.iter()
+            .cloned()
+            .map(|target| QrUrlEvidence {
+                target,
+                relation: QrUrlRelation::Unresolved,
+            })
+            .collect::<Vec<_>>()
+    });
     let mut tx = pool.begin().await?;
-    let total_count = materialize_message_url_evidence(&mut tx, message, qr_urls).await?;
+    let total_count =
+        materialize_message_url_evidence(&mut tx, message, classified_qr_urls.as_deref()).await?;
     tx.commit().await?;
     Ok(total_count)
 }
@@ -312,7 +351,7 @@ pub async fn replace_message_url_evidence_with_qr(
 pub async fn replace_qr_evidence_for_job(
     pool: &PgPool,
     job: &QrScanJob,
-    qr_urls: &[String],
+    qr_urls: &[QrUrlEvidence],
 ) -> anyhow::Result<Option<usize>> {
     let mut tx = pool.begin().await?;
     let lease_file_id: Option<String> = sqlx::query_scalar(
@@ -353,12 +392,13 @@ pub async fn replace_qr_evidence_for_job(
 async fn materialize_message_url_evidence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     message: &Message,
-    qr_urls: Option<&[String]>,
+    qr_urls: Option<&[QrUrlEvidence]>,
 ) -> anyhow::Result<usize> {
     let mut found = teloxide_url::adapter::extract_from_message(message);
+    let mut qr_relations = std::collections::HashMap::<String, &'static str>::new();
     if let Some(qr_urls) = qr_urls {
-        for text in qr_urls.iter().take(MAX_QR_URLS_PER_MESSAGE) {
-            for mut url in teloxide_url::find_urls(text) {
+        for qr_url in qr_urls.iter().take(MAX_QR_URLS_PER_MESSAGE) {
+            for mut url in teloxide_url::find_urls(&qr_url.target) {
                 if found
                     .iter()
                     .filter(|item| item.source == Source::Qr)
@@ -368,6 +408,7 @@ async fn materialize_message_url_evidence(
                     break;
                 }
                 url.source = Source::Qr;
+                qr_relations.insert(url.value.to_ascii_lowercase(), qr_url.relation.as_str());
                 if !found.iter().any(|known| {
                     known.source == Source::Qr && known.value.eq_ignore_ascii_case(&url.value)
                 }) {
@@ -383,7 +424,13 @@ async fn materialize_message_url_evidence(
         .map(|item| {
             let source = source_name(item.source);
             let index = source_indices.get(source).copied().unwrap_or_default();
-            let row = encode(item, index)?;
+            let row = encode(
+                item,
+                index,
+                (item.source == Source::Qr)
+                    .then(|| qr_relations.get(&item.value.to_ascii_lowercase()).copied())
+                    .flatten(),
+            )?;
             *source_indices.entry(source).or_default() += 1;
             Ok(row)
         })
@@ -408,8 +455,8 @@ async fn materialize_message_url_evidence(
         sqlx::query(
             r#"insert into public.telegram_message_url_evidence
                 (chat_id, message_id, parser_version, item_index, kind, source,
-                 target_sha256, host, display_hint, privacy_sensitive)
-               values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 target_sha256, host, display_hint, privacy_sensitive, qr_relation)
+               values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                on conflict do nothing"#,
         )
         .bind(message.chat.id.0)
@@ -422,6 +469,7 @@ async fn materialize_message_url_evidence(
         .bind(&row.host)
         .bind(&row.display_hint)
         .bind(row.privacy_sensitive)
+        .bind(row.qr_relation)
         .execute(&mut **tx)
         .await?;
     }
@@ -547,7 +595,7 @@ mod tests {
             span: None,
             label: Some("join".into()),
         };
-        let row = encode(&found, 0).unwrap();
+        let row = encode(&found, 0, None).unwrap();
         assert_eq!(row.host.as_deref(), Some("t.me"));
         assert_eq!(row.source, "telegram_entity");
         assert!(row.privacy_sensitive);
@@ -561,8 +609,8 @@ mod tests {
         let a = Found::new("https://t.me/+SYNTHETIC_A", Kind::Url);
         let b = Found::new("https://t.me/+SYNTHETIC_B", Kind::Url);
         assert_ne!(
-            encode(&a, 0).unwrap().target_sha256,
-            encode(&b, 0).unwrap().target_sha256
+            encode(&a, 0, None).unwrap().target_sha256,
+            encode(&b, 0, None).unwrap().target_sha256
         );
     }
 
@@ -579,7 +627,7 @@ mod tests {
         }))
         .unwrap();
         let found = teloxide_url::adapter::extract_from_message(&message);
-        let row = encode(&found[0], 0).unwrap();
+        let row = encode(&found[0], 0, None).unwrap();
         assert_eq!(row.source, "telegram_entity");
         assert_eq!(row.kind, "url");
         assert_eq!(row.host.as_deref(), Some("example.org"));
@@ -775,11 +823,23 @@ mod tests {
         let stored = replace_qr_evidence_for_job(
             &pool,
             &job,
-            &["https://example.invalid/qr-target".to_owned()],
+            &[QrUrlEvidence {
+                target: "https://example.invalid/qr-target".to_owned(),
+                relation: QrUrlRelation::External,
+            }],
         )
         .await
         .unwrap();
         assert_eq!(stored, Some(1));
+        let relation: Option<String> = query_scalar(
+            "select qr_relation from telegram_message_url_evidence where chat_id = $1 and message_id = $2 and source = 'qr'",
+        )
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID + 2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(relation.as_deref(), Some("external"));
         finish_qr_scan_job(&pool, &job, Some(0), None)
             .await
             .unwrap();
@@ -808,7 +868,10 @@ mod tests {
         let stale_write = replace_qr_evidence_for_job(
             &pool,
             &stale_after_edit,
-            &["https://example.invalid/stale-qr".to_owned()],
+            &[QrUrlEvidence {
+                target: "https://example.invalid/stale-qr".to_owned(),
+                relation: QrUrlRelation::External,
+            }],
         )
         .await
         .unwrap();

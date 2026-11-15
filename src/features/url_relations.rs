@@ -18,7 +18,10 @@ use teloxide_url::{
 use tokio::time::MissedTickBehavior;
 
 use crate::features::url_feeds::FeedSnapshot;
-use crate::{config::Config, db::membership::MembershipContext};
+use crate::{
+    config::Config,
+    db::{membership::MembershipContext, url_evidence::QrUrlRelation},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkRelation {
@@ -188,7 +191,7 @@ pub async fn recent_link_relationship_summary(
             if let Kind::UserId(id) = target.kind {
                 if let Ok(id) = i64::try_from(id) {
                     user_target_ids.insert(id);
-                    if target.source == Source::TelegramEntity {
+                    if is_native_user_mention(target.source) {
                         native_user_id_entity_count = native_user_id_entity_count.saturating_add(1);
                     } else {
                         uri_user_id_count = uri_user_id_count.saturating_add(1);
@@ -217,6 +220,7 @@ pub async fn recent_link_relationship_summary(
                 TelegramLink::UserId(id) => {
                     if let Ok(id) = i64::try_from(id) {
                         user_target_ids.insert(id);
+                        uri_user_id_count = uri_user_id_count.saturating_add(1);
                     }
                 }
                 TelegramLink::Message {
@@ -300,6 +304,7 @@ pub async fn recent_link_relationship_summary(
                where message.chat_id = $1 and message.user_id = $2
                  and message.created_at >= now() - interval '24 hours'
                  and evidence.source = 'qr' and evidence.kind = 'url'
+                 and evidence.qr_relation = 'external'
                order by message.created_at desc, message.message_id desc
                limit 128"#,
         )
@@ -318,7 +323,8 @@ pub async fn recent_link_relationship_summary(
              on message.chat_id = evidence.chat_id and message.message_id = evidence.message_id
            where message.chat_id = $1 and message.user_id = $2
              and message.created_at >= now() - interval '24 hours'
-             and evidence.parser_version = $3 and evidence.source = 'qr' and evidence.kind = 'url'"#,
+             and evidence.parser_version = $3 and evidence.source = 'qr' and evidence.kind = 'url'
+             and evidence.qr_relation = 'external'"#,
     )
     .bind(chat_id)
     .bind(telegram_user_id)
@@ -366,6 +372,34 @@ fn relation_targets(raw_json: Value, text: Option<&str>) -> Vec<Found> {
         .ok()
         .map(|message| teloxide_url::adapter::extract_from_message(&message))
         .unwrap_or_else(|| text.map(find_urls).unwrap_or_default())
+}
+
+fn is_native_user_mention(source: Source) -> bool {
+    matches!(source, Source::TelegramEntity | Source::RichMessage)
+}
+
+pub fn classify_qr_url(
+    target: &str,
+    chat_id: i64,
+    affiliated_channels: &HashSet<i64>,
+) -> QrUrlRelation {
+    match parse_telegram_link(target) {
+        Some(TelegramLink::Message {
+            peer: TelegramPeer::ChatId(id),
+            ..
+        }) if id == chat_id || affiliated_channels.contains(&id) => QrUrlRelation::Affiliated,
+        Some(TelegramLink::Message {
+            peer: TelegramPeer::ChatId(_),
+            ..
+        }) => QrUrlRelation::External,
+        Some(_) => QrUrlRelation::Unresolved,
+        None if teloxide_url::parse_url(target)
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https")) =>
+        {
+            QrUrlRelation::External
+        }
+        None => QrUrlRelation::Unresolved,
+    }
 }
 
 fn unix_now() -> u64 {
@@ -428,6 +462,30 @@ mod tests {
         assert!(targets.iter().any(|target| {
             target.kind == Kind::UserId(42) && target.source == Source::TelegramEntity
         }));
+    }
+
+    #[test]
+    fn rich_message_user_mentions_are_native_provenance() {
+        assert!(is_native_user_mention(Source::RichMessage));
+        assert!(is_native_user_mention(Source::TelegramEntity));
+        assert!(!is_native_user_mention(Source::VisibleText));
+    }
+
+    #[test]
+    fn qr_telegram_links_distinguish_affiliated_and_external_chats() {
+        let affiliated = HashSet::from([-1_000_000_000_001]);
+        assert_eq!(
+            classify_qr_url("https://t.me/c/1/456", -1001, &affiliated),
+            QrUrlRelation::Affiliated
+        );
+        assert_eq!(
+            classify_qr_url("https://t.me/c/2/456", -1001, &affiliated),
+            QrUrlRelation::External
+        );
+        assert_eq!(
+            classify_qr_url("https://example.com/promo", -1001, &affiliated),
+            QrUrlRelation::External
+        );
     }
 
     #[test]
