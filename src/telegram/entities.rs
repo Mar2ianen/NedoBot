@@ -73,6 +73,9 @@ pub(crate) fn utf16_range(
     offset: usize,
     length: usize,
 ) -> Option<std::ops::Range<usize>> {
+    if length == 0 {
+        return None;
+    }
     let end = offset.checked_add(length)?;
     fn boundary(text: &str, target: usize) -> Option<usize> {
         let mut units = 0usize;
@@ -92,7 +95,7 @@ pub(crate) fn utf16_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{message_has_links, message_url_targets};
+    use super::{message_has_links, message_url_targets, utf16_range};
     use teloxide::types::Message;
 
     #[test]
@@ -133,5 +136,35 @@ mod tests {
         .unwrap();
 
         assert!(!message_has_links(&message));
+    }
+
+    #[test]
+    fn caption_entities_use_utf16_spans_and_keep_the_hidden_link_target() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 9,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 13, "is_bot": false, "first_name": "Test"},
+            "photo": [{"file_id": "synthetic", "file_unique_id": "synthetic", "width": 1, "height": 1}],
+            "caption": "😺open",
+            "caption_entities": [{"type": "text_link", "offset": 2, "length": 4,
+                "url": "https://hidden.example/caption?synthetic=1"}]
+        })).unwrap();
+
+        let targets = message_url_targets(&message);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].value,
+            "https://hidden.example/caption?synthetic=1"
+        );
+        assert_eq!(targets[0].label.as_deref(), Some("open"));
+        assert_eq!(targets[0].span, Some(4..8));
+    }
+
+    #[test]
+    fn shared_utf16_range_rejects_empty_and_split_surrogate_spans() {
+        assert_eq!(utf16_range("😺x", 2, 1), Some(4..5));
+        assert_eq!(utf16_range("😺x", 1, 1), None);
+        assert_eq!(utf16_range("Alice", 0, 0), None);
     }
 }
