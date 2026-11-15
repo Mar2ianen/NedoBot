@@ -1049,12 +1049,13 @@ review-only assessment не даёт права на бан, удаление и
 для отключения reasoning описаны в [Cloudflare runbook](CLOUDFLARE_GEMMA.md).
 Полный multimodal audit проверяется probe_new_user_audit без Telegram/БД.
 
-### Антиспам: Decision shadow
+### Антиспам: Decision shadow и score captcha
 
 Нативный Gemini Decisions API настраивается отдельно в `[moderation.decision]`:
 явные `enabled`, `external_processing_allowed`, `avatar_enabled`, endpoint/model,
-имя env-переменной ключа и bounded бюджеты. Новый shadow не меняет generative
-routes и не даёт права на санкции. Транспорт, версии, диагностика, evaluation CLI
+имя env-переменной ключа и bounded бюджеты. Режим shadow не меняет generative
+routes и не даёт права на санкции. Opt-in `score_captcha` связывает общую метрику
+с ephemeral captcha; production включён только в ПВО, NedoNews остаётся в shadow. Транспорт, версии, диагностика, evaluation CLI
 и migration-aware rollback описаны в [ANTISPAM_V2.md](ANTISPAM_V2.md).
 
 Decision может участвовать в общей метрике с ephemeral captcha: [контракт,

@@ -80,7 +80,10 @@ captcha_max_message_age_sec = 600
 ```
 
 До restart выполнить `validate_instance_config` с реальным окружением unit,
-проверить captcha enabled, threshold, TTL, dry-run и оба instance scope.
+проверить captcha enabled, threshold, TTL, dry-run и нужный instance scope.
+`validate_instance_config` не вызывает Telegram: admin permissions нужно проверить
+отдельно до включения. Нужны `can_delete_messages` и `can_restrict_members`.
+Для NedoNews active policy не включать: его прежний профиль/shadow сохранены.
 Бинарники брать только из Ubuntu 24.04 release artifact. Сначала подготовить
 migration-compatible rollback artifact с обеими новыми миграциями и старым
 runtime: старый production binary без новых embedded migrations не стартует
