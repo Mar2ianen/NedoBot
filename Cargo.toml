@@ -102,6 +102,7 @@ required-features = ["moderation"]
 [dependencies]
 agent-runtime = { path = "crates/agent-runtime" }
 nedobot-qr = { path = "crates/nedobot-qr" }
+psl = "=2.1.255"
 anyhow = "1"
 axum = "0.8"
 async-trait = "0.1"
