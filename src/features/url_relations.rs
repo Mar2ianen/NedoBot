@@ -175,9 +175,10 @@ pub async fn recent_link_relationship_summary(
     let mut affiliated_message_links = 0u16;
     let mut external_message_links = 0u16;
     let mut unresolved_telegram_links = 0u16;
-    let mut external_web_url_count = 0u16;
     let mut verified_threat_feed_hit = false;
     let mut user_target_ids = HashSet::new();
+    let mut username_targets = HashSet::new();
+    let mut bot_candidate_usernames = HashSet::new();
     let mut scanned_targets = 0usize;
     let mut native_user_id_entity_count = 0u16;
     let mut uri_user_id_count = 0u16;
@@ -199,6 +200,15 @@ pub async fn recent_link_relationship_summary(
                 }
                 continue;
             }
+            if target.kind == Kind::Mention {
+                if let Some(username) = normalize_username(&target.value) {
+                    if is_bot_candidate(&username) {
+                        bot_candidate_usernames.insert(username.clone());
+                    }
+                    username_targets.insert(username);
+                }
+                continue;
+            }
             if target.kind != Kind::Url {
                 continue;
             }
@@ -207,7 +217,6 @@ pub async fn recent_link_relationship_summary(
                 && matches!(parsed.scheme(), "http" | "https")
                 && parse_telegram_link(&target).is_none()
             {
-                external_web_url_count = external_web_url_count.saturating_add(1);
                 verified_threat_feed_hit |= feed
                     .and_then(|snapshot| snapshot.lookup(&target, unix_now()))
                     .is_some();
@@ -216,6 +225,21 @@ pub async fn recent_link_relationship_summary(
             let Some(link) = parse_telegram_link(&target) else {
                 continue;
             };
+            match &link {
+                TelegramLink::Profile { username }
+                | TelegramLink::BotStart { username, .. }
+                | TelegramLink::Message {
+                    peer: TelegramPeer::Username(username),
+                    ..
+                } => {
+                    let username = username.to_ascii_lowercase();
+                    if is_bot_candidate(&username) {
+                        bot_candidate_usernames.insert(username.clone());
+                    }
+                    username_targets.insert(username);
+                }
+                _ => {}
+            }
             match link {
                 TelegramLink::UserId(id) => {
                     if let Ok(id) = i64::try_from(id) {
@@ -241,6 +265,36 @@ pub async fn recent_link_relationship_summary(
         }
         if scanned_targets >= MAX_TARGETS {
             break;
+        }
+    }
+
+    // Только один актуальный профиль может разрешить username. История
+    // прежних username намеренно не считается владением: Telegram переиспользует имена.
+    let usernames = username_targets.into_iter().collect::<Vec<_>>();
+    let resolved_names: Vec<(String, i64, bool, i64)> = if usernames.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            r#"select lower(username), min(telegram_user_id), bool_or(is_bot), count(*)::bigint
+                 from telegram_user_profiles
+                where lower(username) = any($1)
+                  and updated_at >= now() - interval '24 hours'
+                group by lower(username)"#,
+        )
+        .bind(&usernames)
+        .fetch_all(pool)
+        .await?
+    };
+    let mut resolved_username_count = 0u16;
+    let mut confirmed_bot_candidate_count = 0u16;
+    for (username, user_id, is_bot, match_count) in resolved_names {
+        if match_count != 1 {
+            continue;
+        }
+        user_target_ids.insert(user_id);
+        resolved_username_count = resolved_username_count.saturating_add(1);
+        if is_bot && bot_candidate_usernames.contains(&username) {
+            confirmed_bot_candidate_count = confirmed_bot_candidate_count.saturating_add(1);
         }
     }
 
@@ -295,6 +349,40 @@ pub async fn recent_link_relationship_summary(
         }
     }
 
+    let url_target_rows: Vec<(String, Option<String>, String, bool)> = sqlx::query_as(
+        r#"select evidence.target_sha256::text,
+                  min(evidence.host),
+                  min(evidence.display_hint),
+                  bool_or(evidence.source = 'qr' and evidence.qr_relation = 'external')
+           from public.telegram_message_url_evidence evidence
+           join public.telegram_messages message
+             on message.chat_id = evidence.chat_id and message.message_id = evidence.message_id
+           where message.chat_id = $1 and message.user_id = $2
+             and message.created_at >= now() - interval '24 hours'
+             and evidence.parser_version = $3 and evidence.kind = 'url'
+           group by evidence.target_sha256
+           order by max(message.created_at) desc
+           limit 128"#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
+    .fetch_all(pool)
+    .await?;
+    let unique_external_url_count = url_target_rows
+        .iter()
+        .filter(|(_, host, display_hint, _)| {
+            (display_hint.starts_with("http://") || display_hint.starts_with("https://"))
+                && host.as_deref().is_some_and(is_external_web_host)
+        })
+        .count()
+        .min(u16::MAX as usize) as u16;
+    let external_qr_url_count = url_target_rows
+        .iter()
+        .filter(|(_, _, _, has_external_qr)| *has_external_qr)
+        .count()
+        .min(u16::MAX as usize) as u16;
+
     if let Some(feed) = feed {
         let qr_hashes: Vec<String> = sqlx::query_scalar(
             r#"select evidence.target_sha256::text
@@ -304,7 +392,6 @@ pub async fn recent_link_relationship_summary(
                where message.chat_id = $1 and message.user_id = $2
                  and message.created_at >= now() - interval '24 hours'
                  and evidence.source = 'qr' and evidence.kind = 'url'
-                 and evidence.qr_relation = 'external'
                order by message.created_at desc, message.message_id desc
                limit 128"#,
         )
@@ -316,22 +403,6 @@ pub async fn recent_link_relationship_summary(
             .iter()
             .any(|hash| feed.contains_evidence_hash(hash, unix_now()));
     }
-    let external_qr_url_count: i64 = sqlx::query_scalar(
-        r#"select count(*)
-           from public.telegram_message_url_evidence evidence
-           join public.telegram_messages message
-             on message.chat_id = evidence.chat_id and message.message_id = evidence.message_id
-           where message.chat_id = $1 and message.user_id = $2
-             and message.created_at >= now() - interval '24 hours'
-             and evidence.parser_version = $3 and evidence.source = 'qr' and evidence.kind = 'url'
-             and evidence.qr_relation = 'external'"#,
-    )
-    .bind(chat_id)
-    .bind(telegram_user_id)
-    .bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
-    .fetch_one(pool)
-    .await?;
-
     Ok(json!({
         "mode": "observational_only",
         "source_message_window_hours": 24,
@@ -341,8 +412,13 @@ pub async fn recent_link_relationship_summary(
         "affiliated_telegram_message_links": affiliated_message_links,
         "external_telegram_message_links": external_message_links,
         "unresolved_telegram_links": unresolved_telegram_links,
-        "external_web_url_count": external_web_url_count,
-        "external_qr_url_count": external_qr_url_count.min(u16::MAX as i64),
+        "locally_resolved_current_usernames": resolved_username_count,
+        "confirmed_bot_candidates": confirmed_bot_candidate_count,
+        "username_snapshot_max_age_hours": 24,
+        "unique_external_url_count": unique_external_url_count,
+        // Compatibility/diagnostic alias; URL shadow uses only the unified unique count.
+        "external_web_url_count": unique_external_url_count,
+        "external_qr_url_count": external_qr_url_count,
         "verified_threat_feed_hit": verified_threat_feed_hit,
         "user_id_target_provenance": {
             "telegram_text_mention_entities": native_user_id_entity_count,
@@ -365,6 +441,37 @@ pub async fn recent_link_relationship_summary(
             "snapshot_max_age_days": 30,
         },
     }))
+}
+
+fn is_external_web_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    ![
+        "t.me",
+        "telegram.me",
+        "telegram.dog",
+        "www.t.me",
+        "www.telegram.me",
+        "www.telegram.dog",
+    ]
+    .contains(&host.as_str())
+        && !host.ends_with(".t.me")
+        && !host.ends_with(".telegram.me")
+        && !host.ends_with(".telegram.dog")
+}
+
+fn normalize_username(value: &str) -> Option<String> {
+    let username = value.trim().trim_start_matches('@').to_ascii_lowercase();
+    (5..=32).contains(&username.len()).then_some(())?;
+    username
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .then_some(username)
+}
+
+fn is_bot_candidate(username: &str) -> bool {
+    ["bot", "agent", "ai", "app", "game", "gay"]
+        .iter()
+        .any(|suffix| username.ends_with(suffix))
 }
 
 fn relation_targets(raw_json: Value, text: Option<&str>) -> Vec<Found> {
@@ -443,6 +550,20 @@ pub fn relation(link: &TelegramLink, context: &RelationContext<'_>) -> LinkRelat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usernames_are_candidate_only_and_require_authoritative_current_profile() {
+        assert_eq!(normalize_username("@AliceBot"), Some("alicebot".to_owned()));
+        assert!(is_bot_candidate("alicebot"));
+        assert!(is_bot_candidate("aliceagent"));
+        assert!(is_bot_candidate("aliceai"));
+        assert!(is_bot_candidate("aliceapp"));
+        assert!(is_bot_candidate("alicegame"));
+        assert!(is_bot_candidate("alicegay"));
+        assert!(!is_bot_candidate("alice"));
+        assert_eq!(normalize_username("@short"), Some("short".to_owned()));
+        assert_eq!(normalize_username("@not-valid!"), None);
+    }
 
     #[test]
     fn relationship_target_extraction_keeps_native_text_mention_identity() {

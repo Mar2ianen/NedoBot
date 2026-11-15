@@ -290,7 +290,7 @@ fn encode(
 
 #[cfg(test)]
 mod target_identity_tests {
-    use teloxide_url::{Found, Kind};
+    use teloxide_url::{Found, Kind, Source};
 
     use super::encode;
 
@@ -305,6 +305,26 @@ mod target_identity_tests {
             alice_42.target_sha256,
             different_label_same_id.target_sha256
         );
+    }
+
+    #[test]
+    fn same_canonical_url_has_one_identity_across_all_extraction_sources() {
+        let sources = [
+            Source::VisibleText,
+            Source::TelegramEntity,
+            Source::RichMessage,
+            Source::Qr,
+        ];
+        let hashes = sources.map(|source| {
+            let mut found = Found::new("https://example.org/a", Kind::Url);
+            found.source = source;
+            encode(&found, 0, (source == Source::Qr).then_some("external"))
+                .unwrap()
+                .target_sha256
+        });
+        assert!(hashes.iter().all(|hash| hash == &hashes[0]));
+        let different = encode(&Found::new("https://example.org/b", Kind::Url), 0, None).unwrap();
+        assert_ne!(hashes[0], different.target_sha256);
     }
 }
 

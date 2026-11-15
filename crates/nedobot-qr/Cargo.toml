@@ -10,4 +10,4 @@ quircs = "0.10.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "b3897a91aad4b4d8a44aade68977c33dc3ad6a04" }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "d374a191ae6b6bcd66fbcf8a6646d73138064038" }

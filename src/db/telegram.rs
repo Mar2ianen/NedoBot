@@ -568,7 +568,7 @@ pub async fn update_user_profile_details(
             $28, now(), null, now()
         )
         on conflict (telegram_user_id) do update set
-            username = coalesce(excluded.username, telegram_user_profiles.username),
+            username = excluded.username,
             first_name = coalesce(excluded.first_name, telegram_user_profiles.first_name),
             last_name = coalesce(excluded.last_name, telegram_user_profiles.last_name),
             bio = excluded.bio,

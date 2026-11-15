@@ -166,11 +166,7 @@ pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
         .await?;
     let url_shadow = teloxide_antispam::url_shadow::analyze_url_shadow(
         teloxide_antispam::url_shadow::UrlShadowEvidence {
-            external_url_count: url_relationship_observation["external_web_url_count"]
-                .as_u64()
-                .unwrap_or_default()
-                .min(u16::MAX as u64) as u16,
-            external_qr_url_count: url_relationship_observation["external_qr_url_count"]
+            unique_external_url_count: url_relationship_observation["unique_external_url_count"]
                 .as_u64()
                 .unwrap_or_default()
                 .min(u16::MAX as u64) as u16,
@@ -407,11 +403,7 @@ async fn refresh_url_shadow_observation_from_links_locked(
     });
     let analysis = teloxide_antispam::url_shadow::analyze_url_shadow(
         teloxide_antispam::url_shadow::UrlShadowEvidence {
-            external_url_count: relationships["external_web_url_count"]
-                .as_u64()
-                .unwrap_or_default()
-                .min(u16::MAX as u64) as u16,
-            external_qr_url_count: relationships["external_qr_url_count"]
+            unique_external_url_count: relationships["unique_external_url_count"]
                 .as_u64()
                 .unwrap_or_default()
                 .min(u16::MAX as u64) as u16,
@@ -1750,12 +1742,16 @@ mod tests {
             .bind(CHAT_ID).bind(USER_ID).execute(&pool).await.unwrap();
         sqlx::query("insert into telegram_messages(chat_id,message_id,user_id,text,raw_json,created_at) values($1,$2,$3,null,'{}',now())")
             .bind(CHAT_ID).bind(MESSAGE_ID).bind(USER_ID).execute(&pool).await.unwrap();
-        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,display_hint,privacy_sensitive,qr_relation) values($1,$2,$3,0,'url','qr',$4,'https://example.invalid/…',true,'external')")
+        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,host,display_hint,privacy_sensitive,qr_relation) values($1,$2,$3,0,'url','qr',$4,'example.invalid','https://example.invalid/…',true,'external')")
             .bind(CHAT_ID).bind(MESSAGE_ID).bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
-            .bind(target_hash).execute(&pool).await.unwrap();
+            .bind(&target_hash).execute(&pool).await.unwrap();
         sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,display_hint,privacy_sensitive,qr_relation) values($1,$2,$3,1,'url','qr',$4,'https://t.me/…',true,'affiliated')")
             .bind(CHAT_ID).bind(MESSAGE_ID).bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
             .bind("0".repeat(64)).execute(&pool).await.unwrap();
+        // The same canonical URL in text and QR is one target for scoring.
+        sqlx::query("insert into telegram_message_url_evidence(chat_id,message_id,parser_version,item_index,kind,source,target_sha256,host,display_hint,privacy_sensitive) values($1,$2,$3,0,'url','visible_text',$4,'example.invalid','https://example.invalid/…',true)")
+            .bind(CHAT_ID).bind(MESSAGE_ID).bind(crate::db::url_evidence::URL_EVIDENCE_PARSER_VERSION)
+            .bind(target_hash).execute(&pool).await.unwrap();
 
         let mut config = Config::from_env().unwrap();
         config.community.instance.id = "url_shadow_fixture".into();
@@ -1790,6 +1786,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.0, 24);
+        assert_eq!(first.1["relationships"]["unique_external_url_count"], 1);
         assert_eq!(first.1["relationships"]["external_qr_url_count"], 1);
         assert!(
             load_latest_link_evidence(&pool, CHAT_ID, USER_ID)

@@ -146,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         let path = config
             .community
             .spam_reputation
-            .ledger_path
+            .sqlite_path
             .as_deref()
             .expect("enabled spam reputation config was validated");
         let store = SpamReputationStore::connect(path).await?;

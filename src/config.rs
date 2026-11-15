@@ -1608,20 +1608,20 @@ fn validate_community_config(
     if community.spam_reputation.enabled
         && community
             .spam_reputation
-            .ledger_path
+            .sqlite_path
             .as_deref()
             .is_none_or(|path| path.trim().is_empty())
     {
-        anyhow::bail!("spam_reputation.enabled=true requires ledger_path");
+        anyhow::bail!("spam_reputation.enabled=true requires sqlite_path");
     }
     if community.spam_reputation.enabled {
         let path = community
             .spam_reputation
-            .ledger_path
+            .sqlite_path
             .as_deref()
             .expect("enabled spam reputation config was checked above");
         if !std::path::Path::new(path).is_absolute() {
-            anyhow::bail!("spam_reputation.ledger_path must be an absolute path");
+            anyhow::bail!("spam_reputation.sqlite_path must be an absolute path");
         }
         require_compiled_feature("spam-sync", cfg!(feature = "spam-sync"))?;
     }
@@ -2756,13 +2756,13 @@ models = ["primary", "fallback"]
 
     #[cfg(feature = "spam-sync")]
     #[test]
-    fn spam_reputation_requires_an_absolute_ledger_path() {
+    fn spam_reputation_requires_an_absolute_sqlite_path() {
         let mut config = config();
         config.community.spam_reputation.enabled = true;
-        config.community.spam_reputation.ledger_path = Some("var/spammers.json".to_string());
+        config.community.spam_reputation.sqlite_path = Some("var/spammers.sqlite".to_string());
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
-        assert!(error.contains("spam_reputation.ledger_path must be an absolute path"));
+        assert!(error.contains("spam_reputation.sqlite_path must be an absolute path"));
     }
 }
