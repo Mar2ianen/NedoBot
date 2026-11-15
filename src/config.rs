@@ -1490,6 +1490,16 @@ fn validate_community_config(
             );
         }
     }
+    if community.moderation.qr_evidence_enabled {
+        require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
+        anyhow::ensure!(
+            community
+                .chats
+                .values()
+                .any(|chat| chat.ingest && chat.moderation),
+            "moderation.qr_evidence_enabled requires an ingested moderation chat"
+        );
+    }
     community.moderation.decision.validate()?;
     if community.moderation.decision.enabled {
         anyhow::ensure!(
@@ -1777,6 +1787,7 @@ mod tests {
         let moderation = toml::from_str::<crate::config_file::ModerationConfig>("")
             .expect("omitted captcha settings must deserialize to safe defaults");
         assert!(!moderation.captcha_enabled);
+        assert!(!moderation.qr_evidence_enabled);
         assert!(moderation.captcha_dry_run);
         assert_eq!(moderation.captcha_threshold, 70);
         assert_eq!(moderation.captcha_ttl_sec, 600);

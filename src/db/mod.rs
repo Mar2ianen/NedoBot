@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 pub mod membership;
 pub mod telegram;
+pub mod url_evidence;
 
 pub async fn build_pool() -> anyhow::Result<PgPool> {
     let database_url = std::env::var("DATABASE_URL")?;

@@ -9,6 +9,7 @@ DATABASE_URL="$TEST_DATABASE_URL" cargo run --quiet --bin migrate
 DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --quiet --bin migrate
 cargo test --all-targets
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test postgres_migrations -- --ignored
+TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --features manual-moderation --test manual_moderation -- --ignored
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test chat_db_mcp ask_mcp_client_starts_canonical_rmcp_child_with_env_clear_allowlist -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" TEST_DATABASE_URL_B="$TEST_DATABASE_URL_B" cargo test --test chat_db_mcp independent_community_databases_generate_manifests_and_start_isolated_mcp_servers -- --ignored --exact

@@ -219,6 +219,9 @@ pub struct ModerationConfig {
     /// Сколько секунд даётся на решение до обратимого удаления из чата.
     #[serde(default = "default_captcha_ttl_sec")]
     pub captcha_ttl_sec: i64,
+    /// Извлечение QR URL ограниченным фоновым обработчиком.
+    #[serde(default)]
+    pub qr_evidence_enabled: bool,
     /// Нейроскоринг первого сообщения (word TF-IDF + LogReg, экспорт
     /// `eval/train_linear_spam.py`). Слабый supporting-сигнал поверх LLM.
     #[serde(default)]

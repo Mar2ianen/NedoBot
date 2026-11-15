@@ -171,6 +171,10 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "spam-sync")]
     spawn_spam_reputation_worker(state.clone());
     #[cfg(feature = "moderation")]
+    if state.config.community.moderation.qr_evidence_enabled {
+        features::qr_url::spawn_worker(bot.inner().clone(), state.clone());
+    }
+    #[cfg(feature = "moderation")]
     features::decision_audit::service::spawn_worker(
         bot.inner().clone(),
         state.pool.clone(),

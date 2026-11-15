@@ -203,6 +203,17 @@ pub async fn save_telegram_message(
     .fetch_one(pool)
     .await?;
 
+    if !teloxide_url::adapter::extract_from_message(msg).is_empty() {
+        super::url_evidence::replace_message_url_evidence(pool, msg).await?;
+    }
+    if config.community.moderation.qr_evidence_enabled
+        && config
+            .chat_by_id(msg.chat.id.0)
+            .is_some_and(|chat| chat.config.moderation)
+    {
+        super::url_evidence::enqueue_qr_scan_job(pool, msg).await?;
+    }
+
     if inserted {
         upsert_chat_user_activity(pool, msg, source_channel_id).await?;
         enqueue_message_embedding_if_enabled(
@@ -232,9 +243,37 @@ pub async fn save_edited_telegram_message(
     });
 
     save_telegram_message(pool, msg, config).await?;
+    super::url_evidence::supersede_qr_scan_jobs(
+        pool,
+        msg,
+        config.community.moderation.qr_evidence_enabled
+            && config
+                .chat_by_id(msg.chat.id.0)
+                .is_some_and(|chat| chat.config.moderation),
+    )
+    .await?;
 
     if !changed {
         return Ok(());
+    }
+
+    if let Some(old) = old.as_ref()
+        && let Ok(old_message) = serde_json::from_value::<Message>(old.raw_json.clone())
+    {
+        let old_had_references =
+            !teloxide_url::adapter::extract_from_message(&old_message).is_empty();
+        let new_has_references = !teloxide_url::adapter::extract_from_message(msg).is_empty();
+        let old_qr_id = super::url_evidence::qr_media_candidate(&old_message)
+            .map(|candidate| candidate.file_unique_id);
+        let new_qr_id =
+            super::url_evidence::qr_media_candidate(msg).map(|candidate| candidate.file_unique_id);
+        let qr_media_changed =
+            old_qr_id != new_qr_id && (old_qr_id.is_some() || new_qr_id.is_some());
+        if (old_had_references && !new_has_references) || qr_media_changed {
+            let qr_targets = qr_media_changed.then_some(&[][..]);
+            super::url_evidence::replace_message_url_evidence_with_qr(pool, msg, qr_targets)
+                .await?;
+        }
     }
 
     let edited_at = msg.edit_date().cloned().unwrap_or_else(Utc::now);

@@ -44,6 +44,7 @@ captcha_enabled = false
 captcha_dry_run = true
 captcha_threshold = 70
 captcha_ttl_sec = 600
+qr_evidence_enabled = false
 ```
 
 `captcha_enabled` включает challenge для новых участников, чей score не ниже
@@ -60,6 +61,12 @@ TTL начинается после отправки challenge. По истеч�
 high-risk аудит может выдать новую капчу.
 Для реальных действий бот должен быть администратором с правами
 `can_delete_messages` и `can_restrict_members` в каждом модерируемом чате.
+
+`qr_evidence_enabled` отдельно включает ограниченную фоновую очередь для QR
+в фотографиях, image-документах и статичных стикерах модерируемых чатов.
+GIF, видео, TGS и OCR не обрабатываются. QR payload не пишется в derived
+таблицу открытым текстом: сохраняются хеш URL и redacted host hint. Сам этот
+флаг не добавляет score, капчу, review или блокировку.
 
 Spam-review buttons are available to configured `reviewer_user_ids` and to
 current administrators/owners of the configured `review_chat`.

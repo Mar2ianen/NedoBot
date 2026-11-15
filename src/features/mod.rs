@@ -27,6 +27,8 @@ pub mod new_user_analysis;
 #[cfg(feature = "moderation")]
 pub mod new_user_audit;
 #[cfg(feature = "moderation")]
+pub mod qr_url;
+#[cfg(feature = "moderation")]
 pub mod reports;
 #[cfg(feature = "moderation")]
 pub mod risk_captcha;
