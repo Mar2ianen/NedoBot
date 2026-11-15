@@ -7,6 +7,7 @@ pub mod http;
 pub mod llm;
 #[cfg(feature = "public-mcp")]
 pub mod mcp;
+pub mod private_corpus;
 pub mod state;
 pub mod telegram;
 pub use teloxide_antispam::text;
