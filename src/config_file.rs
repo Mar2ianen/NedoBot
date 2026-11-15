@@ -219,6 +219,17 @@ pub struct ModerationConfig {
     /// Сколько секунд даётся на решение до обратимого удаления из чата.
     #[serde(default = "default_captcha_ttl_sec")]
     pub captcha_ttl_sec: i64,
+    /// Извлечение QR URL ограниченным фоновым обработчиком.
+    #[serde(default)]
+    pub qr_evidence_enabled: bool,
+    /// Локальный снимок Phishing.Database; URL пользователей не отправляются
+    /// источнику. Сопадения остаются только наблюдательным evidence.
+    #[serde(default)]
+    pub url_feed_enabled: bool,
+    #[serde(default = "default_url_feed_refresh_seconds")]
+    pub url_feed_refresh_seconds: u64,
+    #[serde(default = "default_url_feed_max_age_seconds")]
+    pub url_feed_max_age_seconds: u64,
     /// Нейроскоринг первого сообщения (word TF-IDF + LogReg, экспорт
     /// `eval/train_linear_spam.py`). Слабый supporting-сигнал поверх LLM.
     #[serde(default)]
@@ -240,6 +251,14 @@ pub struct ModerationConfig {
     pub reputation_enabled: bool,
     #[serde(default)]
     pub reputation_model_path: Option<String>,
+}
+
+fn default_url_feed_refresh_seconds() -> u64 {
+    6 * 60 * 60
+}
+
+fn default_url_feed_max_age_seconds() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -713,7 +732,7 @@ impl Default for RuntimeSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{AskConfig, ChatConfig, RuntimeSettings};
+    use super::{AskConfig, ChatConfig, ModerationConfig, RuntimeSettings};
 
     #[test]
     fn ask_gateway_modes_are_disabled_by_default() {
@@ -729,6 +748,14 @@ mod tests {
 
         assert!(!chat.moderation_delete_target_message);
         assert!(!chat.moderation_delete_command_message);
+    }
+
+    #[test]
+    fn url_feed_is_opt_in_with_bounded_default_refresh_and_freshness() {
+        let moderation: ModerationConfig = toml::from_str("").unwrap();
+        assert!(!moderation.url_feed_enabled);
+        assert_eq!(moderation.url_feed_refresh_seconds, 6 * 60 * 60);
+        assert_eq!(moderation.url_feed_max_age_seconds, 7 * 24 * 60 * 60);
     }
 
     #[test]

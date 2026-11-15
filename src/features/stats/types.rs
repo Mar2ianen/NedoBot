@@ -2,6 +2,18 @@ use chrono::{DateTime, Utc};
 
 use crate::telegram::html::Html;
 
+/// Тип агрегированных данных приложения, не зависящий от дополнительных
+/// модулей общей статистики и изменений их состава.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UserActivity {
+    pub messages: i64,
+    pub replies: i64,
+    pub links: i64,
+    pub media: i64,
+    pub voices: i64,
+    pub reactions_received: i64,
+}
+
 #[derive(Clone, Copy)]
 pub enum StatsPeriod {
     Day,
@@ -173,7 +185,7 @@ pub struct TopWordUser {
 pub struct TopMessageUser {
     pub user: UserPresentation,
     pub username: Option<String>,
-    pub activity: teloxide_statistics::activity::UserActivity,
+    pub activity: UserActivity,
 }
 
 #[derive(Clone)]
@@ -220,7 +232,7 @@ pub struct UserStatsReportData {
     pub last_message_id: String,
     pub first_seen_days_ago: Option<i64>,
     pub last_seen_days_ago: Option<i64>,
-    pub activity: teloxide_statistics::activity::UserActivity,
+    pub activity: UserActivity,
     pub activity_extras: UserActivityExtras,
     pub top_words: Vec<(String, i64)>,
 }

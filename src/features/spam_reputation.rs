@@ -125,7 +125,10 @@ impl SpamReputationStore {
         instance_id: &str,
         local_decisions: &[(i64, bool)],
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        // Acquire the SQLite writer reservation before reading the previous
+        // instance snapshot. A deferred transaction can otherwise race another
+        // process's read-to-write upgrade and fail with SQLITE_BUSY_SNAPSHOT.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previously_active = sqlx::query_scalar::<_, i64>(
             "select telegram_user_id from spammer_decisions
              where instance_id = ? and is_spammer = 1",
@@ -272,6 +275,52 @@ mod tests {
         assert_eq!(
             store.active_decisions().await.unwrap(),
             vec![(7, "main".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_instance_writers_keep_both_decision_sets() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("shared.sqlite");
+        let nedonews = SpamReputationStore::connect(&path).await.unwrap();
+        let pvo = SpamReputationStore::connect(&path).await.unwrap();
+
+        let (first, second) = tokio::join!(
+            nedonews.reconcile_instance_decisions("nedonews", &[(42, true), (43, true)]),
+            pvo.reconcile_instance_decisions("pvo", &[(42, true), (44, true)])
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let mut decisions = nedonews.active_decisions().await.unwrap();
+        decisions.sort();
+        assert_eq!(
+            decisions,
+            vec![
+                (42, "nedonews".to_string()),
+                (42, "pvo".to_string()),
+                (43, "nedonews".to_string()),
+                (44, "pvo".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_survive_store_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("shared.sqlite");
+        {
+            let store = SpamReputationStore::connect(&path).await.unwrap();
+            store
+                .reconcile_instance_decisions("nedonews", &[(77, true)])
+                .await
+                .unwrap();
+        }
+
+        let restarted = SpamReputationStore::connect(&path).await.unwrap();
+        assert_eq!(
+            restarted.active_decisions().await.unwrap(),
+            vec![(77, "nedonews".to_string())]
         );
     }
 }

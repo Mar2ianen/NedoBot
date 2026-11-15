@@ -2,6 +2,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use teloxide::drafter::InProcessRateLimiter;
 use teloxide::utils::{rich_text::LlmMarkdownFormatter, time::TimeContext};
+#[cfg(feature = "moderation")]
+use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
@@ -19,6 +21,8 @@ pub struct AppState {
     pub drafter_limiter: InProcessRateLimiter,
     pub ask_delivery_metrics: Arc<AskDeliveryMetrics>,
     pub telegram_bot_identity: Option<TelegramBotIdentity>,
+    #[cfg(feature = "moderation")]
+    pub url_feed_snapshot: Arc<RwLock<Option<Arc<crate::features::url_feeds::FeedSnapshot>>>>,
     #[cfg(feature = "spam-sync")]
     pub spam_reputation: Option<Arc<SpamReputationStore>>,
 }
@@ -38,6 +42,8 @@ impl AppState {
             drafter_limiter: InProcessRateLimiter::default(),
             ask_delivery_metrics: Arc::new(AskDeliveryMetrics::default()),
             telegram_bot_identity: None,
+            #[cfg(feature = "moderation")]
+            url_feed_snapshot: Arc::new(RwLock::new(None)),
             #[cfg(feature = "spam-sync")]
             spam_reputation: None,
         }

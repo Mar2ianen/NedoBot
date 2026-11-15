@@ -603,7 +603,7 @@ mod tests {
     use super::*;
     use crate::features::stats::strings::StatsStrings;
     use crate::features::stats::types::{
-        TopMessageUser, TopWordReportData, TopWordUser, UserPresentation,
+        TopMessageUser, TopWordReportData, TopWordUser, UserActivity, UserPresentation,
     };
 
     fn ranked_fixture() -> TopMessagesReportData {
@@ -618,7 +618,7 @@ mod tests {
                     is_present: None,
                 },
                 username: None,
-                activity: teloxide_statistics::activity::UserActivity {
+                activity: UserActivity {
                     messages: 1,
                     ..Default::default()
                 },

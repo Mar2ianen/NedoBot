@@ -115,6 +115,20 @@ async fn main() -> anyhow::Result<()> {
     preflight_risk_captcha_permissions(&bot, &config).await?;
     let pool = build_pool().await?;
     migrate(&pool).await?;
+    #[cfg(feature = "moderation")]
+    if config.community.moderation.enabled {
+        if let Err(err) =
+            features::url_relations::refresh_configured_linked_chats(bot.inner(), &pool, &config)
+                .await
+        {
+            tracing::warn!(%err, "failed to refresh configured Telegram linked chats at startup");
+        }
+        features::url_relations::spawn_linked_chat_refresh_worker(
+            bot.inner().clone(),
+            pool.clone(),
+            config.clone(),
+        );
+    }
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
         tracing::warn!(%err, "failed to refresh member snapshots");
     }
@@ -156,6 +170,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState::new(pool, config);
+    #[cfg(feature = "moderation")]
+    if state.config.community.moderation.url_feed_enabled {
+        features::url_feeds::spawn_worker(state.url_feed_snapshot.clone(), state.config.clone());
+    }
     #[cfg(feature = "ask")]
     let state = match bot_identity {
         Some(identity) => state.with_telegram_bot_identity(identity),
@@ -171,6 +189,10 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "spam-sync")]
     spawn_spam_reputation_worker(state.clone());
     #[cfg(feature = "moderation")]
+    if state.config.community.moderation.qr_evidence_enabled {
+        features::qr_url::spawn_worker(bot.inner().clone(), state.clone());
+    }
+    #[cfg(feature = "moderation")]
     features::decision_audit::service::spawn_worker(
         bot.inner().clone(),
         state.pool.clone(),
@@ -180,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
         bot.inner().clone(),
         state.pool.clone(),
         state.config.clone(),
+        #[cfg(feature = "moderation")]
+        state.url_feed_snapshot.clone(),
     );
     spawn_spammer_avatar_embedding_worker(bot.inner().clone(), state.clone());
     #[cfg(feature = "moderation")]
@@ -217,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "voice")]
     spawn_voice_transcription_worker(bot.clone(), state.clone());
 
-    let mut handler = dptree::entry()
+    let handler = dptree::entry()
         .branch(
             Update::filter_message()
                 .branch(
@@ -233,9 +257,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .branch(Update::filter_edited_message().endpoint(handle_edited_message));
     #[cfg(feature = "moderation")]
-    {
-        handler = handler.branch(Update::filter_callback_query().endpoint(handle_callback_query));
-    }
+    let handler = handler.branch(Update::filter_callback_query().endpoint(handle_callback_query));
     let handler = handler.branch(Update::filter_chat_member().endpoint(handle_chat_member));
 
     Dispatcher::builder(bot, handler)
@@ -913,8 +935,30 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
     if !managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ingest) {
         return Ok(());
     }
-    if let Err(err) = save_edited_telegram_message(&state.pool, &msg, &state.config).await {
-        tracing::error!(%err, "failed to save edited message");
+    match save_edited_telegram_message(&state.pool, &msg, &state.config).await {
+        Ok(()) => {
+            #[cfg(feature = "moderation")]
+            if state
+                .config
+                .chat_allows(msg.chat.id.0, |chat| chat.moderation)
+                && let Some(user) = msg.from.as_ref().filter(|user| !user.is_bot)
+            {
+                let url_feed = state.url_feed_snapshot.read().await.clone();
+                if let Err(error) =
+                    features::new_user_analysis::refresh_url_shadow_observation_from_links(
+                        &state.pool,
+                        &state.config,
+                        msg.chat.id.0,
+                        user.id.0 as i64,
+                        url_feed.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, chat_id = msg.chat.id.0, user_id = user.id.0, "failed to refresh URL shadow after message edit");
+                }
+            }
+        }
+        Err(err) => tracing::error!(%err, "failed to save edited message"),
     }
 
     Ok(())

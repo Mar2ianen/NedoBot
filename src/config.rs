@@ -28,6 +28,7 @@ const DEFAULT_COMMENT_BLOCKED_SOURCE_DOMAINS: &[&str] = &[
 
 use crate::community::ChatRegistry;
 use crate::config_file::{CommunityConfig, RiskProfile, TelegramIdRiskModel};
+#[cfg(feature = "ask")]
 use crate::features::ask::profile::AgentProfile;
 use crate::features::chat_read_api::types::ChatReadScope;
 use crate::llm::profiles::{Egress, LlmProfiles, RouteRequirements};
@@ -49,6 +50,7 @@ pub struct Config {
     pub post_signature_aliases: Vec<String>,
     pub llm_profiles_path: Option<String>,
     pub llm_profiles: Option<LlmProfiles>,
+    #[cfg(feature = "ask")]
     pub agent_profile: Option<AgentProfile>,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
@@ -164,6 +166,7 @@ impl Config {
         )
     }
 
+    #[cfg(feature = "ask")]
     pub fn ask_agent_route(&self) -> &str {
         self.agent_profile
             .as_ref()
@@ -332,6 +335,7 @@ impl Config {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("LLM profiles are not configured"))?;
         let community = community_config_from_profiles(profiles)?;
+        #[cfg(feature = "ask")]
         let agent_profile = if community.ask.agent_profile.is_some()
             || community.ask.enabled
             || runtime.ask_enabled
@@ -412,6 +416,7 @@ impl Config {
             post_signature_aliases,
             llm_profiles_path,
             llm_profiles,
+            #[cfg(feature = "ask")]
             agent_profile,
             llm_temperature: runtime.llm_temperature,
             llm_max_tokens: runtime.llm_max_tokens,
@@ -599,6 +604,11 @@ impl Config {
             );
             config.embedding_spam_model = Some(std::sync::Arc::new(model));
         }
+        #[cfg(not(feature = "moderation"))]
+        if config.community.moderation.reputation_enabled {
+            anyhow::bail!("moderation.reputation_enabled requires cargo feature moderation");
+        }
+        #[cfg(feature = "moderation")]
         if config.community.moderation.reputation_enabled {
             let path = config
                 .community
@@ -665,6 +675,7 @@ impl Config {
                     .to_string(),
             );
         }
+        #[cfg(feature = "ask")]
         if self.ask_enabled {
             let missing_ask_chat_invites = self
                 .community
@@ -706,7 +717,11 @@ impl Config {
             || gateway.reply_to_bot_enabled
             || gateway.private_messages_enabled
         {
-            if !self.ask_enabled || self.agent_profile.is_none() {
+            #[cfg(feature = "ask")]
+            let missing_agent_profile = self.agent_profile.is_none();
+            #[cfg(not(feature = "ask"))]
+            let missing_agent_profile = true;
+            if !self.ask_enabled || missing_agent_profile {
                 errors.push(
                     "ask.gateway requires ask.enabled=true and a valid AgentProfile".to_string(),
                 );
@@ -758,6 +773,7 @@ impl Config {
             errors.push("LLM_PROFILES_PATH must configure authoritative LLM routes".to_string());
         }
 
+        #[cfg(feature = "ask")]
         if let Some(profile) = &self.agent_profile {
             let compiled_tools = crate::features::ask::mcp_client::compiled_agent_tool_names();
             for tool in &profile.tool_allowlist {
@@ -842,6 +858,7 @@ impl Config {
             errors.push("PROFILE_REFRESH_CONCURRENCY must be greater than 0".to_string());
         }
 
+        #[cfg(feature = "ask")]
         if self.ask_enabled {
             if self.owner_telegram_id.is_none() {
                 errors.push("ASK_ENABLED=true requires OWNER_TELEGRAM_ID".to_string());
@@ -962,6 +979,7 @@ impl Config {
                 ));
             }
         }
+        #[cfg(feature = "ask")]
         if self.ask_enabled {
             for requires_images in [false, true] {
                 routes.push((
@@ -1490,6 +1508,35 @@ fn validate_community_config(
             );
         }
     }
+    if community.moderation.qr_evidence_enabled {
+        require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
+        anyhow::ensure!(
+            community
+                .chats
+                .values()
+                .any(|chat| chat.ingest && chat.moderation),
+            "moderation.qr_evidence_enabled requires an ingested moderation chat"
+        );
+    }
+    if community.moderation.url_feed_enabled {
+        require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
+        anyhow::ensure!(
+            community.moderation.enabled
+                && community
+                    .chats
+                    .values()
+                    .any(|chat| chat.ingest && chat.moderation),
+            "moderation.url_feed_enabled requires moderation and an ingested moderation chat"
+        );
+        anyhow::ensure!(
+            (3_600..=86_400).contains(&community.moderation.url_feed_refresh_seconds),
+            "moderation.url_feed_refresh_seconds must be between 3600 and 86400"
+        );
+        anyhow::ensure!(
+            (3_600..=30 * 24 * 60 * 60).contains(&community.moderation.url_feed_max_age_seconds),
+            "moderation.url_feed_max_age_seconds must be between 3600 and 2592000"
+        );
+    }
     community.moderation.decision.validate()?;
     if community.moderation.decision.enabled {
         anyhow::ensure!(
@@ -1777,6 +1824,7 @@ mod tests {
         let moderation = toml::from_str::<crate::config_file::ModerationConfig>("")
             .expect("omitted captcha settings must deserialize to safe defaults");
         assert!(!moderation.captcha_enabled);
+        assert!(!moderation.qr_evidence_enabled);
         assert!(moderation.captcha_dry_run);
         assert_eq!(moderation.captcha_threshold, 70);
         assert_eq!(moderation.captcha_ttl_sec, 600);
@@ -1974,6 +2022,7 @@ mod tests {
             post_signature_aliases: Vec::new(),
             llm_profiles_path: None,
             llm_profiles: None,
+            #[cfg(feature = "ask")]
             agent_profile: None,
             llm_temperature: 0.35,
             llm_max_tokens: 90,

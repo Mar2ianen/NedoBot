@@ -447,6 +447,7 @@ async fn send_command_html(
         .map(Some)
 }
 
+#[cfg(feature = "moderation")]
 async fn send_command_reply_html(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,

@@ -11,8 +11,8 @@ use crate::features::stats::stop_words::USER_TOP_WORD_STOP_WORDS;
 use crate::features::stats::types::{
     AttractionMetrics, BotCommentStats, ChatStatsReportData, DailyActive, DailyActivitySummary,
     MessageMediaPreview, PeriodTopUser, RetentionSummary, TopMessageUser, TopMessagesReportData,
-    TopReactedMessage, TopReactedReportData, TopWordReportData, TopWordUser, UserActivityExtras,
-    UserPresentation, UserStatsReportData, display_name,
+    TopReactedMessage, TopReactedReportData, TopWordReportData, TopWordUser, UserActivity,
+    UserActivityExtras, UserPresentation, UserStatsReportData, display_name,
 };
 use crate::features::user_profiles::avatar::cache_profile_avatar;
 use crate::features::user_profiles::service::refresh_profile;
@@ -186,7 +186,7 @@ fn top_message_user(row: repo::TopMessage) -> TopMessageUser {
             is_present: Some(row.is_present),
         },
         username: row.username,
-        activity: teloxide_statistics::activity::UserActivity {
+        activity: UserActivity {
             messages: row.messages,
             replies: row.replies,
             links: row.links,

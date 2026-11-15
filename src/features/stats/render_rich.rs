@@ -691,8 +691,8 @@ mod tests {
     use super::*;
     use crate::features::stats::strings::StatsStrings;
     use crate::features::stats::types::{
-        TopMessageUser, TopWordReportData, TopWordUser, UserActivityExtras, UserModerationSummary,
-        UserPresentation, UserStatsReportData,
+        TopMessageUser, TopWordReportData, TopWordUser, UserActivity, UserActivityExtras,
+        UserModerationSummary, UserPresentation, UserStatsReportData,
     };
 
     fn ranked_fixture() -> TopMessagesReportData {
@@ -707,7 +707,7 @@ mod tests {
                     is_present: None,
                 },
                 username: None,
-                activity: teloxide_statistics::activity::UserActivity {
+                activity: UserActivity {
                     messages: 1,
                     ..Default::default()
                 },
@@ -774,7 +774,7 @@ mod tests {
             last_message_id: "1".to_string(),
             first_seen_days_ago: Some(0),
             last_seen_days_ago: Some(0),
-            activity: teloxide_statistics::activity::UserActivity::default(),
+            activity: UserActivity::default(),
             activity_extras: UserActivityExtras {
                 active_days: 0,
                 reactions_given: 0,

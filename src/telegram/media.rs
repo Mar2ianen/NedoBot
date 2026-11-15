@@ -1,12 +1,17 @@
+#[cfg(any(feature = "ask", feature = "auto-comment"))]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
 };
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 use teloxide::{net::Download, prelude::*, types::FileId};
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 use tokio::io::AsyncWrite;
 
+#[cfg(any(feature = "ask", feature = "auto-comment"))]
 use crate::config::Config;
 #[cfg(feature = "ask")]
 use crate::features::ask::python_sandbox::{
@@ -28,6 +33,7 @@ pub(crate) async fn download_largest_photo_base64(
     download_photo_base64(bot, image_file_id, config).await
 }
 
+#[cfg(feature = "auto-comment")]
 pub(crate) async fn download_photo_base64(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     image_file_id: Option<&str>,
@@ -84,11 +90,13 @@ pub(crate) async fn download_ask_sandbox_document(
     Ok(Some(AskSandboxFile { name, bytes }))
 }
 
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 pub(crate) struct LimitedBytesWriter {
     bytes: Vec<u8>,
     limit: usize,
 }
 
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 impl LimitedBytesWriter {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
@@ -102,6 +110,7 @@ impl LimitedBytesWriter {
     }
 }
 
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 impl AsyncWrite for LimitedBytesWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -129,6 +138,7 @@ impl AsyncWrite for LimitedBytesWriter {
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "ask", feature = "auto-comment", feature = "moderation"))]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;

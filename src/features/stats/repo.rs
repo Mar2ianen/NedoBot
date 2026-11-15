@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 
 use crate::features::stats::types::{
-    ChatStatsSummary, ReportWindow, StatsPeriod, UserModerationSummary,
+    ChatStatsSummary, ReportWindow, StatsPeriod, UserActivity, UserModerationSummary,
 };
 
 /// Telegram's built-in service account. It is excluded from human activity rankings.
@@ -208,7 +208,7 @@ pub struct UserActivityExtras {
 
 #[derive(Debug, Clone)]
 pub struct UserActivitySummary {
-    pub activity: teloxide_statistics::activity::UserActivity,
+    pub activity: UserActivity,
     pub extras: UserActivityExtras,
 }
 
@@ -956,7 +956,7 @@ pub async fn user_activity(
         .await?;
 
     Ok(UserActivitySummary {
-        activity: teloxide_statistics::activity::UserActivity {
+        activity: UserActivity {
             messages: row.messages,
             replies: row.replies,
             links: row.links,
