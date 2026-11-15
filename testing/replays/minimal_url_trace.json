@@ -1,0 +1,11 @@
+{
+  "trace_id": "synthetic-url-host-case-001",
+  "seed": 72623859790382856,
+  "validity_class": "V2",
+  "origin": "public_synthetic_corpus",
+  "invariant_id": "URL-01",
+  "operation": "parse_url_pair",
+  "first": "https://EXAMPLE.org/File?campaign=Normal",
+  "second": "https://example.org/File?campaign=Normal",
+  "expected_identity": "https://example.org/File?campaign=Normal"
+}

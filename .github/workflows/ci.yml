@@ -57,6 +57,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Run deterministic adversarial harness and synthetic corpus
+        env:
+          NEDOBOT_PROPTEST_SEED: 72623859790382856
+        run: cargo test --test adversarial_harness --locked -- --nocapture
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
