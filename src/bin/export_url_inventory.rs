@@ -29,17 +29,21 @@ struct LinkRecord {
     host: Option<String>,
     message_count: u64,
     unique_authors: usize,
+    currently_flagged_spam_authors: usize,
+    operator_confirmed_spam_authors: usize,
+    operator_confirmed_normal_authors: usize,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     sources: BTreeSet<String>,
-    spam_authors: usize,
 }
 
 #[derive(Default)]
 struct Aggregate {
     message_ids: BTreeSet<i32>,
     authors: BTreeSet<i64>,
-    spam_authors: BTreeSet<i64>,
+    currently_flagged_spam_authors: BTreeSet<i64>,
+    operator_confirmed_spam_authors: BTreeSet<i64>,
+    operator_confirmed_normal_authors: BTreeSet<i64>,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
     sources: BTreeSet<String>,
@@ -53,7 +57,9 @@ struct Aggregate {
 struct HostAggregate {
     message_ids: BTreeSet<i32>,
     authors: BTreeSet<i64>,
-    spam_authors: BTreeSet<i64>,
+    currently_flagged_spam_authors: BTreeSet<i64>,
+    operator_confirmed_spam_authors: BTreeSet<i64>,
+    operator_confirmed_normal_authors: BTreeSet<i64>,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
     sources: BTreeSet<String>,
@@ -67,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     let mut output = None;
     let mut format = None;
     let mut redact_secrets = false;
+    let mut show_paths = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--chat-id" => {
@@ -89,10 +96,11 @@ async fn main() -> anyhow::Result<()> {
                 )
             }
             "--redact-secrets" => redact_secrets = true,
+            "--show-paths" => show_paths = true,
             _ => anyhow::bail!("unknown argument: {arg}"),
         }
     }
-    let chat_id = chat_id.ok_or_else(|| anyhow::anyhow!("usage: export_url_inventory --chat-id <CHAT_ID> --format jsonl --redact-secrets --output links.jsonl"))?;
+    let chat_id = chat_id.ok_or_else(|| anyhow::anyhow!("usage: export_url_inventory --chat-id <CHAT_ID> --format jsonl --redact-secrets [--show-paths] --output links.jsonl"))?;
     anyhow::ensure!(
         format.as_deref() == Some("jsonl"),
         "--format jsonl is required"
@@ -103,10 +111,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let output = output.ok_or_else(|| anyhow::anyhow!("--output is required"))?;
     let pool = build_pool().await?;
-    export(&pool, chat_id, &output).await
+    export(&pool, chat_id, &output, show_paths).await
 }
 
-async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()> {
+async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> anyhow::Result<()> {
     let output_path = Path::new(output);
     let (mut temporary, parent) = create_private_output_temp(output_path)?;
     let mut writer = BufWriter::new(temporary.as_file_mut());
@@ -121,10 +129,20 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                                   from public.telegram_message_url_evidence e
                                  where e.chat_id = m.chat_id and e.message_id = m.message_id
                                    and e.source = 'qr' and e.parser_version = $4), array[]::text[]) as qr_hashes,
-                      (u.spam_type is not null) as known_spam
+                      coalesce(u.is_spammer, false) as currently_flagged_spam,
+                      human_label.label as latest_operator_label
                  from public.telegram_messages m
                  left join public.telegram_chat_users u
                    on u.chat_id = m.chat_id and u.telegram_user_id = m.user_id
+                 left join lateral (
+                    select e.label
+                      from public.spam_label_events e
+                     where e.chat_id = m.chat_id
+                       and e.telegram_user_id = m.user_id
+                       and e.source in ('owner_review', 'owner_manual', 'legacy_backfill')
+                     order by e.created_at desc, e.id desc
+                     limit 1
+                 ) human_label on true
                 where m.chat_id = $1 and m.id > $2
                 order by m.id limit $3"#,
         )
@@ -145,7 +163,10 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
             let created_at: DateTime<Utc> = row.try_get("created_at")?;
             let raw_json: serde_json::Value = row.try_get("raw_json")?;
             let qr_hashes: Vec<String> = row.try_get("qr_hashes")?;
-            let known_spam: bool = row.try_get("known_spam")?;
+            let currently_flagged_spam: bool = row.try_get("currently_flagged_spam")?;
+            let latest_operator_label: Option<String> = row.try_get("latest_operator_label")?;
+            let operator_confirmed_spam = latest_operator_label.as_deref() == Some("spam");
+            let operator_confirmed_normal = latest_operator_label.as_deref() == Some("not_spam");
             for hash in qr_hashes {
                 let target = format!("sha256:{hash}");
                 let fingerprint = fingerprint(&format!("qr-hash-only:{hash}"));
@@ -175,8 +196,14 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                 );
                 if let Some(user_id) = user_id {
                     entry.authors.insert(user_id);
-                    if known_spam {
-                        entry.spam_authors.insert(user_id);
+                    if currently_flagged_spam {
+                        entry.currently_flagged_spam_authors.insert(user_id);
+                    }
+                    if operator_confirmed_spam {
+                        entry.operator_confirmed_spam_authors.insert(user_id);
+                    }
+                    if operator_confirmed_normal {
+                        entry.operator_confirmed_normal_authors.insert(user_id);
                     }
                 }
                 entry.sources.insert("qr_hash_only".to_owned());
@@ -204,7 +231,7 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                             continue;
                         };
                         let identity = parsed.to_string();
-                        let Some(target) = redact_target(&identity) else {
+                        let Some(target) = redact_target(&identity, show_paths) else {
                             continue;
                         };
                         let host = parsed.host_str().map(str::to_owned);
@@ -247,8 +274,14 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                 );
                 if let Some(user_id) = user_id {
                     entry.authors.insert(user_id);
-                    if known_spam {
-                        entry.spam_authors.insert(user_id);
+                    if currently_flagged_spam {
+                        entry.currently_flagged_spam_authors.insert(user_id);
+                    }
+                    if operator_confirmed_spam {
+                        entry.operator_confirmed_spam_authors.insert(user_id);
+                    }
+                    if operator_confirmed_normal {
+                        entry.operator_confirmed_normal_authors.insert(user_id);
                     }
                 }
                 entry
@@ -290,8 +323,14 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
         }
         summary.authors.extend(aggregate.authors.iter().copied());
         summary
-            .spam_authors
-            .extend(aggregate.spam_authors.iter().copied());
+            .currently_flagged_spam_authors
+            .extend(aggregate.currently_flagged_spam_authors.iter().copied());
+        summary
+            .operator_confirmed_spam_authors
+            .extend(aggregate.operator_confirmed_spam_authors.iter().copied());
+        summary
+            .operator_confirmed_normal_authors
+            .extend(aggregate.operator_confirmed_normal_authors.iter().copied());
         summary.sources.extend(aggregate.sources.iter().cloned());
         if let Some(first) = aggregate.first_seen {
             summary.first_seen = Some(summary.first_seen.map_or(first, |value| value.min(first)));
@@ -325,10 +364,12 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
             host: aggregate.host,
             message_count: aggregate.message_ids.len() as u64,
             unique_authors: aggregate.authors.len(),
+            currently_flagged_spam_authors: aggregate.currently_flagged_spam_authors.len(),
+            operator_confirmed_spam_authors: aggregate.operator_confirmed_spam_authors.len(),
+            operator_confirmed_normal_authors: aggregate.operator_confirmed_normal_authors.len(),
             first_seen,
             last_seen,
             sources: aggregate.sources,
-            spam_authors: aggregate.spam_authors.len(),
         };
         serde_json::to_writer(&mut writer, &record)?;
         writer.write_all(b"\n")?;
@@ -345,10 +386,12 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
             host: Some(host),
             message_count: aggregate.message_ids.len() as u64,
             unique_authors: aggregate.authors.len(),
+            currently_flagged_spam_authors: aggregate.currently_flagged_spam_authors.len(),
+            operator_confirmed_spam_authors: aggregate.operator_confirmed_spam_authors.len(),
+            operator_confirmed_normal_authors: aggregate.operator_confirmed_normal_authors.len(),
             first_seen,
             last_seen: aggregate.last_seen.unwrap_or(first_seen),
             sources: aggregate.sources,
-            spam_authors: aggregate.spam_authors.len(),
         };
         serde_json::to_writer(&mut writer, &record)?;
         writer.write_all(b"\n")?;
@@ -390,7 +433,7 @@ fn persist_private_output(
     Ok(())
 }
 
-fn redact_target(value: &str) -> Option<String> {
+fn redact_target(value: &str, show_paths: bool) -> Option<String> {
     match parse_telegram_link(value) {
         Some(TelegramLink::Invite { .. } | TelegramLink::AmbiguousPlus { .. }) => {
             return Some("https://t.me/<redacted-invite>".to_owned());
@@ -411,6 +454,10 @@ fn redact_target(value: &str) -> Option<String> {
     url.set_password(None).ok()?;
     url.set_query(None);
     url.set_fragment(None);
+    if !show_paths && url.path() != "/" {
+        url.set_path("/<redacted-path>");
+        return Some(url.to_string());
+    }
     let path = url.path().to_owned();
     let segments = path.split('/').collect::<Vec<_>>();
     let sensitive_route = ["login", "auth", "oauth", "reset", "verify", "invite"];
@@ -442,24 +489,32 @@ mod tests {
     #[test]
     fn inventory_redacts_auth_query_and_invite_secrets() {
         assert_eq!(
-            redact_target("https://example.org/review?token=secret#auth").as_deref(),
-            Some("https://example.org/review")
+            redact_target("https://example.org/review?token=secret#auth", false).as_deref(),
+            Some("https://example.org/%3Credacted-path%3E")
         );
         assert_eq!(
-            redact_target("https://t.me/+SyntheticInviteHash").as_deref(),
+            redact_target("https://t.me/+SyntheticInviteHash", false).as_deref(),
             Some("https://t.me/<redacted-invite>")
         );
         assert_eq!(
-            redact_target("https://t.me/review_bot?start=secret").as_deref(),
+            redact_target("https://t.me/review_bot?start=secret", false).as_deref(),
             Some("https://t.me/review_bot?start=<redacted>")
         );
         assert_eq!(
-            redact_target("https://example.org/auth/shortsecret/continue").as_deref(),
+            redact_target("https://example.org/auth/shortsecret/continue", true).as_deref(),
             Some("https://example.org/auth/%3Credacted%3E")
         );
         assert_eq!(
-            redact_target("https://example.org/?campaign=normal"),
-            redact_target("https://example.org/?campaign=spam")
+            redact_target("https://example.org/r/secret123?campaign=secret", false).as_deref(),
+            Some("https://example.org/%3Credacted-path%3E")
+        );
+        assert_eq!(
+            redact_target("https://example.org/careers/apply?token=secret", true).as_deref(),
+            Some("https://example.org/careers/apply")
+        );
+        assert_eq!(
+            redact_target("https://example.org/?campaign=normal", false),
+            redact_target("https://example.org/?campaign=spam", false)
         );
         assert_ne!(
             fingerprint("https://example.org/?campaign=normal"),
@@ -469,6 +524,156 @@ mod tests {
             fingerprint("https://example.org/File"),
             fingerprint("https://example.org/file")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn export_separates_current_flags_from_latest_operator_labels() {
+        use super::export;
+        use sqlx::PgPool;
+
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point at a disposable migrated PostgreSQL database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        tg_ai_bot_teloxide::db::migrate(&pool).await.unwrap();
+        const CHAT_ID: i64 = -100_991_229_901;
+        const USER_SYSTEM_ONLY: i64 = 9_912_299_101;
+        const USER_OPERATOR_NORMAL: i64 = 9_912_299_102;
+        const USER_OPERATOR_SPAM: i64 = 9_912_299_103;
+        const MESSAGE_BASE: i32 = 9_922_990;
+
+        sqlx::query(
+            "delete from telegram_messages where chat_id = $1 and message_id between $2 and $3",
+        )
+        .bind(CHAT_ID)
+        .bind(MESSAGE_BASE)
+        .bind(MESSAGE_BASE + 2)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "delete from spam_label_events where chat_id = $1 and telegram_user_id = any($2)",
+        )
+        .bind(CHAT_ID)
+        .bind(vec![
+            USER_SYSTEM_ONLY,
+            USER_OPERATOR_NORMAL,
+            USER_OPERATOR_SPAM,
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "delete from telegram_chat_users where chat_id = $1 and telegram_user_id = any($2)",
+        )
+        .bind(CHAT_ID)
+        .bind(vec![
+            USER_SYSTEM_ONLY,
+            USER_OPERATOR_NORMAL,
+            USER_OPERATOR_SPAM,
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (user_id, is_spammer) in [
+            (USER_SYSTEM_ONLY, false),
+            (USER_OPERATOR_NORMAL, true),
+            (USER_OPERATOR_SPAM, true),
+        ] {
+            sqlx::query("insert into telegram_chat_users(chat_id, telegram_user_id, first_seen_at, message_count, is_spammer, spam_type) values ($1, $2, now(), 1, $3, 'fixture_system_type')")
+                .bind(CHAT_ID)
+                .bind(user_id)
+                .bind(is_spammer)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let raw_json = serde_json::json!({
+                "message_id": MESSAGE_BASE + (user_id - USER_SYSTEM_ONLY) as i32,
+                "date": 1_700_000_000,
+                "chat": {"id": CHAT_ID, "type": "supergroup"},
+                "from": {"id": user_id, "is_bot": false, "first_name": "Fixture"},
+                "text": "https://example.org/r/secret123"
+            });
+            sqlx::query("insert into telegram_messages(chat_id, message_id, user_id, text, raw_json, created_at) values ($1,$2,$3,$4,$5,now())")
+                .bind(CHAT_ID)
+                .bind(raw_json["message_id"].as_i64().unwrap() as i32)
+                .bind(user_id)
+                .bind("https://example.org/r/secret123")
+                .bind(raw_json)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        for (user_id, label, source) in [
+            (USER_SYSTEM_ONLY, "spam", "system"),
+            (USER_OPERATOR_NORMAL, "spam", "owner_review"),
+            (USER_OPERATOR_NORMAL, "not_spam", "owner_review"),
+            (USER_OPERATOR_NORMAL, "spam", "system"),
+            (USER_OPERATOR_SPAM, "spam", "owner_manual"),
+        ] {
+            sqlx::query("insert into spam_label_events(chat_id, telegram_user_id, label, subtype, source, reason) values($1,$2,$3,'fixture',$4,'fixture label')")
+                .bind(CHAT_ID)
+                .bind(user_id)
+                .bind(label)
+                .bind(source)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("inventory.jsonl");
+        export(&pool, CHAT_ID, output.to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let content = std::fs::read_to_string(output).unwrap();
+        let target: serde_json::Value = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|record: &serde_json::Value| record["record_type"] == "target")
+            .unwrap();
+        assert_eq!(target["target"], "https://example.org/%3Credacted-path%3E");
+        assert_eq!(target["unique_authors"], 3);
+        assert_eq!(target["currently_flagged_spam_authors"], 2);
+        assert_eq!(target["operator_confirmed_spam_authors"], 1);
+        assert_eq!(target["operator_confirmed_normal_authors"], 1);
+
+        sqlx::query(
+            "delete from telegram_messages where chat_id = $1 and message_id between $2 and $3",
+        )
+        .bind(CHAT_ID)
+        .bind(MESSAGE_BASE)
+        .bind(MESSAGE_BASE + 2)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "delete from spam_label_events where chat_id = $1 and telegram_user_id = any($2)",
+        )
+        .bind(CHAT_ID)
+        .bind(vec![
+            USER_SYSTEM_ONLY,
+            USER_OPERATOR_NORMAL,
+            USER_OPERATOR_SPAM,
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "delete from telegram_chat_users where chat_id = $1 and telegram_user_id = any($2)",
+        )
+        .bind(CHAT_ID)
+        .bind(vec![
+            USER_SYSTEM_ONLY,
+            USER_OPERATOR_NORMAL,
+            USER_OPERATOR_SPAM,
+        ])
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
     }
 
     #[test]
