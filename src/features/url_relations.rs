@@ -42,6 +42,45 @@ pub struct RelationContext<'a> {
     pub user_membership: Option<(u64, MembershipContext)>,
 }
 
+/// A Telegram username is resolved only from one fresh local profile row.
+/// Usernames are mutable, so this type deliberately contains no history.
+pub type ResolvedUsernameAliases = HashMap<String, (i64, bool)>;
+
+/// Resolve current local profile aliases without making a Telegram API call.
+/// Stale rows are ignored and duplicate fresh aliases are omitted as ambiguous.
+pub async fn resolve_recent_username_aliases(
+    pool: &PgPool,
+    usernames: &[String],
+) -> Result<ResolvedUsernameAliases, sqlx::Error> {
+    if usernames.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows: Vec<(String, i64, bool)> = sqlx::query_as(
+        r#"select lower(username), telegram_user_id, is_bot
+             from telegram_user_profiles
+            where lower(username) = any($1)
+              and updated_at >= now() - interval '24 hours'"#,
+    )
+    .bind(usernames)
+    .fetch_all(pool)
+    .await?;
+
+    let mut aliases = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for (username, user_id, is_bot) in rows {
+        if ambiguous.contains(&username) {
+            continue;
+        }
+        if aliases.remove(&username).is_some() {
+            ambiguous.insert(username);
+        } else {
+            aliases.insert(username, (user_id, is_bot));
+        }
+    }
+    Ok(aliases)
+}
+
 /// Настроенные пары чата обсуждений и канала известны без вызова Bot API.
 /// Связанные чаты вызывающая сторона добавляет только после проверки API.
 pub fn configured_affiliated_channels(config: &Config, chat_id: i64) -> HashSet<i64> {
@@ -271,26 +310,10 @@ pub async fn recent_link_relationship_summary(
     // Только один актуальный профиль может разрешить username. История
     // прежних username намеренно не считается владением: Telegram переиспользует имена.
     let usernames = username_targets.into_iter().collect::<Vec<_>>();
-    let resolved_names: Vec<(String, i64, bool, i64)> = if usernames.is_empty() {
-        Vec::new()
-    } else {
-        sqlx::query_as(
-            r#"select lower(username), min(telegram_user_id), bool_or(is_bot), count(*)::bigint
-                 from telegram_user_profiles
-                where lower(username) = any($1)
-                  and updated_at >= now() - interval '24 hours'
-                group by lower(username)"#,
-        )
-        .bind(&usernames)
-        .fetch_all(pool)
-        .await?
-    };
+    let resolved_names = resolve_recent_username_aliases(pool, &usernames).await?;
     let mut resolved_username_count = 0u16;
     let mut confirmed_bot_candidate_count = 0u16;
-    for (username, user_id, is_bot, match_count) in resolved_names {
-        if match_count != 1 {
-            continue;
-        }
+    for (username, (user_id, is_bot)) in resolved_names {
         user_target_ids.insert(user_id);
         resolved_username_count = resolved_username_count.saturating_add(1);
         if is_bot && bot_candidate_usernames.contains(&username) {
