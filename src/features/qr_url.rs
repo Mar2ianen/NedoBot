@@ -103,17 +103,18 @@ async fn process_job(
         crate::features::url_relations::load_affiliated_peer_ids(pool, &state.config, job.chat_id)
             .await
             .map_err(|_| "affiliated_channels_lookup_failed")?;
-    let classified_urls = urls
-        .into_iter()
-        .map(|target| QrUrlEvidence {
-            relation: crate::features::url_relations::classify_qr_url(
-                &target,
-                job.chat_id,
-                &affiliated,
-            ),
-            target,
-        })
-        .collect::<Vec<_>>();
+    let mut classified_urls = Vec::with_capacity(urls.len());
+    for target in urls {
+        let relation = crate::features::url_relations::classify_qr_url_with_aliases(
+            pool,
+            &target,
+            job.chat_id,
+            &affiliated,
+        )
+        .await
+        .map_err(|_| "username_alias_lookup_failed")?;
+        classified_urls.push(QrUrlEvidence { target, relation });
+    }
     let materialized = replace_qr_evidence_for_job(pool, job, &classified_urls)
         .await
         .map_err(|_| "evidence_write_failed")?;
