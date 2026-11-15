@@ -14,7 +14,10 @@ use crate::{
 };
 
 #[cfg(feature = "moderation")]
-use crate::features::new_user_analysis::enqueue_new_user_audit_for_profile_refresh;
+use crate::features::{
+    new_user_analysis::enqueue_new_user_audit_for_profile_refresh_with_url_feed,
+    url_feeds::FeedSnapshot,
+};
 
 const PROFILE_REFRESH_QUEUE_CAPACITY: usize = 256;
 
@@ -89,6 +92,9 @@ pub fn spawn_profile_refresh_workers(
     bot: Bot,
     pool: PgPool,
     config: Config,
+    #[cfg(feature = "moderation")] url_feed_snapshot: Arc<
+        tokio::sync::RwLock<Option<Arc<FeedSnapshot>>>,
+    >,
 ) -> ProfileRefreshQueue {
     let (queue, receiver) = ProfileRefreshQueue::new(PROFILE_REFRESH_QUEUE_CAPACITY);
 
@@ -96,11 +102,21 @@ pub fn spawn_profile_refresh_workers(
         let bot = bot.clone();
         let pool = pool.clone();
         let config = config.clone();
+        #[cfg(feature = "moderation")]
+        let url_feed_snapshot = url_feed_snapshot.clone();
         let queue = queue.clone();
         let receiver = receiver.clone();
         tokio::spawn(async move {
             while let Some(job) = receiver.lock().await.recv().await {
-                process_profile_refresh_job(&bot, &pool, &config, job).await;
+                process_profile_refresh_job(
+                    &bot,
+                    &pool,
+                    &config,
+                    #[cfg(feature = "moderation")]
+                    url_feed_snapshot.clone(),
+                    job,
+                )
+                .await;
                 queue.mark_completed(job);
             }
             tracing::warn!(worker_index, "profile refresh queue worker stopped");
@@ -114,6 +130,9 @@ async fn process_profile_refresh_job(
     bot: &Bot,
     pool: &PgPool,
     config: &Config,
+    #[cfg(feature = "moderation")] url_feed_snapshot: Arc<
+        tokio::sync::RwLock<Option<Arc<FeedSnapshot>>>,
+    >,
     job: ProfileRefreshJob,
 ) {
     let should_refresh = match user_profile_needs_refresh(pool, job.user_id).await {
@@ -152,10 +171,24 @@ async fn process_profile_refresh_job(
 
     // Profile freshness is global, while the audit is keyed by (chat, user).
     // A fresh profile must not suppress the first audit in another community chat.
-    process_profile_audit(pool, config, job).await;
+    process_profile_audit(
+        pool,
+        config,
+        #[cfg(feature = "moderation")]
+        url_feed_snapshot,
+        job,
+    )
+    .await;
 }
 
-async fn process_profile_audit(pool: &PgPool, config: &Config, job: ProfileRefreshJob) {
+async fn process_profile_audit(
+    pool: &PgPool,
+    config: &Config,
+    #[cfg(feature = "moderation")] url_feed_snapshot: Arc<
+        tokio::sync::RwLock<Option<Arc<FeedSnapshot>>>,
+    >,
+    job: ProfileRefreshJob,
+) {
     #[cfg(not(feature = "moderation"))]
     let _ = (pool, config, job);
 
@@ -178,8 +211,14 @@ async fn process_profile_audit(pool: &PgPool, config: &Config, job: ProfileRefre
     #[cfg(feature = "moderation")]
     if config.new_user_audit_enabled
         && config.chat_allows(job.chat_id, |chat| chat.moderation)
-        && let Err(err) =
-            enqueue_new_user_audit_for_profile_refresh(pool, config, job.chat_id, job.user_id).await
+        && let Err(err) = enqueue_new_user_audit_for_profile_refresh_with_url_feed(
+            pool,
+            config,
+            job.chat_id,
+            job.user_id,
+            url_feed_snapshot.read().await.clone(),
+        )
+        .await
     {
         tracing::warn!(%err, user_id = job.user_id, "failed to save unified new user audit baseline and job");
     }

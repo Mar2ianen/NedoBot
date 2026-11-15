@@ -513,6 +513,7 @@ mod tests {
 
     const TEST_CHAT_ID: i64 = -100_991_223_441;
     const TEST_MESSAGE_ID: i32 = 9_912_234;
+    const TEST_LINKED_SOURCE_CHANNEL_ID: i64 = -100_991_223_442;
 
     #[test]
     fn evidence_redacts_invite_payload_but_keeps_host_and_fingerprint() {
@@ -608,7 +609,51 @@ mod tests {
             .await
             .unwrap();
             assert!(!can_read_private_evidence);
+            let can_read_link_cache: bool = query_scalar(
+                "select has_table_privilege('nedobot_mcp_ro', 'public.telegram_linked_chat_cache', 'select')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(!can_read_link_cache);
         }
+        query("delete from public.telegram_linked_chat_cache where source_channel_id = $1")
+            .bind(TEST_LINKED_SOURCE_CHANNEL_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        query("insert into public.telegram_linked_chat_cache (source_channel_id, linked_chat_id, observed_at) values ($1, $2, now())")
+            .bind(TEST_LINKED_SOURCE_CHANNEL_ID)
+            .bind(TEST_CHAT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fresh_link: Option<i64> = query_scalar(
+            "select linked_chat_id from public.telegram_linked_chat_cache where source_channel_id = $1 and observed_at >= now() - interval '14 days'",
+        )
+        .bind(TEST_LINKED_SOURCE_CHANNEL_ID)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fresh_link, Some(TEST_CHAT_ID));
+        query("update public.telegram_linked_chat_cache set observed_at = now() - interval '15 days' where source_channel_id = $1")
+            .bind(TEST_LINKED_SOURCE_CHANNEL_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale_link: Option<i64> = query_scalar(
+            "select linked_chat_id from public.telegram_linked_chat_cache where source_channel_id = $1 and observed_at >= now() - interval '14 days'",
+        )
+        .bind(TEST_LINKED_SOURCE_CHANNEL_ID)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stale_link, None);
+        query("delete from public.telegram_linked_chat_cache where source_channel_id = $1")
+            .bind(TEST_LINKED_SOURCE_CHANNEL_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
         query("delete from telegram_messages where chat_id = $1 and message_id between $2 and $3")
             .bind(TEST_CHAT_ID)
             .bind(TEST_MESSAGE_ID)

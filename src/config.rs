@@ -1500,6 +1500,25 @@ fn validate_community_config(
             "moderation.qr_evidence_enabled requires an ingested moderation chat"
         );
     }
+    if community.moderation.url_feed_enabled {
+        require_compiled_feature("moderation", cfg!(feature = "moderation"))?;
+        anyhow::ensure!(
+            community.moderation.enabled
+                && community
+                    .chats
+                    .values()
+                    .any(|chat| chat.ingest && chat.moderation),
+            "moderation.url_feed_enabled requires moderation and an ingested moderation chat"
+        );
+        anyhow::ensure!(
+            (3_600..=86_400).contains(&community.moderation.url_feed_refresh_seconds),
+            "moderation.url_feed_refresh_seconds must be between 3600 and 86400"
+        );
+        anyhow::ensure!(
+            (3_600..=30 * 24 * 60 * 60).contains(&community.moderation.url_feed_max_age_seconds),
+            "moderation.url_feed_max_age_seconds must be between 3600 and 2592000"
+        );
+    }
     community.moderation.decision.validate()?;
     if community.moderation.decision.enabled {
         anyhow::ensure!(

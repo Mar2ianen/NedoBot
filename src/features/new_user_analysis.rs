@@ -62,6 +62,23 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     chat_id: i64,
     telegram_user_id: i64,
 ) -> anyhow::Result<()> {
+    enqueue_new_user_audit_for_profile_refresh_with_url_feed(
+        pool,
+        runtime_config,
+        chat_id,
+        telegram_user_id,
+        None,
+    )
+    .await
+}
+
+pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
+    pool: &PgPool,
+    runtime_config: &Config,
+    chat_id: i64,
+    telegram_user_id: i64,
+    url_feed: Option<std::sync::Arc<crate::features::url_feeds::FeedSnapshot>>,
+) -> anyhow::Result<()> {
     let Some((features, membership_context)) = load_features(
         pool,
         chat_id,
@@ -138,6 +155,38 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
     };
     let mut input_json = project_unified_user_audit_snapshot(&features, &risk, &analysis_config);
     input_json["membership"]["context"] = serde_json::to_value(membership_context)?;
+    let url_relationship_observation =
+        crate::features::url_relations::recent_link_relationship_summary(
+            pool,
+            runtime_config,
+            chat_id,
+            telegram_user_id,
+            url_feed.as_deref(),
+        )
+        .await?;
+    let url_shadow = teloxide_antispam::url_shadow::analyze_url_shadow(
+        teloxide_antispam::url_shadow::UrlShadowEvidence {
+            external_url_count: url_relationship_observation["external_web_url_count"]
+                .as_u64()
+                .unwrap_or_default()
+                .min(u16::MAX as u64) as u16,
+            promotional_content: deterministic_campaign_from_features(&features).is_some()
+                || features.personal_channel_has_adult_links,
+            verified_threat_feed_hit: url_relationship_observation["verified_threat_feed_hit"]
+                .as_bool()
+                .unwrap_or(false),
+            ..teloxide_antispam::url_shadow::UrlShadowEvidence::default()
+        },
+    );
+    let url_shadow_fingerprint = trigger_fingerprint.as_ref().map(|fingerprint| {
+        let material = serde_json::to_vec(&(
+            fingerprint,
+            url_relationship_observation["feed_snapshot"]["revision"].clone(),
+            url_relationship_observation.clone(),
+        ))
+        .unwrap_or_default();
+        hex_digest(&material)
+    });
     input_json["audit_trigger_fingerprint"] = trigger_fingerprint
         .map(Value::String)
         .unwrap_or(Value::Null);
@@ -170,6 +219,18 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
         review_threshold: analysis_config.review_threshold,
     };
     let mut tx = pool.begin().await?;
+    if let Some(fingerprint) = url_shadow_fingerprint.as_deref() {
+        record_url_shadow_observation_in_transaction(
+            &mut tx,
+            chat_id,
+            telegram_user_id,
+            fingerprint,
+            url_shadow.suggested_delta,
+            &url_relationship_observation,
+            &serde_json::to_value(&url_shadow)?,
+        )
+        .await?;
+    }
     // Authoritative transactions consistently lock job, then audit, then review.
     let preserved_in_flight = if run_audit_job || same_fingerprint_in_flight {
         let reused_in_flight =
@@ -245,6 +306,41 @@ fn record_campaign_snapshot(input: &mut Value, campaign: Option<&deterministic::
     input["deterministic_campaign_evidence"] = legacy
         .map(deterministic::CampaignMatch::score_signal)
         .unwrap_or(Value::Null);
+}
+
+async fn record_url_shadow_observation_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    chat_id: i64,
+    telegram_user_id: i64,
+    source_fingerprint: &str,
+    shadow_score: i16,
+    relationships: &Value,
+    analysis: &Value,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"insert into public.telegram_url_shadow_observations
+               (chat_id, telegram_user_id, source_fingerprint, shadow_score, evidence)
+           values ($1, $2, $3, $4, $5)
+           on conflict (chat_id, telegram_user_id) do update set
+               source_fingerprint = excluded.source_fingerprint,
+               observed_at = now(), shadow_score = excluded.shadow_score,
+               evidence = excluded.evidence"#,
+    )
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .bind(source_fingerprint)
+    .bind(shadow_score)
+    .bind(json!({"relationships": relationships, "analysis": analysis}))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn hex_digest(material: &[u8]) -> String {
+    Sha256::digest(material)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn deterministic_campaign_from_features(
@@ -1452,6 +1548,62 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 mod tests {
     use super::*;
     use teloxide_antispam::signals::analyze_new_or_low_activity_user;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn url_shadow_observations_are_separate_and_private() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point at a disposable test database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        const CHAT_ID: i64 = -100_991_223_441;
+        const USER_ID: i64 = 9_912_234;
+        let fingerprint = "a".repeat(64);
+        sqlx::query("delete from public.telegram_url_shadow_observations where chat_id = $1 and telegram_user_id = $2")
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        record_url_shadow_observation_in_transaction(
+            &mut tx,
+            CHAT_ID,
+            USER_ID,
+            &fingerprint,
+            16,
+            &json!({"external_web_url_count": 1}),
+            &json!({"signals": [{"label": "promotion_with_external_url"}]}),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let stored: (i16, Value) = sqlx::query_as(
+            "select shadow_score, evidence from public.telegram_url_shadow_observations where chat_id = $1 and telegram_user_id = $2 and source_fingerprint = $3",
+        )
+        .bind(CHAT_ID)
+        .bind(USER_ID)
+        .bind(&fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, 16);
+        assert_eq!(stored.1["relationships"]["external_web_url_count"], 1);
+        let can_read: bool = sqlx::query_scalar(
+            "select has_table_privilege('nedobot_mcp_ro', 'public.telegram_url_shadow_observations', 'select')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!can_read);
+        sqlx::query("delete from public.telegram_url_shadow_observations where chat_id = $1 and telegram_user_id = $2")
+            .bind(CHAT_ID)
+            .bind(USER_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
 
     #[test]
     fn hidden_link_target_changes_fingerprint_without_leaking_target() {
