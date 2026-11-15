@@ -428,9 +428,11 @@ async fn materialize_message_url_evidence(
                     break;
                 }
                 url.source = Source::Qr;
-                qr_relations.insert(url.value.to_ascii_lowercase(), qr_url.relation.as_str());
+                let canonical_url = canonical_url_identity(&url.value);
+                qr_relations.insert(canonical_url.clone(), qr_url.relation.as_str());
                 if !found.iter().any(|known| {
-                    known.source == Source::Qr && known.value.eq_ignore_ascii_case(&url.value)
+                    known.source == Source::Qr
+                        && canonical_url_identity(&known.value) == canonical_url
                 }) {
                     found.push(url);
                 }
@@ -448,7 +450,11 @@ async fn materialize_message_url_evidence(
                 item,
                 index,
                 (item.source == Source::Qr)
-                    .then(|| qr_relations.get(&item.value.to_ascii_lowercase()).copied())
+                    .then(|| {
+                        qr_relations
+                            .get(&canonical_url_identity(&item.value))
+                            .copied()
+                    })
                     .flatten(),
             )?;
             *source_indices.entry(source).or_default() += 1;
@@ -527,6 +533,12 @@ async fn materialize_message_url_evidence(
     .execute(&mut **tx)
     .await?;
     Ok(usize::try_from(total_count)?)
+}
+
+fn canonical_url_identity(value: &str) -> String {
+    teloxide_url::parse_url(value)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|| value.to_owned())
 }
 
 fn source_fingerprint(message: &Message, qr_hashes: &[String]) -> anyhow::Result<String> {
@@ -631,6 +643,22 @@ mod tests {
         assert_ne!(
             encode(&a, 0, None).unwrap().target_sha256,
             encode(&b, 0, None).unwrap().target_sha256
+        );
+    }
+
+    #[test]
+    fn canonical_url_identity_preserves_path_and_query_case() {
+        assert_eq!(
+            canonical_url_identity("https://EXAMPLE.org/File?campaign=Normal"),
+            "https://example.org/File?campaign=Normal"
+        );
+        assert_ne!(
+            canonical_url_identity("https://example.org/File"),
+            canonical_url_identity("https://example.org/file")
+        );
+        assert_ne!(
+            canonical_url_identity("https://example.org/?campaign=Normal"),
+            canonical_url_identity("https://example.org/?campaign=normal")
         );
     }
 
@@ -843,14 +871,34 @@ mod tests {
         let stored = replace_qr_evidence_for_job(
             &pool,
             &job,
-            &[QrUrlEvidence {
-                target: "https://example.invalid/qr-target".to_owned(),
-                relation: QrUrlRelation::External,
-            }],
+            &[
+                QrUrlEvidence {
+                    target: "https://example.invalid/File".to_owned(),
+                    relation: QrUrlRelation::External,
+                },
+                QrUrlEvidence {
+                    target: "https://example.invalid/file".to_owned(),
+                    relation: QrUrlRelation::External,
+                },
+                QrUrlEvidence {
+                    target: "https://EXAMPLE.invalid/File".to_owned(),
+                    relation: QrUrlRelation::External,
+                },
+            ],
         )
         .await
         .unwrap();
-        assert_eq!(stored, Some(1));
+        assert_eq!(stored, Some(2));
+        let qr_hashes: Vec<String> = query_scalar(
+            "select target_sha256::text from telegram_message_url_evidence where chat_id = $1 and message_id = $2 and source = 'qr' order by item_index",
+        )
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID + 2)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(qr_hashes.len(), 2);
+        assert_ne!(qr_hashes[0], qr_hashes[1]);
         let relation: Option<String> = query_scalar(
             "select qr_relation from telegram_message_url_evidence where chat_id = $1 and message_id = $2 and source = 'qr'",
         )

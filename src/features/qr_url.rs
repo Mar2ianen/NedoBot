@@ -97,26 +97,7 @@ async fn process_job(
         .map_err(|_| "decoder_join_failed")?
         .map_err(|_| "image_decode_failed")?;
 
-    let mut seen = HashSet::new();
-    let mut urls = Vec::new();
-    for payload in &payloads {
-        let Some(text) = nedobot_qr::as_utf8(payload) else {
-            continue;
-        };
-        for target in teloxide_url::find_urls(text) {
-            if target.kind == teloxide_url::Kind::Url
-                && seen.insert(target.value.to_ascii_lowercase())
-            {
-                urls.push(target.value);
-                if urls.len() >= MAX_QR_URLS_PER_MESSAGE {
-                    break;
-                }
-            }
-        }
-        if urls.len() >= MAX_QR_URLS_PER_MESSAGE {
-            break;
-        }
-    }
+    let urls = qr_urls_from_payloads(&payloads);
 
     let affiliated =
         crate::features::url_relations::load_affiliated_peer_ids(pool, &state.config, job.chat_id)
@@ -164,4 +145,56 @@ async fn process_job(
         }
     }
     Ok(materialized)
+}
+
+fn qr_urls_from_payloads(payloads: &[Vec<u8>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for payload in payloads {
+        let Some(text) = nedobot_qr::as_utf8(payload) else {
+            continue;
+        };
+        for target in teloxide_url::find_urls(text) {
+            if target.kind == teloxide_url::Kind::Url {
+                let Some(canonical) =
+                    teloxide_url::parse_url(&target.value).map(|url| url.to_string())
+                else {
+                    continue;
+                };
+                if seen.insert(canonical.clone()) {
+                    urls.push(canonical);
+                }
+                if urls.len() >= MAX_QR_URLS_PER_MESSAGE {
+                    break;
+                }
+            }
+        }
+        if urls.len() >= MAX_QR_URLS_PER_MESSAGE {
+            break;
+        }
+    }
+    urls
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qr_urls_from_payloads;
+
+    #[test]
+    fn qr_deduplication_preserves_case_sensitive_path_and_query() {
+        let payloads = vec![
+            b"https://example.org/File?campaign=Normal".to_vec(),
+            b"https://EXAMPLE.org/File?campaign=Normal".to_vec(),
+            b"https://example.org/file?campaign=Normal".to_vec(),
+            b"https://example.org/File?campaign=normal".to_vec(),
+        ];
+        assert_eq!(
+            qr_urls_from_payloads(&payloads),
+            [
+                "https://example.org/File?campaign=Normal",
+                "https://example.org/file?campaign=Normal",
+                "https://example.org/File?campaign=normal",
+            ]
+        );
+    }
 }

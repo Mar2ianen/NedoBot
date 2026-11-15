@@ -3,6 +3,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
+use std::future::Future;
+use tokio::sync::Semaphore;
 
 use crate::{
     config::Config,
@@ -73,6 +75,29 @@ pub async fn enqueue_new_user_audit_for_profile_refresh(
 }
 
 pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
+    pool: &PgPool,
+    runtime_config: &Config,
+    chat_id: i64,
+    telegram_user_id: i64,
+    url_feed: Option<std::sync::Arc<crate::features::url_feeds::FeedSnapshot>>,
+) -> anyhow::Result<()> {
+    with_url_shadow_advisory_lock(
+        pool,
+        &runtime_config.community.instance.id,
+        chat_id,
+        telegram_user_id,
+        enqueue_new_user_audit_for_profile_refresh_locked(
+            pool,
+            runtime_config,
+            chat_id,
+            telegram_user_id,
+            url_feed,
+        ),
+    )
+    .await
+}
+
+async fn enqueue_new_user_audit_for_profile_refresh_locked(
     pool: &PgPool,
     runtime_config: &Config,
     chat_id: i64,
@@ -275,6 +300,10 @@ const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
 const UNIFIED_AUDIT_RECENT_MESSAGES_LIMIT: usize = 5;
 const NEW_USER_LLM_AUDIT_MIN_BASELINE_SCORE: i32 = 25;
 const LONG_FIRST_COMMENT_MIN_CHARS: usize = 220;
+// build_pool() allows five PostgreSQL connections. Keep one available for the
+// work performed while session locks are held, while still allowing different
+// users to refresh concurrently.
+static URL_SHADOW_LOCK_SLOTS: Semaphore = Semaphore::const_new(4);
 
 #[cfg(test)]
 fn should_enqueue_new_user_audit_job(
@@ -338,6 +367,60 @@ async fn record_url_shadow_observation_in_transaction(
     Ok(())
 }
 
+async fn with_url_shadow_advisory_lock<T>(
+    pool: &PgPool,
+    instance_id: &str,
+    chat_id: i64,
+    telegram_user_id: i64,
+    operation: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let _slot = URL_SHADOW_LOCK_SLOTS.acquire().await?;
+    let lock_sql =
+        "select pg_advisory_lock(hashtextextended($1 || ':' || $2::text || ':' || $3::text, 0))";
+    let mut connection = pool.acquire().await?;
+    // Session advisory locks must never return to the pool while held. If the
+    // caller future is cancelled, dropping this connection closes it and
+    // PostgreSQL releases the lock.
+    connection.close_on_drop();
+    if let Err(error) = sqlx::query(lock_sql)
+        .bind(instance_id)
+        .bind(chat_id)
+        .bind(telegram_user_id)
+        .execute(&mut *connection)
+        .await
+    {
+        let _ = connection.close().await;
+        return Err(error.into());
+    }
+
+    let result = operation.await;
+    let unlocked: Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "select pg_advisory_unlock(hashtextextended($1 || ':' || $2::text || ':' || $3::text, 0))",
+    )
+    .bind(instance_id)
+    .bind(chat_id)
+    .bind(telegram_user_id)
+    .fetch_one(&mut *connection)
+    .await;
+
+    match (result, unlocked) {
+        (Ok(value), Ok(true)) => Ok(value),
+        (Err(error), Ok(true)) => Err(error),
+        (Ok(_), Ok(false)) => anyhow::bail!("URL shadow advisory lock was not held at release"),
+        (Err(error), Ok(false)) => {
+            Err(error.context("URL shadow advisory lock was not held at release"))
+        }
+        (Ok(_), Err(error)) => {
+            let _ = connection.close().await;
+            Err(error.into())
+        }
+        (Err(error), Err(unlock_error)) => {
+            let _ = connection.close().await;
+            Err(error.context(format!("failed to release URL shadow lock: {unlock_error}")))
+        }
+    }
+}
+
 /// Recomputes only the URL shadow projection. It performs bounded PostgreSQL
 /// reads and never enqueues or invokes the LLM audit.
 pub async fn refresh_url_shadow_observation_from_links(
@@ -347,31 +430,20 @@ pub async fn refresh_url_shadow_observation_from_links(
     telegram_user_id: i64,
     url_feed: Option<&crate::features::url_feeds::FeedSnapshot>,
 ) -> anyhow::Result<()> {
-    static URL_SHADOW_REFRESH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _refresh_gate = URL_SHADOW_REFRESH_GATE.lock().await;
-    // Keep concurrent QR, edit, and event-driven refreshes ordered per user.
-    // The lock is held while the latest source evidence is read and the
-    // resulting projection is written, so an older computation cannot win
-    // merely because it finished last.
-    let mut lock_tx = pool.begin().await?;
-    sqlx::query(
-        "select pg_advisory_xact_lock(hashtextextended($1 || ':' || $2::text || ':' || $3::text, 0))",
-    )
-    .bind(&runtime_config.community.instance.id)
-    .bind(chat_id)
-    .bind(telegram_user_id)
-    .execute(&mut *lock_tx)
-    .await?;
-    refresh_url_shadow_observation_from_links_locked(
+    with_url_shadow_advisory_lock(
         pool,
-        runtime_config,
+        &runtime_config.community.instance.id,
         chat_id,
         telegram_user_id,
-        url_feed,
+        refresh_url_shadow_observation_from_links_locked(
+            pool,
+            runtime_config,
+            chat_id,
+            telegram_user_id,
+            url_feed,
+        ),
     )
-    .await?;
-    lock_tx.commit().await?;
-    Ok(())
+    .await
 }
 
 async fn refresh_url_shadow_observation_from_links_locked(
@@ -1638,7 +1710,127 @@ fn best_effort_profile_photo_dc(file_id: Option<&str>) -> DcParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use teloxide_antispam::signals::analyze_new_or_low_activity_user;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn url_shadow_lock_serializes_same_user_without_blocking_other_users() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point at a disposable test database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        const CHAT_ID: i64 = -100_991_223_499;
+        const USER_ID: i64 = 9_912_299;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let same_user_entered = Arc::new(AtomicBool::new(false));
+        let other_user_entered = Arc::new(AtomicBool::new(false));
+
+        let first_pool = pool.clone();
+        let first_entered = entered.clone();
+        let first_release = release.clone();
+        let first = tokio::spawn(async move {
+            with_url_shadow_advisory_lock(
+                &first_pool,
+                "url-shadow-lock-test",
+                CHAT_ID,
+                USER_ID,
+                async move {
+                    first_entered.notify_one();
+                    first_release.notified().await;
+                    Ok(())
+                },
+            )
+            .await
+        });
+        entered.notified().await;
+
+        let second_pool = pool.clone();
+        let second_entered = same_user_entered.clone();
+        let second = tokio::spawn(async move {
+            with_url_shadow_advisory_lock(
+                &second_pool,
+                "url-shadow-lock-test",
+                CHAT_ID,
+                USER_ID,
+                async move {
+                    second_entered.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!same_user_entered.load(Ordering::SeqCst));
+
+        let other_pool = pool.clone();
+        let other_entered = other_user_entered.clone();
+        with_url_shadow_advisory_lock(
+            &other_pool,
+            "url-shadow-lock-test",
+            CHAT_ID,
+            USER_ID + 1,
+            async move {
+                other_entered.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(other_user_entered.load(Ordering::SeqCst));
+
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(same_user_entered.load(Ordering::SeqCst));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn cancelled_url_shadow_refresh_releases_its_session_lock() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point at a disposable test database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task_pool = pool.clone();
+        let task_entered = entered.clone();
+        let task = tokio::spawn(async move {
+            with_url_shadow_advisory_lock(
+                &task_pool,
+                "url-shadow-cancel-test",
+                -100_991_223_501,
+                9_912_301,
+                async move {
+                    task_entered.notify_one();
+                    std::future::pending::<anyhow::Result<()>>().await
+                },
+            )
+            .await
+        });
+
+        entered.notified().await;
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            with_url_shadow_advisory_lock(
+                &pool,
+                "url-shadow-cancel-test",
+                -100_991_223_501,
+                9_912_301,
+                async { Ok(()) },
+            ),
+        )
+        .await
+        .expect("cancelled refresh left its session advisory lock held")
+        .unwrap();
+        pool.close().await;
+    }
 
     #[tokio::test]
     #[ignore = "requires a disposable migrated PostgreSQL database"]

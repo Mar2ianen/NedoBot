@@ -1,14 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs::{self, File},
     io::{BufWriter, Write},
+    path::Path,
 };
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use teloxide::types::Message;
 use teloxide_url::{Kind, TelegramLink, parse_telegram_link};
+use tempfile::NamedTempFile;
 use tg_ai_bot_teloxide::db::build_pool;
 
 const PAGE_SIZE: i64 = 500;
@@ -20,6 +23,7 @@ struct LinkRecord {
     record_type: &'static str,
     chat_id: i64,
     target: String,
+    identity_sha256: String,
     target_type: &'static str,
     resolution: &'static str,
     host: Option<String>,
@@ -41,6 +45,8 @@ struct Aggregate {
     sources: BTreeSet<String>,
     host: Option<String>,
     target_type: &'static str,
+    display_target: String,
+    identity_sha256: String,
 }
 
 #[derive(Default)]
@@ -101,7 +107,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()> {
-    let mut writer = BufWriter::new(File::create(output)?);
+    let output_path = Path::new(output);
+    let (mut temporary, parent) = create_private_output_temp(output_path)?;
+    let mut writer = BufWriter::new(temporary.as_file_mut());
     let mut aggregates: BTreeMap<String, Aggregate> = BTreeMap::new();
     let mut target_message_pairs = 0usize;
     let mut last_id = i64::MIN;
@@ -139,7 +147,9 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
             let qr_hashes: Vec<String> = row.try_get("qr_hashes")?;
             let known_spam: bool = row.try_get("known_spam")?;
             for hash in qr_hashes {
-                let key = format!("qr_unrecoverable\0sha256:{hash}");
+                let target = format!("sha256:{hash}");
+                let fingerprint = fingerprint(&format!("qr-hash-only:{hash}"));
+                let key = format!("qr_unrecoverable\0{fingerprint}");
                 if !aggregates.contains_key(&key) && aggregates.len() >= MAX_DISTINCT_TARGETS {
                     anyhow::bail!(
                         "distinct target limit ({MAX_DISTINCT_TARGETS}) reached; no partial inventory was written"
@@ -171,6 +181,8 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                 }
                 entry.sources.insert("qr_hash_only".to_owned());
                 entry.target_type = "qr_target_unrecoverable";
+                entry.display_target = target;
+                entry.identity_sha256 = fingerprint;
             }
             let message: Message = match serde_json::from_value(raw_json) {
                 Ok(message) => message,
@@ -180,29 +192,36 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                 }
             };
             for found in teloxide_url::adapter::extract_from_message(&message) {
-                let parsed = teloxide_url::parse_url(&found.value);
-                let host = parsed
-                    .as_ref()
-                    .and_then(|url| url.host_str())
-                    .map(str::to_owned);
                 let kind = match found.kind {
                     Kind::Url => "url",
                     Kind::Mention => "telegram_username",
                     Kind::UserId(_) => "telegram_user_id",
                     _ => continue,
                 };
-                let target = match found.kind {
-                    Kind::Url => match redact_target(&found.value) {
-                        Some(target) => target,
-                        None => continue,
-                    },
-                    Kind::Mention => {
-                        format!("@{}", found.value.trim_start_matches('@').to_lowercase())
+                let (identity, target, host) = match found.kind {
+                    Kind::Url => {
+                        let Some(parsed) = teloxide_url::parse_url(&found.value) else {
+                            continue;
+                        };
+                        let identity = parsed.to_string();
+                        let Some(target) = redact_target(&identity) else {
+                            continue;
+                        };
+                        let host = parsed.host_str().map(str::to_owned);
+                        (identity, target, host)
                     }
-                    Kind::UserId(id) => format!("telegram-user-id:{id}"),
+                    Kind::Mention => {
+                        let username = found.value.trim_start_matches('@').to_lowercase();
+                        (format!("@{username}"), format!("@{username}"), None)
+                    }
+                    Kind::UserId(id) => {
+                        let target = format!("telegram-user-id:{id}");
+                        (target.clone(), target, None)
+                    }
                     _ => continue,
                 };
-                let key = format!("{kind}\0{target}");
+                let target_fingerprint = fingerprint(&identity);
+                let key = format!("{kind}\0{target_fingerprint}");
                 if !aggregates.contains_key(&key) && aggregates.len() >= MAX_DISTINCT_TARGETS {
                     anyhow::bail!(
                         "distinct target limit ({MAX_DISTINCT_TARGETS}) reached; no partial inventory was written"
@@ -235,6 +254,8 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
                 entry
                     .sources
                     .insert(format!("{:?}", found.source).to_lowercase());
+                entry.display_target = target;
+                entry.identity_sha256 = target_fingerprint;
                 entry.host = host;
                 entry.target_type = if kind == "url" && parse_telegram_link(&found.value).is_some()
                 {
@@ -280,7 +301,7 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
         }
     }
     for (key, aggregate) in aggregates {
-        let (kind, target) = key.split_once('\0').expect("internal key separator");
+        let (kind, _) = key.split_once('\0').expect("internal key separator");
         let first_seen = aggregate.first_seen.unwrap_or_else(Utc::now);
         let last_seen = aggregate.last_seen.unwrap_or(first_seen);
         let fallback_type = match kind {
@@ -293,7 +314,8 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
         let record = LinkRecord {
             record_type: "target",
             chat_id,
-            target: target.to_owned(),
+            target: aggregate.display_target.clone(),
+            identity_sha256: aggregate.identity_sha256.clone(),
             target_type: if aggregate.target_type.is_empty() {
                 fallback_type
             } else {
@@ -317,6 +339,7 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
             record_type: "host_summary",
             chat_id,
             target: host.clone(),
+            identity_sha256: fingerprint(&host),
             target_type: "host",
             resolution: "not_applicable",
             host: Some(host),
@@ -331,7 +354,39 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str) -> anyhow::Result<()>
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    persist_private_output(temporary, output_path, &parent)?;
     eprintln!("chat_id={chat_id} unreadable_messages={unreadable} output={output}");
+    Ok(())
+}
+
+fn create_private_output_temp(
+    output_path: &Path,
+) -> anyhow::Result<(NamedTempFile, std::path::PathBuf)> {
+    let parent = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let temporary = NamedTempFile::new_in(&parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok((temporary, parent))
+}
+
+fn persist_private_output(
+    temporary: NamedTempFile,
+    output_path: &Path,
+    parent: &Path,
+) -> anyhow::Result<()> {
+    temporary.persist(output_path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -372,9 +427,17 @@ fn redact_target(value: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+fn fingerprint(identity: &str) -> String {
+    Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::redact_target;
+    use super::{create_private_output_temp, fingerprint, persist_private_output, redact_target};
+    use std::io::Write;
 
     #[test]
     fn inventory_redacts_auth_query_and_invite_secrets() {
@@ -394,5 +457,50 @@ mod tests {
             redact_target("https://example.org/auth/shortsecret/continue").as_deref(),
             Some("https://example.org/auth/%3Credacted%3E")
         );
+        assert_eq!(
+            redact_target("https://example.org/?campaign=normal"),
+            redact_target("https://example.org/?campaign=spam")
+        );
+        assert_ne!(
+            fingerprint("https://example.org/?campaign=normal"),
+            fingerprint("https://example.org/?campaign=spam")
+        );
+        assert_ne!(
+            fingerprint("https://example.org/File"),
+            fingerprint("https://example.org/file")
+        );
+    }
+
+    #[test]
+    fn inventory_output_is_private_and_failed_runs_preserve_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("links.jsonl");
+        std::fs::write(&output, "previous complete inventory\n").unwrap();
+        {
+            let (mut temporary, _) = create_private_output_temp(&output).unwrap();
+            temporary.write_all(b"partial inventory").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    temporary.as_file().metadata().unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "previous complete inventory\n"
+        );
+
+        let (mut temporary, parent) = create_private_output_temp(&output).unwrap();
+        temporary.write_all(b"complete inventory\n").unwrap();
+        temporary.as_file().sync_all().unwrap();
+        persist_private_output(temporary, &output, &parent).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "complete inventory\n"
+        );
+        assert_eq!(parent, directory.path());
     }
 }
