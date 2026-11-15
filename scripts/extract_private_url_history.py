@@ -122,6 +122,11 @@ def count_lines(path: Path) -> int:
         return sum(1 for line in stream if line.strip())
 
 
+def cleanup_transient(paths: list[Path]) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
 def decode_export(encoded_path: Path, decoded_path: Path) -> None:
     fd = os.open(decoded_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -177,6 +182,8 @@ def main() -> int:
     args = parser.parse_args()
     if os.environ.get("NEDOBOT_PRIVATE_CORPUS_APPROVED") != "YES":
         parser.error("NEDOBOT_PRIVATE_CORPUS_APPROVED=YES is required after explicit authorization")
+    transient_paths: list[Path] = []
+    output_dir: Path | None = None
     try:
         output_dir = ensure_private_dir(args.output_dir)
         metadata: dict[str, dict[str, object]] = {}
@@ -192,14 +199,18 @@ def main() -> int:
             qr_path = output_dir / f"{instance}.qr.jsonl"
             raw_encoded = output_dir / f"{instance}.raw.jsonl.b64"
             run_ssh(target, remote_script(env_file, instance, MESSAGE_SQL), raw_encoded)
+            transient_paths.append(raw_encoded)
             decode_export(raw_encoded, raw_path)
+            transient_paths.append(raw_path)
             if preflight_data["qr_table_present"]:
                 qr_encoded = output_dir / f"{instance}.qr.jsonl.b64"
                 run_ssh(target, remote_script(env_file, instance, QR_SQL), qr_encoded)
+                transient_paths.append(qr_encoded)
                 decode_export(qr_encoded, qr_path)
             else:
                 fd = os.open(qr_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 os.close(fd)
+            transient_paths.append(qr_path)
             metadata[instance]["exported_link_messages"] = count_lines(raw_path)
             metadata[instance]["exported_qr_rows"] = count_lines(qr_path)
 
@@ -224,6 +235,8 @@ def main() -> int:
         print(json.dumps({"output_dir": str(output_dir), "instances": metadata}, sort_keys=True))
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"private history extraction failed: {error}\n")
+    finally:
+        cleanup_transient(transient_paths)
     return 0
 
 
