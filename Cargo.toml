@@ -109,8 +109,8 @@ base64 = "0.23"
 chrono = "0.4"
 jiff = "0.2"
 dotenvy = "0.15"
-teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "f4070ed31451a888b85acc88d4afa85792e0514f", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "f4070ed31451a888b85acc88d4afa85792e0514f", default-features = false, features = ["teloxide"] }
+teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "578185f60a1abd7543e0bafd5a3eb1be72601152", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "578185f60a1abd7543e0bafd5a3eb1be72601152", default-features = false, features = ["teloxide"] }
 teloxide-statistics = { git = "https://github.com/Mar2ianen/teloxide-statistics", rev = "7e2a5859849044121b9e693bc1ed36e7440db139", default-features = false, features = ["sentiment", "engagement", "reputation"] }
 genai = { version = "=0.7.3", default-features = false, features = ["native-tls"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "query", "socks"] }

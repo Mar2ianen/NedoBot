@@ -3523,7 +3523,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=f4070ed31451a888b85acc88d4afa85792e0514f#f4070ed31451a888b85acc88d4afa85792e0514f"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=578185f60a1abd7543e0bafd5a3eb1be72601152#578185f60a1abd7543e0bafd5a3eb1be72601152"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3595,7 +3595,7 @@ dependencies = [
 [[package]]
 name = "teloxide-url"
 version = "0.1.0"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=f4070ed31451a888b85acc88d4afa85792e0514f#f4070ed31451a888b85acc88d4afa85792e0514f"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=578185f60a1abd7543e0bafd5a3eb1be72601152#578185f60a1abd7543e0bafd5a3eb1be72601152"
 dependencies = [
  "linkify",
  "teloxide",
