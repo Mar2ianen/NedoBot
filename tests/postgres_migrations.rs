@@ -1,14 +1,22 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpListener,
-    sync::{Arc, mpsc::sync_channel},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::sync_channel,
+    },
 };
 
 use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
-use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+use teloxide::{
+    Bot,
+    prelude::{ChatId, Message},
+    types::{InputRichMessage, MessageId},
+};
 use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
 use uuid::Uuid;
@@ -85,6 +93,7 @@ use tg_ai_bot_teloxide::{
             types::{VoiceMedia, VoiceMediaKind},
         },
     },
+    telegram::delivery::{DeliveryEffect, TelegramSendPort},
 };
 
 #[path = "support/local_cascade.rs"]
@@ -102,6 +111,61 @@ mod decision_shadow;
 mod ingress_persistence;
 
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
+
+struct AcknowledgingSendPort {
+    calls: AtomicUsize,
+    message: Message,
+}
+
+impl AcknowledgingSendPort {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            message: serde_json::from_value(serde_json::json!({
+                "message_id": 9_400_201,
+                "date": 1_700_000_000,
+                "chat": {"id": -1001932061163_i64, "type": "supergroup", "title": "Test"},
+                "text": "acknowledged test comment"
+            }))
+            .expect("test Telegram response must deserialize"),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn acknowledged(&self) -> DeliveryEffect<Message> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        DeliveryEffect::Confirmed(self.message.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl TelegramSendPort for AcknowledgingSendPort {
+    async fn send_html_reply(&self, _: ChatId, _: MessageId, _: String) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+
+    async fn send_rich_message_reply(
+        &self,
+        _: ChatId,
+        _: MessageId,
+        _: InputRichMessage,
+    ) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+
+    async fn send_document_reply(
+        &self,
+        _: ChatId,
+        _: MessageId,
+        _: String,
+        _: String,
+    ) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+}
 
 #[path = "support/risk_captcha_cleanup.rs"]
 mod risk_captcha_cleanup;
@@ -137,6 +201,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
+    assert_comment_job_lifecycle(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_mcp_instance_scope_isolation(&pool).await;
     assert_chat_search_quality_path(&pool).await;
@@ -173,7 +238,6 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
-    assert_comment_job_lifecycle(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
     assert_system_spam_label_transition(&pool).await;
     assert_spammer_avatar_embedding_label_gate(&pool).await;
@@ -3795,8 +3859,16 @@ async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
             .expect("local transient failure listener must accept the request");
         let mut request = [0; 1_024];
         let _ = stream.read(&mut request);
+        let body = br#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#;
         stream
-            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .and_then(|()| stream.write_all(body))
             .expect("local transient failure response must be written");
     });
     let bot = Bot::new("test-token").set_api_url(
@@ -7806,6 +7878,21 @@ async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool)
         CasResult::Applied
     );
 
+    let send_port = AcknowledgingSendPort::new();
+    let send_result = send_port
+        .send_html_reply(
+            ChatId(job.discussion_chat_id),
+            MessageId(job.discussion_message_id),
+            "test comment".to_owned(),
+        )
+        .await;
+    assert!(matches!(send_result, DeliveryEffect::Confirmed(_)));
+    assert_eq!(
+        send_port.calls(),
+        1,
+        "fake Telegram accepted exactly one send"
+    );
+
     query("drop trigger if exists post_comment_history_failure_trigger on post_history_entries")
         .execute(pool)
         .await
@@ -7886,6 +7973,33 @@ async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool)
         .await
         .expect("sending job must remain queryable after rollback");
     assert_eq!(status, "sending");
+
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .expect("delivery lease can be expired after the simulated acknowledgement");
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("expired sending recovery must execute")
+            .is_none(),
+        "an acknowledged send whose finalization rolled back must not be reclaimed for sending"
+    );
+    assert_eq!(
+        send_port.calls(),
+        1,
+        "the failed DB finalization must not resend"
+    );
+    let recovered_status: String =
+        query_scalar("select status from post_comment_jobs where id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .expect("expired acknowledged job must remain queryable");
+    assert_eq!(recovered_status, "delivery_unknown");
 }
 
 async fn assert_comment_finalization_is_idempotent_when_audit_rows_exist(pool: &PgPool) {

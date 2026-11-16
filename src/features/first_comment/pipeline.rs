@@ -16,10 +16,9 @@ use crate::features::first_comment::prompt::{
 use crate::features::first_comment::repo::{
     CommentErrorKind, CreatePostCommentJobParams, FinalizePostCommentSent, LlmGenerationInsert,
     PostCommentJob, SendFailure, begin_post_comment_delivery, claim_next_post_comment_job,
-    classify_send_error, create_post_comment_job, finalize_post_comment_sent,
-    load_recent_bot_comments, mark_operator_retry_post_comment_terminal_failed,
-    mark_post_comment_delivery_unknown, mark_post_comment_pre_send_failed,
-    mark_post_comment_send_rejected,
+    create_post_comment_job, finalize_post_comment_sent, load_recent_bot_comments,
+    mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
+    mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
 };
 use crate::features::ingest::ingest_message;
 use crate::features::jobs::claim::CasResult;
@@ -33,8 +32,9 @@ use crate::features::search::types::SearchContext;
 use crate::llm::service::{GenerateTextOptions, generate_text_checked};
 use crate::state::AppState;
 use crate::telegram::{
+    delivery::{BotTelegramSendPort, DeliveryEffect, DeliveryErrorKind, TelegramSendPort},
     media::download_photo_base64,
-    render::{send_html, send_html_reply},
+    render::send_html,
 };
 
 pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Result<()> {
@@ -488,16 +488,17 @@ async fn deliver_prepared_post_comment(
         return Ok(JobOutcome::LeaseLost);
     }
 
-    let sent = match send_html_reply(
-        bot,
-        ChatId(job.discussion_chat_id),
-        MessageId(job.discussion_message_id),
-        completed.final_html.clone(),
-    )
-    .await
+    let port = BotTelegramSendPort::new(bot);
+    let sent = match port
+        .send_html_reply(
+            ChatId(job.discussion_chat_id),
+            MessageId(job.discussion_message_id),
+            completed.final_html.clone(),
+        )
+        .await
     {
-        Ok(sent) => sent,
-        Err(error) => return handle_post_comment_send_error(state, job, &error).await,
+        DeliveryEffect::Confirmed(sent) => sent,
+        effect => return handle_post_comment_delivery_effect(state, job, effect).await,
     };
 
     if let Err(err) = ingest_message(&state.pool, &sent, &state.config).await {
@@ -507,12 +508,14 @@ async fn deliver_prepared_post_comment(
     finalize_completed_post_comment_job(bot, state, job, completed, sent.id.0).await
 }
 
-async fn handle_post_comment_send_error(
+async fn handle_post_comment_delivery_effect(
     state: &AppState,
     job: &PostCommentJob,
-    error: &teloxide::RequestError,
+    effect: DeliveryEffect<teloxide::types::Message>,
 ) -> anyhow::Result<JobOutcome> {
-    match classify_send_error(error) {
+    let failure =
+        comment_send_failure(effect).expect("confirmed Telegram sends are finalized separately");
+    match failure {
         SendFailure::Confirmed {
             error_kind,
             retry_after_seconds,
@@ -544,6 +547,29 @@ async fn handle_post_comment_send_error(
             }
         }
     }
+}
+
+fn comment_send_failure<T>(effect: DeliveryEffect<T>) -> Option<SendFailure> {
+    Some(match effect {
+        DeliveryEffect::Unknown(_) => SendFailure::DeliveryUnknown,
+        DeliveryEffect::NotAttempted(failure) | DeliveryEffect::Rejected(failure) => {
+            let error_kind = match failure.kind {
+                DeliveryErrorKind::InvalidInput | DeliveryErrorKind::PayloadRejected => {
+                    CommentErrorKind::InvalidInput
+                }
+                DeliveryErrorKind::Configuration => CommentErrorKind::Configuration,
+                DeliveryErrorKind::RateLimited => CommentErrorKind::RateLimited,
+                DeliveryErrorKind::TelegramRejected | DeliveryErrorKind::Transport => {
+                    CommentErrorKind::Transient
+                }
+            };
+            SendFailure::Confirmed {
+                error_kind,
+                retry_after_seconds: failure.retry_after_seconds,
+            }
+        }
+        DeliveryEffect::Confirmed(_) => return None,
+    })
 }
 
 async fn finalize_completed_post_comment_job(
@@ -663,5 +689,46 @@ async fn get_chat_member_count(
             tracing::warn!(%err, "failed to get chat member count");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::{CommentErrorKind, SendFailure, comment_send_failure};
+    use crate::telegram::delivery::{DeliveryEffect, DeliveryErrorKind, DeliveryFailure};
+
+    #[test]
+    fn comment_delivery_effects_preserve_safe_retry_certainty() {
+        assert_eq!(
+            comment_send_failure(DeliveryEffect::<()>::Unknown(DeliveryFailure {
+                kind: DeliveryErrorKind::Transport,
+                retry_after_seconds: None,
+            })),
+            Some(SendFailure::DeliveryUnknown)
+        );
+        assert_eq!(
+            comment_send_failure(DeliveryEffect::<()>::Rejected(DeliveryFailure {
+                kind: DeliveryErrorKind::RateLimited,
+                retry_after_seconds: Some(35),
+            })),
+            Some(SendFailure::Confirmed {
+                error_kind: CommentErrorKind::RateLimited,
+                retry_after_seconds: Some(35),
+            })
+        );
+        assert_eq!(
+            comment_send_failure(DeliveryEffect::<()>::NotAttempted(DeliveryFailure {
+                kind: DeliveryErrorKind::InvalidInput,
+                retry_after_seconds: None,
+            })),
+            Some(SendFailure::Confirmed {
+                error_kind: CommentErrorKind::InvalidInput,
+                retry_after_seconds: None,
+            })
+        );
+        assert_eq!(
+            comment_send_failure(DeliveryEffect::<()>::Confirmed(())),
+            None
+        );
     }
 }

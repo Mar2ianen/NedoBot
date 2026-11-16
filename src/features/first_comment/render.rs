@@ -439,6 +439,17 @@ mod tests {
     }
 
     #[test]
+    fn validated_first_comment_keeps_configured_native_custom_emoji_markup() {
+        let mut config = config();
+        config.comment_custom_emoji_id = Some("123456".to_owned());
+
+        let html = build_comment_html("AMD драйвер обновился", &config);
+
+        assert!(html.contains(r#"<tg-emoji emoji-id="123456">😎</tg-emoji>"#));
+        assert!(html.ends_with("AMD драйвер обновился"));
+    }
+
+    #[test]
     fn strips_model_links() {
         let html = build_comment_html("Тест https://example.com в {CHAT_LINK}", &config());
 
