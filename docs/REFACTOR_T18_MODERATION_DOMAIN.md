@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline SHA: `356c0cf7e6b4520f903d89300edff373226e4ee9` (T17 verification checkpoint). Branch: `codex/refactor-t18-moderation-domain`. This is a stacked refactor on T17; no merge or deployment has been performed.
+Baseline SHA: `356c0cf7e6b4520f903d89300edff373226e4ee9` (T17 verification checkpoint). Branch: `codex/refactor-t18-moderation-domain`; implementation commit `e5de137dd9f0379d029ce97d42ca63cc223f779b`. Draft PR [#151](https://github.com/Mar2ianen/NedoBot/pull/151) targets T17 / PR #150. No merge or deployment has been performed.
 
 ## Authorization and existing backend boundaries
 
@@ -40,4 +40,4 @@ All commands ran against the T18 source branch. PostgreSQL tests used disposable
 - New private Rust policy surface: `CaptchaMemberState`, `CaptchaSolveDecision`, and `captcha_solve_decision`; new internal repository helper `lock_automatic_restriction_restore`.
 - No new dependency, SQL migration, public config key, enforcement threshold, spam score, or sanction policy was added.
 - Telegram has no compare-and-set membership API. The code obtains a live membership immediately before the effect and serializes this bot's own manual moderation with database advisory locks. A human administrator using another bot/client can still change membership between Telegram's read and write; that external race cannot be fenced by PostgreSQL. When the live state is already inconsistent, the code fails closed and preserves the other restriction.
-- GitHub CI and draft PR metadata will be recorded after the final source checkpoint. No production service, production database, credentials, merge, or deployment has been touched.
+- GitHub Actions run [#43905648621](https://github.com/Mar2ianen/NedoBot/actions/runs/43905648621) passed formatting, installer/concurrency checks, workspace tests, and Clippy, then remained in `Apply PostgreSQL migrations` for over 30 minutes. The disposable local migration and integration tests passed. To keep this CI step from producing multi-gigabyte debug artifacts, `.github/workflows/ci.yml` now sets `CARGO_PROFILE_DEV_DEBUG=0` only for the two migration-tool invocations; this changes no runtime or test behavior. Recheck the new head's Actions run before closing T18. No production service, production database, credentials, merge, or deployment has been touched.
