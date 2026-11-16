@@ -82,6 +82,40 @@ struct MathChallenge {
     correct_option: i16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptchaStatus {
+    Preparing,
+    SettingUp,
+    Pending,
+    Solving,
+    Passed,
+    Failed,
+    Overridden,
+    SetupFailed,
+    Expired,
+    Expiring,
+}
+
+impl TryFrom<&str> for CaptchaStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "setting_up" => Ok(Self::SettingUp),
+            "pending" => Ok(Self::Pending),
+            "solving" => Ok(Self::Solving),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "overridden" => Ok(Self::Overridden),
+            "setup_failed" => Ok(Self::SetupFailed),
+            "expired" => Ok(Self::Expired),
+            "expiring" => Ok(Self::Expiring),
+            _ => anyhow::bail!("unknown risk captcha status: {value}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CaptchaChallenge {
     id: Uuid,
@@ -95,7 +129,7 @@ struct CaptchaChallenge {
     message_id: Option<i32>,
     ephemeral_message_id: Option<i32>,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    status: String,
+    status: CaptchaStatus,
     setup_attempts: i32,
     decision_job_id: Option<i64>,
     ban_on_failure: bool,
@@ -223,8 +257,8 @@ async fn apply_captcha(
     }
     let challenge = match load_user_challenge(pool, job.chat_id, job.telegram_user_id).await? {
         Some(challenge)
-            if challenge.status == "expired"
-                || (challenge.status == "overridden"
+            if challenge.status == CaptchaStatus::Expired
+                || (challenge.status == CaptchaStatus::Overridden
                     && challenge.decision_job_id.is_some()
                     && challenge.setup_error_kind.as_deref()
                         == Some("decision_source_changed")
@@ -274,14 +308,14 @@ async fn apply_captcha(
         }
     };
 
-    match challenge.status.as_str() {
-        "passed" => return Ok(CaptchaOutcome::AlreadyPassed),
-        "failed" => return Ok(CaptchaOutcome::FailedAttempts),
-        "setup_failed" => return Ok(CaptchaOutcome::SetupFailed),
-        "overridden" => return Ok(CaptchaOutcome::Overridden),
-        "expired" => return Ok(CaptchaOutcome::Expired),
-        "solving" => return Ok(CaptchaOutcome::AlreadyPending),
-        "pending" if challenge.message_id.is_some() => {
+    match challenge.status {
+        CaptchaStatus::Passed => return Ok(CaptchaOutcome::AlreadyPassed),
+        CaptchaStatus::Failed => return Ok(CaptchaOutcome::FailedAttempts),
+        CaptchaStatus::SetupFailed => return Ok(CaptchaOutcome::SetupFailed),
+        CaptchaStatus::Overridden => return Ok(CaptchaOutcome::Overridden),
+        CaptchaStatus::Expired => return Ok(CaptchaOutcome::Expired),
+        CaptchaStatus::Solving => return Ok(CaptchaOutcome::AlreadyPending),
+        CaptchaStatus::Pending if challenge.message_id.is_some() => {
             if ensure_verification_state(bot, pool, &challenge)
                 .await?
                 .is_none()
@@ -291,8 +325,8 @@ async fn apply_captcha(
             delete_audited_messages(bot, pool, &challenge).await?;
             return Ok(CaptchaOutcome::AlreadyPending);
         }
-        "preparing" | "setting_up" | "pending" => {}
-        _ => return Ok(CaptchaOutcome::Overridden),
+        CaptchaStatus::Preparing | CaptchaStatus::SettingUp | CaptchaStatus::Pending => {}
+        CaptchaStatus::Expiring => return Ok(CaptchaOutcome::Overridden),
     }
     let Some(claimed) = claim_setup_by_id(pool, challenge.id).await? else {
         return Ok(CaptchaOutcome::AlreadyPending);
@@ -313,7 +347,7 @@ pub async fn process_next_setup(
     if !decision_source_valid(bot, pool, &challenge).await? {
         return Ok(true);
     }
-    if challenge.status == "pending" && challenge.message_id.is_some() {
+    if challenge.status == CaptchaStatus::Pending && challenge.message_id.is_some() {
         // Cleanup retry не должен накладывать новый mute, если автор успел
         // вступить в группу, пройти проверку или был размучен администратором.
         let member = bot
@@ -635,12 +669,15 @@ pub async fn handle_callback(
         return Ok(CaptchaCallbackOutcome::Expired);
     }
     if !matches!(
-        challenge.status.as_str(),
-        "preparing" | "setting_up" | "pending" | "solving"
+        challenge.status,
+        CaptchaStatus::Preparing
+            | CaptchaStatus::SettingUp
+            | CaptchaStatus::Pending
+            | CaptchaStatus::Solving
     ) {
-        return Ok(match challenge.status.as_str() {
-            "failed" => CaptchaCallbackOutcome::Failed,
-            "expired" | "expiring" => CaptchaCallbackOutcome::Expired,
+        return Ok(match challenge.status {
+            CaptchaStatus::Failed => CaptchaCallbackOutcome::Failed,
+            CaptchaStatus::Expired | CaptchaStatus::Expiring => CaptchaCallbackOutcome::Expired,
             _ => CaptchaCallbackOutcome::Stale,
         });
     }
@@ -1239,7 +1276,7 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         message_id: row.try_get("message_id")?,
         ephemeral_message_id: row.try_get("ephemeral_message_id")?,
         expires_at: row.try_get("expires_at")?,
-        status: row.try_get("status")?,
+        status: CaptchaStatus::try_from(row.try_get::<&str, _>("status")?)?,
         setup_attempts: row.try_get("setup_attempts")?,
         decision_job_id: row.try_get("decision_job_id")?,
         ban_on_failure: row.try_get("ban_on_failure")?,
@@ -1343,8 +1380,8 @@ pub async fn record_wrong_answer(
         return Ok(CaptchaCallbackOutcome::Stale);
     };
     let attempts: i32 = row.try_get("attempts")?;
-    let status: String = row.try_get("status")?;
-    if status == "failed" {
+    let status = CaptchaStatus::try_from(row.try_get::<&str, _>("status")?)?;
+    if status == CaptchaStatus::Failed {
         Ok(CaptchaCallbackOutcome::Failed)
     } else {
         Ok(CaptchaCallbackOutcome::Wrong {
@@ -1358,10 +1395,13 @@ async fn decision_source_valid(
     pool: &PgPool,
     c: &CaptchaChallenge,
 ) -> anyhow::Result<bool> {
-    if matches!(c.status.as_str(), "passed" | "expired") {
+    if matches!(c.status, CaptchaStatus::Passed | CaptchaStatus::Expired) {
         return Ok(true);
     }
-    if matches!(c.status.as_str(), "overridden" | "setup_failed") {
+    if matches!(
+        c.status,
+        CaptchaStatus::Overridden | CaptchaStatus::SetupFailed
+    ) {
         return Ok(false);
     }
     let Some(id) = c.decision_job_id else {
@@ -1405,8 +1445,8 @@ async fn decision_message_ids(
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptchaCallbackOutcome, generate_math_challenge, is_callback_data, parse_callback_data,
-        with_captcha_ephemeral_parameters,
+        CaptchaCallbackOutcome, CaptchaStatus, generate_math_challenge, is_callback_data,
+        parse_callback_data, with_captcha_ephemeral_parameters,
     };
     use teloxide::{
         payloads::SendMessageSetters,
@@ -1500,5 +1540,24 @@ mod tests {
         assert_eq!(parse_callback_data(&data), Some((id, 3)));
         assert_eq!(parse_callback_data(&format!("rc:{id}:4")), None);
         assert_eq!(parse_callback_data("other:uuid:1"), None);
+    }
+
+    #[test]
+    fn persisted_captcha_statuses_round_trip_and_unknown_values_fail_closed() {
+        for status in [
+            "preparing",
+            "setting_up",
+            "pending",
+            "solving",
+            "passed",
+            "failed",
+            "overridden",
+            "setup_failed",
+            "expired",
+            "expiring",
+        ] {
+            assert!(CaptchaStatus::try_from(status).is_ok(), "{status}");
+        }
+        assert!(CaptchaStatus::try_from("unknown_status").is_err());
     }
 }

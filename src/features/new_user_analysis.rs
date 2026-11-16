@@ -13,7 +13,7 @@ use crate::{
         deterministic,
         prompt::PROMPT_VERSION,
         repo::{
-            NewUserAuditJobParams, enqueue_new_user_audit_job_in_transaction,
+            NewUserAuditJobParams, NewUserAuditStatus, enqueue_new_user_audit_job_in_transaction,
             has_materialized_audit_for_first_message, latest_audit_link_message_id,
             latest_audit_trigger_fingerprint, record_new_user_audit_snapshot_in_transaction,
             refresh_in_flight_audit_snapshot_in_transaction,
@@ -147,7 +147,7 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
             .as_ref()
             .is_some_and(|fingerprint| match previous_trigger_fingerprint.as_ref() {
                 Some((previous, status, has_assessment)) if previous == fingerprint => {
-                    status == "succeeded" && !has_assessment
+                    *status == NewUserAuditStatus::Succeeded && !has_assessment
                 }
                 _ => true,
             });
@@ -174,7 +174,12 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
     ) {
         (Some(current), Some((previous, status, _))) => {
             current == previous
-                && matches!(status.as_str(), "pending" | "retry_wait" | "processing")
+                && matches!(
+                    *status,
+                    NewUserAuditStatus::Pending
+                        | NewUserAuditStatus::RetryWait
+                        | NewUserAuditStatus::Processing
+                )
         }
         _ => false,
     };

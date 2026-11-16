@@ -4,6 +4,79 @@ use crate::features::jobs::policy::{VOICE_TRANSCRIPTION_LEASE, VOICE_TRANSCRIPTI
 use crate::features::voice::cleanup::CleanupResult;
 use crate::features::voice::types::{AsrTranscript, VoiceMedia, VoiceMediaKind};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceJobStatus {
+    Pending,
+    RetryWait,
+    Processing,
+    Downloading,
+    Transcribing,
+    Cleaning,
+    Delivering,
+    DeliveryUnknown,
+    Sent,
+    Failed,
+    Skipped,
+}
+
+impl VoiceJobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::RetryWait => "retry_wait",
+            Self::Processing => "processing",
+            Self::Downloading => "downloading",
+            Self::Transcribing => "transcribing",
+            Self::Cleaning => "cleaning",
+            Self::Delivering => "delivering",
+            Self::DeliveryUnknown => "delivery_unknown",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl TryFrom<&str> for VoiceJobStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "retry_wait" => Ok(Self::RetryWait),
+            "processing" => Ok(Self::Processing),
+            "downloading" => Ok(Self::Downloading),
+            "transcribing" => Ok(Self::Transcribing),
+            "cleaning" => Ok(Self::Cleaning),
+            "delivering" => Ok(Self::Delivering),
+            "delivery_unknown" => Ok(Self::DeliveryUnknown),
+            "sent" => Ok(Self::Sent),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            _ => anyhow::bail!("unknown voice transcription status: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceJobPhase {
+    Downloading,
+    Transcribing,
+    Cleaning,
+    Delivering,
+}
+
+impl VoiceJobPhase {
+    fn as_status(self) -> VoiceJobStatus {
+        match self {
+            Self::Downloading => VoiceJobStatus::Downloading,
+            Self::Transcribing => VoiceJobStatus::Transcribing,
+            Self::Cleaning => VoiceJobStatus::Cleaning,
+            Self::Delivering => VoiceJobStatus::Delivering,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VoiceJob {
     pub id: i64,
@@ -18,6 +91,7 @@ pub struct VoiceJob {
     pub mime_type: Option<String>,
     pub attempts: i32,
     pub progress_message_id: Option<i32>,
+    pub status: VoiceJobStatus,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -61,9 +135,10 @@ type VoiceJobRow = (
     Option<String>,
     i32,
     Option<i32>,
+    String,
 );
 
-fn row_to_job(row: VoiceJobRow) -> VoiceJob {
+fn row_to_job(row: VoiceJobRow) -> anyhow::Result<VoiceJob> {
     let (
         id,
         chat_id,
@@ -77,8 +152,9 @@ fn row_to_job(row: VoiceJobRow) -> VoiceJob {
         mime_type,
         attempts,
         progress_message_id,
+        status,
     ) = row;
-    VoiceJob {
+    Ok(VoiceJob {
         id,
         chat_id,
         message_id,
@@ -91,11 +167,12 @@ fn row_to_job(row: VoiceJobRow) -> VoiceJob {
         mime_type,
         attempts,
         progress_message_id,
-    }
+        status: VoiceJobStatus::try_from(status.as_str())?,
+    })
 }
 
-const JOB_COLUMNS: &str = "id, chat_id, message_id, user_id, file_id, file_unique_id, media_kind, duration_sec, file_size, mime_type, attempts, progress_message_id";
-const JOB_COLUMNS_QUALIFIED: &str = "job.id, job.chat_id, job.message_id, job.user_id, job.file_id, job.file_unique_id, job.media_kind, job.duration_sec, job.file_size, job.mime_type, job.attempts, job.progress_message_id";
+const JOB_COLUMNS: &str = "id, chat_id, message_id, user_id, file_id, file_unique_id, media_kind, duration_sec, file_size, mime_type, attempts, progress_message_id, status";
+const JOB_COLUMNS_QUALIFIED: &str = "job.id, job.chat_id, job.message_id, job.user_id, job.file_id, job.file_unique_id, job.media_kind, job.duration_sec, job.file_size, job.mime_type, job.attempts, job.progress_message_id, job.status";
 
 pub async fn create_voice_job(pool: &PgPool, media: &VoiceMedia) -> anyhow::Result<Option<i64>> {
     let row = sqlx::query_as::<_, (i64,)>(
@@ -155,7 +232,7 @@ pub async fn claim_voice_job(pool: &PgPool, job_id: i64) -> anyhow::Result<Optio
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(row_to_job))
+    row.map(row_to_job).transpose()
 }
 
 pub async fn claim_next_voice_job(pool: &PgPool) -> anyhow::Result<Option<VoiceJob>> {
@@ -191,7 +268,7 @@ pub async fn claim_next_voice_job(pool: &PgPool) -> anyhow::Result<Option<VoiceJ
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(row_to_job))
+    row.map(row_to_job).transpose()
 }
 
 pub async fn recover_expired_voice_deliveries(pool: &PgPool) -> anyhow::Result<u64> {
@@ -238,7 +315,7 @@ pub async fn save_progress_message(
 pub async fn mark_voice_job_phase(
     pool: &PgPool,
     job: &VoiceJob,
-    status: &str,
+    phase: VoiceJobPhase,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         r#"
@@ -254,7 +331,7 @@ pub async fn mark_voice_job_phase(
         "#,
     )
     .bind(job.id)
-    .bind(status)
+    .bind(phase.as_status().as_str())
     .bind(VOICE_TRANSCRIPTION_LEASE.seconds())
     .bind(job.attempts)
     .execute(pool)
@@ -449,4 +526,52 @@ pub async fn save_voice_result(
     .execute(pool)
     .await?;
     Ok(query_result.rows_affected() == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VoiceJobPhase, VoiceJobStatus};
+
+    #[test]
+    fn persisted_voice_statuses_round_trip_and_unknown_values_are_rejected() {
+        for status in [
+            VoiceJobStatus::Pending,
+            VoiceJobStatus::RetryWait,
+            VoiceJobStatus::Processing,
+            VoiceJobStatus::Downloading,
+            VoiceJobStatus::Transcribing,
+            VoiceJobStatus::Cleaning,
+            VoiceJobStatus::Delivering,
+            VoiceJobStatus::DeliveryUnknown,
+            VoiceJobStatus::Sent,
+            VoiceJobStatus::Failed,
+            VoiceJobStatus::Skipped,
+        ] {
+            assert_eq!(
+                VoiceJobStatus::try_from(status.as_str()).expect("stored status round trips"),
+                status
+            );
+        }
+        assert!(VoiceJobStatus::try_from("unknown_status").is_err());
+    }
+
+    #[test]
+    fn phase_projection_only_exposes_active_pipeline_phases() {
+        assert_eq!(
+            VoiceJobPhase::Downloading.as_status(),
+            VoiceJobStatus::Downloading
+        );
+        assert_eq!(
+            VoiceJobPhase::Transcribing.as_status(),
+            VoiceJobStatus::Transcribing
+        );
+        assert_eq!(
+            VoiceJobPhase::Cleaning.as_status(),
+            VoiceJobStatus::Cleaning
+        );
+        assert_eq!(
+            VoiceJobPhase::Delivering.as_status(),
+            VoiceJobStatus::Delivering
+        );
+    }
 }

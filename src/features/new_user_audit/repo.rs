@@ -13,6 +13,78 @@ use teloxide_antispam::scoring::ScoreComponents;
 /// чтобы выбранные сохранённые assessments можно было безопасно переиграть.
 pub const CURRENT_MATERIALIZATION_VERSION: &str = "unified-audit-materialization-v9";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewUserAuditStatus {
+    Pending,
+    Processing,
+    RetryWait,
+    Succeeded,
+    Failed,
+}
+
+impl TryFrom<&str> for NewUserAuditStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "processing" => Ok(Self::Processing),
+            "retry_wait" => Ok(Self::RetryWait),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("unknown new-user audit status: {value}"),
+        }
+    }
+}
+
+impl NewUserAuditStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::RetryWait => "retry_wait",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationStatus {
+    Pending,
+    Processing,
+    RetryWait,
+    Succeeded,
+    Stale,
+}
+
+impl TryFrom<&str> for MaterializationStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "processing" => Ok(Self::Processing),
+            "retry_wait" => Ok(Self::RetryWait),
+            "succeeded" => Ok(Self::Succeeded),
+            "stale" => Ok(Self::Stale),
+            _ => anyhow::bail!("unknown new-user audit materialization status: {value}"),
+        }
+    }
+}
+
+impl MaterializationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::RetryWait => "retry_wait",
+            Self::Succeeded => "succeeded",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 /// Короткий retry для успешного LLM-ответа, ещё не пересёкшего durable
 /// generation boundary. Job остаётся под исходным generation lease.
 const GENERATION_FINALIZATION_SQL_RETRIES: u32 = 3;
@@ -31,6 +103,8 @@ pub struct NewUserAuditJob {
     pub avatar_file_id: Option<String>,
     pub avatar_file_unique_id: Option<String>,
     pub assessment_json: Option<Value>,
+    pub status: NewUserAuditStatus,
+    pub materialization_status: MaterializationStatus,
     pub review_threshold: i32,
     /// Monotonic generation claim sequence, used only by generation finalizers.
     pub attempts: i32,
@@ -91,8 +165,8 @@ pub async fn latest_audit_trigger_fingerprint(
     pool: &PgPool,
     chat_id: i64,
     telegram_user_id: i64,
-) -> anyhow::Result<Option<(String, String, bool)>> {
-    Ok(sqlx::query_as(
+) -> anyhow::Result<Option<(String, NewUserAuditStatus, bool)>> {
+    let row: Option<(String, String, bool)> = sqlx::query_as(
         r#"select input_json->>'audit_trigger_fingerprint', status,
                   assessment_json is not null
            from new_user_audit_jobs
@@ -103,7 +177,15 @@ pub async fn latest_audit_trigger_fingerprint(
     .bind(chat_id)
     .bind(telegram_user_id)
     .fetch_optional(pool)
-    .await?)
+    .await?;
+    row.map(|(fingerprint, status, has_assessment)| {
+        Ok((
+            fingerprint,
+            NewUserAuditStatus::try_from(status.as_str())?,
+            has_assessment,
+        ))
+    })
+    .transpose()
 }
 
 pub async fn latest_audit_link_message_id(
@@ -606,7 +688,7 @@ pub async fn claim_next_new_user_audit_job(
         returning job.id, job.chat_id, job.telegram_user_id, job.snapshot_hash,
                   job.prompt_version, job.input_json, job.avatar_file_id,
                   job.avatar_file_unique_id, job.assessment_json, job.review_threshold, job.attempts,
-                  job.materialization_attempts, job.generation_fence, job.materialization_fence,
+                  job.status, job.materialization_status, job.materialization_attempts, job.generation_fence, job.materialization_fence,
                   job.audit_generation, candidate.is_materialization_replay
         "#,
     )
@@ -615,24 +697,31 @@ pub async fn claim_next_new_user_audit_job(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|row| NewUserAuditJob {
-        id: row.get("id"),
-        chat_id: row.get("chat_id"),
-        telegram_user_id: row.get("telegram_user_id"),
-        snapshot_hash: row.get("snapshot_hash"),
-        prompt_version: row.get("prompt_version"),
-        input_json: row.get("input_json"),
-        avatar_file_id: row.get("avatar_file_id"),
-        avatar_file_unique_id: row.get("avatar_file_unique_id"),
-        assessment_json: row.get("assessment_json"),
-        review_threshold: row.get("review_threshold"),
-        attempts: row.get("attempts"),
-        materialization_attempts: row.get("materialization_attempts"),
-        generation_fence: row.get("generation_fence"),
-        materialization_fence: row.get("materialization_fence"),
-        audit_generation: row.get("audit_generation"),
-        is_materialization_replay: row.get("is_materialization_replay"),
-    }))
+    row.map(|row| {
+        Ok(NewUserAuditJob {
+            id: row.try_get("id")?,
+            chat_id: row.try_get("chat_id")?,
+            telegram_user_id: row.try_get("telegram_user_id")?,
+            snapshot_hash: row.try_get("snapshot_hash")?,
+            prompt_version: row.try_get("prompt_version")?,
+            input_json: row.try_get("input_json")?,
+            avatar_file_id: row.try_get("avatar_file_id")?,
+            avatar_file_unique_id: row.try_get("avatar_file_unique_id")?,
+            assessment_json: row.try_get("assessment_json")?,
+            review_threshold: row.try_get("review_threshold")?,
+            status: NewUserAuditStatus::try_from(row.try_get::<&str, _>("status")?)?,
+            materialization_status: MaterializationStatus::try_from(
+                row.try_get::<&str, _>("materialization_status")?,
+            )?,
+            attempts: row.try_get("attempts")?,
+            materialization_attempts: row.try_get("materialization_attempts")?,
+            generation_fence: row.try_get("generation_fence")?,
+            materialization_fence: row.try_get("materialization_fence")?,
+            audit_generation: row.try_get("audit_generation")?,
+            is_materialization_replay: row.try_get("is_materialization_replay")?,
+        })
+    })
+    .transpose()
 }
 
 pub struct NewUserAuditOutcome<'a> {
@@ -1109,5 +1198,35 @@ mod tests {
         for code in ["23505", "23514", "42501", "42601", "08P01"] {
             assert!(!is_transient_postgres_sqlstate(code), "{code}");
         }
+    }
+
+    #[test]
+    fn persisted_new_user_audit_statuses_round_trip_and_unknown_values_fail_closed() {
+        for (value, expected) in [
+            ("pending", NewUserAuditStatus::Pending),
+            ("processing", NewUserAuditStatus::Processing),
+            ("retry_wait", NewUserAuditStatus::RetryWait),
+            ("succeeded", NewUserAuditStatus::Succeeded),
+            ("failed", NewUserAuditStatus::Failed),
+        ] {
+            assert_eq!(NewUserAuditStatus::try_from(value).unwrap(), expected);
+            assert_eq!(expected.as_str(), value);
+        }
+        assert!(NewUserAuditStatus::try_from("unknown_status").is_err());
+    }
+
+    #[test]
+    fn persisted_materialization_statuses_round_trip_and_unknown_values_fail_closed() {
+        for (value, expected) in [
+            ("pending", MaterializationStatus::Pending),
+            ("processing", MaterializationStatus::Processing),
+            ("retry_wait", MaterializationStatus::RetryWait),
+            ("succeeded", MaterializationStatus::Succeeded),
+            ("stale", MaterializationStatus::Stale),
+        ] {
+            assert_eq!(MaterializationStatus::try_from(value).unwrap(), expected);
+            assert_eq!(expected.as_str(), value);
+        }
+        assert!(MaterializationStatus::try_from("unknown_status").is_err());
     }
 }

@@ -70,16 +70,34 @@ impl AskFailureKind {
     }
 
     pub fn from_error(error: &anyhow::Error) -> Self {
-        let error = error.to_string().to_lowercase();
-        if error.contains("timed out") || error.contains("deadline exceeded") {
-            Self::Timeout
-        } else if error.contains("mcp") || error.contains("database") {
-            Self::ToolError
-        } else if error.contains("invalid action") || error.contains("final answer") {
-            Self::InvalidAction
-        } else {
-            Self::GenerationError
-        }
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<AskFailureTag>().map(|tag| tag.kind))
+            .unwrap_or(Self::GenerationError)
+    }
+}
+
+#[derive(Debug)]
+pub struct AskFailureTag {
+    pub kind: AskFailureKind,
+    source: anyhow::Error,
+}
+
+impl AskFailureTag {
+    pub fn wrap(kind: AskFailureKind, source: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self { kind, source })
+    }
+}
+
+impl std::fmt::Display for AskFailureTag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AskFailureTag {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
     }
 }
 
@@ -209,4 +227,37 @@ fn audit_step_number(step: usize) -> i32 {
     step.checked_add(1)
         .and_then(|number| i32::try_from(number).ok())
         .unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AskFailureKind, AskFailureTag};
+
+    #[test]
+    fn ask_failure_categories_come_from_typed_error_chain_tags() {
+        for kind in [
+            AskFailureKind::Timeout,
+            AskFailureKind::ToolError,
+            AskFailureKind::InvalidAction,
+        ] {
+            let error = AskFailureTag::wrap(kind, anyhow::anyhow!("private provider detail"))
+                .context("agent request failed");
+            assert_eq!(AskFailureKind::from_error(&error), kind);
+        }
+    }
+
+    #[test]
+    fn untagged_error_text_does_not_change_failure_category() {
+        for message in [
+            "timed out",
+            "MCP database unavailable",
+            "invalid action: no final answer",
+        ] {
+            let error = anyhow::anyhow!(message);
+            assert_eq!(
+                AskFailureKind::from_error(&error),
+                AskFailureKind::GenerationError
+            );
+        }
+    }
 }

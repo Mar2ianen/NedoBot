@@ -1111,6 +1111,9 @@ mod tests {
             avatar_file_unique_id: None,
             review_threshold: 70,
             assessment_json: None,
+            status: crate::features::new_user_audit::repo::NewUserAuditStatus::Succeeded,
+            materialization_status:
+                crate::features::new_user_audit::repo::MaterializationStatus::Processing,
             attempts: 1,
             generation_fence: 1,
             materialization_attempts: 1,

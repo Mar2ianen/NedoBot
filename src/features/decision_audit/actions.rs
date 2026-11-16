@@ -2,7 +2,7 @@
 use super::{
     client::{DecisionAssessment, POLICY_VERSION, QUESTIONS},
     contacts,
-    repo::{self, DecisionJob},
+    repo::{self, DecisionActionStatus, DecisionJob},
     scoring,
 };
 use crate::{
@@ -23,6 +23,8 @@ const MAX_ACTION_ATTEMPTS: i32 = 6;
 struct Action {
     #[sqlx(flatten)]
     job: DecisionJob,
+    #[sqlx(try_from = "String")]
+    action_status: DecisionActionStatus,
     action_fence: i64,
     action_attempts: i32,
     message_at: Option<DateTime<Utc>>,
@@ -74,14 +76,19 @@ async fn claim(pool: &PgPool, c: &Config) -> anyhow::Result<Option<Action>> {
     tx.commit().await?;
     Ok(Some(action))
 }
-async fn finish(pool: &PgPool, a: &Action, status: &str, reason: &str) -> anyhow::Result<()> {
+async fn finish(
+    pool: &PgPool,
+    a: &Action,
+    status: DecisionActionStatus,
+    reason: &str,
+) -> anyhow::Result<()> {
     sqlx::query("update moderation_decision_jobs set action_status=$3,action_error_kind=$4,action_lease_expires_at=null where id=$1 and action_fence=$2 and action_status='processing'")
-        .bind(a.job.id).bind(a.action_fence).bind(status).bind(reason).execute(pool).await?;
+        .bind(a.job.id).bind(a.action_fence).bind(status.as_str()).bind(reason).execute(pool).await?;
     Ok(())
 }
 async fn retry(pool: &PgPool, a: &Action) -> anyhow::Result<()> {
     sqlx::query("update moderation_decision_jobs set action_status=$3,action_error_kind='action_unavailable',action_next_attempt_at=now()+make_interval(secs=>$4::double precision),action_lease_expires_at=null where id=$1 and action_fence=$2 and action_status='processing'")
-        .bind(a.job.id).bind(a.action_fence).bind(if a.action_attempts>=MAX_ACTION_ATTEMPTS{"failed"}else{"retry_wait"})
+        .bind(a.job.id).bind(a.action_fence).bind(if a.action_attempts>=MAX_ACTION_ATTEMPTS{DecisionActionStatus::Failed}else{DecisionActionStatus::RetryWait}.as_str())
         .bind(ANALYSIS_RETRY.delay_seconds(a.action_attempts,None).unwrap_or(0) as f64).execute(pool).await?;
     Ok(())
 }
@@ -115,11 +122,14 @@ async fn materialize(
     Ok(row)
 }
 async fn apply(bot: &Bot, pool: &PgPool, c: &Config, a: &Action) -> anyhow::Result<()> {
+    if a.action_status != DecisionActionStatus::Processing {
+        anyhow::bail!("claimed decision action is not processing");
+    }
     if a.action_attempts > MAX_ACTION_ATTEMPTS {
-        return finish(pool, a, "failed", "retry_exhausted").await;
+        return finish(pool, a, DecisionActionStatus::Failed, "retry_exhausted").await;
     }
     if !repo::source_is_current(pool, &a.job).await? {
-        return finish(pool, a, "skipped", "source_changed").await;
+        return finish(pool, a, DecisionActionStatus::Skipped, "source_changed").await;
     }
     let assessment: DecisionAssessment = serde_json::from_value(
         a.assessment_json
@@ -132,28 +142,34 @@ async fn apply(bot: &Bot, pool: &PgPool, c: &Config, a: &Action) -> anyhow::Resu
     let source:Option<(String,Value)>=sqlx::query_as("select coalesce(text,''),coalesce(raw_json->'entities',raw_json->'caption_entities','[]'::jsonb) from telegram_messages where chat_id=$1 and message_id=$2 and user_id=$3")
         .bind(a.job.chat_id).bind(a.job.message_id).bind(a.job.user_id).fetch_optional(pool).await?;
     let Some((text, entities)) = source else {
-        return finish(pool, a, "skipped", "source_missing").await;
+        return finish(pool, a, DecisionActionStatus::Skipped, "source_missing").await;
     };
     let contacts = contacts::extract(pool, a.job.chat_id, a.job.user_id, &text, &entities).await?;
     let contribution =
         scoring::contribution(&assessment, &contacts, &c.community.moderation.decision);
     let Some(total) = materialize(pool, c, a, &contribution).await? else {
-        return finish(pool, a, "skipped", "stale_metrics").await;
+        return finish(pool, a, DecisionActionStatus::Skipped, "stale_metrics").await;
     };
     if !contribution.review_candidate || total < c.community.moderation.captcha_threshold {
-        return finish(pool, a, "done", "below_threshold_or_abstain").await;
+        return finish(
+            pool,
+            a,
+            DecisionActionStatus::Done,
+            "below_threshold_or_abstain",
+        )
+        .await;
     }
     if a.message_at.is_none_or(|t| {
         !(0..=c.community.moderation.decision.captcha_max_message_age_sec)
             .contains(&Utc::now().signed_duration_since(t).num_seconds())
     }) {
-        return finish(pool, a, "skipped", "message_too_old").await;
+        return finish(pool, a, DecisionActionStatus::Skipped, "message_too_old").await;
     }
     if c.community.moderation.captcha_dry_run {
-        return finish(pool, a, "done", "captcha_dry_run").await;
+        return finish(pool, a, DecisionActionStatus::Done, "captcha_dry_run").await;
     }
     if !repo::source_is_current(pool, &a.job).await? {
-        return finish(pool, a, "skipped", "source_changed").await;
+        return finish(pool, a, DecisionActionStatus::Skipped, "source_changed").await;
     }
     let authorized=sqlx::query("update moderation_decision_jobs set metrics_json=jsonb_set(metrics_json,'{captcha_authorized}','true'::jsonb) where id=$1 and action_fence=$2 and action_status='processing' and action_lease_expires_at>now()")
         .bind(a.job.id).bind(a.action_fence).execute(pool).await?;
@@ -178,7 +194,7 @@ async fn apply(bot: &Bot, pool: &PgPool, c: &Config, a: &Action) -> anyhow::Resu
     finish(
         pool,
         a,
-        "done",
+        DecisionActionStatus::Done,
         match outcome {
             risk_captcha::CaptchaOutcome::Issued => "issued",
             risk_captcha::CaptchaOutcome::Ineligible => "ineligible",

@@ -55,12 +55,12 @@ use tg_ai_bot_teloxide::{
             finalize_history_failed, finalize_history_retry, load_relevant_memory_notes,
         },
         new_user_audit::repo::{
-            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, has_materialized_audit_for_first_message,
-            latest_audit_trigger_fingerprint, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_new_user_audit_job,
-            reopen_obsolete_materialization_in_transaction,
+            NewUserAuditJobParams, NewUserAuditStatus, claim_next_new_user_audit_job,
+            enqueue_new_user_audit_job, finalize_new_user_audit_job,
+            has_materialized_audit_for_first_message, latest_audit_trigger_fingerprint,
+            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
+            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
+            materialize_new_user_audit_job, reopen_obsolete_materialization_in_transaction,
             supersede_unneeded_new_user_audit_jobs_in_transaction,
             sync_spam_review_from_audit_in_transaction,
         },
@@ -77,8 +77,8 @@ use tg_ai_bot_teloxide::{
         },
         voice::{
             repo::{
-                VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
-                mark_voice_job_delivery_unknown, mark_voice_job_phase,
+                VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
+                create_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_phase,
                 mark_voice_job_retry_or_failed, recover_expired_voice_deliveries,
                 save_progress_message,
             },
@@ -555,12 +555,12 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .expect("progress message must be persisted")
     );
     assert!(
-        mark_voice_job_phase(pool, &job, "downloading")
+        mark_voice_job_phase(pool, &job, VoiceJobPhase::Downloading)
             .await
             .expect("voice phase transition must succeed")
     );
     assert!(
-        mark_voice_job_phase(pool, &job, "transcribing")
+        mark_voice_job_phase(pool, &job, VoiceJobPhase::Transcribing)
             .await
             .expect("voice phase transition must refresh the lease")
     );
@@ -635,7 +635,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("delivery-unknown voice job must be claimable")
         .expect("delivery-unknown voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &unknown_job, "delivering")
+        mark_voice_job_phase(pool, &unknown_job, VoiceJobPhase::Delivering)
             .await
             .expect("voice delivering phase must be persisted")
     );
@@ -675,7 +675,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("active-delivery voice job must be claimable")
         .expect("active-delivery voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &active_delivery_job, "delivering")
+        mark_voice_job_phase(pool, &active_delivery_job, VoiceJobPhase::Delivering)
             .await
             .expect("active delivering phase must be persisted")
     );
@@ -709,7 +709,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("expired-delivery voice job must be claimable")
         .expect("expired-delivery voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &expired_delivery_job, "delivering")
+        mark_voice_job_phase(pool, &expired_delivery_job, VoiceJobPhase::Delivering)
             .await
             .expect("expired delivering phase must be persisted")
     );
@@ -2101,7 +2101,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("pending trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-21".to_string(),
-            "pending".to_string(),
+            NewUserAuditStatus::Pending,
             false
         ))
     );
@@ -2117,7 +2117,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("in-flight trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-21".to_string(),
-            "processing".to_string(),
+            NewUserAuditStatus::Processing,
             false
         ))
     );
@@ -2147,7 +2147,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("latest changed trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-22".to_string(),
-            "pending".to_string(),
+            NewUserAuditStatus::Pending,
             false
         ))
     );
