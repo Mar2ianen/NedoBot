@@ -27,7 +27,10 @@ Local:
 - `git diff --check` — passed.
 - `CARGO_TARGET_DIR=../nedobot-refactor-t11-wip/target cargo check --workspace --all-targets --locked` — passed.
 - `CARGO_TARGET_DIR=../nedobot-refactor-t11-wip/target cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
-- Full tests and disposable PostgreSQL integration are pending CI; the home filesystem has less than 1 GB free, so no fresh local test-profile build was started.
+- `cargo test --workspace --all-targets --locked` — CI passed: 610 passed, 0 failed, 6 ignored; additional test targets passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — CI passed.
+- PostgreSQL migrations and configured integration tests — CI passed, including URL evidence/shadow checks, migration lifecycle, RMCP (2 tests), and manual moderation (3 tests).
+- CI runs [#43817792737](https://github.com/Mar2ianen/NedoBot/actions/runs/43817792737) and [#43817799544](https://github.com/Mar2ianen/NedoBot/actions/runs/43817799544) passed on the final code head. The local disk had less than 1 GB free, so the full test-profile build was delegated to CI.
 
 ## Invariants and limitations
 
@@ -39,4 +42,4 @@ Local:
 
 ## Review state
 
-Draft PR and CI results pending.
+Draft PR [#145](https://github.com/Mar2ianen/NedoBot/pull/145) remains open and unmerged. Current head `b1983ac`; both PR checks passed. No deployment performed.
