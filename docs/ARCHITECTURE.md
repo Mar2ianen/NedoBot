@@ -2,6 +2,8 @@
 
 This describes the current implementation at the T03 baseline. It records actual call and ownership boundaries; it is not a claim that the code already follows a future ports-and-adapters design.
 
+> **Update, 2026-11-16:** the sections below preserve the T03 architecture snapshot. For current code, consult the linked T04–T21 reports and [REFACTOR_EXECUTION.md](REFACTOR_EXECUTION.md). The `llm/*` bullet in the historical summary below predates the configured Gemini/Cloudflare/provider-profile transports.
+
 ## Workspace and runtime graph
 
 ```mermaid
@@ -126,3 +128,13 @@ No import guard is added in T03. A textual ban on `crate::telegram` under `featu
 ## Manual graph review
 
 For this snapshot, `rg` over `src/features` found no imports of `telegram::command_handler`, `telegram::commands`, or `telegram::manual_moderation`; the allowed imports are listed above. Re-run that scan after T06–T09. No source behavior, dependencies, config schema, SQL schema or production settings were changed by T03.
+
+## T20 extensibility proof: hypothetical media import
+
+The T20 contract is recorded in [`../verification/EXTENSIBILITY_CONTRACT.md`](../verification/EXTENSIBILITY_CONTRACT.md). It is a design walkthrough only; no downloader, ffmpeg invocation, Telegram send, command, or runtime feature is added.
+
+A hypothetical `/media_import` trigger would require explicit command/dispatch registration in `telegram/commands.rs` and `telegram/command_handler.rs`, a typed runtime config section, and a new `features/media_import/{types,policy,service,repo,worker,provider}.rs` vertical slice with its own additive migration, job lifecycle, bounded worker registration in `main.rs`, observability registration, and fake-provider/DB tests. The ordinary `handle_message` path does not need a new condition because the trigger is a command routed through the existing command-first router.
+
+The isolated domain would produce an `UploadPlan` from a `MediaImportRequest` and a `Source` port. It would classify `Failed` separately from `Unknown`; unknown Telegram delivery is terminal for automatic retry, with operator reconciliation, because the upload may already have succeeded. A content cache key belongs to source identity plus transformation version, while delivery idempotency belongs to the import request/job, so two requests can reuse a downloaded object without merging their user-visible sends.
+
+No import or edit to `ask/agent.rs`, `voice/pipeline.rs`, or `new_user_analysis.rs` is required. If requirements later need a message-link trigger, add a typed route adapter; do not graft URL sniffing into another feature's orchestration. Any future subprocess needs fixed executable/argument construction, bounded output, timeout, concurrency limit and process-tree cleanup. URL input must pass the existing URL/SSRF boundary before fetch, and every redirect target must be revalidated. Review source terms and legal constraints before implementation.
