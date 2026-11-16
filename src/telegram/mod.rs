@@ -16,3 +16,5 @@ pub mod rich_content;
 pub mod router;
 pub mod service_messages;
 pub mod updates;
+
+pub(crate) mod url_targets;
