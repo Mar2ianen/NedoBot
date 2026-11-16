@@ -125,24 +125,35 @@ impl WorkerSupervisor {
     }
 
     /// Runs the foreground service while observing unexpected worker exits.
-    /// A panic is reported by worker ID; durable jobs remain recoverable through
-    /// their existing database leases on restart.
-    pub async fn supervise_until<F>(&mut self, foreground: F)
+    /// A long-lived worker exiting unexpectedly is fatal: after draining sibling
+    /// workers, return an error so the process supervisor can restart the service.
+    pub async fn supervise_until<F>(&mut self, foreground: F) -> anyhow::Result<()>
     where
         F: Future<Output = ()>,
     {
         tokio::pin!(foreground);
+        let mut failed_worker = None;
         loop {
             tokio::select! {
                 _ = &mut foreground => break,
                 joined = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     if let Some(joined) = joined {
-                        self.record_exit(joined);
+                        failed_worker = self.record_exit(joined);
+                        if failed_worker.is_some() {
+                            break;
+                        }
                     }
                 }
             }
         }
         self.shutdown_and_drain().await;
+        if let Some(worker) = failed_worker {
+            anyhow::bail!(
+                "background worker {} exited unexpectedly; process restart required",
+                worker.as_str()
+            );
+        }
+        Ok(())
     }
 
     pub async fn shutdown_and_drain(&mut self) {
@@ -207,7 +218,7 @@ impl WorkerSupervisor {
         }
     }
 
-    fn record_exit(&mut self, joined: Result<(Id, WorkerId), JoinError>) {
+    fn record_exit(&mut self, joined: Result<(Id, WorkerId), JoinError>) -> Option<WorkerId> {
         let shutting_down = *self.shutdown.borrow();
         let (worker, exit) = self.classify_join(joined);
         match exit {
@@ -233,6 +244,7 @@ impl WorkerSupervisor {
                 );
             }
         }
+        (!shutting_down).then_some(worker)
     }
 }
 
@@ -480,5 +492,26 @@ mod tests {
             supervisor.classify_join(aborted),
             (WorkerId::QrEvidence, WorkerTaskExit::Aborted)
         );
+    }
+
+    #[tokio::test]
+    async fn unexpected_worker_panic_fails_foreground_supervision() {
+        let mut supervisor = WorkerSupervisor::new();
+        let sibling_stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_stopped_by_worker = Arc::clone(&sibling_stopped);
+        supervisor.spawn(WorkerId::ProfileRefresh, move |mut shutdown| async move {
+            let _ = shutdown.changed().await;
+            sibling_stopped_by_worker.store(true, Ordering::SeqCst);
+        });
+        supervisor.spawn(WorkerId::DecisionAudit, |_| async {
+            panic!("synthetic critical worker panic");
+        });
+
+        let result = supervisor
+            .supervise_until(std::future::pending::<()>())
+            .await;
+
+        assert!(result.unwrap_err().to_string().contains("decision_audit"));
+        assert!(sibling_stopped.load(Ordering::SeqCst));
     }
 }

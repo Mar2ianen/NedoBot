@@ -20,9 +20,12 @@ use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
 #[cfg(feature = "voice")]
 use features::jobs::policy::VOICE_TRANSCRIPTION_POLL;
 use features::jobs::policy::{POST_HISTORY_POLL, WorkerPollPolicy};
+#[cfg(feature = "spam-sync")]
+use features::jobs::worker::run_fixed_delay_worker;
+#[cfg(feature = "ask")]
+use features::jobs::worker::run_interval_worker;
 use features::jobs::worker::{
-    PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_fixed_delay_worker,
-    run_interval_worker, run_poll_worker,
+    PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_poll_worker,
 };
 use features::memory::service::process_next_history_entry;
 #[cfg(feature = "moderation")]
@@ -263,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
         .enable_ctrlc_handler()
         .build();
 
-    workers.supervise_until(dispatcher.dispatch()).await;
+    workers.supervise_until(dispatcher.dispatch()).await?;
 
     Ok(())
 }

@@ -849,6 +849,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_failure_after_confirmed_preview_is_unknown_without_redelivery() {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram_edit))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram listener must bind");
+        let address = listener.local_addr().expect("fake listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let port = FaultInjectingSendPort::new([
+            DeliveryEffect::Confirmed(sent_message()),
+            DeliveryEffect::Unknown(delivery_failure(DeliveryErrorKind::Transport)),
+        ]);
+
+        let result = send_rendered_transcript(
+            &bot,
+            &port,
+            ChatId(-1001),
+            MessageId(11),
+            MessageId(27),
+            &RenderedTranscript::MessageAndFile {
+                html: "preview already delivered".to_owned(),
+                filename: "transcript.txt".to_owned(),
+                body: "complete transcript".to_owned(),
+            },
+        )
+        .await;
+        server.abort();
+
+        assert!(matches!(result, Err(VoiceDeliveryFailure::Unknown)));
+        assert_eq!(*port.calls.lock().unwrap(), ["html", "document"]);
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "progress message was updated"
+        );
+    }
+
+    #[tokio::test]
     async fn confirmed_rich_payload_rejection_uses_one_html_fallback() {
         let port = FaultInjectingSendPort::new([
             DeliveryEffect::Rejected(delivery_failure(DeliveryErrorKind::PayloadRejected)),

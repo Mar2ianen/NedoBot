@@ -29,6 +29,26 @@ pub fn client(timeout: Duration) -> anyhow::Result<reqwest::Client> {
     client_with_proxy(timeout, None)
 }
 
+/// Extracts an HTTP status from a typed reqwest error anywhere in an error chain.
+/// Callers can map provider failures without parsing display strings that may
+/// change or contain transport details.
+pub fn status_code(error: &anyhow::Error) -> Option<u16> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .map(|status| status.as_u16())
+    })
+}
+
+pub fn is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
+}
+
 pub fn client_with_proxy(
     timeout: Duration,
     proxy_url: Option<&str>,
@@ -56,4 +76,37 @@ pub fn client_with_proxy(
     let client = builder.build()?;
     clients.insert(key, client.clone());
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, http::StatusCode, routing::get};
+
+    use super::{is_timeout, status_code};
+
+    async fn rate_limited() -> StatusCode {
+        StatusCode::TOO_MANY_REQUESTS
+    }
+
+    #[tokio::test]
+    async fn reads_status_from_typed_reqwest_error_chain() {
+        let app = Router::new().route("/", get(rate_limited));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener.local_addr().expect("test server address is known");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("mock server responds")
+            .error_for_status()
+            .expect_err("429 must be an error");
+        server.abort();
+
+        let error = anyhow::Error::new(error);
+        assert_eq!(status_code(&error), Some(429));
+        assert!(!is_timeout(&error));
+    }
 }

@@ -100,11 +100,6 @@ pub fn classify_request_result<T>(result: ResponseResult<T>) -> DeliveryEffect<T
         Err(RequestError::Api(ApiError::CantParseEntities(_) | ApiError::MessageIsTooLong)) => {
             DeliveryEffect::Rejected(DeliveryFailure::of(DeliveryErrorKind::PayloadRejected))
         }
-        Err(RequestError::Api(ApiError::Unknown(description)))
-            if description.starts_with("Bad Request:") =>
-        {
-            DeliveryEffect::Rejected(DeliveryFailure::of(DeliveryErrorKind::PayloadRejected))
-        }
         Err(RequestError::Api(_) | RequestError::MigrateToChatId(_)) => {
             DeliveryEffect::Rejected(DeliveryFailure::of(DeliveryErrorKind::TelegramRejected))
         }
@@ -328,6 +323,18 @@ mod tests {
                 teloxide::types::Seconds::from_seconds(30),
             ))),
             DeliveryEffect::Rejected(failure(DeliveryErrorKind::RateLimited, Some(30)))
+        );
+        assert_eq!(
+            classify_request_result::<()>(Err(RequestError::Api(ApiError::Unknown(
+                "Bad Request: not enough rights to send messages".to_owned(),
+            )))),
+            DeliveryEffect::Rejected(failure(DeliveryErrorKind::TelegramRejected, None))
+        );
+        assert_eq!(
+            classify_request_result::<()>(Err(RequestError::Api(ApiError::CantParseEntities(
+                "Bad Request: can't parse entities".to_owned()
+            ),))),
+            DeliveryEffect::Rejected(failure(DeliveryErrorKind::PayloadRejected, None))
         );
         let unknown = RequestError::Io(std::sync::Arc::new(std::io::Error::other(
             "private payload",
