@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: T11 verification checkpoint `92e0e24672437aaf1e8641e905c08f1c962be6d2` (draft PR #144). Branch: `codex/refactor-t12-voice-enqueue-only`, stacked on T11.
+Baseline: T11 deterministic-test correction `a2b995c` (draft PR #144). Branch: `codex/refactor-t12-voice-enqueue-only`, stacked on T11.
 
 ## Behavior before and after
 
