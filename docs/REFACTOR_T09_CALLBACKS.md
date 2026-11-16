@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: `1bf1e51` (T08 PR #141). Work branch: `codex/refactor-t09-callbacks`. Draft PR and final commit will be recorded after creation.
+Baseline: `1bf1e51` (T08 PR #141). Work branch: `codex/refactor-t09-callbacks`, implementation commit `a0ccb36`. Draft PR: [#142](https://github.com/Mar2ianen/NedoBot/pull/142), stacked on #141.
 
 ## Changes
 
@@ -33,3 +33,7 @@ The full local `cargo test --workspace --all-targets --locked` build was attempt
 - Reactions are persisted only for managed chats whose ingest flag is enabled. Member snapshots are persisted only under the same ingest condition, while existing welcome/farewell handling remains managed-chat scoped.
 - Acknowledgment, DB update, and card update ordering remains the pre-existing implementation; no concurrency or API semantics were intentionally changed.
 - No production database, live bot, credentials, deployment, or merge was used.
+
+## Review state
+
+PR #142 is open and draft. CI is running on the implementation/report head. No merge or deployment was performed.
