@@ -3,7 +3,7 @@
 | Field | Result |
 |---|---|
 | Baseline | `main` SHA `7b8815bbff80c4665b64076a063f5f4919e5465a`; stacked after T00/#133 and T01/#134 |
-| Branch / PR | `codex/refactor-t02-test-harness`; PR pending creation |
+| Branch / PR | `codex/refactor-t02-test-harness`; [draft PR #135](https://github.com/Mar2ianen/NedoBot/pull/135), head `d37bdf3208ab5736a6a0a65ec1f48c16fc200724`, stacked on #134 |
 | Runtime behavior | Message route expression was extracted unchanged into a typed helper shared by production dispatch and tests. No policy, persistence, model, or moderation behavior changed. |
 | New dependencies / schema | None |
 | New cases | Typed Telegram updates for hidden `text_link`, edited message, bot sender, absent `from` with `sender_chat`; command-first routing; ordinary-message fallback; registered/unknown chat and ingest gate; compile-time manual moderation command gate. Existing `RichMessage` characterization remains in `telegram/rich_content.rs` tests. |
