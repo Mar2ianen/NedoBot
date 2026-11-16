@@ -36,6 +36,15 @@ Local commands:
 - Lifecycle SQL reports the four queues already covered by the operational report. It does not claim to be a universal metrics backend for every background feature.
 - No production database, VPS, credential, live Telegram chat, deployment, merge, or release tag was used.
 
+## CI evidence
+
+Implementation head `18ab7f91a176b6a6dfd3f8eb7e913acfcecf938b` passed both required CI runs:
+
+- [#43810619027](https://github.com/Mar2ianen/NedoBot/actions/runs/43810619027) — 698 passed, 0 failed, 13 ignored across 49 test targets; all configured URL, lifecycle, RMCP, manual-moderation PostgreSQL integrations passed; format, Clippy, and migration steps passed.
+- [#43810624501](https://github.com/Mar2ianen/NedoBot/actions/runs/43810624501) — same green result.
+
+The first CI attempt exposed a test-only race: `JoinSet::abort_all()` requests cancellation, but the test inspected it before Tokio produced the join result. The test now awaits that result; the worker implementation was unchanged by the correction.
+
 ## Review state
 
-Draft PR and CI results are pending.
+PR #144 is open as a draft, stacked on T10. It is not merged or deployed. A documentation-only verification checkpoint follows the implementation head.
