@@ -28,7 +28,7 @@ Baseline SHA: `15be8c1a51236c0ee3fd1d35835345d5d80fca1b` (T13 verification check
 - `with_url_shadow_advisory_lock` remains unchanged: bounded semaphore, session lock, `close_on_drop`, same-user serialization and different-user concurrency are preserved.
 - The transaction order remains job → audit → review; the latest `not_spam` veto and stale materialization behavior are untouched.
 - Score and canonical snapshot/revision hashes are pinned by an independent synthetic golden fixture. Existing PostgreSQL concurrency and cancellation tests were rerun.
-- No external service, live chat, production DB, merge, or deployment was used. PR CI is pending.
+- No external service, live chat, production DB, merge, or deployment was used. GitHub Actions run [#43825979214](https://github.com/Mar2ianen/NedoBot/actions/runs/43825979214) passed: formatting, full workspace tests, Clippy, migrations, URL shadow integrations, PostgreSQL migrations, RMCP, and manual-moderation integrations all completed successfully.
 
 ## API changes
 
