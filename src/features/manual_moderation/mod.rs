@@ -9,8 +9,8 @@ pub use repo::{
     batch_has_uncertain_target, claim_batch, claim_restriction_revoke,
     claim_restriction_revokes_batch, claim_undo_action, create_batch, create_batch_with_request,
     find_batch, find_username, finish_batch, finish_restriction_revoke, finish_undo,
-    known_chat_user, latest_batch, list_actions, list_warnings, mark_action_failed,
-    mark_action_succeeded, prepare_action, prepare_actions_batch, recover_expired_batch_actions,
-    revoke_warnings, start_prepared_action, start_restriction_revoke, start_undo_operation,
-    undo_previous_action,
+    known_chat_user, latest_batch, list_actions, list_warnings, lock_automatic_restriction_restore,
+    mark_action_failed, mark_action_succeeded, prepare_action, prepare_actions_batch,
+    recover_expired_batch_actions, revoke_warnings, start_prepared_action,
+    start_restriction_revoke, start_undo_operation, undo_previous_action,
 };
