@@ -543,9 +543,12 @@ async fn handle_message(
     }
 
     #[cfg(feature = "voice")]
-    match maybe_transcribe_voice(&bot, &msg, &state).await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
+    match maybe_transcribe_voice(&msg, &state).await {
+        Ok(outcome) => {
+            if outcome.consumes_update() {
+                return Ok(());
+            }
+        }
         Err(err) => tracing::error!(%err, "failed to process voice transcription"),
     }
 

@@ -11,6 +11,24 @@ pub enum VoiceMediaKind {
     VideoNote,
 }
 
+/// Result of recognizing and durably enqueueing a voice transcription trigger.
+/// It deliberately contains no ASR or Telegram-delivery result: those belong to
+/// the background worker after the update handler has returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceEnqueueOutcome {
+    NotTriggered,
+    Enqueued { job_id: i64 },
+    AlreadyPresent,
+}
+
+impl VoiceEnqueueOutcome {
+    /// A recognized voice update keeps precedence over automatic first-comment
+    /// handling, including when the message already has a durable job.
+    pub const fn consumes_update(self) -> bool {
+        matches!(self, Self::Enqueued { .. } | Self::AlreadyPresent)
+    }
+}
+
 impl VoiceMediaKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -108,6 +126,13 @@ impl VoiceMedia {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_voice_update_keeps_precedence_over_first_comment() {
+        assert!(VoiceEnqueueOutcome::Enqueued { job_id: 7 }.consumes_update());
+        assert!(VoiceEnqueueOutcome::AlreadyPresent.consumes_update());
+        assert!(!VoiceEnqueueOutcome::NotTriggered.consumes_update());
+    }
 
     #[test]
     fn video_note_has_mp4_mime_type_for_asr_upload() {
