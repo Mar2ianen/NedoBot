@@ -1,5 +1,7 @@
 #[cfg(feature = "ask")]
 pub mod ask_drafter;
+#[cfg(feature = "moderation")]
+pub mod callbacks;
 pub mod command_handler;
 pub mod commands;
 pub mod custom_emoji;
@@ -13,3 +15,4 @@ pub mod render;
 pub mod rich_content;
 pub mod router;
 pub mod service_messages;
+pub mod updates;
