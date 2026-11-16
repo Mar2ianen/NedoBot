@@ -627,11 +627,16 @@ async fn send_regular_transcript(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
     use crate::features::voice::types::AsrSegment;
-    use axum::{Router, body::Bytes, extract::State, routing::post};
+    use axum::{Form, Router, extract::State, routing::post};
+
+    type CapturedTelegramRequest = Arc<Mutex<Option<HashMap<String, String>>>>;
 
     fn transcript(text: &str, segments: Vec<&str>) -> AsrTranscript {
         AsrTranscript {
@@ -712,11 +717,10 @@ mod tests {
     }
 
     async fn fake_telegram_edit(
-        State(captured): State<Arc<Mutex<Option<serde_json::Value>>>>,
-        body: Bytes,
+        State(captured): State<CapturedTelegramRequest>,
+        Form(payload): Form<HashMap<String, String>>,
     ) -> axum::Json<serde_json::Value> {
-        *captured.lock().expect("captured request lock") =
-            Some(serde_json::from_slice(&body).expect("Telegram request body must be JSON"));
+        *captured.lock().expect("captured request lock") = Some(payload);
         axum::Json(serde_json::json!({
             "ok": true,
             "result": {
@@ -762,8 +766,11 @@ mod tests {
             .expect("captured request lock")
             .take()
             .expect("transcript delivery should call Telegram");
-        assert_eq!(payload["chat_id"], -1001);
-        assert_eq!(payload["message_id"], 27);
-        assert_eq!(payload["text"], "<b>recognized words</b>");
+        assert_eq!(payload.get("chat_id").map(String::as_str), Some("-1001"));
+        assert_eq!(payload.get("message_id").map(String::as_str), Some("27"));
+        assert_eq!(
+            payload.get("text").map(String::as_str),
+            Some("<b>recognized words</b>")
+        );
     }
 }
