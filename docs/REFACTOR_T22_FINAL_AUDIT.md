@@ -65,4 +65,4 @@ Recorded local verification:
 - The migration runner passed at 4 MiB and 8 MiB and overflowed at 2 MiB on clean test DBs. CI and `scripts/test.sh` use 8 MiB.
 - PRs #127–#132 were checked at the recorded heads above; all remain open, and both GitHub Actions checks pass for each.
 
-The bot service's production systemd configuration and production deployment state remain intentionally unverified. This branch still needs its own exact-head CI after publication.
+The bot service's production systemd configuration and production deployment state remain intentionally unverified. Exact-head GitHub CI passed on implementation commit `03b60b3`: [run 43949342749](https://github.com/Mar2ianen/NedoBot/actions/runs/43949342749) and [run 43949358431](https://github.com/Mar2ianen/NedoBot/actions/runs/43949358431). A final documentation-only commit records this evidence and gets its own CI before completion.
