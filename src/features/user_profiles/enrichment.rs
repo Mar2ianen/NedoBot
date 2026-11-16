@@ -91,7 +91,7 @@ impl ProfileRefreshQueue {
 pub fn spawn_profile_refresh_workers(
     bot: Bot,
     pool: PgPool,
-    config: Config,
+    config: Arc<Config>,
     #[cfg(feature = "moderation")] url_feed_snapshot: Arc<
         tokio::sync::RwLock<Option<Arc<FeedSnapshot>>>,
     >,
@@ -101,7 +101,7 @@ pub fn spawn_profile_refresh_workers(
     for worker_index in 0..config.profile_refresh_concurrency {
         let bot = bot.clone();
         let pool = pool.clone();
-        let config = config.clone();
+        let config = Arc::clone(&config);
         #[cfg(feature = "moderation")]
         let url_feed_snapshot = url_feed_snapshot.clone();
         let queue = queue.clone();

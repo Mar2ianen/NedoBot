@@ -42,7 +42,7 @@ pub async fn maybe_transcribe_voice(
     msg: &Message,
     state: &AppState,
 ) -> anyhow::Result<bool> {
-    if !state.config.voice_transcription_enabled || !state.config.voice_auto_transcribe {
+    if !state.config.voice.enabled || !state.config.voice.auto_transcribe {
         return Ok(false);
     }
 
@@ -64,7 +64,7 @@ pub async fn transcribe_reply(
     command_message: &Message,
     state: &AppState,
 ) -> anyhow::Result<()> {
-    if !state.config.voice_transcription_enabled {
+    if !state.config.voice.enabled {
         return send_voice_command_message(
             bot,
             command_message,

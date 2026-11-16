@@ -14,7 +14,7 @@ use crate::features::spam_reputation::SpamReputationStore;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    pub config: Config,
+    pub config: Arc<Config>,
     pub render_time: Arc<TimeContext>,
     pub llm_formatter: Arc<LlmMarkdownFormatter>,
     pub ask_slots: Arc<Semaphore>,
@@ -35,7 +35,7 @@ impl AppState {
         let time_context = Arc::new(time_context);
         Self {
             pool,
-            config,
+            config: Arc::new(config),
             render_time: Arc::clone(&time_context),
             llm_formatter: Arc::new(LlmMarkdownFormatter::new()),
             ask_slots: Arc::new(Semaphore::new(ask_concurrency)),

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use teloxide::{
     dispatching::{UpdateFilterExt, UpdateHandler},
     prelude::*,
@@ -172,7 +173,10 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, config);
     #[cfg(feature = "moderation")]
     if state.config.community.moderation.url_feed_enabled {
-        features::url_feeds::spawn_worker(state.url_feed_snapshot.clone(), state.config.clone());
+        features::url_feeds::spawn_worker(
+            state.url_feed_snapshot.clone(),
+            Arc::clone(&state.config),
+        );
     }
     #[cfg(feature = "ask")]
     let state = match bot_identity {
@@ -196,12 +200,12 @@ async fn main() -> anyhow::Result<()> {
     features::decision_audit::service::spawn_worker(
         bot.inner().clone(),
         state.pool.clone(),
-        state.config.clone(),
+        Arc::clone(&state.config),
     )?;
     let profile_refresh_queue = spawn_profile_refresh_workers(
         bot.inner().clone(),
         state.pool.clone(),
-        state.config.clone(),
+        Arc::clone(&state.config),
         #[cfg(feature = "moderation")]
         state.url_feed_snapshot.clone(),
     );
@@ -434,7 +438,7 @@ fn spawn_voice_transcription_worker(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     state: AppState,
 ) {
-    if !state.config.voice_transcription_enabled {
+    if !state.config.voice.enabled {
         return;
     }
     tokio::spawn(async move {

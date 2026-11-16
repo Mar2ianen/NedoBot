@@ -219,7 +219,7 @@ pub fn configuration_hash(config: &Config) -> String {
         .expect("validated serializable decision configuration"))
 }
 
-pub fn spawn_worker(bot: Bot, pool: PgPool, config: Config) -> anyhow::Result<()> {
+pub fn spawn_worker(bot: Bot, pool: PgPool, config: std::sync::Arc<Config>) -> anyhow::Result<()> {
     if !config.community.moderation.enabled || !config.community.moderation.decision.enabled {
         return Ok(());
     }

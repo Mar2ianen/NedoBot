@@ -24,7 +24,7 @@ pub async fn transcribe_audio_with_shadow(
     filename: &str,
     mime_type: Option<&str>,
 ) -> anyhow::Result<(AsrTranscript, Vec<AsrTranscript>)> {
-    let primary_provider = config.voice_asr_provider.trim().to_ascii_lowercase();
+    let primary_provider = config.voice.asr_provider.trim().to_ascii_lowercase();
     let shadow_provider = shadow_provider_for(&primary_provider);
     let shadow_mime_type = shadow_audio_mime_type(filename, mime_type);
     if primary_provider == "gemini" && shadow_mime_type.is_none() {
@@ -36,12 +36,12 @@ pub async fn transcribe_audio_with_shadow(
             filename,
             mime_type,
             "groq",
-            &config.voice_asr_shadow_model,
+            &config.voice.asr_shadow_model,
         )
         .await?;
         return Ok((transcript, Vec::new()));
     }
-    let shadow_enabled = config.voice_asr_shadow_enabled && shadow_provider.is_some();
+    let shadow_enabled = config.voice.asr_shadow_enabled && shadow_provider.is_some();
     let primary = transcribe_audio(config, path, filename, mime_type);
     let shadow = async {
         if !shadow_enabled {
@@ -57,7 +57,7 @@ pub async fn transcribe_audio_with_shadow(
             filename,
             mime_type,
             shadow_provider,
-            &config.voice_asr_shadow_model,
+            &config.voice.asr_shadow_model,
         )
         .await
         .map(Some)
@@ -71,7 +71,7 @@ pub async fn transcribe_audio_with_shadow(
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        model = %config.voice_asr_shadow_model,
+                        model = %config.voice.asr_shadow_model,
                         "shadow ASR failed; keeping primary transcript"
                     );
                     Vec::new()
@@ -113,8 +113,8 @@ pub async fn transcribe_audio(
         path,
         filename,
         mime_type,
-        config.voice_asr_provider.trim(),
-        &config.voice_asr_model,
+        config.voice.asr_provider.trim(),
+        &config.voice.asr_model,
     )
     .await
 }
@@ -144,8 +144,8 @@ async fn transcribe_configured_audio(
                 mime_type,
                 api_key: config.groq_api_key.trim(),
                 model,
-                language: &config.voice_language,
-                temperature: config.voice_asr_temperature,
+                language: &config.voice.language,
+                temperature: config.voice.asr_temperature,
                 endpoint: GROQ_TRANSCRIPTIONS_URL,
             })
             .await
@@ -260,7 +260,7 @@ async fn transcribe_gemini_audio(
         api_key,
         &file,
         model,
-        &config.voice_language,
+        &config.voice.language,
         mime_type,
     )
     .await

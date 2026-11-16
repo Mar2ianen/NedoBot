@@ -19,13 +19,13 @@ pub enum RenderedTranscript {
 
 pub fn render_transcript(clean: &CleanTranscript, config: &Config) -> RenderedTranscript {
     if clean.mode == TranscriptRenderMode::Short
-        || clean.text.chars().count() <= config.voice_short_text_max_chars
+        || clean.text.chars().count() <= config.voice.short_text_max_chars
     {
         return render_plain_text(&clean.text, config);
     }
 
     let chapters = effective_chapters(clean);
-    let html = render_chapters(&chapters, config.voice_render_expandable_chapters);
+    let html = render_chapters(&chapters, config.voice.render_expandable_chapters);
     if html::is_safe_len(&html) {
         return RenderedTranscript::Message { html };
     }
@@ -33,7 +33,7 @@ pub fn render_transcript(clean: &CleanTranscript, config: &Config) -> RenderedTr
     RenderedTranscript::RichMessage {
         html: render_rich_chapters(&chapters),
         fallback: Box::new(render_file_fallback(
-            render_preview(clean, &chapters, config.voice_render_expandable_chapters),
+            render_preview(clean, &chapters, config.voice.render_expandable_chapters),
             render_file_body(clean, &chapters),
             config,
         )),
@@ -61,7 +61,7 @@ fn render_plain_text(text: &str, config: &Config) -> RenderedTranscript {
 }
 
 fn render_file_fallback(html: String, body: String, config: &Config) -> RenderedTranscript {
-    if config.voice_send_full_file {
+    if config.voice.send_full_file {
         RenderedTranscript::MessageAndFile {
             html,
             filename: "voice-transcript.txt".to_string(),
@@ -309,21 +309,14 @@ mod tests {
             amd_custom_emoji_id: None,
             radeon_custom_emoji_id: None,
             ryzen_custom_emoji_id: None,
-            voice_transcription_enabled: true,
-            voice_auto_transcribe: true,
-            voice_max_duration_sec: 600,
-            voice_max_file_mb: 20,
-            voice_short_text_max_chars: 400,
-            voice_language: "ru".to_string(),
-            voice_asr_provider: "groq".to_string(),
-            voice_asr_model: "whisper-large-v3-turbo".to_string(),
-            voice_asr_shadow_enabled: false,
-            voice_asr_shadow_model: "gemini-3.5-transcribe".to_string(),
-            voice_asr_temperature: 0.0,
-            voice_cleanup_temperature: 0.2,
-            voice_cleanup_max_tokens: 1800,
-            voice_render_expandable_chapters: true,
-            voice_send_full_file: true,
+            voice: crate::config::VoiceConfig {
+                enabled: true,
+                auto_transcribe: true,
+                asr_provider: "groq".to_string(),
+                asr_model: "whisper-large-v3-turbo".to_string(),
+                asr_shadow_model: "gemini-3.5-transcribe".to_string(),
+                ..crate::config::VoiceConfig::default()
+            },
             public_base_url: None,
             static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
@@ -417,7 +410,7 @@ mod tests {
             short_summary: None,
         };
         let mut config = config();
-        config.voice_short_text_max_chars = 1;
+        config.voice.short_text_max_chars = 1;
 
         let RenderedTranscript::Message { html } = render_transcript(&clean, &config) else {
             panic!("short chapter transcript must fit into a regular message");
