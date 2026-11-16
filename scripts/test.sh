@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+# Match CI's larger async test-thread stack for the PostgreSQL lifecycle test.
+export RUST_MIN_STACK=${RUST_MIN_STACK:-33554432}
+# Limit simultaneous full-feature binary links on developer workstations.
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
+
 TEST_DATABASE_URL=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_test
 TEST_DATABASE_URL_B=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_test_b
 
