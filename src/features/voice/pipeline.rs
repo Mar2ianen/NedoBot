@@ -688,6 +688,7 @@ mod tests {
     use super::*;
     use crate::features::voice::types::AsrSegment;
     use axum::{Router, body::Bytes, extract::State, routing::post};
+    use sqlx::postgres::PgPoolOptions;
     use teloxide::{prelude::RequesterExt, types::ParseMode};
 
     type CapturedTelegramRequest = Arc<Mutex<Option<String>>>;
@@ -888,6 +889,107 @@ mod tests {
             captured.lock().unwrap().is_some(),
             "progress message was updated"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "run against the disposable local test database"]
+    async fn voice_partial_delivery_is_persisted_and_never_replayed_after_restart() {
+        use crate::features::voice::repo::{
+            VoiceJobPhase, VoiceTransition, claim_voice_job, enqueue_voice_job,
+            mark_voice_job_delivery_unknown, mark_voice_job_phase,
+        };
+        use crate::features::voice::types::{VoiceMedia, VoiceMediaKind};
+
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point to the disposable test database");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("test PostgreSQL must be reachable");
+        let suffix = chrono::Utc::now().timestamp_micros();
+        let media = VoiceMedia {
+            chat_id: -1001932061163,
+            message_id: (suffix.rem_euclid(1_000_000_000) as i32).saturating_add(1_000_000_000),
+            user_id: Some(suffix),
+            kind: VoiceMediaKind::Voice,
+            file_id: format!("partial-delivery-{suffix}"),
+            file_unique_id: Some(format!("partial-delivery-unique-{suffix}")),
+            duration_sec: Some(60),
+            file_size: Some(1024),
+            mime_type: Some("audio/ogg".to_owned()),
+        };
+        let job_id = enqueue_voice_job(&pool, &media)
+            .await
+            .expect("voice job must enqueue")
+            .expect("new voice job must be returned");
+        let job = claim_voice_job(&pool, job_id)
+            .await
+            .expect("voice claim must succeed")
+            .expect("job must be claimed");
+        assert!(
+            mark_voice_job_phase(&pool, &job, VoiceJobPhase::Delivering)
+                .await
+                .expect("delivery phase must persist")
+        );
+
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram_edit))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram listener must bind");
+        let address = listener.local_addr().expect("mock listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let port = FaultInjectingSendPort::new([
+            DeliveryEffect::Confirmed(sent_message()),
+            DeliveryEffect::Unknown(delivery_failure(DeliveryErrorKind::Transport)),
+        ]);
+
+        let delivery = send_rendered_transcript(
+            &bot,
+            &port,
+            ChatId(media.chat_id),
+            MessageId(media.message_id),
+            MessageId(27),
+            &RenderedTranscript::MessageAndFile {
+                html: "confirmed preview".to_owned(),
+                filename: "transcript.txt".to_owned(),
+                body: "complete transcript".to_owned(),
+            },
+        )
+        .await;
+        server.abort();
+        assert!(matches!(delivery, Err(VoiceDeliveryFailure::Unknown)));
+        assert_eq!(*port.calls.lock().unwrap(), ["html", "document"]);
+        assert!(captured.lock().unwrap().is_some());
+        assert_eq!(
+            mark_voice_job_delivery_unknown(&pool, &job, "ambiguous full transcript send")
+                .await
+                .expect("partial delivery state must persist"),
+            VoiceTransition::DeliveryUnknown
+        );
+        pool.close().await;
+
+        // A fresh pool models process restart and must not reclaim or duplicate
+        // either the confirmed preview or the ambiguous full transcript send.
+        let restarted_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("restarted test pool must connect");
+        assert!(
+            claim_voice_job(&restarted_pool, job_id)
+                .await
+                .expect("delivery_unknown job must remain queryable")
+                .is_none()
+        );
+        assert_eq!(*port.calls.lock().unwrap(), ["html", "document"]);
+        restarted_pool.close().await;
     }
 
     #[tokio::test]
