@@ -2388,6 +2388,37 @@ mod tests {
         );
         assert!(!continuation_prompt(2, &Evidence::default()).contains("secret tool payload"));
     }
+
+    #[test]
+    fn partial_tool_replay_preserves_response_call_identity() {
+        let first_call = genai::chat::ToolCall {
+            call_id: "call-first".into(),
+            fn_name: "chat__search_messages".into(),
+            fn_arguments: json!({"query":"first"}),
+            thought_signatures: None,
+        };
+        let second_call = genai::chat::ToolCall {
+            call_id: "call-second".into(),
+            fn_name: "chat__get_user_profile".into(),
+            fn_arguments: json!({"user_id":42}),
+            thought_signatures: None,
+        };
+        let mut messages = vec![ChatMessage::assistant(MessageContent::from(vec![
+            first_call.clone(),
+            second_call.clone(),
+        ]))];
+
+        append_tool_responses(
+            &mut messages,
+            vec![ToolResponse::from_tool_call(&first_call, r#"{"ok":true}"#)],
+        );
+
+        let replayed = messages[1].content.tool_responses();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].call_id, first_call.call_id);
+        assert_eq!(replayed[0].fn_name.as_deref(), Some(first_call.fn_name.as_str()));
+        assert_eq!(messages[0].content.tool_calls()[1].call_id, second_call.call_id);
+    }
     #[tokio::test(start_paused = true)]
     async fn retries_once_after_a_timeout() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
