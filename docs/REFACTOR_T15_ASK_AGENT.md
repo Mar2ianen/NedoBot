@@ -19,7 +19,7 @@ Baseline SHA: `e3363fe7061f562092864e67fa9d34452ab01328` (T14 CI-success checkpo
 - `cargo check --lib --locked` — passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
 - `cargo test --lib --locked features::ask::agent::tests` — 29 passed, 0 failed, 1 ignored, 590 filtered.
-- The required `cargo test --workspace --all-targets --locked` was started, but local compilation was interrupted after roughly 11 minutes while the shared host load average was about 282. No test failure was reported; this run is inconclusive. CI must provide the full-workspace result.
+- Local `cargo test --workspace --all-targets --locked` was interrupted after roughly 11 minutes while the shared host load average was about 282; the local run is inconclusive. GitHub Actions run [#43830314350](https://github.com/Mar2ianen/NedoBot/actions/runs/43830314350) passed on the implementation head: main library 614 passed/0 failed/6 ignored, Clippy, formatting, migrations, URL PostgreSQL checks, RMCP (2/2), and manual moderation (3/3) all succeeded.
 
 ## Invariants and limitations
 
@@ -31,5 +31,4 @@ Baseline SHA: `e3363fe7061f562092864e67fa9d34452ab01328` (T14 CI-success checkpo
 
 ## Remaining verification
 
-- Await CI for `cargo test --workspace --all-targets --locked` and PostgreSQL integration workflows.
-- Review the resulting diff and CI before considering T15 complete.
+- No known implementation or verification blockers remain. The local all-target test build did not finish due host contention; the CI run completed the full suite and integration checks.
