@@ -469,9 +469,14 @@ mod tests {
         });
         tokio::task::yield_now().await;
         supervisor.abort_all();
+        let aborted = supervisor
+            .tasks
+            .join_next_with_id()
+            .await
+            .expect("aborted worker should be joined");
         assert_eq!(
-            supervisor.reap_finished().await,
-            vec![(WorkerId::QrEvidence, WorkerTaskExit::Aborted)]
+            supervisor.classify_join(aborted),
+            (WorkerId::QrEvidence, WorkerTaskExit::Aborted)
         );
     }
 }
