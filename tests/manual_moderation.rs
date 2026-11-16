@@ -608,16 +608,36 @@ async fn captcha_restore_lock_serializes_manual_restriction_and_parallel_undo() 
         )
         .await
     });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), async {
-            // Give the spawned transaction time to reach the advisory lock.
-            while !manual.is_finished() {
-                tokio::task::yield_now().await;
+    let lock_waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                r#"with target_lock as (
+                       select hashtextextended($1::text || ':' || $2::text, 0) as key
+                   )
+                   select exists (
+                       select 1 from pg_locks l, target_lock k
+                       where l.locktype = 'advisory' and not l.granted
+                         and l.database = (select oid from pg_database where datname = current_database())
+                         and l.classid = ((k.key >> 32) & 4294967295)::oid
+                         and l.objid = (k.key & 4294967295)::oid
+                         and l.objsubid = 1
+                   )"#,
+            )
+            .bind(CHAT_ID)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("PostgreSQL must expose the blocked advisory lock");
+            if waiting {
+                break;
             }
-        })
-        .await
-        .is_err(),
-        "manual restriction waits while captcha holds the target lock"
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        lock_waiting.is_ok(),
+        "manual restriction must reach PostgreSQL's waiter queue while captcha owns the target lock"
     );
     captcha_tx.commit().await.unwrap();
     let prepared = manual
@@ -786,7 +806,7 @@ async fn unwarn_defaults_to_latest_and_only_explicit_all_revokes_every_warning()
     let pool = PgPool::connect(&database_url)
         .await
         .expect("test PostgreSQL must be reachable");
-    let user_id = Utc::now().timestamp_micros() + 4_000_000_000;
+    let user_id = Utc::now().timestamp_micros() + 5_000_000_000;
     let actor_id = user_id + 1;
     let mut batch_ids = Vec::new();
     let mut warning_ids = Vec::new();

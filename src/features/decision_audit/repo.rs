@@ -6,7 +6,7 @@ use crate::features::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool};
 
 pub const MAX_ATTEMPTS: i32 = 6;
 
@@ -366,6 +366,28 @@ pub async fn captcha_source_is_current(
     chat: i64,
     user: i64,
 ) -> anyhow::Result<bool> {
+    let mut connection = pool.acquire().await?;
+    captcha_source_is_current_on(&mut connection, id, chat, user).await
+}
+
+/// Checks captcha provenance on an already-held connection. Callers that own a
+/// target advisory lock must use this form so a one-connection pool cannot
+/// deadlock waiting for a second connection held by the same transaction.
+pub async fn captcha_source_is_current_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+    chat: i64,
+    user: i64,
+) -> anyhow::Result<bool> {
+    captcha_source_is_current_on(tx, id, chat, user).await
+}
+
+async fn captcha_source_is_current_on(
+    connection: &mut PgConnection,
+    id: i64,
+    chat: i64,
+    user: i64,
+) -> anyhow::Result<bool> {
     let row:Option<CaptchaSource>=sqlx::query_as(r#"
         select j.source_hash,j.source_edited_at,coalesce(m.text,'') as current_text,m.edited_at as current_edit,coalesce(l.label='not_spam',false) as normal_veto
         from moderation_decision_jobs j join telegram_messages m on m.chat_id=j.chat_id and m.message_id=j.message_id and m.user_id=j.user_id
@@ -375,7 +397,7 @@ pub async fn captcha_source_is_current(
         and m.source_channel_id is null and m.sender_chat_id is null
         and not exists(select 1 from telegram_chat_member_snapshots s where s.chat_id=j.chat_id and s.telegram_user_id=j.user_id and s.is_admin)
         and not exists(select 1 from telegram_user_profiles p where p.telegram_user_id=j.user_id and p.is_bot)"#)
-        .bind(id).bind(chat).bind(user).fetch_optional(pool).await?;
+        .bind(id).bind(chat).bind(user).fetch_optional(&mut *connection).await?;
     Ok(row.is_some_and(|r| {
         !r.normal_veto
             && r.source_edited_at == r.current_edit

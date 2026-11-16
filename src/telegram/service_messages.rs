@@ -330,9 +330,6 @@ pub fn should_fallback_after_payload_rejection(error: &RequestError) -> bool {
     match error {
         RequestError::Validation(_) | RequestError::Serialization(_) => true,
         RequestError::Api(ApiError::CantParseEntities(_) | ApiError::MessageIsTooLong) => true,
-        RequestError::Api(ApiError::Unknown(description)) => {
-            description.starts_with("Bad Request:")
-        }
         RequestError::RetryAfter(_)
         | RequestError::Api(_)
         | RequestError::MigrateToChatId(_)
@@ -470,11 +467,18 @@ mod tests {
     #[test]
     fn rich_html_fallback_only_runs_after_a_confirmed_payload_rejection() {
         assert!(should_fallback_after_payload_rejection(&RequestError::Api(
-            ApiError::Unknown("Bad Request: invalid rich message".to_owned())
-        )));
-        assert!(should_fallback_after_payload_rejection(&RequestError::Api(
             ApiError::CantParseEntities("Bad Request: can't parse entities".to_owned())
         )));
+        assert!(!should_fallback_after_payload_rejection(
+            &RequestError::Api(ApiError::Unknown(
+                "Bad Request: invalid rich message".to_owned()
+            ))
+        ));
+        assert!(!should_fallback_after_payload_rejection(
+            &RequestError::Api(ApiError::Unknown(
+                "Bad Request: not enough rights to send messages".to_owned()
+            ))
+        ));
         assert!(!should_fallback_after_payload_rejection(
             &RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(30))
         ));

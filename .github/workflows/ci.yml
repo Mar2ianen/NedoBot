@@ -101,8 +101,10 @@ jobs:
       - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-          RUST_MIN_STACK: 33554432
-        run: cargo test --test postgres_migrations -- --ignored
+          RUST_MIN_STACK: 8388608
+        run: |
+          cargo test --test postgres_migrations -- --ignored
+          cargo test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
 
       - name: Run RMCP PostgreSQL integration test
         env:

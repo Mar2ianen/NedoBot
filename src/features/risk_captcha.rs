@@ -721,7 +721,7 @@ async fn finish_captcha_solution(
             .execute(&mut *tx)
             .await?;
         CaptchaCallbackOutcome::PassedButOtherRestrictionRemains
-    } else if !captcha_source_current(pool, challenge).await? {
+    } else if !captcha_source_current_in_tx(&mut tx, challenge).await? {
         sqlx::query("update telegram_risk_captcha_challenges set status = 'overridden', setup_error_kind = 'decision_source_changed', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'solving'")
             .bind(challenge.id)
             .execute(&mut *tx)
@@ -747,7 +747,7 @@ async fn finish_captcha_solution(
                 // Manual moderation reserves the same target lock before its Telegram
                 // effect. Keep it through the live membership check, restore, and commit.
                 restore_permissions(bot, challenge).await?;
-                if captcha_source_current(pool, challenge).await? {
+                if captcha_source_current_in_tx(&mut tx, challenge).await? {
                     set_passed_in_tx(&mut tx, challenge.id).await?;
                     CaptchaCallbackOutcome::Passed
                 } else {
@@ -817,15 +817,15 @@ fn captcha_solve_decision(
     }
 }
 
-async fn captcha_source_current(
-    pool: &PgPool,
+async fn captcha_source_current_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<bool> {
     let Some(decision_job_id) = challenge.decision_job_id else {
         return Ok(true);
     };
-    crate::features::decision_audit::repo::captcha_source_is_current(
-        pool,
+    crate::features::decision_audit::repo::captcha_source_is_current_in_tx(
+        tx,
         decision_job_id,
         challenge.chat_id,
         challenge.user_id,
@@ -865,12 +865,14 @@ async fn set_overridden_source_changed_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        "update telegram_risk_captcha_challenges set status = 'overridden', setup_error_kind = 'decision_source_changed', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'solving'",
+    let changed = sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'overridden', setup_error_kind = 'decision_source_changed', setup_lease_expires_at = null, updated_at = now() where id = $1 and status in ('solving', 'setting_up', 'pending')",
     )
     .bind(id)
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected();
+    anyhow::ensure!(changed == 1, "captcha source override lost its state fence");
     Ok(())
 }
 
@@ -879,7 +881,37 @@ async fn ensure_verification_state(
     pool: &PgPool,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<Option<VerificationState>> {
-    if !decision_source_valid(bot, pool, challenge).await? {
+    // Serialize the initial automatic restriction with manual mute/ban/undo.
+    // Hold the same target lock through Telegram's effect and the durable marker
+    // so a manual sanction can never be overwritten by captcha setup.
+    let mut tx = pool.begin().await?;
+    if crate::features::manual_moderation::lock_automatic_restriction_restore(
+        &mut tx,
+        challenge.chat_id,
+        challenge.user_id,
+    )
+    .await?
+    {
+        set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+        tx.commit().await?;
+        remove_captcha_card(bot, challenge).await;
+        return Ok(None);
+    }
+
+    let status: Option<String> = sqlx::query_scalar(
+        "select status from telegram_risk_captcha_challenges where id = $1 for update",
+    )
+    .bind(challenge.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if !matches!(status.as_deref(), Some("setting_up" | "pending")) {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+        set_overridden_source_changed_in_tx(&mut tx, challenge.id).await?;
+        tx.commit().await?;
+        remove_captcha_card(bot, challenge).await;
         return Ok(None);
     }
     let member = bot
@@ -888,7 +920,8 @@ async fn ensure_verification_state(
     match member.kind {
         ChatMemberKind::Member(_) => {
             if challenge.restriction_applied_at.is_some() {
-                set_status(pool, challenge.id, "overridden").await?;
+                set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+                tx.commit().await?;
                 return Ok(None);
             }
             bot.restrict_chat_member(
@@ -898,25 +931,40 @@ async fn ensure_verification_state(
             )
             .use_independent_chat_permissions(true)
             .await?;
-            mark_restriction_applied(pool, challenge.id).await?;
+            // Message edits and normal labels do not share the target lock.
+            // Recheck after the external effect and restore if the source became
+            // stale while Telegram was processing the restriction.
+            if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+                restore_permissions(bot, challenge).await?;
+                set_overridden_source_changed_in_tx(&mut tx, challenge.id).await?;
+                tx.commit().await?;
+                remove_captcha_card(bot, challenge).await;
+                return Ok(None);
+            }
+            mark_restriction_applied_in_tx(&mut tx, challenge.id).await?;
+            tx.commit().await?;
             Ok(Some(VerificationState::RestrictedMember))
         }
         ChatMemberKind::Restricted(restricted)
             if restricted.is_member && has_no_permissions(&restricted) =>
         {
             if challenge.restriction_applied_at.is_none() {
-                set_status(pool, challenge.id, "overridden").await?;
+                set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+                tx.commit().await?;
                 return Ok(None);
             }
+            tx.commit().await?;
             Ok(Some(VerificationState::RestrictedMember))
         }
         ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => {
             // Не пытаемся мутить/вступать за non-member. Доставка ephemeral
             // reply проверяется отдельно; отказ API не запускает TTL.
+            tx.commit().await?;
             Ok(Some(VerificationState::Commenter))
         }
         _ => {
-            set_status(pool, challenge.id, "overridden").await?;
+            set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+            tx.commit().await?;
             Ok(None)
         }
     }
@@ -1288,7 +1336,7 @@ async fn expire_claimed_challenge(
         };
         if may_ban {
             // Старый source/normal label проверяются повторно непосредственно перед баном.
-            if !captcha_source_current(pool, challenge).await? {
+            if !captcha_source_current_in_tx(&mut tx, challenge).await? {
                 set_overridden_source_changed_expiring_in_tx(&mut tx, challenge.id).await?;
                 tx.commit().await?;
                 remove_captcha_card(bot, challenge).await;
@@ -1309,7 +1357,7 @@ async fn expire_claimed_challenge(
                 && has_no_permissions(&restricted)
                 && challenge.restriction_applied_at.is_some() =>
         {
-            if !captcha_source_current(pool, challenge).await? {
+            if !captcha_source_current_in_tx(&mut tx, challenge).await? {
                 set_overridden_source_changed_expiring_in_tx(&mut tx, challenge.id).await?;
                 tx.commit().await?;
                 remove_captcha_card(bot, challenge).await;
@@ -1476,12 +1524,35 @@ async fn set_message_sent(
     Ok(())
 }
 
-async fn mark_restriction_applied(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
-    sqlx::query(
+async fn mark_restriction_applied_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    let changed = sqlx::query(
         "update telegram_risk_captcha_challenges set restriction_applied_at = coalesce(restriction_applied_at, now()), updated_at = now() where id = $1 and status in ('setting_up', 'pending', 'solving')",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    anyhow::ensure!(
+        changed == 1,
+        "captcha restriction marker lost its state fence"
+    );
+    Ok(())
+}
+
+async fn set_status_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    status: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set status = $2, setup_lease_expires_at = null, updated_at = now() where id = $1 and status not in ('passed', 'failed', 'overridden', 'setup_failed')",
+    )
+    .bind(id)
+    .bind(status)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
