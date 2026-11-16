@@ -287,20 +287,34 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_closes_intake_then_drains_already_queued_profiles() {
+        let (empty_queue, empty_receiver) = ProfileRefreshQueue::new(1);
+        let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut draining = false;
+        shutdown_tx.send_replace(true);
+        assert!(
+            next_profile_refresh_job(&empty_receiver, &mut shutdown, &mut draining)
+                .await
+                .is_none()
+        );
+        assert!(draining);
+        assert_eq!(
+            empty_queue.try_enqueue(-1001, 41),
+            ProfileRefreshEnqueueResult::Closed
+        );
+
         let (queue, receiver) = ProfileRefreshQueue::new(2);
         assert_eq!(
             queue.try_enqueue(-1001, 42),
             ProfileRefreshEnqueueResult::Queued
         );
-        let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
-        let mut draining = false;
-        shutdown_tx.send_replace(true);
+        receiver.lock().await.close();
+        let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(true);
+        let mut draining = true;
 
         let queued = next_profile_refresh_job(&receiver, &mut shutdown, &mut draining)
             .await
             .expect("shutdown should retain already queued work");
         assert_eq!(queued.user_id, 42);
-        assert!(draining);
         assert_eq!(
             queue.try_enqueue(-1001, 43),
             ProfileRefreshEnqueueResult::Closed
