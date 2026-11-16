@@ -6,6 +6,7 @@
 
 use teloxide::{RequestError, dispatching::UpdateHandler};
 
+#[cfg(feature = "moderation")]
 mod callbacks;
 mod commands;
 mod members;
