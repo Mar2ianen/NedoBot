@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: T20 checkpoint `e9cb355` / draft PR #153. Branch: `codex/refactor-t21-release-closure`; PR metadata is recorded after publication. This change closes the T00–T21 refactor task pack without merging or deploying any PR. It updates developer/release guidance, CI feature-matrix coverage, and the modular-monolith decision record.
+Baseline: T20 checkpoint `e9cb355` / draft PR #153. Implementation commit `fd1c43f`, branch `codex/refactor-t21-release-closure`, draft PR [#154](https://github.com/Mar2ianen/NedoBot/pull/154), stacked on #153. Current-head CI is pending. This change closes the T00–T21 refactor task pack without merging or deploying any PR. It updates developer/release guidance, CI feature-matrix coverage, and the modular-monolith decision record.
 
 ## Changes
 
