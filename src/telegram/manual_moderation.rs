@@ -456,14 +456,18 @@ async fn authorize_actor(
     let Ok(actor_member) = bot.get_chat_member(chat_id, actor_id).await else {
         return None;
     };
-    if !actor_member.kind.is_privileged() {
+    let actor_privileged = actor_member.kind.is_privileged();
+    let actor_can_restrict = actor_member.kind.can_restrict_members();
+    if !actor_rights_allow_action(
+        actor_privileged,
+        actor_can_restrict,
+        false,
+        requires_restrict_right,
+    ) {
         return None;
     }
     if !requires_restrict_right {
         return Some(AuthorizedActor { user_id: actor_id });
-    }
-    if !actor_member.kind.can_restrict_members() {
-        return None;
     }
 
     let Ok(bot_user) = bot.get_me().await else {
@@ -472,8 +476,24 @@ async fn authorize_actor(
     bot.get_chat_member(chat_id, bot_user.id)
         .await
         .ok()
-        .filter(|member| member.kind.can_restrict_members())
+        .filter(|member| {
+            actor_rights_allow_action(
+                actor_privileged,
+                actor_can_restrict,
+                member.kind.can_restrict_members(),
+                requires_restrict_right,
+            )
+        })
         .map(|_| AuthorizedActor { user_id: actor_id })
+}
+
+fn actor_rights_allow_action(
+    actor_is_privileged: bool,
+    actor_can_restrict: bool,
+    bot_can_restrict: bool,
+    requires_restrict_right: bool,
+) -> bool {
+    actor_is_privileged && (!requires_restrict_right || (actor_can_restrict && bot_can_restrict))
 }
 
 async fn resolve_target_ids(
@@ -1431,6 +1451,15 @@ mod tests {
             WARNING_MUTE_DURATION,
             std::time::Duration::from_secs(5 * 24 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn unauthorized_actors_never_pass_the_manual_effect_gate() {
+        assert!(!actor_rights_allow_action(false, true, true, true));
+        assert!(!actor_rights_allow_action(true, false, true, true));
+        assert!(!actor_rights_allow_action(true, true, false, true));
+        assert!(actor_rights_allow_action(true, true, true, true));
+        assert!(actor_rights_allow_action(true, false, false, false));
     }
 
     #[test]

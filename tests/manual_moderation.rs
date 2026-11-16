@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use tg_ai_bot_teloxide::features::manual_moderation::{
     ActionPreparation, BatchClaim, UndoClaim, WarningSelection, add_warning, add_warnings_batch,
     claim_batch, claim_restriction_revokes_batch, claim_undo_action, create_batch,
-    create_batch_with_request, finish_batch, latest_batch, list_actions, mark_action_failed,
-    mark_action_succeeded, prepare_action, prepare_actions_batch, recover_expired_batch_actions,
-    revoke_warnings, start_prepared_action,
+    create_batch_with_request, finish_batch, finish_undo, latest_batch, list_actions,
+    lock_automatic_restriction_restore, mark_action_failed, mark_action_succeeded, prepare_action,
+    prepare_actions_batch, recover_expired_batch_actions, revoke_warnings, start_prepared_action,
+    start_undo_operation,
     types::{BatchRequestSnapshot, CommandKind},
 };
 
@@ -558,6 +559,223 @@ async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_sa
     );
 
     cleanup(&pool, &[user_id, user_id + 1, user_id + 2], &batch_ids).await;
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn captcha_restore_lock_serializes_manual_restriction_and_parallel_undo() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let user_id = Utc::now().timestamp_micros() + 4_000_000_000;
+    let actor_id = user_id + 1;
+    let restore_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "captcha_restore_race",
+    )
+    .await
+    .expect("captcha restore test batch must exist");
+
+    // Captcha restore owns the same per-target transaction lock as manual
+    // moderation. A manual restriction that starts during the Telegram effect
+    // waits, then applies after captcha's passed state has committed.
+    let mut captcha_tx = pool.begin().await.unwrap();
+    assert!(
+        !lock_automatic_restriction_restore(&mut captcha_tx, CHAT_ID, user_id)
+            .await
+            .unwrap()
+    );
+    let manual_pool = pool.clone();
+    let manual_batch_id = restore_batch.id;
+    let manual = tokio::spawn(async move {
+        prepare_actions_batch(
+            &manual_pool,
+            &[ActionPreparation {
+                batch_id: manual_batch_id,
+                chat_id: CHAT_ID,
+                target_user_id: user_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: Some("manual race"),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            }],
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            // Give the spawned transaction time to reach the advisory lock.
+            while !manual.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err(),
+        "manual restriction waits while captcha holds the target lock"
+    );
+    captcha_tx.commit().await.unwrap();
+    let prepared = manual
+        .await
+        .expect("manual action task must not panic")
+        .expect("manual action reservation must complete")
+        .into_iter()
+        .next()
+        .unwrap()
+        .expect("manual action reservation must be created");
+
+    let mut captcha_tx = pool.begin().await.unwrap();
+    assert!(
+        lock_automatic_restriction_restore(&mut captcha_tx, CHAT_ID, user_id)
+            .await
+            .unwrap(),
+        "a pending manual restriction blocks captcha permission restoration"
+    );
+    captcha_tx.commit().await.unwrap();
+    assert!(start_prepared_action(&pool, prepared.id).await.unwrap());
+    let mut captcha_tx = pool.begin().await.unwrap();
+    assert!(
+        lock_automatic_restriction_restore(&mut captcha_tx, CHAT_ID, user_id)
+            .await
+            .unwrap(),
+        "a processing manual restriction also blocks restoration"
+    );
+    captcha_tx.commit().await.unwrap();
+    mark_action_failed(&pool, prepared.id, false, "test cleanup")
+        .await
+        .unwrap();
+
+    // Two reviewers may both observe the same batch, but only one wins its
+    // claim. This is the database boundary before any Telegram action.
+    let reviewer_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .unwrap();
+    let (first_claim, second_claim) = tokio::join!(
+        claim_batch(&pool, reviewer_batch.id),
+        claim_batch(&pool, reviewer_batch.id)
+    );
+    let claims = [first_claim.unwrap(), second_claim.unwrap()];
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|claim| **claim == BatchClaim::Claimed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|claim| **claim == BatchClaim::Busy)
+            .count(),
+        1
+    );
+
+    // An undo and a replacement action contend on the same target lock. The
+    // old restriction remains authoritative until undo is claimed/finalized.
+    let original_action = prepare_action(
+        &pool,
+        ActionPreparation {
+            batch_id: reviewer_batch.id,
+            chat_id: CHAT_ID,
+            target_user_id: user_id + 10,
+            actor_user_id: actor_id,
+            action: "mute",
+            reason: None,
+            expires_at: Some(Utc::now() + Duration::days(1)),
+            automatic: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    mark_action_succeeded(&pool, original_action).await.unwrap();
+    let undo_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "undo",
+    )
+    .await
+    .unwrap();
+    let (replacement, undo) = tokio::join!(
+        prepare_action(
+            &pool,
+            ActionPreparation {
+                batch_id: undo_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id: user_id + 10,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: None,
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            }
+        ),
+        claim_undo_action(
+            &pool,
+            undo_batch.id,
+            reviewer_batch.id,
+            original_action,
+            actor_id
+        )
+    );
+    let undo = undo.unwrap();
+    match (replacement, undo) {
+        (Ok(Some(replacement)), UndoClaim::Conflict) => {
+            mark_action_failed(&pool, replacement, false, "concurrent undo won")
+                .await
+                .unwrap();
+            assert_eq!(
+                claim_undo_action(
+                    &pool,
+                    undo_batch.id,
+                    reviewer_batch.id,
+                    original_action,
+                    actor_id
+                )
+                .await
+                .unwrap(),
+                UndoClaim::RestrictionClaimed
+            );
+        }
+        (Err(_), UndoClaim::RestrictionClaimed) => {}
+        result => panic!("parallel action/undo must serialize safely: {result:?}"),
+    }
+    assert!(
+        start_undo_operation(&pool, undo_batch.id, original_action)
+            .await
+            .unwrap()
+    );
+    finish_undo(
+        &pool,
+        undo_batch.id,
+        original_action,
+        actor_id,
+        true,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    cleanup(
+        &pool,
+        &[user_id, user_id + 10],
+        &[restore_batch.id, reviewer_batch.id, undo_batch.id],
+    )
+    .await;
 }
 
 #[tokio::test]
