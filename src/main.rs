@@ -22,7 +22,7 @@ use db::{build_pool, migrate};
 use features::chat_retrieval::process_next_embedding_batch;
 #[cfg(feature = "auto-comment")]
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
-use features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
+use features::ingest::{IngressOutcome, ingest_message, is_managed_chat, managed_chat_allows};
 #[cfg(feature = "moderation")]
 use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
 use features::jobs::policy::POST_HISTORY_POLL;
@@ -485,11 +485,11 @@ async fn handle_message(
     if !msg.chat.is_private() {
         maybe_delete_join_leave_message(&bot, &msg, &state.config).await;
         match ingest_message(&state.pool, &msg, &state.config).await {
-            Ok(true) => message_ingested = true,
+            Ok(IngressOutcome::Persisted(_)) => message_ingested = true,
             // Ask activation is independently gated by ask_enabled and
             // chats.<key>.ask, so ingest=false must not suppress an explicit
             // mention or direct reply trigger.
-            Ok(false) => {}
+            Ok(IngressOutcome::Ignored { .. }) => {}
             Err(err) => {
                 tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
                 return Ok(());
@@ -947,7 +947,7 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
         return Ok(());
     }
     match save_edited_telegram_message(&state.pool, &msg, &state.config).await {
-        Ok(()) => {
+        Ok(_) => {
             #[cfg(feature = "moderation")]
             if state
                 .config
