@@ -636,7 +636,7 @@ mod tests {
     use crate::features::voice::types::AsrSegment;
     use axum::{Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
 
-    type CapturedTelegramRequest = Arc<Mutex<Option<(String, HashMap<String, String>)>>>;
+    type CapturedTelegramRequest = Arc<Mutex<Option<HashMap<String, String>>>>;
 
     fn transcript(text: &str, segments: Vec<&str>) -> AsrTranscript {
         AsrTranscript {
@@ -718,7 +718,6 @@ mod tests {
 
     async fn fake_telegram_edit(
         State(captured): State<CapturedTelegramRequest>,
-        axum::extract::Path(path): axum::extract::Path<String>,
         headers: HeaderMap,
         body: Bytes,
     ) -> axum::Json<serde_json::Value> {
@@ -741,7 +740,7 @@ mod tests {
         } else {
             url::form_urlencoded::parse(&body).into_owned().collect()
         };
-        *captured.lock().expect("captured request lock") = Some((path, payload));
+        *captured.lock().expect("captured request lock") = Some(payload);
         axum::Json(serde_json::json!({
             "ok": true,
             "result": {
@@ -787,8 +786,6 @@ mod tests {
             .expect("captured request lock")
             .take()
             .expect("transcript delivery should call Telegram");
-        assert!(payload.0.ends_with("editMessageText"));
-        let payload = payload.1;
         assert_eq!(payload.get("chat_id").map(String::as_str), Some("-1001"));
         assert_eq!(payload.get("message_id").map(String::as_str), Some("27"));
         assert_eq!(
