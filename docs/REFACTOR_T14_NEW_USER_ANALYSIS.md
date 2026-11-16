@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline SHA: `15be8c1a51236c0ee3fd1d35835345d5d80fca1b` (T13 verification checkpoint). Branch: `codex/refactor-t14-new-user-analysis-decomposition`; characterization commit `1eebce4`; implementation commit `7fcbc756f684850a51361eac1fc9390fcd91098f`. Draft PR #147 will be stacked on T13 PR #146.
+Baseline SHA: `15be8c1a51236c0ee3fd1d35835345d5d80fca1b` (T13 verification checkpoint). Branch: `codex/refactor-t14-new-user-analysis-decomposition`; characterization commit `1eebce4`; implementation commit `7fcbc756f684850a51361eac1fc9390fcd91098f`. Draft PR [#147](https://github.com/Mar2ianen/NedoBot/pull/147) is stacked on T13 PR #146.
 
 ## Changes
 
