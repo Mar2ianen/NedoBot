@@ -634,9 +634,9 @@ mod tests {
 
     use super::*;
     use crate::features::voice::types::AsrSegment;
-    use axum::{Form, Router, extract::State, routing::post};
+    use axum::{Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
 
-    type CapturedTelegramRequest = Arc<Mutex<Option<HashMap<String, String>>>>;
+    type CapturedTelegramRequest = Arc<Mutex<Option<(String, HashMap<String, String>)>>>;
 
     fn transcript(text: &str, segments: Vec<&str>) -> AsrTranscript {
         AsrTranscript {
@@ -718,9 +718,30 @@ mod tests {
 
     async fn fake_telegram_edit(
         State(captured): State<CapturedTelegramRequest>,
-        Form(payload): Form<HashMap<String, String>>,
+        axum::extract::Path(path): axum::extract::Path<String>,
+        headers: HeaderMap,
+        body: Bytes,
     ) -> axum::Json<serde_json::Value> {
-        *captured.lock().expect("captured request lock") = Some(payload);
+        let payload = if headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+        {
+            serde_json::from_slice::<HashMap<String, serde_json::Value>>(&body)
+                .expect("Telegram JSON request should be valid")
+                .into_iter()
+                .map(|(key, value)| {
+                    let value = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    (key, value)
+                })
+                .collect()
+        } else {
+            url::form_urlencoded::parse(&body).into_owned().collect()
+        };
+        *captured.lock().expect("captured request lock") = Some((path, payload));
         axum::Json(serde_json::json!({
             "ok": true,
             "result": {
@@ -766,6 +787,8 @@ mod tests {
             .expect("captured request lock")
             .take()
             .expect("transcript delivery should call Telegram");
+        assert!(payload.0.ends_with("/editMessageText"));
+        let payload = payload.1;
         assert_eq!(payload.get("chat_id").map(String::as_str), Some("-1001"));
         assert_eq!(payload.get("message_id").map(String::as_str), Some("27"));
         assert_eq!(
