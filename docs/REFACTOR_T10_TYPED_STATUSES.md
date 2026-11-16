@@ -24,7 +24,11 @@ Local:
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
 - The filtered test build was started, then stopped before tests ran because the home filesystem had only 3.6 GB free and was filling during a fresh test-profile dependency build. No test result is claimed for that interrupted local command.
 
-CI is expected to run the full workspace and PostgreSQL migration/integration suite for this PR. Final test totals and run links will be added after those checks complete.
+Both implementation-head CI runs passed:
+
+- Workspace test suite: **681 passed, 0 failed, 13 ignored** in each run.
+- Both runs also passed formatting, Clippy, migration application, and the configured PostgreSQL integrations: URL evidence/privacy/lock/inventory (5 cases), lifecycle (1), RMCP (2), and manual moderation (3).
+- Runs: [#43805618261](https://github.com/Mar2ianen/NedoBot/actions/runs/43805618261) and [#43805643436](https://github.com/Mar2ianen/NedoBot/actions/runs/43805643436).
 
 ## Invariants and limitations
 
@@ -36,4 +40,4 @@ CI is expected to run the full workspace and PostgreSQL migration/integration su
 
 ## Review state
 
-PR number and CI results pending.
+PR #143 is open and draft, stacked on T09 PR #142. Implementation-head CI passed 2/2. A documentation checkpoint will run before this slice is recorded complete.
