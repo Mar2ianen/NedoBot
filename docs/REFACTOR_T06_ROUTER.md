@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`; this task is stacked on T05 branch `codex/refactor-t05-ingress-effects`, head `0e00edb`. Work branch: `codex/refactor-t06-router`.
+Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`; this task is stacked on T05 branch `codex/refactor-t05-ingress-effects`, head `0e00edb`. Work branch: `codex/refactor-t06-router`; draft [PR #139](https://github.com/Mar2ianen/NedoBot/pull/139), implementation head `97740ea`.
 
 ## Changes
 
@@ -19,4 +19,4 @@ Local `cargo fmt --all -- --check`, `git diff --check`, `CARGO_TARGET_DIR=../../
 
 ## Review state
 
-Focused stacked draft PR; no merge or deployment. Final commit, PR number, and CI results are added after publication.
+Focused stacked draft PR; no merge or deployment. Local checks passed; GitHub CI results will be recorded after both workflows finish.
