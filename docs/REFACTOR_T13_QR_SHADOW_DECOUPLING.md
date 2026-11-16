@@ -21,8 +21,12 @@ Local commands:
 - `CARGO_TARGET_DIR=<shared T11 target> cargo check --workspace --all-targets --locked` — passed.
 - `CARGO_TARGET_DIR=<shared T11 target> cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
 - `CARGO_TARGET_DIR=<shared T11 target> cargo test --lib features::qr_url::tests::timed_out_decode_keeps_the_single_cpu_slot_until_blocking_work_finishes --locked -- --exact` — 1 passed, 0 failed, 616 filtered.
+- `./scripts/dev_db.sh reset-test`, then `cargo run --quiet --bin migrate` for both named disposable test databases — passed.
+- `TEST_DATABASE_URL=... cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable --locked -- --ignored --exact` — 1 passed, 0 failed, 616 filtered. This includes outbox deduplication, fingerprint-only payload, retry after synthetic refresh failure, QR completion, and edited-media rejection.
+- `TEST_DATABASE_URL=... cargo test --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock --locked -- --ignored --exact` — 1 passed, 0 failed, 616 filtered.
+- `TEST_DATABASE_URL=... cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state --locked -- --ignored --exact` — 1 passed, 0 failed, 616 filtered.
 
-The existing disposable-PostgreSQL URL-evidence integration test now also checks outbox deduplication, redacted fingerprint-only payload, retry state after a synthetic refresh failure, successful QR completion, and rejection of edited media. Existing PostgreSQL tests cover cancellation while holding the URL-shadow advisory lock and clearing positive shadow state after source removal. CI run [#43822719597](https://github.com/Mar2ianen/NedoBot/actions/runs/43822719597) is in progress; its result will be recorded here after completion.
+The DB-backed cases ran against the local `tg_ai_bot_test` database in the dedicated dev container; no production database was used. CI run [#43822719597](https://github.com/Mar2ianen/NedoBot/actions/runs/43822719597) is in progress; its result will be recorded here after completion.
 
 ## Invariants and limitations
 
@@ -30,7 +34,7 @@ The existing disposable-PostgreSQL URL-evidence integration test now also checks
 - Stale message media invalidates the QR lease and cannot materialize evidence or enqueue a refresh.
 - Log fields for refresh jobs are numeric job/attempt identifiers and static error categories; raw URL targets are not stored in the outbox or emitted in logs.
 - `spawn_blocking` itself cannot be forcibly stopped. The one-slot permit bounds active detached decoder work; shutdown may wait for the currently running blocking decoder to return.
-- PostgreSQL fault-injection behavior and migration application are delegated to the configured PR CI run; no production DB, live Telegram API, merge, or deployment was used.
+- No live Telegram API, merge, or deployment was used.
 
 ## API and schema changes
 
