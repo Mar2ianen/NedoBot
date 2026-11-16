@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`. This task is stacked on T06 branch `codex/refactor-t06-router`, current head `0121f91`. Work branch: `codex/refactor-t07-readonly-commands`.
+Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`. This task is stacked on T06 branch `codex/refactor-t06-router`, current head `0121f91`. Work branch: `codex/refactor-t07-readonly-commands`; draft [PR #140](https://github.com/Mar2ianen/NedoBot/pull/140), implementation head `2a82eba`.
 
 ## Changes
 
@@ -28,4 +28,4 @@ The full test binary was not rerun locally due the already observed long rustc c
 
 ## Review state
 
-No merge or deployment. PR and CI links will be recorded after publication.
+No merge or deployment. Local checks passed; both PR CI workflows are pending.
