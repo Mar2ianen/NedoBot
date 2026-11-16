@@ -189,19 +189,10 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
             url_feed.as_deref(),
         )
         .await?;
-    let url_shadow = teloxide_antispam::url_shadow::analyze_url_shadow(
-        teloxide_antispam::url_shadow::UrlShadowEvidence {
-            unique_external_url_count: url_relationship_observation["unique_external_url_count"]
-                .as_u64()
-                .unwrap_or_default()
-                .min(u16::MAX as u64) as u16,
-            promotional_content: deterministic_campaign_from_features(&features).is_some()
-                || features.personal_channel_has_adult_links,
-            verified_threat_feed_hit: url_relationship_observation["verified_threat_feed_hit"]
-                .as_bool()
-                .unwrap_or(false),
-            ..teloxide_antispam::url_shadow::UrlShadowEvidence::default()
-        },
+    let url_shadow = crate::features::url_shadow_projection::UrlShadowProjection::project(
+        &url_relationship_observation,
+        deterministic_campaign_from_features(&features).is_some()
+            || features.personal_channel_has_adult_links,
     );
     // Always materialize the current URL state, including an empty/zero result.
     // Otherwise a previously positive observation would survive after a user
@@ -440,18 +431,9 @@ async fn refresh_url_shadow_observation_from_links_locked(
         deterministic_campaign_from_features(&features).is_some()
             || features.personal_channel_has_adult_links
     });
-    let analysis = teloxide_antispam::url_shadow::analyze_url_shadow(
-        teloxide_antispam::url_shadow::UrlShadowEvidence {
-            unique_external_url_count: relationships["unique_external_url_count"]
-                .as_u64()
-                .unwrap_or_default()
-                .min(u16::MAX as u64) as u16,
-            promotional_content,
-            verified_threat_feed_hit: relationships["verified_threat_feed_hit"]
-                .as_bool()
-                .unwrap_or(false),
-            ..teloxide_antispam::url_shadow::UrlShadowEvidence::default()
-        },
+    let analysis = crate::features::url_shadow_projection::UrlShadowProjection::project(
+        &relationships,
+        promotional_content,
     );
     let source_fingerprint = FingerprintCalculator::digest(&serde_json::to_vec(&(
         "url-shadow-links-v2",

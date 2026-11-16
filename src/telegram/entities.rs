@@ -150,10 +150,7 @@ pub fn message_has_links(msg: &Message) -> bool {
 
 /// Извлекает типизированные цели URL. Упоминания и хештеги не считаются URL.
 pub fn message_url_targets(msg: &Message) -> Vec<teloxide_url::Found> {
-    teloxide_url::adapter::extract_from_message(msg)
-        .into_iter()
-        .filter(|target| matches!(target.kind, teloxide_url::Kind::Url))
-        .collect()
+    super::url_targets::extract_message_targets(msg)
 }
 
 /// Диапазон Telegram entity: offsets/length заданы в UTF-16, не UTF-8 байтах.
