@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a` (the refactor stack runs on top of T00–T04). Branch: `codex/refactor-t05-ingress-effects`; PR and final head are recorded here after publication.
+Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a` (the refactor stack runs on top of T00–T04). Branch: `codex/refactor-t05-ingress-effects`; PR [#138](https://github.com/Mar2ianen/NedoBot/pull/138), implementation head `afa2a2b` (draft, stacked on #137).
 
 This slice makes Telegram message projection pure and visible before persistence, and gives ingress a typed result. It does not change moderation policy, SQL schema, transaction boundaries, or externally configured chat behavior.
 
@@ -23,8 +23,15 @@ This slice makes Telegram message projection pure and visible before persistence
 
 ## Verification
 
-Commands and exact counts are updated after the final local test run. PostgreSQL verification used `./scripts/test.sh`, which recreates only local disposable `tg_ai_bot_test` and `tg_ai_bot_test_b` databases. No production resource was accessed.
+Verified locally:
+
+- `./scripts/test.sh` — completed successfully using only disposable local `tg_ai_bot_test` and `tg_ai_bot_test_b`; the PostgreSQL lifecycle test containing the new ingress characterization passed, as did the explicit URL evidence, URL shadow, MCP, and manual moderation integration cases.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
+- `cargo check --workspace --all-targets --no-default-features --locked` — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+
+The full local `cargo test --workspace --all-targets --locked --quiet` rerun was stopped after rustc spent over ten minutes blocked while writing to the nearly full local filesystem. The clean GitHub workflow runs then completed the entire suite: **667 passed, 0 failed, 13 ignored** in each run. PostgreSQL-specific workflow steps passed, including the new migration lifecycle characterization (**1 passed**), URL evidence/shadow checks, RMCP (**2 passed**), and manual moderation (**3 passed**). CI runs [#43790150939](https://github.com/Mar2ianen/NedoBot/actions/runs/43790150939) and [#43790165813](https://github.com/Mar2ianen/NedoBot/actions/runs/43790165813) both passed. No production resource was accessed.
 
 ## Review state
 
-Focused draft PR; no merge or deployment. CI results and any remaining limitations are added here after GitHub checks finish.
+Focused draft PR; no merge or deployment. CI is green on `afa2a2b`. The only verification limitation is that the redundant full local workspace test invocation did not finish; the full suite and DB tests passed in both clean CI environments.
