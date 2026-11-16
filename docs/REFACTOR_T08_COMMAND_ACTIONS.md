@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`. Stacked on T07 PR #140, branch `codex/refactor-t07-readonly-commands`. Work branch: `codex/refactor-t08-command-actions`. This report will be amended with the PR head and CI runs after opening the draft PR.
+Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`. Stacked on T07 PR #140, branch `codex/refactor-t07-readonly-commands`. Work branch: `codex/refactor-t08-command-actions`, implementation commit `0200bd6`. Draft PR: [#141](https://github.com/Mar2ianen/NedoBot/pull/141).
 
 ## Changes
 
@@ -24,7 +24,7 @@ Local commands:
 - `cargo test --locked --lib telegram::command_handler::actions::tests -- --nocapture` — 2 passed, 0 failed, 596 filtered out.
 - `git diff --check` — passed.
 
-The test additions cover human, bot, anonymous-chat and missing actors, plus valid same-chat and malformed/cross-chat reply projection. Full workspace tests and the existing PostgreSQL/manual-moderation/Ask integration suites are delegated to the stacked PR CI; the local run is limited to the two new projection tests.
+The test additions cover human, bot, anonymous-chat and missing actors, plus valid same-chat and malformed/cross-chat reply projection. Both implementation-head CI runs passed: workspace **670 passed, 0 failed, 13 ignored**; PostgreSQL checks included lifecycle (1), RMCP (2), manual moderation (3), and URL evidence/privacy/lock integration tests. Runs: [#43797909102](https://github.com/Mar2ianen/NedoBot/actions/runs/43797909102) and [#43797934074](https://github.com/Mar2ianen/NedoBot/actions/runs/43797934074). A documentation-only checkpoint will run CI again.
 
 ## Invariants and limitations
 
@@ -33,3 +33,7 @@ The test additions cover human, bot, anonymous-chat and missing actors, plus val
 - This is an adapter extraction, not a full platform-independent command model. Conversation scope resolution and each command's access policy remain in the existing use cases.
 - The pre-existing `/usernote` behavior when no valid replying user is available is retained (it follows the existing chat-note fallback); this task does not redesign note syntax.
 - No live bot, production database, credentials, deployment, or merge was used.
+
+## Review state
+
+PR #141 remains draft and open, stacked on #140. The implementation-head CI runs are green. No merge or deployment was performed.
