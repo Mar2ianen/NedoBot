@@ -511,7 +511,50 @@ mod tests {
             .supervise_until(std::future::pending::<()>())
             .await;
 
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("decision_audit"),
+            "unexpected error: {error}"
+        );
+        assert!(sibling_stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unexpected_worker_completion_fails_foreground_supervision() {
+        let mut supervisor = WorkerSupervisor::new();
+        let sibling_stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_stopped_by_worker = Arc::clone(&sibling_stopped);
+        supervisor.spawn(WorkerId::ProfileRefresh, move |mut shutdown| async move {
+            let _ = shutdown.changed().await;
+            sibling_stopped_by_worker.store(true, Ordering::SeqCst);
+        });
+        supervisor.spawn(WorkerId::DecisionAudit, |_| async {});
+
+        let result = supervisor
+            .supervise_until(std::future::pending::<()>())
+            .await;
+
         assert!(result.unwrap_err().to_string().contains("decision_audit"));
         assert!(sibling_stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unexpected_worker_abort_fails_foreground_supervision() {
+        let mut supervisor = WorkerSupervisor::new();
+        supervisor.spawn(WorkerId::DecisionAudit, |_| async {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        supervisor.abort_all();
+
+        let result = supervisor
+            .supervise_until(std::future::pending::<()>())
+            .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("decision_audit"),
+            "unexpected error: {error}"
+        );
     }
 }
