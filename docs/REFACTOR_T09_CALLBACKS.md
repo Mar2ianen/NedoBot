@@ -24,7 +24,7 @@ Local:
 - `cargo test --locked --lib telegram::callbacks::tests -- --nocapture` — 2 passed, 0 failed, 598 filtered out.
 - `git diff --check` — passed.
 
-The full local `cargo test --workspace --all-targets --locked` build was attempted but stopped after about nine minutes while Rust compiled the large library test target and two binary targets; the home filesystem reached 100% use with 2.2 GB free. It produced no test result and was stopped to recover build space. Full workspace and PostgreSQL tests are therefore delegated to stacked PR CI. Existing integration coverage exercises wrong captcha actor/chat, expired/stale challenge, duplicate report resolution, and manual moderation policy. No callback BotPort/fake-requester abstraction exists in the current code; introducing that outbound port is deferred to the dedicated Telegram delivery-port task rather than adding a new abstraction here.
+The full local `cargo test --workspace --all-targets --locked` build was attempted but stopped after about nine minutes while Rust compiled the large library test target and two binary targets; the home filesystem reached 100% use with 2.2 GB free. It produced no test result and was stopped to recover build space. Both implementation/report-head CI runs passed: workspace **672 passed, 0 failed, 13 ignored**; PostgreSQL integrations included lifecycle (1), RMCP (2), manual moderation (3), and URL evidence/privacy/lock cases. Runs: [#43801770446](https://github.com/Mar2ianen/NedoBot/actions/runs/43801770446) and [#43801777022](https://github.com/Mar2ianen/NedoBot/actions/runs/43801777022). Existing integration coverage exercises wrong captcha actor/chat, expired/stale challenge, duplicate report resolution, and manual moderation policy. No callback BotPort/fake-requester abstraction exists in the current code; introducing that outbound port is deferred to the dedicated Telegram delivery-port task rather than adding a new abstraction here.
 
 ## Invariants and limitations
 
@@ -36,4 +36,4 @@ The full local `cargo test --workspace --all-targets --locked` build was attempt
 
 ## Review state
 
-PR #142 is open and draft. CI is running on the implementation/report head. No merge or deployment was performed.
+PR #142 is open and draft. Both implementation/report-head CI runs passed. No merge or deployment was performed.
