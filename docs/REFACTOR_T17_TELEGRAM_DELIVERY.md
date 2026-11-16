@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline SHA: `ea93b62cad3327e18323273fe21b92bf750133fc` (T16 documentation checkpoint). Branch: `codex/refactor-t17-telegram-delivery`, stacked on T16 / PR #149. No new dependencies, migrations, schema changes, or teloxide fork changes.
+Baseline SHA: `ea93b62cad3327e18323273fe21b92bf750133fc` (T16 documentation checkpoint). Branch: `codex/refactor-t17-telegram-delivery`, commit `302182191e9918714a9de947eac76855c31fcd40`, draft PR [#150](https://github.com/Mar2ianen/NedoBot/pull/150), stacked on T16 / PR #149. No new dependencies, migrations, schema changes, or teloxide fork changes.
 
 ## Changes
 
