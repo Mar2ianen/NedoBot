@@ -26,7 +26,7 @@ Local commands:
 - `TEST_DATABASE_URL=... cargo test --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock --locked -- --ignored --exact` — 1 passed, 0 failed, 616 filtered.
 - `TEST_DATABASE_URL=... cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state --locked -- --ignored --exact` — 1 passed, 0 failed, 616 filtered.
 
-The DB-backed cases ran against the local `tg_ai_bot_test` database in the dedicated dev container; no production database was used. CI run [#43822719597](https://github.com/Mar2ianen/NedoBot/actions/runs/43822719597) is in progress; its result will be recorded here after completion.
+The DB-backed cases ran against the local `tg_ai_bot_test` database in the dedicated dev container; no production database was used. CI run [#43822719597](https://github.com/Mar2ianen/NedoBot/actions/runs/43822719597) passed on implementation commit `837f71c`: 611 passed, 0 failed, 6 ignored; Clippy, migrations, URL evidence/privacy/lock, URL inventory, PostgreSQL migrations, RMCP, and manual moderation steps all passed.
 
 ## Invariants and limitations
 
