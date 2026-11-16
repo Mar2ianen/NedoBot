@@ -1859,6 +1859,43 @@ mod tests {
     }
 
     #[test]
+    fn ingress_scope_accepts_only_registered_chats_and_respects_the_ingest_gate() {
+        let mut config = config();
+        let chat_id = -1002;
+        let unknown_chat_id = -1003;
+
+        assert!(crate::features::ingest::is_managed_chat(&config, chat_id));
+        assert!(crate::features::ingest::managed_chat_allows(
+            &config,
+            chat_id,
+            |chat| chat.ingest
+        ));
+        assert!(!crate::features::ingest::is_managed_chat(
+            &config,
+            unknown_chat_id
+        ));
+        assert!(!crate::features::ingest::managed_chat_allows(
+            &config,
+            unknown_chat_id,
+            |chat| chat.ingest
+        ));
+
+        config
+            .community
+            .chats
+            .get_mut("main")
+            .expect("fixture registers its primary chat")
+            .ingest = false;
+
+        assert!(crate::features::ingest::is_managed_chat(&config, chat_id));
+        assert!(!crate::features::ingest::managed_chat_allows(
+            &config,
+            chat_id,
+            |chat| chat.ingest
+        ));
+    }
+
+    #[test]
     fn committed_production_profile_has_valid_community_config() {
         let profiles = LlmProfiles::from_toml(include_str!(
             "../config/llm_profiles.toml.production.example"

@@ -25,6 +25,21 @@ mod top_word_tests {
             Ok(Command::Forget(args)) if !args.is_empty()
         ));
     }
+
+    #[cfg(feature = "manual-moderation")]
+    #[test]
+    fn manual_moderation_command_is_registered_when_its_feature_is_compiled() {
+        assert!(matches!(
+            Command::parse("/ban 123", "nedobot"),
+            Ok(Command::Ban(_))
+        ));
+    }
+
+    #[cfg(not(feature = "manual-moderation"))]
+    #[test]
+    fn manual_moderation_command_is_not_registered_without_its_feature() {
+        assert!(Command::parse("/ban 123", "nedobot").is_err());
+    }
 }
 
 #[derive(BotCommands, Clone)]
