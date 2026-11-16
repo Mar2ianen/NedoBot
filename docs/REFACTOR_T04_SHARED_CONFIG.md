@@ -3,7 +3,7 @@
 | Field | Result |
 |---|---|
 | Baseline | `main` SHA `7b8815bbff80c4665b64076a063f5f4919e5465a`; stacked after T00/#133, T01/#134, T02/#135 and T03/#136 |
-| Branch / PR | `codex/refactor-t04-shared-config`; PR pending creation |
+| Branch / PR | `codex/refactor-t04-shared-config`; [draft PR #137](https://github.com/Mar2ianen/NedoBot/pull/137), head `4efe969f8d3a13e237d284ec1f67df491265e206`, stacked on #136 |
 | Rust API changes | `AppState.config` is now `Arc<Config>`; voice runtime settings are grouped as `Config.voice: VoiceConfig`. Worker startup APIs share the same `Arc<Config>`. |
 | Config compatibility | `RuntimeSettings` fields and serialized TOML/env names remain unchanged. `Config::from_env` maps the same parsed values into the internal `VoiceConfig`; community and secondary-chat runtime gates are unchanged. |
 | Dependencies / SQL | No dependency, migration, SQL or production configuration change. |
