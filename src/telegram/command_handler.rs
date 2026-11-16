@@ -31,13 +31,9 @@ use crate::features::first_comment::clean::{clean_post_for_llm, should_generate_
 #[cfg(feature = "auto-comment")]
 use crate::features::first_comment::render::build_comment_html;
 use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
-#[cfg(feature = "manual-moderation")]
-use crate::features::manual_moderation::types::CommandKind as ManualCommandKind;
 use crate::features::stats::report::send_user_stats;
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
-#[cfg(feature = "voice")]
-use crate::features::voice::pipeline::transcribe_reply;
 #[cfg(feature = "moderation")]
 use crate::features::{
     labels,
@@ -51,14 +47,13 @@ use crate::telegram::commands::Command;
 use crate::telegram::custom_emoji::send_custom_emoji_ids;
 #[cfg(feature = "ask")]
 use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
-#[cfg(feature = "manual-moderation")]
-use crate::telegram::manual_moderation as manual_moderation_frontend;
 #[cfg(feature = "ask")]
 use crate::telegram::media::{download_ask_sandbox_document, download_largest_photo_base64};
 #[cfg(feature = "ask")]
 use crate::telegram::render::escape_html;
 use crate::telegram::service_messages::{self, MessageAudience};
 
+mod actions;
 mod read_only;
 
 pub async fn handle_command(
@@ -111,6 +106,9 @@ pub async fn handle_command(
     let Some(cmd) = read_only::dispatch(&bot, &msg, &state, cmd).await? else {
         return Ok(());
     };
+    let Some(cmd) = actions::dispatch(&bot, &msg, &state, cmd).await? else {
+        return Ok(());
+    };
 
     match cmd {
         Command::EmojiIds => {
@@ -133,118 +131,7 @@ pub async fn handle_command(
             let text = build_comment_html(&clean_post, config);
             send_command_html(&bot, &msg, &state, text).await?;
         }
-        #[cfg(feature = "voice")]
-        Command::Transcribe => {
-            transcribe_reply(&bot, &msg, &state).await.map_err(|err| {
-                tracing::error!(%err, "manual voice transcription command failed");
-                teloxide::RequestError::Io(
-                    std::io::Error::other("manual voice transcription failed").into(),
-                )
-            })?;
-        }
-        #[cfg(feature = "ask")]
-        Command::Ask(question) => {
-            handle_ask_command(&bot, &msg, &state, &question).await?;
-        }
-        #[cfg(feature = "ask")]
-        Command::Forget(args) => {
-            if args.trim().is_empty() {
-                handle_forget_command(&bot, &msg, &state).await?;
-            }
-        }
-        #[cfg(feature = "ask")]
-        Command::ChatNote(note) => {
-            handle_note_command(&bot, &msg, &state, &note, None).await?;
-        }
-        #[cfg(feature = "ask")]
-        Command::UserNote(note) => {
-            handle_note_command(&bot, &msg, &state, &note, reply_user_id(&msg)).await?;
-        }
-        #[cfg(feature = "moderation")]
-        Command::Report(reason) => {
-            handle_report_command(&bot, &msg, &state, &reason).await?;
-        }
-        #[cfg(feature = "moderation")]
-        Command::Notspam(reason) => {
-            handle_notspam_command(&bot, &msg, &state, &reason).await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Mute(args) => {
-            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Mute, &args)
-                .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Ban(args) => {
-            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Ban, &args)
-                .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Warn(args) => {
-            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Warn, &args)
-                .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Unmute(args) => {
-            manual_moderation_frontend::handle(
-                &bot,
-                &msg,
-                &state,
-                ManualCommandKind::Unmute,
-                &args,
-            )
-            .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Unban(args) => {
-            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Unban, &args)
-                .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Unwarn(args) => {
-            manual_moderation_frontend::handle(
-                &bot,
-                &msg,
-                &state,
-                ManualCommandKind::Unwarn,
-                &args,
-            )
-            .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Warns(args) => {
-            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Warns, &args)
-                .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Modlog(args) => {
-            manual_moderation_frontend::handle(
-                &bot,
-                &msg,
-                &state,
-                ManualCommandKind::Modlog,
-                &args,
-            )
-            .await?;
-        }
-        #[cfg(feature = "manual-moderation")]
-        Command::Undo => {
-            manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Undo, "")
-                .await?;
-        }
-        Command::Help
-        | Command::Ping
-        | Command::Db
-        | Command::Memory
-        | Command::StatsDay(_)
-        | Command::StatsWeek(_)
-        | Command::StatsMonth(_)
-        | Command::Status(_)
-        | Command::TopMsg(_)
-        | Command::TopWord(_)
-        | Command::TopReact(_)
-        | Command::BottomMsg(_)
-        | Command::UserStats(_)
-        | Command::UserStatus(_) => unreachable!("read-only commands are dispatched above"),
+        _ => unreachable!("all command routes were handled by the read-only or action adapters"),
     }
 
     Ok(())
@@ -455,11 +342,11 @@ async fn handle_notspam_command(
     msg: &Message,
     state: &AppState,
     reason: &str,
+    actor: actions::ActorIdentity,
 ) -> ResponseResult<()> {
-    let Some(author) = msg.from.as_ref() else {
+    let Some(author_id) = actor.telegram_user_id() else {
         return Ok(());
     };
-    let author_id = author.id.0 as i64;
     let is_reviewer = state.config.reviewer_user_ids().contains(&author_id)
         || state.config.owner_telegram_id == Some(author_id);
     if !is_reviewer {

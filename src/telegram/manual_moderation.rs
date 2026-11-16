@@ -40,6 +40,13 @@ struct BatchContext<'a> {
     actor_id: i64,
 }
 
+/// A Telegram actor whose moderator status and operation-specific rights were
+/// verified against the Bot API for this command's chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedActor {
+    user_id: UserId,
+}
+
 pub async fn handle(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
@@ -64,11 +71,13 @@ pub async fn handle(
         .await?;
         return Ok(());
     };
-    let actor_id = actor.id.0 as i64;
-    if !authorize_actor(bot, msg.chat.id, actor.id, kind.requires_restrict_right()).await {
+    let Some(actor) =
+        authorize_actor(bot, msg.chat.id, actor.id, kind.requires_restrict_right()).await
+    else {
         send_reply(bot, msg, state, "Недостаточно прав: проверь права администратора и разрешение бота ограничивать участников.").await?;
         return Ok(());
-    }
+    };
+    let actor_id = actor.user_id.0 as i64;
 
     if matches!(kind, CommandKind::Warns | CommandKind::Modlog) {
         let targets = match resolve_target_ids(&state.pool, msg, &parsed).await {
@@ -443,26 +452,28 @@ async fn authorize_actor(
     chat_id: ChatId,
     actor_id: UserId,
     requires_restrict_right: bool,
-) -> bool {
+) -> Option<AuthorizedActor> {
     let Ok(actor_member) = bot.get_chat_member(chat_id, actor_id).await else {
-        return false;
+        return None;
     };
     if !actor_member.kind.is_privileged() {
-        return false;
+        return None;
     }
     if !requires_restrict_right {
-        return true;
+        return Some(AuthorizedActor { user_id: actor_id });
     }
     if !actor_member.kind.can_restrict_members() {
-        return false;
+        return None;
     }
 
     let Ok(bot_user) = bot.get_me().await else {
-        return false;
+        return None;
     };
     bot.get_chat_member(chat_id, bot_user.id)
         .await
-        .is_ok_and(|member| member.kind.can_restrict_members())
+        .ok()
+        .filter(|member| member.kind.can_restrict_members())
+        .map(|_| AuthorizedActor { user_id: actor_id })
 }
 
 async fn resolve_target_ids(
