@@ -33,11 +33,7 @@ use crate::features::first_comment::render::build_comment_html;
 use crate::features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
 #[cfg(feature = "manual-moderation")]
 use crate::features::manual_moderation::types::CommandKind as ManualCommandKind;
-use crate::features::memory::report::send_memory_notes;
-use crate::features::stats::report::{
-    send_bottom_messages, send_chat_stats, send_top_messages, send_top_reacted, send_top_word,
-    send_user_stats,
-};
+use crate::features::stats::report::send_user_stats;
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{StatsPeriod, StatsRender};
 #[cfg(feature = "voice")]
@@ -59,8 +55,11 @@ use crate::telegram::html::TELEGRAM_TEXT_LIMIT;
 use crate::telegram::manual_moderation as manual_moderation_frontend;
 #[cfg(feature = "ask")]
 use crate::telegram::media::{download_ask_sandbox_document, download_largest_photo_base64};
+#[cfg(feature = "ask")]
 use crate::telegram::render::escape_html;
 use crate::telegram::service_messages::{self, MessageAudience};
+
+mod read_only;
 
 pub async fn handle_command(
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
@@ -70,8 +69,6 @@ pub async fn handle_command(
 ) -> ResponseResult<()> {
     let pool = &state.pool;
     let config = &state.config;
-    let strings = StatsStrings::for_locale(&config.stats_locale);
-
     if !msg.chat.is_private() && !is_managed_chat(config, msg.chat.id.0) {
         tracing::debug!(chat_id = msg.chat.id.0, "ignored command from unknown chat");
         return Ok(());
@@ -111,27 +108,11 @@ pub async fn handle_command(
         return Ok(());
     }
 
-    match cmd {
-        Command::Help => {
-            let descriptions = command_descriptions(config, msg.chat.id.0);
-            send_command_html(&bot, &msg, &state, escape_html(&descriptions)).await?;
-        }
-        Command::Ping => {
-            send_command_html(&bot, &msg, &state, "pong").await?;
-        }
-        Command::Db => {
-            let row: (i64,) = sqlx::query_as("select 1::bigint")
-                .fetch_one(pool)
-                .await
-                .map_err(|err| {
-                    tracing::error!(%err, "database check failed");
-                    teloxide::RequestError::Io(
-                        std::io::Error::other("database check failed").into(),
-                    )
-                })?;
+    let Some(cmd) = read_only::dispatch(&bot, &msg, &state, cmd).await? else {
+        return Ok(());
+    };
 
-            send_command_html(&bot, &msg, &state, format!("db ok: {}", row.0)).await?;
-        }
+    match cmd {
         Command::EmojiIds => {
             send_custom_emoji_ids(&bot, &msg, command_audience(&msg, &state)).await?;
         }
@@ -151,9 +132,6 @@ pub async fn handle_command(
             let clean_post = clean_post_for_llm(&post_text, config);
             let text = build_comment_html(&clean_post, config);
             send_command_html(&bot, &msg, &state, text).await?;
-        }
-        Command::Memory => {
-            send_memory_notes(&bot, msg.chat.id, pool, command_audience(&msg, &state)).await?;
         }
         #[cfg(feature = "voice")]
         Command::Transcribe => {
@@ -253,148 +231,20 @@ pub async fn handle_command(
             manual_moderation_frontend::handle(&bot, &msg, &state, ManualCommandKind::Undo, "")
                 .await?;
         }
-        Command::StatsDay(args) => {
-            let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                &state.render_time,
-                StatsPeriod::Day,
-                render,
-                &strings,
-                command_audience_for_args(&msg, &state, &args),
-            )
-            .await?;
-        }
-        Command::StatsWeek(args) => {
-            let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                &state.render_time,
-                StatsPeriod::Week,
-                render,
-                &strings,
-                command_audience_for_args(&msg, &state, &args),
-            )
-            .await?;
-        }
-        Command::StatsMonth(args) => {
-            let render = render_from_message_or_args(&msg, &args);
-            send_chat_stats(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                &state.render_time,
-                StatsPeriod::Month,
-                render,
-                &strings,
-                command_audience_for_args(&msg, &state, &args),
-            )
-            .await?;
-        }
-        Command::Status(args) => {
-            let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
-            let render = render_from_message_or_args(&msg, &args);
-            let period = status_period_from_args(raw_args).unwrap_or(StatsPeriod::Day);
-            send_chat_stats(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                &state.render_time,
-                period,
-                render,
-                &strings,
-                command_audience_for_args(&msg, &state, raw_args),
-            )
-            .await?;
-        }
-        Command::TopMsg(args) => {
-            send_top_messages(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                render_from_message_or_args(&msg, &args),
-                &strings,
-                command_audience_for_args(&msg, &state, &args),
-            )
-            .await?;
-        }
-        Command::TopWord(args) => {
-            let raw_args = raw_message_args(&msg).unwrap_or(args.as_str());
-            let Some(parsed) = parse_top_word_args(raw_args) else {
-                send_command_reply_html_for_args(
-                    &bot,
-                    &msg,
-                    &state,
-                    raw_args,
-                    "Использование: /topword <слово> [-r|-p] [-e]. Ищет отдельные вхождения без учета регистра.",
-                )
-                .await?;
-                return Ok(());
-            };
-            send_top_word(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                &parsed.word,
-                parsed.render,
-                &strings,
-                command_audience_for_args(&msg, &state, raw_args),
-            )
-            .await?;
-        }
-        Command::TopReact(args) => {
-            send_top_reacted(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                render_from_message_or_args(&msg, &args),
-                &strings,
-                command_audience_for_args(&msg, &state, &args),
-            )
-            .await?;
-        }
-        Command::BottomMsg(args) => {
-            send_bottom_messages(
-                &bot,
-                msg.chat.id,
-                pool,
-                msg.chat.id.0,
-                render_from_message_or_args(&msg, &args),
-                &strings,
-                command_audience_for_args(&msg, &state, &args),
-            )
-            .await?;
-        }
-        Command::UserStats(target) | Command::UserStatus(target) => {
-            let raw_args = raw_message_args(&msg).unwrap_or(target.as_str());
-            let args = parse_user_stats_args(raw_args);
-            let fallback_user_id = reply_user_id(&msg).or_else(|| sender_user_id(&msg));
-
-            send_user_stats(
-                &bot,
-                msg.chat.id,
-                pool,
-                config,
-                msg.chat.id.0,
-                args.target.as_deref(),
-                fallback_user_id,
-                args.render,
-                &strings,
-                command_audience_for_args(&msg, &state, raw_args),
-            )
-            .await?;
-        }
+        Command::Help
+        | Command::Ping
+        | Command::Db
+        | Command::Memory
+        | Command::StatsDay(_)
+        | Command::StatsWeek(_)
+        | Command::StatsMonth(_)
+        | Command::Status(_)
+        | Command::TopMsg(_)
+        | Command::TopWord(_)
+        | Command::TopReact(_)
+        | Command::BottomMsg(_)
+        | Command::UserStats(_)
+        | Command::UserStatus(_) => unreachable!("read-only commands are dispatched above"),
     }
 
     Ok(())
