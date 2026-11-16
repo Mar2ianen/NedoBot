@@ -14,6 +14,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::config::Config;
+use crate::features::ask::types::{AskFailureKind, AskFailureTag};
 use crate::features::chat_read_api::types::{
     CHAT_EMBEDDING_MODEL_ENV, CHAT_EMBEDDING_QUERY_PREFIX_ENV, CHAT_EMBEDDING_TIMEOUT_ENV,
     CHAT_EMBEDDING_URL_ENV,
@@ -134,10 +135,20 @@ impl McpClient {
             .0;
         let service = timeout(timeout_duration, ().serve(transport))
             .await
-            .map_err(|_| anyhow::anyhow!("chat DB MCP initialization timed out"))??;
+            .map_err(|_| {
+                AskFailureTag::wrap(
+                    AskFailureKind::Timeout,
+                    anyhow::anyhow!("chat DB MCP initialization timed out"),
+                )
+            })??;
         let mut tools = timeout(timeout_duration, service.list_all_tools())
             .await
-            .map_err(|_| anyhow::anyhow!("chat DB MCP tools/list timed out"))??;
+            .map_err(|_| {
+                AskFailureTag::wrap(
+                    AskFailureKind::Timeout,
+                    anyhow::anyhow!("chat DB MCP tools/list timed out"),
+                )
+            })??;
         if !config.youtube_subtitles_enabled {
             tools.retain(|tool| tool.name != "youtube.get_subtitles");
         }
@@ -203,7 +214,12 @@ impl McpClient {
         };
         let result = timeout(call_timeout, self.service.call_tool(request))
             .await
-            .map_err(|_| anyhow::anyhow!("chat DB MCP tool call timed out"))??;
+            .map_err(|_| {
+                AskFailureTag::wrap(
+                    AskFailureKind::Timeout,
+                    anyhow::anyhow!("chat DB MCP tool call timed out"),
+                )
+            })??;
         parse_tool_result(result)
     }
 }

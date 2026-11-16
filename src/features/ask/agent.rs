@@ -24,7 +24,9 @@ use crate::features::ask::notes::{
 use crate::features::ask::profile::AgentProfile;
 use crate::features::ask::python_sandbox::AskPythonSandbox;
 use crate::features::ask::repo;
-use crate::features::ask::types::{AskProgress, AskSandboxFile, PendingToolCallAudit};
+use crate::features::ask::types::{
+    AskFailureKind, AskFailureTag, AskProgress, AskSandboxFile, PendingToolCallAudit,
+};
 use crate::features::search::mcp::search_for_ask;
 use crate::features::search::types::SearchSource;
 use crate::llm::service::{
@@ -166,7 +168,12 @@ pub async fn answer(
         answer_within_deadline(config, pool, request),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("ask total deadline exceeded"))?
+    .map_err(|_| {
+        AskFailureTag::wrap(
+            AskFailureKind::Timeout,
+            anyhow::anyhow!("ask total deadline exceeded"),
+        )
+    })?
 }
 
 async fn answer_within_deadline(
@@ -205,7 +212,16 @@ async fn answer_within_deadline(
     });
     let mut conversation_history = Vec::new();
     report_progress(progress, AskProgress::Preparing);
-    let mcp = McpClient::start_for_scope(config, scope_chat_id).await?;
+    let mcp = McpClient::start_for_scope(config, scope_chat_id)
+        .await
+        .map_err(|error| {
+            let kind = if AskFailureKind::from_error(&error) == AskFailureKind::Timeout {
+                AskFailureKind::Timeout
+            } else {
+                AskFailureKind::ToolError
+            };
+            AskFailureTag::wrap(kind, error)
+        })?;
     let sandbox_allowed = profile
         .tool_allowlist
         .iter()
@@ -709,7 +725,10 @@ async fn answer_within_deadline(
     if let Some(markdown) = response.first_text().and_then(|text| non_empty(Some(text))) {
         return finish_answer(mcp, progress, markdown, &evidence, conversation_scope).await;
     }
-    anyhow::bail!("ask agent did not produce a final answer")
+    Err(AskFailureTag::wrap(
+        AskFailureKind::InvalidAction,
+        anyhow::anyhow!("ask agent did not produce a final answer"),
+    ))
 }
 
 async fn finish_answer(
@@ -887,8 +906,9 @@ where
             match timeout(timeout_duration, generate()).await {
                 Ok(Ok(generated)) => Ok(generated),
                 Ok(Err(err)) => Err(AgentGenerationError::Request(err)),
-                Err(_) => Err(AgentGenerationError::Request(anyhow::anyhow!(
-                    "ask LLM timed out twice"
+                Err(_) => Err(AgentGenerationError::Request(AskFailureTag::wrap(
+                    AskFailureKind::Timeout,
+                    anyhow::anyhow!("ask LLM timed out twice"),
                 ))),
             }
         }
@@ -1680,7 +1700,14 @@ async fn call_tool(
 ) -> anyhow::Result<ToolResult> {
     match tool {
         tool if context.mcp.has_tool(tool) => {
-            let result = context.mcp.call(tool, arguments).await?;
+            let result = context.mcp.call(tool, arguments).await.map_err(|error| {
+                let kind = if AskFailureKind::from_error(&error) == AskFailureKind::Timeout {
+                    AskFailureKind::Timeout
+                } else {
+                    AskFailureKind::ToolError
+                };
+                AskFailureTag::wrap(kind, error)
+            })?;
             let value = if context.reply_scope.strict {
                 filter_reply_scoped_result(tool, &result.value, &context.reply_scope.message_ids)
             } else {

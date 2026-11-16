@@ -7,8 +7,8 @@ use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
 use crate::features::voice::repo::{
-    VoiceJob, VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
-    mark_voice_job_delivery_unknown, mark_voice_job_failed, mark_voice_job_phase,
+    VoiceJob, VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
+    create_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_failed, mark_voice_job_phase,
     mark_voice_job_retry_or_failed, mark_voice_job_skipped, recover_expired_voice_deliveries,
     save_asr_result, save_progress_message, save_voice_result,
 };
@@ -356,7 +356,7 @@ async fn process_voice_job(
     media: &VoiceMedia,
     progress_message_id: MessageId,
 ) -> Result<(), VoiceProcessingFailure> {
-    mark_voice_job_phase(&state.pool, job, "downloading")
+    mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Downloading)
         .await
         .map_err(|_| VoiceProcessingFailure::Download)?
         .then_some(())
@@ -372,7 +372,7 @@ async fn process_voice_job(
             "downloaded media file for transcription"
         );
 
-        mark_voice_job_phase(&state.pool, job, "transcribing")
+        mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Transcribing)
             .await
             .map_err(|_| VoiceProcessingFailure::Asr)?
             .then_some(())
@@ -408,7 +408,7 @@ async fn process_voice_job(
         return Ok(());
     }
 
-    mark_voice_job_phase(&state.pool, job, "cleaning")
+    mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Cleaning)
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?
         .then_some(())
@@ -417,7 +417,7 @@ async fn process_voice_job(
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
     let rendered = render_transcript(&cleanup.transcript, &state.config);
-    mark_voice_job_phase(&state.pool, job, "delivering")
+    mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Delivering)
         .await
         .map_err(|_| VoiceProcessingFailure::DeliveryUnknown)?
         .then_some(())

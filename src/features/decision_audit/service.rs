@@ -170,6 +170,7 @@ pub async fn observe_message(
             normalization_version: PREPROCESSING_VERSION.into(),
             policy_version: POLICY_VERSION.into(),
             model: settings.model.clone(),
+            status: repo::DecisionJobStatus::Pending,
             input_json: input,
             avatar_file_id,
             avatar_unique_id,

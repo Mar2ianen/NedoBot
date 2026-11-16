@@ -9,6 +9,104 @@ use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 
 pub const MAX_ATTEMPTS: i32 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionJobStatus {
+    Pending,
+    Processing,
+    RetryWait,
+    Succeeded,
+    Failed,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionActionStatus {
+    NotRequested,
+    Pending,
+    Processing,
+    RetryWait,
+    Done,
+    Skipped,
+    Failed,
+}
+
+impl DecisionActionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::RetryWait => "retry_wait",
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for DecisionActionStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not_requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "processing" => Ok(Self::Processing),
+            "retry_wait" => Ok(Self::RetryWait),
+            "done" => Ok(Self::Done),
+            "skipped" => Ok(Self::Skipped),
+            "failed" => Ok(Self::Failed),
+            _ => anyhow::bail!("unknown moderation decision action status: {value}"),
+        }
+    }
+}
+
+impl TryFrom<String> for DecisionActionStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+
+impl DecisionJobStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::RetryWait => "retry_wait",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+impl TryFrom<&str> for DecisionJobStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "processing" => Ok(Self::Processing),
+            "retry_wait" => Ok(Self::RetryWait),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "stale" => Ok(Self::Stale),
+            _ => anyhow::bail!("unknown moderation decision status: {value}"),
+        }
+    }
+}
+
+impl TryFrom<String> for DecisionJobStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnqueueResult {
@@ -34,6 +132,8 @@ pub struct DecisionJob {
     pub normalization_version: String,
     pub policy_version: String,
     pub model: String,
+    #[sqlx(try_from = "String")]
+    pub status: DecisionJobStatus,
     pub input_json: Value,
     pub avatar_file_id: Option<String>,
     pub avatar_unique_id: Option<String>,
@@ -135,7 +235,7 @@ pub async fn claim(pool: &PgPool, config: &Config) -> anyhow::Result<Option<Deci
     };
     if job.attempts >= MAX_ATTEMPTS || !current_in_tx(&mut tx, &job).await? {
         sqlx::query("update moderation_decision_jobs set status=$2,error_kind=$3,completed_at=now(),lease_expires_at=null where id=$1")
-            .bind(job.id).bind(if job.attempts >= MAX_ATTEMPTS {"failed"}else{"stale"})
+            .bind(job.id).bind(if job.attempts >= MAX_ATTEMPTS {DecisionJobStatus::Failed} else {DecisionJobStatus::Stale}.as_str())
             .bind(if job.attempts >= MAX_ATTEMPTS {"retry_exhausted"}else{"expired_or_changed"}).execute(&mut *tx).await?;
         tx.commit().await?;
         return Ok(None);
@@ -154,6 +254,7 @@ pub async fn claim(pool: &PgPool, config: &Config) -> anyhow::Result<Option<Deci
     }
     job.attempts += 1;
     job.fence += 1;
+    job.status = DecisionJobStatus::Processing;
     sqlx::query("update moderation_decision_jobs set status='processing',attempts=$2,fence=$3,lease_expires_at=now()+make_interval(secs=>$4::double precision),error_kind=null where id=$1")
         .bind(job.id).bind(job.attempts).bind(job.fence).bind(EXTERNAL_REQUEST_LEASE.seconds() as f64).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -213,9 +314,9 @@ pub async fn complete(
     } else {
         assessment.verdict()
     })?;
-    sqlx::query("update moderation_decision_jobs set status=$2,assessment_json=$3,shadow_verdict=$4,api_latency_ms=$5,completed_at=now(),lease_expires_at=null,error_kind=$6,action_status=case when $7 then 'pending' else 'not_requested' end where id=$1")
-        .bind(job.id).bind(if current {"succeeded"} else {"stale"}).bind(serde_json::to_value(assessment)?)
-        .bind(verdict.as_str()).bind(latency_ms as i64).bind(if current {None} else {Some("source_or_label_changed")}).bind(current && job.input_json["score_captcha"]==true).execute(&mut *tx).await?;
+    sqlx::query("update moderation_decision_jobs set status=$2,assessment_json=$3,shadow_verdict=$4,api_latency_ms=$5,completed_at=now(),lease_expires_at=null,error_kind=$6,action_status=$7 where id=$1")
+        .bind(job.id).bind(if current {DecisionJobStatus::Succeeded} else {DecisionJobStatus::Stale}.as_str()).bind(serde_json::to_value(assessment)?)
+        .bind(verdict.as_str()).bind(latency_ms as i64).bind(if current {None} else {Some("source_or_label_changed")}).bind(if current && job.input_json["score_captcha"]==true {DecisionActionStatus::Pending} else {DecisionActionStatus::NotRequested}.as_str()).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(current)
 }
@@ -226,7 +327,7 @@ pub async fn fail(pool: &PgPool, job: &DecisionJob, error: Failure) -> anyhow::R
         .then(|| ANALYSIS_RETRY.delay_seconds(job.attempts, None))
         .flatten();
     let changed=sqlx::query("update moderation_decision_jobs set status=$4,error_kind=$5,next_attempt_at=now()+make_interval(secs=>$6::double precision),lease_expires_at=null,completed_at=case when $4='failed' then now() else null end where id=$1 and instance_id=$2 and fence=$3 and status='processing' and lease_expires_at>now()")
-        .bind(job.id).bind(&job.instance_id).bind(job.fence).bind(if delay.is_some(){"retry_wait"}else{"failed"})
+        .bind(job.id).bind(&job.instance_id).bind(job.fence).bind(if delay.is_some(){DecisionJobStatus::RetryWait}else{DecisionJobStatus::Failed}.as_str())
         .bind(error.kind()).bind(delay.unwrap_or_default() as f64).execute(pool).await?.rows_affected()>0;
     Ok(changed)
 }
@@ -280,4 +381,46 @@ pub async fn captcha_source_is_current(
             && r.source_edited_at == r.current_edit
             && hash_bytes(r.current_text.as_bytes()) == r.source_hash
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecisionActionStatus, DecisionJobStatus};
+
+    #[test]
+    fn persisted_decision_statuses_round_trip_and_unknown_values_are_rejected() {
+        for status in [
+            DecisionJobStatus::Pending,
+            DecisionJobStatus::Processing,
+            DecisionJobStatus::RetryWait,
+            DecisionJobStatus::Succeeded,
+            DecisionJobStatus::Failed,
+            DecisionJobStatus::Stale,
+        ] {
+            assert_eq!(
+                DecisionJobStatus::try_from(status.as_str()).expect("known status"),
+                status
+            );
+        }
+        assert!(DecisionJobStatus::try_from("unknown_status").is_err());
+    }
+
+    #[test]
+    fn persisted_decision_action_statuses_round_trip_and_unknown_values_are_rejected() {
+        for status in [
+            DecisionActionStatus::NotRequested,
+            DecisionActionStatus::Pending,
+            DecisionActionStatus::Processing,
+            DecisionActionStatus::RetryWait,
+            DecisionActionStatus::Done,
+            DecisionActionStatus::Skipped,
+            DecisionActionStatus::Failed,
+        ] {
+            assert_eq!(
+                DecisionActionStatus::try_from(status.as_str()).expect("known status"),
+                status
+            );
+        }
+        assert!(DecisionActionStatus::try_from("unknown_status").is_err());
+    }
 }

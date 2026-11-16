@@ -14,7 +14,7 @@ use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::features::ask::mcp_client::wire_tool_name;
-use crate::features::ask::types::AskSandboxFile;
+use crate::features::ask::types::{AskFailureKind, AskFailureTag, AskSandboxFile};
 
 const TOOL_NAME: &str = "sandbox.python";
 const MAX_CODE_BYTES: usize = 16 * 1024;
@@ -147,7 +147,12 @@ impl AskPythonSandbox {
         let mut child = command.spawn().context("start isolated Python sandbox")?;
         let output = timeout(EXECUTION_TIMEOUT, run_child(&mut child, &payload))
             .await
-            .map_err(|_| anyhow::anyhow!("Python sandbox execution timed out"))??;
+            .map_err(|_| {
+                AskFailureTag::wrap(
+                    AskFailureKind::Timeout,
+                    anyhow::anyhow!("Python sandbox execution timed out"),
+                )
+            })??;
 
         Ok(json!({
             "exit_code": output.status.code(),
@@ -163,7 +168,12 @@ impl AskPythonSandbox {
     ) -> anyhow::Result<std::process::Output> {
         let output = timeout(VERIFY_TIMEOUT, self.podman_command().args(args).output())
             .await
-            .map_err(|_| anyhow::anyhow!("Podman sandbox preflight timed out"))??;
+            .map_err(|_| {
+                AskFailureTag::wrap(
+                    AskFailureKind::Timeout,
+                    anyhow::anyhow!("Podman sandbox preflight timed out"),
+                )
+            })??;
         Ok(output)
     }
 
