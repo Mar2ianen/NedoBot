@@ -6,8 +6,8 @@ Work follows the 22-task pack dated 2026-11-16. One focused PR per task; no merg
 
 | Task | Status | Branch / PR | Notes |
 | --- | --- | --- | --- |
-| T00 — baseline snapshot | Implemented; draft PR #133, CI pending | `codex/refactor-t00-baseline` | [PR #133](https://github.com/Mar2ianen/NedoBot/pull/133). Report: [REFACTOR_BASELINE_2026-11-16.md](REFACTOR_BASELINE_2026-11-16.md). Baseline SHA `7b8815bbff80c4665b64076a063f5f4919e5465a`; fmt, check, 659 default tests, Clippy, no-default check and 9 additional local PostgreSQL integration cases passed. |
-| T01 — AGENTS and style guidance | Not started | — | Starts after T00 PR CI passes. |
+| T00 — baseline snapshot | Implemented; draft PR #133, CI passed 2/2 | `codex/refactor-t00-baseline` | [PR #133](https://github.com/Mar2ianen/NedoBot/pull/133), head `6508013e8d09ed832a50185ae5a4b900a9d595c1`. Report: [REFACTOR_BASELINE_2026-11-16.md](REFACTOR_BASELINE_2026-11-16.md). Baseline SHA `7b8815bbff80c4665b64076a063f5f4919e5465a`; fmt, check, 659 default tests, Clippy, no-default check and 9 additional local PostgreSQL integration cases passed. CI runs `43780665554` and `43780673778` passed. |
+| T01 — AGENTS and style guidance | Implemented; draft PR #134, CI pending | `codex/refactor-t01-guidance` | [PR #134](https://github.com/Mar2ianen/NedoBot/pull/134), stacked on #133. Preserved the existing AGENTS content while correcting stale paths, the `dev` lag condition and command-handler instruction; installed normative style/test guidance and build matrix. Script dry-run/idempotence, tracked-path/security-invariant checks and `git diff --check` passed. |
 | T02 — test/adversarial harness | Not started | — | Depends on T00 and T01. |
 | T03–T21 | Not started | — | Follow dependency graph in the task pack `tasks/INDEX.md`; update this table at each task boundary. |
 

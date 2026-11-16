@@ -4,7 +4,7 @@
 
 ## Проект
 
-Rust-бот для Telegram-чата `НедоNews Chat`. Первый комментарий под постом канала, память контекста, статистика, расшифровка голосовых.
+Rust-бот для сообществ NedoNews и PVO. Один release binary использует раздельные runtime-конфигурации и PostgreSQL базы; функции включаются compile-time features и per-instance config.
 
 - **Стек**: Rust 2024 edition, fork teloxide 0.21.0-rc.1 / teloxide-core 0.17.0-rc.1 (Bot API 10.4), sqlx 0.9 (PostgreSQL), reqwest 0.13
 - **LLM-провайдеры**: Gemini (основной), Groq, Cerebras, OpenRouter, Ollama, OpenAI-compatible
@@ -18,7 +18,7 @@ src/main.rs                          — dispatcher, handler wiring, startup che
 src/config.rs                        — Config из profile TOML и secrets env, validate_runtime_secrets
 src/state.rs                         — AppState(pool, config)
 src/http.rs                          — кэшированные reqwest::Client с proxy
-src/text.rs                          — normalize_ai_markers, strip_links, first_text_chars
+src/lib.rs                            — crate exports; `text` re-exported from pinned `teloxide-antispam`
 src/db/mod.rs                        — build_pool, migrate
 src/db/telegram.rs                    — CRUD: сообщения, пользователи, реакции, member events
 src/telegram/commands.rs             — enum Command (BotCommands derive)
@@ -28,11 +28,10 @@ src/telegram/html.rs                 — Html builder (text/bold/code/link/custo
 src/telegram/entities.rs             — forwarded_channel_post, message_text, custom_emoji_ids, message_has_links
 src/telegram/custom_emoji.rs         — /emojiids diagnostic command
 src/llm/mod.rs                       — модуль LLM
-src/llm/types.rs                     — LlmRequest, LlmResponse, GeneratedText, LlmClient trait
-src/llm/service.rs                   — generate_text с fallback-цепочкой, output validator
-src/llm/gemini.rs                    — Gemini API (thinking budget, inline image)
-src/llm/ollama.rs                    — Ollama /api/chat
-src/llm/openai_compat.rs             — Groq, Cerebras, OpenRouter, custom OpenAI-compatible
+src/llm/types.rs                     — typed generation, attempt, transport error и output types
+src/llm/service.rs                   — generation через выбранный route/profile и output validation
+src/llm/profiles.rs                  — profile/route configuration
+src/llm/genai_transport.rs           — provider transport adapter
 src/features/first_comment/mod.rs
 src/features/first_comment/pipeline.rs — maybe_comment_post: detect → clean → prompt → LLM → render → send
 src/features/first_comment/candidate.rs — comment_candidate: только auto-forward из source_channel_id
@@ -200,7 +199,7 @@ VPS `vps-153`, Postgres в Podman `tg-ai-bot-postgres`. Два community-инс�
 `/etc/tg-ai-bot/pvo-llm_profiles.toml`); общий SQLite спам-репутации
 `/var/lib/nedobot/spam-reputation.sqlite` при разных `instance.id`.
 Проверенные общие команды и ограничения деплоя описаны в `docs/TECHNICAL.md`;
-`docs/LOCAL_WORKFLOW.md` остаётся локальным, некоммитящимся файлом для machine-specific заметок.
+Machine-specific local workflow notes не являются частью репозитория и не должны добавляться в commit.
 
 ### Живость обоих инстансов
 
@@ -220,7 +219,7 @@ VPS `vps-153`, Postgres в Podman `tg-ai-bot-postgres`. Два community-инс�
 ### Ветки между deploy
 
 - `main` — release line. Каждый фактический deploy отмечается immutable annotated tag `deploy-YYYY-MM-DD-<scope>` на точном commit release binary.
-- После deploy вся дальнейшая разработка идёт в `dev`; новый deploy готовится отдельным review/merge из `dev` в `main`.
+- Обычная post-deploy разработка идёт в `dev`, затем проходит отдельный review/merge из `dev` в `main`. Сначала проверь, что `dev` основан на актуальном `main`; если он отстаёт от релизной линии или задачу явно привязали к более свежему baseline, не создавай разветвившуюся историю и веди узкие PR от актуальной целевой ветки до явной синхронизации `dev`.
 - Не считать `HEAD` автоматически задеплоенным: ориентироваться на deployment tag и запись в `docs/TECHNICAL.md`.
 - Первый такой tag: `deploy-2026-07-30-unified-audit` указывает на `849b632`.
 
@@ -356,9 +355,46 @@ Typed-модель teloxide предоставляет эти поля для с
 2. **Изменять промпты аккуратно** — они определяют поведение бота в проде. Правка промпта = redeploy.
 3. **SQL-миграции**: новый файл в `migrations/` с timestamp prefix. После добавления — `touch src/db/mod.rs` для sqlx recompile.
 4. **Новые Config-поля**: добавить в struct, `from_env()`, все test `fn config()`, документацию и tracked config template, если он существует.
-5. **Новые команды**: enum `Command` в `commands.rs` + handler в `command_handler.rs` + обновить README и TECHNICAL.
+5. **Новые команды**: зарегистрировать `Command` в `commands.rs`, а transport adapter держать тонким и делегировать отдельному feature/use-case модулю. Не добавлять новую бизнес-логику в общий `command_handler.rs`; поддерживать общие справку/документацию. См. `docs/CODE_STYLE.md`.
 6. **Новые LLM-провайдеры**: добавить provider/model profile и route selection в `config/llm_profiles.toml.example`; не добавлять provider match в service code.
 7. **Не ломать backward compatibility**: бот работает в проде, старые записи в БД. Миграции только additive.
 8. **Comment density**: код хорошо документирован. Писать комментарии по делу, не_water.
 9. **Russian** — код, комментарии, промпты, документация на русском. Git commit messages на английском (imperative).
-10. **Проверять перед правками**: `cargo test` после каждого non-trivial change. Формат: `cargo fmt`.
+10. **Проверять перед правками**: для нетривиального изменения использовать зафиксированные команды CI (`cargo fmt --all -- --check`, locked workspace check/test и Clippy); PostgreSQL проверки запускать только на disposable локальных БД через `scripts/test.sh`. Смотреть `docs/TEST_QUALITY.md`; число тестов не заменяет проверку инвариантов.
+
+<!-- NEDOBOT_REFACTOR_GUIDANCE_BEGIN -->
+## Архитектурные правила для новых изменений (обязательные)
+
+Этот раздел дополняет существующие правила `AGENTS.md`; при конфликте с историческими указаниями «добавить новый handler в общий command_handler.rs» **этот раздел приоритетен**. Существующие privacy/security/Telegram delivery/SQL/deploy ограничения не ослабляются. Перед рефактором ознакомиться с `docs/CODE_STYLE.md` и `docs/TEST_QUALITY.md`; оба документа — нормативные для code review.
+
+### Расширяемость и границы
+- `main.rs`, Telegram router и общие command/callback adapters должны быть **тонкими**: Telegram update → проверка scope/полномочий → typed use-case → typed result → delivery. Новую фичу оформлять отдельным модулем; не добавлять очередную цепочку условий в монолитный handler.
+- `dptree` использовать только для маршрутизации и typed dependency injection. Его `.branch` **не** означает broadcast/fan-out. Обязательные шаги и несколько независимых потребителей выражать явно, а durable работа — через job/outbox.
+- Не делать универсальный actor/ECS framework, глобальный event bus, service locator, registry или SQL jobs table только ради сокращения числа файлов. Новая абстракция обосновывается минимум двумя реальными потребителями либо конкретной тестовой/операционной проблемой.
+- Бизнес-логика не должна импортировать Telegram bot client для принятия чистых решений. Domain DTO/policy/validators отделять от I/O; не строить blanket traits для каждой функции.
+
+### Типизация и enum
+- Для конечных наборов состояний, действий, решений, ошибок, провайдерских capabilities и типов событий **предпочитать `enum`**. Ветвление исчерпывающим `match`; недопустим wildcard `_` там, где появление нового варианта требует решения разработчика.
+- Не использовать magic strings или integer codes в core-логике (`"pending"`, `"retry_wait"`, `"denied"`), если это типизированный домен. String ↔ enum исключительно на SQL/JSON/protocol boundary; некорректный persisted value — явная ошибка, не silent fallback.
+- Предпочитать суммарные типы невозможным комбинациям `bool`/`Option`; typed newtypes для разнородных ID, версий, source scope и revision, когда это устраняет ошибку смешения.
+- `Result<T, DomainError>` для expected domain failures; `anyhow` допустим в composition binaries/CLI и для контекстов, где типизировать каждый уровень вреднее. Не классифицировать ошибки поиском слов в `error.to_string()`.
+- `#[serde(deny_unknown_fields)]` и fail-closed для input от внешних источников там, где семантика требует строгой схемы. Не навязывать строгую схему всем Telegram raw events без проверки расширяемости Bot API.
+
+### Сначала зависимости, потом собственный код
+- **Запрещено писать велосипед вместо существующей поддерживаемой зависимости** для URL/IDNA/PSL, Telegram API/entities, HTTP retries/limiting, MIME, QR, JSON/MCP transport, timezones, structured output, workflow cancellation и test generation без явной ADR.
+- Порядок: проверить уже подключённый crate / API → провести поиск по crates.io/docs.rs/GitHub → сравнить кандидатов (maintainership, API, лицензия, безопасность, transitive deps, portability, поведение на ошибках) → либо reuse, либо короткая документированная реализация. Не тащить тяжёлую dependency ради простой 5-строчной чистой функции.
+- Не копировать стороннюю реализацию внутрь репозитория, не строить собственный `yt-dlp`/FFmpeg/Teloxide/MCP/URL parser. Любой внешний процесс — через проверенный bounded adapter без shell interpolation и leakage.
+
+### Качество тестирования (обязательное, не количество ради количества)
+- Каждый PR с нетривиальным поведением должен показать **что именно тест способен поймать**: invariant, counterexample и/или искусственный broken implementation. Не принимать тесты вида `assert!(true)`, проверки лишь формы JSON, совпадение объекта с самим собой, тест с воспроизведением того же алгоритма вместо независимого оракула.
+- Unit + table-driven edge cases + property/metamorphic tests (`proptest`) + deterministic replay/shrink + integration/concurrency tests (для SQL и lifecycle), по области изменений. Все adversarial cases synthetic, не помещать реальные Telegram ссылки/чаты/токены в репозиторий.
+- Использовать **фиксированный воспроизводимый seed**, выводить минимальный контрпример и точную команду replay; отдельные случайные seed допускаются как дополнение. Защититься от false passes: осознанно ввести один локальный дефект и доказать падение соответствующего теста либо выполнить выборочное mutation testing.
+- При URL/Telegram parsing, hidden entities, QR, edit/delete/replay проверять не только `count`, но и identity, provenance, dedup, privacy, idempotency, canonicalization, false positive/negative, scope и boundary. Не считать большой corpus доказательством качества без оракула.
+- SQL transitions тестировать на двух конкурирующих claims/lease loss, revision changes, stale finalization, crash between external effect and commit. `delivery_unknown` не ретраить автоматически. Тесты без настоящего PostgreSQL не заменяют PG integration tests.
+- Формат/Clippy/tests по матрице `docs/TEST_QUALITY.md` и текущей CI. Не сообщать «прошло», если не запускал; указывать число исполненных/пропущенных кейсов, реальную команду, конкретные ограничения environment.
+
+### Переписывание и дисциплина
+- Перед перемещением code path добавить characterization tests. Отдельный PR — отдельное смысловое изменение. Рефактор не меняет visible behavior, score, санкции, URL shadow или outbound fallback. Обнаруженный баг исправлять отдельным `fix` PR.
+- SQL migrations **только новые additive файлы**; не менять уже применённые и не включать prod data в тесты. Сохранять fencing, write order, `not_spam`, privacy scopes, authority boundaries и exact provider routing.
+- Short-form video import / Shorts / TikTok — **не реализовывать**, использовать только как hypothetical design test: новый модуль не должен требовать правок Ask, Voice или URL audit.
+<!-- NEDOBOT_REFACTOR_GUIDANCE_END -->
