@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: T20 checkpoint `e9cb355` / draft PR #153. Implementation commit `fd1c43f`, branch `codex/refactor-t21-release-closure`, draft PR [#154](https://github.com/Mar2ianen/NedoBot/pull/154), stacked on #153. Current-head CI is pending. This change closes the T00–T21 refactor task pack without merging or deploying any PR. It updates developer/release guidance, CI feature-matrix coverage, and the modular-monolith decision record.
+Baseline: T20 checkpoint `e9cb355` / draft PR #153. Implementation checkpoint `dba7e7f9a131139d2480265d5f7fa8746f8d8395`, branch `codex/refactor-t21-release-closure`, draft PR [#154](https://github.com/Mar2ianen/NedoBot/pull/154), stacked on #153. Both CI runs passed on that checkpoint: [#43924397083](https://github.com/Mar2ianen/NedoBot/actions/runs/43924397083) and [#43924408160](https://github.com/Mar2ianen/NedoBot/actions/runs/43924408160). This change closes the T00–T21 refactor task pack without merging or deploying any PR. It updates developer/release guidance, CI feature-matrix coverage, and the modular-monolith decision record.
 
 ## Changes
 
@@ -25,7 +25,7 @@ Local checks on this source checkpoint:
 - `cargo test --no-default-features --workspace --all-targets --locked` — 335 passed, 0 failed, 2 ignored; `cargo check --no-default-features --workspace --all-targets --locked` — passed.
 - `cargo check --workspace --all-targets --locked` — passed.
 
-The PR's GitHub CI still needs to run on its published SHA; local checks do not replace that immutable-head gate.
+Both GitHub Actions runs passed on the code-complete checkpoint `dba7e7f`: [#43924397083](https://github.com/Mar2ianen/NedoBot/actions/runs/43924397083) and [#43924408160](https://github.com/Mar2ianen/NedoBot/actions/runs/43924408160). The final metadata-only commit records these results and adds no runtime or CI changes.
 
 Staging and production evidence are intentionally not claimed: this documentation task has no staging target, does not access production credentials, and the task pack forbids automatic deployment.
 
