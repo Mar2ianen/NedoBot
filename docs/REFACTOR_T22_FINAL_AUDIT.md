@@ -15,6 +15,20 @@ This correction pass is based on the T21 checkpoint `cd591188d2fd86fb7f823c553a5
 - Worker supervision tests cover panic, unexpected normal return, and task abort. The first two also verify sibling shutdown and drain.
 - Voice delivery has a combined DB/fake Telegram regression: confirmed preview, unknown file-send result, persisted `delivery_unknown`, pool close/reopen, and no replay after restart.
 
+## Verification of earlier review fixes
+
+| Finding | Evidence checked | Result |
+| --- | --- | --- |
+| T05: disabled ingest must not touch PostgreSQL | `ingest::tests::disabled_ingest_skips_before_any_database_effect` uses an unreachable lazy pool and returns `IngestDisabled` | Verified |
+| T09: unsupported callback must be acknowledged without mutation | `unsupported_callback_is_acknowledged_without_side_effects` captures the Bot API call and asserts `AnswerCallbackQuery` and no callback text | Verified |
+| T11: critical worker panic, normal return, or abort must fail foreground supervision | Three `WorkerSupervisor` tests cover these exits; panic and normal return also assert sibling shutdown | Verified |
+| T17: unknown delivery cannot be replayed; only a typed payload rejection may use HTML fallback | `delivery` certainty tests, voice unknown/partial-send tests, and the final negative fallback cases for generic `Bad Request` and insufficient rights | Verified; generic-message fallback was corrected in this pass |
+| T19: Ask/provider failure classification must use typed error sources, not message text | `ask_failure_categories_come_from_typed_error_chain_tags` and `untagged_error_text_does_not_change_failure_category` | Verified |
+| T10/T19: unknown persisted job states must fail closed | Status round-trip/unknown-value tests cover voice, audit, materialization, decision, and CAPTCHA states | Verified |
+| T02 feature fixtures and gates | Full default and `--no-default-features` workspace test suites on the final implementation tree | Verified |
+
+The worker supervisor tests establish that unexpected exits reach the foreground service error path. This checkout has no production Telegram bot unit files, so automatic systemd restart and its configured timeout remain unverified. The repository's MCP unit has `Restart=on-failure`; it is not evidence for the bot units.
+
 ## PostgreSQL test-thread stack
 
 The failing runner is one `#[tokio::test]` that awaits the full migration and lifecycle suite in sequence. A 2 MiB test thread reproducibly overflows on a clean disposable database; the same test passes at 4 MiB and 8 MiB. This points to the large generated async test future and its test-thread stack, rather than PostgreSQL state. CI and `scripts/test.sh` now use 8 MiB, which retains a 2x margin over the smallest passing value and reduces the prior 32 MiB reservation by 75%.
