@@ -755,7 +755,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .await
             .expect("delivery-unknown job must be queryable")
             .is_none(),
-        "an unknown Telegram outcome must never be retried automatically"
+        "a fresh worker after restart must not replay an unknown Telegram outcome"
     );
     assert_eq!(
         enqueue_voice_job(pool, &unknown_media)

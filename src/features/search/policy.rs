@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     fn blocks_exact_domain_and_subdomains_without_overmatching() {
-        let mut config = Config::from_env().expect("test configuration must parse");
+        let mut config = crate::config::test_config();
         config.comment_blocked_source_domains = vec!["meduza.io".to_string()];
 
         assert!(!is_allowed_source_url(
@@ -60,10 +60,19 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_contains_multiple_blocked_sources() {
-        let config = Config::from_env().expect("test configuration must parse");
+    fn configured_policy_blocks_multiple_sources() {
+        let config = crate::config::test_config();
+        assert!(!config.comment_blocked_source_domains.is_empty());
 
-        assert!(!is_allowed_source_url(&config, "https://theins.ru/story"));
+        config
+            .comment_blocked_source_domains
+            .iter()
+            .for_each(|domain| {
+                assert!(
+                    !is_allowed_source_url(&config, &format!("https://{domain}/story")),
+                    "configured source domain {domain} must be blocked"
+                );
+            });
         assert!(!is_allowed_source_url(
             &config,
             "https://www.currenttime.tv/story"
@@ -72,7 +81,7 @@ mod tests {
 
     #[test]
     fn blocks_configured_terms_in_comment_text() {
-        let mut config = Config::from_env().expect("test configuration must parse");
+        let mut config = crate::config::test_config();
         config.comment_blocked_terms = vec!["запрещенное название".to_string()];
 
         assert!(!is_allowed_comment_text(

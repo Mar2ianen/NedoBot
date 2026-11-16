@@ -84,17 +84,48 @@ pub async fn ingest_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{IngressOutcome, IngressSkipReason};
+    use super::{IngressOutcome, IngressSkipReason, ingest_message};
     use crate::telegram::entities::TelegramMessageRef;
+    use sqlx::postgres::PgPoolOptions;
+    use teloxide::types::Message;
 
-    #[test]
-    fn feature_scope_is_explicit_in_the_service_api() {
-        // The database path is integration-tested by existing Telegram CRUD
-        // tests; this unit test documents the boundary without a live pool.
+    #[tokio::test]
+    async fn disabled_ingest_skips_before_any_database_effect() {
+        let mut config = crate::config::test_config();
+        let chat = config
+            .community
+            .chats
+            .get_mut("main")
+            .expect("test community has a primary chat");
+        let chat_id = chat.id;
+        chat.ingest = false;
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy test pool should be constructible without connecting");
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 17,
+            "date": 1700000000,
+            "chat": {"id": chat_id, "type": "supergroup", "title": "Test"},
+            "from": {"id": 42, "is_bot": false, "first_name": "A"},
+            "text": "must not be persisted"
+        }))
+        .expect("synthetic Telegram message should deserialize");
+
+        let outcome = ingest_message(&pool, &message, &config)
+            .await
+            .expect("disabled ingestion must return before connecting to PostgreSQL");
+
         assert_eq!(
-            std::mem::size_of::<fn(&crate::config_file::ChatConfig) -> bool>(),
-            std::mem::size_of::<usize>()
+            outcome,
+            IngressOutcome::Ignored {
+                message: TelegramMessageRef {
+                    chat_id,
+                    message_id: 17,
+                },
+                reason: IngressSkipReason::IngestDisabled,
+            }
         );
+        pool.close().await;
     }
 
     #[test]

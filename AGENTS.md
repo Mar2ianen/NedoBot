@@ -180,6 +180,10 @@ migrations/                            — sqlx compile-time миграции
 cargo test
 ```
 
+Для проверки workspace используйте команды из `docs/DEVELOPMENT.md`: default и `--no-default-features` test/check lanes запускаются отдельно. Успех сборки без feature не доказывает корректность runtime-конфигурации: fixtures должны отключать отсутствующие compile-time capabilities, а тесты feature-specific поведения — иметь соответствующий `#[cfg(feature = ...)]`.
+
+Все зарегистрированные в `WorkerSupervisor` задачи являются long-lived workers. Неожиданное завершение worker должно завершать процесс ошибкой после bounded drain, чтобы systemd мог перезапустить сервис. Не превращайте panic/return такого worker в только запись в журнал.
+
 Test fixtures: каждая тестовая модуль определяет `fn config() -> Config`. При добавлении поля в `Config` — обновить все test configs (антипаттерн AP2, планируется общий helper).
 
 ## Промпты

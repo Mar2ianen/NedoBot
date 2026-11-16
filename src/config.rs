@@ -1814,8 +1814,8 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
                 moderation_delete_target_message: false,
                 moderation_delete_command_message: false,
                 stats: true,
-                voice: true,
-                ask: true,
+                voice: cfg!(feature = "voice"),
+                ask: cfg!(feature = "ask"),
                 reports: false,
                 review_destination: true,
                 invite_url_env: Some("CHAT_INVITE_URL".to_string()),
@@ -1839,6 +1839,11 @@ pub(crate) fn test_community_config() -> (CommunityConfig, ChatRegistry) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    tests::config()
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         ffi::OsString,
@@ -1850,6 +1855,7 @@ mod tests {
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
+    #[cfg(feature = "moderation")]
     fn risk_captcha_is_disabled_by_default_and_validates_its_threshold() {
         let moderation = toml::from_str::<crate::config_file::ModerationConfig>("")
             .expect("omitted captcha settings must deserialize to safe defaults");
@@ -1926,6 +1932,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        feature = "moderation",
+        feature = "voice",
+        feature = "ask",
+        feature = "auto-comment",
+        feature = "spam-sync",
+        feature = "public-mcp"
+    ))]
     fn committed_production_profile_has_valid_community_config() {
         let profiles = LlmProfiles::from_toml(include_str!(
             "../config/llm_profiles.toml.production.example"
@@ -1940,6 +1954,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        feature = "auto-comment",
+        feature = "ask",
+        feature = "voice",
+        feature = "moderation",
+        feature = "public-mcp"
+    ))]
     fn mcp_scope_and_public_gate_come_from_selected_community_profile() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2075,7 +2096,7 @@ mod tests {
         }
     }
 
-    fn config() -> Config {
+    pub(super) fn config() -> Config {
         Config {
             community: test_community_config().0,
             chat_registry: test_community_config().1,
@@ -2149,7 +2170,11 @@ mod tests {
             youtube_subtitles_timeout_sec: 15,
             youtube_subtitles_max_chars: 12_000,
             youtube_subtitles_max_videos: 2,
-            comment_blocked_source_domains: vec!["meduza.io".to_string()],
+            comment_blocked_source_domains: vec![
+                "meduza.io".to_string(),
+                "theins.ru".to_string(),
+                "currenttime.tv".to_string(),
+            ],
             comment_blocked_terms: Vec::new(),
             search_github_mcp_command: None,
             search_github_mcp_args: Vec::new(),
@@ -2216,6 +2241,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "ask", feature = "auto-comment"))]
     fn from_env_defaults_ask_db_mcp_env_to_database_url_and_manifest() {
         let _env_lock = ENV_LOCK
             .lock()
@@ -2235,6 +2261,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "auto-comment")]
     fn runtime_settings_defaults_to_disabled_audit_and_reject_invalid_values() {
         let config = Config::from_env().expect("configuration must parse without audit flag");
         assert!(!config.new_user_audit_enabled);
@@ -2747,6 +2774,7 @@ models = ["primary", "fallback"]
     }
 
     #[test]
+    #[cfg(feature = "ask")]
     fn enabled_ask_requires_owner_model_and_mcp_command() {
         let mut config = config();
         config.ask_enabled = true;
@@ -2790,6 +2818,7 @@ models = ["primary", "fallback"]
     }
 
     #[test]
+    #[cfg(feature = "ask")]
     fn ask_validates_invites_for_every_ask_chat() {
         let mut config = config();
         config.ask_enabled = true;

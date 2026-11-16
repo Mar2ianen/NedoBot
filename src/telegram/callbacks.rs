@@ -77,8 +77,17 @@ pub async fn handle_callback_query(
         CallbackKind::SpamReview(request_id, decision) => {
             handle_spam_review_callback(&bot, &query, &state, request_id, decision.as_str()).await
         }
-        CallbackKind::Unsupported => Ok(()),
+        CallbackKind::Unsupported => answer_unsupported_callback(&bot, &query).await,
     }
+}
+
+#[cfg(feature = "moderation")]
+async fn answer_unsupported_callback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    query: &CallbackQuery,
+) -> ResponseResult<()> {
+    bot.answer_callback_query(query.id.clone()).await?;
+    Ok(())
 }
 
 #[cfg(feature = "moderation")]
@@ -288,8 +297,29 @@ async fn handle_report_callback(
 
 #[cfg(all(test, feature = "moderation"))]
 mod tests {
-    use super::{CallbackKind, classify_callback};
+    use std::sync::{Arc, Mutex};
+
+    use super::{CallbackKind, answer_unsupported_callback, classify_callback};
     use crate::features::reports::ReportAction;
+    use axum::{Router, body::Bytes, extract::State, routing::post};
+    use teloxide::{
+        prelude::{Bot, RequesterExt},
+        types::ParseMode,
+    };
+
+    type CapturedRequest = Arc<Mutex<Option<(String, String)>>>;
+
+    async fn fake_telegram(
+        State(captured): State<CapturedRequest>,
+        uri: axum::http::Uri,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        *captured.lock().expect("request capture lock") = Some((
+            uri.path().to_owned(),
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
+        axum::Json(serde_json::json!({"ok": true, "result": true}))
+    }
 
     #[test]
     fn callback_classifier_preserves_captcha_report_spam_review_precedence() {
@@ -322,5 +352,46 @@ mod tests {
             classify_callback(Some("unrecognized:payload")),
             CallbackKind::Unsupported
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_callback_is_acknowledged_without_side_effects() {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock Telegram listener should bind");
+        let address = listener.local_addr().expect("listener address is known");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let query = serde_json::from_value(serde_json::json!({
+            "id": "query-1",
+            "from": {"id": 42, "is_bot": false, "first_name": "Test"},
+            "chat_instance": "instance",
+            "data": "unrecognized:payload"
+        }))
+        .expect("synthetic callback query should deserialize");
+
+        answer_unsupported_callback(&bot, &query)
+            .await
+            .expect("unsupported callback should be answered");
+        server.abort();
+
+        let (path, body) = captured
+            .lock()
+            .expect("request capture lock")
+            .take()
+            .expect("Telegram callback acknowledgement should be sent");
+        assert!(
+            path.ends_with("/AnswerCallbackQuery"),
+            "unexpected Telegram method path: {path}"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["callback_query_id"], "query-1");
+        assert!(payload.get("text").is_none());
     }
 }

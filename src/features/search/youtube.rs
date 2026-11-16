@@ -480,7 +480,7 @@ printf '%s\n' 'WEBVTT' '' '00:00.000 --> 00:01.000' '<c>Привет &amp; ми�
         permissions.set_mode(0o755);
         std::fs::set_permissions(&command, permissions).expect("fake yt-dlp must be executable");
 
-        let mut config = Config::from_env().expect("test configuration must parse");
+        let mut config = crate::config::test_config();
         config.youtube_subtitles_enabled = true;
         config.youtube_subtitles_command = Some(command.to_string_lossy().into_owned());
         config.youtube_subtitles_languages = vec!["ru".to_string(), "en".to_string()];
