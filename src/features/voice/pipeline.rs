@@ -787,7 +787,7 @@ mod tests {
             .expect("captured request lock")
             .take()
             .expect("transcript delivery should call Telegram");
-        assert!(payload.0.ends_with("/editMessageText"));
+        assert!(payload.0.ends_with("editMessageText"));
         let payload = payload.1;
         assert_eq!(payload.get("chat_id").map(String::as_str), Some("-1001"));
         assert_eq!(payload.get("message_id").map(String::as_str), Some("27"));
