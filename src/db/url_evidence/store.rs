@@ -19,7 +19,7 @@ async fn materialize_message_url_evidence(
     message: &Message,
     qr_urls: Option<&[QrUrlEvidence]>,
 ) -> anyhow::Result<usize> {
-    let mut found = teloxide_url::adapter::extract_from_message(message);
+    let mut found = crate::telegram::url_targets::extract_message_evidence(message);
     let mut qr_relations = std::collections::HashMap::<String, &'static str>::new();
     if let Some(qr_urls) = qr_urls {
         for qr_url in qr_urls.iter().take(MAX_QR_URLS_PER_MESSAGE) {
