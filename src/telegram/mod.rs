@@ -11,4 +11,5 @@ pub mod manual_moderation;
 pub mod media;
 pub mod render;
 pub mod rich_content;
+pub mod router;
 pub mod service_messages;
