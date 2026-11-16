@@ -6,7 +6,7 @@ Work follows the 22-task pack dated 2026-11-16. One focused PR per task; no merg
 
 | Task | Status | Branch / PR | Notes |
 | --- | --- | --- | --- |
-| T00 — baseline snapshot | Implemented; PR pending | `codex/refactor-t00-baseline` | Report: [REFACTOR_BASELINE_2026-11-16.md](REFACTOR_BASELINE_2026-11-16.md). Baseline SHA `7b8815bbff80c4665b64076a063f5f4919e5465a`; fmt, check, 659 default tests, Clippy, no-default check and 9 additional local PostgreSQL integration cases passed. |
+| T00 — baseline snapshot | Implemented; draft PR #133, CI pending | `codex/refactor-t00-baseline` | [PR #133](https://github.com/Mar2ianen/NedoBot/pull/133). Report: [REFACTOR_BASELINE_2026-11-16.md](REFACTOR_BASELINE_2026-11-16.md). Baseline SHA `7b8815bbff80c4665b64076a063f5f4919e5465a`; fmt, check, 659 default tests, Clippy, no-default check and 9 additional local PostgreSQL integration cases passed. |
 | T01 — AGENTS and style guidance | Not started | — | Starts after T00 PR CI passes. |
 | T02 — test/adversarial harness | Not started | — | Depends on T00 and T01. |
 | T03–T21 | Not started | — | Follow dependency graph in the task pack `tasks/INDEX.md`; update this table at each task boundary. |

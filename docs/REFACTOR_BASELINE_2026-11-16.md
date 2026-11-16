@@ -6,7 +6,7 @@
 - Baseline branch: `main`
 - Baseline SHA: `7b8815bbff80c4665b64076a063f5f4919e5465a`
 - Baseline date: 2026-11-15 (commit subject: merge PR #126, teloxide URL integration)
-- Baseline PR: this report is prepared on `codex/refactor-t00-baseline`; the PR number is recorded in `docs/REFACTOR_EXECUTION.md` after creation.
+- Baseline PR: [#133](https://github.com/Mar2ianen/NedoBot/pull/133) (`codex/refactor-t00-baseline` → `main`, draft).
 - Runtime/application code, migrations, configuration, credentials, dependencies and generated artifacts are unchanged by T00.
 
 ## Repository and dependency snapshot
