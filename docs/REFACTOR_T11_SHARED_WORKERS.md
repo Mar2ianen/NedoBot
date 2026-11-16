@@ -43,8 +43,10 @@ Implementation head `18ab7f91a176b6a6dfd3f8eb7e913acfcecf938b` passed both requi
 - [#43810619027](https://github.com/Mar2ianen/NedoBot/actions/runs/43810619027) — 698 passed, 0 failed, 13 ignored across 49 test targets; all configured URL, lifecycle, RMCP, manual-moderation PostgreSQL integrations passed; format, Clippy, and migration steps passed.
 - [#43810624501](https://github.com/Mar2ianen/NedoBot/actions/runs/43810624501) — same green result.
 
-The first CI attempt exposed a test-only race: `JoinSet::abort_all()` requests cancellation, but the test inspected it before Tokio produced the join result. The test now awaits that result; the worker implementation was unchanged by the correction.
+The initial implementation CI exposed two test-only races, both corrected without changing worker runtime behavior: the abort test now awaits Tokio's `JoinSet` cancellation result, and profile queue coverage no longer assumes `select!` picks the shutdown branch while both shutdown and a queued item are ready.
+
+The test-only correction head `a2b995c` also passed both current-head CI runs: [#43813637005](https://github.com/Mar2ianen/NedoBot/actions/runs/43813637005) and [#43813643322](https://github.com/Mar2ianen/NedoBot/actions/runs/43813643322). Each run reports 698 passed, 0 failed, 13 ignored; formatting, Clippy, migrations, and all configured PostgreSQL integrations passed.
 
 ## Review state
 
-PR #144 is open as a draft, stacked on T10. It is not merged or deployed. A documentation-only verification checkpoint follows the implementation head.
+PR #144 is open as a draft, stacked on T10. Its runtime implementation head is `18ab7f9`; head `a2b995c` adds deterministic test coverage. It is not merged or deployed. A documentation-only verification checkpoint follows the test correction.
