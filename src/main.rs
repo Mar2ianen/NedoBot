@@ -1,5 +1,5 @@
 use teloxide::{
-    dispatching::UpdateFilterExt,
+    dispatching::{UpdateFilterExt, UpdateHandler},
     prelude::*,
     types::{
         ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
@@ -242,15 +242,12 @@ async fn main() -> anyhow::Result<()> {
     spawn_voice_transcription_worker(bot.clone(), state.clone());
 
     let handler = dptree::entry()
-        .branch(
-            Update::filter_message()
-                .branch(
-                    dptree::entry()
-                        .filter_command::<Command>()
-                        .endpoint(handle_command),
-                )
-                .branch(dptree::endpoint(handle_message)),
-        )
+        .branch(message_update_handler(
+            dptree::entry()
+                .filter_command::<Command>()
+                .endpoint(handle_command),
+            dptree::endpoint(handle_message),
+        ))
         .branch(Update::filter_message_reaction_updated().endpoint(handle_message_reaction))
         .branch(
             Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
@@ -268,6 +265,16 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     Ok(())
+}
+
+/// Keeps command-first routing shared between the dispatcher and route tests.
+fn message_update_handler(
+    command_handler: UpdateHandler<teloxide::RequestError>,
+    message_handler: UpdateHandler<teloxide::RequestError>,
+) -> UpdateHandler<teloxide::RequestError> {
+    Update::filter_message()
+        .branch(command_handler)
+        .branch(message_handler)
 }
 
 #[cfg(feature = "ask")]
@@ -1192,7 +1199,175 @@ async fn preflight_risk_captcha_permissions(
 
 #[cfg(test)]
 mod tests {
+    use super::message_update_handler;
     use super::privacy_mode_blocks_group_messages;
+    use std::ops::ControlFlow;
+    use std::sync::{Arc, Mutex};
+    use teloxide::{
+        dispatching::{HandlerExt, UpdateHandler},
+        dptree,
+        prelude::{Message, ResponseResult},
+        types::{Me, Update, UpdateKind},
+    };
+    use tg_ai_bot_teloxide::telegram::commands::Command;
+
+    #[derive(Clone)]
+    struct RouteCalls(Arc<Mutex<Vec<&'static str>>>);
+
+    async fn record_command(
+        _message: Message,
+        _command: Command,
+        calls: RouteCalls,
+    ) -> ResponseResult<()> {
+        calls.0.lock().unwrap().push("command");
+        Ok(())
+    }
+
+    async fn record_message(_message: Message, calls: RouteCalls) -> ResponseResult<()> {
+        calls.0.lock().unwrap().push("message");
+        Ok(())
+    }
+
+    fn test_me() -> Me {
+        serde_json::from_value(serde_json::json!({
+            "id": 900000001,
+            "is_bot": true,
+            "first_name": "Synthetic bot",
+            "username": "nedobot",
+            "can_join_groups": true,
+            "can_read_all_group_messages": true,
+            "supports_inline_queries": false,
+            "has_main_web_app": false
+        }))
+        .expect("synthetic bot identity must match the Telegram Me schema")
+    }
+
+    fn test_update(text: &str) -> Update {
+        serde_json::from_value(serde_json::json!({
+            "update_id": 1001,
+            "message": {
+                "message_id": 1001,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {
+                    "id": 900000002,
+                    "is_bot": false,
+                    "first_name": "Synthetic user"
+                },
+                "text": text
+            }
+        }))
+        .expect("synthetic update must deserialize using Telegram's typed model")
+    }
+
+    fn test_message_handler() -> UpdateHandler<teloxide::RequestError> {
+        message_update_handler(
+            dptree::entry()
+                .filter_command::<Command>()
+                .endpoint(record_command),
+            dptree::endpoint(record_message),
+        )
+    }
+
+    #[tokio::test]
+    async fn production_message_route_dispatches_commands_before_ordinary_messages() {
+        let update = test_update("/ping");
+        let calls = RouteCalls(Arc::new(Mutex::new(Vec::new())));
+        let outcome = test_message_handler()
+            .dispatch(dptree::deps![update, test_me(), calls.clone()])
+            .await;
+
+        assert!(matches!(outcome, ControlFlow::Break(Ok(()))));
+        assert_eq!(*calls.0.lock().unwrap(), ["command"]);
+    }
+
+    #[tokio::test]
+    async fn production_message_route_sends_non_commands_to_the_ingress_endpoint() {
+        let update = test_update("ordinary synthetic message");
+        let calls = RouteCalls(Arc::new(Mutex::new(Vec::new())));
+        let outcome = test_message_handler()
+            .dispatch(dptree::deps![update, test_me(), calls.clone()])
+            .await;
+
+        assert!(matches!(outcome, ControlFlow::Break(Ok(()))));
+        assert_eq!(*calls.0.lock().unwrap(), ["message"]);
+    }
+
+    #[test]
+    fn synthetic_update_shapes_cover_hidden_links_edits_bots_and_anonymous_senders() {
+        let hidden_link: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1002,
+            "message": {
+                "message_id": 1002,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {"id": 900000002, "is_bot": false, "first_name": "Synthetic user"},
+                "text": "read this",
+                "entities": [{"type": "text_link", "offset": 0, "length": 4, "url": "https://example.org/landing"}]
+            }
+        }))
+        .unwrap();
+        let anonymous: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1003,
+            "message": {
+                "message_id": 1003,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "sender_chat": {"id": -1001000000002_i64, "type": "channel", "title": "Synthetic sender"},
+                "text": "anonymous synthetic post"
+            }
+        }))
+        .unwrap();
+        let bot_sender: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1004,
+            "message": {
+                "message_id": 1004,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {"id": 900000003, "is_bot": true, "first_name": "Synthetic helper"},
+                "text": "synthetic bot message"
+            }
+        }))
+        .unwrap();
+        let edited: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1005,
+            "edited_message": {
+                "message_id": 1005,
+                "date": 1700000000,
+                "edit_date": 1700000001,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {"id": 900000002, "is_bot": false, "first_name": "Synthetic user"},
+                "text": "edited synthetic message"
+            }
+        }))
+        .unwrap();
+
+        let UpdateKind::Message(message) = hidden_link.kind else {
+            panic!("hidden-link fixture must use the message update variant");
+        };
+        let entities = message
+            .entities()
+            .expect("text link fixture must retain text entities");
+        assert_eq!(entities.len(), 1);
+        assert!(matches!(
+            &entities[0].kind,
+            teloxide::types::MessageEntityKind::TextLink { url }
+                if url.as_str() == "https://example.org/landing"
+        ));
+
+        let UpdateKind::Message(message) = anonymous.kind else {
+            panic!("anonymous fixture must use the message update variant");
+        };
+        assert!(message.from.is_none());
+        assert!(message.sender_chat.is_some());
+
+        let UpdateKind::Message(message) = bot_sender.kind else {
+            panic!("bot fixture must use the message update variant");
+        };
+        assert!(message.from.is_some_and(|sender| sender.is_bot));
+
+        assert!(matches!(edited.kind, UpdateKind::EditedMessage(_)));
+    }
 
     #[test]
     fn privacy_mode_only_blocks_group_ingress_when_bot_is_not_admin() {
