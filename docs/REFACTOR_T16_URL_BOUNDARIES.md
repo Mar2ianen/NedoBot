@@ -26,7 +26,7 @@ The open alias resolver PR #127 (head `6b24f04bad159fdb02061295a70449cee3c77ff6`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
 - `cargo test --lib --locked url` — 54 passed, 0 failed, 4 ignored, 564 filtered out before the final adapter wiring. Includes the new Unicode canonical identity test, QR relation and shadow projection tests, plus existing hidden-link, edit fingerprint, and privacy coverage.
 - After final adapter wiring: `cargo fmt --all -- --check`, `git diff --check`, `cargo check --lib --locked`, and the canonical cross-source identity test — passed.
-- Full GitHub Actions for the final PR head — pending.
+- GitHub Actions run [#43879323211](https://github.com/Mar2ianen/NedoBot/actions/runs/43879323211) passed on head `cbffc19c474e1a6cc3062933231420e65c91017c`: formatting, release installer isolation, workspace tests (main library 616 passed/0 failed/6 ignored), Clippy, PostgreSQL migrations, URL evidence (1/1), URL shadow privacy (1/1), URL shadow locks (2/2), URL inventory privacy (1/1), PostgreSQL migration integration (1/1), RMCP (2/2), and manual moderation (3/3).
 - PostgreSQL evidence/privacy tests on the disposable local `tg_ai_bot_test` database (the local test databases were recreated with `./scripts/dev_db.sh reset-test` and migrated before these tests):
   - `TEST_DATABASE_URL=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_test cargo test --lib --locked db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact` — 1 passed.
   - `TEST_DATABASE_URL=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_test cargo test --lib --locked features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact` — 1 passed.
@@ -39,5 +39,5 @@ The open alias resolver PR #127 (head `6b24f04bad159fdb02061295a70449cee3c77ff6`
 - Raw URL parsing remains owned by the pinned `teloxide-url` dependency. Provenance remains source-specific; canonical target identity is source-independent. Persisted evidence continues to store SHA-256 fingerprints and redacted hints, not raw targets.
 - No fake Ozon or YouTube domain allow was introduced. No new URL trust decision is made.
 - Public function signatures and persisted schema are unchanged; no migration or dependency was added.
-- Full workspace CI on the final PR head remains pending. PR #127/#128 overlap should be revalidated when they are rebased or merged.
+- A documentation-only tracker/report checkpoint follows the successful CI head; no source changed after CI. PR #127/#128 overlap should be revalidated when they are rebased or merged.
 - No live service, production database, merge, or deployment was used.
