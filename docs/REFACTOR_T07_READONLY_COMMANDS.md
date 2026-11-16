@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`. This task is stacked on T06 branch `codex/refactor-t06-router`, current head `0121f91`. Work branch: `codex/refactor-t07-readonly-commands`; draft [PR #140](https://github.com/Mar2ianen/NedoBot/pull/140), implementation head `2a82eba`.
+Baseline: `7b8815bbff80c4665b64076a063f5f4919e5465a`. This task is stacked on T06 branch `codex/refactor-t06-router`, current head `0121f91`. Work branch: `codex/refactor-t07-readonly-commands`; draft [PR #140](https://github.com/Mar2ianen/NedoBot/pull/140), implementation head `2a82eba` and verification checkpoint `892965b`.
 
 ## Changes
 
@@ -26,6 +26,8 @@ Local:
 
 The full test binary was not rerun locally due the already observed long rustc codegen and nearly full home filesystem; all test targets type-check locally. Full tests and PostgreSQL repo checks will run in the stacked PR CI.
 
+Both implementation-head CI runs passed: **668 passed, 0 failed, 13 ignored** in the workspace test step. PostgreSQL integration steps also passed: lifecycle (**1 passed**), RMCP (**2 passed**), and manual moderation (**3 passed**). The new read-only command dispatch table and T06 production route tests both ran and passed. CI: [#43795065510](https://github.com/Mar2ianen/NedoBot/actions/runs/43795065510) and [#43795068762](https://github.com/Mar2ianen/NedoBot/actions/runs/43795068762).
+
 ## Review state
 
-No merge or deployment. Local checks passed; both PR CI workflows are pending.
+No merge or deployment. Both CI workflows are green on the implementation/report head `892965b`. The only verification limitation is the redundant local full test-binary build; both clean CI suites passed all tests.
