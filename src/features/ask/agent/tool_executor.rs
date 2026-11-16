@@ -30,6 +30,16 @@ pub(super) fn should_cache_tool_result(tool: &str) -> bool {
     )
 }
 
+pub(super) fn cached_tool_result<'a>(
+    tool: &str,
+    signature: &str,
+    cache: &'a HashMap<String, ToolResult>,
+) -> Option<&'a ToolResult> {
+    should_cache_tool_result(tool)
+        .then(|| cache.get(signature))
+        .flatten()
+}
+
 pub(super) fn durable_note_write_denial(
     allow_mutations: bool,
     policy: crate::llm::profiles::AgentMemoryWritePolicy,

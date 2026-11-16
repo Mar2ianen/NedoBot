@@ -10,7 +10,7 @@ Baseline SHA: `e3363fe7061f562092864e67fa9d34452ab01328` (T14 CI-success checkpo
 - Native tool policy, catalog construction, audit projection, dispatch, and execution are grouped in `agent/tool_executor.rs`. The existing authorized-tool dispatch now enters through `ToolCallExecutor`.
 - Message/source provenance, verified count scopes, reply ancestry filtering, and bounded observations live in `agent/evidence.rs` as `EvidenceTracker` and `ScopeTracker` state.
 - Prompt construction and native tool-history compaction are in `agent/context.rs`, with `ContextBuilder` as the orchestration entry point.
-- Added a replay characterization for partial tool completion: a response remains paired with the first call identity while an unfinished sibling call remains pending.
+- Added replay characterizations for partial tool completion (stable call identity) and duplicate note-write suppression (same authorized note call is served from the per-turn cache).
 - Existing policy behavior and serialized/native tool history are unchanged; no generic agent framework or secret-bearing test seam was introduced.
 
 ## Verification
@@ -18,7 +18,7 @@ Baseline SHA: `e3363fe7061f562092864e67fa9d34452ab01328` (T14 CI-success checkpo
 - `cargo fmt --all -- --check` — passed.
 - `cargo check --lib --locked` — passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
-- `cargo test --lib --locked features::ask::agent::tests` — 28 passed, 0 failed, 1 ignored, 590 filtered.
+- `cargo test --lib --locked features::ask::agent::tests` — 29 passed, 0 failed, 1 ignored, 590 filtered.
 - The required `cargo test --workspace --all-targets --locked` was started, but local compilation was interrupted after roughly 11 minutes while the shared host load average was about 282. No test failure was reported; this run is inconclusive. CI must provide the full-workspace result.
 
 ## Invariants and limitations

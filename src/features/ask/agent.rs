@@ -382,9 +382,7 @@ async fn answer_within_deadline(
             let tracking_arguments = audit_tool_arguments(tool, arguments);
             let started = Instant::now();
 
-            if should_cache_tool_result(tool)
-                && let Some(cached) = tool_cache.get(&signature)
-            {
+            if let Some(cached) = cached_tool_result(tool, &signature, &tool_cache) {
                 audit_tool_call(
                     pool,
                     ask_run_id,
@@ -1426,6 +1424,17 @@ mod tests {
         assert!(!LOCAL_AGENT_TOOLS.contains(&"chat.raw_sql"));
         assert!(LOCAL_AGENT_TOOLS.contains(&"notes.add_user"));
         assert!(!LOCAL_AGENT_TOOLS.contains(&"chat.get_user_profile"));
+    }
+
+    #[test]
+    fn identical_note_tool_calls_are_replayed_from_cache() {
+        let signature = "notes.add_user:{\"note\":\"timezone\",\"telegram_user_id\":7}";
+        let mut cache = HashMap::new();
+        let result = ToolResult::from_value(json!({"saved": true})).unwrap();
+        cache.insert(signature.to_owned(), result);
+
+        assert!(cached_tool_result("notes.add_user", signature, &cache).is_some());
+        assert!(cached_tool_result("chat.count_messages", signature, &cache).is_none());
     }
 
     #[test]
