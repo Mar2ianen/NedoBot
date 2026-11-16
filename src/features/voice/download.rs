@@ -46,8 +46,8 @@ pub fn validate_media(media: &VoiceMedia, config: &Config) -> Result<(), VoiceDo
     validate_limits(
         media.duration_sec,
         media.file_size,
-        config.voice_max_duration_sec,
-        config.voice_max_file_mb,
+        config.voice.max_duration_sec,
+        config.voice.max_file_mb,
     )
 }
 

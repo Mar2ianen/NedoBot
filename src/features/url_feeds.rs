@@ -251,7 +251,7 @@ struct FeedCommitter {
 
 /// Starts an opt-in, bounded updater. The feed origin and metadata endpoint
 /// are constants; no URL from Telegram is ever sent to either service.
-pub fn spawn_worker(snapshot: Arc<RwLock<Option<Arc<FeedSnapshot>>>>, config: Config) {
+pub fn spawn_worker(snapshot: Arc<RwLock<Option<Arc<FeedSnapshot>>>>, config: Arc<Config>) {
     if !config.community.moderation.url_feed_enabled {
         return;
     }

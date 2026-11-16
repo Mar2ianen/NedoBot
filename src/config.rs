@@ -136,23 +136,50 @@ pub struct Config {
     pub amd_custom_emoji_id: Option<String>,
     pub radeon_custom_emoji_id: Option<String>,
     pub ryzen_custom_emoji_id: Option<String>,
-    pub voice_transcription_enabled: bool,
-    pub voice_auto_transcribe: bool,
-    pub voice_max_duration_sec: u32,
-    pub voice_max_file_mb: u32,
-    pub voice_short_text_max_chars: usize,
-    pub voice_language: String,
-    pub voice_asr_provider: String,
-    pub voice_asr_model: String,
-    pub voice_asr_shadow_enabled: bool,
-    pub voice_asr_shadow_model: String,
-    pub voice_asr_temperature: f32,
-    pub voice_cleanup_temperature: f32,
-    pub voice_cleanup_max_tokens: u32,
-    pub voice_render_expandable_chapters: bool,
-    pub voice_send_full_file: bool,
+    pub voice: VoiceConfig,
     pub public_base_url: Option<String>,
     pub static_files_dir: String,
+}
+
+#[derive(Clone)]
+pub struct VoiceConfig {
+    pub enabled: bool,
+    pub auto_transcribe: bool,
+    pub max_duration_sec: u32,
+    pub max_file_mb: u32,
+    pub short_text_max_chars: usize,
+    pub language: String,
+    pub asr_provider: String,
+    pub asr_model: String,
+    pub asr_shadow_enabled: bool,
+    pub asr_shadow_model: String,
+    pub asr_temperature: f32,
+    pub cleanup_temperature: f32,
+    pub cleanup_max_tokens: u32,
+    pub render_expandable_chapters: bool,
+    pub send_full_file: bool,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_transcribe: false,
+            max_duration_sec: 600,
+            max_file_mb: 20,
+            short_text_max_chars: 400,
+            language: "ru".to_string(),
+            asr_provider: "gemini".to_string(),
+            asr_model: "gemini-3.5-transcribe".to_string(),
+            asr_shadow_enabled: false,
+            asr_shadow_model: "whisper-large-v3-turbo".to_string(),
+            asr_temperature: 0.0,
+            cleanup_temperature: 0.2,
+            cleanup_max_tokens: 1800,
+            render_expandable_chapters: true,
+            send_full_file: true,
+        }
+    }
 }
 
 impl Config {
@@ -524,25 +551,27 @@ impl Config {
             amd_custom_emoji_id: runtime.amd_custom_emoji_id,
             radeon_custom_emoji_id: runtime.radeon_custom_emoji_id,
             ryzen_custom_emoji_id: runtime.ryzen_custom_emoji_id,
-            voice_transcription_enabled: if voice_section_present {
-                community_voice_enabled
-            } else {
-                runtime.voice_transcription_enabled
+            voice: VoiceConfig {
+                enabled: if voice_section_present {
+                    community_voice_enabled
+                } else {
+                    runtime.voice_transcription_enabled
+                },
+                auto_transcribe: runtime.voice_auto_transcribe,
+                max_duration_sec: runtime.voice_max_duration_sec,
+                max_file_mb: runtime.voice_max_file_mb,
+                short_text_max_chars: runtime.voice_short_text_max_chars,
+                language: runtime.voice_language,
+                asr_provider: runtime.voice_asr_provider,
+                asr_model: runtime.voice_asr_model,
+                asr_shadow_enabled: runtime.voice_asr_shadow_enabled,
+                asr_shadow_model: runtime.voice_asr_shadow_model,
+                asr_temperature: runtime.voice_asr_temperature,
+                cleanup_temperature: runtime.voice_cleanup_temperature,
+                cleanup_max_tokens: runtime.voice_cleanup_max_tokens,
+                render_expandable_chapters: runtime.voice_render_expandable_chapters,
+                send_full_file: runtime.voice_send_full_file,
             },
-            voice_auto_transcribe: runtime.voice_auto_transcribe,
-            voice_max_duration_sec: runtime.voice_max_duration_sec,
-            voice_max_file_mb: runtime.voice_max_file_mb,
-            voice_short_text_max_chars: runtime.voice_short_text_max_chars,
-            voice_language: runtime.voice_language,
-            voice_asr_provider: runtime.voice_asr_provider,
-            voice_asr_model: runtime.voice_asr_model,
-            voice_asr_shadow_enabled: runtime.voice_asr_shadow_enabled,
-            voice_asr_shadow_model: runtime.voice_asr_shadow_model,
-            voice_asr_temperature: runtime.voice_asr_temperature,
-            voice_cleanup_temperature: runtime.voice_cleanup_temperature,
-            voice_cleanup_max_tokens: runtime.voice_cleanup_max_tokens,
-            voice_render_expandable_chapters: runtime.voice_render_expandable_chapters,
-            voice_send_full_file: runtime.voice_send_full_file,
             public_base_url: runtime.public_base_url,
             static_files_dir: runtime.static_files_dir,
             linear_spam_model: None,
@@ -737,7 +766,7 @@ impl Config {
                 errors.push("ask.gateway.private_messages_enabled requires ask.default_chat and an explicit private user allowlist".to_string());
             }
         }
-        if self.voice_transcription_enabled && !cfg!(feature = "voice") {
+        if self.voice.enabled && !cfg!(feature = "voice") {
             errors.push(
                 "voice transcription is enabled but binary lacks cargo feature voice".to_string(),
             );
@@ -793,13 +822,14 @@ impl Config {
             validate_youtube_subtitles_config(&mut errors, self);
         }
 
-        if self.voice_transcription_enabled {
+        if self.voice.enabled {
             validate_voice_asr_secret(&mut errors, self);
             // Gemini audio ASR не принимает video notes; для них используется
             // настроенный Groq media fallback даже без сравнительного shadow.
-            if self.voice_asr_shadow_enabled
+            if self.voice.asr_shadow_enabled
                 || self
-                    .voice_asr_provider
+                    .voice
+                    .asr_provider
                     .trim()
                     .eq_ignore_ascii_case("gemini")
             {
@@ -944,12 +974,12 @@ impl Config {
                 },
             ));
         }
-        if self.voice_transcription_enabled {
+        if self.voice.enabled {
             routes.push((
                 "voice_cleanup",
                 RouteRequirements {
                     requires_system_prompt: true,
-                    num_predict: Some(self.voice_cleanup_max_tokens),
+                    num_predict: Some(self.voice.cleanup_max_tokens),
                     ..RouteRequirements::default()
                 },
             ));
@@ -1293,7 +1323,7 @@ fn command_is_available(command: &str) -> bool {
 }
 
 fn validate_voice_asr_secret(errors: &mut Vec<String>, config: &Config) {
-    match config.voice_asr_provider.trim().to_lowercase().as_str() {
+    match config.voice.asr_provider.trim().to_lowercase().as_str() {
         "groq" => require_secret(
             errors,
             "GROQ_API_KEY",
@@ -1307,13 +1337,13 @@ fn validate_voice_asr_secret(errors: &mut Vec<String>, config: &Config) {
             "VOICE_ASR_PROVIDER={provider} is unsupported; supported providers: groq, gemini"
         )),
     }
-    if config.voice_asr_model.trim().is_empty() {
+    if config.voice.asr_model.trim().is_empty() {
         errors.push("VOICE_ASR_MODEL must not be empty".to_string());
     }
 }
 
 fn validate_voice_asr_shadow_secret(errors: &mut Vec<String>, config: &Config) {
-    let shadow_provider = match config.voice_asr_provider.trim().to_lowercase().as_str() {
+    let shadow_provider = match config.voice.asr_provider.trim().to_lowercase().as_str() {
         "groq" => "gemini",
         "gemini" => "groq",
         _ => return,
@@ -1332,7 +1362,7 @@ fn validate_voice_asr_shadow_secret(errors: &mut Vec<String>, config: &Config) {
         ),
         _ => unreachable!("shadow provider is derived from the supported primary providers"),
     }
-    if config.voice_asr_shadow_model.trim().is_empty() {
+    if config.voice.asr_shadow_model.trim().is_empty() {
         errors.push("VOICE_ASR_SHADOW_MODEL must not be empty".to_string());
     }
 }
@@ -2161,24 +2191,28 @@ mod tests {
             amd_custom_emoji_id: None,
             radeon_custom_emoji_id: None,
             ryzen_custom_emoji_id: None,
-            voice_transcription_enabled: false,
-            voice_auto_transcribe: false,
-            voice_max_duration_sec: 600,
-            voice_max_file_mb: 20,
-            voice_short_text_max_chars: 400,
-            voice_language: "ru".to_string(),
-            voice_asr_provider: "gemini".to_string(),
-            voice_asr_model: "gemini-3.5-transcribe".to_string(),
-            voice_asr_shadow_enabled: true,
-            voice_asr_shadow_model: "whisper-large-v3-turbo".to_string(),
-            voice_asr_temperature: 0.0,
-            voice_cleanup_temperature: 0.2,
-            voice_cleanup_max_tokens: 1800,
-            voice_render_expandable_chapters: true,
-            voice_send_full_file: true,
+            voice: VoiceConfig {
+                asr_shadow_enabled: true,
+                ..VoiceConfig::default()
+            },
             public_base_url: None,
             static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn app_state_clones_share_the_same_runtime_config_allocation() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
+            .expect("synthetic PostgreSQL URL must parse without connecting");
+        let state = crate::state::AppState::new(pool, config());
+        let cloned_state = state.clone();
+
+        assert!(std::sync::Arc::ptr_eq(&state.config, &cloned_state.config));
+        assert_eq!(
+            state.config.community.instance.id,
+            cloned_state.config.community.instance.id
+        );
     }
 
     #[test]
@@ -2395,8 +2429,8 @@ models = ["primary", "fallback"]
         config.llm_profiles = Some(
             LlmProfiles::from_toml(include_str!("../config/llm_profiles.toml.example")).unwrap(),
         );
-        config.voice_transcription_enabled = true;
-        config.voice_auto_transcribe = true;
+        config.voice.enabled = true;
+        config.voice.auto_transcribe = true;
 
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
@@ -2433,8 +2467,8 @@ models = ["primary", "fallback"]
         let _lock = ENV_LOCK.lock().unwrap();
         let gemini = EnvVarGuard::unset("GEMINI_API_KEY");
         let mut config = config();
-        config.voice_transcription_enabled = true;
-        config.voice_auto_transcribe = true;
+        config.voice.enabled = true;
+        config.voice.auto_transcribe = true;
 
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 
@@ -2449,8 +2483,8 @@ models = ["primary", "fallback"]
         let groq = EnvVarGuard::unset("GROQ_API_KEY");
         unsafe { std::env::set_var("GEMINI_API_KEY", "test-key") };
         let mut config = config();
-        config.voice_transcription_enabled = true;
-        config.voice_asr_shadow_enabled = true;
+        config.voice.enabled = true;
+        config.voice.asr_shadow_enabled = true;
 
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 
@@ -2468,10 +2502,10 @@ models = ["primary", "fallback"]
             std::env::set_var("GROQ_API_KEY", "test-key");
         }
         let mut config = config();
-        config.voice_transcription_enabled = true;
-        config.voice_asr_provider = "groq".to_string();
-        config.voice_asr_model = "whisper-large-v3-turbo".to_string();
-        config.voice_asr_shadow_model = "gemini-3.5-transcribe".to_string();
+        config.voice.enabled = true;
+        config.voice.asr_provider = "groq".to_string();
+        config.voice.asr_model = "whisper-large-v3-turbo".to_string();
+        config.voice.asr_shadow_model = "gemini-3.5-transcribe".to_string();
 
         let err = config.validate_runtime_secrets().unwrap_err().to_string();
 

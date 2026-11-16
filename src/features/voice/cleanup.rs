@@ -22,7 +22,7 @@ pub async fn cleanup_transcript(
     transcript: &AsrTranscript,
     alternatives: &[AsrTranscript],
 ) -> anyhow::Result<CleanupResult> {
-    let prompt = build_user_prompt(config.voice_short_text_max_chars, transcript, alternatives);
+    let prompt = build_user_prompt(config.voice.short_text_max_chars, transcript, alternatives);
     let generation = match generate_cleanup_content(config, &prompt).await {
         Ok(generation) => generation,
         Err(err) => {
@@ -33,7 +33,7 @@ pub async fn cleanup_transcript(
                 transcript: normalize_cleanup(
                     plain_cleanup(&transcript.text),
                     transcript,
-                    config.voice_short_text_max_chars,
+                    config.voice.short_text_max_chars,
                 ),
             });
         }
@@ -52,7 +52,7 @@ pub async fn cleanup_transcript(
     Ok(CleanupResult {
         provider: generation.provider,
         model: generation.model,
-        transcript: normalize_cleanup(clean, transcript, config.voice_short_text_max_chars),
+        transcript: normalize_cleanup(clean, transcript, config.voice.short_text_max_chars),
     })
 }
 
@@ -67,8 +67,8 @@ async fn generate_cleanup_content(
             system_prompt: Some(CLEANUP_PROMPT),
             prompt,
             image_base64: None,
-            temperature: config.voice_cleanup_temperature,
-            num_predict: config.voice_cleanup_max_tokens,
+            temperature: config.voice.cleanup_temperature,
+            num_predict: config.voice.cleanup_max_tokens,
             output_validator: None,
             structured_output: None,
         },
