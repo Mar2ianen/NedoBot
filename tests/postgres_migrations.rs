@@ -98,6 +98,9 @@ mod membership_history;
 #[path = "support/decision_shadow.rs"]
 mod decision_shadow;
 
+#[path = "support/ingress_persistence.rs"]
+mod ingress_persistence;
+
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
 
 #[path = "support/risk_captcha_cleanup.rs"]
@@ -180,6 +183,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+    ingress_persistence::assert_message_persistence_effects(&pool).await;
 }
 
 async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {

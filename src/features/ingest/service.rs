@@ -2,7 +2,29 @@ use sqlx::PgPool;
 use teloxide::types::Message;
 
 use crate::config::Config;
-use crate::db::telegram::save_telegram_message;
+use crate::db::telegram::{MessagePersistenceOutcome, save_telegram_message};
+use crate::telegram::entities::TelegramMessageRef;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressSkipReason {
+    UnmanagedChat,
+    IngestDisabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressOutcome {
+    Ignored {
+        message: TelegramMessageRef,
+        reason: IngressSkipReason,
+    },
+    Persisted(MessagePersistenceOutcome),
+}
+
+impl IngressOutcome {
+    pub fn was_persisted(self) -> bool {
+        matches!(self, Self::Persisted(_))
+    }
+}
 
 /// Returns whether an update belongs to this bot's configured community.
 /// Unknown chats are rejected before any profile/message persistence.
@@ -22,11 +44,25 @@ pub fn managed_chat_allows(
 
 /// Neutral Telegram message persistence. Feature pipelines may consume the
 /// result, but no feature owns base message ingest anymore.
-pub async fn ingest_message(pool: &PgPool, msg: &Message, config: &Config) -> anyhow::Result<bool> {
-    if !managed_chat_allows(config, msg.chat.id.0, |chat| chat.ingest) {
-        return Ok(false);
+pub async fn ingest_message(
+    pool: &PgPool,
+    msg: &Message,
+    config: &Config,
+) -> anyhow::Result<IngressOutcome> {
+    let message = TelegramMessageRef::from_message(msg);
+    if !is_managed_chat(config, msg.chat.id.0) {
+        return Ok(IngressOutcome::Ignored {
+            message,
+            reason: IngressSkipReason::UnmanagedChat,
+        });
     }
-    save_telegram_message(pool, msg, config).await?;
+    if !managed_chat_allows(config, msg.chat.id.0, |chat| chat.ingest) {
+        return Ok(IngressOutcome::Ignored {
+            message,
+            reason: IngressSkipReason::IngestDisabled,
+        });
+    }
+    let persistence = save_telegram_message(pool, msg, config).await?;
     #[cfg(feature = "moderation")]
     if let Err(_error) = crate::features::decision_audit::service::observe_message(
         pool,
@@ -43,11 +79,14 @@ pub async fn ingest_message(pool: &PgPool, msg: &Message, config: &Config) -> an
             "cheap moderation observation failed"
         );
     }
-    Ok(true)
+    Ok(IngressOutcome::Persisted(persistence))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{IngressOutcome, IngressSkipReason};
+    use crate::telegram::entities::TelegramMessageRef;
+
     #[test]
     fn feature_scope_is_explicit_in_the_service_api() {
         // The database path is integration-tested by existing Telegram CRUD
@@ -56,5 +95,38 @@ mod tests {
             std::mem::size_of::<fn(&crate::config_file::ChatConfig) -> bool>(),
             std::mem::size_of::<usize>()
         );
+    }
+
+    #[test]
+    fn ingress_outcomes_preserve_identity_and_distinguish_skip_reasons() {
+        let message = TelegramMessageRef {
+            chat_id: -100_000_000_001,
+            message_id: 17,
+        };
+        let unknown = IngressOutcome::Ignored {
+            message,
+            reason: IngressSkipReason::UnmanagedChat,
+        };
+        let disabled = IngressOutcome::Ignored {
+            message,
+            reason: IngressSkipReason::IngestDisabled,
+        };
+
+        assert_eq!(
+            unknown,
+            IngressOutcome::Ignored {
+                message,
+                reason: IngressSkipReason::UnmanagedChat,
+            }
+        );
+        assert_eq!(
+            disabled,
+            IngressOutcome::Ignored {
+                message,
+                reason: IngressSkipReason::IngestDisabled,
+            }
+        );
+        assert!(!unknown.was_persisted());
+        assert!(!disabled.was_persisted());
     }
 }
