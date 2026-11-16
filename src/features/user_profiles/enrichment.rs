@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::{
     config::Config,
     db::telegram::{mark_user_profile_refresh_error, user_profile_needs_refresh},
+    features::jobs::worker::{WorkerId, WorkerSupervisor},
     features::user_profiles::service::refresh_profile,
 };
 
@@ -89,6 +90,7 @@ impl ProfileRefreshQueue {
 }
 
 pub fn spawn_profile_refresh_workers(
+    supervisor: &mut WorkerSupervisor,
     bot: Bot,
     pool: PgPool,
     config: Arc<Config>,
@@ -106,8 +108,11 @@ pub fn spawn_profile_refresh_workers(
         let url_feed_snapshot = url_feed_snapshot.clone();
         let queue = queue.clone();
         let receiver = receiver.clone();
-        tokio::spawn(async move {
-            while let Some(job) = receiver.lock().await.recv().await {
+        supervisor.spawn(WorkerId::ProfileRefresh, move |mut shutdown| async move {
+            let mut draining = false;
+            while let Some(job) =
+                next_profile_refresh_job(&receiver, &mut shutdown, &mut draining).await
+            {
                 process_profile_refresh_job(
                     &bot,
                     &pool,
@@ -124,6 +129,27 @@ pub fn spawn_profile_refresh_workers(
     }
 
     queue
+}
+
+async fn next_profile_refresh_job(
+    receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<ProfileRefreshJob>>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    draining: &mut bool,
+) -> Option<ProfileRefreshJob> {
+    loop {
+        if *draining {
+            return receiver.lock().await.recv().await;
+        }
+        tokio::select! {
+            job = async { receiver.lock().await.recv().await } => return job,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    receiver.lock().await.close();
+                    *draining = true;
+                }
+            }
+        }
+    }
 }
 
 async fn process_profile_refresh_job(
@@ -256,6 +282,35 @@ mod tests {
         assert_eq!(
             queue.try_enqueue(-1001, 42),
             ProfileRefreshEnqueueResult::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_intake_then_drains_already_queued_profiles() {
+        let (queue, receiver) = ProfileRefreshQueue::new(2);
+        assert_eq!(
+            queue.try_enqueue(-1001, 42),
+            ProfileRefreshEnqueueResult::Queued
+        );
+        let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut draining = false;
+        shutdown_tx.send_replace(true);
+
+        let queued = next_profile_refresh_job(&receiver, &mut shutdown, &mut draining)
+            .await
+            .expect("shutdown should retain already queued work");
+        assert_eq!(queued.user_id, 42);
+        assert!(draining);
+        assert_eq!(
+            queue.try_enqueue(-1001, 43),
+            ProfileRefreshEnqueueResult::Closed
+        );
+
+        queue.mark_completed(queued);
+        assert!(
+            next_profile_refresh_job(&receiver, &mut shutdown, &mut draining)
+                .await
+                .is_none()
         );
     }
 }

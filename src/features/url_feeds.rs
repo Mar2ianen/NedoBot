@@ -1,5 +1,6 @@
 //! Локальный exact-URL feed; снимок opt-in, а его score остаётся shadow-only.
 use crate::config::Config;
+use crate::features::jobs::worker::{WorkerId, WorkerSupervisor, run_interval_worker};
 use chrono::DateTime;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -251,11 +252,15 @@ struct FeedCommitter {
 
 /// Starts an opt-in, bounded updater. The feed origin and metadata endpoint
 /// are constants; no URL from Telegram is ever sent to either service.
-pub fn spawn_worker(snapshot: Arc<RwLock<Option<Arc<FeedSnapshot>>>>, config: Arc<Config>) {
+pub fn spawn_worker(
+    supervisor: &mut WorkerSupervisor,
+    snapshot: Arc<RwLock<Option<Arc<FeedSnapshot>>>>,
+    config: Arc<Config>,
+) {
     if !config.community.moderation.url_feed_enabled {
         return;
     }
-    tokio::spawn(async move {
+    supervisor.spawn(WorkerId::UrlFeedRefresh, move |shutdown| async move {
         let client = match reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(120))
@@ -264,29 +269,33 @@ pub fn spawn_worker(snapshot: Arc<RwLock<Option<Arc<FeedSnapshot>>>>, config: Ar
         {
             Ok(client) => client,
             Err(_) => {
-                tracing::error!("failed to create URL feed HTTP client");
+                tracing::error!(error_kind = "client_configuration", "failed to create URL feed HTTP client");
                 return;
             }
         };
         let refresh_seconds = config.community.moderation.url_feed_refresh_seconds;
         let max_age_seconds = config.community.moderation.url_feed_max_age_seconds;
-        let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            match download_snapshot(&client, max_age_seconds).await {
+        run_interval_worker(
+            WorkerId::UrlFeedRefresh,
+            shutdown,
+            Duration::from_secs(refresh_seconds),
+            true,
+            false,
+            || async {
+                match download_snapshot(&client, max_age_seconds).await {
                 Ok(candidate) => {
                     let entry_count = candidate.entry_count();
                     let fresh = candidate.is_fresh(unix_now());
                     let revision = candidate.revision.clone();
                     *snapshot.write().await = Some(Arc::new(candidate));
                     tracing::info!(entry_count, %revision, fresh, "replaced local phishing URL feed snapshot");
+                    None
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "URL feed refresh failed; previous snapshot retained");
+                Err(_) => Some("snapshot_refresh_failed"),
                 }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 

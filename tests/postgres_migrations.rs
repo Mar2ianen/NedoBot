@@ -441,6 +441,7 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     const MESSAGE_ID: i32 = 9_300_003;
     const HIGH_RISK_USER_ID: i64 = 9_000_101;
     const LOW_RISK_USER_ID: i64 = 9_000_102;
+    const EXPIRED_REVIEW_USER_ID: i64 = 9_000_103;
     query(
         "update telegram_message_embeddings_gemma2 set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
     )
@@ -452,15 +453,18 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     query(
         r#"
         insert into spam_review_requests
-            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at)
+            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at,
+             notification_processing_started_at, notification_lease_expires_at)
         values
-            ($1, $2, 80, 'pending', now() - interval '1 minute'),
-            ($1, $3, 65, 'pending', now() - interval '1 day')
+            ($1, $2, 80, 'pending', now() - interval '1 minute', null, null),
+            ($1, $3, 65, 'pending', now() - interval '1 day', null, null),
+            ($1, $4, 85, 'processing', now(), now() - interval '3 minutes', now() - interval '1 second')
         "#,
     )
     .bind(CHAT_ID)
     .bind(HIGH_RISK_USER_ID)
     .bind(LOW_RISK_USER_ID)
+    .bind(EXPIRED_REVIEW_USER_ID)
     .execute(pool)
     .await
     .expect("high- and low-risk ready review fixtures must be inserted");
@@ -504,6 +508,12 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         .find(|queue| queue.queue == "reviews")
         .expect("reviews queue must be reported");
     assert!(reviews.lease_reclaim_count >= 1);
+    assert!(reviews.expired_lease_count >= 1);
+    assert!(
+        reviews
+            .oldest_processing_age_seconds
+            .is_some_and(|age| age >= 120.0)
+    );
     let oldest_ready_age = reviews
         .oldest_ready_age_seconds
         .expect("due high-risk review must contribute to oldest_ready_age");
