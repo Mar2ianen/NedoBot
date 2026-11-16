@@ -2423,6 +2423,38 @@ mod tests {
     }
 
     #[test]
+    fn canonical_analysis_matches_golden_score_and_snapshot_revisions() {
+        let features = NewUserFeatures {
+            chat_id: -100_991_235,
+            telegram_user_id: 42,
+            username: Some("reader_42".to_string()),
+            display_name: Some("Synthetic Reader".to_string()),
+            first_message_text: Some("Добрый день https://t.me/example".to_string()),
+            recent_message_texts: vec!["Добрый день https://t.me/example".to_string()],
+            member_status: Some("member".to_string()),
+            ..Default::default()
+        };
+        let config = NewUserAnalysisConfig::default();
+        let risk = analyze_new_or_low_activity_user(&features, &config);
+        let snapshot = project_unified_user_audit_snapshot(&features, &risk, &config);
+        let revision = project_unified_user_audit_material_revision(&features, &config);
+        let snapshot_hash = hex_digest(&serde_json::to_vec(&snapshot).unwrap());
+        let revision_hash = hex_digest(&serde_json::to_vec(&revision).unwrap());
+
+        assert_eq!(risk.score, 18);
+        assert_eq!(
+            snapshot_hash,
+            "eb7a70a8a9dfa6af5d1d466004266634e983f0b8fed56565e79730d71c7d587a"
+        );
+        assert_eq!(
+            revision_hash,
+            "b7633f743c32c860735a1304a5ce75d621eb660114a238c1597483404576b761"
+        );
+        assert_eq!(snapshot["profile"]["username"], "reader_42");
+        assert_eq!(snapshot["text"]["first_message_preview"], "Добрый день [link]");
+    }
+
+    #[test]
     fn dc_parser_does_not_guess_without_verified_decoder() {
         let result = best_effort_profile_photo_dc(Some("AQADBAADb6sxG4x8AAEC"));
         assert!(result.dc_id.is_none());
