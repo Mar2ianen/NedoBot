@@ -2,7 +2,7 @@
 
 ## Scope
 
-Baseline: T18 CI-success checkpoint `72c9d53c68052a9e90ac296722061d57fd649ee7`. Implementation commit `f9222c1`, branch `codex/refactor-review-close-t19`, draft PR [#152](https://github.com/Mar2ianen/NedoBot/pull/152), stacked on draft PR #151. Current published CI is pending. This pass also closes the independently reviewed T05, T09, T11, and T17 correctness findings; no production behavior is deployed.
+Baseline: T18 CI-success checkpoint `72c9d53c68052a9e90ac296722061d57fd649ee7`. Final branch head `7ea9a4d1b0d0e841b96f3ffdf79fbadea979dbd`, branch `codex/refactor-review-close-t19`, draft PR [#152](https://github.com/Mar2ianen/NedoBot/pull/152), stacked on draft PR #151. Both CI runs passed: [#43923825414](https://github.com/Mar2ianen/NedoBot/actions/runs/43923825414) and [#43923835306](https://github.com/Mar2ianen/NedoBot/actions/runs/43923835306). This pass also closes the independently reviewed T05, T09, T11, and T17 correctness findings; no production behavior is deployed.
 
 ## Changes
 

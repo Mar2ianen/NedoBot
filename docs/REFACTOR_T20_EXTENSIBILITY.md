@@ -1,6 +1,6 @@
 # T20 — Extension proof without a downloader
 
-Baseline: T19 final published checkpoint `7ea9a4d` / draft PR #152. Implementation commit `d72f535`, branch `codex/refactor-t20-extensibility`, draft PR [#153](https://github.com/Mar2ianen/NedoBot/pull/153), stacked on #152. Current-head CI is pending. This walkthrough is static; it adds no executable downloader, command, Telegram send, ffmpeg, yt-dlp, or runtime configuration.
+Baseline: T19 final published checkpoint `7ea9a4d` / draft PR #152. Final branch head `e9cb35516dd8d735a869e24e1d2d587468040b85`, branch `codex/refactor-t20-extensibility`, draft PR [#153](https://github.com/Mar2ianen/NedoBot/pull/153), stacked on #152. Both CI runs passed: [#43924099073](https://github.com/Mar2ianen/NedoBot/actions/runs/43924099073) and [#43924112125](https://github.com/Mar2ianen/NedoBot/actions/runs/43924112125). This walkthrough is static; it adds no executable downloader, command, Telegram send, ffmpeg, yt-dlp, or runtime configuration.
 
 The hypothetical media import surface and its tradeoffs are in [`verification/EXTENSIBILITY_CONTRACT.md`](../verification/EXTENSIBILITY_CONTRACT.md). The expected change is a vertical feature slice plus the existing explicit command, config, worker, metrics, migration, and test registration seams. A command trigger does not require editing ordinary-message routing. None of `ask/agent.rs`, `voice/pipeline.rs`, or `new_user_analysis.rs` needs to change.
 

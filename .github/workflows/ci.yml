@@ -57,6 +57,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Test no-default feature set
+        run: cargo test --no-default-features --workspace --all-targets --locked
+
+      - name: Check no-default feature set
+        run: cargo check --no-default-features --workspace --all-targets --locked
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
