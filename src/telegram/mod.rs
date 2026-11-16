@@ -5,6 +5,7 @@ pub mod callbacks;
 pub mod command_handler;
 pub mod commands;
 pub mod custom_emoji;
+pub mod delivery;
 pub mod entities;
 pub mod export_rich;
 pub mod html;

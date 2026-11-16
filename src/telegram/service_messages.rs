@@ -191,9 +191,8 @@ async fn send_plain_fallback(
         Err(_) => return Err(original_error),
     };
     tracing::warn!(
-        %original_error,
         chat_id = chat_id.0,
-        "Telegram HTML delivery failed; retrying as escaped plain text"
+        "Telegram HTML delivery failed; retrying with escaped plain text"
     );
     let bot = bot.inner();
     let request = bot
@@ -346,7 +345,10 @@ pub fn should_fallback_after_payload_rejection(error: &RequestError) -> bool {
 /// A failed send with no definitive Telegram rejection may already have been
 /// accepted. Durable senders should not retry it as a new message.
 pub fn delivery_outcome_is_unknown(error: &RequestError) -> bool {
-    matches!(error, RequestError::Network(_) | RequestError::Io(_))
+    matches!(
+        error,
+        RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_)
+    )
 }
 
 fn with_ephemeral_parameters<R: SendMessageSetters>(
@@ -479,6 +481,12 @@ mod tests {
         assert!(!should_fallback_after_payload_rejection(
             &RequestError::Api(ApiError::BotBlocked)
         ));
+        assert!(delivery_outcome_is_unknown(&RequestError::InvalidJson {
+            source: std::sync::Arc::new(
+                serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            ),
+            raw: "private response".into(),
+        }));
     }
 
     #[test]
