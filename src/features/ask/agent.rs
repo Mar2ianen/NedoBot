@@ -259,6 +259,13 @@ async fn answer_within_deadline(
                     "SYSTEM: профиль не разрешает чтение reply-ветки; поиск по сообщениям закрыт, чтобы не смешать контекст.".to_owned(),
                 );
             }
+        } else if !reply_prefetch_has_tool_budget(tool_call_count, profile.budgets.max_tool_calls) {
+            if reply_scope.strict {
+                push_observation(
+                    &mut observations,
+                    "SYSTEM: лимит вызовов инструментов исчерпан до чтения reply-ветки; поиск по другим сообщениям закрыт, чтобы не смешать контекст.".to_owned(),
+                );
+            }
         } else {
             let arguments = json!({"message_id": message_id});
             let started = Instant::now();
@@ -1283,6 +1290,10 @@ fn reply_thread_prefetch_allowed(profile: &AgentProfile) -> bool {
         .tool_allowlist
         .iter()
         .any(|tool| tool == "chat.get_reply_thread")
+}
+
+fn reply_prefetch_has_tool_budget(used_calls: usize, max_calls: usize) -> bool {
+    used_calls < max_calls
 }
 
 fn filter_reply_scoped_result(tool: &str, value: &Value, allowed_ids: &HashSet<i32>) -> Value {
