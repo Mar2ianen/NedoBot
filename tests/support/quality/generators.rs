@@ -225,3 +225,117 @@ pub fn ordered_job_operations() -> impl Strategy<Value = Vec<JobOperation>> {
         0..=32,
     )
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    Text,
+    Entity,
+    Caption,
+    Qr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub target: u8,
+    pub source: EvidenceSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IngressMessageKey {
+    pub instance: String,
+    pub chat_id: i64,
+    pub user_id: u64,
+    pub message_id: i32,
+}
+
+pub fn ingress_message_key() -> impl Strategy<Value = IngressMessageKey> {
+    (
+        "[a-z][a-z0-9_]{0,11}",
+        -100_000_000_000_i64..=-1,
+        1_u64..=9_999_999_999,
+        1_i32..=2_000_000_000,
+    )
+        .prop_map(
+            |(instance, chat_id, user_id, message_id)| IngressMessageKey {
+                instance,
+                chat_id,
+                user_id,
+                message_id,
+            },
+        )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum IngressOperation {
+    Receive {
+        revision: u16,
+        media_generation: u8,
+        evidence: Vec<EvidenceRef>,
+    },
+    Duplicate {
+        revision: u16,
+    },
+    Edit {
+        revision: u16,
+        media_generation: u8,
+        evidence: Vec<EvidenceRef>,
+    },
+    RemoveLink {
+        revision: u16,
+    },
+    AttachQr {
+        media_generation: u8,
+        targets: Vec<u8>,
+    },
+    ReplaceMedia {
+        revision: u16,
+        media_generation: u8,
+    },
+    DeleteStoredMessage,
+    RefreshShadow {
+        revision: u16,
+    },
+    RetryOldJob {
+        media_generation: u8,
+        targets: Vec<u8>,
+    },
+}
+
+fn evidence_refs() -> impl Strategy<Value = Vec<EvidenceRef>> {
+    collection::vec(
+        (
+            0_u8..=15,
+            prop_oneof![
+                Just(EvidenceSource::Text),
+                Just(EvidenceSource::Entity),
+                Just(EvidenceSource::Caption),
+            ],
+        )
+            .prop_map(|(target, source)| EvidenceRef { target, source }),
+        0..=8,
+    )
+}
+
+fn target_refs() -> impl Strategy<Value = Vec<u8>> {
+    collection::vec(0_u8..=15, 0..=8)
+}
+
+pub fn ingress_operation() -> impl Strategy<Value = IngressOperation> {
+    prop_oneof![
+        2 => (1_u16..=100, 0_u8..=15, evidence_refs()).prop_map(|(revision, media_generation, evidence)| IngressOperation::Receive { revision, media_generation, evidence }),
+        2 => (1_u16..=100).prop_map(|revision| IngressOperation::Duplicate { revision }),
+        3 => (1_u16..=100, 0_u8..=15, evidence_refs()).prop_map(|(revision, media_generation, evidence)| IngressOperation::Edit { revision, media_generation, evidence }),
+        1 => (1_u16..=100).prop_map(|revision| IngressOperation::RemoveLink { revision }),
+        2 => (0_u8..=15, target_refs()).prop_map(|(media_generation, targets)| IngressOperation::AttachQr { media_generation, targets }),
+        2 => (1_u16..=100, 0_u8..=15).prop_map(|(revision, media_generation)| IngressOperation::ReplaceMedia { revision, media_generation }),
+        1 => Just(IngressOperation::DeleteStoredMessage),
+        2 => (1_u16..=100).prop_map(|revision| IngressOperation::RefreshShadow { revision }),
+        1 => (0_u8..=15, target_refs()).prop_map(|(media_generation, targets)| IngressOperation::RetryOldJob { media_generation, targets }),
+    ]
+}
+
+pub fn ingress_trace() -> impl Strategy<Value = Vec<IngressOperation>> {
+    collection::vec(ingress_operation(), 1..=32)
+}

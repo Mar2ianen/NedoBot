@@ -7,8 +7,8 @@ use std::{
 use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
-use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+use teloxide::{Bot, types::Message};
 use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
 use uuid::Uuid;
@@ -47,6 +47,7 @@ use tg_ai_bot_teloxide::{
             mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
             mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
         },
+        ingest::ingest_message,
         jobs::{claim::CasResult, observability::load_job_lifecycle_report},
         labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
         memory::embedding::EMBEDDINGGEMMA2_MODEL_ID,
@@ -116,6 +117,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_ingest_disabled_is_noop(&pool).await;
     membership_history::assert_membership_history(&pool).await;
     decision_shadow::assert_decision_shadow(&pool).await;
     local_cascade::assert_local_cascade(&pool).await;
@@ -180,6 +182,93 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+}
+
+async fn assert_ingest_disabled_is_noop(pool: &PgPool) {
+    const CHAT_ID: i64 = -100_900_333;
+    const MESSAGE_ID: i32 = 900_333;
+    const USER_ID: i64 = 900_333;
+
+    query("delete from telegram_messages where chat_id = $1 and message_id = $2")
+        .bind(CHAT_ID)
+        .bind(MESSAGE_ID)
+        .execute(pool)
+        .await
+        .expect("synthetic ingress fixture cleanup must succeed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("synthetic profile fixture cleanup must succeed");
+
+    let example_profile = format!(
+        "{}/config/llm_profiles.toml.example",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let previous_profile_path = std::env::var_os("LLM_PROFILES_PATH");
+    unsafe { std::env::set_var("LLM_PROFILES_PATH", &example_profile) };
+    let config_result = Config::from_env();
+    unsafe {
+        if let Some(previous_profile_path) = previous_profile_path {
+            std::env::set_var("LLM_PROFILES_PATH", previous_profile_path);
+        } else {
+            std::env::remove_var("LLM_PROFILES_PATH");
+        }
+    }
+    let mut config = config_result.expect("committed example runtime config must load");
+    let chat = config
+        .community
+        .chats
+        .get_mut("main")
+        .expect("committed test config must include main chat");
+    chat.id = CHAT_ID;
+    chat.ingest = false;
+    config.discussion_chat_id = CHAT_ID;
+    config.chat_registry = ChatRegistry::new(&config.community)
+        .expect("synthetic disabled-ingest chat registry must build");
+
+    let message: Message = serde_json::from_value(serde_json::json!({
+        "message_id": MESSAGE_ID,
+        "date": 1_700_000_000,
+        "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Synthetic"},
+        "from": {"id": USER_ID, "is_bot": false, "first_name": "Synthetic"},
+        "text": "synthetic https://example.invalid/disabled-ingest"
+    }))
+    .expect("synthetic Message must decode");
+
+    assert!(
+        !ingest_message(pool, &message, &config)
+            .await
+            .expect("disabled ingest must return without an error")
+    );
+    let message_rows: i64 = query_scalar(
+        "select count(*) from telegram_messages where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("synthetic message row count must be queryable");
+    let profile_rows: i64 =
+        query_scalar("select count(*) from telegram_user_profiles where telegram_user_id = $1")
+            .bind(USER_ID)
+            .fetch_one(pool)
+            .await
+            .expect("synthetic profile row count must be queryable");
+    let evidence_rows: i64 = query_scalar(
+        "select count(*) from telegram_message_url_evidence where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("synthetic evidence row count must be queryable");
+    assert_eq!(message_rows, 0, "ingest=false must not persist the message");
+    assert_eq!(profile_rows, 0, "ingest=false must not persist its profile");
+    assert_eq!(
+        evidence_rows, 0,
+        "ingest=false must not persist URL evidence"
+    );
 }
 
 async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {

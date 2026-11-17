@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
     exit 2
 fi
 
@@ -34,9 +34,10 @@ case "$case_id" in
         test_target=tg_ai_bot_teloxide
         test_filter=structurally_valid_generated_messages_preserve_command_precedence
         ;;
+    ingress-reference-trace) test_filter=ingress_reference_model_keeps_only_current_revision_and_media_evidence ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
         exit 2
         ;;
 esac

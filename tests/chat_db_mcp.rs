@@ -342,6 +342,7 @@ async fn independent_community_databases_generate_manifests_and_start_isolated_m
             "community-b-user-note",
         )
         .await?;
+        assert_database_evidence_isolation(&database_a, &database_b, &marker_a, &marker_b).await?;
 
         let config_a = config_for_instance(&profile_a, &database_a, &manifest_a)?;
         ensure!(
@@ -598,6 +599,13 @@ async fn seed_instance_data(
         .bind(message)
         .execute(&pool)
         .await?;
+    query("insert into telegram_message_url_evidence (chat_id, message_id, parser_version, item_index, kind, source, target_sha256, host, display_hint, privacy_sensitive) values ($1, $2, 2, 0, 'url', 'visible_text', $3, 'example.invalid', $4, true)")
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(format!("{:064x}", user_id as u64))
+        .bind(format!("https://example.invalid/{message}"))
+        .execute(&pool)
+        .await?;
     query("insert into telegram_chat_notes (chat_id, note, created_by_user_id) values ($1, $2, 1)")
         .bind(chat_id)
         .bind(chat_note)
@@ -609,6 +617,51 @@ async fn seed_instance_data(
         .bind(user_note)
         .execute(&pool)
         .await?;
+    Ok(())
+}
+
+async fn assert_database_evidence_isolation(
+    database_a: &str,
+    database_b: &str,
+    marker_a: &str,
+    marker_b: &str,
+) -> Result<()> {
+    let pool_a = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_a)
+        .await?;
+    let pool_b = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_b)
+        .await?;
+    let evidence_a: i64 = sqlx::query_scalar(
+        "select count(*) from telegram_message_url_evidence where display_hint = $1",
+    )
+    .bind(format!("https://example.invalid/{marker_a}"))
+    .fetch_one(&pool_a)
+    .await?;
+    let evidence_a_in_b: i64 = sqlx::query_scalar(
+        "select count(*) from telegram_message_url_evidence where display_hint = $1",
+    )
+    .bind(format!("https://example.invalid/{marker_a}"))
+    .fetch_one(&pool_b)
+    .await?;
+    let evidence_b: i64 = sqlx::query_scalar(
+        "select count(*) from telegram_message_url_evidence where display_hint = $1",
+    )
+    .bind(format!("https://example.invalid/{marker_b}"))
+    .fetch_one(&pool_b)
+    .await?;
+    let evidence_b_in_a: i64 = sqlx::query_scalar(
+        "select count(*) from telegram_message_url_evidence where display_hint = $1",
+    )
+    .bind(format!("https://example.invalid/{marker_b}"))
+    .fetch_one(&pool_a)
+    .await?;
+    ensure!(evidence_a == 1 && evidence_b == 1);
+    ensure!(evidence_a_in_b == 0 && evidence_b_in_a == 0);
+    pool_a.close().await;
+    pool_b.close().await;
     Ok(())
 }
 
