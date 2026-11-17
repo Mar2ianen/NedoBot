@@ -173,3 +173,113 @@ mod manual_moderation_tests {
         assert!(matches!(Command::parse("/undo", "bot"), Ok(Command::Undo)));
     }
 }
+
+#[cfg(test)]
+mod command_inventory_tests {
+    use super::Command;
+    use teloxide::utils::command::BotCommands;
+
+    #[test]
+    fn ungated_commands_remain_parseable() {
+        for (input, bot_name) in [
+            ("/help", "nedobot"),
+            ("/ping", "nedobot"),
+            ("/db", "nedobot"),
+            ("/emoji_ids", "nedobot"),
+            ("/memory", "nedobot"),
+            ("/stats_day", "nedobot"),
+            ("/stats_week", "nedobot"),
+            ("/stats_month", "nedobot"),
+            ("/status", "nedobot"),
+            ("/topmsg", "nedobot"),
+            ("/topword rust", "nedobot"),
+            ("/topreact", "nedobot"),
+            ("/bottommsg", "nedobot"),
+            ("/userstats 42", "nedobot"),
+            ("/userstatus 42", "nedobot"),
+        ] {
+            assert!(
+                Command::parse(input, bot_name).is_ok(),
+                "{input} must parse"
+            );
+        }
+    }
+
+    #[cfg(feature = "ask")]
+    #[test]
+    fn ask_commands_are_present_only_with_the_ask_feature() {
+        for input in [
+            "/ask synthetic question",
+            "/forget",
+            "/chat_note synthetic",
+            "/user_note synthetic",
+        ] {
+            assert!(
+                Command::parse(input, "nedobot").is_ok(),
+                "{input} must parse"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "ask"))]
+    #[test]
+    fn ask_commands_are_not_registered_without_the_ask_feature() {
+        assert!(Command::parse("/ask synthetic question", "nedobot").is_err());
+    }
+
+    #[cfg(feature = "moderation")]
+    #[test]
+    fn moderation_commands_are_present_with_the_moderation_feature() {
+        assert!(Command::parse("/report synthetic", "nedobot").is_ok());
+        assert!(Command::parse("/notspam synthetic", "nedobot").is_ok());
+    }
+
+    #[cfg(not(feature = "moderation"))]
+    #[test]
+    fn moderation_commands_are_not_registered_without_the_moderation_feature() {
+        assert!(Command::parse("/report synthetic", "nedobot").is_err());
+    }
+
+    #[cfg(feature = "manual-moderation")]
+    #[test]
+    fn manual_moderation_commands_are_present_with_their_feature() {
+        for input in [
+            "/mute", "/ban", "/warn", "/unmute", "/unban", "/unwarn", "/warns", "/modlog", "/undo",
+        ] {
+            assert!(
+                Command::parse(input, "nedobot").is_ok(),
+                "{input} must parse"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "manual-moderation"))]
+    #[test]
+    fn manual_moderation_commands_are_not_registered_without_their_feature() {
+        assert!(Command::parse("/ban", "nedobot").is_err());
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn transcription_command_is_registered_with_voice_feature() {
+        assert!(Command::parse("/transcribe", "nedobot").is_ok());
+    }
+
+    #[cfg(not(feature = "voice"))]
+    #[test]
+    fn transcription_command_is_not_registered_without_voice_feature() {
+        assert!(Command::parse("/transcribe", "nedobot").is_err());
+    }
+
+    #[cfg(feature = "auto-comment")]
+    #[test]
+    fn format_test_command_is_registered_with_auto_comment_feature() {
+        assert!(Command::parse("/format_test synthetic", "nedobot").is_ok());
+    }
+
+    #[cfg(not(feature = "auto-comment"))]
+    #[test]
+    fn format_test_command_is_not_registered_without_auto_comment_feature() {
+        assert!(Command::parse("/format_test synthetic", "nedobot").is_err());
+    }
+}

@@ -92,6 +92,8 @@ pub(crate) fn utf16_range(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "ask", feature = "moderation"))]
+    use super::utf16_range;
     use super::{message_has_links, message_url_targets};
     use teloxide::types::Message;
 
@@ -133,5 +135,16 @@ mod tests {
         .unwrap();
 
         assert!(!message_has_links(&message));
+    }
+
+    #[cfg(any(feature = "ask", feature = "moderation"))]
+    #[test]
+    fn utf16_entity_ranges_accept_codepoint_boundaries_and_reject_surrogate_splits() {
+        let text = "😀x";
+        assert_eq!(utf16_range(text, 0, 2), Some(0..4));
+        assert_eq!(utf16_range(text, 2, 1), Some(4..5));
+        assert_eq!(utf16_range(text, 1, 1), None);
+        assert_eq!(utf16_range(text, 3, 1), None);
+        assert_eq!(utf16_range(text, usize::MAX, 1), None);
     }
 }

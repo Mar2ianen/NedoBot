@@ -3,12 +3,14 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence" >&2
     exit 2
 fi
 
 case_id=$1
 seed=$2
+test_target_flag=--test
+test_target=adversarial_harness
 case "$seed" in
     ''|*[!0-9]*)
         echo "seed must be an unsigned decimal integer" >&2
@@ -27,9 +29,14 @@ case "$case_id" in
     http-outcomes) test_filter=typed_http_outcomes_preserve_uncertain_delivery_and_bounds ;;
     safe-report) test_filter=reports_omit_payload_and_require_evidence_for_v1 ;;
     minimal-url-trace) test_filter=minimal_operation_trace_replays_with_independent_identity ;;
+    telegram-route-command-precedence)
+        test_target_flag=--bin
+        test_target=tg_ai_bot_teloxide
+        test_filter=structurally_valid_generated_messages_preserve_command_precedence
+        ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence" >&2
         exit 2
         ;;
 esac
@@ -38,4 +45,4 @@ export NEDOBOT_PROPTEST_SEED="$seed"
 if [ -z "${GITHUB_SHA:-}" ]; then
     export NEDOBOT_TEST_SHA="$(git rev-parse HEAD)"
 fi
-exec cargo test --test adversarial_harness --locked "$test_filter" -- --nocapture
+exec cargo test "$test_target_flag" "$test_target" --locked "$test_filter" -- --nocapture
