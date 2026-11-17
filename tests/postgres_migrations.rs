@@ -3929,8 +3929,12 @@ async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
             .expect("local transient failure listener must accept the request");
         let mut request = [0; 1_024];
         let _ = stream.read(&mut request);
-        stream
-            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        let body = r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
             .expect("local transient failure response must be written");
     });
     let bot = Bot::new("test-token").set_api_url(
