@@ -422,6 +422,173 @@ fn typed_authorization_and_ordered_job_strategies_round_trip() {
 }
 
 #[test]
+fn ingress_reference_model_keeps_only_current_revision_and_media_evidence() {
+    use quality::{
+        generators::{
+            EvidenceRef, EvidenceSource, IngressMessageKey, IngressOperation, ingress_message_key,
+            ingress_trace,
+        },
+        model::{ReferenceIngress, ReferenceIngressStore},
+    };
+
+    let mut state = ReferenceIngress::default();
+    let receive = IngressOperation::Receive {
+        revision: 1,
+        media_generation: 10,
+        evidence: vec![
+            EvidenceRef {
+                target: 1,
+                source: EvidenceSource::Text,
+            },
+            EvidenceRef {
+                target: 1,
+                source: EvidenceSource::Entity,
+            },
+        ],
+    };
+    state.apply(&receive);
+    assert_eq!(state.unique_target_count(), 1);
+    assert_eq!(state.message_evidence.len(), 2);
+
+    state.apply(&IngressOperation::AttachQr {
+        media_generation: 10,
+        targets: vec![2],
+    });
+    assert_eq!(state.unique_target_count(), 2);
+    let with_current_qr = state.clone();
+    state.apply(&IngressOperation::RetryOldJob {
+        media_generation: 9,
+        targets: vec![3],
+    });
+    assert_eq!(state, with_current_qr, "stale QR retry must be a no-op");
+
+    state.apply(&IngressOperation::RefreshShadow { revision: 1 });
+    assert_eq!(state.shadow_revision, Some(1));
+    assert_eq!(state.shadow_evidence, with_current_qr.current_evidence());
+
+    state.apply(&IngressOperation::Edit {
+        revision: 2,
+        media_generation: 11,
+        evidence: vec![EvidenceRef {
+            target: 4,
+            source: EvidenceSource::Caption,
+        }],
+    });
+    assert_eq!(state.unique_target_count(), 1);
+    assert_eq!(state.current_evidence().iter().next().unwrap().target, 4);
+    let after_edit = state.clone();
+    state.apply(&IngressOperation::Edit {
+        revision: 1,
+        media_generation: 10,
+        evidence: vec![EvidenceRef {
+            target: 5,
+            source: EvidenceSource::Text,
+        }],
+    });
+    assert_eq!(
+        state, after_edit,
+        "late old edit must not restore stale evidence"
+    );
+    state.apply(&IngressOperation::RemoveLink { revision: 3 });
+    assert!(state.current_evidence().is_empty());
+    state.apply(&IngressOperation::RefreshShadow { revision: 3 });
+    assert!(state.shadow_evidence.is_empty());
+
+    // Identical Telegram identifiers in separate instances are different keys.
+    let key_a = IngressMessageKey {
+        instance: "community_a".into(),
+        chat_id: -1001,
+        user_id: 42,
+        message_id: 7,
+    };
+    let key_b = IngressMessageKey {
+        instance: "community_b".into(),
+        ..key_a.clone()
+    };
+    let mut isolated = ReferenceIngressStore::default();
+    isolated.apply(key_a.clone(), &receive);
+    assert!(isolated.message(&key_b).is_none());
+    isolated.apply(
+        key_b.clone(),
+        &IngressOperation::Receive {
+            revision: 1,
+            media_generation: 10,
+            evidence: vec![EvidenceRef {
+                target: 8,
+                source: EvidenceSource::Text,
+            }],
+        },
+    );
+    assert_eq!(isolated.message(&key_a).unwrap().unique_target_count(), 1);
+    assert_eq!(
+        isolated
+            .message(&key_b)
+            .unwrap()
+            .current_evidence()
+            .iter()
+            .next()
+            .unwrap()
+            .target,
+        8
+    );
+
+    let seed = replay_seed();
+    let mut runner = fixed_runner(seed, PROPERTY_CASES);
+    let accepted = Cell::new(0_u32);
+    runner
+        .run(&(ingress_message_key(), ingress_trace()), |(key, trace)| {
+            let mut store = ReferenceIngressStore::default();
+            for operation in &trace {
+                let before = store.message(&key).cloned().unwrap_or_default();
+                let should_be_ignored = match operation {
+                    IngressOperation::Duplicate { .. } => true,
+                    IngressOperation::Edit { revision, .. }
+                    | IngressOperation::RemoveLink { revision }
+                    | IngressOperation::ReplaceMedia { revision, .. } => {
+                        before.revision.is_some_and(|current| *revision <= current)
+                    }
+                    IngressOperation::AttachQr {
+                        media_generation, ..
+                    }
+                    | IngressOperation::RetryOldJob {
+                        media_generation, ..
+                    } => before.media_generation != Some(*media_generation),
+                    IngressOperation::RefreshShadow { revision } => {
+                        before.revision != Some(*revision)
+                    }
+                    IngressOperation::Receive { revision, .. } => {
+                        before.revision.is_some_and(|current| *revision <= current)
+                    }
+                    IngressOperation::DeleteStoredMessage => false,
+                };
+                store.apply(key.clone(), operation);
+                let after = store.message(&key).cloned().unwrap_or_default();
+                if should_be_ignored {
+                    prop_assert_eq!(&after, &before, "stale or duplicate op: {:?}", operation);
+                }
+                prop_assert!(after.unique_target_count() <= after.current_evidence().len());
+            }
+            accepted.set(accepted.get() + 1);
+            Ok(())
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}",
+                failure_summary("ingress-reference-trace", seed, error)
+            )
+        });
+    let report = property_case_report(
+        "ingress-reference-trace",
+        "INGRESS-CURRENT-REVISION-01",
+        seed,
+        accepted.get(),
+        0,
+    );
+    assert!(report.is_well_formed());
+    assert_eq!(report.accepted, PROPERTY_CASES);
+}
+
+#[test]
 fn typed_http_outcomes_preserve_uncertain_delivery_and_bounds() {
     use quality::{
         fixed_runner,

@@ -776,7 +776,7 @@ mod tests {
         query("delete from telegram_messages where chat_id = $1 and message_id between $2 and $3")
             .bind(TEST_CHAT_ID)
             .bind(TEST_MESSAGE_ID)
-            .bind(TEST_MESSAGE_ID + 1)
+            .bind(TEST_MESSAGE_ID + 4)
             .execute(&pool)
             .await
             .unwrap();
@@ -822,6 +822,80 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(original.0, edited_hash);
+
+        // Replaying the same delivery cannot duplicate the current projection.
+        assert_eq!(
+            replace_message_url_evidence(&pool, &edited).await.unwrap(),
+            1
+        );
+        let replayed_hash: String = query_scalar(
+            "select target_sha256::text from telegram_message_url_evidence where chat_id = $1 and message_id = $2",
+        )
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replayed_hash, edited_hash);
+
+        // The same resource coming from visible text and a hidden text_link is
+        // represented by multiple provenance rows but one unique identity.
+        let same_target = "https://example.invalid/shared";
+        let multi_source: Message = serde_json::from_value(json!({
+            "message_id": TEST_MESSAGE_ID + 4,
+            "date": 1_700_000_000,
+            "chat": {"id": TEST_CHAT_ID, "type": "supergroup"},
+            "from": {"id": 7_777_777, "is_bot": false, "first_name": "Synthetic"},
+            "text": format!("open {same_target}"),
+            "entities": [{
+                "type": "text_link", "offset": 0, "length": 4,
+                "url": same_target
+            }]
+        }))
+        .unwrap();
+        insert_message(&pool, &multi_source).await;
+        assert_eq!(
+            replace_message_url_evidence(&pool, &multi_source)
+                .await
+                .unwrap(),
+            2
+        );
+        let (provenance_rows, unique_targets, expected_hash_matches): (i64, i64, i64) = query_as(
+            "select count(*), count(distinct target_sha256), count(*) filter (where target_sha256 = $3) from telegram_message_url_evidence where chat_id = $1 and message_id = $2",
+        )
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID + 4)
+        .bind(reference_url_hash(same_target))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(provenance_rows, 2);
+        assert_eq!(unique_targets, 1);
+        assert_eq!(expected_hash_matches, 2);
+
+        // Removing a link on edit removes its old evidence from the projection.
+        let no_link: Message = serde_json::from_value(json!({
+            "message_id": TEST_MESSAGE_ID,
+            "date": 1_700_000_001,
+            "edit_date": 1_700_000_001,
+            "chat": {"id": TEST_CHAT_ID, "type": "supergroup"},
+            "from": {"id": 7_777_777, "is_bot": false, "first_name": "Synthetic"},
+            "text": "edited without a link"
+        }))
+        .unwrap();
+        assert_eq!(
+            replace_message_url_evidence(&pool, &no_link).await.unwrap(),
+            0
+        );
+        let removed_rows: i64 = query_scalar(
+            "select count(*) from telegram_message_url_evidence where chat_id = $1 and message_id = $2",
+        )
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(removed_rows, 0);
 
         let backfill = hidden_link_message(TEST_MESSAGE_ID + 1, "SYNTHETIC_BACKFILL");
         insert_message(&pool, &backfill).await;
@@ -944,6 +1018,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stale_write, None);
+        // The worker-side generation check rejects the old result even before
+        // the edit handler's best-effort queue supersession runs.
+        supersede_qr_scan_jobs(&pool, &edited_current, true)
+            .await
+            .unwrap();
         let stale_qr_rows: i64 = query_scalar(
             "select count(*) from telegram_message_url_evidence where chat_id = $1 and message_id = $2 and source = 'qr'",
         )
@@ -957,7 +1036,7 @@ mod tests {
         query("delete from telegram_messages where chat_id = $1 and message_id between $2 and $3")
             .bind(TEST_CHAT_ID)
             .bind(TEST_MESSAGE_ID)
-            .bind(TEST_MESSAGE_ID + 3)
+            .bind(TEST_MESSAGE_ID + 4)
             .execute(&pool)
             .await
             .unwrap();
@@ -984,6 +1063,17 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    fn reference_url_hash(target: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"nedobot-url-evidence-v1\0url\0");
+        digest.update(target.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     fn photo_message(message_id: i32, file_id: &str, unique_id: &str) -> Message {
