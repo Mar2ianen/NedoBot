@@ -196,6 +196,84 @@ async fn post_comment_claim_skips_a_locked_oldest_ready_job() {
     assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
 }
 
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn captcha_wrong_answers_are_atomic_with_one_database_connection() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let id = Uuid::new_v4();
+    let chat_id = -1_009_876_543_210_i64;
+    let user_id = 9_876_543_210_i64;
+    query(
+        r#"insert into telegram_risk_captcha_challenges
+               (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
+                options, correct_option, restore_permissions, status, expires_at)
+           values ($1, $2, $3, 1, 90, '1 + 1 = ?', '["2","3","4","5"]', 0,
+                   '{}', 'pending', now() + interval '1 hour')"#,
+    )
+    .bind(id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic pending captcha must be created");
+
+    let (first, second, third) = tokio::join!(
+        record_wrong_answer(&pool, id),
+        record_wrong_answer(&pool, id),
+        record_wrong_answer(&pool, id),
+    );
+    let outcomes = [
+        first.expect("first wrong answer must commit"),
+        second.expect("second wrong answer must commit"),
+        third.expect("third wrong answer must commit"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Wrong { attempts_left: 2 })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Wrong { attempts_left: 1 })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Failed)
+            .count(),
+        1
+    );
+    let state: (i32, String) =
+        query_as("select attempts, status from telegram_risk_captcha_challenges where id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("concurrent captcha state must remain readable");
+    assert_eq!(state, (3, "failed".to_owned()));
+    assert_eq!(
+        record_wrong_answer(&pool, id)
+            .await
+            .expect("closed captcha must reject a late callback"),
+        CaptchaCallbackOutcome::Stale
+    );
+    query("delete from telegram_risk_captcha_challenges where id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("synthetic captcha must be removed");
+}
+
 async fn assert_ingest_disabled_is_noop(pool: &PgPool) {
     const CHAT_ID: i64 = -100_900_333;
     const MESSAGE_ID: i32 = 900_333;

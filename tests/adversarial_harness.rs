@@ -489,6 +489,91 @@ fn durable_job_reference_model_preserves_fences_and_uncertain_delivery() {
 }
 
 #[test]
+fn moderation_reference_model_preserves_veto_ownership_and_uncertainty() {
+    use quality::{
+        generators::{ModerationOperation as Op, PrivilegeRole as Role, moderation_trace},
+        moderation::{CaptchaState, ModerationModel, Restriction},
+    };
+
+    let foreign_solver = [
+        Op::IssueCaptcha { owner: 1 },
+        Op::ApplyCaptchaRestriction,
+        Op::SolveCaptcha { actor: 2 },
+    ];
+    let mut captcha = ModerationModel::default();
+    for op in foreign_solver {
+        captcha.apply(op);
+    }
+    assert_eq!(captcha.captcha, CaptchaState::Pending);
+    assert!(captcha.captcha_owned_restriction);
+    captcha.apply(Op::SolveCaptcha { actor: 1 });
+    assert_eq!(captcha.captcha, CaptchaState::Passed);
+    assert!(!captcha.captcha_owned_restriction);
+    assert_eq!(captcha.captcha_releases, 1);
+
+    let mut veto = ModerationModel::default();
+    for op in [Op::LabelNotSpam, Op::AutoEnforce { score: 100 }] {
+        veto.apply(op);
+    }
+    assert_eq!(veto.automatic_effects, 0);
+    veto.apply(Op::LabelSpam);
+    veto.apply(Op::EditSource);
+    veto.apply(Op::AutoEnforce { score: 100 });
+    assert_eq!(
+        veto.automatic_effects, 0,
+        "stale source cannot authorize a sanction"
+    );
+
+    let accepted_manual = Op::ManualRestrict {
+        actor: Role::AdminWithRestrict,
+        bot: Role::Owner,
+        target: Role::Member,
+        target_is_bot: false,
+    };
+    let mut manual = ModerationModel::default();
+    manual.apply(accepted_manual);
+    assert_eq!(manual.manual_restriction, Some(Restriction::Mute));
+    manual.apply(Op::IssueCaptcha { owner: 3 });
+    manual.apply(Op::ApplyCaptchaRestriction);
+    manual.apply(Op::SolveCaptcha { actor: 3 });
+    assert_eq!(manual.manual_restriction, Some(Restriction::Mute));
+    assert_eq!(manual.captcha_releases, 0);
+
+    let mut unknown = ModerationModel::default();
+    unknown.apply(Op::TelegramUnknown);
+    unknown.apply(Op::RetryTelegramEffect);
+    assert!(unknown.uncertain_delivery);
+    assert_eq!(unknown.external_effects, 0);
+
+    let seed = replay_seed();
+    let mut runner = fixed_runner(seed, PROPERTY_CASES);
+    let traces = Cell::new(0_u32);
+    runner
+        .run(&moderation_trace(), |trace| {
+            let mut model = ModerationModel::default();
+            for op in &trace {
+                model.apply(*op);
+                prop_assert!(
+                    model.invariant_holds(),
+                    "trace={trace:?} operation={op:?} state={model:?}"
+                );
+                prop_assert!(model.invariant_holds());
+                if model.latest_not_spam || !model.source_current {
+                    let before = model.automatic_effects;
+                    model.apply(Op::AutoEnforce { score: 100 });
+                    prop_assert_eq!(model.automatic_effects, before);
+                }
+            }
+            traces.set(traces.get() + 1);
+            Ok(())
+        })
+        .unwrap_or_else(|error| {
+            panic!("{}", failure_summary("moderation-state-trace", seed, error))
+        });
+    assert_eq!(traces.get(), PROPERTY_CASES);
+}
+
+#[test]
 fn ingress_reference_model_keeps_only_current_revision_and_media_evidence() {
     use quality::{
         generators::{

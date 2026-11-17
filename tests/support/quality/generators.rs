@@ -261,6 +261,99 @@ pub fn durable_job_trace() -> impl Strategy<Value = Vec<DurableJobOperation>> {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegeRole {
+    Owner,
+    AdminWithRestrict,
+    AdminWithoutRestrict,
+    Member,
+    Restricted,
+    Left,
+    Banned,
+}
+
+impl PrivilegeRole {
+    pub fn is_privileged(self) -> bool {
+        matches!(
+            self,
+            Self::Owner | Self::AdminWithRestrict | Self::AdminWithoutRestrict
+        )
+    }
+
+    pub fn can_restrict(self) -> bool {
+        matches!(self, Self::Owner | Self::AdminWithRestrict)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum ModerationOperation {
+    LabelNotSpam,
+    LabelSpam,
+    EditSource,
+    AutoEnforce {
+        score: u8,
+    },
+    ManualRestrict {
+        actor: PrivilegeRole,
+        bot: PrivilegeRole,
+        target: PrivilegeRole,
+        target_is_bot: bool,
+    },
+    IssueCaptcha {
+        owner: u8,
+    },
+    ApplyCaptchaRestriction,
+    SolveCaptcha {
+        actor: u8,
+    },
+    ExpireCaptcha,
+    UndoManualRestriction,
+    TelegramUnknown,
+    RetryTelegramEffect,
+    ModeratorDisconnected,
+    DuplicateEvent,
+}
+
+pub fn moderation_trace() -> impl Strategy<Value = Vec<ModerationOperation>> {
+    let role = prop_oneof![
+        Just(PrivilegeRole::Owner),
+        Just(PrivilegeRole::AdminWithRestrict),
+        Just(PrivilegeRole::AdminWithoutRestrict),
+        Just(PrivilegeRole::Member),
+        Just(PrivilegeRole::Restricted),
+        Just(PrivilegeRole::Left),
+        Just(PrivilegeRole::Banned),
+    ];
+    collection::vec(
+        prop_oneof![
+            Just(ModerationOperation::LabelNotSpam),
+            Just(ModerationOperation::LabelSpam),
+            Just(ModerationOperation::EditSource),
+            (0_u8..=100).prop_map(|score| ModerationOperation::AutoEnforce { score }),
+            (role.clone(), role.clone(), role, any::<bool>()).prop_map(
+                |(actor, bot, target, target_is_bot)| ModerationOperation::ManualRestrict {
+                    actor,
+                    bot,
+                    target,
+                    target_is_bot,
+                }
+            ),
+            (0_u8..=3).prop_map(|owner| ModerationOperation::IssueCaptcha { owner }),
+            Just(ModerationOperation::ApplyCaptchaRestriction),
+            (0_u8..=3).prop_map(|actor| ModerationOperation::SolveCaptcha { actor }),
+            Just(ModerationOperation::ExpireCaptcha),
+            Just(ModerationOperation::UndoManualRestriction),
+            Just(ModerationOperation::TelegramUnknown),
+            Just(ModerationOperation::RetryTelegramEffect),
+            Just(ModerationOperation::ModeratorDisconnected),
+            Just(ModerationOperation::DuplicateEvent),
+        ],
+        0..=64,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSource {

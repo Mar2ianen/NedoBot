@@ -1,6 +1,7 @@
 pub mod durable_jobs;
 pub mod generators;
 pub mod model;
+pub mod moderation;
 pub mod report;
 
 use proptest::test_runner::{Config, RngSeed, TestRunner};
