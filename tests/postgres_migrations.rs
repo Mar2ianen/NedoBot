@@ -6770,8 +6770,23 @@ async fn assert_first_comment_context_isolated(
     .await
     .expect("other-discussion post job must be created")
     .expect("other-discussion post job must be unique");
+    let same_scope_tie_job_id = create_post_comment_job(
+        pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: DISCUSSION_CHAT_ID,
+            discussion_message_id: suffix + 20_003,
+            source_channel_id: SOURCE_CHANNEL_ID,
+            source_message_id: source_message_id + 3,
+            cleaned_post_text: "same-score tie post",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("same-scope tie job must be created")
+    .expect("same-scope tie job must be unique");
     query("update post_comment_jobs set status = 'failed', error = 'context isolation fixture' where id = any($1)")
-        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id])
+        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id, same_scope_tie_job_id])
         .execute(pool)
         .await
         .expect("context fixture jobs must not enter the pending delivery queue");
@@ -6814,14 +6829,20 @@ async fn assert_first_comment_context_isolated(
             2,
             "foreign discussion summary",
         ),
+        (
+            same_scope_tie_job_id,
+            SOURCE_CHANNEL_ID,
+            3,
+            "same-score tie summary",
+        ),
     ] {
         query(
             r#"
             insert into post_history_entries
                 (post_comment_job_id, source_channel_id, source_message_id, post_text,
-                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model)
+                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model, created_at)
             values ($1, $2, $3, 'fixture post', 'fixture comment', 'ready', $4,
-                    $5::vector, $6)
+                    $5::vector, $6, '2020-01-01 00:00:00+00'::timestamptz)
             "#,
         )
         .bind(job_id)
@@ -6872,6 +6893,31 @@ async fn assert_first_comment_context_isolated(
     assert!(!memory_notes.iter().any(|note| {
         note.summary == "foreign source summary" || note.summary == "foreign discussion summary"
     }));
+    assert_eq!(
+        memory_notes
+            .iter()
+            .map(|note| note.source_message_id)
+            .collect::<Vec<_>>(),
+        vec![source_message_id + 3, source_message_id],
+        "independent tie oracle orders equal rank by descending source_message_id"
+    );
+    assert_eq!(
+        memory_notes[0].rank_score, memory_notes[1].rank_score,
+        "synthetic equal-vector rows at the same timestamp must tie"
+    );
+
+    config.rag_top_k = 1;
+    let top_one = load_relevant_memory_notes(
+        pool,
+        &config,
+        DISCUSSION_CHAT_ID,
+        SOURCE_CHANNEL_ID,
+        "semantic memory scope query",
+    )
+    .await
+    .expect("top-k retrieval must use deterministic tie order");
+    assert_eq!(top_one.len(), 1);
+    assert_eq!(top_one[0].source_message_id, source_message_id + 3);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

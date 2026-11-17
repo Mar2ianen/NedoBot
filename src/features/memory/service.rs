@@ -635,6 +635,11 @@ const MEMORY_SYSTEM_PROMPT: &str = r#"Ты ведёшь атомарную RAG-�
 
 #[cfg(test)]
 mod tests {
+    use proptest::{
+        prelude::*,
+        test_runner::{Config, RngSeed, TestRunner},
+    };
+
     use super::*;
 
     #[test]
@@ -739,5 +744,98 @@ mod tests {
             serde_json::from_str::<Value>("{").expect_err("fixture must be invalid JSON"),
         );
         assert_eq!(classify_error(&invalid_json), "validation_failed");
+    }
+
+    #[test]
+    fn generated_summary_entities_match_normalization_contract() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x12_01_02_03_04_05_06_07);
+        let entity = prop::collection::vec(any::<char>(), 0..=100)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let strategy = prop::collection::vec(entity, 0..=20);
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+
+        runner
+            .run(&strategy, |entities| {
+                let input = json!({
+                    "summary": "A sufficiently long synthetic fact summary.",
+                    "entities": entities,
+                    "used_angle": null,
+                    "external_fact": null,
+                    "skip_reason": null,
+                })
+                .to_string();
+                let parsed = parse_memory_summary(&input).expect("valid summary object");
+
+                // Independent spec oracle: trim, cap by Unicode scalar values,
+                // remove empty/case-insensitive duplicates, preserve first occurrence,
+                // then retain no more than the documented 12 entities.
+                let mut seen = HashSet::new();
+                let expected = entities
+                    .iter()
+                    .map(|value| {
+                        let trimmed = value.trim();
+                        let chars = trimmed.chars().collect::<Vec<_>>();
+                        if chars.len() > MAX_ENTITY_CHARS {
+                            format!(
+                                "{}…",
+                                chars.iter().take(MAX_ENTITY_CHARS).collect::<String>()
+                            )
+                        } else {
+                            trimmed.to_owned()
+                        }
+                    })
+                    .filter(|value| !value.is_empty())
+                    .filter(|value| seen.insert(value.to_lowercase()))
+                    .take(MAX_ENTITIES)
+                    .collect::<Vec<_>>();
+                prop_assert_eq!(parsed.entities, expected);
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=memory-summary-normalization seed={seed} sha={} replay=sh scripts/replay_quality_case.sh memory-summary-normalization {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
+    }
+
+    #[test]
+    fn generated_error_text_cannot_impersonate_transport_statuses() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x12_02_02_03_04_05_06_07);
+        let strategy = prop::collection::vec(any::<char>(), 0..=160)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+
+        runner
+            .run(&strategy, |text| {
+                let message = format!("{text} HTTP 429 timeout timed out JSON summary=null");
+                let error = anyhow::anyhow!("{message}");
+                prop_assert_eq!(classify_error(&error), "error");
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=memory-error-classification seed={seed} sha={} replay=sh scripts/replay_quality_case.sh memory-error-classification {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
     }
 }
