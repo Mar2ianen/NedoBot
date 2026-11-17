@@ -23,6 +23,10 @@ pub struct JobQueueMetrics {
     pub statuses: Vec<JobStatusMetrics>,
     /// Seconds since the earliest due initial/retry delivery, excluding expired leases.
     pub oldest_ready_age_seconds: Option<f64>,
+    /// Age of the oldest currently processing claim, independent of lease expiry.
+    pub oldest_processing_age_seconds: Option<f64>,
+    /// Processing claims whose lease has elapsed and can be reclaimed.
+    pub expired_lease_count: i64,
     pub lease_reclaim_count: i64,
     pub errors: Vec<JobErrorMetrics>,
     /// Present only for the embeddings queue. This is a subset of `errors`.
@@ -48,6 +52,15 @@ const POST_COMMENT_READY_AGE_SQL: &str = r#"
     from post_comment_jobs
     where status in ('pending', 'retry_wait') and next_attempt_at <= now()
 "#;
+const POST_COMMENT_PROCESSING_AGE_SQL: &str = r#"
+    select extract(epoch from now() - min(processing_started_at))::double precision
+    from post_comment_jobs
+    where status = 'processing' and processing_started_at is not null
+"#;
+const POST_COMMENT_EXPIRED_LEASES_SQL: &str = r#"
+    select count(*)::bigint from post_comment_jobs
+    where status = 'processing' and lease_expires_at <= now()
+"#;
 const POST_COMMENT_RECLAIMS_SQL: &str =
     "select coalesce(sum(lease_reclaim_count), 0)::bigint from post_comment_jobs";
 
@@ -70,6 +83,15 @@ const EMBEDDING_READY_AGE_SQL: &str = r#"
     from telegram_message_embeddings_gemma2
     where status in ('pending', 'retry_wait') and next_attempt_at <= now()
 "#;
+const EMBEDDING_PROCESSING_AGE_SQL: &str = r#"
+    select extract(epoch from now() - min(processing_started_at))::double precision
+    from telegram_message_embeddings_gemma2
+    where status = 'processing' and processing_started_at is not null
+"#;
+const EMBEDDING_EXPIRED_LEASES_SQL: &str = r#"
+    select count(*)::bigint from telegram_message_embeddings_gemma2
+    where status = 'processing' and lease_expires_at <= now()
+"#;
 const EMBEDDING_RECLAIMS_SQL: &str =
     "select coalesce(sum(lease_reclaim_count), 0)::bigint from telegram_message_embeddings_gemma2";
 
@@ -91,6 +113,15 @@ const HISTORY_READY_AGE_SQL: &str = r#"
     select extract(epoch from now() - min(next_attempt_at))::double precision
     from post_history_entries
     where status in ('pending', 'retry') and next_attempt_at <= now()
+"#;
+const HISTORY_PROCESSING_AGE_SQL: &str = r#"
+    select extract(epoch from now() - min(processing_started_at))::double precision
+    from post_history_entries
+    where status = 'processing' and processing_started_at is not null
+"#;
+const HISTORY_EXPIRED_LEASES_SQL: &str = r#"
+    select count(*)::bigint from post_history_entries
+    where status = 'processing' and lease_expires_at <= now()
 "#;
 const HISTORY_RECLAIMS_SQL: &str =
     "select coalesce(sum(lease_reclaim_count), 0)::bigint from post_history_entries";
@@ -119,6 +150,17 @@ const REVIEW_READY_AGE_SQL: &str = r#"
       and notification_status in ('pending', 'retry_wait')
       and notification_next_attempt_at <= now()
 "#;
+const REVIEW_PROCESSING_AGE_SQL: &str = r#"
+    select extract(epoch from now() - min(notification_processing_started_at))::double precision
+    from spam_review_requests
+    where notification_status = 'processing'
+      and notification_processing_started_at is not null
+"#;
+const REVIEW_EXPIRED_LEASES_SQL: &str = r#"
+    select count(*)::bigint from spam_review_requests
+    where notification_status = 'processing'
+      and notification_lease_expires_at <= now()
+"#;
 const REVIEW_RECLAIMS_SQL: &str =
     "select coalesce(sum(notification_lease_reclaim_count), 0)::bigint from spam_review_requests";
 
@@ -127,6 +169,8 @@ struct QueueDefinition {
     status_sql: &'static str,
     error_sql: &'static str,
     ready_age_sql: &'static str,
+    processing_age_sql: &'static str,
+    expired_leases_sql: &'static str,
     reclaim_sql: &'static str,
     is_embedding: bool,
 }
@@ -137,6 +181,8 @@ const QUEUES: [QueueDefinition; 4] = [
         status_sql: POST_COMMENT_STATUS_SQL,
         error_sql: POST_COMMENT_ERROR_SQL,
         ready_age_sql: POST_COMMENT_READY_AGE_SQL,
+        processing_age_sql: POST_COMMENT_PROCESSING_AGE_SQL,
+        expired_leases_sql: POST_COMMENT_EXPIRED_LEASES_SQL,
         reclaim_sql: POST_COMMENT_RECLAIMS_SQL,
         is_embedding: false,
     },
@@ -145,6 +191,8 @@ const QUEUES: [QueueDefinition; 4] = [
         status_sql: EMBEDDING_STATUS_SQL,
         error_sql: EMBEDDING_ERROR_SQL,
         ready_age_sql: EMBEDDING_READY_AGE_SQL,
+        processing_age_sql: EMBEDDING_PROCESSING_AGE_SQL,
+        expired_leases_sql: EMBEDDING_EXPIRED_LEASES_SQL,
         reclaim_sql: EMBEDDING_RECLAIMS_SQL,
         is_embedding: true,
     },
@@ -153,6 +201,8 @@ const QUEUES: [QueueDefinition; 4] = [
         status_sql: HISTORY_STATUS_SQL,
         error_sql: HISTORY_ERROR_SQL,
         ready_age_sql: HISTORY_READY_AGE_SQL,
+        processing_age_sql: HISTORY_PROCESSING_AGE_SQL,
+        expired_leases_sql: HISTORY_EXPIRED_LEASES_SQL,
         reclaim_sql: HISTORY_RECLAIMS_SQL,
         is_embedding: false,
     },
@@ -161,6 +211,8 @@ const QUEUES: [QueueDefinition; 4] = [
         status_sql: REVIEW_STATUS_SQL,
         error_sql: REVIEW_ERROR_SQL,
         ready_age_sql: REVIEW_READY_AGE_SQL,
+        processing_age_sql: REVIEW_PROCESSING_AGE_SQL,
+        expired_leases_sql: REVIEW_EXPIRED_LEASES_SQL,
         reclaim_sql: REVIEW_RECLAIMS_SQL,
         is_embedding: false,
     },
@@ -204,6 +256,13 @@ async fn load_queue_metrics(
     let oldest_ready_age_seconds = sqlx::query_scalar::<_, Option<f64>>(definition.ready_age_sql)
         .fetch_one(&mut **transaction)
         .await?;
+    let oldest_processing_age_seconds =
+        sqlx::query_scalar::<_, Option<f64>>(definition.processing_age_sql)
+            .fetch_one(&mut **transaction)
+            .await?;
+    let expired_lease_count = sqlx::query_scalar::<_, i64>(definition.expired_leases_sql)
+        .fetch_one(&mut **transaction)
+        .await?;
     let lease_reclaim_count = sqlx::query_scalar::<_, i64>(definition.reclaim_sql)
         .fetch_one(&mut **transaction)
         .await?;
@@ -218,6 +277,8 @@ async fn load_queue_metrics(
         queue: definition.name,
         statuses,
         oldest_ready_age_seconds,
+        oldest_processing_age_seconds,
+        expired_lease_count,
         lease_reclaim_count,
         errors,
         embedding_batch_cardinality_failures,

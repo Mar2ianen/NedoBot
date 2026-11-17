@@ -7,22 +7,28 @@ use crate::{
         MAX_QR_URLS_PER_MESSAGE, QrScanJob, QrUrlEvidence, claim_next_qr_scan_job,
         finish_qr_scan_job, replace_qr_evidence_for_job,
     },
+    features::jobs::{
+        policy::WorkerPollPolicy,
+        worker::{PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_poll_worker},
+    },
     state::AppState,
     telegram::media::LimitedBytesWriter,
 };
 
-pub fn spawn_worker(bot: Bot, state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            match process_next_job(&bot, &state).await {
-                Ok(true) => continue,
-                Ok(false) => tokio::time::sleep(Duration::from_secs(3)).await,
-                Err(error_kind) => {
-                    tracing::warn!(error_kind, "QR evidence worker failed");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+pub fn spawn_worker(supervisor: &mut WorkerSupervisor, bot: Bot, state: AppState) {
+    supervisor.spawn(WorkerId::QrEvidence, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::QrEvidence, WorkerPollPolicy::new(3, 3)),
+            shutdown,
+            || async {
+                match process_next_job(&bot, &state).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(error_kind) => PollOutcome::Failed(error_kind),
                 }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
