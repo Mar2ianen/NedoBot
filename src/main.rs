@@ -56,6 +56,350 @@ use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
 use telegram::commands::Command;
 
+// Keep the production update tree shared with the route tests below. Tests
+// replace only the terminal handlers, so they exercise the actual teloxide
+// filters and branch precedence without touching PostgreSQL or Telegram.
+macro_rules! update_handler_tree {
+    ($command:expr, $message:expr, $reaction:expr, $reaction_count:expr, $edited:expr, $callback:expr, $member:expr) => {{
+        let handler = dptree::entry()
+            .branch(
+                Update::filter_message()
+                    .branch(
+                        dptree::entry()
+                            .filter_command::<Command>()
+                            .endpoint($command),
+                    )
+                    .branch(dptree::endpoint($message)),
+            )
+            .branch(Update::filter_message_reaction_updated().endpoint($reaction))
+            .branch(Update::filter_message_reaction_count_updated().endpoint($reaction_count))
+            .branch(Update::filter_edited_message().endpoint($edited));
+        #[cfg(feature = "moderation")]
+        let handler = handler.branch(Update::filter_callback_query().endpoint($callback));
+        handler.branch(Update::filter_chat_member().endpoint($member))
+    }};
+}
+
+#[cfg(test)]
+#[path = "../tests/support/quality/generators.rs"]
+#[allow(dead_code)]
+mod quality_generators;
+
+#[cfg(test)]
+mod update_route_tests {
+    use std::ops::ControlFlow;
+
+    use proptest::{prelude::*, test_runner::TestRunner};
+    use serde_json::{Value, json};
+    use teloxide::{
+        prelude::*,
+        types::{Me, MessageReactionCountUpdated, MessageReactionUpdated, Update},
+    };
+
+    use super::Command;
+    use crate::quality_generators;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Route {
+        Command,
+        Message,
+        Edited,
+        Reaction,
+        ReactionCount,
+        #[cfg(feature = "moderation")]
+        Callback,
+        Member,
+    }
+
+    async fn command(_: Message, _: Command) -> ResponseResult<Route> {
+        Ok(Route::Command)
+    }
+    async fn message(_: Message) -> ResponseResult<Route> {
+        Ok(Route::Message)
+    }
+    async fn edited(_: Message) -> ResponseResult<Route> {
+        Ok(Route::Edited)
+    }
+    async fn reaction(_: MessageReactionUpdated) -> ResponseResult<Route> {
+        Ok(Route::Reaction)
+    }
+    async fn reaction_count(_: MessageReactionCountUpdated) -> ResponseResult<Route> {
+        Ok(Route::ReactionCount)
+    }
+    #[cfg(feature = "moderation")]
+    async fn callback(_: CallbackQuery) -> ResponseResult<Route> {
+        Ok(Route::Callback)
+    }
+    async fn member(_: ChatMemberUpdated) -> ResponseResult<Route> {
+        Ok(Route::Member)
+    }
+
+    fn decode_update(value: Value) -> Update {
+        serde_json::from_value(value).expect("synthetic Telegram Update must match teloxide schema")
+    }
+
+    fn synthetic_bot_identity() -> Me {
+        serde_json::from_value(json!({
+            "id": 99,
+            "is_bot": true,
+            "first_name": "SyntheticBot",
+            "username": "synthetic_bot",
+            "can_join_groups": true,
+            "can_read_all_group_messages": false,
+            "supports_inline_queries": false,
+            "has_main_web_app": false
+        }))
+        .expect("synthetic bot identity must match teloxide schema")
+    }
+
+    async fn dispatch(
+        update: Update,
+    ) -> ControlFlow<ResponseResult<Route>, dptree::di::DependencyMap> {
+        update_handler_tree!(
+            command,
+            message,
+            reaction,
+            reaction_count,
+            edited,
+            callback,
+            member
+        )
+        .dispatch(dptree::deps![update, synthetic_bot_identity()])
+        .await
+    }
+
+    fn message_update(update_id: u32, message_id: i32, text: &str) -> Update {
+        decode_update(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "date": 1_700_000_000,
+                "chat": {"id": -100123, "type": "supergroup", "title": "Synthetic"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Synthetic"},
+                "text": text
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn command_filter_has_precedence_and_unknown_command_is_ordinary_message() {
+        let command = dispatch(message_update(1, 10, "/ping")).await;
+        assert!(matches!(command, ControlFlow::Break(Ok(Route::Command))));
+
+        let unknown = dispatch(message_update(2, 11, "/not_a_command arg")).await;
+        assert!(matches!(unknown, ControlFlow::Break(Ok(Route::Message))));
+
+        let plain = dispatch(message_update(3, 12, "hello")).await;
+        assert!(matches!(plain, ControlFlow::Break(Ok(Route::Message))));
+    }
+
+    #[tokio::test]
+    async fn edited_message_routes_to_edit_handler_without_falling_through_to_ingest() {
+        let mut update = serde_json::to_value(message_update(4, 13, "edited text")).unwrap();
+        let message = update.as_object_mut().unwrap().remove("message").unwrap();
+        update["edited_message"] = message;
+        let route = dispatch(decode_update(update)).await;
+        assert!(matches!(route, ControlFlow::Break(Ok(Route::Edited))));
+    }
+
+    #[tokio::test]
+    async fn callback_and_reaction_updates_reach_only_their_matching_routes() {
+        #[cfg(feature = "moderation")]
+        let callback = decode_update(json!({
+            "update_id": 5,
+            "callback_query": {
+                "id": "synthetic-query",
+                "from": {"id": 42, "is_bot": false, "first_name": "Synthetic"},
+                "chat_instance": "synthetic-chat-instance",
+                "data": "unsupported:test"
+            }
+        }));
+        #[cfg(feature = "moderation")]
+        assert!(matches!(
+            dispatch(callback).await,
+            ControlFlow::Break(Ok(Route::Callback))
+        ));
+
+        let reaction = decode_update(json!({
+            "update_id": 6,
+            "message_reaction": {
+                "chat": {"id": -100123, "type": "supergroup", "title": "Synthetic"},
+                "message_id": 14,
+                "user": {"id": 42, "is_bot": false, "first_name": "Synthetic"},
+                "date": 1_700_000_000,
+                "old_reaction": [],
+                "new_reaction": []
+            }
+        }));
+        assert!(matches!(
+            dispatch(reaction).await,
+            ControlFlow::Break(Ok(Route::Reaction))
+        ));
+
+        let reaction_count = decode_update(json!({
+            "update_id": 7,
+            "message_reaction_count": {
+                "chat": {"id": -100123, "type": "supergroup", "title": "Synthetic"},
+                "message_id": 14,
+                "date": 1_700_000_000,
+                "reactions": []
+            }
+        }));
+        assert!(matches!(
+            dispatch(reaction_count).await,
+            ControlFlow::Break(Ok(Route::ReactionCount))
+        ));
+
+        let actor = json!({"id": 42, "is_bot": false, "first_name": "Synthetic"});
+        let member = decode_update(json!({
+            "update_id": 8,
+            "chat_member": {
+                "chat": {"id": -100123, "type": "supergroup", "title": "Synthetic"},
+                "from": actor,
+                "date": 1_700_000_000,
+                "old_chat_member": {"status": "left", "user": actor},
+                "new_chat_member": {"status": "left", "user": actor}
+            }
+        }));
+        assert!(matches!(
+            dispatch(member).await,
+            ControlFlow::Break(Ok(Route::Member))
+        ));
+    }
+
+    #[cfg(feature = "moderation")]
+    #[tokio::test]
+    async fn unsupported_callback_is_acknowledged_once_through_local_telegram_fake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "Telegram fake closed before receiving a request");
+                request.extend_from_slice(&buffer[..count]);
+                let request_text = String::from_utf8_lossy(&request);
+                let Some((headers, body)) = request_text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or_default();
+                if body.len() >= content_length {
+                    break;
+                }
+            }
+            let response_body = r#"{"ok":true,"result":true}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let api_url = format!("http://{address}/").parse().unwrap();
+        let bot = Bot::new("synthetic-token").set_api_url(api_url);
+        super::answer_unsupported_callback(
+            &bot,
+            teloxide::types::CallbackQueryId("synthetic-query-id".to_owned()),
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+        assert_eq!(
+            request.matches("AnswerCallbackQuery").count(),
+            1,
+            "request was: {request}"
+        );
+        assert!(request.contains("synthetic-query-id"));
+    }
+
+    #[test]
+    fn structurally_valid_generated_messages_preserve_command_precedence() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .expect("NEDOBOT_PROPTEST_SEED must be an unsigned integer")
+            })
+            .unwrap_or(0x5445_4c45_4752_414d);
+        let sha = std::env::var("GITHUB_SHA")
+            .or_else(|_| std::env::var("NEDOBOT_TEST_SHA"))
+            .unwrap_or_else(|_| "local".to_owned());
+        let mut runner = TestRunner::new(proptest::test_runner::Config {
+            cases: 192,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Default::default()
+        });
+        let strategy = quality_generators::schema_valid_update();
+        runner
+            .run(&strategy, |case| {
+                let mut ordinary_json = case.to_json();
+                ordinary_json["message"]["text"] = json!(format!("synthetic {}", case.update_id));
+                ordinary_json["message"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("entities");
+                let ordinary = decode_update(ordinary_json);
+                let mut command_json = case.to_json();
+                command_json["message"]["text"] = json!("/ping");
+                command_json["message"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("entities");
+                let command = decode_update(command_json);
+
+                runtime.block_on(async {
+                    prop_assert!(matches!(
+                        dispatch(ordinary).await,
+                        ControlFlow::Break(Ok(Route::Message))
+                    ));
+                    prop_assert!(matches!(
+                        dispatch(command).await,
+                        ControlFlow::Break(Ok(Route::Command))
+                    ));
+                    Ok(())
+                })
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=telegram-route-command-precedence seed={seed} sha={} replay=sh scripts/replay_quality_case.sh telegram-route-command-precedence {seed}\n{error}",
+                    sha
+                )
+            });
+    }
+
+    #[tokio::test]
+    async fn unsupported_update_kind_has_no_route_or_effect() {
+        let update = decode_update(
+            json!({"update_id": 7, "poll": {"id":"p", "question":"q", "options":[]}}),
+        );
+        assert!(matches!(dispatch(update).await, ControlFlow::Continue(_)));
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let explicit_env_file = std::env::var("ENV_FILE").ok();
@@ -241,24 +585,15 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "voice")]
     spawn_voice_transcription_worker(bot.clone(), state.clone());
 
-    let handler = dptree::entry()
-        .branch(
-            Update::filter_message()
-                .branch(
-                    dptree::entry()
-                        .filter_command::<Command>()
-                        .endpoint(handle_command),
-                )
-                .branch(dptree::endpoint(handle_message)),
-        )
-        .branch(Update::filter_message_reaction_updated().endpoint(handle_message_reaction))
-        .branch(
-            Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
-        )
-        .branch(Update::filter_edited_message().endpoint(handle_edited_message));
-    #[cfg(feature = "moderation")]
-    let handler = handler.branch(Update::filter_callback_query().endpoint(handle_callback_query));
-    let handler = handler.branch(Update::filter_chat_member().endpoint(handle_chat_member));
+    let handler = update_handler_tree!(
+        handle_command,
+        handle_message,
+        handle_message_reaction,
+        handle_message_reaction_count,
+        handle_edited_message,
+        handle_callback_query,
+        handle_chat_member
+    );
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state, profile_refresh_queue])
@@ -590,7 +925,7 @@ async fn handle_callback_query(
     }
 
     let Some((request_id, decision)) = query.data.as_deref().and_then(parse_callback) else {
-        return Ok(());
+        return answer_unsupported_callback(bot.inner(), query.id).await;
     };
     let reviewer_id = query.from.id.0 as i64;
     let is_configured_reviewer = state.config.reviewer_user_ids().contains(&reviewer_id)
@@ -646,6 +981,15 @@ async fn handle_callback_query(
                 .await?;
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn answer_unsupported_callback(
+    bot: &Bot,
+    callback_query_id: teloxide::types::CallbackQueryId,
+) -> ResponseResult<()> {
+    bot.answer_callback_query(callback_query_id).await?;
     Ok(())
 }
 
