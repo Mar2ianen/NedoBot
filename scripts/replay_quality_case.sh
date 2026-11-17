@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components" >&2
     exit 2
 fi
 
@@ -77,9 +77,14 @@ case "$case_id" in
         test_target=
         test_filter=features::chat_read_api::query::tests::generated_nonnegative_cursors_round_trip_without_offset_change
         ;;
+    audit-score-components)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::new_user_audit::service::tests::generated_component_scores_match_independent_clamp_and_threshold_oracle
+        ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components" >&2
         exit 2
         ;;
 esac
