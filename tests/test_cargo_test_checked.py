@@ -1,4 +1,5 @@
 import contextlib
+import base64
 import io
 from pathlib import Path
 import sys
@@ -12,9 +13,10 @@ from run_cargo_test_checked import run_checked  # noqa: E402
 class CheckedCargoTest(unittest.TestCase):
     def fake_cargo(self, root: Path, output: str, exit_code: int) -> Path:
         cargo = root / "cargo"
+        encoded_output = base64.b64encode(output.encode()).decode("ascii")
         cargo.write_text(
             "#!/bin/sh\n"
-            f"printf '%b' {output!r}\n"
+            f"printf '%s' '{encoded_output}' | base64 -d\n"
             f"exit {exit_code}\n",
             encoding="utf-8",
         )

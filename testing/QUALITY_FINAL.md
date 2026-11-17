@@ -36,13 +36,13 @@ Audit snapshot: 2026-11-18. Baseline main SHA: `7b8815bbff80c4665b64076a063f5f49
 1. The whole no-default workspace test suite was already red in the T00 baseline (20 config-dependent failures); this work verifies no-default library compilation and a real fail-closed feature-gate test, but does not claim all no-default tests are green. Fixing every config-dependent default-profile fixture remains open.
 2. Search fetching is delegated to external MCP providers. Local syntax/IP-literal filtering cannot verify the remote provider's DNS result or each redirect. DNS rebinding and redirect-to-private-address behavior remain unproven; see T14.
 3. `cargo-fuzz` and nightly are unavailable in the local environment. No sanitizer fuzz run or fuzz target is claimed; deterministic proptest properties are the executed alternative.
-4. Current `main` still launches long-lived workers detached. The separate open refactor PR #144 adds a supervisor, but its `supervise_until` currently logs a worker's unexpected completion and continues instead of making the application exit fatal. T15 remains incomplete until that behavior is corrected and tested; draft PR #171 records the gap.
+4. Current `main` still launches long-lived workers detached. The separate refactor PR #144 now has a correction at `8f46b26477fe117e2f6547280f750029bfefd9e4`: unexpected worker completion is fatal after bounded drain, with eight local lifecycle tests. Its exact-head CI is pending, and it is still an open stacked PR. This does not change the behavior of current `main`; T15 remains unverified until the refactor is integrated and the dependent stack is checked.
 5. 17 ignored tests in the workspace run are not all covered by `scripts/test.sh`; a live `/ask` smoke is intentionally excluded because it would require external services. Safe PostgreSQL ignored tests are run in dedicated local/CI lanes.
 6. Coverage aggregates include binary glue with no direct unit tests and do not establish assertion quality. Low lines in command handling and moderation are prioritized for further focused cases rather than a global coverage threshold.
 
 ## PR audit snapshot
 
-- Existing open work: PRs #127–#155 remain open and unmerged, including the corrective/refactor chain. Their GitHub merge-state snapshot was `CLEAN`; #144 worker supervision has the lifecycle caveat above. PR #129 remains the shared adversarial harness foundation.
+- Existing open work: PRs #127–#155 remain open and unmerged, including the corrective/refactor chain. PR #144's worker-exit correction is awaiting CI. PR #129 remains the shared adversarial harness foundation.
 - Testing stack: #156–#170 are the T00–T14 stack; PR #171 (T15 config/release matrix, draft) and #172 (T16 coverage/mutation profile, draft) are stacked after #170. T17 CI audit is submitted separately after these checks. No branch in this task was merged or deployed.
 - CI status is taken from GitHub for the exact commit SHA, not inferred from local test evidence. Any pending or failed check keeps that PR unverified.
 
