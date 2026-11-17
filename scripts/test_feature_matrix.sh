@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+feature_gate_test=config::tests::manual_moderation_requires_global_and_chat_gates_and_compiled_feature
+
+cargo check --lib --locked
+cargo check --no-default-features --lib --locked
+cargo test --lib "$feature_gate_test" --locked -- --exact
+cargo test --no-default-features --lib "$feature_gate_test" --locked -- --exact

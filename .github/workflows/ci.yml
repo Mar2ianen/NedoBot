@@ -57,6 +57,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Check supported default and feature-disabled config matrix
+        run: sh scripts/test_feature_matrix.sh
+
       - name: Run deterministic adversarial harness and synthetic corpus
         env:
           NEDOBOT_PROPTEST_SEED: "72623859790382856"
