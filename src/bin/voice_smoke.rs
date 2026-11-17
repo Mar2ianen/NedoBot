@@ -34,7 +34,8 @@ async fn main() -> anyhow::Result<()> {
     let media = load_latest_sent_voice(&pool).await?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
 
-    let downloaded = download_media_file(&bot, &media).await?;
+    let max_download_bytes = u64::from(config.voice_max_file_mb) * 1024 * 1024;
+    let downloaded = download_media_file(&bot, &media, max_download_bytes).await?;
     let (transcript, alternatives) = transcribe_audio_with_shadow(
         &config,
         &downloaded.path,

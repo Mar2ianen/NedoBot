@@ -711,6 +711,13 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .await
         .expect("voice job must be created")
         .expect("new voice job must return its id");
+    assert_eq!(
+        create_voice_job(pool, &media)
+            .await
+            .expect("duplicate event enqueue must remain idempotent"),
+        Some(job_id),
+        "duplicate Telegram event must reuse the existing job instead of creating another"
+    );
 
     let (first_result, second_result) =
         tokio::join!(claim_voice_job(pool, job_id), claim_voice_job(pool, job_id));
