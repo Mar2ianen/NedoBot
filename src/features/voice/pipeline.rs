@@ -362,7 +362,8 @@ async fn process_voice_job(
         .then_some(())
         .ok_or(VoiceProcessingFailure::LeaseLost)?;
     let (transcript, alternatives) = {
-        let downloaded = download_media_file(bot, media)
+        let max_download_bytes = u64::from(state.config.voice_max_file_mb) * 1024 * 1024;
+        let downloaded = download_media_file(bot, media, max_download_bytes)
             .await
             .map_err(|_| VoiceProcessingFailure::Download)?;
         tracing::info!(

@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    io,
+    path::PathBuf,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use teloxide::net::Download;
 use teloxide::prelude::*;
@@ -82,6 +87,7 @@ fn validate_limits(
 pub async fn download_media_file(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     media: &VoiceMedia,
+    max_size_bytes: u64,
 ) -> anyhow::Result<DownloadedMedia> {
     let file = bot
         .get_file(teloxide::types::FileId(media.file_id.clone()))
@@ -95,10 +101,13 @@ pub async fn download_media_file(
     let path = temp_path.to_path_buf();
 
     let mut dst = tokio::fs::File::create(&path).await?;
-    bot.download_file(&file.path, &mut dst).await?;
+    let size = {
+        let mut bounded = LimitedWriter::new(&mut dst, max_size_bytes);
+        bot.download_file(&file.path, &mut bounded).await?;
+        bounded.written
+    };
     dst.flush().await?;
 
-    let size = tokio::fs::metadata(&path).await?.len();
     Ok(DownloadedMedia {
         path,
         filename: format!("telegram-{}{}", media.kind.as_str(), file_suffix(media)),
@@ -106,6 +115,59 @@ pub async fn download_media_file(
         size,
         _temp_path: temp_path,
     })
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LimitedWriter<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if buffer.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let remaining = this.limit.saturating_sub(this.written);
+        if remaining == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "download exceeds configured media size limit",
+            )));
+        }
+        let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
+        let write_len = buffer.len().min(remaining);
+        match Pin::new(&mut this.inner).poll_write(context, &buffer[..write_len]) {
+            Poll::Ready(Ok(written)) => {
+                this.written += written as u64;
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
 }
 
 fn file_suffix(media: &VoiceMedia) -> String {
@@ -148,6 +210,17 @@ fn format_duration(seconds: u32) -> String {
 mod tests {
     use super::*;
     use crate::features::voice::types::VIDEO_NOTE_MIME_TYPE;
+    use axum::{
+        Json, Router,
+        http::Uri,
+        response::{IntoResponse, Response},
+        routing::any,
+    };
+    use proptest::{
+        prelude::*,
+        test_runner::{Config, RngSeed, TestRunner},
+    };
+    use serde_json::json;
 
     fn media(
         kind: VoiceMediaKind,
@@ -196,5 +269,133 @@ mod tests {
                 max_size: 20 * 1024 * 1024,
             })
         );
+    }
+
+    #[test]
+    fn generated_media_metadata_matches_independent_size_and_duration_oracle() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .map(|value| value.parse::<u64>().expect("seed must be unsigned"))
+            .unwrap_or(0x0706_0504_0302_0100);
+        let strategy = (
+            1_u32..100_000,
+            -1_i32..=1,
+            1_u32..=20,
+            -1_i32..=1,
+            proptest::option::of(0_u8..=1),
+        )
+            .prop_map(
+                |(duration_limit, duration_delta, max_file_mb, size_delta, known_size)| {
+                    let duration = (i64::from(duration_limit) + i64::from(duration_delta)) as u32;
+                    let max_bytes = u64::from(max_file_mb) * 1024 * 1024;
+                    let size = match size_delta {
+                        -1 => max_bytes - 1,
+                        0 => max_bytes,
+                        _ => max_bytes + 1,
+                    };
+                    (
+                        duration_limit,
+                        duration,
+                        max_file_mb,
+                        known_size.map(|_| size),
+                    )
+                },
+            );
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner
+            .run(&strategy, |(duration_limit, duration, max_file_mb, file_size)| {
+                let max_bytes = u64::from(max_file_mb) * 1024 * 1024;
+                let expected = if duration > duration_limit {
+                    Err(VoiceDownloadSkip::TooLong {
+                        duration_sec: duration,
+                        max_sec: duration_limit,
+                    })
+                } else if file_size.is_some_and(|size| size > max_bytes) {
+                    Err(VoiceDownloadSkip::TooLarge {
+                        size: file_size.unwrap(),
+                        max_size: max_bytes,
+                    })
+                } else {
+                    Ok(())
+                };
+                prop_assert_eq!(
+                    validate_limits(Some(duration), file_size, duration_limit, max_file_mb),
+                    expected
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!("case_id=voice-media-bounds seed={seed} replay=sh scripts/replay_quality_case.sh voice-media-bounds {seed}: {error}")
+            });
+    }
+
+    #[tokio::test]
+    async fn downloaded_bytes_are_bounded_even_when_telegram_size_is_missing_or_wrong() {
+        async fn fake_telegram(uri: Uri) -> Response {
+            if uri
+                .path()
+                .rsplit('/')
+                .next()
+                .is_some_and(|method| method.eq_ignore_ascii_case("getFile"))
+            {
+                return Json(json!({
+                    "ok": true,
+                    "result": {
+                        "file_id": "file-id",
+                        "file_unique_id": "unique-id",
+                        "file_size": 1,
+                        "file_path": "media/test.oga"
+                    }
+                }))
+                .into_response();
+            }
+            b"0123456789".as_slice().into_response()
+        }
+
+        let app = Router::new().route("/{*path}", any(fake_telegram));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local fake Telegram must bind");
+        let address = listener.local_addr().expect("fake address must exist");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("fake Telegram must run");
+        });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("fake URL"))
+            .parse_mode(teloxide::types::ParseMode::Html);
+        let mut media = media(VoiceMediaKind::Voice, Some(1), None, Some("audio/ogg"));
+        media.file_size = None;
+
+        let result = download_media_file(&bot, &media, 4).await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "oversized actual response must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn limited_writer_never_persists_bytes_after_its_cap() {
+        use tokio::io::AsyncWriteExt;
+
+        let file = tempfile::NamedTempFile::new().expect("temporary output must be created");
+        let path = file.path().to_owned();
+        let mut output = tokio::fs::File::from_std(file.reopen().expect("file must reopen"));
+        let mut bounded = LimitedWriter::new(&mut output, 4);
+        let error = bounded
+            .write_all(b"0123456789")
+            .await
+            .expect_err("writer must reject the first byte beyond its cap");
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(bounded.written, 4);
+        drop(bounded);
+        output.flush().await.expect("written prefix must flush");
+        assert_eq!(tokio::fs::metadata(path).await.unwrap().len(), 4);
     }
 }
