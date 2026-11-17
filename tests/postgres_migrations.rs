@@ -7705,6 +7705,67 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
     );
 }
 
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn concurrent_duplicate_post_comment_events_create_one_semantic_job() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let discussion_chat_id = -1_001_888_000_123;
+    let discussion_message_id =
+        (Utc::now().timestamp_micros().unsigned_abs() % 1_000_000_000) as i32 + 1;
+    let mut workers = Vec::new();
+    for _ in 0..16 {
+        let worker_pool = pool.clone();
+        workers.push(tokio::spawn(async move {
+            create_post_comment_job(
+                &worker_pool,
+                CreatePostCommentJobParams {
+                    discussion_chat_id,
+                    discussion_message_id,
+                    source_channel_id: -1_001_888_000_124,
+                    source_message_id: discussion_message_id,
+                    cleaned_post_text: "synthetic duplicate post event",
+                    image_file_id: None,
+                    image_file_unique_id: None,
+                },
+            )
+            .await
+        }));
+    }
+    let mut results = Vec::with_capacity(workers.len());
+    for worker in workers {
+        results.push(worker.await.expect("duplicate enqueue worker must finish"));
+    }
+    let row_count: i64 = query_scalar(
+        "select count(*) from post_comment_jobs where discussion_chat_id=$1 and discussion_message_id=$2",
+    )
+    .bind(discussion_chat_id)
+    .bind(discussion_message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("duplicate job row count must be readable");
+    query("delete from post_comment_jobs where discussion_chat_id=$1 and discussion_message_id=$2")
+        .bind(discussion_chat_id)
+        .bind(discussion_message_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic post jobs must be cleaned before assertions");
+
+    let ids = results
+        .into_iter()
+        .map(|result| result.expect("duplicate enqueue must not fail"))
+        .collect::<Vec<_>>();
+    assert_eq!(row_count, 1, "one semantic post must persist one job");
+    assert_eq!(
+        ids.iter().filter(|id| id.is_some()).count(),
+        1,
+        "exactly one concurrent duplicate event may create the job"
+    );
+}
+
 async fn assert_post_comment_claim_skips_locked_oldest_row(pool: &PgPool) {
     let suffix = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
