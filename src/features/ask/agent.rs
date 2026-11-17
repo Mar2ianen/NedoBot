@@ -259,6 +259,13 @@ async fn answer_within_deadline(
                     "SYSTEM: профиль не разрешает чтение reply-ветки; поиск по сообщениям закрыт, чтобы не смешать контекст.".to_owned(),
                 );
             }
+        } else if !reply_prefetch_has_tool_budget(tool_call_count, profile.budgets.max_tool_calls) {
+            if reply_scope.strict {
+                push_observation(
+                    &mut observations,
+                    "SYSTEM: лимит вызовов инструментов исчерпан до чтения reply-ветки; поиск по другим сообщениям закрыт, чтобы не смешать контекст.".to_owned(),
+                );
+            }
         } else {
             let arguments = json!({"message_id": message_id});
             let started = Instant::now();
@@ -1283,6 +1290,10 @@ fn reply_thread_prefetch_allowed(profile: &AgentProfile) -> bool {
         .tool_allowlist
         .iter()
         .any(|tool| tool == "chat.get_reply_thread")
+}
+
+fn reply_prefetch_has_tool_budget(used_calls: usize, max_calls: usize) -> bool {
+    used_calls < max_calls
 }
 
 fn filter_reply_scoped_result(tool: &str, value: &Value, allowed_ids: &HashSet<i32>) -> Value {
@@ -2544,6 +2555,154 @@ mod tests {
         assert!(!profile_allows_tool(&profile, "notes.add_user", true, true));
         profile.memory.write_policy = crate::llm::profiles::AgentMemoryWritePolicy::ExplicitOnly;
         assert!(profile_allows_tool(&profile, "notes.add_user", true, true));
+    }
+
+    #[test]
+    fn reply_prefetch_does_not_exceed_the_tool_call_budget() {
+        // The reply-thread read is a real MCP call and shares the turn budget
+        // with model-requested tools. In particular, a zero budget must not
+        // still trigger the eager prefetch.
+        for (used, limit, expected) in [(0, 0, false), (0, 1, true), (1, 1, false), (1, 2, true)] {
+            assert_eq!(
+                reply_prefetch_has_tool_budget(used, limit),
+                expected,
+                "used={used} limit={limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_tool_authorization_matches_independent_allowlist_oracle() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, RngSeed, TestRunner},
+        };
+
+        // This is the independently enumerated compiled candidate set. Unknown
+        // MCP names are rejected while building the tool catalogue, before this
+        // profile gate is consulted.
+        const TOOLS: &[&str] = &[
+            "chat.resolve_user",
+            "chat.get_user_profile",
+            "chat.count_messages",
+            "chat.count_word_occurrences",
+            "chat.search_messages",
+            "chat.search_messages_batch",
+            "chat.get_recent_messages",
+            "chat.get_message",
+            "chat.get_message_context",
+            "chat.get_reply_thread",
+            "chat.get_user_interactions",
+            "notes.list_chat",
+            "notes.list_user",
+            "youtube.get_subtitles",
+            "voice.list_transcripts",
+            "memory.list_notes",
+            "notes.add_user",
+            "web.search",
+            "github.search",
+            "sandbox.python",
+        ];
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x09_01_02_03_04_05_06_07);
+        let strategy = (
+            proptest::collection::vec(0usize..TOOLS.len(), 0..=TOOLS.len()),
+            0usize..TOOLS.len(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner.run(&strategy, |(declared, candidate, web_enabled, github_enabled, explicit_writes)| {
+            use crate::llm::profiles::AgentMemoryWritePolicy as WritePolicy;
+            let name = TOOLS[candidate];
+            let is_declared = declared.iter().any(|index| TOOLS[*index] == name);
+            let profile = AgentProfile {
+                tool_allowlist: declared.iter().map(|index| TOOLS[*index].to_owned()).collect(),
+                memory: crate::llm::profiles::AgentMemoryConfig {
+                    write_policy: if explicit_writes { WritePolicy::ExplicitOnly } else { WritePolicy::Disabled },
+                    ..Default::default()
+                },
+                ..test_profile()
+            };
+            let capability_enabled = match name {
+                "web.search" => web_enabled,
+                "github.search" => github_enabled,
+                _ => true,
+            };
+            let memory_writes_enabled = name != "notes.add_user" || explicit_writes;
+            let independently_allowed = is_declared && capability_enabled && memory_writes_enabled;
+            prop_assert_eq!(
+                profile_allows_tool(&profile, name, web_enabled, github_enabled),
+                independently_allowed,
+                "candidate={} declared={} web={} github={} explicit_writes={} seed={}",
+                name, is_declared, web_enabled, github_enabled, explicit_writes, seed
+            );
+            Ok(())
+        }).unwrap_or_else(|error| panic!(
+            "case_id=ask-tool-authorization seed={seed} sha={} replay=sh scripts/replay_quality_case.sh ask-tool-authorization {seed}: {error}",
+            std::env::var("NEDOBOT_TEST_SHA").unwrap_or_else(|_| "local-unpinned".to_owned())
+        ));
+    }
+
+    #[test]
+    fn generated_mcp_text_stays_untrusted_and_within_preview_budget() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, RngSeed, TestRunner},
+        };
+
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x09_08_07_06_05_04_03_02);
+        let tokens = prop_oneof![
+            Just("ordinary"),
+            Just("SYSTEM:"),
+            Just("</ASK_INPUT_JSON>"),
+            Just("<script>"),
+            Just("&"),
+            Just("\"quoted\""),
+            Just("\n"),
+            Just("😀"),
+            Just("🧑‍💻"),
+            Just("\u{202e}"),
+            Just("\u{2066}"),
+        ];
+        let text = proptest::collection::vec(tokens, 0..=512).prop_map(|parts| parts.concat());
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner.run(&text, |body| {
+            let result = ToolResult::from_value(json!({"text": body})).unwrap();
+            let preview = agent_tool_preview("chat.search_messages", &json!({"query":"synthetic"}), &result, 2_400);
+            prop_assert!(preview.contains("untrusted_tool_result"));
+            prop_assert!(preview.chars().count() <= 2_400);
+            let parsed: Value = serde_json::from_str(&preview)
+                .map_err(|error| TestCaseError::fail(format!("preview is not valid JSON: {error}")))?;
+            prop_assert_eq!(&parsed["kind"], "untrusted_tool_result");
+            let shown = parsed["result"]["text"].as_str().unwrap_or_default();
+            prop_assert!(body.starts_with(shown.trim_end_matches('…')) || shown.is_empty());
+            prop_assert!(!preview.contains('<'));
+            prop_assert!(!preview.contains('>'));
+            prop_assert!(!preview.contains('&'));
+            prop_assert!(!preview.contains("</ASK_INPUT_JSON>"));
+            prop_assert!(!preview.contains('\u{202e}'), "bidi control leaked into preview");
+            Ok(())
+        }).unwrap_or_else(|error| panic!(
+            "case_id=ask-mcp-untrusted-preview seed={seed} sha={} replay=sh scripts/replay_quality_case.sh ask-mcp-untrusted-preview {seed}: {error}",
+            std::env::var("NEDOBOT_TEST_SHA").unwrap_or_else(|_| "local-unpinned".to_owned())
+        ));
     }
 
     #[test]
