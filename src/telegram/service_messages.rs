@@ -346,7 +346,10 @@ pub fn should_fallback_after_payload_rejection(error: &RequestError) -> bool {
 /// A failed send with no definitive Telegram rejection may already have been
 /// accepted. Durable senders should not retry it as a new message.
 pub fn delivery_outcome_is_unknown(error: &RequestError) -> bool {
-    matches!(error, RequestError::Network(_) | RequestError::Io(_))
+    matches!(
+        error,
+        RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_)
+    )
 }
 
 fn with_ephemeral_parameters<R: SendMessageSetters>(
@@ -582,6 +585,13 @@ mod tests {
     fn ambiguous_transport_failures_are_not_safe_to_retry_as_new_messages() {
         let io_error = RequestError::Io(std::sync::Arc::new(std::io::Error::other("test")));
         assert!(delivery_outcome_is_unknown(&io_error));
+        let malformed_ack = RequestError::InvalidJson {
+            source: std::sync::Arc::new(
+                serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            ),
+            raw: "{".into(),
+        };
+        assert!(delivery_outcome_is_unknown(&malformed_ack));
         assert!(!delivery_outcome_is_unknown(&RequestError::RetryAfter(
             teloxide::types::Seconds::from_seconds(30)
         )));
