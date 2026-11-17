@@ -1,3 +1,4 @@
+pub mod durable_jobs;
 pub mod generators;
 pub mod model;
 pub mod report;

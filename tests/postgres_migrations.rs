@@ -173,6 +173,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
     assert_comment_job_lifecycle(&pool).await;
+    assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
     assert_system_spam_label_transition(&pool).await;
     assert_spammer_avatar_embedding_label_gate(&pool).await;
@@ -182,6 +183,17 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn post_comment_claim_skips_a_locked_oldest_ready_job() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
 }
 
 async fn assert_ingest_disabled_is_noop(pool: &PgPool) {
@@ -7602,6 +7614,102 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         CasResult::LeaseLost,
         "a completed send cannot be finalized twice"
     );
+}
+
+async fn assert_post_comment_claim_skips_locked_oldest_row(pool: &PgPool) {
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 900_000) as i32;
+    let first_message_id = 8_000_000 + suffix;
+    let second_message_id = first_message_id + 1;
+    let first_id = create_job(pool, first_message_id).await;
+    let second_id = create_job(pool, second_message_id).await;
+
+    // Equalize the due time so the deterministic `id` ordering picks first_id.
+    query("update post_comment_jobs set next_attempt_at = '2000-01-01 00:00:00+00' where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("two ready jobs must receive the same due timestamp");
+    let oldest_id: i64 = query_scalar(
+        "select id from post_comment_jobs where id = any($1) order by next_attempt_at, id limit 1",
+    )
+    .bind(vec![first_id, second_id])
+    .fetch_one(pool)
+    .await
+    .expect("oldest ready fixture must exist");
+    let expected_unlocked_id = if oldest_id == first_id {
+        second_id
+    } else {
+        first_id
+    };
+
+    let mut owner = pool
+        .begin()
+        .await
+        .expect("row-lock owner transaction must start");
+    let locked_id: i64 = query_scalar("select id from post_comment_jobs where id = $1 for update")
+        .bind(oldest_id)
+        .fetch_one(&mut *owner)
+        .await
+        .expect("oldest ready row must be locked by the test transaction");
+    assert_eq!(locked_id, oldest_id);
+
+    let claim_pool = pool.clone();
+    let claim = tokio::spawn(async move { claim_next_post_comment_job(&claim_pool).await });
+    // Poll PostgreSQL's actual wait state. The short sleeps only pace these
+    // observations; a timeout is a liveness guard and is never treated as
+    // evidence that the competing worker is blocked on this lock.
+    let observed_lock_wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if claim.is_finished() {
+                return Ok::<bool, sqlx::Error>(false);
+            }
+            let waiting_on_row_lock: bool = query_scalar(
+                "select exists(select 1 from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and query ilike '%with expired_sends as%')",
+            )
+            .fetch_one(pool)
+            .await?;
+            if waiting_on_row_lock {
+                return Ok::<bool, sqlx::Error>(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    owner
+        .commit()
+        .await
+        .expect("test row lock must be released cleanly");
+    query("delete from post_comment_jobs where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("synthetic locked-claim fixtures must be removed");
+
+    let claim_result = claim
+        .await
+        .expect("claim task must complete after the test releases its lock");
+    query("delete from post_comment_jobs where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("synthetic locked-claim fixtures must be removed");
+    let observed_lock_wait = observed_lock_wait
+        .expect("claim lock-state observation must complete within the liveness bound")
+        .expect("PostgreSQL lock-state query must succeed");
+    assert!(
+        !observed_lock_wait,
+        "claim query waited on a row another worker already locked"
+    );
+    let claimed = claim_result
+        .expect("concurrent claim query must succeed")
+        .expect("second ready fixture must remain claimable");
+    assert_eq!(claimed.id, expected_unlocked_id);
+    assert_eq!(claimed.attempts, 1);
 }
 
 async fn assert_comment_reconciliation_requires_operator_claim(pool: &PgPool) {

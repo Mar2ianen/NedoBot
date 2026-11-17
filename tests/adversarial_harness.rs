@@ -422,6 +422,73 @@ fn typed_authorization_and_ordered_job_strategies_round_trip() {
 }
 
 #[test]
+fn durable_job_reference_model_preserves_fences_and_uncertain_delivery() {
+    use quality::{
+        durable_jobs::{DurableJobModel, DurableJobStatus},
+        generators::{DurableJobOperation as Op, durable_job_trace},
+    };
+
+    let stale_worker_trace = [
+        Op::Claim { worker: 0 },
+        Op::AdvanceClock { seconds: 31 },
+        Op::Claim { worker: 1 },
+        Op::FinalizeOk { worker: 0 },
+    ];
+    let mut job = DurableJobModel::default();
+    for op in stale_worker_trace {
+        job.apply(op);
+        assert!(job.invariant_holds(), "state after {op:?}: {job:?}");
+    }
+    assert_eq!(job.status, DurableJobStatus::Processing);
+    assert_eq!(job.owner, Some(1));
+    assert_eq!(job.fence, 2);
+    assert_eq!(job.attempts, 2);
+    assert_eq!(job.confirmed_effects, 0);
+
+    assert!(job.apply(Op::BeginExternalEffect { worker: 1 }));
+    assert!(job.apply(Op::MarkDeliveryUnknown { worker: 1 }));
+    let unknown = job.clone();
+    for op in [Op::Restart, Op::Claim { worker: 2 }, Op::DuplicateIngress] {
+        assert!(!job.apply(op), "terminal unknown job accepted {op:?}");
+        assert_eq!(job, unknown, "terminal unknown job changed after {op:?}");
+    }
+    assert!(job.apply(Op::AdvanceClock { seconds: 40 }));
+    assert!(!job.apply(Op::Claim { worker: 2 }));
+    assert_eq!(job.status, DurableJobStatus::DeliveryUnknown);
+    assert_eq!(job.confirmed_effects, 0);
+
+    let seed = replay_seed();
+    let mut runner = fixed_runner(seed, PROPERTY_CASES);
+    let traces = Cell::new(0_u32);
+    runner
+        .run(&durable_job_trace(), |trace| {
+            let mut model = DurableJobModel::default();
+            let mut previous_fence = 0;
+            let mut previous_attempts = 0;
+            for op in &trace {
+                model.apply(*op);
+                prop_assert!(
+                    model.invariant_holds(),
+                    "trace={trace:?} operation={op:?} state={model:?}"
+                );
+                prop_assert!(model.fence >= previous_fence);
+                prop_assert!(model.attempts >= previous_attempts);
+                previous_fence = model.fence;
+                previous_attempts = model.attempts;
+            }
+            traces.set(traces.get() + 1);
+            Ok(())
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}",
+                failure_summary("durable-job-state-trace", seed, error)
+            )
+        });
+    assert_eq!(traces.get(), PROPERTY_CASES);
+}
+
+#[test]
 fn ingress_reference_model_keeps_only_current_revision_and_media_evidence() {
     use quality::{
         generators::{

@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
     exit 2
 fi
 
@@ -26,6 +26,7 @@ case "$case_id" in
     seeded-update-replay) test_filter=seeded_update_stream_replays_identically ;;
     typed-state-generators) test_filter=typed_authorization_and_ordered_job_strategies_round_trip ;;
     reference-models) test_filter=reference_models_reject_stale_job_completion_and_unauthorized_actions ;;
+    durable-job-state-trace) test_filter=durable_job_reference_model_preserves_fences_and_uncertain_delivery ;;
     http-outcomes) test_filter=typed_http_outcomes_preserve_uncertain_delivery_and_bounds ;;
     safe-report) test_filter=reports_omit_payload_and_require_evidence_for_v1 ;;
     minimal-url-trace) test_filter=minimal_operation_trace_replays_with_independent_identity ;;
@@ -37,7 +38,7 @@ case "$case_id" in
     ingress-reference-trace) test_filter=ingress_reference_model_keeps_only_current_revision_and_media_evidence ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
         exit 2
         ;;
 esac

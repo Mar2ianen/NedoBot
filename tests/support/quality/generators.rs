@@ -226,6 +226,41 @@ pub fn ordered_job_operations() -> impl Strategy<Value = Vec<JobOperation>> {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum DurableJobOperation {
+    Claim { worker: u8 },
+    Heartbeat { worker: u8 },
+    BeginExternalEffect { worker: u8 },
+    FinalizeOk { worker: u8 },
+    FinalizeRetry { worker: u8 },
+    FinalizeFailed { worker: u8 },
+    MarkDeliveryUnknown { worker: u8 },
+    AdvanceClock { seconds: u8 },
+    Restart,
+    Cancel,
+    DuplicateIngress,
+}
+
+pub fn durable_job_trace() -> impl Strategy<Value = Vec<DurableJobOperation>> {
+    collection::vec(
+        prop_oneof![
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::Claim { worker }),
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::Heartbeat { worker }),
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::BeginExternalEffect { worker }),
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::FinalizeOk { worker }),
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::FinalizeRetry { worker }),
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::FinalizeFailed { worker }),
+            (0_u8..=3).prop_map(|worker| DurableJobOperation::MarkDeliveryUnknown { worker }),
+            (0_u8..=40).prop_map(|seconds| DurableJobOperation::AdvanceClock { seconds }),
+            Just(DurableJobOperation::Restart),
+            Just(DurableJobOperation::Cancel),
+            Just(DurableJobOperation::DuplicateIngress),
+        ],
+        0..=64,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSource {
