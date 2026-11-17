@@ -1177,6 +1177,122 @@ mod tests {
     }
 
     #[test]
+    fn generated_sql_like_filter_values_are_bound_not_interpolated() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, RngSeed, TestRunner},
+        };
+
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x10_01_02_03_04_05_06_07);
+        let fragments = prop_oneof![
+            Just("' OR 1=1 --"),
+            Just("'; DROP TABLE mcp_public.test; --"),
+            Just("\\' UNION SELECT current_user --"),
+            Just("%_\\"),
+            Just("$1::text; SELECT pg_sleep(10)"),
+            Just("\u{202e}--\n/* synthetic */"),
+        ];
+        let values = proptest::collection::vec(fragments, 1..=24).prop_map(|parts| parts.concat());
+        let catalog = catalog(&[("message_text", "text")]);
+        let definition = catalog.tables.get("test").unwrap();
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner.run(&values, |payload| {
+            let mut sql = String::new();
+            let mut binds = Vec::new();
+            append_filters(
+                &mut sql,
+                definition,
+                &[filter("message_text", FilterOp::Eq, Some(json!(payload)), vec![])],
+                &mut binds,
+            )
+            .expect("catalog-reviewed text value must validate");
+            prop_assert_eq!(binds, vec![payload.clone()]);
+            prop_assert!(!sql.contains(&payload));
+            prop_assert!(sql.contains("\"message_text\" = $1::text"));
+            Ok(())
+        }).unwrap_or_else(|error| panic!(
+            "case_id=mcp-sql-bindings seed={seed} sha={} replay=sh scripts/replay_quality_case.sh mcp-sql-bindings {seed}: {error}",
+            std::env::var("NEDOBOT_TEST_SHA").unwrap_or_else(|_| "local-unpinned".to_owned())
+        ));
+    }
+
+    #[test]
+    fn generated_forged_chat_ids_are_rejected_by_scope_policy() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, RngSeed, TestRunner},
+        };
+
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x10_08_07_06_05_04_03_02);
+        let scope = ChatReadScope::new("community_a", -2001, Some(-2002)).unwrap();
+        // Positive Telegram IDs can never equal this configured group ID.
+        let forged_ids = 1_i64..=i64::MAX;
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner.run(&forged_ids, |forged_chat_id| {
+            let request = [filter(
+                "chat_id",
+                FilterOp::Eq,
+                Some(json!(forged_chat_id)),
+                vec![],
+            )];
+            prop_assert_ne!(forged_chat_id, scope.discussion_chat_id);
+            prop_assert!(validate_scope_filters(&scope, &request).is_err());
+            Ok(())
+        }).unwrap_or_else(|error| panic!(
+            "case_id=mcp-forged-scope seed={seed} sha={} replay=sh scripts/replay_quality_case.sh mcp-forged-scope {seed}: {error}",
+            std::env::var("NEDOBOT_TEST_SHA").unwrap_or_else(|_| "local-unpinned".to_owned())
+        ));
+    }
+
+    #[test]
+    fn generated_nonnegative_cursors_round_trip_without_offset_change() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, RngSeed, TestRunner},
+        };
+
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x10_09_08_07_06_05_04_03);
+        let offsets = 0_i64..=i64::MAX;
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner.run(&offsets, |offset| {
+            let encoded = encode_cursor(offset);
+            let decoded = decode_cursor(Some(&encoded))
+                .map_err(|error| TestCaseError::fail(format!("valid cursor rejected: {error}")))?;
+            prop_assert_eq!(decoded, offset);
+            Ok(())
+        }).unwrap_or_else(|error| panic!(
+            "case_id=mcp-cursor-roundtrip seed={seed} sha={} replay=sh scripts/replay_quality_case.sh mcp-cursor-roundtrip {seed}: {error}",
+            std::env::var("NEDOBOT_TEST_SHA").unwrap_or_else(|_| "local-unpinned".to_owned())
+        ));
+        assert!(decode_cursor(Some("not-base64!")).is_err());
+        assert!(decode_cursor(Some("AQ")).is_err());
+    }
+
+    #[test]
     fn text_pages_cannot_bypass_sensitive_field_redaction() {
         let catalog = catalog(&[("api_token", "text")]);
         let request = TextReadRequest {
