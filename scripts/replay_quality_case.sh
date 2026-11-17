@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget" >&2
     exit 2
 fi
 
@@ -82,9 +82,24 @@ case "$case_id" in
         test_target=
         test_filter=features::new_user_audit::service::tests::generated_component_scores_match_independent_clamp_and_threshold_oracle
         ;;
+    memory-summary-normalization)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::memory::service::tests::generated_summary_entities_match_normalization_contract
+        ;;
+    memory-error-classification)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::memory::service::tests::generated_error_text_cannot_impersonate_transport_statuses
+        ;;
+    agent-compaction-budget)
+        test_target_flag=--package
+        test_target=agent-runtime
+        test_filter=generated_compaction_plans_match_independent_budget_oracle
+        ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget" >&2
         exit 2
         ;;
 esac

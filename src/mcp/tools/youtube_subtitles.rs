@@ -739,7 +739,10 @@ exit {exit_code}
         let error = get_subtitles(Some(&service), page_input(0, None))
             .await
             .unwrap_err();
-        assert!(error.message.contains("partial files"));
+        assert!(
+            error.message.contains("partial files"),
+            "unexpected provider failure: {error:?}"
+        );
         assert!(service.cached("abcdefghijk").await.is_none());
         assert_eq!(
             std::fs::read_to_string(directory.path().join("calls")).unwrap(),
