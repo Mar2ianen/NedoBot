@@ -579,16 +579,30 @@ fn embedding_text(summary: &MemorySummaryOutput) -> String {
 }
 
 fn classify_error(error: &anyhow::Error) -> &'static str {
-    let value = error.to_string().to_lowercase();
-    if value.contains("429") {
-        "http_429"
-    } else if value.contains("timeout") || value.contains("timed out") {
-        "timeout"
-    } else if value.contains("json") || value.contains("summary=null") {
-        "validation_failed"
-    } else {
-        "error"
+    for cause in error.chain() {
+        if let Some(transport) = cause.downcast_ref::<crate::llm::types::LlmTransportError>() {
+            match transport {
+                crate::llm::types::LlmTransportError::HttpStatus(429) => return "http_429",
+                crate::llm::types::LlmTransportError::Timeout => return "timeout",
+                _ => {}
+            }
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            if request.is_timeout() {
+                return "timeout";
+            }
+            if request
+                .status()
+                .is_some_and(|status| status.as_u16() == 429)
+            {
+                return "http_429";
+            }
+        }
+        if cause.is::<serde_json::Error>() || cause.is::<crate::llm::types::ValidationFailure>() {
+            return "validation_failed";
+        }
     }
+    "error"
 }
 
 pub fn memory_summary_schema() -> Value {
@@ -706,5 +720,24 @@ mod tests {
     fn history_retry_schedule_fails_after_last_attempt() {
         assert_eq!(history_retry_action(10), HistoryRetryAction::Fail);
         assert_eq!(history_retry_action(11), HistoryRetryAction::Fail);
+    }
+
+    #[test]
+    fn error_classification_uses_typed_failures_not_message_substrings() {
+        let untrusted_error =
+            anyhow::anyhow!("model text mentions HTTP 429, timeout, and invalid JSON");
+        assert_eq!(classify_error(&untrusted_error), "error");
+
+        let rate_limited =
+            anyhow::Error::new(crate::llm::types::LlmTransportError::http_status(429));
+        assert_eq!(classify_error(&rate_limited), "http_429");
+
+        let timeout = anyhow::Error::new(crate::llm::types::LlmTransportError::timeout());
+        assert_eq!(classify_error(&timeout), "timeout");
+
+        let invalid_json = anyhow::Error::new(
+            serde_json::from_str::<Value>("{").expect_err("fixture must be invalid JSON"),
+        );
+        assert_eq!(classify_error(&invalid_json), "validation_failed");
     }
 }
