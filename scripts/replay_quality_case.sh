@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip" >&2
     exit 2
 fi
 
@@ -62,9 +62,24 @@ case "$case_id" in
         test_target=
         test_filter=features::ask::agent::tests::reply_prefetch_does_not_exceed_the_tool_call_budget
         ;;
+    mcp-sql-bindings)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::chat_read_api::query::tests::generated_sql_like_filter_values_are_bound_not_interpolated
+        ;;
+    mcp-forged-scope)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::chat_read_api::query::tests::generated_forged_chat_ids_are_rejected_by_scope_policy
+        ;;
+    mcp-cursor-roundtrip)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::chat_read_api::query::tests::generated_nonnegative_cursors_round_trip_without_offset_change
+        ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip" >&2
         exit 2
         ;;
 esac
