@@ -1943,6 +1943,7 @@ name = "nedobot-qr"
 version = "0.1.0"
 dependencies = [
  "image",
+ "proptest",
  "quircs",
  "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=d374a191ae6b6bcd66fbcf8a6646d73138064038)",
 ]

@@ -440,26 +440,34 @@ pub(crate) fn is_safe_fetch_url(value: &str) -> bool {
         return false;
     }
 
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+    let host_ip = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&host);
+    let Ok(ip) = host_ip.parse::<std::net::IpAddr>() else {
         return true;
     };
     match ip {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            !(ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || octets == [169, 254, 169, 254])
-        }
-        std::net::IpAddr::V6(ip) => {
-            let first = ip.segments()[0];
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
-        }
+        std::net::IpAddr::V4(ip) => is_safe_ipv4(ip),
+        std::net::IpAddr::V6(ip) => is_safe_ipv6(ip) && ip.to_ipv4().is_none_or(is_safe_ipv4),
     }
+}
+
+fn is_safe_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || octets == [169, 254, 169, 254])
+}
+
+fn is_safe_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80)
 }
 
 fn attach_requested_url(fetched_results: &mut [SearchResult], requested_url: &str) {
@@ -867,6 +875,10 @@ mod tests {
             "http://10.0.0.1/",
             "http://169.254.169.254/latest/meta-data",
             "http://localhost:8080/",
+            "http://[::1]/",
+            "http://[fc00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:127.0.0.1]/",
             "file:///etc/passwd",
             "https://user:pass@example.com/",
         ] {
@@ -878,6 +890,7 @@ mod tests {
     fn fetch_url_filter_accepts_public_http_targets() {
         assert!(is_safe_fetch_url("https://example.com/news"));
         assert!(is_safe_fetch_url("http://93.184.216.34/news"));
+        assert!(is_safe_fetch_url("http://[2606:4700:4700::1111]/news"));
     }
 
     #[test]
@@ -901,6 +914,33 @@ mod tests {
         assert_eq!(
             fetch_urls(&results, &config, 2),
             vec!["https://example.com/story"]
+        );
+    }
+
+    #[test]
+    fn fetch_urls_never_forwards_blocked_ip_literals_and_keeps_lookalike_hosts_distinct() {
+        let config = Config::from_env().expect("test configuration must parse");
+        let results = [
+            "http://[::1]/admin",
+            "http://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal.attacker.example/article",
+            "https://localhost.example.com/article",
+        ]
+        .into_iter()
+        .map(|url| SearchResult {
+            source: SearchSource::Web,
+            title: url.to_owned(),
+            url: url.to_owned(),
+            snippet: String::new(),
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            fetch_urls(&results, &config, 10),
+            vec![
+                "https://metadata.google.internal.attacker.example/article",
+                "https://localhost.example.com/article",
+            ]
         );
     }
 
