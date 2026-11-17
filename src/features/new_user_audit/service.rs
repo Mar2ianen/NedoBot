@@ -1072,6 +1072,76 @@ fn classify_audit_failure(error: &anyhow::Error) -> AuditFailure {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{
+        prelude::*,
+        test_runner::{Config, RngSeed, TestRunner},
+    };
+
+    use teloxide_antispam::scoring::ScoreComponents;
+
+    use super::*;
+
+    #[test]
+    fn generated_component_scores_match_independent_clamp_and_threshold_oracle() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x11_01_02_03_04_05_06_07);
+        let strategy = (
+            -20_i32..=120,
+            -20_i32..=120,
+            -20_i32..=120,
+            -20_i32..=120,
+            -20_i32..=40,
+            -20_i32..=120,
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner.run(&strategy, |(baseline, first_message, avatar, channel, external, threshold)| {
+            let components = ScoreComponents {
+                baseline_score: baseline,
+                baseline_signals: Value::Array(Vec::new()),
+                first_message_score: first_message,
+                first_message_signals: Value::Array(Vec::new()),
+                avatar_score: avatar,
+                avatar_signals: Value::Array(Vec::new()),
+                personal_channel_score: channel,
+                personal_channel_signals: Value::Array(Vec::new()),
+                external_score: external,
+                external_signals: Value::Array(Vec::new()),
+                review_threshold: threshold,
+                first_message_embedding: None,
+            };
+
+            // Independent contract: clamp each source separately, cap external
+            // reputation at 12, saturate the total at 100, then apply 70/40 bands.
+            let expected_score = (baseline.clamp(0, 100)
+                + first_message.clamp(0, 100)
+                + avatar.clamp(0, 100)
+                + channel.clamp(0, 100)
+                + external.clamp(0, 12))
+                .clamp(0, 100);
+            prop_assert_eq!(components.final_score(), expected_score);
+            let threshold = threshold.clamp(0, 100);
+            let expected_level = if expected_score >= threshold {
+                "high"
+            } else if expected_score >= 40 {
+                "medium"
+            } else {
+                "low"
+            };
+            prop_assert_eq!(components.final_level(), expected_level);
+            Ok(())
+        }).unwrap_or_else(|error| panic!(
+            "case_id=audit-score-components seed={seed} sha={} replay=sh scripts/replay_quality_case.sh audit-score-components {seed}: {error}",
+            std::env::var("NEDOBOT_TEST_SHA").unwrap_or_else(|_| "local-unpinned".to_owned())
+        ));
+    }
+
     #[test]
     fn reputation_gemma_tfidf_and_has_text_follow_the_artifact_contract() {
         let context = FirstMessageScoreContext {
@@ -1096,8 +1166,6 @@ mod tests {
         );
     }
     use serde_json::json;
-
-    use super::*;
 
     fn job_with_input(input_json: Value) -> NewUserAuditJob {
         NewUserAuditJob {
