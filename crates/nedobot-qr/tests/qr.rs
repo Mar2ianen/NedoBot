@@ -1,5 +1,9 @@
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb, RgbImage, imageops};
 use nedobot_qr::{as_utf8, scan_image};
+use proptest::{
+    prelude::*,
+    test_runner::{Config, RngSeed, TestRunner},
+};
 use std::io::Cursor;
 
 #[test]
@@ -81,9 +85,54 @@ fn rejects_oversized_or_corrupt() {
     assert!(scan_image(b"broken").is_err());
 }
 
-fn encode_png(image: RgbImage) -> Vec<u8> {
+#[test]
+fn generated_valid_pngs_keep_qr_scan_output_bounded_and_deterministic() {
+    let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0x14_01_02_03_04_05_06_07);
+    let dimensions = (1_u32..=128, 1_u32..=128);
+    let strategy = dimensions.prop_flat_map(|(width, height)| {
+        prop::collection::vec(any::<u8>(), (width * height) as usize)
+            .prop_map(move |pixels| (width, height, pixels))
+    });
+    let mut runner = TestRunner::new(Config {
+        cases: 128,
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..Config::default()
+    });
+
+    runner
+        .run(&strategy, |(width, height, pixels)| {
+            let image = image::GrayImage::from_raw(width, height, pixels)
+                .expect("generated pixel count matches dimensions");
+            let bytes = encode_png(DynamicImage::ImageLuma8(image));
+            let first = scan_image(&bytes).expect("bounded schema-valid PNG must decode safely");
+            let replay = scan_image(&bytes).expect("same PNG must remain decodable");
+
+            prop_assert_eq!(&first, &replay);
+            prop_assert!(first.len() <= nedobot_qr::MAX_CODES);
+            prop_assert!(
+                first
+                    .iter()
+                    .all(|payload| payload.len() <= nedobot_qr::MAX_PAYLOAD_BYTES)
+            );
+            Ok(())
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "case_id=qr-decoder-resource seed={seed} sha={} replay=sh scripts/replay_quality_case.sh qr-decoder-resource {seed}: {error}",
+                std::env::var("NEDOBOT_TEST_SHA")
+                    .unwrap_or_else(|_| "local-unpinned".to_owned())
+            )
+        });
+}
+
+fn encode_png(image: impl Into<DynamicImage>) -> Vec<u8> {
     let mut output = Cursor::new(Vec::new());
-    DynamicImage::ImageRgb8(image)
+    image
+        .into()
         .write_to(&mut output, ImageFormat::Png)
         .unwrap();
     output.into_inner()

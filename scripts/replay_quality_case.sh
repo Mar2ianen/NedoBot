@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape fetch-url-ip-literals qr-decoder-resource mcp-youtube-timeout media-writer-boundary" >&2
     exit 2
 fi
 
@@ -102,9 +102,29 @@ case "$case_id" in
         test_target=
         test_filter=features::reports::render::tests::generated_report_html_escapes_untrusted_text_and_stays_bounded
         ;;
+    fetch-url-ip-literals)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::search::mcp::tests::fetch_url
+        ;;
+    qr-decoder-resource)
+        test_target_flag=--package
+        test_target=nedobot-qr
+        test_filter=generated_valid_pngs_keep_qr_scan_output_bounded_and_deterministic
+        ;;
+    mcp-youtube-timeout)
+        test_target_flag=--lib
+        test_target=
+        test_filter=mcp::tools::youtube_subtitles::tests::timed_out_provider_process_is_killed_and_not_cached
+        ;;
+    media-writer-boundary)
+        test_target_flag=--lib
+        test_target=
+        test_filter=mcp::tools::media::tests::bounded_media_writer_accepts_exact_limit_and_rejects_partial_overflow
+        ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape fetch-url-ip-literals qr-decoder-resource mcp-youtube-timeout media-writer-boundary" >&2
         exit 2
         ;;
 esac
@@ -115,5 +135,8 @@ if [ -z "${GITHUB_SHA:-}" ]; then
 fi
 if [ "$test_target_flag" = --lib ]; then
     exec cargo test --lib --locked "$test_filter" -- --nocapture
+fi
+if [ "$test_target_flag" = --package ]; then
+    exec cargo test --package "$test_target" --locked "$test_filter" -- --nocapture
 fi
 exec cargo test "$test_target_flag" "$test_target" --locked "$test_filter" -- --nocapture

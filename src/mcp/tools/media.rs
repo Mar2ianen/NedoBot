@@ -276,3 +276,24 @@ impl AsyncWrite for BoundedMediaWriter {
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn bounded_media_writer_accepts_exact_limit_and_rejects_partial_overflow() {
+        let mut writer = BoundedMediaWriter::new(4);
+        writer.write_all(b"abcd").await.unwrap();
+
+        let error = writer
+            .write_all(b"e")
+            .await
+            .expect_err("the first byte beyond the limit must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(writer.bytes, b"abcd");
+        assert_eq!(writer.exceeded_at, Some(5));
+    }
+}
