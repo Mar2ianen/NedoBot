@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget" >&2
     exit 2
 fi
 
@@ -47,9 +47,24 @@ case "$case_id" in
         test_filter=structurally_valid_generated_messages_preserve_command_precedence
         ;;
     ingress-reference-trace) test_filter=ingress_reference_model_keeps_only_current_revision_and_media_evidence ;;
+    ask-tool-authorization)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::ask::agent::tests::generated_tool_authorization_matches_independent_allowlist_oracle
+        ;;
+    ask-mcp-untrusted-preview)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::ask::agent::tests::generated_mcp_text_stays_untrusted_and_within_preview_budget
+        ;;
+    ask-prefetch-budget)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::ask::agent::tests::reply_prefetch_does_not_exceed_the_tool_call_budget
+        ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget" >&2
         exit 2
         ;;
 esac
