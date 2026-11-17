@@ -92,6 +92,7 @@ pub struct VoiceJob {
     pub attempts: i32,
     pub progress_message_id: Option<i32>,
     pub status: VoiceJobStatus,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -136,6 +137,7 @@ type VoiceJobRow = (
     i32,
     Option<i32>,
     String,
+    chrono::DateTime<chrono::Utc>,
 );
 
 fn row_to_job(row: VoiceJobRow) -> anyhow::Result<VoiceJob> {
@@ -153,6 +155,7 @@ fn row_to_job(row: VoiceJobRow) -> anyhow::Result<VoiceJob> {
         attempts,
         progress_message_id,
         status,
+        created_at,
     ) = row;
     Ok(VoiceJob {
         id,
@@ -168,13 +171,14 @@ fn row_to_job(row: VoiceJobRow) -> anyhow::Result<VoiceJob> {
         attempts,
         progress_message_id,
         status: VoiceJobStatus::try_from(status.as_str())?,
+        created_at,
     })
 }
 
-const JOB_COLUMNS: &str = "id, chat_id, message_id, user_id, file_id, file_unique_id, media_kind, duration_sec, file_size, mime_type, attempts, progress_message_id, status";
-const JOB_COLUMNS_QUALIFIED: &str = "job.id, job.chat_id, job.message_id, job.user_id, job.file_id, job.file_unique_id, job.media_kind, job.duration_sec, job.file_size, job.mime_type, job.attempts, job.progress_message_id, job.status";
+const JOB_COLUMNS: &str = "id, chat_id, message_id, user_id, file_id, file_unique_id, media_kind, duration_sec, file_size, mime_type, attempts, progress_message_id, status, created_at";
+const JOB_COLUMNS_QUALIFIED: &str = "job.id, job.chat_id, job.message_id, job.user_id, job.file_id, job.file_unique_id, job.media_kind, job.duration_sec, job.file_size, job.mime_type, job.attempts, job.progress_message_id, job.status, job.created_at";
 
-pub async fn create_voice_job(pool: &PgPool, media: &VoiceMedia) -> anyhow::Result<Option<i64>> {
+pub async fn enqueue_voice_job(pool: &PgPool, media: &VoiceMedia) -> anyhow::Result<Option<i64>> {
     let row = sqlx::query_as::<_, (i64,)>(
         r#"
         insert into voice_transcription_jobs
@@ -183,11 +187,7 @@ pub async fn create_voice_job(pool: &PgPool, media: &VoiceMedia) -> anyhow::Resu
                 media_kind, duration_sec, file_size, mime_type
             )
         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        on conflict (chat_id, message_id) do update
-        set updated_at = now()
-        where voice_transcription_jobs.status in ('pending', 'retry_wait')
-           or (voice_transcription_jobs.status in ('processing', 'downloading', 'transcribing', 'cleaning')
-               and voice_transcription_jobs.lease_expires_at <= now())
+        on conflict (chat_id, message_id) do nothing
         returning id
         "#,
     )

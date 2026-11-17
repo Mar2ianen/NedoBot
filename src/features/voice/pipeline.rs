@@ -7,12 +7,12 @@ use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
 use crate::features::voice::repo::{
-    VoiceJob, VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
-    create_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_failed, mark_voice_job_phase,
+    VoiceJob, VoiceJobPhase, VoiceTransition, claim_next_voice_job, enqueue_voice_job,
+    mark_voice_job_delivery_unknown, mark_voice_job_failed, mark_voice_job_phase,
     mark_voice_job_retry_or_failed, mark_voice_job_skipped, recover_expired_voice_deliveries,
     save_asr_result, save_progress_message, save_voice_result,
 };
-use crate::features::voice::types::{AsrTranscript, VoiceMedia};
+use crate::features::voice::types::{AsrTranscript, VoiceEnqueueOutcome, VoiceMedia};
 use crate::state::AppState;
 use crate::telegram::render::{send_html_reply, send_rich_message_reply};
 
@@ -38,12 +38,11 @@ const NO_SPEECH_ARTIFACTS: &[&str] = &[
 ];
 
 pub async fn maybe_transcribe_voice(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VoiceEnqueueOutcome> {
     if !state.config.voice.enabled || !state.config.voice.auto_transcribe {
-        return Ok(false);
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
     if !voice_chat_is_supported(msg, state)
@@ -53,53 +52,56 @@ pub async fn maybe_transcribe_voice(
             .is_some_and(|text| text.trim_start().starts_with('/'))
         || msg.is_automatic_forward()
     {
-        return Ok(false);
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
-    transcribe_media_message(bot, msg, state).await
+    transcribe_media_message(msg, state).await
 }
 
 pub async fn transcribe_reply(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     command_message: &Message,
     state: &AppState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<VoiceEnqueueOutcome> {
     if !state.config.voice.enabled {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Расшифровка голосовых сейчас отключена.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
     if !voice_chat_is_supported(command_message, state) {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Эта команда доступна только в личном чате или основном чате.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
     let Some(reply) = command_message.reply_to_message() else {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Ответьте командой /transcribe на voice, audio или кружок.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     };
     if VoiceMedia::from_message(reply).is_none() {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Нужен reply на voice, audio или кружок.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
-    transcribe_media_message(bot, reply, state).await?;
-    Ok(())
+    transcribe_media_message(reply, state).await
 }
 
 fn voice_chat_is_supported(msg: &Message, state: &AppState) -> bool {
@@ -123,37 +125,22 @@ async fn send_voice_command_message(
 }
 
 async fn transcribe_media_message(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VoiceEnqueueOutcome> {
     let Some(media) = VoiceMedia::from_message(msg) else {
-        return Ok(false);
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     };
 
-    let recovered = recover_expired_voice_deliveries(&state.pool).await?;
-    if recovered > 0 {
-        tracing::warn!(count = recovered, "recovered expired voice delivery leases");
-    }
-
-    let Some(job_id) = create_voice_job(&state.pool, &media).await? else {
+    let Some(job_id) = enqueue_voice_job(&state.pool, &media).await? else {
         tracing::debug!(
             chat_id = media.chat_id,
             message_id = media.message_id,
-            "voice transcription job is already processing or terminal"
+            "voice transcription job already exists; duplicate update was not enqueued"
         );
-        return Ok(true);
+        return Ok(VoiceEnqueueOutcome::AlreadyPresent);
     };
-
-    let Some(job) = claim_voice_job(&state.pool, job_id).await? else {
-        tracing::debug!(
-            job_id,
-            "voice transcription job was claimed by another worker"
-        );
-        return Ok(true);
-    };
-    process_claimed_voice_job(bot, state, job, media).await?;
-    Ok(true)
+    Ok(VoiceEnqueueOutcome::Enqueued { job_id })
 }
 
 pub async fn process_next_voice_job(
@@ -167,6 +154,15 @@ pub async fn process_next_voice_job(
     let Some(job) = claim_next_voice_job(&state.pool).await? else {
         return Ok(false);
     };
+    let queue_latency_seconds = chrono::Utc::now()
+        .signed_duration_since(job.created_at)
+        .num_seconds()
+        .max(0);
+    tracing::info!(
+        job_id = job.id,
+        queue_latency_seconds,
+        "claimed voice transcription job"
+    );
     let media = job.media()?;
     process_claimed_voice_job(bot, state, job, media).await?;
     Ok(true)
@@ -631,8 +627,13 @@ async fn send_regular_transcript(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::features::voice::types::AsrSegment;
+    use axum::{Router, body::Bytes, extract::State, routing::post};
+
+    type CapturedTelegramRequest = Arc<Mutex<Option<String>>>;
 
     fn transcript(text: &str, segments: Vec<&str>) -> AsrTranscript {
         AsrTranscript {
@@ -710,5 +711,69 @@ mod tests {
             "Музыка сегодня громкая",
             Vec::new()
         )));
+    }
+
+    async fn fake_telegram_edit(
+        State(captured): State<CapturedTelegramRequest>,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        *captured.lock().expect("captured request lock") =
+            Some(String::from_utf8_lossy(&body).into_owned());
+        axum::Json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 27,
+                "date": 1,
+                "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
+                "text": "<b>recognized words</b>"
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn transcript_delivery_uses_the_fake_telegram_api() {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram_edit))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram listener must bind");
+        let address = listener.local_addr().expect("fake listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(teloxide::types::ParseMode::Html);
+
+        let delivered = send_rendered_transcript(
+            &bot,
+            ChatId(-1001),
+            MessageId(11),
+            MessageId(27),
+            &RenderedTranscript::Message {
+                html: "<b>recognized words</b>".to_owned(),
+            },
+        )
+        .await
+        .expect("fake Telegram API should accept the transcript edit");
+        server.abort();
+
+        assert_eq!(delivered.html, "<b>recognized words</b>");
+        let payload = captured
+            .lock()
+            .expect("captured request lock")
+            .take()
+            .expect("transcript delivery should call Telegram");
+        assert!(payload.contains("chat_id"), "Telegram request: {payload}");
+        assert!(payload.contains("-1001"), "Telegram request: {payload}");
+        assert!(
+            payload.contains("message_id"),
+            "Telegram request: {payload}"
+        );
+        assert!(payload.contains("27"), "Telegram request: {payload}");
+        assert!(
+            payload.contains("<b>recognized words</b>"),
+            "Telegram request: {payload}"
+        );
     }
 }
