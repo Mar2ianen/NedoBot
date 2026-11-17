@@ -451,7 +451,7 @@ async fn authorize_actor(
         return false;
     }
     if !requires_restrict_right {
-        return true;
+        return actor_is_authorized(&actor_member.kind, None, false);
     }
     if !actor_member.kind.can_restrict_members() {
         return false;
@@ -460,9 +460,25 @@ async fn authorize_actor(
     let Ok(bot_user) = bot.get_me().await else {
         return false;
     };
-    bot.get_chat_member(chat_id, bot_user.id)
-        .await
-        .is_ok_and(|member| member.kind.can_restrict_members())
+    let Ok(bot_member) = bot.get_chat_member(chat_id, bot_user.id).await else {
+        return false;
+    };
+    actor_is_authorized(&actor_member.kind, Some(&bot_member.kind), true)
+}
+
+fn actor_is_authorized(
+    actor: &ChatMemberKind,
+    bot: Option<&ChatMemberKind>,
+    requires_restrict_right: bool,
+) -> bool {
+    actor.is_privileged()
+        && (!requires_restrict_right
+            || (actor.can_restrict_members()
+                && bot.is_some_and(ChatMemberKind::can_restrict_members)))
+}
+
+fn target_may_be_moderated(is_bot: bool, kind: &ChatMemberKind) -> bool {
+    !is_bot && !kind.is_privileged()
 }
 
 async fn resolve_target_ids(
@@ -533,7 +549,7 @@ async fn checked_targets(
                     candidate.user_id
                 )
             })?;
-        if member.user.is_bot || member.kind.is_privileged() {
+        if !target_may_be_moderated(member.user.is_bot, &member.kind) {
             anyhow::bail!("ботов и администраторов нельзя включать в ручное наказание");
         }
         let local_restriction =
@@ -1413,6 +1429,184 @@ async fn send_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kind(status: &str, can_restrict: bool) -> ChatMemberKind {
+        let value = match status {
+            "creator" => serde_json::json!({
+                "status": status,
+                "is_anonymous": false,
+                "custom_title": null
+            }),
+            "administrator" => serde_json::json!({
+                "status": status,
+                "is_anonymous": false,
+                "can_be_edited": false,
+                "can_manage_chat": false,
+                "can_change_info": false,
+                "can_delete_messages": false,
+                "can_manage_video_chats": false,
+                "can_invite_users": false,
+                "can_restrict_members": can_restrict,
+                "can_promote_members": false
+            }),
+            "member" => serde_json::json!({"status": status}),
+            "restricted" => serde_json::json!({
+                "status": status,
+                "until_date": 1_700_000_000,
+                "is_member": true,
+                "can_send_messages": false,
+                "can_send_audios": false,
+                "can_send_documents": false,
+                "can_send_photos": false,
+                "can_send_videos": false,
+                "can_send_video_notes": false,
+                "can_send_voice_notes": false,
+                "can_send_other_messages": false,
+                "can_add_web_page_previews": false,
+                "can_change_info": false,
+                "can_invite_users": false,
+                "can_pin_messages": false,
+                "can_manage_topics": false,
+                "can_send_polls": false
+            }),
+            "left" => serde_json::json!({"status": status}),
+            "kicked" => serde_json::json!({"status": status, "until_date": 0}),
+            _ => unreachable!("test fixture status must be known"),
+        };
+        serde_json::from_value(value).expect("synthetic Telegram member kind must be schema-valid")
+    }
+
+    #[test]
+    fn moderation_actor_and_bot_rights_match_the_independent_privilege_table() {
+        // These expected columns are the policy oracle, independent of the
+        // production helper: basic reads require an admin; mutations require
+        // both actor and bot to hold restrict-members rights.
+        let roles = [
+            ("creator", false, true, true),
+            ("administrator", false, true, false),
+            ("administrator", true, true, true),
+            ("member", false, false, false),
+            ("restricted", false, false, false),
+            ("left", false, false, false),
+            ("kicked", false, false, false),
+        ];
+        for (actor_status, actor_restrict, actor_privileged, actor_can_mutate) in roles {
+            let actor = kind(actor_status, actor_restrict);
+            assert_eq!(
+                actor_is_authorized(&actor, None, false),
+                actor_privileged,
+                "read policy for actor={actor_status}/{actor_restrict}"
+            );
+            for (bot_status, bot_restrict, _, bot_can_mutate) in roles {
+                let bot = kind(bot_status, bot_restrict);
+                assert_eq!(
+                    actor_is_authorized(&actor, Some(&bot), true),
+                    actor_can_mutate && bot_can_mutate,
+                    "mutation policy actor={actor_status}/{actor_restrict}, bot={bot_status}/{bot_restrict}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moderation_targets_exclude_every_bot_and_privileged_member() {
+        for (status, can_restrict, privileged) in [
+            ("creator", false, true),
+            ("administrator", false, true),
+            ("administrator", true, true),
+            ("member", false, false),
+            ("restricted", false, false),
+            ("left", false, false),
+            ("kicked", false, false),
+        ] {
+            let target = kind(status, can_restrict);
+            assert_eq!(
+                target_may_be_moderated(false, &target),
+                !privileged,
+                "target role policy for {status}/{can_restrict}"
+            );
+            assert!(!target_may_be_moderated(true, &target));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_but_lost_telegram_response_is_unknown_not_rejected() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        async fn fake_api(
+            response: Option<&'static str>,
+        ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("local Telegram fake must bind");
+            let address = listener.local_addr().expect("fake address must exist");
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("fake must accept request");
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0_usize;
+                loop {
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .await
+                        .expect("request header must be readable");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value
+                            .trim()
+                            .parse()
+                            .expect("content length must be numeric");
+                    }
+                }
+                let mut body = vec![0_u8; content_length];
+                reader
+                    .read_exact(&mut body)
+                    .await
+                    .expect("Telegram request body must be readable");
+                if let Some(body) = response {
+                    let mut stream = reader.into_inner();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("fake Telegram response must be writable");
+                }
+                // No response simulates Telegram applying the request and the
+                // transport disappearing before the acknowledgement arrives.
+            });
+            (address, server)
+        }
+
+        let (address, server) = fake_api(None).await;
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("fake URL"))
+            .parse_mode(teloxide::types::ParseMode::Html);
+        let error = apply_ban(&bot, ChatId(-1001), 42, None)
+            .await
+            .expect_err("lost acknowledgement must surface as a request error");
+        server.await.expect("fake server must finish");
+        assert!(telegram_outcome_unknown(&error));
+
+        let (address, server) = fake_api(Some(
+            r#"{"ok":false,"error_code":403,"description":"not enough rights"}"#,
+        ))
+        .await;
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("fake URL"))
+            .parse_mode(teloxide::types::ParseMode::Html);
+        let error = apply_ban(&bot, ChatId(-1001), 42, None)
+            .await
+            .expect_err("Telegram denial must surface as a request error");
+        server.await.expect("fake server must finish");
+        assert!(!telegram_outcome_unknown(&error));
+    }
 
     #[test]
     fn escalation_action_uses_fixed_five_day_expiration() {
