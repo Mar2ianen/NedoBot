@@ -3,7 +3,7 @@ set -eu
 
 if [ "$#" -ne 2 ]; then
     echo "usage: $0 <case-id> <seed>" >&2
-    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
     exit 2
 fi
 
@@ -33,6 +33,11 @@ case "$case_id" in
         test_target=
         test_filter=features::voice::download::tests::generated_media_metadata_matches_independent_size_and_duration_oracle
         ;;
+    first-comment-render)
+        test_target_flag=--lib
+        test_target=
+        test_filter=features::first_comment::render::tests::generated_unicode_and_control_text_never_becomes_untrusted_html
+        ;;
     http-outcomes) test_filter=typed_http_outcomes_preserve_uncertain_delivery_and_bounds ;;
     safe-report) test_filter=reports_omit_payload_and_require_evidence_for_v1 ;;
     minimal-url-trace) test_filter=minimal_operation_trace_replays_with_independent_identity ;;
@@ -44,7 +49,7 @@ case "$case_id" in
     ingress-reference-trace) test_filter=ingress_reference_model_keeps_only_current_revision_and_media_evidence ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
+        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace" >&2
         exit 2
         ;;
 esac
