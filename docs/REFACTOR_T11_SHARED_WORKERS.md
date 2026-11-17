@@ -29,7 +29,7 @@ Local commands:
 - `cargo test --locked --bin tg_ai_bot_teloxide features::jobs::worker::tests` — passed (8 worker lifecycle tests, including unexpected return, panic, clean shutdown, and bounded abort).
 - `cargo check --workspace --all-targets --locked` — passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
-- Full local test-profile build was not run because the home filesystem reached 100% use with approximately 1.3 GB available. CI is required to verify the full suite and disposable PostgreSQL assertions; results will be recorded after the implementation head completes both required CI runs.
+- Full local test-profile build was not run because the home filesystem reached 100% use with approximately 1.3 GB available. CI verifies the full suite and disposable PostgreSQL assertions for the correction head below.
 
 ## Invariants and limitations
 
@@ -51,8 +51,8 @@ The test-only correction head `a2b995c` also passed both current-head CI runs: [
 
 ## Fatal worker-exit correction
 
-The follow-up correction makes unexpected exits fatal after graceful shutdown is attempted. Local verification on the correction worktree: 8 worker lifecycle tests passed, `cargo check --bin tg_ai_bot_teloxide --locked` passed, and `cargo clippy --workspace --all-targets --locked -- -D warnings` passed. The new PR head still requires its own GitHub CI runs; the earlier CI results above cover the prior head only.
+The follow-up correction makes unexpected exits fatal after graceful shutdown is attempted. Local verification on the correction worktree: 8 worker lifecycle tests passed, `cargo check --bin tg_ai_bot_teloxide --locked` passed, and `cargo clippy --workspace --all-targets --locked -- -D warnings` passed. Correction head `8f46b26477fe117e2f6547280f750029bfefd9e4` passed both required GitHub CI runs: [#44194954792](https://github.com/Mar2ianen/NedoBot/actions/runs/44194954792) and [#44194961644](https://github.com/Mar2ianen/NedoBot/actions/runs/44194961644). Both completed workspace tests, Clippy, migrations, URL PostgreSQL lanes, MCP PostgreSQL integration, and manual-moderation PostgreSQL integration successfully.
 
 ## Review state
 
-PR #144 is open as a draft, stacked on T10. Its prior runtime implementation head was `18ab7f9`; head `a2b995c` added deterministic test coverage. The fatal worker-exit correction is an additional unverified PR head pending CI. It is not merged or deployed.
+PR #144 is open as a draft, stacked on T10. Its prior runtime implementation head was `18ab7f9`; head `a2b995c` added deterministic test coverage. The fatal worker-exit correction at `8f46b26477fe` passed both CI runs above. It is not merged or deployed.
