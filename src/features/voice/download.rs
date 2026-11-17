@@ -387,14 +387,16 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("temporary output must be created");
         let path = file.path().to_owned();
         let mut output = tokio::fs::File::from_std(file.reopen().expect("file must reopen"));
-        let mut bounded = LimitedWriter::new(&mut output, 4);
-        let error = bounded
-            .write_all(b"0123456789")
-            .await
-            .expect_err("writer must reject the first byte beyond its cap");
-        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
-        assert_eq!(bounded.written, 4);
-        drop(bounded);
+        let (error_kind, written) = {
+            let mut bounded = LimitedWriter::new(&mut output, 4);
+            let error = bounded
+                .write_all(b"0123456789")
+                .await
+                .expect_err("writer must reject the first byte beyond its cap");
+            (error.kind(), bounded.written)
+        };
+        assert_eq!(error_kind, io::ErrorKind::FileTooLarge);
+        assert_eq!(written, 4);
         output.flush().await.expect("written prefix must flush");
         assert_eq!(tokio::fs::metadata(path).await.unwrap().len(), 4);
     }
