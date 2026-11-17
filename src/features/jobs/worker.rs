@@ -87,6 +87,24 @@ pub enum WorkerTaskExit {
     Aborted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerFailure {
+    pub worker: WorkerId,
+    pub exit: WorkerTaskExit,
+}
+
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "background worker {:?} exited unexpectedly: {:?}",
+            self.worker, self.exit
+        )
+    }
+}
+
+impl std::error::Error for WorkerFailure {}
+
 pub struct WorkerSupervisor {
     shutdown: watch::Sender<bool>,
     tasks: JoinSet<WorkerId>,
@@ -125,35 +143,41 @@ impl WorkerSupervisor {
     /// Runs the foreground service while observing unexpected worker exits.
     /// A panic is reported by worker ID; durable jobs remain recoverable through
     /// their existing database leases on restart.
-    pub async fn supervise_until<F>(&mut self, foreground: F)
+    pub async fn supervise_until<F>(&mut self, foreground: F) -> Result<(), WorkerFailure>
     where
         F: Future<Output = ()>,
     {
         tokio::pin!(foreground);
         loop {
             tokio::select! {
-                _ = &mut foreground => break,
+                _ = &mut foreground => {
+                    self.shutdown_and_drain().await;
+                    return Ok(());
+                },
                 joined = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     if let Some(joined) = joined {
-                        self.record_exit(joined);
+                        let (worker, exit) = self.record_exit(joined);
+                        self.shutdown_and_drain().await;
+                        return Err(WorkerFailure { worker, exit });
                     }
                 }
             }
         }
-        self.shutdown_and_drain().await;
     }
 
     pub async fn shutdown_and_drain(&mut self) {
+        self.shutdown_and_drain_with_timeout(WORKER_DRAIN_TIMEOUT)
+            .await;
+    }
+
+    async fn shutdown_and_drain_with_timeout(&mut self, drain_timeout: Duration) {
         self.shutdown.send_replace(true);
         let drain = async {
             while let Some(joined) = self.tasks.join_next_with_id().await {
                 self.record_exit(joined);
             }
         };
-        if tokio::time::timeout(WORKER_DRAIN_TIMEOUT, drain)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(drain_timeout, drain).await.is_err() {
             let abandoned = self.tasks.len();
             self.tasks.abort_all();
             while let Some(joined) = self.tasks.join_next_with_id().await {
@@ -161,7 +185,7 @@ impl WorkerSupervisor {
             }
             tracing::warn!(
                 abandoned,
-                drain_timeout_seconds = WORKER_DRAIN_TIMEOUT.as_secs(),
+                drain_timeout_ms = drain_timeout.as_millis(),
                 "aborted background workers after bounded shutdown drain"
             );
         }
@@ -205,7 +229,10 @@ impl WorkerSupervisor {
         }
     }
 
-    fn record_exit(&mut self, joined: Result<(Id, WorkerId), JoinError>) {
+    fn record_exit(
+        &mut self,
+        joined: Result<(Id, WorkerId), JoinError>,
+    ) -> (WorkerId, WorkerTaskExit) {
         let shutting_down = *self.shutdown.borrow();
         let (worker, exit) = self.classify_join(joined);
         match exit {
@@ -231,6 +258,7 @@ impl WorkerSupervisor {
                 );
             }
         }
+        (worker, exit)
     }
 }
 
@@ -356,7 +384,8 @@ mod tests {
     use super::super::policy::WorkerPollPolicy;
     use super::run_interval_worker;
     use super::{
-        PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, WorkerTaskExit, run_poll_worker,
+        PollOutcome, WorkerFailure, WorkerId, WorkerSpec, WorkerSupervisor, WorkerTaskExit,
+        run_poll_worker,
     };
 
     #[tokio::test(start_paused = true)]
@@ -478,5 +507,105 @@ mod tests {
             supervisor.classify_join(aborted),
             (WorkerId::QrEvidence, WorkerTaskExit::Aborted)
         );
+    }
+
+    #[tokio::test]
+    async fn unexpected_worker_return_is_fatal_after_other_workers_drain() {
+        let mut supervisor = WorkerSupervisor::new();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        supervisor.spawn(WorkerId::NewUserAudit, |_| async {});
+        supervisor.spawn(WorkerId::QrEvidence, move |mut shutdown| async move {
+            let _ = shutdown.changed().await;
+            let _ = stopped_tx.send(());
+        });
+
+        let failure = supervisor
+            .supervise_until(std::future::pending())
+            .await
+            .expect_err("a worker returning before shutdown must fail the service");
+
+        assert_eq!(
+            failure,
+            WorkerFailure {
+                worker: WorkerId::NewUserAudit,
+                exit: WorkerTaskExit::Completed,
+            }
+        );
+        stopped_rx
+            .await
+            .expect("remaining workers must drain before the fatal result is returned");
+    }
+
+    #[tokio::test]
+    async fn worker_panic_is_fatal_after_other_workers_drain() {
+        let mut supervisor = WorkerSupervisor::new();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        supervisor.spawn(WorkerId::DecisionAudit, |_| async {
+            panic!("synthetic worker panic");
+        });
+        supervisor.spawn(WorkerId::QrEvidence, move |mut shutdown| async move {
+            let _ = shutdown.changed().await;
+            let _ = stopped_tx.send(());
+        });
+
+        let failure = supervisor
+            .supervise_until(std::future::pending())
+            .await
+            .expect_err("a worker panic must fail the service");
+
+        assert_eq!(
+            failure,
+            WorkerFailure {
+                worker: WorkerId::DecisionAudit,
+                exit: WorkerTaskExit::Panicked,
+            }
+        );
+        stopped_rx
+            .await
+            .expect("remaining workers must drain before the fatal result is returned");
+    }
+
+    #[tokio::test]
+    async fn foreground_shutdown_drains_workers_without_failing() {
+        let mut supervisor = WorkerSupervisor::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        supervisor.spawn(WorkerId::QrEvidence, move |mut shutdown| async move {
+            let _ = started_tx.send(());
+            let _ = shutdown.changed().await;
+            let _ = stopped_tx.send(());
+        });
+
+        let result = supervisor
+            .supervise_until(async {
+                started_rx
+                    .await
+                    .expect("worker must start before foreground shutdown");
+            })
+            .await;
+
+        assert!(result.is_ok(), "normal dispatcher shutdown is successful");
+        stopped_rx
+            .await
+            .expect("normal shutdown must drain the worker");
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_worker_after_the_drain_deadline() {
+        let mut supervisor = WorkerSupervisor::new();
+        supervisor.spawn(WorkerId::QrEvidence, |_| async {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        supervisor
+            .shutdown_and_drain_with_timeout(std::time::Duration::from_millis(1))
+            .await;
+
+        assert!(
+            supervisor.tasks.is_empty(),
+            "timed-out tasks must be joined"
+        );
+        assert!(supervisor.worker_ids.is_empty());
     }
 }

@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         .enable_ctrlc_handler()
         .build();
 
-    workers.supervise_until(dispatcher.dispatch()).await;
+    workers.supervise_until(dispatcher.dispatch()).await?;
 
     Ok(())
 }
