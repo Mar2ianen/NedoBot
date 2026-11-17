@@ -142,6 +142,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_rich_backfill_and_exact_word_counts(&pool).await;
     assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
+    assert_stats_rank_ties_follow_the_reference_order(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_ask_conversation_memory(&pool).await;
@@ -7129,6 +7130,71 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     assert!(html.contains(strings.sentiment_mood));
     assert!(rich.contains(strings.sentiment_mood));
     assert!(html.contains("позитив"));
+}
+
+async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
+    const CHAT_ID: i64 = -1_009_876_543_201;
+    const USERS: [(i64, i64); 3] = [(30_003, 2), (30_001, 2), (30_002, 1)];
+
+    for (user_index, (user_id, message_count)) in USERS.iter().copied().enumerate() {
+        for offset in 0..usize::try_from(message_count).unwrap() {
+            query(
+                r#"
+                insert into telegram_messages
+                    (chat_id, message_id, user_id, text, created_at)
+                values ($1, $2, $3, 'synthetic stats ledger', '2026-01-01 12:00:00+00')
+                "#,
+            )
+            .bind(CHAT_ID)
+            .bind(900_000_i32 + i32::try_from(user_index * 10 + offset).unwrap())
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("synthetic equal-count ledger row must insert");
+        }
+    }
+
+    // Independent ledger oracle: activity descending for top-N, ascending for
+    // bottom-N, and stable user ID ascending for every equal-count group.
+    let mut expected_top = USERS.to_vec();
+    expected_top.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count.cmp(left_count).then(left_id.cmp(right_id))
+    });
+    let top = stats_repo::top_message_users(pool, CHAT_ID, 3)
+        .await
+        .expect("top user query must use deterministic ordering");
+    assert_eq!(
+        top.iter()
+            .map(|row| (row.user_id, row.messages))
+            .collect::<Vec<_>>(),
+        expected_top
+    );
+
+    let mut expected_bottom = USERS.to_vec();
+    expected_bottom.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        left_count.cmp(right_count).then(left_id.cmp(right_id))
+    });
+    let bottom = stats_repo::bottom_message_users(pool, CHAT_ID, 3)
+        .await
+        .expect("bottom user query must use deterministic ordering");
+    assert_eq!(
+        bottom
+            .iter()
+            .map(|row| (row.user_id, row.messages))
+            .collect::<Vec<_>>(),
+        expected_bottom
+    );
+
+    let top_ids = stats_repo::top_message_user_ids(pool, CHAT_ID, 2)
+        .await
+        .expect("top message user IDs must preserve the same tie rule");
+    assert_eq!(
+        top_ids,
+        expected_top[..2]
+            .iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>()
+    );
 }
 
 async fn assert_feature_gated_jobs(pool: &PgPool) {

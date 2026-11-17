@@ -627,6 +627,10 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use proptest::{
+        prelude::*,
+        test_runner::{Config, RngSeed, TestRunner},
+    };
     use serde_json::json;
     use teloxide::ValidateWith;
 
@@ -712,6 +716,58 @@ mod tests {
         assert!(!fallback.contains("<script>"));
         assert!(fallback.chars().count() <= crate::telegram::html::TELEGRAM_TEXT_LIMIT);
     }
+
+    #[test]
+    fn generated_report_html_escapes_untrusted_text_and_stays_bounded() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x13_01_02_03_04_05_06_07);
+        let html_char = prop_oneof![
+            Just('<'),
+            Just('>'),
+            Just('&'),
+            Just('"'),
+            Just('\''),
+            Just('🦀'),
+            Just('Ж'),
+            Just('\n'),
+        ];
+        let strategy = prop::collection::vec(html_char, 0..=80)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+
+        runner
+            .run(&strategy, |tail| {
+                let untrusted = format!("<script>{tail}</script> & \"quoted\"");
+                let mut report = card();
+                report.reason = untrusted.clone();
+                report.target_text = Some(untrusted.clone());
+
+                let html = render_report_html_fallback(&report);
+                let escaped = crate::telegram::html::escape(&untrusted);
+                prop_assert!(html.contains(&escaped));
+                prop_assert!(!html.contains(&untrusted));
+                prop_assert!(!html.contains("<script>"));
+                prop_assert!(
+                    html.chars().count() <= crate::telegram::html::TELEGRAM_TEXT_LIMIT
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=report-render-html-escape seed={seed} sha={} replay=sh scripts/replay_quality_case.sh report-render-html-escape {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
+    }
+
     #[test]
     fn puts_original_message_link_before_report_details() {
         let rendered = render_report(&card());
