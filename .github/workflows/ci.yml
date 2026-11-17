@@ -43,6 +43,7 @@ jobs:
         run: |
           python3 tests/release_install.py
           python3 tests/reviewed_spam_training.py
+          python3 tests/test_cargo_test_checked.py
 
       - name: Prepare PostgreSQL integration databases and read-only role
         env:
@@ -55,7 +56,7 @@ jobs:
             -c 'GRANT nedobot_mcp_ro TO tg_ai_bot_dev'
 
       - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+        run: python3 scripts/run_cargo_test_checked.py cargo test --workspace --all-targets --locked
 
       - name: Check supported default and feature-disabled config matrix
         run: sh scripts/test_feature_matrix.sh
@@ -63,7 +64,7 @@ jobs:
       - name: Run deterministic adversarial harness and synthetic corpus
         env:
           NEDOBOT_PROPTEST_SEED: "72623859790382856"
-        run: cargo test --test adversarial_harness --locked -- --nocapture
+        run: python3 scripts/run_cargo_test_checked.py cargo test --test adversarial_harness --locked -- --nocapture
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -79,38 +80,38 @@ jobs:
       - name: Run URL evidence PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
 
       - name: Run URL shadow privacy PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
 
       - name: Run URL shadow lock PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
         run: |
-          cargo test --lib features::new_user_analysis::tests::url_shadow_lock_serializes_same_user_without_blocking_other_users -- --ignored --exact
-          cargo test --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock -- --ignored --exact
-          cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::url_shadow_lock_serializes_same_user_without_blocking_other_users -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state -- --ignored --exact
 
       - name: Run URL inventory privacy and label PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --bin export_url_inventory tests::export_separates_current_flags_from_latest_operator_labels -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --bin export_url_inventory tests::export_separates_current_flags_from_latest_operator_labels -- --ignored --exact
 
       - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --test postgres_migrations -- --ignored
+        run: python3 scripts/run_cargo_test_checked.py cargo test --test postgres_migrations -- --ignored
 
       - name: Run RMCP PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
           TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
-        run: cargo test --test chat_db_mcp -- --ignored
+        run: python3 scripts/run_cargo_test_checked.py cargo test --test chat_db_mcp -- --ignored
 
       - name: Run manual moderation PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --test manual_moderation -- --ignored
+        run: python3 scripts/run_cargo_test_checked.py cargo test --test manual_moderation -- --ignored
