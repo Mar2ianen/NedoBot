@@ -174,6 +174,9 @@ mod risk_captcha_cleanup;
 #[path = "support/known_spammer_risk.rs"]
 mod known_spammer_risk;
 
+#[path = "support/url_alias_churn.rs"]
+mod url_alias_churn;
+
 #[tokio::test]
 #[ignore = "run with ./scripts/test.sh against the local test database"]
 async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecycle() {
@@ -198,6 +201,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_risk_captcha_state_transitions(&pool).await;
     risk_captcha_cleanup::assert_cleanup(&pool).await;
     known_spammer_risk::assert_known_spammer_is_rechecked(&pool).await;
+    url_alias_churn::assert_current_alias_resolution(&pool).await;
     assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;

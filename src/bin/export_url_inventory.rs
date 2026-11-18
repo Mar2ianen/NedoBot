@@ -784,6 +784,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inventory_redacts_all_bot_start_payloads_and_invite_hashes() {
+        let fixtures = [
+            (
+                "https://t.me/demo_bot?start=synthetic-token",
+                "https://t.me/demo_bot?start=<redacted>",
+            ),
+            (
+                "https://t.me/demo_bot?startgroup=synthetic-token",
+                "https://t.me/demo_bot?startgroup=<redacted>",
+            ),
+            (
+                "https://t.me/demo_bot?startchannel=synthetic-token",
+                "https://t.me/demo_bot?startchannel=<redacted>",
+            ),
+            (
+                "https://t.me/demo_bot/mini?startapp=synthetic-token",
+                "https://t.me/demo_bot?startapp=<redacted>",
+            ),
+            (
+                "tg://resolve?domain=demo_bot&startapp=synthetic-token",
+                "https://t.me/demo_bot?startapp=<redacted>",
+            ),
+        ];
+
+        for (input, expected) in fixtures {
+            let redacted = redact_target(input, true).expect("Telegram deep link must parse");
+            assert_eq!(redacted, expected);
+            assert!(!redacted.contains("synthetic-token"));
+        }
+
+        for input in [
+            "https://t.me/+SyntheticInviteHash",
+            "https://t.me/joinchat/SyntheticInviteHash",
+            "tg://join?invite=SyntheticInviteHash",
+        ] {
+            let redacted = redact_target(input, true).expect("invite link must parse");
+            assert_eq!(redacted, "https://t.me/<redacted-invite>");
+            assert!(!redacted.contains("SyntheticInviteHash"));
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires a disposable migrated PostgreSQL database"]
     async fn export_separates_current_flags_from_latest_operator_labels() {
