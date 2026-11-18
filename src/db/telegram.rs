@@ -131,6 +131,7 @@ async fn replace_current_telegram_username_aliases_in_transaction(
         .iter()
         .filter_map(|username| normalize_telegram_username(username))
         .collect::<std::collections::BTreeSet<_>>();
+    lock_telegram_peer_alias_snapshot(tx, peer_id).await?;
     sqlx::query(
         "update public.telegram_username_aliases set is_active = false where telegram_peer_id = $1 and peer_type = $2",
     )
@@ -143,6 +144,17 @@ async fn replace_current_telegram_username_aliases_in_transaction(
         upsert_telegram_username_alias_in_transaction(tx, peer_id, peer_type, source, &username)
             .await?;
     }
+    Ok(())
+}
+
+async fn lock_telegram_peer_alias_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    peer_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("telegram_user_profile:{peer_id}"))
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -613,10 +625,7 @@ pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<(
     // `FOR UPDATE` cannot serialize the first observation because there is no
     // profile row yet. Lock by Telegram peer before reading so concurrent
     // initial snapshots cannot leave multiple active aliases behind.
-    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("telegram_user_profile:{user_id}"))
-        .execute(&mut *tx)
-        .await?;
+    lock_telegram_peer_alias_snapshot(&mut tx, user_id).await?;
     let previous: Option<(Option<String>, bool)> = sqlx::query_as(
         "select username, is_bot from telegram_user_profiles where telegram_user_id = $1 for update",
     )

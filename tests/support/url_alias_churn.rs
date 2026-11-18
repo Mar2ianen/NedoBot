@@ -82,6 +82,11 @@ pub async fn assert_current_alias_resolution(pool: &PgPool) {
             TelegramUsernameResolution::Unknown,
             "only the last serialized username may remain active"
         );
+        query("delete from public.telegram_username_aliases where telegram_peer_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("synthetic alias fixture must be removed");
         query("delete from public.telegram_user_profiles where telegram_user_id = $1")
             .bind(user_id)
             .execute(pool)
@@ -110,6 +115,11 @@ pub async fn assert_current_alias_resolution(pool: &PgPool) {
         resolve_telegram_username(pool, &old_username).await,
         Ok(TelegramUsernameResolution::Unique(peer)) if peer.peer_id == owner_b
     ));
+    query("delete from public.telegram_username_aliases where telegram_peer_id = any($1)")
+        .bind([owner_a, owner_b])
+        .execute(pool)
+        .await
+        .expect("synthetic alias reassignment records must be removed");
     query("delete from public.telegram_user_profiles where telegram_user_id = any($1)")
         .bind([owner_a, owner_b])
         .execute(pool)
