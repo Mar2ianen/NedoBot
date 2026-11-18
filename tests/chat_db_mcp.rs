@@ -357,6 +357,28 @@ async fn independent_community_databases_generate_manifests_and_start_isolated_m
         ensure!(client_a.has_tool("chat.search_messages"));
         ensure!(client_b.has_tool("chat.search_messages"));
 
+        for forged_chat_id in [-900_000_201_i64, -100_900_000_301_i64] {
+            ensure!(
+                client_a
+                    .call(
+                        "db.select",
+                        json!({
+                            "table": "telegram_messages",
+                            "columns": ["chat_id", "message_id"],
+                            "filters": [{
+                                "column": "chat_id",
+                                "op": "eq",
+                                "value": forged_chat_id
+                            }],
+                            "limit": 5
+                        }),
+                    )
+                    .await
+                    .is_err(),
+                "negative forged Telegram chat ID {forged_chat_id} must be rejected by the configured MCP scope"
+            );
+        }
+
         assert_instance_reads(
             &client_a,
             &marker_a,

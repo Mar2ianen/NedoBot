@@ -1236,8 +1236,25 @@ mod tests {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0x10_08_07_06_05_04_03_02);
         let scope = ChatReadScope::new("community_a", -2001, Some(-2002)).unwrap();
-        // Positive Telegram IDs can never equal this configured group ID.
-        let forged_ids = 1_i64..=i64::MAX;
+        // Telegram supergroup IDs are negative; exercise that real-shaped
+        // domain and explicitly cover another -100... group ID.
+        let forged_ids = (-i64::MAX..=-1_i64).prop_filter("foreign chat ID", |chat_id| {
+            *chat_id != scope.discussion_chat_id && Some(*chat_id) != scope.source_channel_id
+        });
+        for forged_chat_id in [-100_900_000_001_i64, -2003] {
+            assert!(
+                validate_scope_filters(
+                    &scope,
+                    &[filter(
+                        "chat_id",
+                        FilterOp::Eq,
+                        Some(json!(forged_chat_id)),
+                        vec![],
+                    )],
+                )
+                .is_err()
+            );
+        }
         let mut runner = TestRunner::new(Config {
             cases: 256,
             rng_seed: RngSeed::Fixed(seed),

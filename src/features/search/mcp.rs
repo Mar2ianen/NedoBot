@@ -425,10 +425,16 @@ fn fetch_urls(results: &[SearchResult], config: &Config, top_n: usize) -> Vec<St
 }
 
 pub(crate) fn is_safe_fetch_url(value: &str) -> bool {
+    let has_userinfo = value
+        .trim_start()
+        .split_once("://")
+        .and_then(|(_, remainder)| remainder.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
     if !matches!(url.scheme(), "http" | "https")
+        || has_userinfo
         || !url.username().is_empty()
         || url.password().is_some()
     {
@@ -979,6 +985,8 @@ mod tests {
             "http://203.0.113.1/",
             "http://224.0.0.1/",
             "http://255.255.255.255/",
+            "http://@example.com/private",
+            "http://user@example.com/private",
             "http://[2001:db8::1]/",
             "http://[64:ff9b::a00:1]/",
             "file:///etc/passwd",
@@ -1160,7 +1168,7 @@ mod tests {
 
     #[test]
     fn fetch_urls_never_forwards_blocked_ip_literals_and_keeps_lookalike_hosts_distinct() {
-        let config = Config::from_env().expect("test configuration must parse");
+        let config = crate::config::test_config();
         let results = [
             "http://[::1]/admin",
             "http://169.254.169.254/latest/meta-data",
