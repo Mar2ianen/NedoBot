@@ -2,6 +2,13 @@
 
 Audit snapshot: 2026-11-18. Baseline main SHA: `7b8815bbff80c4665b64076a063f5f4919e5465a`. The exact PR stack heads and CI conclusions are reported in the GitHub PRs; this file does not treat unmerged branches as production or mainline state.
 
+> Integration update: the testing package and refactor stack are combined in
+> `codex/integration-audit-126-173` (PR #174). Final counts, conflict resolution
+> and residual risks are in
+> [PR_126_173_INTEGRATION_AUDIT.md](reports/PR_126_173_INTEGRATION_AUDIT.md).
+> Where that report supersedes the per-PR notes below, the integration report
+> takes precedence.
+
 ## Test contours and evidence
 
 | Area | Evidence |
@@ -33,11 +40,11 @@ Audit snapshot: 2026-11-18. Baseline main SHA: `7b8815bbff80c4665b64076a063f5f49
 
 ## Open risks and gaps
 
-1. The whole no-default workspace test suite was already red in the T00 baseline (20 config-dependent failures); this work verifies no-default library compilation and a real fail-closed feature-gate test, but does not claim all no-default tests are green. Fixing every config-dependent default-profile fixture remains open.
+1. The whole no-default workspace test suite was red in the T00 baseline (20 config-dependent failures). The integration branch replaces the production-config test fixture with a synthetic config and the full no-default workspace/all-targets run now reports 392 passed, 0 failed, 4 ignored; the four ignored tests require disposable PostgreSQL. See the integration report.
 2. Search fetching is delegated to external MCP providers. Local syntax/IP-literal filtering cannot verify the remote provider's DNS result or each redirect. DNS rebinding and redirect-to-private-address behavior remain unproven; see T14.
 3. `cargo-fuzz` and nightly are unavailable in the local environment. No sanitizer fuzz run or fuzz target is claimed; deterministic proptest properties are the executed alternative.
-4. Current `main` still launches long-lived workers detached. The separate refactor PR #144 has a correction at code head `8f46b26477fe117e2f6547280f750029bfefd9e4`: unexpected worker completion is fatal after bounded drain, with eight local lifecycle tests. Both exact-head CI runs passed (44194954792, 44194961644). The PR remains open and stacked; this does not change current `main`. T15 remains unverified until the refactor is integrated and the dependent stack is checked.
-5. 17 ignored tests in the workspace run are not all covered by `scripts/test.sh`; a live `/ask` smoke is intentionally excluded because it would require external services. Safe PostgreSQL ignored tests are run in dedicated local/CI lanes.
+4. Current `main` still launches long-lived workers detached. The integration branch now contains PR #144 plus a bounded-drain correction: unexpected worker completion is fatal after bounded drain, with ten local lifecycle tests and a killed fatal-exit mutation. `main` itself is unchanged until a reviewed merge; no merge or deploy was performed here.
+5. The 22 ignored tests in the integrated workspace run are not all covered by `scripts/test.sh`; live `/ask` smoke is intentionally excluded because it would require external services. Safe PostgreSQL ignored tests are run in dedicated local/CI lanes.
 6. Coverage aggregates include binary glue with no direct unit tests and do not establish assertion quality. Low lines in command handling and moderation are prioritized for further focused cases rather than a global coverage threshold.
 
 ## PR audit snapshot
