@@ -267,6 +267,11 @@ use std::collections::HashMap;
 mod tests {
     use super::*;
     use crate::config::SearchMcpTools;
+    use proptest::{
+        collection,
+        prelude::*,
+        test_runner::{Config as TestConfig, RngSeed, TestRunner},
+    };
 
     fn config() -> Config {
         Config {
@@ -447,6 +452,47 @@ mod tests {
 
         assert!(html.contains(r#"<tg-emoji emoji-id="123456">😎</tg-emoji>"#));
         assert!(html.ends_with("AMD драйвер обновился"));
+    }
+
+    #[test]
+    fn generated_unicode_and_control_text_never_becomes_untrusted_html() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .map(|value| value.parse::<u64>().expect("seed must be unsigned"))
+            .unwrap_or(0x0807_0605_0403_0201);
+        let strategy = collection::vec(
+            prop_oneof![
+                Just("слово".to_owned()),
+                Just("Ж".to_owned()),
+                Just("😀".to_owned()),
+                Just("<script>".to_owned()),
+                Just("<b>".to_owned()),
+                Just("&".to_owned()),
+                Just("\"".to_owned()),
+                Just("\0".to_owned()),
+                Just("\u{0001}".to_owned()),
+                Just("\n".to_owned()),
+            ],
+            0..32,
+        )
+        .prop_map(|parts| parts.concat());
+        let mut runner = TestRunner::new(TestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..TestConfig::default()
+        });
+        runner
+            .run(&strategy, |body| {
+                let rendered = build_comment_html(&body, &config());
+                prop_assert!(
+                    !rendered.contains('<'),
+                    "untrusted text became an HTML tag: input={body:?} output={rendered:?}"
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!("case_id=first-comment-render seed={seed} replay=sh scripts/replay_quality_case.sh first-comment-render {seed}: {error}")
+            });
     }
 
     #[test]

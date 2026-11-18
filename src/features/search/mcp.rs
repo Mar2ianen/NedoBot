@@ -2,6 +2,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ipnet::{Ipv4Net, Ipv6Net};
 use rmcp::{
     RoleClient, ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ContentBlock},
@@ -256,12 +257,12 @@ async fn run_mcp_flow(
             .await;
             let response = match response {
                 Ok(Ok(response)) => response,
-                Ok(Err(err)) => {
-                    tracing::warn!(%err, source = ?query.source, url, "MCP fetch failed; keeping raw search result");
+                Ok(Err(_err)) => {
+                    warn_fetch_failure(query.source, url, "request_failed");
                     continue;
                 }
                 Err(_) => {
-                    tracing::warn!(source = ?query.source, url, "MCP fetch timed out; keeping raw search result");
+                    warn_fetch_failure(query.source, url, "timeout");
                     continue;
                 }
             };
@@ -271,8 +272,8 @@ async fn run_mcp_flow(
                     fetched_results.retain(|result| is_allowed_search_result(config, result));
                     enrich_results_with_fetch(&mut results, fetched_results);
                 }
-                Err(err) => {
-                    tracing::warn!(%err, source = ?query.source, url, "MCP fetch response could not be parsed; keeping raw search result")
+                Err(_err) => {
+                    warn_fetch_failure(query.source, url, "response_parse_failed");
                 }
             }
         }
@@ -399,6 +400,10 @@ fn fetch_tool_arguments(tool_name: &str, urls: &[String], max_chars: usize) -> V
 }
 
 fn fetch_urls(results: &[SearchResult], config: &Config, top_n: usize) -> Vec<String> {
+    if top_n == 0 {
+        return Vec::new();
+    }
+
     let mut urls = Vec::new();
 
     for result in results {
@@ -423,43 +428,139 @@ pub(crate) fn is_safe_fetch_url(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
-    if !matches!(url.scheme(), "http" | "https") || url.username() != "" || url.password().is_some()
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
     {
         return false;
     }
 
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host == "metadata.google.internal"
-    {
-        return false;
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            !(host == "localhost"
+                || host.ends_with(".localhost")
+                || host.ends_with(".local")
+                || host == "metadata.google.internal")
+        }
+        Some(url::Host::Ipv4(ip)) => is_safe_ipv4(ip),
+        Some(url::Host::Ipv6(ip)) => is_safe_ipv6(ip),
+        None => false,
     }
+}
 
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+fn is_safe_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    // Non-globally-reachable entries from the IANA IPv4 Special-Purpose
+    // Address Registry. Use the typed URL host and CIDR parser so embedded
+    // textual forms cannot bypass this address classification.
+    const NON_GLOBAL: &[&str] = &[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.88.99.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ];
+
+    // These more-specific assignments are marked globally reachable by IANA.
+    if matches!(ip.octets(), [192, 0, 0, 9 | 10]) {
         return true;
-    };
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            !(ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || octets == [169, 254, 169, 254])
-        }
-        std::net::IpAddr::V6(ip) => {
-            let first = ip.segments()[0];
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
-        }
     }
+    !ip.is_broadcast()
+        && !NON_GLOBAL.iter().any(|cidr| {
+            cidr.parse::<Ipv4Net>()
+                .is_ok_and(|network| network.contains(&ip))
+        })
+}
+
+fn is_safe_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4() {
+        return is_safe_ipv4(mapped);
+    }
+    if "64:ff9b::/96"
+        .parse::<Ipv6Net>()
+        .is_ok_and(|network| network.contains(&ip))
+    {
+        return is_safe_ipv4(std::net::Ipv4Addr::from(ip.to_bits() as u32));
+    }
+
+    const NON_GLOBAL: &[&str] = &[
+        "::/128",
+        "::1/128",
+        "64:ff9b:1::/48",
+        "100::/64",
+        "100:0:0:1::/64",
+        "2001:2::/48",
+        "2001:10::/28",
+        "2001:db8::/32",
+        "2002::/16",
+        "3fff::/20",
+        "5f00::/16",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    ];
+    if NON_GLOBAL.iter().any(|cidr| {
+        cidr.parse::<Ipv6Net>()
+            .is_ok_and(|network| network.contains(&ip))
+    }) {
+        return false;
+    }
+
+    let in_global_unicast = "2000::/3"
+        .parse::<Ipv6Net>()
+        .is_ok_and(|network| network.contains(&ip));
+    if !in_global_unicast {
+        return false;
+    }
+
+    // The aggregate IETF protocol-assignment block is not globally reachable
+    // by default. Allow only its explicit globally reachable sub-allocations.
+    let in_ietf_assignments = "2001::/23"
+        .parse::<Ipv6Net>()
+        .is_ok_and(|network| network.contains(&ip));
+    if !in_ietf_assignments {
+        return true;
+    }
+    [
+        "2001:1::1/128",
+        "2001:1::2/128",
+        "2001:1::3/128",
+        "2001:3::/32",
+        "2001:4:112::/48",
+        "2001:20::/28",
+        "2001:30::/28",
+    ]
+    .iter()
+    .any(|cidr| {
+        cidr.parse::<Ipv6Net>()
+            .is_ok_and(|network| network.contains(&ip))
+    })
+}
+
+fn safe_fetch_host(value: &str) -> String {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "unparseable".to_owned())
+}
+
+fn warn_fetch_failure(source: SearchSource, url: &str, failure: &'static str) {
+    tracing::warn!(
+        source = ?source,
+        fetch_host = %safe_fetch_host(url),
+        failure,
+        "MCP fetch failed; keeping raw search result"
+    );
 }
 
 fn attach_requested_url(fetched_results: &mut [SearchResult], requested_url: &str) {
@@ -867,6 +968,19 @@ mod tests {
             "http://10.0.0.1/",
             "http://169.254.169.254/latest/meta-data",
             "http://localhost:8080/",
+            "http://[::1]/",
+            "http://[fc00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://100.64.0.1/",
+            "http://198.18.0.1/",
+            "http://192.0.2.1/",
+            "http://198.51.100.1/",
+            "http://203.0.113.1/",
+            "http://224.0.0.1/",
+            "http://255.255.255.255/",
+            "http://[2001:db8::1]/",
+            "http://[64:ff9b::a00:1]/",
             "file:///etc/passwd",
             "https://user:pass@example.com/",
         ] {
@@ -878,6 +992,146 @@ mod tests {
     fn fetch_url_filter_accepts_public_http_targets() {
         assert!(is_safe_fetch_url("https://example.com/news"));
         assert!(is_safe_fetch_url("http://93.184.216.34/news"));
+        assert!(is_safe_fetch_url("http://[2606:4700:4700::1111]/news"));
+        assert!(is_safe_fetch_url("https://localhost.example.com/article"));
+        assert!(is_safe_fetch_url("http://192.0.0.9/"));
+        assert!(is_safe_fetch_url("http://192.0.0.10/"));
+    }
+
+    #[test]
+    fn ipv4_special_registry_ranges_reject_both_ends_and_accept_adjacent_addresses() {
+        for (address, expected) in [
+            ("100.63.255.255", true),
+            ("100.64.0.0", false),
+            ("100.127.255.255", false),
+            ("100.128.0.0", true),
+            ("198.17.255.255", true),
+            ("198.18.0.0", false),
+            ("198.19.255.255", false),
+            ("198.20.0.0", true),
+            ("192.0.0.0", false),
+            ("192.0.0.8", false),
+            ("192.0.0.9", true),
+            ("192.0.0.10", true),
+            ("192.0.0.11", false),
+            ("192.0.0.255", false),
+            ("192.0.1.0", true),
+            ("192.0.1.255", true),
+            ("192.0.2.0", false),
+            ("192.0.2.255", false),
+            ("192.0.3.0", true),
+            ("198.51.100.0", false),
+            ("198.51.100.255", false),
+            ("198.51.101.0", true),
+            ("203.0.113.0", false),
+            ("203.0.113.255", false),
+            ("203.0.114.0", true),
+        ] {
+            let ip = address.parse().expect("literal must parse");
+            assert_eq!(
+                is_safe_ipv4(ip),
+                expected,
+                "unexpected classification for {ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_special_registry_boundaries_reject_non_global_and_accept_global_unicast() {
+        for (address, expected) in [
+            ("::", false),
+            ("::1", false),
+            ("64:ff9b:1::", false),
+            ("64:ff9b:1:ffff:ffff:ffff:ffff:ffff", false),
+            ("100::", false),
+            ("100:0:0:1::", false),
+            ("2001:2::", false),
+            ("2001:2:0:ffff:ffff:ffff:ffff:ffff", false),
+            ("2001:db8::", false),
+            ("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("3fff::", false),
+            ("3fff:f::ffff:ffff:ffff:ffff:ffff", false),
+            ("5f00::", false),
+            ("fc00::1", false),
+            ("fe80::1", false),
+            ("ff02::1", false),
+            ("2000::1", true),
+            ("2606:4700:4700::1111", true),
+        ] {
+            let ip = address.parse().expect("literal must parse");
+            assert_eq!(
+                is_safe_ipv6(ip),
+                expected,
+                "unexpected classification for {ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_and_ipv4_mapped_hosts_reuse_ipv4_classification() {
+        assert!(!is_safe_fetch_url("http://[::ffff:100.64.0.1]/"));
+        assert!(!is_safe_fetch_url("http://[64:ff9b::a00:1]/"));
+        assert!(is_safe_fetch_url("http://[64:ff9b::5db8:d822]/"));
+    }
+
+    #[test]
+    fn fetch_url_limit_zero_returns_no_targets() {
+        let config = crate::config::test_config();
+        let result = SearchResult {
+            source: SearchSource::Web,
+            title: "synthetic".to_owned(),
+            url: "https://example.com/article".to_owned(),
+            snippet: String::new(),
+        };
+        assert!(fetch_urls(&[result], &config, 0).is_empty());
+    }
+
+    #[test]
+    fn fetch_failure_event_does_not_include_url_path_or_query_secret() {
+        use std::{
+            io::{self, Write},
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture mutex")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Capture(bytes.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_fetch_failure(
+                SearchSource::Web,
+                "https://example.com/private?token=SYNTHETIC_SECRET",
+                "request_failed",
+            );
+        });
+        let output = String::from_utf8(bytes.lock().expect("capture mutex").clone())
+            .expect("tracing output is UTF-8");
+        assert!(output.contains("example.com"));
+        assert!(!output.contains("/private"));
+        assert!(!output.contains("SYNTHETIC_SECRET"));
     }
 
     #[test]
@@ -901,6 +1155,33 @@ mod tests {
         assert_eq!(
             fetch_urls(&results, &config, 2),
             vec!["https://example.com/story"]
+        );
+    }
+
+    #[test]
+    fn fetch_urls_never_forwards_blocked_ip_literals_and_keeps_lookalike_hosts_distinct() {
+        let config = Config::from_env().expect("test configuration must parse");
+        let results = [
+            "http://[::1]/admin",
+            "http://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal.attacker.example/article",
+            "https://localhost.example.com/article",
+        ]
+        .into_iter()
+        .map(|url| SearchResult {
+            source: SearchSource::Web,
+            title: url.to_owned(),
+            url: url.to_owned(),
+            snippet: String::new(),
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            fetch_urls(&results, &config, 10),
+            vec![
+                "https://metadata.google.internal.attacker.example/article",
+                "https://localhost.example.com/article",
+            ]
         );
     }
 

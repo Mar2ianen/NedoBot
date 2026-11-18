@@ -1,0 +1,87 @@
+name: Quality stress and mutation
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Monday 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      collect_coverage:
+        description: Run the longer default-workspace coverage profile
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stress-and-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate default and feature-disabled builds
+        run: sh scripts/test_feature_matrix.sh
+
+      - name: Run deterministic stateful and schema-valid cases with fixed seeds
+        env:
+          CARGO_BUILD_JOBS: "3"
+        run: |
+          for seed in 72623859790382856 12345 20261118; do
+            NEDOBOT_PROPTEST_SEED="$seed" python3 scripts/run_cargo_test_checked.py \
+              cargo test --test adversarial_harness --locked -- --nocapture
+          done
+
+      - name: Install pinned mutation tool
+        run: cargo install cargo-mutants --version 27.1.0 --locked
+
+      - name: Run bounded URL-policy mutation checks
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: sh scripts/run_targeted_mutations.sh
+
+      - name: Upload sanitized mutation summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-summary-${{ github.sha }}
+          path: mutants.out/*.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  coverage:
+    if: github.event_name == 'workflow_dispatch' && inputs.collect_coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install pinned coverage tool
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+
+      - name: Collect test and subsystem coverage summary
+        run: |
+          mkdir -p target/quality-coverage
+          cargo llvm-cov --workspace --all-targets --locked --json --summary-only \
+            --output-path target/quality-coverage/coverage.json
+
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary-${{ github.sha }}
+          path: target/quality-coverage/coverage.json
+          if-no-files-found: error
+          retention-days: 14

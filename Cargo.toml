@@ -109,6 +109,7 @@ base64 = "0.23"
 chrono = "0.4"
 jiff = "0.2"
 dotenvy = "0.15"
+ipnet = "2"
 teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "d374a19", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
 teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "d374a19", default-features = false, features = ["teloxide"] }
 teloxide-statistics = { git = "https://github.com/Mar2ianen/teloxide-statistics", rev = "7e2a5859849044121b9e693bc1ed36e7440db139", default-features = false, features = ["sentiment", "engagement", "reputation"] }
@@ -127,3 +128,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }

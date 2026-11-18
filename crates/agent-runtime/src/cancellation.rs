@@ -64,4 +64,29 @@ mod tests {
         parent.cancel.cancel();
         assert!(sibling.is_cancelled());
     }
+
+    #[tokio::test]
+    async fn cancelling_turn_releases_waiting_child_work() {
+        use std::time::Duration;
+
+        let parent = TurnContext::new(
+            "turn".into(),
+            TurnLimits {
+                max_model_roundtrips: 2,
+                max_tool_calls: 2,
+                max_wall_time_secs: 1,
+            },
+        );
+        let child = parent.child("remote-tool".into());
+        let waiting = tokio::spawn(async move {
+            child.cancel.cancelled().await;
+            child.turn_id
+        });
+        parent.cancel.cancel();
+        let completed = tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("parent cancellation must release child work")
+            .expect("child task must not panic");
+        assert_eq!(completed, "remote-tool");
+    }
 }

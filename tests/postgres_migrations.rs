@@ -14,8 +14,8 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
 use teloxide::utils::time::TimeContext;
 use teloxide::{
     Bot,
-    prelude::{ChatId, Message},
-    types::{InputRichMessage, MessageId},
+    prelude::ChatId,
+    types::{InputRichMessage, Message, MessageId},
 };
 use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
@@ -55,6 +55,7 @@ use tg_ai_bot_teloxide::{
             mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
             mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
         },
+        ingest::ingest_message,
         jobs::{claim::CasResult, observability::load_job_lifecycle_report},
         labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
         memory::embedding::EMBEDDINGGEMMA2_MODEL_ID,
@@ -183,6 +184,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_ingest_disabled_is_noop(&pool).await;
     membership_history::assert_membership_history(&pool).await;
     decision_shadow::assert_decision_shadow(&pool).await;
     local_cascade::assert_local_cascade(&pool).await;
@@ -208,6 +210,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_rich_backfill_and_exact_word_counts(&pool).await;
     assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
+    assert_stats_rank_ties_follow_the_reference_order(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_ask_conversation_memory(&pool).await;
@@ -238,6 +241,8 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
+    assert_comment_job_lifecycle(&pool).await;
+    assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
     assert_system_spam_label_transition(&pool).await;
     assert_spammer_avatar_embedding_label_gate(&pool).await;
@@ -248,6 +253,186 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
     ingress_persistence::assert_message_persistence_effects(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn post_comment_claim_skips_a_locked_oldest_ready_job() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn captcha_wrong_answers_are_atomic_with_one_database_connection() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let id = Uuid::new_v4();
+    let chat_id = -1_009_876_543_210_i64;
+    let user_id = 9_876_543_210_i64;
+    query(
+        r#"insert into telegram_risk_captcha_challenges
+               (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
+                options, correct_option, restore_permissions, status, expires_at)
+           values ($1, $2, $3, 1, 90, '1 + 1 = ?', '["2","3","4","5"]', 0,
+                   '{}', 'pending', now() + interval '1 hour')"#,
+    )
+    .bind(id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic pending captcha must be created");
+
+    let (first, second, third) = tokio::join!(
+        record_wrong_answer(&pool, id),
+        record_wrong_answer(&pool, id),
+        record_wrong_answer(&pool, id),
+    );
+    let outcomes = [
+        first.expect("first wrong answer must commit"),
+        second.expect("second wrong answer must commit"),
+        third.expect("third wrong answer must commit"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Wrong { attempts_left: 2 })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Wrong { attempts_left: 1 })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Failed)
+            .count(),
+        1
+    );
+    let state: (i32, String) =
+        query_as("select attempts, status from telegram_risk_captcha_challenges where id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("concurrent captcha state must remain readable");
+    assert_eq!(state, (3, "failed".to_owned()));
+    assert_eq!(
+        record_wrong_answer(&pool, id)
+            .await
+            .expect("closed captcha must reject a late callback"),
+        CaptchaCallbackOutcome::Stale
+    );
+    query("delete from telegram_risk_captcha_challenges where id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("synthetic captcha must be removed");
+}
+
+async fn assert_ingest_disabled_is_noop(pool: &PgPool) {
+    const CHAT_ID: i64 = -100_900_333;
+    const MESSAGE_ID: i32 = 900_333;
+    const USER_ID: i64 = 900_333;
+
+    query("delete from telegram_messages where chat_id = $1 and message_id = $2")
+        .bind(CHAT_ID)
+        .bind(MESSAGE_ID)
+        .execute(pool)
+        .await
+        .expect("synthetic ingress fixture cleanup must succeed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("synthetic profile fixture cleanup must succeed");
+
+    let example_profile = format!(
+        "{}/config/llm_profiles.toml.example",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let previous_profile_path = std::env::var_os("LLM_PROFILES_PATH");
+    unsafe { std::env::set_var("LLM_PROFILES_PATH", &example_profile) };
+    let config_result = Config::from_env();
+    unsafe {
+        if let Some(previous_profile_path) = previous_profile_path {
+            std::env::set_var("LLM_PROFILES_PATH", previous_profile_path);
+        } else {
+            std::env::remove_var("LLM_PROFILES_PATH");
+        }
+    }
+    let mut config = config_result.expect("committed example runtime config must load");
+    let chat = config
+        .community
+        .chats
+        .get_mut("main")
+        .expect("committed test config must include main chat");
+    chat.id = CHAT_ID;
+    chat.ingest = false;
+    config.discussion_chat_id = CHAT_ID;
+    config.chat_registry = ChatRegistry::new(&config.community)
+        .expect("synthetic disabled-ingest chat registry must build");
+
+    let message: Message = serde_json::from_value(serde_json::json!({
+        "message_id": MESSAGE_ID,
+        "date": 1_700_000_000,
+        "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Synthetic"},
+        "from": {"id": USER_ID, "is_bot": false, "first_name": "Synthetic"},
+        "text": "synthetic https://example.invalid/disabled-ingest"
+    }))
+    .expect("synthetic Message must decode");
+
+    assert!(matches!(
+        ingest_message(pool, &message, &config)
+            .await
+            .expect("disabled ingest must return without an error"),
+        tg_ai_bot_teloxide::features::ingest::IngressOutcome::Ignored {
+            reason: tg_ai_bot_teloxide::features::ingest::IngressSkipReason::IngestDisabled,
+            ..
+        }
+    ));
+    let message_rows: i64 = query_scalar(
+        "select count(*) from telegram_messages where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("synthetic message row count must be queryable");
+    let profile_rows: i64 =
+        query_scalar("select count(*) from telegram_user_profiles where telegram_user_id = $1")
+            .bind(USER_ID)
+            .fetch_one(pool)
+            .await
+            .expect("synthetic profile row count must be queryable");
+    let evidence_rows: i64 = query_scalar(
+        "select count(*) from telegram_message_url_evidence where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("synthetic evidence row count must be queryable");
+    assert_eq!(message_rows, 0, "ingest=false must not persist the message");
+    assert_eq!(profile_rows, 0, "ingest=false must not persist its profile");
+    assert_eq!(
+        evidence_rows, 0,
+        "ingest=false must not persist URL evidence"
+    );
 }
 
 async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {
@@ -624,7 +809,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
     .bind(message_id)
     .fetch_one(pool)
     .await
-    .expect("voice duplicate count must be readable");
+    .expect("duplicate voice count must be readable");
     assert_eq!(duplicate_count, 1);
     let queued_state: (String, i32, Option<i32>, bool) = query_as(
         "select status, attempts, progress_message_id, lease_expires_at is null from voice_transcription_jobs where id = $1",
@@ -6697,8 +6882,23 @@ async fn assert_first_comment_context_isolated(
     .await
     .expect("other-discussion post job must be created")
     .expect("other-discussion post job must be unique");
+    let same_scope_tie_job_id = create_post_comment_job(
+        pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: DISCUSSION_CHAT_ID,
+            discussion_message_id: suffix + 20_003,
+            source_channel_id: SOURCE_CHANNEL_ID,
+            source_message_id: source_message_id + 3,
+            cleaned_post_text: "same-score tie post",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("same-scope tie job must be created")
+    .expect("same-scope tie job must be unique");
     query("update post_comment_jobs set status = 'failed', error = 'context isolation fixture' where id = any($1)")
-        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id])
+        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id, same_scope_tie_job_id])
         .execute(pool)
         .await
         .expect("context fixture jobs must not enter the pending delivery queue");
@@ -6741,14 +6941,20 @@ async fn assert_first_comment_context_isolated(
             2,
             "foreign discussion summary",
         ),
+        (
+            same_scope_tie_job_id,
+            SOURCE_CHANNEL_ID,
+            3,
+            "same-score tie summary",
+        ),
     ] {
         query(
             r#"
             insert into post_history_entries
                 (post_comment_job_id, source_channel_id, source_message_id, post_text,
-                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model)
+                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model, created_at)
             values ($1, $2, $3, 'fixture post', 'fixture comment', 'ready', $4,
-                    $5::vector, $6)
+                    $5::vector, $6, '2020-01-01 00:00:00+00'::timestamptz)
             "#,
         )
         .bind(job_id)
@@ -6799,6 +7005,31 @@ async fn assert_first_comment_context_isolated(
     assert!(!memory_notes.iter().any(|note| {
         note.summary == "foreign source summary" || note.summary == "foreign discussion summary"
     }));
+    assert_eq!(
+        memory_notes
+            .iter()
+            .map(|note| note.source_message_id)
+            .collect::<Vec<_>>(),
+        vec![source_message_id + 3, source_message_id],
+        "independent tie oracle orders equal rank by descending source_message_id"
+    );
+    assert_eq!(
+        memory_notes[0].rank_score, memory_notes[1].rank_score,
+        "synthetic equal-vector rows at the same timestamp must tie"
+    );
+
+    config.rag_top_k = 1;
+    let top_one = load_relevant_memory_notes(
+        pool,
+        &config,
+        DISCUSSION_CHAT_ID,
+        SOURCE_CHANNEL_ID,
+        "semantic memory scope query",
+    )
+    .await
+    .expect("top-k retrieval must use deterministic tie order");
+    assert_eq!(top_one.len(), 1);
+    assert_eq!(top_one[0].source_message_id, source_message_id + 3);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
@@ -7010,6 +7241,71 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     assert!(html.contains(strings.sentiment_mood));
     assert!(rich.contains(strings.sentiment_mood));
     assert!(html.contains("позитив"));
+}
+
+async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
+    const CHAT_ID: i64 = -1_009_876_543_201;
+    const USERS: [(i64, i64); 3] = [(30_003, 2), (30_001, 2), (30_002, 1)];
+
+    for (user_index, (user_id, message_count)) in USERS.iter().copied().enumerate() {
+        for offset in 0..usize::try_from(message_count).unwrap() {
+            query(
+                r#"
+                insert into telegram_messages
+                    (chat_id, message_id, user_id, text, created_at)
+                values ($1, $2, $3, 'synthetic stats ledger', '2026-01-01 12:00:00+00')
+                "#,
+            )
+            .bind(CHAT_ID)
+            .bind(900_000_i32 + i32::try_from(user_index * 10 + offset).unwrap())
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("synthetic equal-count ledger row must insert");
+        }
+    }
+
+    // Independent ledger oracle: activity descending for top-N, ascending for
+    // bottom-N, and stable user ID ascending for every equal-count group.
+    let mut expected_top = USERS.to_vec();
+    expected_top.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count.cmp(left_count).then(left_id.cmp(right_id))
+    });
+    let top = stats_repo::top_message_users(pool, CHAT_ID, 3)
+        .await
+        .expect("top user query must use deterministic ordering");
+    assert_eq!(
+        top.iter()
+            .map(|row| (row.user_id, row.messages))
+            .collect::<Vec<_>>(),
+        expected_top
+    );
+
+    let mut expected_bottom = USERS.to_vec();
+    expected_bottom.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        left_count.cmp(right_count).then(left_id.cmp(right_id))
+    });
+    let bottom = stats_repo::bottom_message_users(pool, CHAT_ID, 3)
+        .await
+        .expect("bottom user query must use deterministic ordering");
+    assert_eq!(
+        bottom
+            .iter()
+            .map(|row| (row.user_id, row.messages))
+            .collect::<Vec<_>>(),
+        expected_bottom
+    );
+
+    let top_ids = stats_repo::top_message_user_ids(pool, CHAT_ID, 2)
+        .await
+        .expect("top message user IDs must preserve the same tie rule");
+    assert_eq!(
+        top_ids,
+        expected_top[..2]
+            .iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>()
+    );
 }
 
 async fn assert_feature_gated_jobs(pool: &PgPool) {
@@ -7630,6 +7926,163 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         CasResult::LeaseLost,
         "a completed send cannot be finalized twice"
     );
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn concurrent_duplicate_post_comment_events_create_one_semantic_job() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let discussion_chat_id = -1_001_888_000_123;
+    let discussion_message_id =
+        (Utc::now().timestamp_micros().unsigned_abs() % 1_000_000_000) as i32 + 1;
+    let mut workers = Vec::new();
+    for _ in 0..16 {
+        let worker_pool = pool.clone();
+        workers.push(tokio::spawn(async move {
+            create_post_comment_job(
+                &worker_pool,
+                CreatePostCommentJobParams {
+                    discussion_chat_id,
+                    discussion_message_id,
+                    source_channel_id: -1_001_888_000_124,
+                    source_message_id: discussion_message_id,
+                    cleaned_post_text: "synthetic duplicate post event",
+                    image_file_id: None,
+                    image_file_unique_id: None,
+                },
+            )
+            .await
+        }));
+    }
+    let mut results = Vec::with_capacity(workers.len());
+    for worker in workers {
+        results.push(worker.await.expect("duplicate enqueue worker must finish"));
+    }
+    let row_count: i64 = query_scalar(
+        "select count(*) from post_comment_jobs where discussion_chat_id=$1 and discussion_message_id=$2",
+    )
+    .bind(discussion_chat_id)
+    .bind(discussion_message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("duplicate job row count must be readable");
+    query("delete from post_comment_jobs where discussion_chat_id=$1 and discussion_message_id=$2")
+        .bind(discussion_chat_id)
+        .bind(discussion_message_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic post jobs must be cleaned before assertions");
+
+    let ids = results
+        .into_iter()
+        .map(|result| result.expect("duplicate enqueue must not fail"))
+        .collect::<Vec<_>>();
+    assert_eq!(row_count, 1, "one semantic post must persist one job");
+    assert_eq!(
+        ids.iter().filter(|id| id.is_some()).count(),
+        1,
+        "exactly one concurrent duplicate event may create the job"
+    );
+}
+
+async fn assert_post_comment_claim_skips_locked_oldest_row(pool: &PgPool) {
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 900_000) as i32;
+    let first_message_id = 8_000_000 + suffix;
+    let second_message_id = first_message_id + 1;
+    let first_id = create_job(pool, first_message_id).await;
+    let second_id = create_job(pool, second_message_id).await;
+
+    // Equalize the due time so the deterministic `id` ordering picks first_id.
+    query("update post_comment_jobs set next_attempt_at = '2000-01-01 00:00:00+00' where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("two ready jobs must receive the same due timestamp");
+    let oldest_id: i64 = query_scalar(
+        "select id from post_comment_jobs where id = any($1) order by next_attempt_at, id limit 1",
+    )
+    .bind(vec![first_id, second_id])
+    .fetch_one(pool)
+    .await
+    .expect("oldest ready fixture must exist");
+    let expected_unlocked_id = if oldest_id == first_id {
+        second_id
+    } else {
+        first_id
+    };
+
+    let mut owner = pool
+        .begin()
+        .await
+        .expect("row-lock owner transaction must start");
+    let locked_id: i64 = query_scalar("select id from post_comment_jobs where id = $1 for update")
+        .bind(oldest_id)
+        .fetch_one(&mut *owner)
+        .await
+        .expect("oldest ready row must be locked by the test transaction");
+    assert_eq!(locked_id, oldest_id);
+
+    let claim_pool = pool.clone();
+    let claim = tokio::spawn(async move { claim_next_post_comment_job(&claim_pool).await });
+    // Poll PostgreSQL's actual wait state. The short sleeps only pace these
+    // observations; a timeout is a liveness guard and is never treated as
+    // evidence that the competing worker is blocked on this lock.
+    let observed_lock_wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if claim.is_finished() {
+                return Ok::<bool, sqlx::Error>(false);
+            }
+            let waiting_on_row_lock: bool = query_scalar(
+                "select exists(select 1 from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and query ilike '%with expired_sends as%')",
+            )
+            .fetch_one(pool)
+            .await?;
+            if waiting_on_row_lock {
+                return Ok::<bool, sqlx::Error>(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    owner
+        .commit()
+        .await
+        .expect("test row lock must be released cleanly");
+    query("delete from post_comment_jobs where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("synthetic locked-claim fixtures must be removed");
+
+    let claim_result = claim
+        .await
+        .expect("claim task must complete after the test releases its lock");
+    query("delete from post_comment_jobs where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("synthetic locked-claim fixtures must be removed");
+    let observed_lock_wait = observed_lock_wait
+        .expect("claim lock-state observation must complete within the liveness bound")
+        .expect("PostgreSQL lock-state query must succeed");
+    assert!(
+        !observed_lock_wait,
+        "claim query waited on a row another worker already locked"
+    );
+    let claimed = claim_result
+        .expect("concurrent claim query must succeed")
+        .expect("second ready fixture must remain claimable");
+    assert_eq!(claimed.id, expected_unlocked_id);
+    assert_eq!(claimed.attempts, 1);
 }
 
 async fn assert_comment_reconciliation_requires_operator_claim(pool: &PgPool) {

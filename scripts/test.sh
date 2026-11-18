@@ -17,6 +17,9 @@ DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --quiet --bin migrate
 cargo test --all-targets
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test postgres_migrations -- --ignored
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test postgres_migrations post_comment_claim_skips_a_locked_oldest_ready_job -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test postgres_migrations concurrent_duplicate_post_comment_events_create_one_semantic_job -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test postgres_migrations captcha_wrong_answers_are_atomic_with_one_database_connection -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state -- --ignored --exact

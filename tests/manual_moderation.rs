@@ -305,6 +305,215 @@ async fn cleanup(pool: &PgPool, user_ids: &[i64], batch_ids: &[i64]) {
 
 #[tokio::test]
 #[ignore = "run against the disposable local test database"]
+async fn concurrent_sanctions_for_one_target_are_serialized_by_postgres() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let target_user_id = Utc::now().timestamp_micros() + 7_000_000_000;
+    let actor_id = target_user_id + 1;
+    let locked_target_id = target_user_id + 10;
+    let locked_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute-lock-oracle",
+    )
+    .await
+    .expect("advisory-lock fixture batch must be created");
+    let mut lock_owner = pool
+        .begin()
+        .await
+        .expect("advisory-lock owner transaction must start");
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))")
+        .bind(CHAT_ID)
+        .bind(locked_target_id)
+        .execute(&mut *lock_owner)
+        .await
+        .expect("test transaction must acquire the target advisory lock");
+    let claimant_pool = pool.clone();
+    let claimant = tokio::spawn(async move {
+        prepare_action(
+            &claimant_pool,
+            ActionPreparation {
+                batch_id: locked_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id: locked_target_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: Some("advisory lock oracle"),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            },
+        )
+        .await
+    });
+    let observed_target_lock = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if claimant.is_finished() {
+                return Ok::<bool, sqlx::Error>(false);
+            }
+            let blocked: bool = sqlx::query_scalar(
+                "select exists(select 1 from pg_stat_activity where datname=current_database() and wait_event_type='Lock' and query ilike '%pg_advisory_xact_lock%')",
+            )
+            .fetch_one(&pool)
+            .await?;
+            if blocked {
+                return Ok::<bool, sqlx::Error>(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    lock_owner
+        .commit()
+        .await
+        .expect("target advisory lock must be released");
+    let lock_claim_result = claimant
+        .await
+        .expect("action preparation must finish after releasing the lock");
+    cleanup(&pool, &[locked_target_id], &[locked_batch.id]).await;
+    let lock_claim = lock_claim_result
+        .expect("action preparation must succeed after acquiring the lock")
+        .expect("first action must be prepared");
+    assert!(
+        observed_target_lock
+            .expect("lock observation must finish within liveness bound")
+            .expect("PostgreSQL lock-state query must succeed"),
+        "PostgreSQL must show the competing moderation transaction waiting on the target lock"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "select not exists(select 1 from manual_moderation_actions where id=$1)"
+        )
+        .bind(lock_claim)
+        .fetch_one(&pool)
+        .await
+        .expect("advisory-lock fixture cleanup must complete")
+    );
+
+    let mute_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .expect("first synthetic moderation batch must be created");
+    let ban_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "ban",
+    )
+    .await
+    .expect("second synthetic moderation batch must be created");
+    let (mute, ban) = tokio::join!(
+        prepare_action(
+            &pool,
+            ActionPreparation {
+                batch_id: mute_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: Some("synthetic race"),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            }
+        ),
+        prepare_action(
+            &pool,
+            ActionPreparation {
+                batch_id: ban_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id,
+                actor_user_id: actor_id,
+                action: "ban",
+                reason: Some("synthetic race"),
+                expires_at: None,
+                automatic: false,
+            }
+        )
+    );
+    let outcomes = [mute, ban];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(Some(_))))
+            .count(),
+        1,
+        "the target advisory lock must let exactly one concurrent sanction prepare"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1,
+        "the second transaction must observe the first processing action"
+    );
+    let processing: i64 = sqlx::query_scalar(
+        "select count(*) from manual_moderation_actions where chat_id=$1 and target_user_id=$2 and status='processing'",
+    )
+    .bind(CHAT_ID)
+    .bind(target_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("race result must be readable from PostgreSQL");
+    assert_eq!(processing, 1);
+    cleanup(&pool, &[target_user_id], &[mute_batch.id, ban_batch.id]).await;
+
+    // Exercise the same transactional API with a single-connection pool. The
+    // worker must not try to acquire a second connection while holding its tx.
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("single-connection test pool must connect");
+    let single_target = target_user_id + 10;
+    let single_batch = create_batch(
+        &single,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .expect("single-connection moderation batch must be created");
+    let action_id = prepare_action(
+        &single,
+        ActionPreparation {
+            batch_id: single_batch.id,
+            chat_id: CHAT_ID,
+            target_user_id: single_target,
+            actor_user_id: actor_id,
+            action: "mute",
+            reason: Some("single connection"),
+            expires_at: Some(Utc::now() + Duration::days(1)),
+            automatic: false,
+        },
+    )
+    .await
+    .expect("single-connection action preparation must not deadlock")
+    .expect("single-connection action must be prepared");
+    cleanup(&single, &[single_target], &[single_batch.id]).await;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "select not exists(select 1 from manual_moderation_actions where id=$1)"
+        )
+        .bind(action_id)
+        .fetch_one(&single)
+        .await
+        .expect("single-connection fixture cleanup must complete")
+    );
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
 async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_safely() {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must point to the disposable test database");

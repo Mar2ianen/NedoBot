@@ -739,11 +739,59 @@ exit {exit_code}
         let error = get_subtitles(Some(&service), page_input(0, None))
             .await
             .unwrap_err();
-        assert!(error.message.contains("partial files"));
+        assert!(
+            error.message.contains("partial files"),
+            "unexpected provider failure: {error:?}"
+        );
         assert!(service.cached("abcdefghijk").await.is_none());
         assert_eq!(
             std::fs::read_to_string(directory.path().join("calls")).unwrap(),
             "x"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_provider_process_is_killed_and_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, mut service) = fixture_provider("", 0);
+        let pid_file = directory.path().join("provider.pid");
+        std::fs::write(
+            &service.config.command,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("timeout provider script must be written");
+        let mut permissions = std::fs::metadata(&service.config.command)
+            .expect("timeout provider metadata must be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&service.config.command, permissions)
+            .expect("timeout provider must be executable");
+        service.config.timeout = Duration::from_millis(500);
+
+        let error = get_subtitles(Some(&service), page_input(0, None))
+            .await
+            .expect_err("slow fake provider must hit its local timeout");
+        assert!(error.message.contains("timed out"));
+        assert!(service.cached("abcdefghijk").await.is_none());
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("provider must record its process ID before sleeping")
+            .trim()
+            .to_owned();
+        for _ in 0..100 {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "timed-out subprocess {pid} must not survive cancellation"
         );
     }
 

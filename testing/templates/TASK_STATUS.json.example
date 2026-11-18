@@ -1,0 +1,14 @@
+{
+  "phase": "A",
+  "task": "T01",
+  "status": "not_started",
+  "repo": "NedoBot",
+  "sha": null,
+  "pr": null,
+  "ci": null,
+  "tests_executed": 0,
+  "synthetic_cases": 0,
+  "bugs_confirmed": 0,
+  "privacy_reviewed": false,
+  "next_gate": false
+}

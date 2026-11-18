@@ -397,7 +397,11 @@ mod tests {
             DecisionClient {
                 client: reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
-                    .timeout(Duration::from_millis(75))
+                    .timeout(if slow {
+                        Duration::from_millis(75)
+                    } else {
+                        Duration::from_secs(2)
+                    })
                     .build()
                     .unwrap(),
                 endpoint,

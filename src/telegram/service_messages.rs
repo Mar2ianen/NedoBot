@@ -560,7 +560,57 @@ mod tests {
         assert_eq!(sent.id, MessageId(5));
     }
 
+    #[tokio::test]
+    async fn malformed_telegram_ack_is_unknown_and_does_not_trigger_a_second_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Telegram API");
+        let address = listener.local_addr().expect("mock API address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept initial Telegram request");
+            let _request_body = read_request_body(&stream);
+            write_json_response(&mut stream, "200 OK", "not-json");
+            drop(stream);
+
+            listener
+                .set_nonblocking(true)
+                .expect("enable nonblocking call counter");
+            let mut calls = 1;
+            for _ in 0..25 {
+                match listener.accept() {
+                    Ok((mut retry, _)) => {
+                        calls += 1;
+                        let _ = retry.write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock listener failed: {error}"),
+                }
+            }
+            calls
+        });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+
+        let error = super::send_rich_html(
+            &bot,
+            ChatId(-1001),
+            "<b>accepted, acknowledgement malformed</b>",
+            MessageAudience::Public,
+        )
+        .await
+        .expect_err("malformed acknowledgement must remain an error");
+        assert!(delivery_outcome_is_unknown(&error));
+        assert_eq!(server.join().expect("fake server must finish"), 1);
+    }
+
     fn read_request_payload(stream: &TcpStream) -> serde_json::Value {
+        serde_json::from_slice(&read_request_body(stream)).expect("Telegram JSON request")
+    }
+
+    fn read_request_body(stream: &TcpStream) -> Vec<u8> {
         let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
         let mut content_length = 0;
         loop {
@@ -577,7 +627,7 @@ mod tests {
         }
         let mut body = vec![0; content_length];
         reader.read_exact(&mut body).expect("read request body");
-        serde_json::from_slice(&body).expect("Telegram JSON request")
+        body
     }
 
     fn write_json_response(stream: &mut TcpStream, status: &str, body: &str) {
@@ -594,6 +644,13 @@ mod tests {
     fn ambiguous_transport_failures_are_not_safe_to_retry_as_new_messages() {
         let io_error = RequestError::Io(std::sync::Arc::new(std::io::Error::other("test")));
         assert!(delivery_outcome_is_unknown(&io_error));
+        let malformed_ack = RequestError::InvalidJson {
+            source: std::sync::Arc::new(
+                serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            ),
+            raw: "{".into(),
+        };
+        assert!(delivery_outcome_is_unknown(&malformed_ack));
         assert!(!delivery_outcome_is_unknown(&RequestError::RetryAfter(
             teloxide::types::Seconds::from_seconds(30)
         )));

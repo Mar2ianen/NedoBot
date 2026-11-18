@@ -603,10 +603,18 @@ mod tests {
             review_threshold: 70,
             ban_threshold: 90,
         };
-        assert_eq!(decide_auto_action(69, &policy), AutoAction::None);
-        assert_eq!(decide_auto_action(70, &policy), AutoAction::DeleteMessages);
-        assert_eq!(decide_auto_action(89, &policy), AutoAction::DeleteMessages);
-        assert_eq!(decide_auto_action(90, &policy), AutoAction::Ban);
+        for (score, expected) in [
+            (69, AutoAction::None),
+            (70, AutoAction::DeleteMessages),
+            (89, AutoAction::DeleteMessages),
+            (90, AutoAction::Ban),
+        ] {
+            assert_eq!(
+                decide_auto_action(score, &policy),
+                expected,
+                "moderation boundary score={score}"
+            );
+        }
     }
 
     #[test]

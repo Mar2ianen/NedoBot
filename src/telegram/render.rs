@@ -156,6 +156,7 @@ mod tests {
     #[test]
     fn rich_markdown_input_keeps_telegram_limit() {
         assert!(validate_rich_markdown("## Ответ").is_ok());
+        assert!(validate_rich_markdown(&"😀".repeat(TELEGRAM_RICH_TEXT_LIMIT)).is_ok());
         assert!(validate_rich_markdown(&"x".repeat(TELEGRAM_RICH_TEXT_LIMIT + 1)).is_err());
     }
 
@@ -168,6 +169,13 @@ mod tests {
         let error = normalize_send_text(oversized).unwrap_err();
         assert!(matches!(error, teloxide::RequestError::Validation(_)));
         assert!(!error.to_string().contains("private-model-output"));
+    }
+
+    #[test]
+    fn plain_message_limit_counts_unicode_scalar_values_at_the_boundary() {
+        assert!(normalize_send_text("😀".repeat(TELEGRAM_TEXT_LIMIT)).is_ok());
+        assert!(normalize_send_text("😀".repeat(TELEGRAM_TEXT_LIMIT + 1)).is_err());
+        assert_eq!(normalize_send_text(" \n ").unwrap(), "Пустой ответ.");
     }
 
     #[test]

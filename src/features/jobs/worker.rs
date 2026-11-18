@@ -89,6 +89,25 @@ pub enum WorkerTaskExit {
     Aborted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerFailure {
+    pub worker: WorkerId,
+    pub exit: WorkerTaskExit,
+}
+
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "background worker {} exited unexpectedly ({:?}); process restart required",
+            self.worker.as_str(),
+            self.exit
+        )
+    }
+}
+
+impl std::error::Error for WorkerFailure {}
+
 pub struct WorkerSupervisor {
     shutdown: watch::Sender<bool>,
     tasks: JoinSet<WorkerId>,
@@ -127,19 +146,19 @@ impl WorkerSupervisor {
     /// Runs the foreground service while observing unexpected worker exits.
     /// A long-lived worker exiting unexpectedly is fatal: after draining sibling
     /// workers, return an error so the process supervisor can restart the service.
-    pub async fn supervise_until<F>(&mut self, foreground: F) -> anyhow::Result<()>
+    pub async fn supervise_until<F>(&mut self, foreground: F) -> Result<(), WorkerFailure>
     where
         F: Future<Output = ()>,
     {
         tokio::pin!(foreground);
-        let mut failed_worker = None;
+        let mut failure = None;
         loop {
             tokio::select! {
                 _ = &mut foreground => break,
                 joined = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     if let Some(joined) = joined {
-                        failed_worker = self.record_exit(joined);
-                        if failed_worker.is_some() {
+                        failure = self.record_exit(joined);
+                        if failure.is_some() {
                             break;
                         }
                     }
@@ -147,13 +166,7 @@ impl WorkerSupervisor {
             }
         }
         self.shutdown_and_drain().await;
-        if let Some(worker) = failed_worker {
-            anyhow::bail!(
-                "background worker {} exited unexpectedly; process restart required",
-                worker.as_str()
-            );
-        }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     pub async fn shutdown_and_drain(&mut self) {
@@ -218,7 +231,10 @@ impl WorkerSupervisor {
         }
     }
 
-    fn record_exit(&mut self, joined: Result<(Id, WorkerId), JoinError>) -> Option<WorkerId> {
+    fn record_exit(
+        &mut self,
+        joined: Result<(Id, WorkerId), JoinError>,
+    ) -> Option<WorkerFailure> {
         let shutting_down = *self.shutdown.borrow();
         let (worker, exit) = self.classify_join(joined);
         match exit {
@@ -244,7 +260,7 @@ impl WorkerSupervisor {
                 );
             }
         }
-        (!shutting_down).then_some(worker)
+        (!shutting_down).then_some(WorkerFailure { worker, exit })
     }
 }
 
@@ -370,7 +386,8 @@ mod tests {
     use super::super::policy::WorkerPollPolicy;
     use super::run_interval_worker;
     use super::{
-        PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, WorkerTaskExit, run_poll_worker,
+        PollOutcome, WorkerFailure, WorkerId, WorkerSpec, WorkerSupervisor, WorkerTaskExit,
+        run_poll_worker,
     };
 
     #[tokio::test(start_paused = true)]
@@ -511,10 +528,12 @@ mod tests {
             .supervise_until(std::future::pending::<()>())
             .await;
 
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("decision_audit"),
-            "unexpected error: {error}"
+        assert_eq!(
+            result.unwrap_err(),
+            WorkerFailure {
+                worker: WorkerId::DecisionAudit,
+                exit: WorkerTaskExit::Panicked,
+            }
         );
         assert!(sibling_stopped.load(Ordering::SeqCst));
     }
@@ -534,7 +553,13 @@ mod tests {
             .supervise_until(std::future::pending::<()>())
             .await;
 
-        assert!(result.unwrap_err().to_string().contains("decision_audit"));
+        assert_eq!(
+            result.unwrap_err(),
+            WorkerFailure {
+                worker: WorkerId::DecisionAudit,
+                exit: WorkerTaskExit::Completed,
+            }
+        );
         assert!(sibling_stopped.load(Ordering::SeqCst));
     }
 
@@ -551,10 +576,12 @@ mod tests {
             .supervise_until(std::future::pending::<()>())
             .await;
 
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("decision_audit"),
-            "unexpected error: {error}"
+        assert_eq!(
+            result.unwrap_err(),
+            WorkerFailure {
+                worker: WorkerId::DecisionAudit,
+                exit: WorkerTaskExit::Aborted,
+            }
         );
     }
 }

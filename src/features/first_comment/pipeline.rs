@@ -694,8 +694,14 @@ async fn get_chat_member_count(
 
 #[cfg(test)]
 mod delivery_tests {
-    use super::{CommentErrorKind, SendFailure, comment_send_failure};
+    use super::*;
     use crate::telegram::delivery::{DeliveryEffect, DeliveryErrorKind, DeliveryFailure};
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        thread,
+    };
+    use teloxide::types::ParseMode;
 
     #[test]
     fn comment_delivery_effects_preserve_safe_retry_certainty() {
@@ -730,5 +736,74 @@ mod delivery_tests {
             comment_send_failure(DeliveryEffect::<()>::Confirmed(())),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn owner_preview_uses_only_the_configured_private_destination() {
+        const OWNER_ID: i64 = 47_321;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Telegram API");
+        let address = listener.local_addr().expect("fake address must exist");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept preview send");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read Telegram header");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().expect("valid body length");
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).expect("read preview request");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body).expect("Telegram request must be JSON");
+            assert_eq!(payload["chat_id"], OWNER_ID);
+            assert!(
+                payload["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Комментарий отправлен")
+            );
+            assert!(
+                payload["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("source_message_id=99")
+            );
+
+            let result = serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 1,
+                    "date": 1,
+                    "chat": {"id": OWNER_ID, "type": "private"},
+                    "text": payload["text"]
+                }
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{result}", result.len())
+                .expect("fake Telegram response must be writable");
+            stream.flush().expect("fake Telegram response must flush");
+        });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("fake URL"))
+            .parse_mode(ParseMode::Html);
+
+        send_owner_preview(
+            &bot,
+            OWNER_ID,
+            "<b>synthetic comment</b>",
+            MessageId(99),
+            &crate::features::search::types::SearchContext::skipped("disabled", 0),
+            None,
+        )
+        .await;
+        server.join().expect("fake Telegram server must finish");
     }
 }
