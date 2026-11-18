@@ -10,6 +10,10 @@ import sys
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PASSED_RE = re.compile(r"^test result: ok\.\s+(\d+) passed;", re.MULTILINE)
+RESULT_RE = re.compile(
+    r"^test result: (?:ok\.|FAILED\.)\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;",
+    re.MULTILINE,
+)
 
 
 def run_checked(command: list[str]) -> int:
@@ -25,11 +29,20 @@ def run_checked(command: list[str]) -> int:
         return result.returncode
 
     plain_output = ANSI_RE.sub("", result.stdout)
-    passed = sum(int(count) for count in PASSED_RE.findall(plain_output))
+    results = [(int(passed), int(failed), int(ignored)) for passed, failed, ignored in RESULT_RE.findall(plain_output)]
+    if results:
+        passed = sum(counts[0] for counts in results)
+        failed = sum(counts[1] for counts in results)
+        ignored = sum(counts[2] for counts in results)
+    else:
+        passed = sum(int(count) for count in PASSED_RE.findall(plain_output))
+        failed = ignored = 0
     if passed == 0:
         print("error: cargo test exited successfully but ran no passing tests", file=sys.stderr)
         return 1
-    print(f"checked test execution: {passed} passing test(s)")
+    print(
+        f"checked test execution: {passed} passed, {failed} failed, {ignored} ignored"
+    )
     return 0
 
 

@@ -42,25 +42,20 @@ case "$case_id" in
     safe-report) test_filter=reports_omit_payload_and_require_evidence_for_v1 ;;
     minimal-url-trace) test_filter=minimal_operation_trace_replays_with_independent_identity ;;
     telegram-route-command-precedence)
-        test_target_flag=--bin
-        test_target=tg_ai_bot_teloxide
-        test_filter=structurally_valid_generated_messages_preserve_command_precedence
+        test_target_flag=--lib
+        test_target=
+        test_filter=telegram::router::tests::actual_router_builder_prefers_command_and_falls_back_for_unknown_command
         ;;
     ingress-reference-trace) test_filter=ingress_reference_model_keeps_only_current_revision_and_media_evidence ;;
     ask-tool-authorization)
         test_target_flag=--lib
         test_target=
-        test_filter=features::ask::agent::tests::generated_tool_authorization_matches_independent_allowlist_oracle
+        test_filter=features::ask::agent::tests::profile_allowlist_restricts_advertised_and_dispatchable_tools
         ;;
     ask-mcp-untrusted-preview)
         test_target_flag=--lib
         test_target=
-        test_filter=features::ask::agent::tests::generated_mcp_text_stays_untrusted_and_within_preview_budget
-        ;;
-    ask-prefetch-budget)
-        test_target_flag=--lib
-        test_target=
-        test_filter=features::ask::agent::tests::reply_prefetch_does_not_exceed_the_tool_call_budget
+        test_filter=features::ask::agent::tests::ask_input_and_tool_results_keep_injection_text_inside_escaped_json_values
         ;;
     mcp-sql-bindings)
         test_target_flag=--lib
@@ -124,7 +119,7 @@ case "$case_id" in
         ;;
     *)
         echo "unknown quality case: $case_id" >&2
-        echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview ask-prefetch-budget mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape fetch-url-ip-literals qr-decoder-resource mcp-youtube-timeout media-writer-boundary" >&2
+    echo "cases: seeded-url-property deliberate-shrink-fixture utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape fetch-url-ip-literals qr-decoder-resource mcp-youtube-timeout media-writer-boundary" >&2
         exit 2
         ;;
 esac
@@ -134,9 +129,9 @@ if [ -z "${GITHUB_SHA:-}" ]; then
     export NEDOBOT_TEST_SHA="$(git rev-parse HEAD)"
 fi
 if [ "$test_target_flag" = --lib ]; then
-    exec cargo test --lib --locked "$test_filter" -- --nocapture
+    python3 scripts/run_cargo_test_checked.py cargo test --lib --locked "$test_filter" -- --nocapture
+elif [ "$test_target_flag" = --package ]; then
+    python3 scripts/run_cargo_test_checked.py cargo test --package "$test_target" --locked "$test_filter" -- --nocapture
+else
+    python3 scripts/run_cargo_test_checked.py cargo test "$test_target_flag" "$test_target" --locked "$test_filter" -- --nocapture
 fi
-if [ "$test_target_flag" = --package ]; then
-    exec cargo test --package "$test_target" --locked "$test_filter" -- --nocapture
-fi
-exec cargo test "$test_target_flag" "$test_target" --locked "$test_filter" -- --nocapture

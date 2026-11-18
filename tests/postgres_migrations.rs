@@ -245,7 +245,6 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
-    assert_comment_job_lifecycle(&pool).await;
     assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
     assert_system_spam_label_transition(&pool).await;

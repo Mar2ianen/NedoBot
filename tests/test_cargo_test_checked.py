@@ -32,31 +32,35 @@ class CheckedCargoTest(unittest.TestCase):
             return result, stdout.getvalue()
 
     def test_zero_test_success_is_rejected(self):
-        result, output = self.run_fake("running 0 tests\ntest result: ok. 0 passed; 0 failed\n", 0)
+        result, output = self.run_fake(
+            "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored;\n", 0
+        )
         self.assertEqual(result, 1)
         self.assertIn("0 passed", output)
 
     def test_real_test_failure_is_not_swallowed_by_a_success_summary(self):
-        result, output = self.run_fake("test result: ok. 1 passed; 0 failed\n", 23)
+        result, output = self.run_fake(
+            "test result: ok. 1 passed; 0 failed; 0 ignored;\n", 23
+        )
         self.assertEqual(result, 23)
         self.assertIn("1 passed", output)
 
     def test_passing_test_summary_is_accepted_and_counted(self):
         result, output = self.run_fake(
-            "test result: ok. 2 passed; 0 failed\n"
-            "test result: ok. 3 passed; 1 ignored\n",
+            "test result: ok. 2 passed; 0 failed; 0 ignored;\n"
+            "test result: ok. 3 passed; 0 failed; 1 ignored;\n",
             0,
         )
         self.assertEqual(result, 0)
-        self.assertIn("5 passing test(s)", output)
+        self.assertIn("checked test execution: 5 passed, 0 failed, 1 ignored", output)
 
     def test_ansi_color_does_not_hide_test_summary(self):
         result, output = self.run_fake(
-            "\x1b[32mtest result: ok. 1 passed; 0 failed\x1b[0m\n",
+            "\x1b[32mtest result: ok. 1 passed; 0 failed; 0 ignored;\x1b[0m\n",
             0,
         )
         self.assertEqual(result, 0)
-        self.assertIn("1 passing test(s)", output)
+        self.assertIn("checked test execution: 1 passed, 0 failed, 0 ignored", output)
 
 
 if __name__ == "__main__":
