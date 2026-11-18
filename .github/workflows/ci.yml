@@ -51,6 +51,9 @@ jobs:
         run: |
           psql -h 127.0.0.1 -U tg_ai_bot_dev -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE DATABASE tg_ai_bot_test_b'
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE tg_ai_bot_corpus_a' \
+            -c 'CREATE DATABASE tg_ai_bot_corpus_b'
           psql -h 127.0.0.1 -U tg_ai_bot_dev -d tg_ai_bot_test -v ON_ERROR_STOP=1 \
             -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'nedobot_mcp_ro') THEN CREATE ROLE nedobot_mcp_ro NOLOGIN; END IF; END \$\$" \
             -c 'GRANT nedobot_mcp_ro TO tg_ai_bot_dev'
@@ -119,6 +122,17 @@ jobs:
         run: |
           python3 scripts/run_cargo_test_checked.py cargo test --test postgres_migrations -- --ignored
           python3 scripts/run_cargo_test_checked.py cargo test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
+
+      - name: Validate synthetic public URL corpus
+        run: |
+          python3 scripts/validate_public_url_corpus.py
+          python3 -m unittest discover -s tests -p 'test_public_url_corpus.py'
+
+      - name: Run isolated synthetic history extraction across two databases
+        env:
+          TEST_PRIVATE_HISTORY_DATABASE_URL_A: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_corpus_a
+          TEST_PRIVATE_HISTORY_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_corpus_b
+        run: cargo test --test private_url_history two_synthetic_databases_extract_only_their_scoped_messages_and_qr_hashes -- --ignored --exact
 
       - name: Run RMCP PostgreSQL integration test
         env:

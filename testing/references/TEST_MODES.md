@@ -1,6 +1,6 @@
 # CI lanes and objective gates
 
-**PR fast (every change):** format, feature matrix, test corpus, deterministic proptest (start 256–2048 cases/property), checked `cargo test` counts; small synthetic PG/SQLite integrations under existing test service. Do not invoke daily private corpus on GitHub Actions.
+**PR fast (every change):** format, feature matrix, test corpus, deterministic proptest (start 256–2048 cases/property), checked `cargo test` counts; small synthetic PG/SQLite integrations under existing test service. Use only committed or generated synthetic corpora; do not connect CI to chat databases.
 
 **Daily/nightly extended:** 50k–200k properties or a timed budget after profiling, randomized state traces, deterministic failure schedules, fresh fuzz corpus. Isolate heavy libFuzzer jobs. Record exact toolchain/build SHA, seed, target, cases, unique edges, timeouts.
 
