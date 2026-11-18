@@ -1059,3 +1059,7 @@ routes и не даёт права на санкции. Транспорт, ве
 
 Decision может участвовать в общей метрике с ephemeral captcha: [контракт,
 настройки и migration-aware rollback](DECISION_SCORING.md). Shadow остаётся default.
+
+### Worker supervision
+
+Long-lived workers регистрируются в общем `WorkerSupervisor`. Если такой worker неожиданно завершается или паникует, supervisor сигналит остановку оставшимся workers, ждёт ограниченный drain и возвращает ошибку из процесса. Systemd `Restart=on-failure` поднимает процесс заново; PostgreSQL leases восстанавливают durable jobs. Ошибка worker не маскируется как обычный здоровый Telegram poller. При штатном завершении dispatcher supervisor только останавливает и drain-ит workers.

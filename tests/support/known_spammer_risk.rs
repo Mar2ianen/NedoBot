@@ -106,6 +106,9 @@ async fn load_job(pool: &PgPool) -> NewUserAuditJob {
         avatar_file_id: None,
         avatar_file_unique_id: None,
         assessment_json: None,
+        status: tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditStatus::Succeeded,
+        materialization_status:
+            tg_ai_bot_teloxide::features::new_user_audit::repo::MaterializationStatus::Processing,
         review_threshold: 70,
         attempts: 1,
         generation_fence: 1,

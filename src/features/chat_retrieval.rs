@@ -508,7 +508,7 @@ async fn retry_embedding_jobs_individually(
                 );
             }
             Err(err) => {
-                let error_kind = if err.to_string().contains("429") {
+                let error_kind = if crate::http::status_code(&err) == Some(429) {
                     "http_429"
                 } else {
                     "embedding_failed"

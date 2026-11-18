@@ -51,3 +51,6 @@ pub mod voice;
 
 #[cfg(feature = "moderation")]
 pub mod decision_audit;
+
+#[cfg(feature = "moderation")]
+pub mod url_shadow_projection;

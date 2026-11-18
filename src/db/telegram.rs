@@ -10,7 +10,9 @@ use teloxide::{
 
 use crate::config::Config;
 use crate::features::chat_retrieval::enqueue_message_embedding_if_enabled;
-use crate::telegram::entities::{forwarded_channel_post, message_has_links, message_text};
+use crate::telegram::entities::{
+    MessageRevision, TelegramMessageProjection, TelegramMessageRef, message_has_links, message_text,
+};
 use crate::text::normalize_cyrillic_homoglyphs;
 
 struct MemberSnapshot {
@@ -37,6 +39,13 @@ struct StoredMessageSnapshot {
     user_id: Option<i64>,
     text: Option<String>,
     raw_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessagePersistenceOutcome {
+    pub message: TelegramMessageRef,
+    pub revision: MessageRevision,
+    pub inserted: bool,
 }
 
 #[allow(dead_code)]
@@ -124,11 +133,10 @@ pub async fn save_telegram_message(
     pool: &PgPool,
     msg: &Message,
     config: &Config,
-) -> anyhow::Result<()> {
-    let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
-        .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
-        .unwrap_or((None, None));
-    let user_id = msg.from.as_ref().map(|user| user.id.0 as i64);
+) -> anyhow::Result<MessagePersistenceOutcome> {
+    let projection = TelegramMessageProjection::from_message(msg)?;
+    let message = projection.message;
+    let revision = MessageRevision::from_message(msg);
     if let Some(user) = msg.from.as_ref() {
         upsert_user_profile(pool, user).await?;
     }
@@ -136,18 +144,6 @@ pub async fn save_telegram_message(
     if let Some(reply_user) = msg.reply_to_message().and_then(|reply| reply.from.as_ref()) {
         upsert_user_profile(pool, reply_user).await?;
     }
-
-    let reply_to_message_id = msg.reply_to_message().map(|reply| reply.id.0);
-    let reply_to_user_id = msg
-        .reply_to_message()
-        .and_then(|reply| reply.from.as_ref())
-        .map(|user| user.id.0 as i64);
-    let sender_chat_id = msg.sender_chat.as_ref().map(|chat| chat.id.0);
-    let via_bot_id = msg.via_bot.as_ref().map(|bot| bot.id.0 as i64);
-    // Keep the raw payload while the bot is young: Telegram update shapes vary,
-    // and raw_json makes production debugging much faster.
-    let raw_json = serde_json::to_value(msg)?;
-
     let (inserted,): (bool,) = sqlx::query_as(
         r#"
         insert into telegram_messages
@@ -181,25 +177,25 @@ pub async fn save_telegram_message(
     )
     .bind(msg.chat.id.0)
     .bind(msg.id.0)
-    .bind(user_id)
-    .bind(source_channel_id)
-    .bind(source_message_id)
-    .bind(msg.is_automatic_forward())
-    .bind(message_text(msg).as_deref())
-    .bind(raw_json)
-    .bind(reply_to_message_id)
-    .bind(reply_to_user_id)
-    .bind(sender_chat_id)
-    .bind(via_bot_id)
-    .bind(msg.photo().is_some())
-    .bind(msg.video().is_some())
-    .bind(msg.document().is_some())
-    .bind(msg.audio().is_some())
-    .bind(msg.voice().is_some())
-    .bind(msg.sticker().is_some())
-    .bind(msg.animation().is_some())
-    .bind(message_has_links(msg))
-    .bind(msg.forward_origin().is_some())
+    .bind(projection.user_id)
+    .bind(projection.source_channel_id)
+    .bind(projection.source_message_id)
+    .bind(projection.is_automatic_forward)
+    .bind(projection.text.as_deref())
+    .bind(projection.raw_json)
+    .bind(projection.reply_to_message_id)
+    .bind(projection.reply_to_user_id)
+    .bind(projection.sender_chat_id)
+    .bind(projection.via_bot_id)
+    .bind(projection.has_photo)
+    .bind(projection.has_video)
+    .bind(projection.has_document)
+    .bind(projection.has_audio)
+    .bind(projection.has_voice)
+    .bind(projection.has_sticker)
+    .bind(projection.has_animation)
+    .bind(projection.has_links)
+    .bind(projection.is_forwarded)
     .fetch_one(pool)
     .await?;
 
@@ -215,7 +211,7 @@ pub async fn save_telegram_message(
     }
 
     if inserted {
-        upsert_chat_user_activity(pool, msg, source_channel_id).await?;
+        upsert_chat_user_activity(pool, msg, projection.source_channel_id).await?;
         enqueue_message_embedding_if_enabled(
             pool,
             config.chat_retrieval_embeddings_enabled,
@@ -227,14 +223,18 @@ pub async fn save_telegram_message(
 
     super::membership::observe_service_message(pool, msg).await?;
 
-    Ok(())
+    Ok(MessagePersistenceOutcome {
+        message,
+        revision,
+        inserted,
+    })
 }
 
 pub async fn save_edited_telegram_message(
     pool: &PgPool,
     msg: &Message,
     config: &Config,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MessagePersistenceOutcome> {
     let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
     let new_text = message_text(msg);
     let new_raw_json = serde_json::to_value(msg)?;
@@ -242,7 +242,7 @@ pub async fn save_edited_telegram_message(
         old.text.as_deref() != new_text.as_deref() || old.raw_json != new_raw_json
     });
 
-    save_telegram_message(pool, msg, config).await?;
+    let persistence = save_telegram_message(pool, msg, config).await?;
     super::url_evidence::supersede_qr_scan_jobs(
         pool,
         msg,
@@ -254,7 +254,7 @@ pub async fn save_edited_telegram_message(
     .await?;
 
     if !changed {
-        return Ok(());
+        return Ok(persistence);
     }
 
     if let Some(old) = old.as_ref()
@@ -326,7 +326,7 @@ pub async fn save_edited_telegram_message(
     )
     .await?;
 
-    Ok(())
+    Ok(persistence)
 }
 
 async fn load_message_snapshot(

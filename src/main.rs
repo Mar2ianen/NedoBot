@@ -1,46 +1,42 @@
+use std::sync::Arc;
 use teloxide::{
     dispatching::UpdateFilterExt,
+    dptree,
     prelude::*,
-    types::{
-        ChatId, ChatMemberKind, ChatMemberUpdated, MessageReactionCountUpdated,
-        MessageReactionUpdated, ParseMode,
-    },
+    types::{ChatId, ChatMemberKind, ParseMode},
 };
-
-#[cfg(feature = "moderation")]
-use teloxide::types::CallbackQuery;
 
 use tg_ai_bot_teloxide::{config, db, features, llm, state, telegram};
 
 use config::Config;
-use db::telegram::{
-    refresh_known_member_snapshots, save_chat_member_event, save_edited_telegram_message,
-    save_message_reaction, save_message_reaction_count,
-};
+use db::telegram::{refresh_known_member_snapshots, save_edited_telegram_message};
 use db::{build_pool, migrate};
 use features::chat_retrieval::process_next_embedding_batch;
 #[cfg(feature = "auto-comment")]
 use features::first_comment::pipeline::{maybe_comment_post, process_next_post_comment_job};
-use features::ingest::{ingest_message, is_managed_chat, managed_chat_allows};
+use features::ingest::{IngressOutcome, ingest_message, is_managed_chat, managed_chat_allows};
 #[cfg(feature = "moderation")]
 use features::jobs::policy::EXTERNAL_ANALYSIS_POLL;
-use features::jobs::policy::POST_HISTORY_POLL;
 #[cfg(feature = "voice")]
 use features::jobs::policy::VOICE_TRANSCRIPTION_POLL;
-use features::member_greetings::handle_chat_member_update;
+use features::jobs::policy::{POST_HISTORY_POLL, WorkerPollPolicy};
+#[cfg(feature = "spam-sync")]
+use features::jobs::worker::run_fixed_delay_worker;
+#[cfg(feature = "ask")]
+use features::jobs::worker::run_interval_worker;
+use features::jobs::worker::{
+    PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_poll_worker,
+};
 use features::memory::service::process_next_history_entry;
 #[cfg(feature = "moderation")]
 use features::new_user_audit::service::process_next_new_user_audit_job;
 #[cfg(feature = "moderation")]
-use features::reports::{self, ReportActionResult};
+use features::reports;
 use features::service_message_cleanup::maybe_delete_join_leave_message;
 #[cfg(feature = "spam-sync")]
 use features::spam_reputation::SpamReputationStore;
 #[cfg(feature = "moderation")]
-use features::spam_review::{
-    apply_callback, callback_message_chat_id, is_chat_admin, parse_callback,
-    process_next_review_delivery, review_delivery_enabled,
-};
+use features::spam_review::{process_next_review_delivery, review_delivery_enabled};
 use features::spammer_avatar_embeddings::{
     enqueue_existing_spammer_avatars, process_next_spammer_avatar_embedding,
     worker_error_seconds as spammer_avatar_worker_error_seconds,
@@ -115,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     preflight_risk_captcha_permissions(&bot, &config).await?;
     let pool = build_pool().await?;
     migrate(&pool).await?;
+    let mut workers = WorkerSupervisor::new();
     #[cfg(feature = "moderation")]
     if config.community.moderation.enabled {
         if let Err(err) =
@@ -124,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(%err, "failed to refresh configured Telegram linked chats at startup");
         }
         features::url_relations::spawn_linked_chat_refresh_worker(
+            &mut workers,
             bot.inner().clone(),
             pool.clone(),
             config.clone(),
@@ -172,7 +170,11 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, config);
     #[cfg(feature = "moderation")]
     if state.config.community.moderation.url_feed_enabled {
-        features::url_feeds::spawn_worker(state.url_feed_snapshot.clone(), state.config.clone());
+        features::url_feeds::spawn_worker(
+            &mut workers,
+            state.url_feed_snapshot.clone(),
+            Arc::clone(&state.config),
+        );
     }
     #[cfg(feature = "ask")]
     let state = match bot_identity {
@@ -180,47 +182,49 @@ async fn main() -> anyhow::Result<()> {
         None => state,
     };
     #[cfg(feature = "ask")]
-    spawn_ask_memory_expiry_worker(state.pool.clone());
+    spawn_ask_memory_expiry_worker(&mut workers, state.pool.clone());
     #[cfg(feature = "spam-sync")]
     let state = match spam_reputation_store {
         Some(store) => state.with_spam_reputation(store),
         None => state,
     };
     #[cfg(feature = "spam-sync")]
-    spawn_spam_reputation_worker(state.clone());
+    spawn_spam_reputation_worker(&mut workers, state.clone());
     #[cfg(feature = "moderation")]
     if state.config.community.moderation.qr_evidence_enabled {
-        features::qr_url::spawn_worker(bot.inner().clone(), state.clone());
+        features::qr_url::spawn_worker(&mut workers, bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]
     features::decision_audit::service::spawn_worker(
+        &mut workers,
         bot.inner().clone(),
         state.pool.clone(),
-        state.config.clone(),
+        Arc::clone(&state.config),
     )?;
     let profile_refresh_queue = spawn_profile_refresh_workers(
+        &mut workers,
         bot.inner().clone(),
         state.pool.clone(),
-        state.config.clone(),
+        Arc::clone(&state.config),
         #[cfg(feature = "moderation")]
         state.url_feed_snapshot.clone(),
     );
-    spawn_spammer_avatar_embedding_worker(bot.inner().clone(), state.clone());
+    spawn_spammer_avatar_embedding_worker(&mut workers, bot.inner().clone(), state.clone());
     #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled {
-        spawn_new_user_audit_worker(bot.inner().clone(), state.clone());
+        spawn_new_user_audit_worker(&mut workers, bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]
     if state.config.community.moderation.captcha_enabled
         && !state.config.community.moderation.captcha_dry_run
     {
-        spawn_risk_captcha_worker(bot.inner().clone(), state.clone());
+        spawn_risk_captcha_worker(&mut workers, bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled
         || review_delivery_enabled(&state.config.community.moderation)
     {
-        spawn_spam_review_delivery_worker(bot.inner().clone(), state.clone());
+        spawn_spam_review_delivery_worker(&mut workers, bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "moderation")]
     if state
@@ -230,62 +234,64 @@ async fn main() -> anyhow::Result<()> {
         .values()
         .any(|chat| chat.reports)
     {
-        spawn_report_delivery_worker(bot.inner().clone(), state.clone());
+        spawn_report_delivery_worker(&mut workers, bot.inner().clone(), state.clone());
     }
     #[cfg(feature = "auto-comment")]
     if state.config.community.first_comment.enabled {
-        spawn_post_comment_worker(bot.clone(), state.clone());
+        spawn_post_comment_worker(&mut workers, bot.clone(), state.clone());
     }
-    spawn_post_history_worker(state.clone());
-    spawn_chat_retrieval_embedding_worker(state.clone());
+    spawn_post_history_worker(&mut workers, state.clone());
+    spawn_chat_retrieval_embedding_worker(&mut workers, state.clone());
     #[cfg(feature = "voice")]
-    spawn_voice_transcription_worker(bot.clone(), state.clone());
+    spawn_voice_transcription_worker(&mut workers, bot.clone(), state.clone());
 
-    let handler = dptree::entry()
-        .branch(
-            Update::filter_message()
-                .branch(
-                    dptree::entry()
-                        .filter_command::<Command>()
-                        .endpoint(handle_command),
-                )
-                .branch(dptree::endpoint(handle_message)),
-        )
-        .branch(Update::filter_message_reaction_updated().endpoint(handle_message_reaction))
-        .branch(
-            Update::filter_message_reaction_count_updated().endpoint(handle_message_reaction_count),
-        )
-        .branch(Update::filter_edited_message().endpoint(handle_edited_message));
-    #[cfg(feature = "moderation")]
-    let handler = handler.branch(Update::filter_callback_query().endpoint(handle_callback_query));
-    let handler = handler.branch(Update::filter_chat_member().endpoint(handle_chat_member));
+    let handler = telegram::router::build(telegram::router::Routes {
+        command: dptree::entry()
+            .filter_command::<Command>()
+            .endpoint(handle_command),
+        message: dptree::endpoint(handle_message),
+        reaction: Update::filter_message_reaction_updated()
+            .endpoint(telegram::updates::handle_message_reaction),
+        reaction_count: Update::filter_message_reaction_count_updated()
+            .endpoint(telegram::updates::handle_message_reaction_count),
+        edited_message: Update::filter_edited_message().endpoint(handle_edited_message),
+        #[cfg(feature = "moderation")]
+        callback: Update::filter_callback_query()
+            .endpoint(telegram::callbacks::handle_callback_query),
+        chat_member: Update::filter_chat_member().endpoint(telegram::updates::handle_chat_member),
+    });
 
-    Dispatcher::builder(bot, handler)
+    let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state, profile_refresh_queue])
         .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .build();
+
+    workers.supervise_until(dispatcher.dispatch()).await?;
 
     Ok(())
 }
 
 #[cfg(feature = "ask")]
-fn spawn_ask_memory_expiry_worker(pool: sqlx::PgPool) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-        loop {
-            interval.tick().await;
-            match features::ask::conversation_memory::purge_expired(&pool).await {
-                Ok(deleted) if deleted > 0 => {
-                    tracing::info!(deleted, "purged expired /ask conversation memory turns");
+fn spawn_ask_memory_expiry_worker(supervisor: &mut WorkerSupervisor, pool: sqlx::PgPool) {
+    supervisor.spawn(WorkerId::AskMemoryExpiry, move |shutdown| async move {
+        run_interval_worker(
+            WorkerId::AskMemoryExpiry,
+            shutdown,
+            std::time::Duration::from_secs(60 * 60),
+            false,
+            false,
+            || async {
+                match features::ask::conversation_memory::purge_expired(&pool).await {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(deleted, "purged expired /ask conversation memory turns");
+                        None
+                    }
+                    Ok(_) => None,
+                    Err(_) => Some("database_operation_failed"),
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "failed to purge expired /ask conversation memory")
-                }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
@@ -300,155 +306,173 @@ fn community_reputation_chat_ids(config: &Config) -> Vec<i64> {
 }
 
 #[cfg(feature = "spam-sync")]
-fn spawn_spam_reputation_worker(state: AppState) {
+fn spawn_spam_reputation_worker(supervisor: &mut WorkerSupervisor, state: AppState) {
     let Some(store) = state.spam_reputation.clone() else {
         return;
     };
     let chat_ids = community_reputation_chat_ids(&state.config);
     let instance_id = state.config.community.instance.id.clone();
-    tokio::spawn(async move {
-        loop {
-            match store
-                .synchronize_instance(&state.pool, &instance_id, &chat_ids)
-                .await
-            {
-                Ok(summary) => tracing::debug!(
-                    spammer_count = summary.spammer_count,
-                    source_decision_count = summary.source_decision_count,
-                    "shared spam reputation synchronized"
-                ),
-                Err(err) => tracing::warn!(%err, "shared spam reputation sync failed"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        }
+    supervisor.spawn(WorkerId::SpamReputationSync, move |shutdown| async move {
+        run_fixed_delay_worker(
+            WorkerId::SpamReputationSync,
+            shutdown,
+            std::time::Duration::from_secs(30),
+            || async {
+                match store
+                    .synchronize_instance(&state.pool, &instance_id, &chat_ids)
+                    .await
+                {
+                    Ok(summary) => {
+                        tracing::debug!(
+                            spammer_count = summary.spammer_count,
+                            source_decision_count = summary.source_decision_count,
+                            "shared spam reputation synchronized"
+                        );
+                        None
+                    }
+                    Err(_) => Some("synchronization_failed"),
+                }
+            },
+        )
+        .await;
     });
 }
 
 #[cfg(feature = "auto-comment")]
-fn spawn_post_comment_worker(bot: teloxide::adaptors::DefaultParseMode<Bot>, state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            match process_next_post_comment_job(&bot, &state).await {
-                Ok(true) => continue,
-                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
-                Err(err) => {
-                    tracing::warn!(%err, "post comment worker failed to claim a job");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+fn spawn_post_comment_worker(
+    supervisor: &mut WorkerSupervisor,
+    bot: teloxide::adaptors::DefaultParseMode<Bot>,
+    state: AppState,
+) {
+    supervisor.spawn(WorkerId::FirstComment, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::FirstComment, WorkerPollPolicy::new(2, 2)),
+            shutdown,
+            || async {
+                match process_next_post_comment_job(&bot, &state).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("claim_or_process_failed"),
                 }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
-fn spawn_post_history_worker(state: AppState) {
+fn spawn_post_history_worker(supervisor: &mut WorkerSupervisor, state: AppState) {
     if !state.config.rag_enabled {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            match process_next_history_entry(&state.pool, &state.config).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        POST_HISTORY_POLL.idle_seconds(),
-                    ))
-                    .await
+    supervisor.spawn(WorkerId::PostHistory, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::PostHistory, POST_HISTORY_POLL),
+            shutdown,
+            || async {
+                match process_next_history_entry(&state.pool, &state.config).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("claim_or_process_failed"),
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "post history worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        POST_HISTORY_POLL.error_seconds(),
-                    ))
-                    .await;
-                }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
-fn spawn_chat_retrieval_embedding_worker(state: AppState) {
+fn spawn_chat_retrieval_embedding_worker(supervisor: &mut WorkerSupervisor, state: AppState) {
     if !state.config.chat_retrieval_embeddings_enabled {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            match process_next_embedding_batch(&state.pool, &state.config).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        state.config.chat_retrieval_embedding_poll_sec,
-                    ))
-                    .await;
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "chat retrieval embedding worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        state.config.chat_retrieval_embedding_poll_sec,
-                    ))
-                    .await;
-                }
-            }
-        }
-    });
+    let poll = state.config.chat_retrieval_embedding_poll_sec;
+    supervisor.spawn(
+        WorkerId::ChatRetrievalEmbedding,
+        move |shutdown| async move {
+            run_poll_worker(
+                WorkerSpec::new(
+                    WorkerId::ChatRetrievalEmbedding,
+                    WorkerPollPolicy::new(poll, poll),
+                ),
+                shutdown,
+                || async {
+                    match process_next_embedding_batch(&state.pool, &state.config).await {
+                        Ok(true) => PollOutcome::Processed,
+                        Ok(false) => PollOutcome::Idle,
+                        Err(_) => PollOutcome::Failed("claim_or_process_failed"),
+                    }
+                },
+            )
+            .await;
+        },
+    );
 }
 
-fn spawn_spammer_avatar_embedding_worker(bot: Bot, state: AppState) {
+fn spawn_spammer_avatar_embedding_worker(
+    supervisor: &mut WorkerSupervisor,
+    bot: Bot,
+    state: AppState,
+) {
     if !state.config.avatar_embeddings_enabled {
         return;
     }
-    tokio::spawn(async move {
-        match enqueue_existing_spammer_avatars(&state.pool).await {
-            Ok(queued) => tracing::info!(queued, "queued confirmed spammer avatars for embedding"),
-            Err(err) => tracing::warn!(%err, "failed to queue existing confirmed spammer avatars"),
-        }
-        loop {
-            match process_next_spammer_avatar_embedding(&bot, &state.pool, &state.config).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        spammer_avatar_worker_idle_seconds(),
-                    ))
-                    .await;
+    supervisor.spawn(
+        WorkerId::SpammerAvatarEmbedding,
+        move |shutdown| async move {
+            match enqueue_existing_spammer_avatars(&state.pool).await {
+                Ok(queued) => {
+                    tracing::info!(queued, "queued confirmed spammer avatars for embedding")
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "spammer avatar embedding worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        spammer_avatar_worker_error_seconds(),
-                    ))
-                    .await;
-                }
+                Err(_) => tracing::warn!(
+                    error_kind = "enqueue_failed",
+                    "failed to queue existing confirmed spammer avatars"
+                ),
             }
-        }
-    });
+            run_poll_worker(
+                WorkerSpec::new(
+                    WorkerId::SpammerAvatarEmbedding,
+                    WorkerPollPolicy::new(
+                        spammer_avatar_worker_idle_seconds(),
+                        spammer_avatar_worker_error_seconds(),
+                    ),
+                ),
+                shutdown,
+                || async {
+                    match process_next_spammer_avatar_embedding(&bot, &state.pool, &state.config)
+                        .await
+                    {
+                        Ok(true) => PollOutcome::Processed,
+                        Ok(false) => PollOutcome::Idle,
+                        Err(_) => PollOutcome::Failed("claim_or_process_failed"),
+                    }
+                },
+            )
+            .await;
+        },
+    );
 }
 
 #[cfg(feature = "voice")]
 fn spawn_voice_transcription_worker(
+    supervisor: &mut WorkerSupervisor,
     bot: teloxide::adaptors::DefaultParseMode<Bot>,
     state: AppState,
 ) {
-    if !state.config.voice_transcription_enabled {
+    if !state.config.voice.enabled {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            match process_next_voice_job(&bot, &state).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        VOICE_TRANSCRIPTION_POLL.idle_seconds(),
-                    ))
-                    .await;
+    supervisor.spawn(WorkerId::VoiceTranscription, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::VoiceTranscription, VOICE_TRANSCRIPTION_POLL),
+            shutdown,
+            || async {
+                match process_next_voice_job(&bot, &state).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("claim_or_process_failed"),
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "voice transcription worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        VOICE_TRANSCRIPTION_POLL.error_seconds(),
-                    ))
-                    .await;
-                }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
@@ -474,11 +498,11 @@ async fn handle_message(
     if !msg.chat.is_private() {
         maybe_delete_join_leave_message(&bot, &msg, &state.config).await;
         match ingest_message(&state.pool, &msg, &state.config).await {
-            Ok(true) => message_ingested = true,
+            Ok(IngressOutcome::Persisted(_)) => message_ingested = true,
             // Ask activation is independently gated by ask_enabled and
             // chats.<key>.ask, so ingest=false must not suppress an explicit
             // mention or direct reply trigger.
-            Ok(false) => {}
+            Ok(IngressOutcome::Ignored { .. }) => {}
             Err(err) => {
                 tracing::error!(%err, chat_id = msg.chat.id.0, "failed to ingest message");
                 return Ok(());
@@ -522,9 +546,12 @@ async fn handle_message(
     }
 
     #[cfg(feature = "voice")]
-    match maybe_transcribe_voice(&bot, &msg, &state).await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
+    match maybe_transcribe_voice(&msg, &state).await {
+        Ok(outcome) => {
+            if outcome.consumes_update() {
+                return Ok(());
+            }
+        }
         Err(err) => tracing::error!(%err, "failed to process voice transcription"),
     }
 
@@ -573,362 +600,86 @@ fn enqueue_message_author_profile_refresh(
 }
 
 #[cfg(feature = "moderation")]
-async fn handle_callback_query(
-    bot: teloxide::adaptors::DefaultParseMode<Bot>,
-    query: CallbackQuery,
-    state: AppState,
-) -> ResponseResult<()> {
-    if query
-        .data
-        .as_deref()
-        .is_some_and(features::risk_captcha::is_callback_data)
-    {
-        return handle_risk_captcha_callback(&bot, &query, &state).await;
-    }
-    if let Some((report_id, action)) = query.data.as_deref().and_then(reports::parse_callback) {
-        return handle_report_callback(&bot, &query, &state, report_id, action).await;
-    }
-
-    let Some((request_id, decision)) = query.data.as_deref().and_then(parse_callback) else {
-        return Ok(());
-    };
-    let reviewer_id = query.from.id.0 as i64;
-    let is_configured_reviewer = state.config.reviewer_user_ids().contains(&reviewer_id)
-        || state.config.owner_telegram_id == Some(reviewer_id);
-    let is_review_chat_admin = if is_configured_reviewer {
-        false
-    } else if let Some(review_chat_id) = callback_message_chat_id(&query) {
-        match is_chat_admin(bot.inner(), review_chat_id, reviewer_id).await {
-            Ok(is_admin) => is_admin,
-            Err(error) => {
-                tracing::warn!(%error, review_chat_id, reviewer_id, "failed to verify spam review callback actor");
-                bot.answer_callback_query(query.id)
-                    .text("Не удалось проверить права администратора.")
-                    .await?;
-                return Ok(());
-            }
-        }
-    } else {
-        false
-    };
-    if !is_configured_reviewer && !is_review_chat_admin {
-        bot.answer_callback_query(query.id)
-            .text("Недостаточно прав.")
-            .await?;
-        return Ok(());
-    }
-    match apply_callback(
-        &state.pool,
-        request_id,
-        decision,
-        reviewer_id,
-        state.config.avatar_embeddings_enabled,
-    )
-    .await
-    {
-        Ok(Some(text)) => {
-            bot.answer_callback_query(query.id.clone())
-                .text(text)
-                .await?;
-            if let Some(message) = query.regular_message() {
-                bot.delete_message(message.chat.id, message.id).await?;
-            }
-        }
-        Ok(None) => {
-            bot.answer_callback_query(query.id)
-                .text("Решение уже принято или кнопка устарела.")
-                .await?;
-        }
-        Err(err) => {
-            tracing::error!(%err, request_id, "failed to apply spam review callback");
-            bot.answer_callback_query(query.id)
-                .text("Не удалось сохранить решение.")
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "moderation")]
-async fn handle_risk_captcha_callback(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    query: &CallbackQuery,
-    state: &AppState,
-) -> ResponseResult<()> {
-    let callback_chat_id = query.regular_message().map(|message| message.chat.id.0);
-    let outcome = match features::risk_captcha::handle_callback(
-        bot.inner(),
-        &state.pool,
-        callback_chat_id,
-        query.from.id.0 as i64,
-        query.data.as_deref().unwrap_or_default(),
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                user_id = query.from.id.0,
-                "risk captcha callback failed"
-            );
-            bot.answer_callback_query(query.id.clone()).await?;
-            return Ok(());
-        }
-    };
-
-    let message = query.regular_message();
-    let success_text = outcome.success_message();
-    let answer = bot.answer_callback_query(query.id.clone());
-    if let Some(success_text) = success_text
-        && message.is_some_and(|message| message.ephemeral_message_id.is_none())
-    {
-        // Legacy public captcha cards are removed after deploy; show their
-        // success result only to the participant who pressed the button.
-        answer.text(success_text).show_alert(true).await?;
-    } else {
-        answer.await?;
-    }
-
-    if outcome.is_terminal()
-        && let Some(message) = message
-    {
-        features::risk_captcha::finish_captcha_card(
-            bot.inner(),
-            message.chat.id,
-            query.from.id,
-            message.id,
-            message.ephemeral_message_id,
-            success_text,
+fn spawn_new_user_audit_worker(supervisor: &mut WorkerSupervisor, bot: Bot, state: AppState) {
+    supervisor.spawn(WorkerId::NewUserAudit, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::NewUserAudit, EXTERNAL_ANALYSIS_POLL),
+            shutdown,
+            || async {
+                match process_next_new_user_audit_job(&bot, &state.pool, &state.config).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("claim_or_process_failed"),
+                }
+            },
         )
         .await;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "moderation")]
-async fn handle_report_callback(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    query: &CallbackQuery,
-    state: &AppState,
-    report_id: i64,
-    action: reports::ReportAction,
-) -> ResponseResult<()> {
-    let actor_id = query.from.id.0 as i64;
-    if !reports::is_admin_callback_actor(bot.inner(), &state.config, actor_id).await {
-        bot.answer_callback_query(query.id.clone())
-            .text("Недостаточно прав.")
-            .await?;
-        return Ok(());
-    }
-
-    match reports::apply_action(
-        &state.pool,
-        report_id,
-        action,
-        actor_id,
-        state.config.avatar_embeddings_enabled,
-    )
-    .await
-    {
-        Ok(ReportActionResult::Applied(resolution)) => {
-            let text = match resolution {
-                reports::ReportResolution::Accepted => "Репорт принят.",
-                reports::ReportResolution::Rejected => "Репорт отклонён.",
-                reports::ReportResolution::Pending => "Решение сохранено.",
-            };
-            bot.answer_callback_query(query.id.clone())
-                .text(text)
-                .await?;
-            if let Some(message) = query.regular_message() {
-                match reports::load_report(&state.pool, report_id).await {
-                    Ok(card) => {
-                        if let Err(err) = bot
-                            .inner()
-                            .edit_message_rich_text(
-                                message.chat.id,
-                                message.id,
-                                reports::render_report(&card),
-                            )
-                            .await
-                        {
-                            tracing::warn!(%err, report_id, "failed to update report card after decision");
-                        }
-                        if let Err(err) = bot
-                            .inner()
-                            .edit_message_reply_markup(message.chat.id, message.id)
-                            .reply_markup(reports::render_report_keyboard(&card))
-                            .await
-                        {
-                            tracing::warn!(%err, report_id, "failed to update report card buttons after decision");
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(%err, report_id, "failed to reload report card after decision");
-                    }
-                }
-            }
-        }
-        Ok(ReportActionResult::AlreadyResolved) => {
-            bot.answer_callback_query(query.id.clone())
-                .text("Решение уже принято.")
-                .await?;
-        }
-        Ok(ReportActionResult::Missing) => {
-            bot.answer_callback_query(query.id.clone())
-                .text("Репорт не найден.")
-                .await?;
-        }
-        Err(err) => {
-            tracing::error!(%err, report_id, "failed to apply report callback");
-            bot.answer_callback_query(query.id.clone())
-                .text("Не удалось сохранить решение.")
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "moderation")]
-fn spawn_new_user_audit_worker(bot: Bot, state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            match process_next_new_user_audit_job(&bot, &state.pool, &state.config).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
-                    ))
-                    .await
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "unified new user audit worker failed to claim a job");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
-                    ))
-                    .await;
-                }
-            }
-        }
     });
 }
 
 #[cfg(feature = "moderation")]
-fn spawn_risk_captcha_worker(bot: Bot, state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            match features::risk_captcha::process_next_expired(&bot, &state.pool).await {
-                Ok(true) => continue,
-                Err(error) => {
-                    tracing::warn!(%error, "risk captcha expiration worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
-                    ))
-                    .await;
-                    continue;
+fn spawn_risk_captcha_worker(supervisor: &mut WorkerSupervisor, bot: Bot, state: AppState) {
+    supervisor.spawn(WorkerId::RiskCaptchaLifecycle, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::RiskCaptchaLifecycle, EXTERNAL_ANALYSIS_POLL),
+            shutdown,
+            || async {
+                match features::risk_captcha::process_next_expired(&bot, &state.pool).await {
+                    Ok(true) => return PollOutcome::Processed,
+                    Err(_) => return PollOutcome::Failed("expiration_operation_failed"),
+                    Ok(false) => {}
                 }
-                Ok(false) => {}
-            }
-            match features::risk_captcha::process_next_setup(
-                &bot,
-                &state.pool,
-                state.config.community.moderation.captcha_ttl_sec,
-            )
-            .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
-                    ))
-                    .await
+                match features::risk_captcha::process_next_setup(
+                    &bot,
+                    &state.pool,
+                    state.config.community.moderation.captcha_ttl_sec,
+                )
+                .await
+                {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("setup_operation_failed"),
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "risk captcha setup worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
-                    ))
-                    .await;
-                }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
 #[cfg(feature = "moderation")]
-fn spawn_spam_review_delivery_worker(bot: Bot, state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            match process_next_review_delivery(&bot, &state.pool, &state.config).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
-                    ))
-                    .await
+fn spawn_spam_review_delivery_worker(supervisor: &mut WorkerSupervisor, bot: Bot, state: AppState) {
+    supervisor.spawn(WorkerId::SpamReviewDelivery, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::SpamReviewDelivery, EXTERNAL_ANALYSIS_POLL),
+            shutdown,
+            || async {
+                match process_next_review_delivery(&bot, &state.pool, &state.config).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("delivery_operation_failed"),
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "spam review delivery worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
-                    ))
-                    .await;
-                }
-            }
-        }
+            },
+        )
+        .await;
     });
 }
 
 #[cfg(feature = "moderation")]
-fn spawn_report_delivery_worker(bot: Bot, state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            match reports::process_next_delivery(&bot, &state.pool).await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.idle_seconds(),
-                    ))
-                    .await
+fn spawn_report_delivery_worker(supervisor: &mut WorkerSupervisor, bot: Bot, state: AppState) {
+    supervisor.spawn(WorkerId::ReportDelivery, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::ReportDelivery, EXTERNAL_ANALYSIS_POLL),
+            shutdown,
+            || async {
+                match reports::process_next_delivery(&bot, &state.pool).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("delivery_operation_failed"),
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "report delivery worker failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        EXTERNAL_ANALYSIS_POLL.error_seconds(),
-                    ))
-                    .await
-                }
-            }
-        }
+            },
+        )
+        .await;
     });
-}
-
-async fn handle_message_reaction(
-    reaction: MessageReactionUpdated,
-    state: AppState,
-) -> ResponseResult<()> {
-    if !managed_chat_allows(&state.config, reaction.chat.id.0, |chat| chat.ingest) {
-        return Ok(());
-    }
-    if let Err(err) = save_message_reaction(&state.pool, &reaction).await {
-        tracing::error!(%err, "failed to save message reaction");
-    }
-
-    Ok(())
-}
-
-async fn handle_message_reaction_count(
-    reaction_count: MessageReactionCountUpdated,
-    state: AppState,
-) -> ResponseResult<()> {
-    if !managed_chat_allows(&state.config, reaction_count.chat.id.0, |chat| chat.ingest) {
-        return Ok(());
-    }
-    if let Err(err) = save_message_reaction_count(&state.pool, &reaction_count).await {
-        tracing::error!(%err, "failed to save message reaction count");
-    }
-
-    Ok(())
 }
 
 async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<()> {
@@ -936,7 +687,7 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
         return Ok(());
     }
     match save_edited_telegram_message(&state.pool, &msg, &state.config).await {
-        Ok(()) => {
+        Ok(_) => {
             #[cfg(feature = "moderation")]
             if state
                 .config
@@ -959,26 +710,6 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
             }
         }
         Err(err) => tracing::error!(%err, "failed to save edited message"),
-    }
-
-    Ok(())
-}
-
-async fn handle_chat_member(
-    bot: teloxide::adaptors::DefaultParseMode<Bot>,
-    member: ChatMemberUpdated,
-    state: AppState,
-) -> ResponseResult<()> {
-    if !is_managed_chat(&state.config, member.chat.id.0) {
-        return Ok(());
-    }
-    if managed_chat_allows(&state.config, member.chat.id.0, |chat| chat.ingest)
-        && let Err(err) = save_chat_member_event(&state.pool, &member).await
-    {
-        tracing::error!(%err, "failed to save chat member event");
-    }
-    if let Err(err) = handle_chat_member_update(&bot, &member, &state.config).await {
-        tracing::warn!(%err, chat_id = member.chat.id.0, "failed to send configured welcome or farewell message");
     }
 
     Ok(())
@@ -1193,6 +924,83 @@ async fn preflight_risk_captcha_permissions(
 #[cfg(test)]
 mod tests {
     use super::privacy_mode_blocks_group_messages;
+    use teloxide::types::{Update, UpdateKind};
+
+    #[test]
+    fn synthetic_update_shapes_cover_hidden_links_edits_bots_and_anonymous_senders() {
+        let hidden_link: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1002,
+            "message": {
+                "message_id": 1002,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {"id": 900000002, "is_bot": false, "first_name": "Synthetic user"},
+                "text": "read this",
+                "entities": [{"type": "text_link", "offset": 0, "length": 4, "url": "https://example.org/landing"}]
+            }
+        }))
+        .unwrap();
+        let anonymous: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1003,
+            "message": {
+                "message_id": 1003,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "sender_chat": {"id": -1001000000002_i64, "type": "channel", "title": "Synthetic sender"},
+                "text": "anonymous synthetic post"
+            }
+        }))
+        .unwrap();
+        let bot_sender: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1004,
+            "message": {
+                "message_id": 1004,
+                "date": 1700000000,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {"id": 900000003, "is_bot": true, "first_name": "Synthetic helper"},
+                "text": "synthetic bot message"
+            }
+        }))
+        .unwrap();
+        let edited: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 1005,
+            "edited_message": {
+                "message_id": 1005,
+                "date": 1700000000,
+                "edit_date": 1700000001,
+                "chat": {"id": -1001000000001_i64, "type": "supergroup"},
+                "from": {"id": 900000002, "is_bot": false, "first_name": "Synthetic user"},
+                "text": "edited synthetic message"
+            }
+        }))
+        .unwrap();
+
+        let UpdateKind::Message(message) = hidden_link.kind else {
+            panic!("hidden-link fixture must use the message update variant");
+        };
+        let entities = message
+            .entities()
+            .expect("text link fixture must retain text entities");
+        assert_eq!(entities.len(), 1);
+        assert!(matches!(
+            &entities[0].kind,
+            teloxide::types::MessageEntityKind::TextLink { url }
+                if url.as_str() == "https://example.org/landing"
+        ));
+
+        let UpdateKind::Message(message) = anonymous.kind else {
+            panic!("anonymous fixture must use the message update variant");
+        };
+        assert!(message.from.is_none());
+        assert!(message.sender_chat.is_some());
+
+        let UpdateKind::Message(message) = bot_sender.kind else {
+            panic!("bot fixture must use the message update variant");
+        };
+        assert!(message.from.is_some_and(|sender| sender.is_bot));
+
+        assert!(matches!(edited.kind, UpdateKind::EditedMessage(_)));
+    }
 
     #[test]
     fn privacy_mode_only_blocks_group_ingress_when_bot_is_not_admin() {

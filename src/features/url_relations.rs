@@ -15,8 +15,8 @@ use teloxide::{
 use teloxide_url::{
     Found, Kind, Source, TelegramLink, TelegramPeer, find_urls, parse_telegram_link,
 };
-use tokio::time::MissedTickBehavior;
 
+use crate::features::jobs::worker::{WorkerId, WorkerSupervisor, run_interval_worker};
 use crate::features::url_feeds::FeedSnapshot;
 use crate::{
     config::Config,
@@ -101,17 +101,27 @@ pub async fn refresh_configured_linked_chats(
     Ok(())
 }
 
-pub fn spawn_linked_chat_refresh_worker(bot: Bot, pool: PgPool, config: Config) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(LINKED_CHAT_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(error) = refresh_configured_linked_chats(&bot, &pool, &config).await {
-                tracing::warn!(%error, "Telegram linked-chat refresh pass failed");
-            }
-        }
+pub fn spawn_linked_chat_refresh_worker(
+    supervisor: &mut WorkerSupervisor,
+    bot: Bot,
+    pool: PgPool,
+    config: Config,
+) {
+    supervisor.spawn(WorkerId::LinkedChatRefresh, move |shutdown| async move {
+        run_interval_worker(
+            WorkerId::LinkedChatRefresh,
+            shutdown,
+            LINKED_CHAT_REFRESH_INTERVAL,
+            true,
+            true,
+            || async {
+                refresh_configured_linked_chats(&bot, &pool, &config)
+                    .await
+                    .err()
+                    .map(|_| "linked_chat_refresh_failed")
+            },
+        )
+        .await;
     });
 }
 
@@ -490,23 +500,7 @@ pub fn classify_qr_url(
     chat_id: i64,
     affiliated_channels: &HashSet<i64>,
 ) -> QrUrlRelation {
-    match parse_telegram_link(target) {
-        Some(TelegramLink::Message {
-            peer: TelegramPeer::ChatId(id),
-            ..
-        }) if id == chat_id || affiliated_channels.contains(&id) => QrUrlRelation::Affiliated,
-        Some(TelegramLink::Message {
-            peer: TelegramPeer::ChatId(_),
-            ..
-        }) => QrUrlRelation::External,
-        Some(_) => QrUrlRelation::Unresolved,
-        None if teloxide_url::parse_url(target)
-            .is_some_and(|url| matches!(url.scheme(), "http" | "https")) =>
-        {
-            QrUrlRelation::External
-        }
-        None => QrUrlRelation::Unresolved,
-    }
+    domain::classify_qr_url(target, chat_id, affiliated_channels)
 }
 
 fn unix_now() -> u64 {
@@ -516,35 +510,7 @@ fn unix_now() -> u64 {
 }
 
 pub fn relation(link: &TelegramLink, context: &RelationContext<'_>) -> LinkRelation {
-    match link {
-        TelegramLink::UserId(id) => {
-            let Some((known_id, membership)) = context.user_membership else {
-                return LinkRelation::Unresolved;
-            };
-            if *id != known_id {
-                return LinkRelation::Unresolved;
-            }
-            match membership {
-                MembershipContext::CurrentMember => LinkRelation::CurrentMember,
-                MembershipContext::FormerMember => LinkRelation::FormerMember,
-                MembershipContext::Banned => LinkRelation::BannedMember,
-                MembershipContext::Unknown | MembershipContext::NonMemberHistoryUnknown => {
-                    LinkRelation::Unresolved
-                }
-            }
-        }
-        TelegramLink::Message {
-            peer: TelegramPeer::ChatId(id),
-            ..
-        } => {
-            if *id == context.chat_id || context.affiliated_channels.contains(id) {
-                LinkRelation::AffiliatedChannel
-            } else {
-                LinkRelation::KnownExternal
-            }
-        }
-        _ => LinkRelation::Unresolved,
-    }
+    domain::relation(link, context)
 }
 
 #[cfg(test)]
@@ -687,3 +653,5 @@ mod tests {
         );
     }
 }
+
+mod domain;

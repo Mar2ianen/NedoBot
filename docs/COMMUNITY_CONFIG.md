@@ -116,6 +116,21 @@ cargo check --no-default-features --features "moderation,spam-sync" --all-target
 If a config enables a module that is absent from the binary, startup fails
 instead of silently ignoring that setting.
 
+Treat feature activation as three separate gates:
+
+1. **Compile-time:** the Cargo feature must be present in the binary (for
+   example, `ask`, `moderation`, `voice`, or `auto-comment`).
+2. **Instance/runtime:** the community-level feature and required settings
+   must be enabled and valid.
+3. **Chat scope:** the specific managed chat must enable the feature where the
+   feature is chat-scoped (`ask`, `voice`, `stats`, moderation, reports, and
+   similar gates).
+
+All three gates must allow an action. Missing or malformed explicit environment
+values, unavailable referenced secrets, and configs requesting an uncompiled
+feature fail startup validation. Defaults apply only when an optional value is
+absent; they do not hide an explicitly invalid value.
+
 ## MCP для отдельного community instance
 
 Read-model scope берётся из authoritative community profile (`[instance].id`,

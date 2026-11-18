@@ -57,6 +57,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Test no-default feature set
+        run: cargo test --no-default-features --workspace --all-targets --locked
+
+      - name: Check no-default feature set
+        run: cargo check --no-default-features --workspace --all-targets --locked
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -64,6 +70,7 @@ jobs:
         env:
           DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
           TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           cargo run --bin migrate
           DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --bin migrate
@@ -94,7 +101,10 @@ jobs:
       - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --test postgres_migrations -- --ignored
+          RUST_MIN_STACK: 8388608
+        run: |
+          cargo test --test postgres_migrations -- --ignored
+          cargo test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
 
       - name: Run RMCP PostgreSQL integration test
         env:

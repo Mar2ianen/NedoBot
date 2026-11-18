@@ -2,6 +2,96 @@ use super::rich_content::{project, rich_message};
 use std::borrow::Cow;
 use teloxide::types::{Message, MessageEntityKind, MessageId, MessageOrigin};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelegramMessageRef {
+    pub chat_id: i64,
+    pub message_id: i32,
+}
+
+impl TelegramMessageRef {
+    pub fn from_message(message: &Message) -> Self {
+        Self {
+            chat_id: message.chat.id.0,
+            message_id: message.id.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRevision {
+    Original,
+    Edited { edit_date_unix: Option<i64> },
+}
+
+impl MessageRevision {
+    pub fn from_message(message: &Message) -> Self {
+        match message.edit_date() {
+            Some(edit_date) => Self::Edited {
+                edit_date_unix: Some(edit_date.timestamp()),
+            },
+            None => Self::Original,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TelegramMessageProjection {
+    pub message: TelegramMessageRef,
+    pub source_channel_id: Option<i64>,
+    pub source_message_id: Option<i32>,
+    pub user_id: Option<i64>,
+    pub reply_to_message_id: Option<i32>,
+    pub reply_to_user_id: Option<i64>,
+    pub sender_chat_id: Option<i64>,
+    pub via_bot_id: Option<i64>,
+    pub text: Option<String>,
+    pub raw_json: serde_json::Value,
+    pub has_photo: bool,
+    pub has_video: bool,
+    pub has_document: bool,
+    pub has_audio: bool,
+    pub has_voice: bool,
+    pub has_sticker: bool,
+    pub has_animation: bool,
+    pub has_links: bool,
+    pub is_forwarded: bool,
+    pub is_automatic_forward: bool,
+}
+
+impl TelegramMessageProjection {
+    pub fn from_message(message: &Message) -> serde_json::Result<Self> {
+        let (source_channel_id, source_message_id) = forwarded_channel_post(message)
+            .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
+            .unwrap_or((None, None));
+        let reply = message.reply_to_message();
+
+        Ok(Self {
+            message: TelegramMessageRef::from_message(message),
+            source_channel_id,
+            source_message_id,
+            user_id: message.from.as_ref().map(|user| user.id.0 as i64),
+            reply_to_message_id: reply.map(|reply| reply.id.0),
+            reply_to_user_id: reply
+                .and_then(|reply| reply.from.as_ref())
+                .map(|user| user.id.0 as i64),
+            sender_chat_id: message.sender_chat.as_ref().map(|chat| chat.id.0),
+            via_bot_id: message.via_bot.as_ref().map(|bot| bot.id.0 as i64),
+            text: message_text(message).map(Cow::into_owned),
+            raw_json: serde_json::to_value(message)?,
+            has_photo: message.photo().is_some(),
+            has_video: message.video().is_some(),
+            has_document: message.document().is_some(),
+            has_audio: message.audio().is_some(),
+            has_voice: message.voice().is_some(),
+            has_sticker: message.sticker().is_some(),
+            has_animation: message.animation().is_some(),
+            has_links: message_has_links(message),
+            is_forwarded: message.forward_origin().is_some(),
+            is_automatic_forward: message.is_automatic_forward(),
+        })
+    }
+}
+
 pub fn forwarded_channel_post(msg: &Message) -> Option<(i64, MessageId)> {
     match msg.forward_origin()? {
         MessageOrigin::Channel {
@@ -60,10 +150,7 @@ pub fn message_has_links(msg: &Message) -> bool {
 
 /// Извлекает типизированные цели URL. Упоминания и хештеги не считаются URL.
 pub fn message_url_targets(msg: &Message) -> Vec<teloxide_url::Found> {
-    teloxide_url::adapter::extract_from_message(msg)
-        .into_iter()
-        .filter(|target| matches!(target.kind, teloxide_url::Kind::Url))
-        .collect()
+    super::url_targets::extract_message_targets(msg)
 }
 
 /// Диапазон Telegram entity: offsets/length заданы в UTF-16, не UTF-8 байтах.
@@ -92,7 +179,9 @@ pub(crate) fn utf16_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{message_has_links, message_url_targets};
+    use super::{
+        MessageRevision, TelegramMessageProjection, message_has_links, message_url_targets,
+    };
     use teloxide::types::Message;
 
     #[test]
@@ -115,6 +204,37 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].value, "https://example.org/hidden");
         assert_eq!(targets[0].label.as_deref(), Some("открыть"));
+
+        let projection = TelegramMessageProjection::from_message(&message).unwrap();
+        assert_eq!(projection.message.chat_id, 42);
+        assert_eq!(projection.message.message_id, 7);
+        assert_eq!(projection.user_id, Some(13));
+        assert_eq!(projection.text.as_deref(), Some("открыть"));
+        assert!(projection.has_links);
+        assert!(!projection.is_forwarded);
+        assert_eq!(
+            MessageRevision::from_message(&message),
+            MessageRevision::Original
+        );
+    }
+
+    #[test]
+    fn anonymous_message_projection_keeps_sender_chat_without_fabricating_user_id() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 9,
+            "date": 1_700_000_000,
+            "chat": {"id": -10042, "type": "supergroup"},
+            "sender_chat": {"id": -10043, "type": "channel", "title": "Synthetic sender"},
+            "text": "synthetic anonymous post"
+        }))
+        .unwrap();
+
+        let projection = TelegramMessageProjection::from_message(&message).unwrap();
+        assert_eq!(projection.message.chat_id, -10042);
+        assert_eq!(projection.message.message_id, 9);
+        assert_eq!(projection.user_id, None);
+        assert_eq!(projection.sender_chat_id, Some(-10043));
+        assert!(!projection.is_forwarded);
     }
 
     #[test]

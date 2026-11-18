@@ -1,5 +1,7 @@
 # Completed refactor state
 
+> Historical implementation notes, not the current architecture inventory. The active T00–T21 status and latest source links are tracked in [`REFACTOR_EXECUTION.md`](REFACTOR_EXECUTION.md); see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the extension walkthrough. Do not use this file's old provider names or deployment details as a present-day configuration guide.
+
 Архив того, что уже закрыто большим проходом рефактора. Активный следующий план лежит в [`REFACTOR_NEXT.md`](REFACTOR_NEXT.md).
 
 ## Drafter и explicit time rendering

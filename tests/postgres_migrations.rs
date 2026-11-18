@@ -1,14 +1,22 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpListener,
-    sync::{Arc, mpsc::sync_channel},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::sync_channel,
+    },
 };
 
 use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
-use teloxide::Bot;
 use teloxide::utils::time::TimeContext;
+use teloxide::{
+    Bot,
+    prelude::{ChatId, Message},
+    types::{InputRichMessage, MessageId},
+};
 use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
 use uuid::Uuid;
@@ -55,12 +63,12 @@ use tg_ai_bot_teloxide::{
             finalize_history_failed, finalize_history_retry, load_relevant_memory_notes,
         },
         new_user_audit::repo::{
-            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, has_materialized_audit_for_first_message,
-            latest_audit_trigger_fingerprint, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_new_user_audit_job,
-            reopen_obsolete_materialization_in_transaction,
+            NewUserAuditJobParams, NewUserAuditStatus, claim_next_new_user_audit_job,
+            enqueue_new_user_audit_job, finalize_new_user_audit_job,
+            has_materialized_audit_for_first_message, latest_audit_trigger_fingerprint,
+            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
+            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
+            materialize_new_user_audit_job, reopen_obsolete_materialization_in_transaction,
             supersede_unneeded_new_user_audit_jobs_in_transaction,
             sync_spam_review_from_audit_in_transaction,
         },
@@ -77,14 +85,15 @@ use tg_ai_bot_teloxide::{
         },
         voice::{
             repo::{
-                VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
-                mark_voice_job_delivery_unknown, mark_voice_job_phase,
+                VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
+                enqueue_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_phase,
                 mark_voice_job_retry_or_failed, recover_expired_voice_deliveries,
                 save_progress_message,
             },
             types::{VoiceMedia, VoiceMediaKind},
         },
     },
+    telegram::delivery::{DeliveryEffect, TelegramSendPort},
 };
 
 #[path = "support/local_cascade.rs"]
@@ -98,7 +107,65 @@ mod membership_history;
 #[path = "support/decision_shadow.rs"]
 mod decision_shadow;
 
+#[path = "support/ingress_persistence.rs"]
+mod ingress_persistence;
+
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
+
+struct AcknowledgingSendPort {
+    calls: AtomicUsize,
+    message: Message,
+}
+
+impl AcknowledgingSendPort {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            message: serde_json::from_value(serde_json::json!({
+                "message_id": 9_400_201,
+                "date": 1_700_000_000,
+                "chat": {"id": -1001932061163_i64, "type": "supergroup", "title": "Test"},
+                "text": "acknowledged test comment"
+            }))
+            .expect("test Telegram response must deserialize"),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn acknowledged(&self) -> DeliveryEffect<Message> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        DeliveryEffect::Confirmed(self.message.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl TelegramSendPort for AcknowledgingSendPort {
+    async fn send_html_reply(&self, _: ChatId, _: MessageId, _: String) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+
+    async fn send_rich_message_reply(
+        &self,
+        _: ChatId,
+        _: MessageId,
+        _: InputRichMessage,
+    ) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+
+    async fn send_document_reply(
+        &self,
+        _: ChatId,
+        _: MessageId,
+        _: String,
+        _: String,
+    ) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+}
 
 #[path = "support/risk_captcha_cleanup.rs"]
 mod risk_captcha_cleanup;
@@ -134,6 +201,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
+    assert_comment_job_lifecycle(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_mcp_instance_scope_isolation(&pool).await;
     assert_chat_search_quality_path(&pool).await;
@@ -170,7 +238,6 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
-    assert_comment_job_lifecycle(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
     assert_system_spam_label_transition(&pool).await;
     assert_spammer_avatar_embedding_label_gate(&pool).await;
@@ -180,6 +247,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+    ingress_persistence::assert_message_persistence_effects(&pool).await;
 }
 
 async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {
@@ -437,6 +505,7 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     const MESSAGE_ID: i32 = 9_300_003;
     const HIGH_RISK_USER_ID: i64 = 9_000_101;
     const LOW_RISK_USER_ID: i64 = 9_000_102;
+    const EXPIRED_REVIEW_USER_ID: i64 = 9_000_103;
     query(
         "update telegram_message_embeddings_gemma2 set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
     )
@@ -448,15 +517,18 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     query(
         r#"
         insert into spam_review_requests
-            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at)
+            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at,
+             notification_processing_started_at, notification_lease_expires_at)
         values
-            ($1, $2, 80, 'pending', now() - interval '1 minute'),
-            ($1, $3, 65, 'pending', now() - interval '1 day')
+            ($1, $2, 80, 'pending', now() - interval '1 minute', null, null),
+            ($1, $3, 65, 'pending', now() - interval '1 day', null, null),
+            ($1, $4, 85, 'processing', now(), now() - interval '3 minutes', now() - interval '1 second')
         "#,
     )
     .bind(CHAT_ID)
     .bind(HIGH_RISK_USER_ID)
     .bind(LOW_RISK_USER_ID)
+    .bind(EXPIRED_REVIEW_USER_ID)
     .execute(pool)
     .await
     .expect("high- and low-risk ready review fixtures must be inserted");
@@ -500,6 +572,12 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         .find(|queue| queue.queue == "reviews")
         .expect("reviews queue must be reported");
     assert!(reviews.lease_reclaim_count >= 1);
+    assert!(reviews.expired_lease_count >= 1);
+    assert!(
+        reviews
+            .oldest_processing_age_seconds
+            .is_some_and(|age| age >= 120.0)
+    );
     let oldest_ready_age = reviews
         .oldest_ready_age_seconds
         .expect("due high-risk review must contribute to oldest_ready_age");
@@ -528,10 +606,34 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_size: Some(1_024),
         mime_type: Some("audio/ogg".to_owned()),
     };
-    let job_id = create_voice_job(pool, &media)
+    let job_id = enqueue_voice_job(pool, &media)
         .await
         .expect("voice job must be created")
         .expect("new voice job must return its id");
+    assert_eq!(
+        enqueue_voice_job(pool, &media)
+            .await
+            .expect("duplicate voice enqueue must succeed"),
+        None,
+        "duplicate update must leave the existing job to the worker"
+    );
+    let duplicate_count: i64 = query_scalar(
+        "select count(*) from voice_transcription_jobs where chat_id = $1 and message_id = $2",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .expect("voice duplicate count must be readable");
+    assert_eq!(duplicate_count, 1);
+    let queued_state: (String, i32, Option<i32>, bool) = query_as(
+        "select status, attempts, progress_message_id, lease_expires_at is null from voice_transcription_jobs where id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("new voice job must remain unclaimed until the worker runs");
+    assert_eq!(queued_state, ("pending".to_owned(), 0, None, true));
 
     let (first_result, second_result) =
         tokio::join!(claim_voice_job(pool, job_id), claim_voice_job(pool, job_id));
@@ -551,12 +653,12 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .expect("progress message must be persisted")
     );
     assert!(
-        mark_voice_job_phase(pool, &job, "downloading")
+        mark_voice_job_phase(pool, &job, VoiceJobPhase::Downloading)
             .await
             .expect("voice phase transition must succeed")
     );
     assert!(
-        mark_voice_job_phase(pool, &job, "transcribing")
+        mark_voice_job_phase(pool, &job, VoiceJobPhase::Transcribing)
             .await
             .expect("voice phase transition must refresh the lease")
     );
@@ -622,7 +724,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("unknown-unique-{suffix}")),
         ..media.clone()
     };
-    let unknown_id = create_voice_job(pool, &unknown_media)
+    let unknown_id = enqueue_voice_job(pool, &unknown_media)
         .await
         .expect("delivery-unknown voice job must be created")
         .expect("delivery-unknown voice job id must be returned");
@@ -631,7 +733,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("delivery-unknown voice job must be claimable")
         .expect("delivery-unknown voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &unknown_job, "delivering")
+        mark_voice_job_phase(pool, &unknown_job, VoiceJobPhase::Delivering)
             .await
             .expect("voice delivering phase must be persisted")
     );
@@ -653,7 +755,14 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .await
             .expect("delivery-unknown job must be queryable")
             .is_none(),
-        "an unknown Telegram outcome must never be retried automatically"
+        "a fresh worker after restart must not replay an unknown Telegram outcome"
+    );
+    assert_eq!(
+        enqueue_voice_job(pool, &unknown_media)
+            .await
+            .expect("terminal duplicate voice enqueue must succeed"),
+        None,
+        "delivery_unknown is terminal and cannot silently create another job"
     );
 
     let active_delivery_media = VoiceMedia {
@@ -662,7 +771,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("active-delivery-unique-{suffix}")),
         ..media.clone()
     };
-    let active_delivery_id = create_voice_job(pool, &active_delivery_media)
+    let active_delivery_id = enqueue_voice_job(pool, &active_delivery_media)
         .await
         .expect("active-delivery voice job must be created")
         .expect("active-delivery voice job id must be returned");
@@ -671,7 +780,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("active-delivery voice job must be claimable")
         .expect("active-delivery voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &active_delivery_job, "delivering")
+        mark_voice_job_phase(pool, &active_delivery_job, VoiceJobPhase::Delivering)
             .await
             .expect("active delivering phase must be persisted")
     );
@@ -696,7 +805,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("expired-delivery-unique-{suffix}")),
         ..media.clone()
     };
-    let expired_delivery_id = create_voice_job(pool, &expired_delivery_media)
+    let expired_delivery_id = enqueue_voice_job(pool, &expired_delivery_media)
         .await
         .expect("expired-delivery voice job must be created")
         .expect("expired-delivery voice job id must be returned");
@@ -705,7 +814,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("expired-delivery voice job must be claimable")
         .expect("expired-delivery voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &expired_delivery_job, "delivering")
+        mark_voice_job_phase(pool, &expired_delivery_job, VoiceJobPhase::Delivering)
             .await
             .expect("expired delivering phase must be persisted")
     );
@@ -743,7 +852,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("terminal-unique-{suffix}")),
         ..media.clone()
     };
-    let terminal_id = create_voice_job(pool, &terminal_media)
+    let terminal_id = enqueue_voice_job(pool, &terminal_media)
         .await
         .expect("terminal voice job must be created")
         .expect("terminal voice job id must be returned");
@@ -774,7 +883,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("sent-unique-{suffix}")),
         ..media
     };
-    let sent_id = create_voice_job(pool, &sent_media)
+    let sent_id = enqueue_voice_job(pool, &sent_media)
         .await
         .expect("sent voice job must be created")
         .expect("sent voice job id must be returned");
@@ -2097,7 +2206,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("pending trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-21".to_string(),
-            "pending".to_string(),
+            NewUserAuditStatus::Pending,
             false
         ))
     );
@@ -2113,7 +2222,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("in-flight trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-21".to_string(),
-            "processing".to_string(),
+            NewUserAuditStatus::Processing,
             false
         ))
     );
@@ -2143,7 +2252,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("latest changed trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-22".to_string(),
-            "pending".to_string(),
+            NewUserAuditStatus::Pending,
             false
         ))
     );
@@ -3750,8 +3859,16 @@ async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
             .expect("local transient failure listener must accept the request");
         let mut request = [0; 1_024];
         let _ = stream.read(&mut request);
+        let body = br#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#;
         stream
-            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .and_then(|()| stream.write_all(body))
             .expect("local transient failure response must be written");
     });
     let bot = Bot::new("test-token").set_api_url(
@@ -7761,6 +7878,21 @@ async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool)
         CasResult::Applied
     );
 
+    let send_port = AcknowledgingSendPort::new();
+    let send_result = send_port
+        .send_html_reply(
+            ChatId(job.discussion_chat_id),
+            MessageId(job.discussion_message_id),
+            "test comment".to_owned(),
+        )
+        .await;
+    assert!(matches!(send_result, DeliveryEffect::Confirmed(_)));
+    assert_eq!(
+        send_port.calls(),
+        1,
+        "fake Telegram accepted exactly one send"
+    );
+
     query("drop trigger if exists post_comment_history_failure_trigger on post_history_entries")
         .execute(pool)
         .await
@@ -7841,6 +7973,33 @@ async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool)
         .await
         .expect("sending job must remain queryable after rollback");
     assert_eq!(status, "sending");
+
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .expect("delivery lease can be expired after the simulated acknowledgement");
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("expired sending recovery must execute")
+            .is_none(),
+        "an acknowledged send whose finalization rolled back must not be reclaimed for sending"
+    );
+    assert_eq!(
+        send_port.calls(),
+        1,
+        "the failed DB finalization must not resend"
+    );
+    let recovered_status: String =
+        query_scalar("select status from post_comment_jobs where id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .expect("expired acknowledged job must remain queryable");
+    assert_eq!(recovered_status, "delivery_unknown");
 }
 
 async fn assert_comment_finalization_is_idempotent_when_audit_rows_exist(pool: &PgPool) {

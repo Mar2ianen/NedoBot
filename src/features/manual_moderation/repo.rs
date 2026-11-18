@@ -1066,6 +1066,30 @@ pub async fn active_restriction_action(
     .map_err(Into::into)
 }
 
+/// Serializes a captcha permission restore against a manual restriction or undo.
+/// Callers keep this transaction open across the Telegram effect and final state write.
+pub async fn lock_automatic_restriction_restore(
+    tx: &mut Transaction<'_, Postgres>,
+    chat_id: i64,
+    target_user_id: i64,
+) -> anyhow::Result<bool> {
+    lock_target(tx, chat_id, target_user_id).await?;
+    sqlx::query_scalar(
+        r#"select exists (
+             select 1 from manual_moderation_actions
+             where chat_id = $1 and target_user_id = $2
+               and action in ('mute', 'ban', 'auto_mute')
+               and status in ('pending', 'processing', 'applied', 'unknown')
+               and (expires_at is null or expires_at > now())
+           )"#,
+    )
+    .bind(chat_id)
+    .bind(target_user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
 pub async fn latest_batch(
     pool: &PgPool,
     chat_id: i64,

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +62,17 @@ enum HistoryRetryAction {
     Retry { delay_seconds: i64 },
     Fail,
 }
+
+#[derive(Debug)]
+struct MemorySummaryValidationError(&'static str);
+
+impl fmt::Display for MemorySummaryValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MemorySummaryValidationError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -244,10 +255,10 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
             let error_kind = classify_error(&err);
             let updated = match history_retry_action(entry.attempts) {
                 HistoryRetryAction::Retry { .. } => {
-                    finalize_history_retry(pool, &entry, error_kind).await?
+                    finalize_history_retry(pool, &entry, &error_kind).await?
                 }
                 HistoryRetryAction::Fail => {
-                    finalize_history_failed(pool, &entry, error_kind).await?
+                    finalize_history_failed(pool, &entry, &error_kind).await?
                 }
             };
             if updated == CasResult::Applied {
@@ -359,7 +370,9 @@ async fn build_history_entry(
     .await?;
     let summary = parse_memory_summary(&generation.content)?;
     if entry.used_search_result.is_none() && summary.external_fact.is_some() {
-        anyhow::bail!("external_fact requires used_search_result");
+        return Err(anyhow::Error::new(MemorySummaryValidationError(
+            "external_fact requires used_search_result",
+        )));
     }
     let embedding = match summary.summary.as_deref() {
         Some(_) => Some(embed_rag_document(config, &embedding_text(&summary)).await?),
@@ -512,7 +525,9 @@ fn parse_memory_summary(value: &str) -> anyhow::Result<MemorySummaryOutput> {
 
     if parsed.summary.is_none() {
         if parsed.skip_reason.is_none() {
-            anyhow::bail!("summary=null requires skip_reason");
+            return Err(anyhow::Error::new(MemorySummaryValidationError(
+                "summary=null requires skip_reason",
+            )));
         }
         parsed.entities.clear();
         parsed.used_angle = None;
@@ -523,7 +538,9 @@ fn parse_memory_summary(value: &str) -> anyhow::Result<MemorySummaryOutput> {
             .as_ref()
             .is_some_and(|summary| summary.chars().count() < 20)
         {
-            anyhow::bail!("summary is too short for a reusable fact card");
+            return Err(anyhow::Error::new(MemorySummaryValidationError(
+                "summary is too short for a reusable fact card",
+            )));
         }
         parsed.skip_reason = None;
     }
@@ -578,17 +595,31 @@ fn embedding_text(summary: &MemorySummaryOutput) -> String {
     .join("\n")
 }
 
-fn classify_error(error: &anyhow::Error) -> &'static str {
-    let value = error.to_string().to_lowercase();
-    if value.contains("429") {
-        "http_429"
-    } else if value.contains("timeout") || value.contains("timed out") {
-        "timeout"
-    } else if value.contains("json") || value.contains("summary=null") {
-        "validation_failed"
-    } else {
-        "error"
+fn classify_error(error: &anyhow::Error) -> String {
+    use crate::llm::types::LlmTransportError;
+
+    if let Some(LlmTransportError::HttpStatus(status)) = error.downcast_ref::<LlmTransportError>() {
+        return format!("http_{status}");
     }
+    if error.downcast_ref::<LlmTransportError>() == Some(&LlmTransportError::Timeout)
+        || crate::http::is_timeout(error)
+    {
+        return "timeout".to_owned();
+    }
+    if let Some(status) = crate::http::status_code(error) {
+        return format!("http_{status}");
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<serde_json::Error>() || cause.is::<MemorySummaryValidationError>())
+        || matches!(
+            error.downcast_ref::<LlmTransportError>(),
+            Some(LlmTransportError::InvalidResponse | LlmTransportError::StructuredOutputRejected)
+        )
+    {
+        return "validation_failed".to_owned();
+    }
+    "error".to_owned()
 }
 
 pub fn memory_summary_schema() -> Value {
@@ -622,6 +653,29 @@ const MEMORY_SYSTEM_PROMPT: &str = r#"Ты ведёшь атомарную RAG-�
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_error_classification_uses_typed_sources() {
+        assert_eq!(
+            classify_error(&anyhow::Error::new(
+                crate::llm::types::LlmTransportError::http_status(429)
+            )),
+            "http_429"
+        );
+        assert_eq!(
+            classify_error(&anyhow::Error::new(
+                crate::llm::types::LlmTransportError::timeout()
+            )),
+            "timeout"
+        );
+        assert_eq!(
+            classify_error(&anyhow::Error::new(MemorySummaryValidationError(
+                "summary=null requires skip_reason",
+            ))),
+            "validation_failed"
+        );
+        assert_eq!(classify_error(&anyhow::anyhow!("unclassified")), "error");
+    }
 
     #[test]
     fn summary_schema_is_strict_and_nullable() {

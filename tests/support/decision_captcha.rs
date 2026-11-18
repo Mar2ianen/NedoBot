@@ -9,6 +9,13 @@ use tg_ai_bot_teloxide::{
             service::observe_message,
         },
         labels::record_not_spam,
+        manual_moderation::{
+            ActionPreparation, create_batch, mark_action_failed, prepare_action,
+        },
+        new_user_audit::repo::{
+            MaterializationStatus, NewUserAuditJob, NewUserAuditStatus,
+        },
+        risk_captcha::{CaptchaOutcome, apply_risk_captcha},
     },
 };
 fn config() -> Config {
@@ -186,6 +193,73 @@ pub async fn assert_policy(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
     completed(pool, &c, &a).await;
     assert!(actions::process_next(bot, pool, &c).await.unwrap());
     assert!(stub.calls.lock().unwrap().is_empty());
+    // A manual restriction reserved after the Decision verdict but before
+    // captcha setup must prevent the bot's first automatic mute.
+    reset(pool, stub).await;
+    let actor = USER_ID + 10_000;
+    let batch = create_batch(
+        pool,
+        CHAT_ID,
+        actor,
+        (chrono::Utc::now().timestamp_micros().rem_euclid(1_000_000_000) as i32)
+            .saturating_add(1_000_000_000),
+        "mute",
+    )
+    .await
+    .unwrap();
+    let action_id = prepare_action(
+        pool,
+        ActionPreparation {
+            batch_id: batch.id,
+            chat_id: CHAT_ID,
+            target_user_id: USER_ID,
+            actor_user_id: actor,
+            action: "mute",
+            reason: Some("setup race fixture"),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            automatic: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let audit_job = NewUserAuditJob {
+        id: 1,
+        chat_id: CHAT_ID,
+        telegram_user_id: USER_ID,
+        snapshot_hash: "setup-race-fixture".into(),
+        prompt_version: "fixture".into(),
+        input_json: json!({}),
+        avatar_file_id: None,
+        avatar_file_unique_id: None,
+        assessment_json: None,
+        status: NewUserAuditStatus::Succeeded,
+        materialization_status: MaterializationStatus::Processing,
+        review_threshold: 70,
+        attempts: 1,
+        generation_fence: 1,
+        materialization_attempts: 1,
+        materialization_fence: 1,
+        audit_generation: 0,
+        is_materialization_replay: true,
+    };
+    assert_eq!(
+        apply_risk_captcha(bot, pool, &audit_job, 100, 600)
+            .await
+            .unwrap(),
+        CaptchaOutcome::Overridden
+    );
+    assert_eq!(status(pool).await, "overridden");
+    assert!(!stub.restricted.load(Ordering::SeqCst));
+    assert!(!stub
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, _)| method == "restrictchatmember"));
+    mark_action_failed(pool, action_id, false, "fixture complete")
+        .await
+        .unwrap();
     // Реальный handoff: карточка reply отправляется раньше удаления только отмеченного текста.
     reset(pool, stub).await;
     c.community.moderation.captcha_dry_run = false;

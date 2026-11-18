@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+# The single PostgreSQL lifecycle test retains a large async future on its test
+# thread. 8 MiB passes locally and in CI; 2 MiB overflows, so keep a bounded 4x
+# margin without reserving the old 32 MiB per test thread.
+export RUST_MIN_STACK=${RUST_MIN_STACK:-8388608}
+# Limit simultaneous full-feature binary links on developer workstations.
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
+
 TEST_DATABASE_URL=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_test
 TEST_DATABASE_URL_B=postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5433/tg_ai_bot_test_b
 
@@ -9,6 +16,7 @@ DATABASE_URL="$TEST_DATABASE_URL" cargo run --quiet --bin migrate
 DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --quiet --bin migrate
 cargo test --all-targets
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --test postgres_migrations -- --ignored
+TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state -- --ignored --exact

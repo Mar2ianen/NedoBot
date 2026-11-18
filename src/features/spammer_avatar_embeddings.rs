@@ -40,6 +40,29 @@ struct AvatarEmbeddingJob {
     attempts: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvatarEmbeddingFailureKind {
+    AvatarTooLarge,
+    EmbeddingFailed,
+    AvatarDownloadFailed,
+}
+
+impl AvatarEmbeddingFailureKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AvatarTooLarge => "avatar_too_large",
+            Self::EmbeddingFailed => "embedding_failed",
+            Self::AvatarDownloadFailed => "avatar_download_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvatarDownloadFailure {
+    TooLarge,
+    Failed,
+}
+
 /// Adds the current photo to the positive dataset only after the moderation
 /// transaction has set `is_spammer` to true.
 pub async fn enqueue_confirmed_avatar_in_transaction(
@@ -152,9 +175,16 @@ pub async fn process_next_spammer_avatar_embedding(
     };
 
     let result = tokio::time::timeout(AVATAR_REQUEST_TIMEOUT, async {
-        let image_base64 = download_avatar_base64(bot, &job.avatar_file_id).await?;
-        let embedding = embed_profile_image(config, &image_base64).await?;
-        pgvector_literal(&embedding)
+        let image_base64 = download_avatar_base64(bot, &job.avatar_file_id)
+            .await
+            .map_err(|error| match error {
+                AvatarDownloadFailure::TooLarge => AvatarEmbeddingFailureKind::AvatarTooLarge,
+                AvatarDownloadFailure::Failed => AvatarEmbeddingFailureKind::AvatarDownloadFailed,
+            })?;
+        let embedding = embed_profile_image(config, &image_base64)
+            .await
+            .map_err(|_| AvatarEmbeddingFailureKind::EmbeddingFailed)?;
+        pgvector_literal(&embedding).map_err(|_| AvatarEmbeddingFailureKind::EmbeddingFailed)
     })
     .await;
 
@@ -170,13 +200,7 @@ pub async fn process_next_spammer_avatar_embedding(
             }
         }
         Ok(Err(error)) => {
-            let error_kind = if error.to_string().contains("exceeds configured limit") {
-                "avatar_too_large"
-            } else if error.to_string().contains("embedding") {
-                "embedding_failed"
-            } else {
-                "avatar_download_failed"
-            };
+            let error_kind = error.as_str();
             mark_failed(pool, &job, error_kind).await?;
             tracing::warn!(
                 chat_id = job.chat_id,
@@ -327,16 +351,21 @@ async fn mark_failed(
     CasResult::from_rows_affected(update.rows_affected())
 }
 
-async fn download_avatar_base64(bot: &Bot, file_id: &str) -> anyhow::Result<String> {
-    let file = bot.get_file(FileId(file_id.to_string())).await?;
+async fn download_avatar_base64(bot: &Bot, file_id: &str) -> Result<String, AvatarDownloadFailure> {
+    let file = bot
+        .get_file(FileId(file_id.to_string()))
+        .await
+        .map_err(|_| AvatarDownloadFailure::Failed)?;
     if usize::try_from(file.size).unwrap_or(usize::MAX) > MAX_AVATAR_BYTES {
-        anyhow::bail!("profile avatar exceeds configured limit");
+        return Err(AvatarDownloadFailure::TooLarge);
     }
     let mut writer = BoundedAvatarWriter::default();
-    bot.download_file(&file.path, &mut writer).await?;
+    bot.download_file(&file.path, &mut writer)
+        .await
+        .map_err(|_| AvatarDownloadFailure::Failed)?;
     let bytes = writer.bytes;
     if bytes.is_empty() {
-        anyhow::bail!("profile avatar download was empty");
+        return Err(AvatarDownloadFailure::Failed);
     }
     Ok(BASE64.encode(bytes))
 }

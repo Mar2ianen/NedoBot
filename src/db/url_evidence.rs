@@ -1,12 +1,16 @@
-use sha2::{Digest, Sha256};
+mod identity;
+mod store;
+
+use identity::*;
+pub use identity::{QrUrlEvidence, QrUrlRelation};
+use store::UrlEvidenceStore;
+
 use sqlx::PgPool;
 use teloxide::types::Message;
-use teloxide_url::{
-    Found, Kind, Source, TelegramLink, TelegramPeer, parse_telegram_link, parse_url,
-};
 
 pub const URL_EVIDENCE_PARSER_VERSION: i16 = 2;
 pub const MAX_QR_URLS_PER_MESSAGE: usize = 64;
+pub const MAX_URL_SHADOW_REFRESH_ATTEMPTS: i32 = 10;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BackfillSummary {
@@ -30,6 +34,17 @@ pub struct QrScanJob {
     pub message_id: i32,
     pub file_id: String,
     pub file_unique_id: String,
+    pub attempts: i32,
+    pub lease_generation: i32,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UrlShadowRefreshJob {
+    pub id: i64,
+    pub instance_id: String,
+    pub chat_id: i64,
+    pub telegram_user_id: i64,
+    pub evidence_revision: String,
     pub attempts: i32,
     pub lease_generation: i32,
 }
@@ -178,163 +193,75 @@ pub async fn finish_qr_scan_job(
     Ok(())
 }
 
-struct EvidenceRow {
-    index: i16,
-    kind: &'static str,
-    source: &'static str,
-    target_sha256: String,
-    host: Option<String>,
-    display_hint: String,
-    privacy_sensitive: bool,
-    qr_relation: Option<&'static str>,
+pub async fn claim_next_url_shadow_refresh_job(
+    pool: &PgPool,
+    instance_id: &str,
+) -> anyhow::Result<Option<UrlShadowRefreshJob>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "update public.telegram_url_shadow_refresh_jobs set status = 'failed', lease_expires_at = null, error_kind = 'lease_exhausted', updated_at = now() where instance_id = $1 and status = 'leased' and lease_expires_at <= now() and attempts >= $2",
+    )
+    .bind(instance_id)
+    .bind(MAX_URL_SHADOW_REFRESH_ATTEMPTS)
+    .execute(&mut *tx)
+    .await?;
+    let job = sqlx::query_as::<_, UrlShadowRefreshJob>(
+        r#"with candidate as (
+               select id from public.telegram_url_shadow_refresh_jobs
+                where instance_id = $1 and attempts < $2 and retry_at <= now()
+                  and (status = 'pending' or (status = 'leased' and lease_expires_at <= now()))
+                order by retry_at, id
+                for update skip locked
+                limit 1
+           )
+           update public.telegram_url_shadow_refresh_jobs as job
+              set status = 'leased', attempts = attempts + 1,
+                  lease_generation = lease_generation + 1,
+                  lease_expires_at = now() + interval '2 minutes',
+                  updated_at = now()
+             from candidate
+            where job.id = candidate.id
+        returning job.id, job.instance_id, job.chat_id, job.telegram_user_id,
+                  job.evidence_revision, job.attempts, job.lease_generation"#,
+    )
+    .bind(instance_id)
+    .bind(MAX_URL_SHADOW_REFRESH_ATTEMPTS)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(job)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QrUrlRelation {
-    Affiliated,
-    External,
-    Unresolved,
-}
-
-impl QrUrlRelation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Affiliated => "affiliated",
-            Self::External => "external",
-            Self::Unresolved => "unresolved",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct QrUrlEvidence {
-    pub target: String,
-    pub relation: QrUrlRelation,
-}
-
-fn encode(
-    found: &Found,
-    index: usize,
-    qr_relation: Option<&'static str>,
-) -> anyhow::Result<EvidenceRow> {
-    let kind = match found.kind {
-        Kind::Url => "url",
-        Kind::Mention => "mention",
-        Kind::UserId(_) => "user_id",
-        Kind::Hashtag => "hashtag",
-        Kind::Cashtag => "cashtag",
-        Kind::BotCommand => "bot_command",
-    };
-    let source = source_name(found.source);
-    let parsed = (found.kind == Kind::Url)
-        .then(|| parse_url(&found.value))
-        .flatten();
-    let normalized = match found.kind {
-        Kind::UserId(id) => format!("telegram-user-id:{id}"),
-        _ => parsed
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| found.value.trim().to_lowercase()),
-    };
-    let mut digest = Sha256::new();
-    digest.update(b"nedobot-url-evidence-v1\0");
-    digest.update(kind.as_bytes());
-    digest.update(b"\0");
-    digest.update(normalized.as_bytes());
-    let target_sha256 = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-
-    let host = parsed
-        .as_ref()
-        .and_then(|url| url.host_str())
-        .map(str::to_owned);
-    let display_hint = parsed.as_ref().map_or_else(
-        || format!("{kind}:redacted"),
-        |url| match url.host_str() {
-            Some(host) => format!("{}://{host}/…", url.scheme()),
-            None => format!("{}://…", url.scheme()),
-        },
+pub async fn finish_url_shadow_refresh_job(
+    pool: &PgPool,
+    job: &UrlShadowRefreshJob,
+    error_kind: Option<&str>,
+) -> anyhow::Result<()> {
+    let succeeded = error_kind.is_none();
+    let terminal = !succeeded && job.attempts >= MAX_URL_SHADOW_REFRESH_ATTEMPTS;
+    let delay_seconds = 5_i64.saturating_mul(1_i64 << job.attempts.min(10));
+    let result = sqlx::query(
+        r#"update public.telegram_url_shadow_refresh_jobs
+              set status = case when $3 then 'completed' when $4 then 'failed' else 'pending' end,
+                  error_kind = $5,
+                  retry_at = case when $3 or $4 then retry_at else now() + make_interval(secs => $6) end,
+                  lease_expires_at = null,
+                  updated_at = now()
+            where id = $1 and status = 'leased' and lease_generation = $2"#,
+    )
+    .bind(job.id)
+    .bind(job.lease_generation)
+    .bind(succeeded)
+    .bind(terminal)
+    .bind(error_kind)
+    .bind(delay_seconds)
+    .execute(pool)
+    .await?;
+    anyhow::ensure!(
+        result.rows_affected() == 1,
+        "URL shadow refresh lease was superseded"
     );
-    let telegram_sensitive = parse_telegram_link(&found.value).is_some_and(|link| {
-        matches!(
-            link,
-            TelegramLink::Invite { .. }
-                | TelegramLink::AmbiguousPlus { .. }
-                | TelegramLink::BotStart { .. }
-                | TelegramLink::Share { .. }
-                | TelegramLink::Reserved { .. }
-                | TelegramLink::Message {
-                    peer: TelegramPeer::ChatId(_),
-                    ..
-                }
-        )
-    });
-    let url_sensitive = parsed
-        .as_ref()
-        .is_some_and(|url| url.path() != "/" || url.query().is_some());
-
-    Ok(EvidenceRow {
-        index: i16::try_from(index)?,
-        kind,
-        source,
-        target_sha256,
-        host,
-        display_hint,
-        privacy_sensitive: telegram_sensitive || url_sensitive,
-        qr_relation,
-    })
-}
-
-#[cfg(test)]
-mod target_identity_tests {
-    use teloxide_url::{Found, Kind, Source};
-
-    use super::encode;
-
-    #[test]
-    fn native_user_mentions_hash_the_telegram_id_not_the_visible_label() {
-        let alice_42 = encode(&Found::new("Alice", Kind::UserId(42)), 0, None).unwrap();
-        let alice_43 = encode(&Found::new("Alice", Kind::UserId(43)), 0, None).unwrap();
-        let different_label_same_id = encode(&Found::new("A.", Kind::UserId(42)), 0, None).unwrap();
-
-        assert_ne!(alice_42.target_sha256, alice_43.target_sha256);
-        assert_eq!(
-            alice_42.target_sha256,
-            different_label_same_id.target_sha256
-        );
-    }
-
-    #[test]
-    fn same_canonical_url_has_one_identity_across_all_extraction_sources() {
-        let sources = [
-            Source::VisibleText,
-            Source::TelegramEntity,
-            Source::RichMessage,
-            Source::Qr,
-        ];
-        let hashes = sources.map(|source| {
-            let mut found = Found::new("https://example.org/a", Kind::Url);
-            found.source = source;
-            encode(&found, 0, (source == Source::Qr).then_some("external"))
-                .unwrap()
-                .target_sha256
-        });
-        assert!(hashes.iter().all(|hash| hash == &hashes[0]));
-        let different = encode(&Found::new("https://example.org/b", Kind::Url), 0, None).unwrap();
-        assert_ne!(hashes[0], different.target_sha256);
-    }
-}
-
-fn source_name(source: Source) -> &'static str {
-    match source {
-        Source::VisibleText => "visible_text",
-        Source::TelegramEntity => "telegram_entity",
-        Source::RichMessage => "rich_message",
-        Source::Qr => "qr",
-    }
+    Ok(())
 }
 
 /// Replaces this message's derived references atomically; raw targets are never copied here.
@@ -361,7 +288,7 @@ pub async fn replace_message_url_evidence_with_qr(
     });
     let mut tx = pool.begin().await?;
     let total_count =
-        materialize_message_url_evidence(&mut tx, message, classified_qr_urls.as_deref()).await?;
+        UrlEvidenceStore::materialize(&mut tx, message, classified_qr_urls.as_deref()).await?;
     tx.commit().await?;
     Ok(total_count)
 }
@@ -370,6 +297,7 @@ pub async fn replace_message_url_evidence_with_qr(
 /// The lease row and current Telegram message row remain locked until evidence commits.
 pub async fn replace_qr_evidence_for_job(
     pool: &PgPool,
+    instance_id: &str,
     job: &QrScanJob,
     qr_urls: &[QrUrlEvidence],
 ) -> anyhow::Result<Option<usize>> {
@@ -386,174 +314,72 @@ pub async fn replace_qr_evidence_for_job(
         return Ok(None);
     }
 
-    let raw_json: Option<serde_json::Value> = sqlx::query_scalar(
-        "select raw_json from public.telegram_messages where chat_id = $1 and message_id = $2 for update",
+    let message_row: Option<(serde_json::Value, Option<i64>)> = sqlx::query_as(
+        "select raw_json, user_id from public.telegram_messages where chat_id = $1 and message_id = $2 for update",
     )
     .bind(job.chat_id)
     .bind(job.message_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(raw_json) = raw_json else {
+    let Some((raw_json, user_id)) = message_row else {
         tx.rollback().await?;
         return Ok(None);
     };
     let message: Message = serde_json::from_value(raw_json)?;
     let current_file_id = qr_media_candidate(&message).map(|candidate| candidate.file_unique_id);
     if current_file_id.as_deref() != Some(job.file_unique_id.as_str()) {
-        tx.rollback().await?;
+        sqlx::query(
+            r#"update public.telegram_qr_scan_jobs
+                  set status = 'failed', error_kind = 'message_media_superseded',
+                      lease_generation = lease_generation + 1,
+                      lease_expires_at = null, updated_at = now()
+                where id = $1 and status = 'leased' and lease_generation = $2"#,
+        )
+        .bind(job.id)
+        .bind(job.lease_generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         return Ok(None);
     }
 
-    let total_count = materialize_message_url_evidence(&mut tx, &message, Some(qr_urls)).await?;
+    let total_count = UrlEvidenceStore::materialize(&mut tx, &message, Some(qr_urls)).await?;
+    if let Some(telegram_user_id) = user_id {
+        let evidence_revision: String = sqlx::query_scalar(
+            "select source_fingerprint::text from public.telegram_message_url_evidence_runs where chat_id = $1 and message_id = $2 and parser_version = $3",
+        )
+        .bind(job.chat_id)
+        .bind(job.message_id)
+        .bind(URL_EVIDENCE_PARSER_VERSION)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"insert into public.telegram_url_shadow_refresh_jobs
+                  (instance_id, chat_id, telegram_user_id, evidence_revision)
+               values ($1, $2, $3, $4)
+               on conflict (instance_id, chat_id, telegram_user_id, evidence_revision) do nothing"#,
+        )
+        .bind(instance_id)
+        .bind(job.chat_id)
+        .bind(telegram_user_id)
+        .bind(evidence_revision)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let updated = sqlx::query(
+        r#"update public.telegram_qr_scan_jobs
+              set status = 'succeeded', reference_count = $3, error_kind = null,
+                  lease_expires_at = null, updated_at = now()
+            where id = $1 and status = 'leased' and lease_generation = $2"#,
+    )
+    .bind(job.id)
+    .bind(job.lease_generation)
+    .bind(i16::try_from(total_count)?)
+    .execute(&mut *tx)
+    .await?;
+    anyhow::ensure!(updated.rows_affected() == 1, "QR scan lease was superseded");
     tx.commit().await?;
     Ok(Some(total_count))
-}
-
-async fn materialize_message_url_evidence(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    message: &Message,
-    qr_urls: Option<&[QrUrlEvidence]>,
-) -> anyhow::Result<usize> {
-    let mut found = teloxide_url::adapter::extract_from_message(message);
-    let mut qr_relations = std::collections::HashMap::<String, &'static str>::new();
-    if let Some(qr_urls) = qr_urls {
-        for qr_url in qr_urls.iter().take(MAX_QR_URLS_PER_MESSAGE) {
-            for mut url in teloxide_url::find_urls(&qr_url.target) {
-                if found
-                    .iter()
-                    .filter(|item| item.source == Source::Qr)
-                    .count()
-                    >= MAX_QR_URLS_PER_MESSAGE
-                {
-                    break;
-                }
-                url.source = Source::Qr;
-                let canonical_url = canonical_url_identity(&url.value);
-                qr_relations.insert(canonical_url.clone(), qr_url.relation.as_str());
-                if !found.iter().any(|known| {
-                    known.source == Source::Qr
-                        && canonical_url_identity(&known.value) == canonical_url
-                }) {
-                    found.push(url);
-                }
-            }
-        }
-    }
-    found.truncate(teloxide_url::MAX_ITEMS + MAX_QR_URLS_PER_MESSAGE);
-    let mut source_indices = std::collections::HashMap::<&'static str, usize>::new();
-    let rows = found
-        .iter()
-        .map(|item| {
-            let source = source_name(item.source);
-            let index = source_indices.get(source).copied().unwrap_or_default();
-            let row = encode(
-                item,
-                index,
-                (item.source == Source::Qr)
-                    .then(|| {
-                        qr_relations
-                            .get(&canonical_url_identity(&item.value))
-                            .copied()
-                    })
-                    .flatten(),
-            )?;
-            *source_indices.entry(source).or_default() += 1;
-            Ok(row)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let mut delete = sqlx::query(
-        "delete from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version <= $3",
-    );
-    if qr_urls.is_none() {
-        delete = sqlx::query(
-            "delete from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version <= $3 and (parser_version < $3 or source <> 'qr')",
-        );
-    }
-    delete
-        .bind(message.chat.id.0)
-        .bind(message.id.0)
-        .bind(URL_EVIDENCE_PARSER_VERSION)
-        .execute(&mut **tx)
-        .await?;
-
-    for row in &rows {
-        sqlx::query(
-            r#"insert into public.telegram_message_url_evidence
-                (chat_id, message_id, parser_version, item_index, kind, source,
-                 target_sha256, host, display_hint, privacy_sensitive, qr_relation)
-               values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-               on conflict do nothing"#,
-        )
-        .bind(message.chat.id.0)
-        .bind(message.id.0)
-        .bind(URL_EVIDENCE_PARSER_VERSION)
-        .bind(row.index)
-        .bind(row.kind)
-        .bind(row.source)
-        .bind(&row.target_sha256)
-        .bind(&row.host)
-        .bind(&row.display_hint)
-        .bind(row.privacy_sensitive)
-        .bind(row.qr_relation)
-        .execute(&mut **tx)
-        .await?;
-    }
-    let qr_hashes: Vec<String> = sqlx::query_scalar(
-        "select coalesce(array_agg(target_sha256::text order by item_index), array[]::text[]) from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version = $3 and source = 'qr'",
-    )
-    .bind(message.chat.id.0)
-    .bind(message.id.0)
-    .bind(URL_EVIDENCE_PARSER_VERSION)
-        .fetch_one(&mut **tx)
-    .await?;
-    let source_fingerprint = source_fingerprint(message, &qr_hashes)?;
-    let total_count: i16 = sqlx::query_scalar(
-        "select count(*)::smallint from public.telegram_message_url_evidence where chat_id = $1 and message_id = $2 and parser_version = $3",
-    )
-    .bind(message.chat.id.0)
-    .bind(message.id.0)
-    .bind(URL_EVIDENCE_PARSER_VERSION)
-        .fetch_one(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"insert into public.telegram_message_url_evidence_runs
-              (chat_id, message_id, parser_version, source_fingerprint, target_count, processed_at)
-           values ($1, $2, $3, $4, $5, now())
-           on conflict (chat_id, message_id, parser_version) do update
-             set source_fingerprint = excluded.source_fingerprint,
-                 target_count = excluded.target_count,
-                 processed_at = excluded.processed_at"#,
-    )
-    .bind(message.chat.id.0)
-    .bind(message.id.0)
-    .bind(URL_EVIDENCE_PARSER_VERSION)
-    .bind(source_fingerprint)
-    .bind(total_count)
-    .execute(&mut **tx)
-    .await?;
-    Ok(usize::try_from(total_count)?)
-}
-
-fn canonical_url_identity(value: &str) -> String {
-    teloxide_url::parse_url(value)
-        .map(|url| url.to_string())
-        .unwrap_or_else(|| value.to_owned())
-}
-
-fn source_fingerprint(message: &Message, qr_hashes: &[String]) -> anyhow::Result<String> {
-    let bytes = serde_json::to_vec(message)?;
-    let mut digest = Sha256::new();
-    digest.update(bytes);
-    for hash in qr_hashes {
-        digest.update(b"\0qr:");
-        digest.update(hash.as_bytes());
-    }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
 }
 
 pub async fn backfill_url_evidence(
@@ -613,10 +439,12 @@ mod tests {
     use super::*;
     use serde_json::json;
     use sqlx::{PgPool, query, query_as, query_scalar};
+    use teloxide_url::{Found, Kind, Source};
 
     const TEST_CHAT_ID: i64 = -100_991_223_441;
     const TEST_MESSAGE_ID: i32 = 9_912_234;
     const TEST_LINKED_SOURCE_CHANNEL_ID: i64 = -100_991_223_442;
+    const TEST_QR_INSTANCE_ID: &str = "qr-shadow-outbox-test";
 
     #[test]
     fn evidence_redacts_invite_payload_but_keeps_host_and_fingerprint() {
@@ -715,6 +543,14 @@ mod tests {
             .expect("TEST_DATABASE_URL must point at a disposable test database");
         let pool = PgPool::connect(&database_url).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
+        query(
+            "delete from telegram_url_shadow_refresh_jobs where instance_id = $1 and chat_id = $2",
+        )
+        .bind(TEST_QR_INSTANCE_ID)
+        .bind(TEST_CHAT_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
         let readonly_role_exists: bool =
             query_scalar("select exists(select 1 from pg_roles where rolname = 'nedobot_mcp_ro')")
                 .fetch_one(&pool)
@@ -870,6 +706,7 @@ mod tests {
         );
         let stored = replace_qr_evidence_for_job(
             &pool,
+            TEST_QR_INSTANCE_ID,
             &job,
             &[
                 QrUrlEvidence {
@@ -889,6 +726,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored, Some(2));
+        let evidence_revision: String = query_scalar(
+            "select source_fingerprint::text from telegram_message_url_evidence_runs where chat_id = $1 and message_id = $2 and parser_version = $3",
+        )
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID + 2)
+        .bind(URL_EVIDENCE_PARSER_VERSION)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let duplicate_outbox = query(
+            r#"insert into telegram_url_shadow_refresh_jobs
+                  (instance_id, chat_id, telegram_user_id, evidence_revision)
+               values ($1, $2, 7_777_777, $3)
+               on conflict (instance_id, chat_id, telegram_user_id, evidence_revision) do nothing"#,
+        )
+        .bind(TEST_QR_INSTANCE_ID)
+        .bind(TEST_CHAT_ID)
+        .bind(&evidence_revision)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(duplicate_outbox.rows_affected(), 0);
+        let refresh_count: i64 = query_scalar(
+            "select count(*) from telegram_url_shadow_refresh_jobs where instance_id = $1 and chat_id = $2 and telegram_user_id = 7_777_777",
+        )
+        .bind(TEST_QR_INSTANCE_ID)
+        .bind(TEST_CHAT_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(refresh_count, 1, "same evidence revision must deduplicate");
+        let scan_state: (String, i16) =
+            query_as("select status, reference_count from telegram_qr_scan_jobs where id = $1")
+                .bind(job.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(scan_state, ("succeeded".to_owned(), 2));
+        let refresh_job = claim_next_url_shadow_refresh_job(&pool, TEST_QR_INSTANCE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh_job.instance_id, TEST_QR_INSTANCE_ID);
+        assert_eq!(refresh_job.chat_id, TEST_CHAT_ID);
+        assert_eq!(refresh_job.telegram_user_id, 7_777_777);
+        assert_eq!(refresh_job.evidence_revision.len(), 64);
+        assert!(!refresh_job.evidence_revision.contains("example.invalid"));
+        finish_url_shadow_refresh_job(&pool, &refresh_job, Some("synthetic_failure"))
+            .await
+            .unwrap();
+        let refresh_state: (String, Option<String>) = query_as(
+            "select status, error_kind from telegram_url_shadow_refresh_jobs where id = $1",
+        )
+        .bind(refresh_job.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            refresh_state,
+            ("pending".to_owned(), Some("synthetic_failure".to_owned()))
+        );
         let qr_hashes: Vec<String> = query_scalar(
             "select target_sha256::text from telegram_message_url_evidence where chat_id = $1 and message_id = $2 and source = 'qr' order by item_index",
         )
@@ -908,9 +806,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(relation.as_deref(), Some("external"));
-        finish_qr_scan_job(&pool, &job, Some(0), None)
-            .await
-            .unwrap();
         let queue_status: String = query_scalar(
             "select status from telegram_qr_scan_jobs where chat_id = $1 and message_id = $2",
         )
@@ -935,6 +830,7 @@ mod tests {
             .unwrap();
         let stale_write = replace_qr_evidence_for_job(
             &pool,
+            TEST_QR_INSTANCE_ID,
             &stale_after_edit,
             &[QrUrlEvidence {
                 target: "https://example.invalid/stale-qr".to_owned(),
@@ -944,6 +840,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stale_write, None);
+        let stale_job_status: String =
+            query_scalar("select status from telegram_qr_scan_jobs where id = $1")
+                .bind(stale_after_edit.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale_job_status, "failed");
         let stale_qr_rows: i64 = query_scalar(
             "select count(*) from telegram_message_url_evidence where chat_id = $1 and message_id = $2 and source = 'qr'",
         )
@@ -953,6 +856,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stale_qr_rows, 0);
+        let stale_refresh_count: i64 = query_scalar(
+            "select count(*) from telegram_url_shadow_refresh_jobs where instance_id = $1 and chat_id = $2 and telegram_user_id = 7_777_777 and evidence_revision in (select source_fingerprint::text from telegram_message_url_evidence_runs where chat_id = $2 and message_id = $3)",
+        )
+        .bind(TEST_QR_INSTANCE_ID)
+        .bind(TEST_CHAT_ID)
+        .bind(TEST_MESSAGE_ID + 3)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stale_refresh_count, 0);
 
         query("delete from telegram_messages where chat_id = $1 and message_id between $2 and $3")
             .bind(TEST_CHAT_ID)
@@ -961,6 +874,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        query(
+            "delete from telegram_url_shadow_refresh_jobs where instance_id = $1 and chat_id = $2",
+        )
+        .bind(TEST_QR_INSTANCE_ID)
+        .bind(TEST_CHAT_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
         let cascaded: i64 =
             query_scalar("select count(*) from telegram_message_url_evidence where chat_id = $1")
                 .bind(TEST_CHAT_ID)
