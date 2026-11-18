@@ -697,12 +697,12 @@ mod tests {
         let status_503 = anyhow::Error::new(LlmTransportError::http_status(503));
         assert_eq!(classify_error(&status_503), "http_503");
 
-        let nested_status = anyhow::anyhow!("outer context")
-            .context(anyhow::Error::new(LlmTransportError::http_status(429)));
+        let nested_status =
+            anyhow::Error::new(LlmTransportError::http_status(429)).context("outer context");
         assert_eq!(classify_error(&nested_status), "http_429");
 
-        let invalid_response = anyhow::anyhow!("provider context")
-            .context(anyhow::Error::new(LlmTransportError::invalid_response()));
+        let invalid_response =
+            anyhow::Error::new(LlmTransportError::invalid_response()).context("provider context");
         assert_eq!(classify_error(&invalid_response), "validation_failed");
 
         let structured_rejected =
