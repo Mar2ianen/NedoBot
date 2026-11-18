@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 
 from scripts.validate_public_url_corpus import validate
-from scripts.extract_private_url_history import cleanup_transient
 
 
 class PublicCorpusPrivacyTests(unittest.TestCase):
@@ -20,15 +19,10 @@ class PublicCorpusPrivacyTests(unittest.TestCase):
     def test_rejects_numeric_person_identity(self):
         self.assert_rejected(lambda row: row.update(cross_field_assumptions="user 123456789"))
 
-    def test_private_extraction_cleanup_removes_only_registered_transients(self):
-        with tempfile.TemporaryDirectory() as directory:
-            transient = Path(directory) / "private.raw.jsonl"
-            retained = Path(directory) / "private.manifest.jsonl"
-            transient.write_text("sensitive fixture", encoding="utf-8")
-            retained.write_text("curated fixture", encoding="utf-8")
-            cleanup_transient([transient])
-            self.assertFalse(transient.exists())
-            self.assertTrue(retained.exists())
+    def test_test_pack_does_not_ship_live_database_export_commands(self):
+        root = Path(__file__).resolve().parents[1]
+        self.assertFalse((root / "scripts/extract_private_url_history.py").exists())
+        self.assertFalse((root / "src/bin/export_private_url_history.rs").exists())
 
     def assert_rejected(self, mutation):
         path = Path(__file__).resolve().parents[1] / "testing/corpus/public/synthetic_url_history.jsonl"

@@ -1,4 +1,4 @@
-//! Offline processing for explicitly authorized, private historical URL exports.
+//! Offline processing for synthetic historical URL records.
 //! This module never performs network requests and never emits source message text.
 
 use std::{
@@ -40,7 +40,7 @@ pub struct RawQrEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct PrivateUrlRecord {
+pub struct UrlHistoryRecord {
     pub schema_version: u8,
     pub instance: String,
     pub validity_class: &'static str,
@@ -73,7 +73,7 @@ pub struct InstanceSummary {
 }
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
-pub struct PrivateCorpusSummary {
+pub struct UrlHistorySummary {
     pub schema_version: u8,
     pub validity_class: &'static str,
     pub instances: BTreeMap<String, InstanceSummary>,
@@ -82,20 +82,21 @@ pub struct PrivateCorpusSummary {
     pub labels_are_message_level: bool,
 }
 
-/// Process one local, private JSONL message export. Input lines should contain
+/// Process one local, synthetic JSONL message fixture. Input lines should contain
 /// only message ID/date/text/caption/entities; no user identity fields.
-pub fn extract_private_records(
+pub fn extract_url_history_records(
     instance: &str,
     messages: impl Read,
     qr_evidence: impl Read,
-) -> anyhow::Result<(Vec<PrivateUrlRecord>, InstanceSummary)> {
+) -> anyhow::Result<(Vec<UrlHistoryRecord>, InstanceSummary)> {
     validate_instance(instance)?;
     let mut records = Vec::new();
     let mut message_count = 0;
     for (line_index, line) in bounded_lines(messages).enumerate() {
-        let line = line.with_context(|| format!("read private message line {}", line_index + 1))?;
+        let line =
+            line.with_context(|| format!("read synthetic message line {}", line_index + 1))?;
         let message: RawMessage = serde_json::from_str(&line)
-            .with_context(|| format!("parse private message line {}", line_index + 1))?;
+            .with_context(|| format!("parse synthetic message line {}", line_index + 1))?;
         message_count += 1;
         records.extend(message_urls(instance, &message)?);
     }
@@ -112,11 +113,11 @@ pub fn extract_private_records(
             "QR evidence line {} has invalid hash shape",
             line_index + 1
         );
-        records.push(PrivateUrlRecord {
+        records.push(UrlHistoryRecord {
             schema_version: 1,
             instance: instance.to_owned(),
-            validity_class: "V1_observed",
-            evidence_source: "production_postgres_telegram_message_url_evidence",
+            validity_class: "V2_synthetic",
+            evidence_source: "synthetic_postgres_message_url_evidence",
             bot_api_version: "not_recorded_in_source_row",
             teloxide_revision: "f05b90be40e9838e009281182abfcc3db2319c41",
             cross_field_assumptions: "QR hash remains non_reversible; no URL inferred",
@@ -191,22 +192,22 @@ pub fn extract_private_records(
 
 pub fn summarize_instances(
     instances: BTreeMap<String, InstanceSummary>,
-    records_by_instance: &BTreeMap<String, Vec<PrivateUrlRecord>>,
-) -> anyhow::Result<PrivateCorpusSummary> {
+    records_by_instance: &BTreeMap<String, Vec<UrlHistoryRecord>>,
+) -> anyhow::Result<UrlHistorySummary> {
     anyhow::ensure!(
         instances.len() == 2,
         "exactly two separate instances are required"
     );
     anyhow::ensure!(
-        instances.contains_key("nedonews") && instances.contains_key("pvo"),
-        "expected separate nedonews and pvo instances"
+        instances.contains_key("synthetic_a") && instances.contains_key("synthetic_b"),
+        "expected separate synthetic_a and synthetic_b instances"
     );
-    let left = url_identities(records_by_instance.get("nedonews"));
-    let right = url_identities(records_by_instance.get("pvo"));
+    let left = url_identities(records_by_instance.get("synthetic_a"));
+    let right = url_identities(records_by_instance.get("synthetic_b"));
     let shared_url_identity_count = left.intersection(&right).count();
-    Ok(PrivateCorpusSummary {
+    Ok(UrlHistorySummary {
         schema_version: 1,
-        validity_class: "V1_observed",
+        validity_class: "V2_synthetic",
         instances,
         shared_url_identity_count,
         qr_hashes_are_reversible: false,
@@ -214,7 +215,7 @@ pub fn summarize_instances(
     })
 }
 
-fn url_identities(records: Option<&Vec<PrivateUrlRecord>>) -> BTreeSet<String> {
+fn url_identities(records: Option<&Vec<UrlHistoryRecord>>) -> BTreeSet<String> {
     records
         .into_iter()
         .flatten()
@@ -222,7 +223,7 @@ fn url_identities(records: Option<&Vec<PrivateUrlRecord>>) -> BTreeSet<String> {
         .collect()
 }
 
-fn message_urls(instance: &str, message: &RawMessage) -> anyhow::Result<Vec<PrivateUrlRecord>> {
+fn message_urls(instance: &str, message: &RawMessage) -> anyhow::Result<Vec<UrlHistoryRecord>> {
     let mut output = Vec::new();
     if let Some(rich_message) = &message.rich_message {
         for target in rich_link_targets(rich_message, 0) {
@@ -400,18 +401,18 @@ fn url_record(
     message: &RawMessage,
     raw_target: &str,
     source: &str,
-) -> Option<PrivateUrlRecord> {
+) -> Option<UrlHistoryRecord> {
     let canonical = parse_url(raw_target)?.to_string();
     let class = if parse_telegram_link(&canonical).is_some() {
         "telegram_link"
     } else {
         "web_url"
     };
-    Some(PrivateUrlRecord {
+    Some(UrlHistoryRecord {
         schema_version: 1,
         instance: instance.to_owned(),
-        validity_class: "V1_observed",
-        evidence_source: "production_postgres_telegram_messages_raw_json",
+        validity_class: "V2_synthetic",
+        evidence_source: "synthetic_telegram_message_fixture",
         bot_api_version: "not_recorded_in_source_row",
         teloxide_revision: "f05b90be40e9838e009281182abfcc3db2319c41",
         cross_field_assumptions: "stored message_id/date/text/caption/entities belong to one persisted message",
@@ -435,15 +436,15 @@ fn bounded_lines(input: impl Read) -> impl Iterator<Item = anyhow::Result<String
         let bytes = line?;
         anyhow::ensure!(
             bytes.len() <= MAX_INPUT_LINE_BYTES,
-            "private input line exceeds size bound"
+            "synthetic input line exceeds size bound"
         );
-        String::from_utf8(bytes).context("private input contains invalid UTF-8")
+        String::from_utf8(bytes).context("synthetic input contains invalid UTF-8")
     })
 }
 
 fn validate_instance(instance: &str) -> anyhow::Result<()> {
-    if !matches!(instance, "nedonews" | "pvo" | "synthetic_a" | "synthetic_b") {
-        bail!("unknown private corpus instance label");
+    if !matches!(instance, "synthetic_a" | "synthetic_b") {
+        bail!("unknown synthetic instance label");
     }
     Ok(())
 }
@@ -454,7 +455,7 @@ fn is_sha256_hex(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivateUrlRecord, extract_private_records, summarize_instances};
+    use super::{UrlHistoryRecord, extract_url_history_records, summarize_instances};
     use std::{collections::BTreeMap, io::Cursor};
 
     fn raw(message_id: i64, text: &str, entities: &str) -> String {
@@ -476,8 +477,8 @@ mod tests {
             "😀 read this https://EXAMPLE.org/path and hidden",
             r#"[{"type":"text_link","offset":42,"length":5,"url":"https://example.org/hidden?secret=fixture"}]"#,
         );
-        let (records, summary) = extract_private_records(
-            "nedonews",
+        let (records, summary) = extract_url_history_records(
+            "synthetic_a",
             Cursor::new(format!("{line}\n")),
             Cursor::new(""),
         )
@@ -494,7 +495,7 @@ mod tests {
         let output = serde_json::to_string(&records).unwrap();
         assert!(!output.contains("read this"));
         assert!(!output.contains("hidden\""));
-        assert!(records.iter().all(|r| r.validity_class == "V1_observed"));
+        assert!(records.iter().all(|r| r.validity_class == "V2_synthetic"));
     }
 
     #[test]
@@ -507,9 +508,12 @@ mod tests {
             "display_hint": "example.org/private",
             "privacy_sensitive": true
         });
-        let (records, summary) =
-            extract_private_records("pvo", Cursor::new(""), Cursor::new(format!("{}\n", qr)))
-                .unwrap();
+        let (records, summary) = extract_url_history_records(
+            "synthetic_b",
+            Cursor::new(""),
+            Cursor::new(format!("{}\n", qr)),
+        )
+        .unwrap();
         assert_eq!(summary.qr_hash_only_records, 1);
         assert_eq!(records[0].class, "qr_hash_only");
         assert_eq!(records[0].canonical_url_identity, None);
@@ -518,24 +522,24 @@ mod tests {
 
     #[test]
     fn two_instance_summary_counts_collisions_without_emitting_targets() {
-        let (a, sa) = extract_private_records(
-            "nedonews",
+        let (a, sa) = extract_url_history_records(
+            "synthetic_a",
             Cursor::new(raw(1, "https://example.org/shared", "[]")),
             Cursor::new(""),
         )
         .unwrap();
-        let (b, sb) = extract_private_records(
-            "pvo",
+        let (b, sb) = extract_url_history_records(
+            "synthetic_b",
             Cursor::new(raw(2, "https://example.org/shared", "[]")),
             Cursor::new(""),
         )
         .unwrap();
         let mut instances = BTreeMap::new();
-        instances.insert("nedonews".to_owned(), sa);
-        instances.insert("pvo".to_owned(), sb);
+        instances.insert("synthetic_a".to_owned(), sa);
+        instances.insert("synthetic_b".to_owned(), sb);
         let mut records = BTreeMap::new();
-        records.insert("nedonews".to_owned(), a);
-        records.insert("pvo".to_owned(), b);
+        records.insert("synthetic_a".to_owned(), a);
+        records.insert("synthetic_b".to_owned(), b);
         let summary = summarize_instances(instances, &records).unwrap();
         assert_eq!(summary.shared_url_identity_count, 1);
         assert!(
@@ -556,10 +560,14 @@ mod tests {
             "privacy_sensitive": false
         });
         assert!(
-            extract_private_records("pvo", Cursor::new(""), Cursor::new(format!("{}\n", qr)))
-                .is_err()
+            extract_url_history_records(
+                "synthetic_b",
+                Cursor::new(""),
+                Cursor::new(format!("{}\n", qr))
+            )
+            .is_err()
         );
-        assert!(extract_private_records("other", Cursor::new(""), Cursor::new("")).is_err());
+        assert!(extract_url_history_records("other", Cursor::new(""), Cursor::new("")).is_err());
     }
 
     #[test]
@@ -576,9 +584,12 @@ mod tests {
             "entities": [],
             "caption_entities": []
         });
-        let (records, _) =
-            extract_private_records("pvo", Cursor::new(format!("{message}\n")), Cursor::new(""))
-                .unwrap();
+        let (records, _) = extract_url_history_records(
+            "synthetic_b",
+            Cursor::new(format!("{message}\n")),
+            Cursor::new(""),
+        )
+        .unwrap();
         assert_eq!(records.len(), 2);
         assert!(records.iter().any(|r| r.canonical_url_identity.as_deref() == Some("https://example.org/visible")));
         assert!(
@@ -601,9 +612,12 @@ mod tests {
             "entities": [],
             "caption_entities": []
         });
-        let (records, _) =
-            extract_private_records("pvo", Cursor::new(format!("{message}\n")), Cursor::new(""))
-                .unwrap();
+        let (records, _) = extract_url_history_records(
+            "synthetic_b",
+            Cursor::new(format!("{message}\n")),
+            Cursor::new(""),
+        )
+        .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].canonical_url_identity.as_deref(),
@@ -627,8 +641,8 @@ mod tests {
                 ]}]
             }
         });
-        let (records, _) = extract_private_records(
-            "nedonews",
+        let (records, _) = extract_url_history_records(
+            "synthetic_a",
             Cursor::new(format!("{message}\n")),
             Cursor::new(""),
         )
@@ -642,5 +656,5 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn _schema_anchor(_: PrivateUrlRecord) {}
+    fn _schema_anchor(_: UrlHistoryRecord) {}
 }

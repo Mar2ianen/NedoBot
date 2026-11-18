@@ -1,5 +1,5 @@
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_scalar};
-use tg_ai_bot_teloxide::private_corpus::extract_private_records;
+use tg_ai_bot_teloxide::url_history::extract_url_history_records;
 
 async fn fixture_database(
     url: &str,
@@ -46,7 +46,8 @@ async fn fixture_database(
     let qr_lines = scoped_qr_lines(&pool).await;
     drop(pool);
     let (records, _) =
-        extract_private_records(instance, message_lines.as_bytes(), qr_lines.as_bytes()).unwrap();
+        extract_url_history_records(instance, message_lines.as_bytes(), qr_lines.as_bytes())
+            .unwrap();
     serde_json::to_string(&records).unwrap()
 }
 
