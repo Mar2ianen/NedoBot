@@ -44,13 +44,14 @@ mod tests {
     use std::ops::ControlFlow;
     use std::sync::{Arc, Mutex};
 
+    #[cfg(feature = "moderation")]
+    use teloxide::types::CallbackQuery;
     use teloxide::{
         dispatching::{HandlerExt, UpdateFilterExt},
         dptree,
         prelude::{Message, ResponseResult},
         types::{
-            CallbackQuery, ChatMemberUpdated, Me, MessageReactionCountUpdated,
-            MessageReactionUpdated, Update,
+            ChatMemberUpdated, Me, MessageReactionCountUpdated, MessageReactionUpdated, Update,
         },
     };
 
@@ -101,6 +102,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "moderation")]
     async fn callback(_query: CallbackQuery, calls: RouteCalls) -> ResponseResult<()> {
         record(&calls, "callback");
         Ok(())
