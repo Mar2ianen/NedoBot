@@ -212,7 +212,7 @@ mod tests {
                 "message_reaction_count",
                 serde_json::json!({
                     "chat": chat, "message_id": 1001, "date": 1700000000,
-                    "reactions": [{"type":"emoji", "emoji":"👍", "total_count": 2}]
+                    "reactions": [{"type":{"type":"emoji", "emoji":"👍"}, "total_count": 2}]
                 }),
                 "reaction_count",
             ),
@@ -234,10 +234,18 @@ mod tests {
             ),
         ] {
             calls.0.lock().unwrap().clear();
-            let outcome = dispatch(update(field, payload), &calls).await;
+            let telegram_update = update(field, payload);
+            if field == "message_reaction_count" {
+                assert!(matches!(
+                    telegram_update.kind,
+                    teloxide::types::UpdateKind::MessageReactionCount(_)
+                ));
+            }
+            let outcome = dispatch(telegram_update, &calls).await;
             assert!(
                 matches!(outcome, ControlFlow::Break(Ok(()))),
-                "route={field} result={outcome:?}"
+                "route={field} calls={:?} result={outcome:?}",
+                *calls.0.lock().unwrap()
             );
             assert_eq!(*calls.0.lock().unwrap(), [expected], "route={field}");
         }

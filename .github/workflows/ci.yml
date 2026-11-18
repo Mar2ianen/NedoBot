@@ -107,6 +107,11 @@ jobs:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
         run: python3 scripts/run_cargo_test_checked.py cargo test --bin export_url_inventory tests::export_separates_current_flags_from_latest_operator_labels -- --ignored --exact
 
+      - name: Run Telegram username alias PostgreSQL integration test
+        env:
+          TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+        run: cargo test --lib features::url_relations::tests::current_username_aliases_resolve_only_fresh_unique_owners -- --ignored --exact
+
       - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test

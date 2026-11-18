@@ -1,5 +1,5 @@
-use sqlx::PgPool;
 use sqlx::types::chrono::{DateTime, Utc};
+use sqlx::{PgPool, Postgres, Transaction};
 use teloxide::{
     prelude::*,
     types::{
@@ -52,6 +52,7 @@ pub struct MessagePersistenceOutcome {
 pub struct UserProfileDetails {
     pub telegram_user_id: i64,
     pub username: Option<String>,
+    pub active_usernames: Option<Vec<String>>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub bio: Option<String>,
@@ -78,6 +79,103 @@ pub struct UserProfileDetails {
     pub personal_channel_refreshed_at: Option<DateTime<Utc>>,
     pub personal_channel_fetch_error: Option<String>,
     pub raw_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramPeerType {
+    User,
+    Bot,
+    PrivateChat,
+    Group,
+    Supergroup,
+    Channel,
+}
+
+impl TelegramPeerType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Bot => "bot",
+            Self::PrivateChat => "private_chat",
+            Self::Group => "group",
+            Self::Supergroup => "supergroup",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+pub async fn replace_current_telegram_username_aliases(
+    pool: &PgPool,
+    peer_id: i64,
+    peer_type: TelegramPeerType,
+    source: &str,
+    usernames: &[String],
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    replace_current_telegram_username_aliases_in_transaction(
+        &mut tx, peer_id, peer_type, source, usernames,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn replace_current_telegram_username_aliases_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    peer_id: i64,
+    peer_type: TelegramPeerType,
+    source: &str,
+    usernames: &[String],
+) -> anyhow::Result<()> {
+    let usernames = usernames
+        .iter()
+        .filter_map(|username| normalize_telegram_username(username))
+        .collect::<std::collections::BTreeSet<_>>();
+    sqlx::query(
+        "update public.telegram_username_aliases set is_active = false where telegram_peer_id = $1 and peer_type = $2",
+    )
+    .bind(peer_id)
+    .bind(peer_type.as_str())
+    .execute(&mut **tx)
+    .await?;
+
+    for username in usernames {
+        upsert_telegram_username_alias_in_transaction(tx, peer_id, peer_type, source, &username)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn upsert_telegram_username_alias_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    peer_id: i64,
+    peer_type: TelegramPeerType,
+    source: &str,
+    username: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"insert into public.telegram_username_aliases
+               (username_normalized, telegram_peer_id, peer_type, source, observed_at, is_active)
+           values ($1, $2, $3, $4, now(), true)
+           on conflict (username_normalized, telegram_peer_id, peer_type, source)
+           do update set observed_at = excluded.observed_at, is_active = true"#,
+    )
+    .bind(username)
+    .bind(peer_id)
+    .bind(peer_type.as_str())
+    .bind(source)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn normalize_telegram_username(value: &str) -> Option<String> {
+    let username = value.trim().trim_start_matches('@').to_ascii_lowercase();
+    (5..=32).contains(&username.len()).then_some(())?;
+    username
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .then_some(username)
 }
 
 struct ProfileIdentityObservation {
@@ -506,6 +604,18 @@ async fn upsert_chat_user_activity(
 }
 
 pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
+    let user_id = user.id.0 as i64;
+    let new_username = user
+        .username
+        .as_deref()
+        .and_then(normalize_telegram_username);
+    let mut tx = pool.begin().await?;
+    let previous: Option<(Option<String>, bool)> = sqlx::query_as(
+        "select username, is_bot from telegram_user_profiles where telegram_user_id = $1 for update",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     sqlx::query(
         r#"
         insert into telegram_user_profiles
@@ -522,16 +632,48 @@ pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<(
             updated_at = now()
         "#,
     )
-    .bind(user.id.0 as i64)
+    .bind(user_id)
     .bind(&user.username)
     .bind(&user.first_name)
     .bind(&user.last_name)
     .bind(user.is_bot)
     .bind(user.is_premium)
     .bind(&user.language_code)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    let peer_type = if user.is_bot {
+        TelegramPeerType::Bot
+    } else {
+        TelegramPeerType::User
+    };
+    let old_username = previous
+        .as_ref()
+        .and_then(|(username, _)| username.as_deref())
+        .and_then(normalize_telegram_username);
+    let identity_changed = previous
+        .as_ref()
+        .is_some_and(|(_, is_bot)| old_username != new_username || *is_bot != user.is_bot);
+    if identity_changed {
+        sqlx::query(
+            "update public.telegram_username_aliases set is_active = false where telegram_peer_id = $1 and peer_type in ('user', 'bot')",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(username) = new_username {
+        upsert_telegram_username_alias_in_transaction(
+            &mut tx,
+            user_id,
+            peer_type,
+            "user_update",
+            &username,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -540,7 +682,16 @@ pub async fn update_user_profile_details(
     pool: &PgPool,
     details: UserProfileDetails,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
     let observation = ProfileIdentityObservation::from_details(&details);
+    let usernames = details
+        .active_usernames
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+        .chain(details.username.iter().cloned())
+        .collect::<Vec<_>>();
     sqlx::query(
         r#"
         insert into telegram_user_profiles
@@ -628,7 +779,7 @@ pub async fn update_user_profile_details(
     .bind(details.personal_channel_refreshed_at)
     .bind(details.personal_channel_fetch_error)
     .bind(details.raw_json)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query(
@@ -644,9 +795,19 @@ pub async fn update_user_profile_details(
     .bind(observation.username_normalized)
     .bind(observation.display_name_normalized)
     .bind(observation.profile_photo_file_unique_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    replace_current_telegram_username_aliases_in_transaction(
+        &mut tx,
+        details.telegram_user_id,
+        TelegramPeerType::User,
+        "profile_refresh",
+        &usernames,
+    )
+    .await?;
+
+    tx.commit().await?;
     Ok(())
 }
 

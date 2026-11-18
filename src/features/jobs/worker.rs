@@ -231,10 +231,7 @@ impl WorkerSupervisor {
         }
     }
 
-    fn record_exit(
-        &mut self,
-        joined: Result<(Id, WorkerId), JoinError>,
-    ) -> Option<WorkerFailure> {
+    fn record_exit(&mut self, joined: Result<(Id, WorkerId), JoinError>) -> Option<WorkerFailure> {
         let shutting_down = *self.shutdown.borrow();
         let (worker, exit) = self.classify_join(joined);
         match exit {

@@ -163,6 +163,7 @@ fn build_details(
     UserProfileDetails {
         telegram_user_id,
         username: chat.and_then(|chat| chat.username().map(str::to_owned)),
+        active_usernames: chat.and_then(|chat| chat.active_usernames().map(<[String]>::to_vec)),
         first_name: chat.and_then(|chat| chat.first_name().map(str::to_owned)),
         last_name: chat.and_then(|chat| chat.last_name().map(str::to_owned)),
         bio: chat.and_then(|chat| chat.bio().map(str::to_owned)),
