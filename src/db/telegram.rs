@@ -610,6 +610,13 @@ pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<(
         .as_deref()
         .and_then(normalize_telegram_username);
     let mut tx = pool.begin().await?;
+    // `FOR UPDATE` cannot serialize the first observation because there is no
+    // profile row yet. Lock by Telegram peer before reading so concurrent
+    // initial snapshots cannot leave multiple active aliases behind.
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("telegram_user_profile:{user_id}"))
+        .execute(&mut *tx)
+        .await?;
     let previous: Option<(Option<String>, bool)> = sqlx::query_as(
         "select username, is_bot from telegram_user_profiles where telegram_user_id = $1 for update",
     )

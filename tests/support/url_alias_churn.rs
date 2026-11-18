@@ -1,5 +1,22 @@
-use sqlx::{PgPool, query};
-use tg_ai_bot_teloxide::features::url_relations::resolve_recent_username_aliases;
+use std::{sync::Arc, time::Duration};
+
+use sqlx::{PgPool, query, query_scalar};
+use teloxide::types::User;
+use tg_ai_bot_teloxide::{
+    db::telegram::upsert_user_profile,
+    features::url_relations::{TelegramUsernameResolution, resolve_telegram_username},
+};
+use tokio::sync::Barrier;
+
+fn synthetic_user(id: i64, username: &str) -> User {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "is_bot": false,
+        "first_name": "Synthetic",
+        "username": username
+    }))
+    .expect("synthetic Telegram profile must deserialize")
+}
 
 pub async fn assert_current_alias_resolution(pool: &PgPool) {
     let suffix = (std::time::SystemTime::now()
@@ -7,90 +24,95 @@ pub async fn assert_current_alias_resolution(pool: &PgPool) {
         .expect("system clock must be after unix epoch")
         .as_nanos()
         % 900_000_000) as i64;
-    let owner_a = 9_100_000_000_000 + suffix * 2;
+
+    for iteration in 0..32_i64 {
+        let user_id = 9_100_000_000_000 + suffix * 32 + iteration;
+        let username_a = format!("a{suffix:08x}{iteration:02x}");
+        let username_b = format!("b{suffix:08x}{iteration:02x}");
+        let barrier = Arc::new(Barrier::new(3));
+        let user_a = synthetic_user(user_id, &username_a);
+        let user_b = synthetic_user(user_id, &username_b);
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+        let pool_a = pool.clone();
+        let pool_b = pool.clone();
+        let a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            upsert_user_profile(&pool_a, &user_a).await
+        });
+        let b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            upsert_user_profile(&pool_b, &user_b).await
+        });
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            a.await.expect("first concurrent profile task must join")?;
+            b.await.expect("second concurrent profile task must join")?;
+            anyhow::Ok(())
+        })
+        .await
+        .expect("concurrent initial profile upserts must not hang")
+        .expect("both synthetic profile upserts must commit");
+
+        let profile_username: String = query_scalar(
+            "select username from public.telegram_user_profiles where telegram_user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("one synthetic profile row must be present");
+        let resolution_a = resolve_telegram_username(pool, &username_a)
+            .await
+            .expect("first synthetic alias must resolve");
+        let resolution_b = resolve_telegram_username(pool, &username_b)
+            .await
+            .expect("second synthetic alias must resolve");
+        let (active_username, inactive_resolution) = if profile_username == username_a {
+            (username_a.as_str(), resolution_b)
+        } else {
+            assert_eq!(profile_username, username_b);
+            (username_b.as_str(), resolution_a)
+        };
+        assert!(matches!(
+            resolve_telegram_username(pool, active_username).await,
+            Ok(TelegramUsernameResolution::Unique(peer)) if peer.peer_id == user_id
+        ));
+        assert_eq!(
+            inactive_resolution,
+            TelegramUsernameResolution::Unknown,
+            "only the last serialized username may remain active"
+        );
+        query("delete from public.telegram_user_profiles where telegram_user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("synthetic profile fixture must be removed");
+    }
+
+    let owner_a = 9_200_000_000_001 + suffix;
     let owner_b = owner_a + 1;
-    let alias_a = format!("a{:08x}bot", suffix as u32);
-    let alias_b = format!("b{:08x}agent", suffix as u32);
-    let stale = format!("s{:08x}", suffix as u32);
-
-    query("delete from telegram_user_profiles where telegram_user_id = any($1)")
-        .bind(vec![owner_a, owner_b])
+    let old_username = format!("old{suffix:08x}");
+    let new_username = format!("new{suffix:08x}");
+    let other_username = format!("other{suffix:08x}");
+    upsert_user_profile(pool, &synthetic_user(owner_a, &old_username))
+        .await
+        .expect("first owner must be created");
+    upsert_user_profile(pool, &synthetic_user(owner_b, &other_username))
+        .await
+        .expect("second owner must be created");
+    upsert_user_profile(pool, &synthetic_user(owner_a, &new_username))
+        .await
+        .expect("first owner must release its prior alias");
+    upsert_user_profile(pool, &synthetic_user(owner_b, &old_username))
+        .await
+        .expect("second owner must acquire the released alias");
+    assert!(matches!(
+        resolve_telegram_username(pool, &old_username).await,
+        Ok(TelegramUsernameResolution::Unique(peer)) if peer.peer_id == owner_b
+    ));
+    query("delete from public.telegram_user_profiles where telegram_user_id = any($1)")
+        .bind([owner_a, owner_b])
         .execute(pool)
         .await
-        .expect("synthetic alias fixtures must start clean");
-
-    query(
-        "insert into telegram_user_profiles (telegram_user_id, username, is_bot, updated_at) values ($1, $2, false, now()), ($3, $4, true, now())",
-    )
-    .bind(owner_a)
-    .bind(&alias_a)
-    .bind(owner_b)
-    .bind(&alias_b)
-    .execute(pool)
-    .await
-    .expect("two owners must receive separate current aliases");
-
-    let resolved = resolve_recent_username_aliases(pool, &[alias_a.clone(), alias_b.clone()])
-        .await
-        .expect("fresh aliases must be queryable");
-    assert_eq!(resolved.get(&alias_a), Some(&(owner_a, false)));
-    assert_eq!(resolved.get(&alias_b), Some(&(owner_b, true)));
-
-    // The first owner gives up alias A and the second owner acquires it.
-    query("update telegram_user_profiles set username = $2, updated_at = now() where telegram_user_id = $1")
-        .bind(owner_a)
-        .bind(&stale)
-        .execute(pool)
-        .await
-        .expect("first owner's current username must change");
-    query("update telegram_user_profiles set username = $2, updated_at = now() where telegram_user_id = $1")
-        .bind(owner_b)
-        .bind(&alias_a)
-        .execute(pool)
-        .await
-        .expect("second owner must acquire the reassigned alias");
-
-    let reassigned = resolve_recent_username_aliases(pool, std::slice::from_ref(&alias_a))
-        .await
-        .expect("reassigned alias must be queryable");
-    assert_eq!(reassigned.get(&alias_a), Some(&(owner_b, true)));
-    assert_ne!(reassigned.get(&alias_a).map(|value| value.0), Some(owner_a));
-
-    // When the only observation for an alias becomes stale, it must not fall
-    // back to the former owner or be promoted to a known external target.
-    query("update telegram_user_profiles set username = $2, updated_at = now() - interval '25 hours' where telegram_user_id = $1")
-        .bind(owner_b)
-        .bind(&alias_a)
-        .execute(pool)
-        .await
-        .expect("current profile observation must age out");
-    let expired = resolve_recent_username_aliases(pool, std::slice::from_ref(&alias_a))
-        .await
-        .expect("stale alias lookup must be queryable");
-    assert!(!expired.contains_key(&alias_a));
-
-    // Two fresh snapshots claiming the same alias are ambiguous even when
-    // one owner is a bot and the other is not.
-    query("update telegram_user_profiles set username = $2, updated_at = now() where telegram_user_id = $1")
-        .bind(owner_a)
-        .bind(&alias_b)
-        .execute(pool)
-        .await
-        .expect("first duplicate alias fixture must be fresh");
-    query("update telegram_user_profiles set username = $2, updated_at = now() where telegram_user_id = $1")
-        .bind(owner_b)
-        .bind(&alias_b)
-        .execute(pool)
-        .await
-        .expect("second duplicate alias fixture must be fresh");
-    let duplicate = resolve_recent_username_aliases(pool, std::slice::from_ref(&alias_b))
-        .await
-        .expect("duplicate alias lookup must be queryable");
-    assert!(!duplicate.contains_key(&alias_b));
-
-    query("delete from telegram_user_profiles where telegram_user_id = any($1)")
-        .bind(vec![owner_a, owner_b])
-        .execute(pool)
-        .await
-        .expect("synthetic alias fixtures must be removed");
+        .expect("synthetic alias reassignment fixtures must be removed");
 }
