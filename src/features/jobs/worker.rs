@@ -112,6 +112,7 @@ pub struct WorkerSupervisor {
     shutdown: watch::Sender<bool>,
     tasks: JoinSet<WorkerId>,
     worker_ids: HashMap<Id, WorkerId>,
+    drain_timeout: Duration,
 }
 
 impl Default for WorkerSupervisor {
@@ -127,6 +128,15 @@ impl WorkerSupervisor {
             shutdown,
             tasks: JoinSet::new(),
             worker_ids: HashMap::new(),
+            drain_timeout: WORKER_DRAIN_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_drain_timeout(drain_timeout: Duration) -> Self {
+        Self {
+            drain_timeout,
+            ..Self::new()
         }
     }
 
@@ -171,15 +181,13 @@ impl WorkerSupervisor {
 
     pub async fn shutdown_and_drain(&mut self) {
         self.shutdown.send_replace(true);
+        let drain_timeout = self.drain_timeout;
         let drain = async {
             while let Some(joined) = self.tasks.join_next_with_id().await {
                 self.record_exit(joined);
             }
         };
-        if tokio::time::timeout(WORKER_DRAIN_TIMEOUT, drain)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(drain_timeout, drain).await.is_err() {
             let abandoned = self.tasks.len();
             self.tasks.abort_all();
             while let Some(joined) = self.tasks.join_next_with_id().await {
@@ -187,7 +195,7 @@ impl WorkerSupervisor {
             }
             tracing::warn!(
                 abandoned,
-                drain_timeout_seconds = WORKER_DRAIN_TIMEOUT.as_secs(),
+                drain_timeout_ms = self.drain_timeout.as_millis() as u64,
                 "aborted background workers after bounded shutdown drain"
             );
         }
@@ -375,17 +383,104 @@ pub async fn run_fixed_delay_worker<F, Fut>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
     use super::super::policy::WorkerPollPolicy;
     use super::run_interval_worker;
     use super::{
         PollOutcome, WorkerFailure, WorkerId, WorkerSpec, WorkerSupervisor, WorkerTaskExit,
         run_poll_worker,
     };
+    use std::{
+        io::{self, Write},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Clone)]
+    struct CaptureLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureLogs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture mutex")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs(operation: impl FnOnce()) -> String {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(CaptureLogs(Arc::clone(&bytes)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, operation);
+        String::from_utf8(bytes.lock().expect("capture mutex").clone())
+            .expect("tracing output is UTF-8")
+    }
+
+    async fn supervise_pending(supervisor: &mut WorkerSupervisor) -> Result<(), WorkerFailure> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            supervisor.supervise_until(std::future::pending::<()>()),
+        )
+        .await
+        .expect(
+            "supervision must terminate after an unexpected worker exit instead of waiting forever",
+        )
+    }
+
+    #[tokio::test]
+    async fn record_exit_logs_graceful_and_unexpected_completion_differently() {
+        let mut supervisor = WorkerSupervisor::new();
+        supervisor.spawn(WorkerId::ProfileRefresh, |_| async {});
+        tokio::task::yield_now().await;
+        let joined = supervisor
+            .tasks
+            .join_next_with_id()
+            .await
+            .expect("completed worker must be joined");
+        let mut fatal = None;
+        let unexpected = capture_logs(|| fatal = supervisor.record_exit(joined));
+        assert_eq!(
+            fatal,
+            Some(WorkerFailure {
+                worker: WorkerId::ProfileRefresh,
+                exit: WorkerTaskExit::Completed,
+            })
+        );
+        assert!(unexpected.contains("exited unexpectedly"));
+        assert!(!unexpected.contains("background worker stopped"));
+
+        supervisor.shutdown.send_replace(true);
+        supervisor.spawn(WorkerId::ProfileRefresh, |_| async {});
+        tokio::task::yield_now().await;
+        let joined = supervisor
+            .tasks
+            .join_next_with_id()
+            .await
+            .expect("stopped worker must be joined");
+        let graceful = capture_logs(|| {
+            assert_eq!(supervisor.record_exit(joined), None);
+        });
+        assert!(graceful.contains("background worker stopped"));
+        assert!(!graceful.contains("exited unexpectedly"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn poll_worker_uses_idle_policy_and_stops_during_backoff() {
@@ -521,9 +616,7 @@ mod tests {
             panic!("synthetic critical worker panic");
         });
 
-        let result = supervisor
-            .supervise_until(std::future::pending::<()>())
-            .await;
+        let result = supervise_pending(&mut supervisor).await;
 
         assert_eq!(
             result.unwrap_err(),
@@ -546,9 +639,7 @@ mod tests {
         });
         supervisor.spawn(WorkerId::DecisionAudit, |_| async {});
 
-        let result = supervisor
-            .supervise_until(std::future::pending::<()>())
-            .await;
+        let result = supervise_pending(&mut supervisor).await;
 
         assert_eq!(
             result.unwrap_err(),
@@ -569,9 +660,7 @@ mod tests {
         tokio::task::yield_now().await;
         supervisor.abort_all();
 
-        let result = supervisor
-            .supervise_until(std::future::pending::<()>())
-            .await;
+        let result = supervise_pending(&mut supervisor).await;
 
         assert_eq!(
             result.unwrap_err(),
@@ -580,5 +669,41 @@ mod tests {
                 exit: WorkerTaskExit::Aborted,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn completed_foreground_drains_workers_without_fatal_error() {
+        let mut supervisor = WorkerSupervisor::new();
+        supervisor.spawn(WorkerId::ProfileRefresh, move |mut shutdown| async move {
+            let _ = shutdown.changed().await;
+        });
+
+        assert!(supervisor.supervise_until(async {}).await.is_ok());
+        assert!(supervisor.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_aborts_and_drops_stuck_workers() {
+        struct ObserveDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut supervisor =
+            WorkerSupervisor::with_drain_timeout(std::time::Duration::from_millis(10));
+        let worker_dropped = Arc::clone(&dropped);
+        supervisor.spawn(WorkerId::QrEvidence, move |_| async move {
+            let _observe_drop = ObserveDrop(worker_dropped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        supervisor.shutdown_and_drain().await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(supervisor.tasks.is_empty());
     }
 }
