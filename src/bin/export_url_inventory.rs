@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{BufWriter, Write},
+    net::IpAddr,
     path::Path,
 };
 
@@ -27,11 +28,20 @@ struct LinkRecord {
     target_type: &'static str,
     resolution: &'static str,
     host: Option<String>,
+    registrable_domain: Option<String>,
     message_count: u64,
+    messages_per_day: f64,
     unique_authors: usize,
     currently_flagged_spam_authors: usize,
     operator_confirmed_spam_authors: usize,
     operator_confirmed_normal_authors: usize,
+    operator_labeled_authors: usize,
+    operator_labeled_author_fraction: f64,
+    legacy_spam_authors: usize,
+    legacy_not_spam_authors: usize,
+    system_spam_authors: usize,
+    system_not_spam_authors: usize,
+    unconfirmed_authors: usize,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
     sources: BTreeSet<String>,
@@ -44,6 +54,11 @@ struct Aggregate {
     currently_flagged_spam_authors: BTreeSet<i64>,
     operator_confirmed_spam_authors: BTreeSet<i64>,
     operator_confirmed_normal_authors: BTreeSet<i64>,
+    legacy_spam_authors: BTreeSet<i64>,
+    legacy_not_spam_authors: BTreeSet<i64>,
+    system_spam_authors: BTreeSet<i64>,
+    system_not_spam_authors: BTreeSet<i64>,
+    unconfirmed_authors: BTreeSet<i64>,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
     sources: BTreeSet<String>,
@@ -60,6 +75,11 @@ struct HostAggregate {
     currently_flagged_spam_authors: BTreeSet<i64>,
     operator_confirmed_spam_authors: BTreeSet<i64>,
     operator_confirmed_normal_authors: BTreeSet<i64>,
+    legacy_spam_authors: BTreeSet<i64>,
+    legacy_not_spam_authors: BTreeSet<i64>,
+    system_spam_authors: BTreeSet<i64>,
+    system_not_spam_authors: BTreeSet<i64>,
+    unconfirmed_authors: BTreeSet<i64>,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
     sources: BTreeSet<String>,
@@ -130,7 +150,9 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
                                  where e.chat_id = m.chat_id and e.message_id = m.message_id
                                    and e.source = 'qr' and e.parser_version = $4), array[]::text[]) as qr_hashes,
                       coalesce(u.is_spammer, false) as currently_flagged_spam,
-                      human_label.label as latest_operator_label
+                      operator_label.label as latest_operator_label,
+                      legacy_label.label as latest_legacy_label,
+                      system_label.label as latest_system_label
                  from public.telegram_messages m
                  left join public.telegram_chat_users u
                    on u.chat_id = m.chat_id and u.telegram_user_id = m.user_id
@@ -139,10 +161,28 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
                       from public.spam_label_events e
                      where e.chat_id = m.chat_id
                        and e.telegram_user_id = m.user_id
-                       and e.source in ('owner_review', 'owner_manual', 'legacy_backfill')
+                       and e.source in ('owner_review', 'owner_manual')
                      order by e.created_at desc, e.id desc
                      limit 1
-                 ) human_label on true
+                 ) operator_label on true
+                 left join lateral (
+                    select e.label
+                      from public.spam_label_events e
+                     where e.chat_id = m.chat_id
+                       and e.telegram_user_id = m.user_id
+                       and e.source = 'legacy_backfill'
+                     order by e.created_at desc, e.id desc
+                     limit 1
+                 ) legacy_label on true
+                 left join lateral (
+                    select e.label
+                      from public.spam_label_events e
+                     where e.chat_id = m.chat_id
+                       and e.telegram_user_id = m.user_id
+                       and e.source = 'system'
+                     order by e.created_at desc, e.id desc
+                     limit 1
+                 ) system_label on true
                 where m.chat_id = $1 and m.id > $2
                 order by m.id limit $3"#,
         )
@@ -165,8 +205,14 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
             let qr_hashes: Vec<String> = row.try_get("qr_hashes")?;
             let currently_flagged_spam: bool = row.try_get("currently_flagged_spam")?;
             let latest_operator_label: Option<String> = row.try_get("latest_operator_label")?;
+            let latest_legacy_label: Option<String> = row.try_get("latest_legacy_label")?;
+            let latest_system_label: Option<String> = row.try_get("latest_system_label")?;
             let operator_confirmed_spam = latest_operator_label.as_deref() == Some("spam");
             let operator_confirmed_normal = latest_operator_label.as_deref() == Some("not_spam");
+            let legacy_spam = latest_legacy_label.as_deref() == Some("spam");
+            let legacy_not_spam = latest_legacy_label.as_deref() == Some("not_spam");
+            let system_spam = latest_system_label.as_deref() == Some("spam");
+            let system_not_spam = latest_system_label.as_deref() == Some("not_spam");
             for hash in qr_hashes {
                 let target = format!("sha256:{hash}");
                 let fingerprint = fingerprint(&format!("qr-hash-only:{hash}"));
@@ -204,6 +250,21 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
                     }
                     if operator_confirmed_normal {
                         entry.operator_confirmed_normal_authors.insert(user_id);
+                    }
+                    if legacy_spam {
+                        entry.legacy_spam_authors.insert(user_id);
+                    }
+                    if legacy_not_spam {
+                        entry.legacy_not_spam_authors.insert(user_id);
+                    }
+                    if system_spam {
+                        entry.system_spam_authors.insert(user_id);
+                    }
+                    if system_not_spam {
+                        entry.system_not_spam_authors.insert(user_id);
+                    }
+                    if latest_operator_label.is_none() {
+                        entry.unconfirmed_authors.insert(user_id);
                     }
                 }
                 entry.sources.insert("qr_hash_only".to_owned());
@@ -283,6 +344,21 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
                     if operator_confirmed_normal {
                         entry.operator_confirmed_normal_authors.insert(user_id);
                     }
+                    if legacy_spam {
+                        entry.legacy_spam_authors.insert(user_id);
+                    }
+                    if legacy_not_spam {
+                        entry.legacy_not_spam_authors.insert(user_id);
+                    }
+                    if system_spam {
+                        entry.system_spam_authors.insert(user_id);
+                    }
+                    if system_not_spam {
+                        entry.system_not_spam_authors.insert(user_id);
+                    }
+                    if latest_operator_label.is_none() {
+                        entry.unconfirmed_authors.insert(user_id);
+                    }
                 }
                 entry
                     .sources
@@ -331,6 +407,21 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
         summary
             .operator_confirmed_normal_authors
             .extend(aggregate.operator_confirmed_normal_authors.iter().copied());
+        summary
+            .legacy_spam_authors
+            .extend(aggregate.legacy_spam_authors.iter().copied());
+        summary
+            .legacy_not_spam_authors
+            .extend(aggregate.legacy_not_spam_authors.iter().copied());
+        summary
+            .system_spam_authors
+            .extend(aggregate.system_spam_authors.iter().copied());
+        summary
+            .system_not_spam_authors
+            .extend(aggregate.system_not_spam_authors.iter().copied());
+        summary
+            .unconfirmed_authors
+            .extend(aggregate.unconfirmed_authors.iter().copied());
         summary.sources.extend(aggregate.sources.iter().cloned());
         if let Some(first) = aggregate.first_seen {
             summary.first_seen = Some(summary.first_seen.map_or(first, |value| value.min(first)));
@@ -338,6 +429,62 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
         if let Some(last) = aggregate.last_seen {
             summary.last_seen = Some(summary.last_seen.map_or(last, |value| value.max(last)));
         }
+    }
+    let mut domains = BTreeMap::<String, HostAggregate>::new();
+    let mut domain_message_pairs = 0usize;
+    for (host, aggregate) in &hosts {
+        let Some(domain) = registrable_domain(host) else {
+            continue;
+        };
+        if !domains.contains_key(&domain) && domains.len() >= 25_000 {
+            anyhow::bail!(
+                "registrable-domain aggregation limit reached; no partial inventory was written"
+            );
+        }
+        let summary = domains.entry(domain).or_default();
+        for message_id in &aggregate.message_ids {
+            if summary.message_ids.insert(*message_id) {
+                domain_message_pairs += 1;
+                anyhow::ensure!(
+                    domain_message_pairs <= MAX_TARGET_MESSAGE_PAIRS,
+                    "registrable-domain/message pair limit reached; no partial inventory was written"
+                );
+            }
+        }
+        summary.authors.extend(aggregate.authors.iter().copied());
+        summary
+            .currently_flagged_spam_authors
+            .extend(aggregate.currently_flagged_spam_authors.iter().copied());
+        summary
+            .operator_confirmed_spam_authors
+            .extend(aggregate.operator_confirmed_spam_authors.iter().copied());
+        summary
+            .operator_confirmed_normal_authors
+            .extend(aggregate.operator_confirmed_normal_authors.iter().copied());
+        summary
+            .legacy_spam_authors
+            .extend(aggregate.legacy_spam_authors.iter().copied());
+        summary
+            .legacy_not_spam_authors
+            .extend(aggregate.legacy_not_spam_authors.iter().copied());
+        summary
+            .system_spam_authors
+            .extend(aggregate.system_spam_authors.iter().copied());
+        summary
+            .system_not_spam_authors
+            .extend(aggregate.system_not_spam_authors.iter().copied());
+        summary
+            .unconfirmed_authors
+            .extend(aggregate.unconfirmed_authors.iter().copied());
+        summary.sources.extend(aggregate.sources.iter().cloned());
+        summary.first_seen = match (summary.first_seen, aggregate.first_seen) {
+            (Some(current), Some(candidate)) => Some(current.min(candidate)),
+            (None, value) | (value, None) => value,
+        };
+        summary.last_seen = match (summary.last_seen, aggregate.last_seen) {
+            (Some(current), Some(candidate)) => Some(current.max(candidate)),
+            (None, value) | (value, None) => value,
+        };
     }
     for (key, aggregate) in aggregates {
         let (kind, _) = key.split_once('\0').expect("internal key separator");
@@ -361,12 +508,32 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
                 aggregate.target_type
             },
             resolution: "Unresolved",
-            host: aggregate.host,
+            host: aggregate.host.clone(),
+            registrable_domain: aggregate.host.as_deref().and_then(registrable_domain),
             message_count: aggregate.message_ids.len() as u64,
+            messages_per_day: messages_per_day(
+                aggregate.message_ids.len(),
+                aggregate.first_seen,
+                aggregate.last_seen,
+            ),
             unique_authors: aggregate.authors.len(),
             currently_flagged_spam_authors: aggregate.currently_flagged_spam_authors.len(),
             operator_confirmed_spam_authors: aggregate.operator_confirmed_spam_authors.len(),
             operator_confirmed_normal_authors: aggregate.operator_confirmed_normal_authors.len(),
+            operator_labeled_authors: aggregate
+                .operator_confirmed_spam_authors
+                .union(&aggregate.operator_confirmed_normal_authors)
+                .count(),
+            operator_labeled_author_fraction: label_fraction(
+                &aggregate.authors,
+                &aggregate.operator_confirmed_spam_authors,
+                &aggregate.operator_confirmed_normal_authors,
+            ),
+            legacy_spam_authors: aggregate.legacy_spam_authors.len(),
+            legacy_not_spam_authors: aggregate.legacy_not_spam_authors.len(),
+            system_spam_authors: aggregate.system_spam_authors.len(),
+            system_not_spam_authors: aggregate.system_not_spam_authors.len(),
+            unconfirmed_authors: aggregate.unconfirmed_authors.len(),
             first_seen,
             last_seen,
             sources: aggregate.sources,
@@ -383,12 +550,74 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
             identity_sha256: fingerprint(&host),
             target_type: "host",
             resolution: "not_applicable",
-            host: Some(host),
+            host: Some(host.clone()),
+            registrable_domain: registrable_domain(&host),
             message_count: aggregate.message_ids.len() as u64,
+            messages_per_day: messages_per_day(
+                aggregate.message_ids.len(),
+                aggregate.first_seen,
+                aggregate.last_seen,
+            ),
             unique_authors: aggregate.authors.len(),
             currently_flagged_spam_authors: aggregate.currently_flagged_spam_authors.len(),
             operator_confirmed_spam_authors: aggregate.operator_confirmed_spam_authors.len(),
             operator_confirmed_normal_authors: aggregate.operator_confirmed_normal_authors.len(),
+            operator_labeled_authors: aggregate
+                .operator_confirmed_spam_authors
+                .union(&aggregate.operator_confirmed_normal_authors)
+                .count(),
+            operator_labeled_author_fraction: label_fraction(
+                &aggregate.authors,
+                &aggregate.operator_confirmed_spam_authors,
+                &aggregate.operator_confirmed_normal_authors,
+            ),
+            legacy_spam_authors: aggregate.legacy_spam_authors.len(),
+            legacy_not_spam_authors: aggregate.legacy_not_spam_authors.len(),
+            system_spam_authors: aggregate.system_spam_authors.len(),
+            system_not_spam_authors: aggregate.system_not_spam_authors.len(),
+            unconfirmed_authors: aggregate.unconfirmed_authors.len(),
+            first_seen,
+            last_seen: aggregate.last_seen.unwrap_or(first_seen),
+            sources: aggregate.sources,
+        };
+        serde_json::to_writer(&mut writer, &record)?;
+        writer.write_all(b"\n")?;
+    }
+    for (domain, aggregate) in domains {
+        let first_seen = aggregate.first_seen.unwrap_or_else(Utc::now);
+        let record = LinkRecord {
+            record_type: "domain_summary",
+            chat_id,
+            target: domain.clone(),
+            identity_sha256: fingerprint(&domain),
+            target_type: "registrable_domain",
+            resolution: "not_applicable",
+            host: None,
+            registrable_domain: Some(domain),
+            message_count: aggregate.message_ids.len() as u64,
+            messages_per_day: messages_per_day(
+                aggregate.message_ids.len(),
+                aggregate.first_seen,
+                aggregate.last_seen,
+            ),
+            unique_authors: aggregate.authors.len(),
+            currently_flagged_spam_authors: aggregate.currently_flagged_spam_authors.len(),
+            operator_confirmed_spam_authors: aggregate.operator_confirmed_spam_authors.len(),
+            operator_confirmed_normal_authors: aggregate.operator_confirmed_normal_authors.len(),
+            operator_labeled_authors: aggregate
+                .operator_confirmed_spam_authors
+                .union(&aggregate.operator_confirmed_normal_authors)
+                .count(),
+            operator_labeled_author_fraction: label_fraction(
+                &aggregate.authors,
+                &aggregate.operator_confirmed_spam_authors,
+                &aggregate.operator_confirmed_normal_authors,
+            ),
+            legacy_spam_authors: aggregate.legacy_spam_authors.len(),
+            legacy_not_spam_authors: aggregate.legacy_not_spam_authors.len(),
+            system_spam_authors: aggregate.system_spam_authors.len(),
+            system_not_spam_authors: aggregate.system_not_spam_authors.len(),
+            unconfirmed_authors: aggregate.unconfirmed_authors.len(),
             first_seen,
             last_seen: aggregate.last_seen.unwrap_or(first_seen),
             sources: aggregate.sources,
@@ -481,9 +710,38 @@ fn fingerprint(identity: &str) -> String {
         .collect()
 }
 
+fn messages_per_day(
+    message_count: usize,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+) -> f64 {
+    let Some((first, last)) = first_seen.zip(last_seen) else {
+        return 0.0;
+    };
+    let days = (last - first).num_seconds().max(0) as f64 / 86_400.0;
+    message_count as f64 / days.max(1.0)
+}
+
+fn label_fraction(authors: &BTreeSet<i64>, spam: &BTreeSet<i64>, not_spam: &BTreeSet<i64>) -> f64 {
+    if authors.is_empty() {
+        return 0.0;
+    }
+    spam.union(not_spam).count() as f64 / authors.len() as f64
+}
+
+fn registrable_domain(host: &str) -> Option<String> {
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    psl::domain_str(host).map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{create_private_output_temp, fingerprint, persist_private_output, redact_target};
+    use super::{
+        create_private_output_temp, fingerprint, persist_private_output, redact_target,
+        registrable_domain,
+    };
     use std::io::Write;
 
     #[test]
@@ -608,6 +866,7 @@ mod tests {
 
         for (user_id, label, source) in [
             (USER_SYSTEM_ONLY, "spam", "system"),
+            (USER_SYSTEM_ONLY, "spam", "legacy_backfill"),
             (USER_OPERATOR_NORMAL, "spam", "owner_review"),
             (USER_OPERATOR_NORMAL, "not_spam", "owner_review"),
             (USER_OPERATOR_NORMAL, "spam", "system"),
@@ -639,6 +898,20 @@ mod tests {
         assert_eq!(target["currently_flagged_spam_authors"], 2);
         assert_eq!(target["operator_confirmed_spam_authors"], 1);
         assert_eq!(target["operator_confirmed_normal_authors"], 1);
+        assert_eq!(target["operator_labeled_authors"], 2);
+        assert_eq!(target["operator_labeled_author_fraction"], 2.0 / 3.0);
+        assert_eq!(target["legacy_spam_authors"], 1);
+        assert_eq!(target["system_spam_authors"], 2);
+        assert_eq!(target["unconfirmed_authors"], 1);
+        assert_eq!(target["registrable_domain"], "example.org");
+        let domain: serde_json::Value = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|record: &serde_json::Value| record["record_type"] == "domain_summary")
+            .unwrap();
+        assert_eq!(domain["target"], "example.org");
+        assert_eq!(domain["message_count"], 3);
+        assert_eq!(domain["operator_labeled_authors"], 2);
 
         sqlx::query(
             "delete from telegram_messages where chat_id = $1 and message_id between $2 and $3",
@@ -707,5 +980,105 @@ mod tests {
             "complete inventory\n"
         );
         assert_eq!(parent, directory.path());
+    }
+
+    #[test]
+    fn registrable_domain_uses_pinned_public_suffix_list() {
+        assert_eq!(
+            registrable_domain("news.example.co.uk").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            registrable_domain("a.b.example.com").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(registrable_domain("localhost"), None);
+        assert_eq!(registrable_domain("127.0.0.1"), None);
+        assert_eq!(registrable_domain("2001:db8::1"), None);
+    }
+
+    #[test]
+    fn deterministic_random_url_corpus_parses_and_redacts() {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        for index in 0..10_000 {
+            let host_label = (0..10)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()] as char)
+                .collect::<String>();
+            let secret = (0..18)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()] as char)
+                .collect::<String>();
+            let url = match index % 6 {
+                0 => format!("https://{host_label}.example.co.uk/r/{secret}?token={secret}#frag"),
+                1 => format!("http://{host_label}.example/path/{secret}?id={secret}"),
+                2 => format!("https://t.me/{host_label}_bot?start={secret}"),
+                3 => format!("tg://resolve?domain={host_label}_bot&start={secret}"),
+                4 => format!("https://{host_label}.пример.рф/{secret}"),
+                _ => format!("https://{host_label}.example/%2F{secret}?a=b%26c"),
+            };
+            let parsed = teloxide_url::parse_url(&url)
+                .unwrap_or_else(|| panic!("generated URL did not parse at case {index}"));
+            assert!(!parsed.as_str().is_empty());
+            let redacted = redact_target(&url, false)
+                .unwrap_or_else(|| panic!("generated URL could not be redacted at case {index}"));
+            assert!(!redacted.contains(&secret), "secret leaked at case {index}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local private corpus extracted from public chat history"]
+    fn extracted_public_chat_url_corpus_is_safe_to_parse_and_redact() {
+        let path = std::env::var("NEDOBOT_URL_CORPUS")
+            .expect("set NEDOBOT_URL_CORPUS to the private local corpus path");
+        let corpus = std::fs::read_to_string(path).unwrap();
+        let mut count = 0usize;
+        let mut parsed_count = 0usize;
+        let mut redacted_count = 0usize;
+        let mut rejected_count = 0usize;
+        for line in corpus.lines().filter(|line| !line.trim().is_empty()) {
+            count += 1;
+            let line = line.trim();
+            let normalized = if line.starts_with("t.me/") || line.starts_with("telegram.me/") {
+                format!("https://{line}")
+            } else {
+                line.to_owned()
+            };
+            if normalized.starts_with('@') {
+                continue;
+            }
+            if teloxide_url::parse_url(&normalized).is_some()
+                || teloxide_url::parse_telegram_link(&normalized).is_some()
+            {
+                parsed_count += 1;
+                if let Some(redacted) = redact_target(&normalized, false) {
+                    redacted_count += 1;
+                    if let Some((_, query)) = normalized.split_once('?') {
+                        let secret = query.split(['&', '#']).next().unwrap_or_default();
+                        if !secret.is_empty() {
+                            assert!(
+                                !redacted.contains(secret),
+                                "query leaked in corpus case {count}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                rejected_count += 1;
+            }
+        }
+        assert!(count > 0, "private URL corpus was empty");
+        assert!(
+            parsed_count > 0,
+            "no URL candidates parsed from private corpus"
+        );
+        eprintln!(
+            "locally extracted URL corpus: candidates={count}, parsed={parsed_count}, redacted={redacted_count}, rejected={rejected_count}"
+        );
     }
 }
