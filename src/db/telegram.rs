@@ -735,6 +735,7 @@ pub async fn update_user_profile_details(
                 personal_channel_has_adult_links, personal_channel_raw_json,
                 personal_channel_refreshed_at, personal_channel_fetch_error,
                 profile_raw_json, profile_refreshed_at, profile_refresh_error,
+                profile_refresh_failure_count, profile_refresh_retry_at,
                 updated_at
             )
         values (
@@ -743,7 +744,13 @@ pub async fn update_user_profile_details(
             $10, $11, $12, $13, $14,
             $15, $16,
             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-            $28, case when $29 then now() else null end, $30, now()
+            $28, case when $29 then now() else null end, $30,
+            case when $30 is null then 0 else 1 end,
+            case
+                when $30 is null then null
+                else now() + interval '1 minute'
+            end,
+            now()
         )
         on conflict (telegram_user_id) do update set
             username = case when $29 then excluded.username else telegram_user_profiles.username end,
@@ -855,7 +862,25 @@ pub async fn update_user_profile_details(
                 when $29 then excluded.profile_refreshed_at
                 else telegram_user_profiles.profile_refreshed_at
             end,
-            profile_refresh_error = case when $29 then null else $30 end,
+            profile_refresh_error = case
+                when $29 then null
+                when $30 is not null then $30
+                else telegram_user_profiles.profile_refresh_error
+            end,
+            profile_refresh_failure_count = case
+                when $29 then 0
+                when $30 is not null then telegram_user_profiles.profile_refresh_failure_count + 1
+                else telegram_user_profiles.profile_refresh_failure_count
+            end,
+            profile_refresh_retry_at = case
+                when $29 then null
+                when $30 is not null then now() + least(
+                    interval '1 minute'
+                        * power(2, least(telegram_user_profiles.profile_refresh_failure_count, 9)),
+                    interval '6 hours'
+                )
+                else telegram_user_profiles.profile_refresh_retry_at
+            end,
             updated_at = now()
         "#,
     )
@@ -933,11 +958,21 @@ pub async fn mark_user_profile_refresh_error(
     sqlx::query(
         r#"
         insert into telegram_user_profiles
-            (telegram_user_id, profile_refreshed_at, profile_refresh_error, updated_at)
-        values ($1, now(), $2, now())
+            (
+                telegram_user_id, profile_refresh_error,
+                profile_refresh_failure_count, profile_refresh_retry_at,
+                updated_at
+            )
+        values ($1, $2, 1, now() + interval '1 minute', now())
         on conflict (telegram_user_id) do update set
-            profile_refreshed_at = excluded.profile_refreshed_at,
             profile_refresh_error = excluded.profile_refresh_error,
+            profile_refresh_failure_count =
+                telegram_user_profiles.profile_refresh_failure_count + 1,
+            profile_refresh_retry_at = now() + least(
+                interval '1 minute'
+                    * power(2, least(telegram_user_profiles.profile_refresh_failure_count, 9)),
+                interval '6 hours'
+            ),
             updated_at = now()
         "#,
     )
@@ -961,6 +996,12 @@ pub async fn user_profile_needs_refresh(
                    and (
                         profile_refreshed_at is null
                         or personal_channel_refreshed_at is null
+                        or profile_refresh_error is not null
+                   )
+                   and (
+                        profile_refresh_error is null
+                        or profile_refresh_retry_at is null
+                        or profile_refresh_retry_at <= now()
                    )
                 from telegram_user_profiles
                 where telegram_user_id = $1

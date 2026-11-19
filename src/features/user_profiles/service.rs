@@ -43,8 +43,18 @@ pub async fn load_user_ids(
         where cu.chat_id = $1
           and (
               $2
-              or p.profile_refreshed_at is null
-              or p.personal_channel_refreshed_at is null
+              or (
+                  (
+                      p.profile_refreshed_at is null
+                      or p.personal_channel_refreshed_at is null
+                      or p.profile_refresh_error is not null
+                  )
+                  and (
+                      p.profile_refresh_error is null
+                      or p.profile_refresh_retry_at is null
+                      or p.profile_refresh_retry_at <= now()
+                  )
+              )
           )
           and (not $3 or cu.is_spammer)
           and not coalesce(p.is_bot, false)

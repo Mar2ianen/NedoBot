@@ -28,7 +28,10 @@ use uuid::Uuid;
 use tg_ai_bot_teloxide::{
     community::ChatRegistry,
     config::Config,
-    db::telegram::{UserProfileDetails, update_user_profile_details, upsert_user_profile},
+    db::telegram::{
+        UserProfileDetails, mark_user_profile_refresh_error, update_user_profile_details,
+        upsert_user_profile, user_profile_needs_refresh,
+    },
     features::{
         ask::{
             conversation_memory::{self, ConversationScope, ConversationTurn},
@@ -89,6 +92,7 @@ use tg_ai_bot_teloxide::{
             render_html, render_rich, repo as stats_repo,
             types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
         },
+        user_profiles::service::{RefreshUserProfilesQuery, load_user_ids},
         voice::{
             repo::{
                 VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
@@ -407,6 +411,41 @@ type PreservedProfileSnapshot = (
     DateTime<Utc>,
     Option<String>,
 );
+
+type ProfileRetryState = (
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    i32,
+    Option<String>,
+);
+
+fn synthetic_partial_profile_details(telegram_user_id: i64) -> UserProfileDetails {
+    let mut details = synthetic_profile_details(telegram_user_id);
+    details.photos_fetched = true;
+    details.profile_photo_file_id = Some("retry-profile-file".to_owned());
+    details.profile_photo_file_unique_id = Some("retry-profile-unique".to_owned());
+    details.profile_photo_count = Some(3);
+    // The reviewer counterexample: only `getChat` failed; photos and the
+    // personal channel succeeded, so both snapshot timestamps stay non-null.
+    details.personal_channel_refreshed_at = Some(Utc::now());
+    details.profile_refresh_error = Some("getChat failed: synthetic timeout".to_owned());
+    details
+}
+
+async fn load_profile_retry_state(pool: &PgPool, user_id: i64) -> ProfileRetryState {
+    query_as(
+        r#"
+        select profile_refreshed_at, profile_refresh_retry_at,
+               profile_refresh_failure_count, profile_refresh_error
+        from telegram_user_profiles
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("profile retry state must be readable")
+}
 
 fn synthetic_profile_suffix() -> i64 {
     (std::time::SystemTime::now()
@@ -736,6 +775,291 @@ async fn concurrent_profile_refreshes_share_one_lock_order() {
         .execute(&pool)
         .await
         .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic profile fixture must be removed");
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn partial_profile_refresh_retries_after_bounded_cooldown() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let suffix = synthetic_profile_suffix();
+    let user_id = 9_330_000_000_000 + suffix;
+    let chat_id = -1_009_330_000_000 - suffix;
+    let username = format!("r{suffix:08x}");
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic aliases must be removed");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic chat user must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic profile must be removed");
+
+    upsert_user_profile(&pool, &synthetic_profile_user(user_id, &username))
+        .await
+        .expect("synthetic profile must be created");
+    // Both snapshots are already confirmed. Only `getChat` will fail, so the
+    // scheduler must use `profile_refresh_error`, not a missing timestamp.
+    query(
+        r#"
+        update telegram_user_profiles
+        set profile_refreshed_at = '2020-01-01 00:00:00+00',
+            personal_channel_refreshed_at = '2020-01-02 00:00:00+00',
+            profile_refresh_error = null,
+            profile_refresh_failure_count = 0,
+            profile_refresh_retry_at = null
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("confirmed synthetic profile snapshots must be stored");
+    query(
+        "insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, 301)",
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic chat user must be created");
+    let refreshed_before: DateTime<Utc> = query_scalar(
+        "select profile_refreshed_at from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed profile timestamp must be readable");
+
+    update_user_profile_details(&pool, synthetic_partial_profile_details(user_id))
+        .await
+        .expect("partial profile refresh must commit");
+
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(
+        state.0,
+        Some(refreshed_before),
+        "a partial failure must keep the last successful profile snapshot"
+    );
+    assert_eq!(
+        state.2, 1,
+        "a partial failure must start the retry backoff counter"
+    );
+    assert_eq!(
+        state.3.as_deref(),
+        Some("getChat failed: synthetic timeout")
+    );
+    let first_retry_at = state.1.expect("a partial failure must schedule a retry");
+    let now = Utc::now();
+    assert!(
+        first_retry_at > now,
+        "the first retry must not be due immediately"
+    );
+    assert!(
+        first_retry_at <= now + Duration::minutes(2),
+        "the first retry must stay inside the bounded first cooldown"
+    );
+
+    let preserved_username: Option<String> =
+        query_scalar("select username from telegram_user_profiles where telegram_user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("partially refreshed username must be readable");
+    assert_eq!(preserved_username.as_deref(), Some(username.as_str()));
+    let alias_active: bool = query_scalar(
+        r#"
+        select is_active
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and source = 'user_update'
+          and username_normalized = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed username alias must remain present");
+    assert!(
+        alias_active,
+        "a partial failure must not deactivate the last confirmed alias"
+    );
+
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable"),
+        "the scheduler must not retry before the cooldown expires"
+    );
+    let selection = RefreshUserProfilesQuery {
+        chat_id,
+        limit: 10,
+        include_refreshed: false,
+        only_spammers: false,
+    };
+    assert!(
+        load_user_ids(&pool, &selection)
+            .await
+            .expect("batch profile selection must execute")
+            .is_empty(),
+        "the batch refresher must also respect the cooldown"
+    );
+
+    query(
+        "update telegram_user_profiles set profile_refresh_retry_at = now() - interval '1 second' where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic cooldown must be rewound");
+    assert!(
+        user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable"),
+        "the scheduler must retry a partial failure once the cooldown expires"
+    );
+    assert_eq!(
+        load_user_ids(&pool, &selection)
+            .await
+            .expect("batch profile selection must execute"),
+        vec![user_id],
+        "the batch refresher must pick the profile up when the cooldown expires"
+    );
+
+    // A second failure must increase, not reset, the backoff delay.
+    update_user_profile_details(&pool, synthetic_partial_profile_details(user_id))
+        .await
+        .expect("second partial profile refresh must commit");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(state.2, 2);
+    let second_retry_at = state
+        .1
+        .expect("second partial failure must schedule a retry");
+    let now = Utc::now();
+    assert!(
+        second_retry_at > now + Duration::seconds(60),
+        "the second retry must use the exponential step, not the base delay"
+    );
+    assert!(
+        second_retry_at < now + Duration::minutes(3),
+        "the second retry must stay inside the exponential step"
+    );
+
+    // A corrupted or very large counter must not produce an unbounded delay.
+    query(
+        r#"
+        update telegram_user_profiles
+        set profile_refresh_failure_count = 100,
+            profile_refresh_retry_at = now() - interval '1 second'
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic backoff counter must be seeded");
+    update_user_profile_details(&pool, synthetic_partial_profile_details(user_id))
+        .await
+        .expect("capped partial profile refresh must commit");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(state.2, 101);
+    let capped_retry_at = state.1.expect("capped failure must schedule a retry");
+    let now = Utc::now();
+    assert!(
+        capped_retry_at > now + Duration::hours(5) + Duration::minutes(58),
+        "the retry delay must remain close to the six-hour cap"
+    );
+    assert!(
+        capped_retry_at < now + Duration::hours(6) + Duration::minutes(2),
+        "the retry delay must never exceed the six-hour cap"
+    );
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable"),
+        "the capped retry must still respect the cooldown"
+    );
+
+    // A total failure must schedule a retry without pretending the profile
+    // snapshot is fresh.
+    mark_user_profile_refresh_error(&pool, user_id, "all profile APIs failed")
+        .await
+        .expect("total profile refresh error must be stored");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(
+        state.0,
+        Some(refreshed_before),
+        "a total failure must keep the last successful profile snapshot"
+    );
+    assert_eq!(state.2, 102);
+    assert_eq!(state.3.as_deref(), Some("all profile APIs failed"));
+    assert!(
+        state.1.expect("total failure must schedule a retry") > Utc::now(),
+        "a total failure must schedule a future retry"
+    );
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable")
+    );
+
+    // A successful refresh must clear the whole retry state.
+    let mut success = synthetic_profile_details(user_id);
+    success.chat_fetched = true;
+    success.photos_fetched = true;
+    success.username = Some(username.clone());
+    success.active_usernames = Some(vec![username.clone()]);
+    success.first_name = Some("Retried".to_owned());
+    success.personal_channel_refreshed_at = Some(Utc::now());
+    update_user_profile_details(&pool, success)
+        .await
+        .expect("successful profile refresh must commit");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(state.1, None, "success must clear the scheduled retry");
+    assert_eq!(state.2, 0, "success must reset the backoff counter");
+    assert_eq!(state.3, None, "success must clear the refresh error");
+    assert!(
+        state
+            .0
+            .expect("successful refresh must set the snapshot time")
+            > refreshed_before
+    );
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable")
+    );
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic chat user must be removed");
     query("delete from telegram_user_profiles where telegram_user_id = $1")
         .bind(user_id)
         .execute(&pool)
