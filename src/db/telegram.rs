@@ -51,6 +51,11 @@ pub struct MessagePersistenceOutcome {
 #[allow(dead_code)]
 pub struct UserProfileDetails {
     pub telegram_user_id: i64,
+    /// `getChat` succeeded, so its fields (including an absent username) are
+    /// authoritative for this snapshot.
+    pub chat_fetched: bool,
+    /// `getUserProfilePhotos` succeeded, so its fields are authoritative.
+    pub photos_fetched: bool,
     pub username: Option<String>,
     pub active_usernames: Option<Vec<String>>,
     pub first_name: Option<String>,
@@ -79,6 +84,7 @@ pub struct UserProfileDetails {
     pub personal_channel_refreshed_at: Option<DateTime<Utc>>,
     pub personal_channel_fetch_error: Option<String>,
     pub raw_json: serde_json::Value,
+    pub profile_refresh_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -699,6 +705,11 @@ pub async fn update_user_profile_details(
     details: UserProfileDetails,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
+    // Both profile writers must take the advisory snapshot lock before they
+    // touch the profile row. Otherwise `upsert_user_profile` can hold the
+    // advisory lock while waiting for this row, while this function holds the
+    // row and waits for the advisory lock inside alias replacement.
+    lock_telegram_peer_alias_snapshot(&mut tx, details.telegram_user_id).await?;
     let observation = ProfileIdentityObservation::from_details(&details);
     let usernames = details
         .active_usernames
@@ -732,38 +743,119 @@ pub async fn update_user_profile_details(
             $10, $11, $12, $13, $14,
             $15, $16,
             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-            $28, now(), null, now()
+            $28, case when $29 then now() else null end, $30, now()
         )
         on conflict (telegram_user_id) do update set
-            username = excluded.username,
-            first_name = coalesce(excluded.first_name, telegram_user_profiles.first_name),
-            last_name = coalesce(excluded.last_name, telegram_user_profiles.last_name),
-            bio = excluded.bio,
-            profile_photo_small_file_id = excluded.profile_photo_small_file_id,
-            profile_photo_small_file_unique_id = excluded.profile_photo_small_file_unique_id,
-            profile_photo_big_file_id = excluded.profile_photo_big_file_id,
-            profile_photo_big_file_unique_id = excluded.profile_photo_big_file_unique_id,
-            profile_photo_file_id = excluded.profile_photo_file_id,
-            profile_photo_file_unique_id = excluded.profile_photo_file_unique_id,
-            profile_photo_width = excluded.profile_photo_width,
-            profile_photo_height = excluded.profile_photo_height,
-            profile_photo_count = excluded.profile_photo_count,
-            emoji_status_custom_emoji_id = excluded.emoji_status_custom_emoji_id,
-            profile_accent_color_id = excluded.profile_accent_color_id,
-            personal_channel_chat_id = excluded.personal_channel_chat_id,
-            personal_channel_title = excluded.personal_channel_title,
-            personal_channel_username = excluded.personal_channel_username,
-            personal_channel_message_count = excluded.personal_channel_message_count,
-            personal_channel_last_message_id = excluded.personal_channel_last_message_id,
-            personal_channel_last_message_at = excluded.personal_channel_last_message_at,
-            personal_channel_last_text = excluded.personal_channel_last_text,
-            personal_channel_has_adult_links = excluded.personal_channel_has_adult_links,
-            personal_channel_raw_json = excluded.personal_channel_raw_json,
+            username = case when $29 then excluded.username else telegram_user_profiles.username end,
+            first_name = case
+                when $29 then coalesce(excluded.first_name, telegram_user_profiles.first_name)
+                else telegram_user_profiles.first_name
+            end,
+            last_name = case
+                when $29 then coalesce(excluded.last_name, telegram_user_profiles.last_name)
+                else telegram_user_profiles.last_name
+            end,
+            bio = case when $29 then excluded.bio else telegram_user_profiles.bio end,
+            profile_photo_small_file_id = case
+                when $29 then excluded.profile_photo_small_file_id
+                else telegram_user_profiles.profile_photo_small_file_id
+            end,
+            profile_photo_small_file_unique_id = case
+                when $29 then excluded.profile_photo_small_file_unique_id
+                else telegram_user_profiles.profile_photo_small_file_unique_id
+            end,
+            profile_photo_big_file_id = case
+                when $29 then excluded.profile_photo_big_file_id
+                else telegram_user_profiles.profile_photo_big_file_id
+            end,
+            profile_photo_big_file_unique_id = case
+                when $29 then excluded.profile_photo_big_file_unique_id
+                else telegram_user_profiles.profile_photo_big_file_unique_id
+            end,
+            profile_photo_file_id = case
+                when $31 then excluded.profile_photo_file_id
+                else telegram_user_profiles.profile_photo_file_id
+            end,
+            profile_photo_file_unique_id = case
+                when $31 then excluded.profile_photo_file_unique_id
+                else telegram_user_profiles.profile_photo_file_unique_id
+            end,
+            profile_photo_width = case
+                when $31 then excluded.profile_photo_width
+                else telegram_user_profiles.profile_photo_width
+            end,
+            profile_photo_height = case
+                when $31 then excluded.profile_photo_height
+                else telegram_user_profiles.profile_photo_height
+            end,
+            profile_photo_count = case
+                when $31 then excluded.profile_photo_count
+                else telegram_user_profiles.profile_photo_count
+            end,
+            emoji_status_custom_emoji_id = case
+                when $29 then excluded.emoji_status_custom_emoji_id
+                else telegram_user_profiles.emoji_status_custom_emoji_id
+            end,
+            profile_accent_color_id = case
+                when $29 then excluded.profile_accent_color_id
+                else telegram_user_profiles.profile_accent_color_id
+            end,
+            personal_channel_chat_id = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_chat_id
+                else telegram_user_profiles.personal_channel_chat_id
+            end,
+            personal_channel_title = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_title
+                else telegram_user_profiles.personal_channel_title
+            end,
+            personal_channel_username = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_username
+                else telegram_user_profiles.personal_channel_username
+            end,
+            personal_channel_message_count = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_message_count
+                else telegram_user_profiles.personal_channel_message_count
+            end,
+            personal_channel_last_message_id = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_last_message_id
+                else telegram_user_profiles.personal_channel_last_message_id
+            end,
+            personal_channel_last_message_at = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_last_message_at
+                else telegram_user_profiles.personal_channel_last_message_at
+            end,
+            personal_channel_last_text = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_last_text
+                else telegram_user_profiles.personal_channel_last_text
+            end,
+            personal_channel_has_adult_links = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_has_adult_links
+                else telegram_user_profiles.personal_channel_has_adult_links
+            end,
+            personal_channel_raw_json = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_raw_json
+                else telegram_user_profiles.personal_channel_raw_json
+            end,
             personal_channel_refreshed_at = excluded.personal_channel_refreshed_at,
             personal_channel_fetch_error = excluded.personal_channel_fetch_error,
-            profile_raw_json = excluded.profile_raw_json,
-            profile_refreshed_at = excluded.profile_refreshed_at,
-            profile_refresh_error = null,
+            profile_raw_json = case
+                when $29 then excluded.profile_raw_json
+                else telegram_user_profiles.profile_raw_json
+            end,
+            profile_refreshed_at = case
+                when $29 then excluded.profile_refreshed_at
+                else telegram_user_profiles.profile_refreshed_at
+            end,
+            profile_refresh_error = case when $29 then null else $30 end,
             updated_at = now()
         "#,
     )
@@ -795,33 +887,38 @@ pub async fn update_user_profile_details(
     .bind(details.personal_channel_refreshed_at)
     .bind(details.personal_channel_fetch_error)
     .bind(details.raw_json)
+    .bind(details.chat_fetched)
+    .bind(details.profile_refresh_error)
+    .bind(details.photos_fetched)
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
-        r#"
-        insert into telegram_profile_identity_observations
-            (telegram_user_id, snapshot_key, username_normalized, display_name_normalized, profile_photo_file_unique_id)
-        values ($1, $2, $3, $4, $5)
-        on conflict (telegram_user_id, snapshot_key) do update set last_seen_at = now()
-        "#,
-    )
-    .bind(observation.telegram_user_id)
-    .bind(observation.snapshot_key)
-    .bind(observation.username_normalized)
-    .bind(observation.display_name_normalized)
-    .bind(observation.profile_photo_file_unique_id)
-    .execute(&mut *tx)
-    .await?;
+    if details.chat_fetched {
+        sqlx::query(
+            r#"
+            insert into telegram_profile_identity_observations
+                (telegram_user_id, snapshot_key, username_normalized, display_name_normalized, profile_photo_file_unique_id)
+            values ($1, $2, $3, $4, $5)
+            on conflict (telegram_user_id, snapshot_key) do update set last_seen_at = now()
+            "#,
+        )
+        .bind(observation.telegram_user_id)
+        .bind(observation.snapshot_key)
+        .bind(observation.username_normalized)
+        .bind(observation.display_name_normalized)
+        .bind(observation.profile_photo_file_unique_id)
+        .execute(&mut *tx)
+        .await?;
 
-    replace_current_telegram_username_aliases_in_transaction(
-        &mut tx,
-        details.telegram_user_id,
-        TelegramPeerType::User,
-        "profile_refresh",
-        &usernames,
-    )
-    .await?;
+        replace_current_telegram_username_aliases_in_transaction(
+            &mut tx,
+            details.telegram_user_id,
+            TelegramPeerType::User,
+            "profile_refresh",
+            &usernames,
+        )
+        .await?;
+    }
 
     tx.commit().await?;
     Ok(())

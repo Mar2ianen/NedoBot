@@ -10,7 +10,11 @@ use std::{
 
 use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
+use sqlx::{
+    PgPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
+    query, query_as, query_scalar,
+};
 use teloxide::utils::time::TimeContext;
 use teloxide::{
     Bot,
@@ -24,6 +28,7 @@ use uuid::Uuid;
 use tg_ai_bot_teloxide::{
     community::ChatRegistry,
     config::Config,
+    db::telegram::{UserProfileDetails, update_user_profile_details, upsert_user_profile},
     features::{
         ask::{
             conversation_memory::{self, ConversationScope, ConversationTurn},
@@ -345,6 +350,397 @@ async fn captcha_wrong_answers_are_atomic_with_one_database_connection() {
         .execute(&pool)
         .await
         .expect("synthetic captcha must be removed");
+}
+
+fn synthetic_profile_user(id: i64, username: &str) -> teloxide::types::User {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "is_bot": false,
+        "first_name": "Synthetic",
+        "username": username
+    }))
+    .expect("synthetic Telegram profile must deserialize")
+}
+
+fn synthetic_profile_details(telegram_user_id: i64) -> UserProfileDetails {
+    UserProfileDetails {
+        telegram_user_id,
+        chat_fetched: false,
+        photos_fetched: false,
+        username: None,
+        active_usernames: None,
+        first_name: None,
+        last_name: None,
+        bio: None,
+        small_photo_file_id: None,
+        small_photo_file_unique_id: None,
+        big_photo_file_id: None,
+        big_photo_file_unique_id: None,
+        profile_photo_file_id: None,
+        profile_photo_file_unique_id: None,
+        profile_photo_width: None,
+        profile_photo_height: None,
+        profile_photo_count: None,
+        emoji_status_custom_emoji_id: None,
+        profile_accent_color_id: None,
+        personal_channel_chat_id: None,
+        personal_channel_title: None,
+        personal_channel_username: None,
+        personal_channel_message_count: None,
+        personal_channel_last_message_id: None,
+        personal_channel_last_message_at: None,
+        personal_channel_last_text: None,
+        personal_channel_has_adult_links: false,
+        personal_channel_raw_json: None,
+        personal_channel_refreshed_at: None,
+        personal_channel_fetch_error: None,
+        raw_json: serde_json::json!({}),
+        profile_refresh_error: None,
+    }
+}
+
+type PreservedProfileSnapshot = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    DateTime<Utc>,
+    Option<String>,
+);
+
+fn synthetic_profile_suffix() -> i64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_nanos()
+        % 900_000_000) as i64
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn partial_profile_refresh_preserves_confirmed_username_and_aliases() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let suffix = synthetic_profile_suffix();
+    let user_id = 9_310_000_000_000 + suffix;
+    let username = format!("a{suffix:08x}");
+
+    upsert_user_profile(&pool, &synthetic_profile_user(user_id, &username))
+        .await
+        .expect("synthetic profile must be created");
+    query(
+        r#"
+        update telegram_user_profiles
+        set first_name = 'Confirmed',
+            bio = 'confirmed bio',
+            profile_photo_small_file_id = 'old-small-file',
+            profile_photo_small_file_unique_id = 'old-small-unique',
+            profile_photo_file_id = 'old-profile-file',
+            profile_photo_file_unique_id = 'old-profile-unique',
+            profile_photo_count = 1,
+            profile_refreshed_at = '2020-01-01 00:00:00+00',
+            profile_refresh_error = null
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("confirmed synthetic profile snapshot must be stored");
+    let refreshed_before: DateTime<Utc> = query_scalar(
+        "select profile_refreshed_at from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed profile timestamp must be readable");
+
+    // `getChat` failed while `getUserProfilePhotos` succeeded. This must not
+    // turn the missing username into a confirmed username removal.
+    let mut partial = synthetic_profile_details(user_id);
+    partial.photos_fetched = true;
+    partial.profile_photo_file_id = Some("new-profile-file".to_owned());
+    partial.profile_photo_file_unique_id = Some("new-profile-unique".to_owned());
+    partial.profile_photo_width = Some(64);
+    partial.profile_photo_height = Some(64);
+    partial.profile_photo_count = Some(2);
+    partial.profile_refresh_error = Some("getChat failed: synthetic timeout".to_owned());
+    update_user_profile_details(&pool, partial)
+        .await
+        .expect("partial profile refresh must commit");
+
+    let preserved: PreservedProfileSnapshot = query_as(
+        r#"
+        select username, first_name, bio, profile_photo_small_file_id,
+               profile_refreshed_at, profile_refresh_error
+        from telegram_user_profiles
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("partially refreshed profile must be readable");
+    assert_eq!(preserved.0.as_deref(), Some(username.as_str()));
+    assert_eq!(preserved.1.as_deref(), Some("Confirmed"));
+    assert_eq!(preserved.2.as_deref(), Some("confirmed bio"));
+    assert_eq!(preserved.3.as_deref(), Some("old-small-file"));
+    assert_eq!(
+        preserved.4, refreshed_before,
+        "a failed getChat must not claim a fresher profile snapshot"
+    );
+    assert_eq!(
+        preserved.5.as_deref(),
+        Some("getChat failed: synthetic timeout")
+    );
+    let updated_photo: Option<String> = query_scalar(
+        "select profile_photo_file_id from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("independently fetched profile photo must be stored");
+    assert_eq!(updated_photo.as_deref(), Some("new-profile-file"));
+    let alias_active: bool = query_scalar(
+        r#"
+        select is_active
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and source = 'user_update'
+          and username_normalized = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed username alias must remain present");
+    assert!(
+        alias_active,
+        "a failed getChat must not deactivate the last confirmed alias"
+    );
+
+    // A successful getChat without a username is authoritative and must clear
+    // the alias, unlike the failed call above.
+    let mut confirmed_removal = synthetic_profile_details(user_id);
+    confirmed_removal.chat_fetched = true;
+    confirmed_removal.photos_fetched = true;
+    confirmed_removal.first_name = Some("Alice".to_owned());
+    confirmed_removal.profile_photo_file_id = Some("new-profile-file".to_owned());
+    confirmed_removal.profile_photo_file_unique_id = Some("new-profile-unique".to_owned());
+    confirmed_removal.profile_photo_count = Some(2);
+    update_user_profile_details(&pool, confirmed_removal)
+        .await
+        .expect("confirmed username removal must commit");
+
+    let removed: (Option<String>, DateTime<Utc>, Option<String>) = query_as(
+        "select username, profile_refreshed_at, profile_refresh_error from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed removal must be readable");
+    assert_eq!(removed.0, None);
+    assert!(removed.1 > refreshed_before);
+    assert_eq!(removed.2, None);
+    let alias_active: bool = query_scalar(
+        r#"
+        select is_active
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and source = 'user_update'
+          and username_normalized = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .expect("historically confirmed alias must remain readable");
+    assert!(
+        !alias_active,
+        "a successful getChat without a username must clear the alias"
+    );
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic profile fixture must be removed");
+}
+
+async fn wait_for_profile_observation_pause(pool: &PgPool, application_name: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let paused: bool = query_scalar(
+            r#"
+            select exists(
+                select 1
+                from pg_stat_activity
+                where datname = current_database()
+                  and application_name = $1
+                  and wait_event = 'PgSleep'
+                  and query like '%telegram_profile_identity_observations%'
+            )
+            "#,
+        )
+        .bind(application_name)
+        .fetch_one(pool)
+        .await
+        .expect("profile pause state must be readable");
+        if paused {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "profile detail transaction did not reach the observation insert pause"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn concurrent_profile_refreshes_share_one_lock_order() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let suffix = synthetic_profile_suffix();
+    let user_id = 9_320_000_001_i64;
+    let initial_username = format!("l{suffix:08x}");
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic aliases must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic profile must be removed");
+    upsert_user_profile(&pool, &synthetic_profile_user(user_id, &initial_username))
+        .await
+        .expect("synthetic profile must be created");
+
+    let application_name = format!("synthetic-profile-lock-{suffix}");
+    let details_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            database_url
+                .parse::<PgConnectOptions>()
+                .expect("test database URL must parse")
+                .application_name(&application_name),
+        )
+        .await
+        .expect("profile detail pool must connect");
+
+    query(
+        "drop trigger if exists synthetic_profile_pause on telegram_profile_identity_observations",
+    )
+    .execute(&pool)
+    .await
+    .expect("previous profile pause trigger must be removable");
+    query("drop function if exists synthetic_profile_pause()")
+        .execute(&pool)
+        .await
+        .expect("previous profile pause function must be removable");
+    query(
+        "create function synthetic_profile_pause() returns trigger language plpgsql as $$ begin perform pg_sleep(1.0); return new; end; $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("profile pause trigger function must be created");
+    query(
+        "create trigger synthetic_profile_pause before insert on telegram_profile_identity_observations for each row when (new.telegram_user_id = 9320000001) execute function synthetic_profile_pause()",
+    )
+    .execute(&pool)
+    .await
+    .expect("profile pause trigger must be created");
+
+    let mut details = synthetic_profile_details(user_id);
+    details.chat_fetched = true;
+    details.photos_fetched = true;
+    details.username = Some(format!("d{suffix:08x}"));
+    details.first_name = Some("Refresh".to_owned());
+    let details_task =
+        tokio::spawn(async move { update_user_profile_details(&details_pool, details).await });
+    wait_for_profile_observation_pause(&pool, &application_name).await;
+
+    let upsert_pool = pool.clone();
+    let upsert_task = tokio::spawn(async move {
+        upsert_user_profile(
+            &upsert_pool,
+            &synthetic_profile_user(user_id, &format!("u{suffix:08x}")),
+        )
+        .await
+    });
+
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        (
+            details_task.await.expect("detail writer task must join"),
+            upsert_task.await.expect("upsert writer task must join"),
+        )
+    })
+    .await
+    .expect("concurrent profile writers must not hang");
+
+    query("drop trigger synthetic_profile_pause on telegram_profile_identity_observations")
+        .execute(&pool)
+        .await
+        .expect("profile pause trigger must be removed");
+    query("drop function synthetic_profile_pause()")
+        .execute(&pool)
+        .await
+        .expect("profile pause trigger function must be removed");
+
+    joined
+        .0
+        .expect("profile detail writer must not be a deadlock victim");
+    joined
+        .1
+        .expect("profile upsert writer must not be a deadlock victim");
+    let active_aliases: i64 = query_scalar(
+        r#"
+        select count(*)
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and is_active
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("active alias count must be readable");
+    assert_eq!(
+        active_aliases, 1,
+        "one serialized profile writer must leave one current alias"
+    );
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic profile fixture must be removed");
 }
 
 async fn assert_ingest_disabled_is_noop(pool: &PgPool) {
