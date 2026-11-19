@@ -1,9 +1,9 @@
 # Интеграционный аудит NedoBot PR #126–#173
 
-Дата: 2026-11-18. База: `main` @ `7b8815bbff80c4665b64076a063f5f4919e5465a` (merge #126).
+Дата: 2026-11-19 (обновлено после первого ревью PR #174). База: `main` @ `7b8815bbff80c4665b64076a063f5f4919e5465a` (merge #126).
 Интеграционная ветка: `codex/integration-audit-126-173`, PR #174.
-Проверенный кодовый SHA: `fad47108be20d3ecfbfb49bc6c33ac5b738715d8`.
-CI на этом SHA: push run [44332252764](https://github.com/Mar2ianen/NedoBot/actions/runs/44332252764) — success, PR run [44332310153](https://github.com/Mar2ianen/NedoBot/actions/runs/44332310153) — success. Отчётный коммит меняет только этот файл и `testing/QUALITY_FINAL.md`, то есть не меняет проверенный код; его exact-head run виден в checks PR #174.
+Проверенный кодовый SHA: `8fb79865a58bbbd059a47041e38ff20835561d48`.
+CI на этом SHA: push run [44527048887](https://github.com/Mar2ianen/NedoBot/actions/runs/44527048887) — success, PR run [44527057457](https://github.com/Mar2ianen/NedoBot/actions/runs/44527057457) — success. Отчётный коммит меняет только этот файл и `testing/QUALITY_FINAL.md`, то есть не меняет проверенный код; его exact-head run виден в checks PR #174.
 
 ## 1. DAG и фактическая последовательность интеграции
 
@@ -56,6 +56,7 @@ tests/postgres_migrations.rs
 | P1.3 | P1 | #139/#158 | `src/telegram/router/commands.rs:6`; `src/telegram/router/mod.rs:36` | fixed | Тесты макроса не доказывали production graph; корневой `filter_message()` мог поглощать не-message updates. После тесты вызывают `telegram::router::build(Routes { … })`; command идёт до ordinary message, edited/reaction/reaction_count/callback/member изолированы, unsupported — без side effects | `actual_router_builder_prefers_command_and_falls_back_for_unknown_command`, `…routes_edits…`, `…routes_reaction…`, `…routes_callback_updates_once`, `…has_no_side_effects…` | Ручной branch-order mutant убит production-тестом (`scripts/run_router_order_mutation.sh`) | `fad4710` + `cc82a0e` + `d1a6d36` | ACK ровно один раз проверяется на уровне callback adapter (`callbacks.rs`), не в dptree graph |
 | P1.4 | P1 | #144 `727872a` | `src/features/jobs/worker.rs:159`, `:182`, `:242` | fixed | Worker завершался/паниковал, процесс продолжал жить. После return/panic/abort → typed `WorkerFailure` после bounded drain; graceful dispatcher shutdown — не fatal; drain timeout абортит и дропает зависшие задачи | 10 worker lifecycle tests, включая `unexpected_worker_{completion,panic,abort}_fails_foreground_supervision`, `completed_foreground_drains_workers_without_fatal_error`, `drain_timeout_aborts_and_drops_stuck_workers`, `record_exit_logs_graceful_and_unexpected_completion_differently` | 4 caught, 1 unviable (`record_exit` → `Some(Default::default())`) | `26dd88b` + `727872a` | systemd/restart policy в репозитории не проверялась и не заявляется |
 | P1.5 | P1 | #171–#173 | `scripts/test.sh:7`; `.github/workflows/quality-nightly.yml:33` | fixed | `cargo test --no-default-features --workspace --all-targets --locked`: было 20 failed из-за production TOML/env и feature-gates; после — `392 passed, 0 failed, 4 ignored`. URL-тест больше не вызывает `Config::from_env()` | Полный no-default workspace suite; `fetch_urls_never_forwards_blocked_ip_literals_and_keeps_lookalike_hosts_distinct` на синтетическом config | — | `b5e7a25` + `314f26e` | 4 ignored — только PG-тесты, требующие disposable БД; они запускаются отдельными lanes |
+| P1.6 | P1 | ревью #174 / `8fb7986` | `src/features/user_profiles/service.rs:102`, `:143`; `src/db/telegram.rs:703` | fixed | `getChat` ошибка + успешный `getUserProfilePhotos`: до — `username=NULL`, alias deactivated, `profile_refreshed_at=now()`; после — обновляются только photo-поля, username/first_name/bio/chat-photo/timestamp сохраняются, ошибка пишется в `profile_refresh_error`; успешный `getChat` без username по-прежнему очищает alias | `partial_profile_refresh_preserves_confirmed_username_and_aliases`; unit `failed_chat_fetch_is_not_a_confirmed_username_removal`, `successful_chat_without_username_is_authoritative` | 2/2 caught: снятие guard с username → падение на сохранённом username; снятие guard с alias replacement → падение на active alias | `8fb7986` | `mark_user_profile_refresh_error` при полном отказе всех API по-прежнему ставит `profile_refreshed_at=now()` (существующее поведение, не менялось); production-данные не использовались |
 | P2.1 | P2 | #127 `6b24f04` | `src/db/telegram.rs:150`, `:618` | reproduced + fixed | Два первых upsert одного peer с разными username не сериализовались: `SELECT … FOR UPDATE` не блокирует отсутствующую строку, оба видели `previous = None`. После — `pg_advisory_xact_lock` до первого чтения; 32 барьерных итерации и reassignment между двумя owners дают ровно один актуальный alias | `current_username_aliases_resolve_only_fresh_unique_owners` + `url_alias_churn::assert_current_alias_resolution` | — (concurrency test) | `dfd7057` + `426eef1` | Advisory lock сериализует обновления одного Telegram peer; это осознанная цена за согласованность |
 | P2.2 | P2 | #127/#131 | `src/features/url_relations.rs:698`, `:944` | fixed | Две модели (`telegram_username_aliases` vs свежие `telegram_user_profiles`) могли расходиться. После — одна authoritative current-ownership таблица/сервис; `Unknown`/`Ambiguous` остаются fail-closed; QR relation не создаёт `Affiliated` при reassignment | `current_username_aliases_resolve_only_fresh_unique_owners`; QR/URL relation tests | — | `426eef1` + `7906e2d` | 24h freshness и SQL privilege `nedobot_mcp_ro` проверены на synthetic PG; production-данные не использовались |
 | P2.3 | P2 | #166 `bdc7dd1` | `src/features/chat_read_api/query.rs:1228`; `tests/chat_db_mcp.rs:360` | confirmed coverage gap + fixed | Property генерировал только `1..=i64::MAX`, а Telegram group IDs отрицательны. После генерируются `-i64::MAX..=-1` и явные `-100…`/`-2003`; два инстанса на двух БД не видят чужие messages/notes/profile; mutant scope condition убивается | `generated_forged_chat_ids_are_rejected_by_scope_policy`; `independent_community_databases_generate_manifests_and_start_isolated_mcp_servers` | 3/3 caught | `b5e7a25` | Тест synthetic PG; cursor/filter scope проверяется существующими MCP-тестами |
@@ -63,9 +64,10 @@ tests/postgres_migrations.rs
 | P2.5 | P2 | #170 | `src/features/search/mcp.rs:563` | confirmed data exposure path + fixed | В warning писался сырой `url` с path/query/token. После логируются source, host и failure code; URL path/query не пишутся. Тест `https://example.com/private?token=SYNTHETIC_SECRET` доказывает отсутствие секрета | `fetch_failure_event_does_not_include_url_path_or_query_secret` | — | `7906e2d` | Host остаётся в логе намеренно; это публичная часть URL |
 | P2.6 | P2 | #173 `f6f552a` | `.github/workflows/quality-nightly.yml:33`; `scripts/run_quality_nightly.sh` | fixed | Nightly запускал 3 seed только для `adversarial_harness`; T07–T14 в `--lib`/`--bin`/`postgres_migrations` не стрессировались. После — 28 явных selectors × 3 fixed seed = 84 executions, manifest `SHA/seed/case`; stateful PG job пишет свой target-level manifest | `sh scripts/run_quality_nightly.sh` (84/84 passed); checked runner отвергает 0 tests | — | `314f26e` | DB/fake-subprocess cases остаются в отдельной disposable lane с bounded timeout |
 | P2.7 | P2 | #154/#173 | `scripts/test.sh:18` | fixed | Локальный script не запускал URL-shadow lock/cancellation и URL inventory PG scenarios, которые были только в CI. После — 17 checked invocations, включая shadow lock/cancel, inventory, private history и moderation | `sh scripts/test.sh`: 779 workspace + integration, 0 failed; 17 checked invocations | — | `314f26e` | Локальный script требует Podman/PostgreSQL на 5433 и не является production-командой |
+| P2.8 | P2 | ревью #174 / `8fb7986` | `src/db/telegram.rs:712`, `:634`, `:129` | fixed | `upsert_user_profile`: advisory lock → profile row; `update_user_profile_details`: profile row → observation → advisory lock. Конкурентные writers дают `40P01` deadlock. После — оба берут advisory lock до первого write в profile row; trigger-pause regression проверяет реальные locks | `concurrent_profile_refreshes_share_one_lock_order` (две транзакции, trigger `pg_sleep` после row lock, ожидание по `pg_stat_activity` `PgSleep`) | 1/1 caught: удаление advisory lock в начале `update_user_profile_details` → `deadlock detected` | `8fb7986` | Regression использует synthetic trigger-pause 1s; другие writers alias-таблицы уже берут advisory первым, `mark_user_profile_refresh_error` не берёт advisory и не создаёт цикл |
 | P3.1 | P3 | #158/#164 | `src/features/first_comment/pipeline.rs:744`; `src/features/spam_review.rs:1130` | risk / unverified | Часть fake TCP-серверов ждёт `accept()`/`join()` без явного deadline; при регрессии возможен hang до общего CI timeout. `rmcp_transport` уже использует `within_e2e_timeout` | Не добавлялся отдельный regression: не доказан реальный hang в текущем suite | — | — | Не входит в P1; рекомендуется bounded accept/teardown отдельным test-hygiene PR |
 
-## 3. Результаты проверок на `fad4710`
+## 3. Результаты проверок на `8fb7986`
 
 Все команды выполнены в дереве интеграции; `TMPDIR` указывал внутрь `target/tmp`.
 
@@ -73,7 +75,7 @@ tests/postgres_migrations.rs
 cargo fmt --all -- --check
 git diff --check
 cargo check --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo test --no-default-features --workspace --all-targets --locked
 sh scripts/test_feature_matrix.sh
@@ -91,13 +93,13 @@ python3 -m unittest discover -s tests -p 'test_public_url_corpus.py'
 |---|---|
 | `cargo fmt --all -- --check`, `git diff --check` | passed |
 | `cargo check --workspace --all-targets --locked` | passed |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
-| Default workspace/all-targets | **779 passed, 0 failed, 22 ignored** |
-| No-default workspace/all-targets | **392 passed, 0 failed, 4 ignored** |
+| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | passed |
+| Default workspace/all-targets | **781 passed, 0 failed, 24 ignored** |
+| No-default workspace/all-targets | **394 passed, 0 failed, 4 ignored** |
 | `scripts/test_feature_matrix.sh` | default/no-default check + gate test — passed |
-| `scripts/test.sh` | 17 checked invocations, **0 failed**; workspace 779 passed |
+| `scripts/test.sh` | 17 checked invocations, **0 failed**; workspace 781 passed; оба profile regression прошли |
 | `scripts/run_quality_nightly.sh` | **84/84** executions (28 selectors × 3 seeds) |
-| Targeted mutations | URL 2/2, MCP scope 3/3, classifier 4/4 caught; worker 4 caught + 1 unviable; router branch-order manual mutant killed |
+| Targeted mutations | URL 2/2, MCP scope 3/3, classifier 4/4 caught; worker 4 caught + 1 unviable; router branch-order manual mutant killed; profile partial 2/2 caught; profile lock order 1/1 caught |
 | Python release/spam/checked/corpus | 2 + 2 + 4 + 5 passed |
 | Coverage baseline (T16) | 42.25% lines, 47.95% regions, 45.91% functions; не является gate |
 
@@ -109,9 +111,11 @@ Versions: `rustc 1.100.0 (0ef1bc386 2026-11-09)`, `cargo 1.100.0`, `cargo-mutant
 - Classifier: до — `http_503` и вложенный typed 429 могли стать `error`; после — `http_503`, `http_429`, `timeout`, `validation_failed`, а spoof-текст остаётся `error`.
 - Router: до — тест мог проверять макрос, не production graph; после — тест вызывает `router::build` и убивает перестановку command/message.
 - Worker: до — `record_exit` мог вернуть `None`/потерять fatal exit; после — bounded drain + typed fatal, mutation не проходит.
-- No-default: до — 20 failed; после — `392 passed, 0 failed, 4 ignored`.
+- No-default: до — 20 failed; после — `392 passed, 0 failed, 4 ignored`; на финальном дереве с новыми unit-тестами — `394 passed, 0 failed, 4 ignored`.
 - Alias race: до — два первых upsert могли оставить два active alias; после — advisory lock и ровно один active alias на 32 барьерных итерациях.
 - MCP scope: до — property не проверял отрицательные Telegram chat IDs; после — проверяет и убивает mutant scope condition.
+- Profile partial fetch: до — ошибка `getChat` при успешных photos обнуляла username, деактивировала aliases и ставила свежий `profile_refreshed_at`; после — источник-специфичные guard-ы сохраняют подтверждённые поля, а успешный `getChat` без username остаётся авторитетным удалением.
+- Profile writers: до — `upsert_user_profile` брал advisory lock до profile row, а `update_user_profile_details` — наоборот, что давало `40P01`; после — единый порядок advisory lock → profile row.
 
 ## 5. Безопасность и границы доверия
 
@@ -123,5 +127,21 @@ Versions: `rustc 1.100.0 (0ef1bc386 2026-11-09)`, `cargo 1.100.0`, `cargo-mutant
 
 1. P1.1 DNS/redirect: нужен контроль адреса фактического соединения и каждого redirect hop либо контракт с доверенным fetch-провайдером. Текущий фильтр проверяет только URL-аргумент.
 2. P3.1: часть fake TCP-серверов не имеет bounded accept/read/join; это test hygiene, не production-дефект. Рекомендуется отдельный PR.
-3. CI на кодовом SHA `fad4710`: push run [44332252764](https://github.com/Mar2ianen/NedoBot/actions/runs/44332252764) — success (11m54s), PR run [44332310153](https://github.com/Mar2ianen/NedoBot/actions/runs/44332310153) — success (15m45s). Все job-шаги, включая PostgreSQL lanes, прошли. Отчётный коммит docs-only; его exact-head run — в checks PR #174.
+3. CI на кодовом SHA `8fb7986`: push run [44527048887](https://github.com/Mar2ianen/NedoBot/actions/runs/44527048887) — success (14m43s), PR run [44527057457](https://github.com/Mar2ianen/NedoBot/actions/runs/44527057457) — success (13m57s). Все job-шаги, включая PostgreSQL lanes, прошли. Отчётный коммит docs-only; его exact-head run — в checks PR #174.
 4. Ветка не merge/deploy; production `main` не изменён.
+
+## 7. Повторная проверка после первого ревью (2026-11-19)
+
+Первый ревью PR #174 выявил два новых дефекта в обновлении Telegram-профилей. Оба воспроизведены на synthetic disposable PostgreSQL и закрыты в `8fb7986`; production-данные не использовались.
+
+### P1.6. Частичный отказ API больше не удаляет подтверждённый профиль
+
+`refresh_profile` выполняет три независимых запроса. Ранее при ошибке `getChat` и успешном `getUserProfilePhotos` вызов `update_user_profile_details` записывал `username = NULL`, деактивировал aliases и ставил `profile_refreshed_at = now()`. Теперь `UserProfileDetails` несёт `chat_fetched`/`photos_fetched` и ошибку `getChat`; SQL обновляет поля только из успешно полученных источников. При частичном отказе сохраняются username, имя, bio, chat-photo, прежний `profile_refreshed_at` и aliases; обновляются только photo-поля и `profile_refresh_error`. При успешном `getChat` без username aliases по-прежнему очищаются, потому что это подтверждённое удаление.
+
+Failing-before: снятие guard-а с `username` даёт `left: None, right: Some("a…")`; снятие guard-а с alias replacement даёт `a failed getChat must not deactivate the last confirmed alias`. Passing-after: оба теста проходят на финальном дереве. Regression: `partial_profile_refresh_preserves_confirmed_username_and_aliases`, unit-тесты `failed_chat_fetch_is_not_a_confirmed_username_removal` и `successful_chat_without_username_is_authoritative`.
+
+### P2.8. Единый порядок блокировок profile writers
+
+`upsert_user_profile` брал advisory lock, затем блокировал profile row. `update_user_profile_details` сначала делал UPSERT profile row, затем внутри alias replacement брал advisory lock. При конкурентном исполнении PostgreSQL возвращал `40P01 deadlock detected`. Теперь `update_user_profile_details` берёт `lock_telegram_peer_alias_snapshot()` до первого write в profile row, как и `upsert_user_profile`.
+
+Failing-before: удаление новой advisory-блокировки воспроизводит `deadlock detected at line 1130`; regression `concurrent_profile_refreshes_share_one_lock_order` завершает одну из транзакций ошибкой. Passing-after: обе транзакции коммитятся, остаётся ровно один active alias. Синхронизация теста идёт по реальному состоянию PostgreSQL: trigger ставит `pg_sleep` после захвата profile row, тест ждёт `wait_event = 'PgSleep'` в `pg_stat_activity`, затем запускает второй writer.

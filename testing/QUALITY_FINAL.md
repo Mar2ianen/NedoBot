@@ -8,6 +8,11 @@ Audit snapshot: 2026-11-18. Baseline main SHA: `7b8815bbff80c4665b64076a063f5f49
 > [PR_126_173_INTEGRATION_AUDIT.md](reports/PR_126_173_INTEGRATION_AUDIT.md).
 > Where that report supersedes the per-PR notes below, the integration report
 > takes precedence.
+>
+> Re-review update (2026-11-19): code SHA `8fb7986` fixes the partial
+> `getChat` profile deletion (P1.6) and the inverted profile-writer lock order
+> (P2.8). Both have failing-before/passing-after PostgreSQL regressions in the
+> integration report.
 
 ## Test contours and evidence
 
@@ -40,11 +45,11 @@ Audit snapshot: 2026-11-18. Baseline main SHA: `7b8815bbff80c4665b64076a063f5f49
 
 ## Open risks and gaps
 
-1. The whole no-default workspace test suite was red in the T00 baseline (20 config-dependent failures). The integration branch replaces the production-config test fixture with a synthetic config and the full no-default workspace/all-targets run now reports 392 passed, 0 failed, 4 ignored; the four ignored tests require disposable PostgreSQL. See the integration report.
+1. The whole no-default workspace test suite was red in the T00 baseline (20 config-dependent failures). The integration branch replaces the production-config test fixture with a synthetic config and the full no-default workspace/all-targets run now reports 394 passed, 0 failed, 4 ignored; the four ignored tests require disposable PostgreSQL. See the integration report.
 2. Search fetching is delegated to external MCP providers. Local syntax/IP-literal filtering cannot verify the remote provider's DNS result or each redirect. DNS rebinding and redirect-to-private-address behavior remain unproven; see T14.
 3. `cargo-fuzz` and nightly are unavailable in the local environment. No sanitizer fuzz run or fuzz target is claimed; deterministic proptest properties are the executed alternative.
 4. Current `main` still launches long-lived workers detached. The integration branch now contains PR #144 plus a bounded-drain correction: unexpected worker completion is fatal after bounded drain, with ten local lifecycle tests and a killed fatal-exit mutation. `main` itself is unchanged until a reviewed merge; no merge or deploy was performed here.
-5. The 22 ignored tests in the integrated workspace run are not all covered by `scripts/test.sh`; live `/ask` smoke is intentionally excluded because it would require external services. Safe PostgreSQL ignored tests are run in dedicated local/CI lanes.
+5. The 24 ignored tests in the integrated workspace run are not all covered by `scripts/test.sh`; live `/ask` smoke is intentionally excluded because it would require external services. Safe PostgreSQL ignored tests are run in dedicated local/CI lanes.
 6. Coverage aggregates include binary glue with no direct unit tests and do not establish assertion quality. Low lines in command handling and moderation are prioritized for further focused cases rather than a global coverage threshold.
 
 ## PR audit snapshot
