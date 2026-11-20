@@ -34,10 +34,11 @@ QR PNG воспроизводится командой `qrencode -s 5 -o tests/f
 'https://t.me/fixture_qr_alias/123'`; ссылка не открывается. Ни production DB,
 ни Telegram, ни внешние MCP/LLM, ни приватные корпуса для этих тестов не использовались.
 
-Промежуточные проверки на рабочем дереве: `cargo clippy --workspace
+Локальные проверки: `cargo clippy --workspace
 --all-targets --all-features --locked -- -D warnings` и `cargo check --workspace
---all-targets --no-default-features --locked` прошли. В `scripts/test.sh`
-workspace-этап: 781 passed, 0 failed, 28 ignored; это не итог PG-этапа.
+--all-targets --no-default-features --locked` прошли. Полный `scripts/test.sh`
+завершился с кодом 0: workspace-этап 781 passed, 0 failed, 30 ignored;
+после него 31 успешное исполнение в PG-ланах (включая повторные селекторы).
 Отдельный default-disabled прогон workspace/all-targets: 394 passed, 0 failed,
 4 ignored; `scripts/test_feature_matrix.sh` прошёл для default и no-default.
 
