@@ -5,7 +5,7 @@ use std::sync::{
 
 use axum::{Json, Router, extract::State, http::Uri, routing::post};
 use serde_json::{Value, json};
-use sqlx::{PgPool, query, query_scalar};
+use sqlx::{PgPool, postgres::PgPoolOptions, query, query_scalar};
 use teloxide::Bot;
 use tg_ai_bot_teloxide::features::{
     new_user_audit::repo::NewUserAuditJob,
@@ -163,6 +163,63 @@ async fn assert_non_member_reply(
         CaptchaOutcome::Ineligible
     );
     assert_eq!(send_count(stub), 0);
+
+    // Telegram может применить restriction, но вернуть ошибку до durable marker.
+    // При повторной сверке совпавшие permissions не доказывают владение CAPTCHA,
+    // поэтому бот должен оставить ограничение и отказаться от автоматического restore.
+    reset_commenter(pool).await;
+    stub.non_member.store(false, Ordering::SeqCst);
+    stub.stateful.store(true, Ordering::SeqCst);
+    stub.restricted.store(false, Ordering::SeqCst);
+    stub.fail_restrict_after_effect
+        .store(true, Ordering::SeqCst);
+    stub.calls.lock().unwrap().clear();
+    assert!(apply_risk_captcha(bot, pool, job, 100, 600).await.is_err());
+    let ambiguous: (String, bool) = sqlx::query_as(
+        "select status, restriction_applied_at is null from telegram_risk_captcha_challenges where chat_id=$1",
+    )
+    .bind(CHAT_ID)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ambiguous.0, "preparing");
+    assert!(
+        ambiguous.1,
+        "failed API response cannot create ownership proof"
+    );
+    assert!(stub.restricted.load(Ordering::SeqCst));
+    assert_eq!(
+        stub.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "restrictchatmember")
+            .count(),
+        1,
+        "the ambiguous initial API call must have occurred exactly once"
+    );
+    stub.calls.lock().unwrap().clear();
+    query(
+        "update telegram_risk_captcha_challenges set setup_next_attempt_at=now() where chat_id=$1",
+    )
+    .bind(CHAT_ID)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        apply_risk_captcha(bot, pool, job, 100, 600).await.unwrap(),
+        CaptchaOutcome::Overridden,
+        "reconciliation must fail closed when ownership is unknown"
+    );
+    assert!(stub.restricted.load(Ordering::SeqCst));
+    assert!(!stub.calls.lock().unwrap().iter().any(|(method, _)| {
+        matches!(
+            method.as_str(),
+            "unrestrictchatmember" | "restrictchatmember"
+        )
+    }));
+    stub.stateful.store(false, Ordering::SeqCst);
+    stub.restricted.store(false, Ordering::SeqCst);
 }
 
 #[derive(Default)]
@@ -170,6 +227,7 @@ struct TelegramStub {
     calls: Mutex<Vec<(String, Value)>>,
     fail_delete: AtomicBool,
     fail_send: AtomicBool,
+    fail_restrict_after_effect: AtomicBool,
     non_member: AtomicBool,
     omit_ephemeral_id: AtomicBool,
     restricted: AtomicBool,
@@ -197,6 +255,16 @@ async fn telegram_api(
                 payload["permissions"]["can_send_messages"] != true,
                 Ordering::SeqCst,
             );
+            if stub
+                .fail_restrict_after_effect
+                .swap(false, Ordering::SeqCst)
+            {
+                return Json(json!({
+                    "ok": false,
+                    "error_code": 500,
+                    "description": "simulated ambiguous Telegram restriction result"
+                }));
+            }
             json!(true)
         }
         "banchatmember" if stub.stateful.load(Ordering::SeqCst) => {
@@ -287,6 +355,30 @@ fn send_count(stub: &TelegramStub) -> usize {
 }
 
 pub async fn assert_cleanup(pool: &PgPool) {
+    // A source check inside a transaction must reuse its connection. With a
+    // single-connection pool the previous pool-based call deadlocked forever.
+    let single_connection = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("TEST_DATABASE_URL").expect("test DB URL is required"))
+        .await
+        .expect("single-connection test pool must connect");
+    let mut tx = single_connection.begin().await.unwrap();
+    let current = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tg_ai_bot_teloxide::features::decision_audit::repo::captcha_source_is_current_in_tx(
+            &mut tx,
+            i64::MAX,
+            CHAT_ID,
+            USER_ID,
+        ),
+    )
+    .await
+    .expect("captcha source check must not wait for a second pool connection")
+    .unwrap();
+    assert!(!current, "nonexistent decision source must fail closed");
+    tx.rollback().await.unwrap();
+    single_connection.close().await;
+
     query(
         r#"insert into telegram_new_user_profile_audits
              (chat_id, telegram_user_id, first_message_id, last_message_id,
@@ -345,6 +437,9 @@ pub async fn assert_cleanup(pool: &PgPool) {
         avatar_file_id: None,
         avatar_file_unique_id: None,
         assessment_json: None,
+        status: tg_ai_bot_teloxide::features::new_user_audit::repo::NewUserAuditStatus::Succeeded,
+        materialization_status:
+            tg_ai_bot_teloxide::features::new_user_audit::repo::MaterializationStatus::Processing,
         review_threshold: 70,
         attempts: 1,
         generation_fence: 1,

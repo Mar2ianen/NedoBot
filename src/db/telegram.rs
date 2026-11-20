@@ -1,5 +1,5 @@
-use sqlx::PgPool;
 use sqlx::types::chrono::{DateTime, Utc};
+use sqlx::{PgPool, Postgres, Transaction};
 use teloxide::{
     prelude::*,
     types::{
@@ -10,7 +10,9 @@ use teloxide::{
 
 use crate::config::Config;
 use crate::features::chat_retrieval::enqueue_message_embedding_if_enabled;
-use crate::telegram::entities::{forwarded_channel_post, message_has_links, message_text};
+use crate::telegram::entities::{
+    MessageRevision, TelegramMessageProjection, TelegramMessageRef, message_has_links, message_text,
+};
 use crate::text::normalize_cyrillic_homoglyphs;
 
 struct MemberSnapshot {
@@ -39,10 +41,23 @@ struct StoredMessageSnapshot {
     raw_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessagePersistenceOutcome {
+    pub message: TelegramMessageRef,
+    pub revision: MessageRevision,
+    pub inserted: bool,
+}
+
 #[allow(dead_code)]
 pub struct UserProfileDetails {
     pub telegram_user_id: i64,
+    /// `getChat` succeeded, so its fields (including an absent username) are
+    /// authoritative for this snapshot.
+    pub chat_fetched: bool,
+    /// `getUserProfilePhotos` succeeded, so its fields are authoritative.
+    pub photos_fetched: bool,
     pub username: Option<String>,
+    pub active_usernames: Option<Vec<String>>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub bio: Option<String>,
@@ -69,6 +84,116 @@ pub struct UserProfileDetails {
     pub personal_channel_refreshed_at: Option<DateTime<Utc>>,
     pub personal_channel_fetch_error: Option<String>,
     pub raw_json: serde_json::Value,
+    pub profile_refresh_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramPeerType {
+    User,
+    Bot,
+    PrivateChat,
+    Group,
+    Supergroup,
+    Channel,
+}
+
+impl TelegramPeerType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Bot => "bot",
+            Self::PrivateChat => "private_chat",
+            Self::Group => "group",
+            Self::Supergroup => "supergroup",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+pub async fn replace_current_telegram_username_aliases(
+    pool: &PgPool,
+    peer_id: i64,
+    peer_type: TelegramPeerType,
+    source: &str,
+    usernames: &[String],
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    replace_current_telegram_username_aliases_in_transaction(
+        &mut tx, peer_id, peer_type, source, usernames,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn replace_current_telegram_username_aliases_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    peer_id: i64,
+    peer_type: TelegramPeerType,
+    source: &str,
+    usernames: &[String],
+) -> anyhow::Result<()> {
+    let usernames = usernames
+        .iter()
+        .filter_map(|username| normalize_telegram_username(username))
+        .collect::<std::collections::BTreeSet<_>>();
+    lock_telegram_peer_alias_snapshot(tx, peer_id).await?;
+    sqlx::query(
+        "update public.telegram_username_aliases set is_active = false where telegram_peer_id = $1 and peer_type = $2",
+    )
+    .bind(peer_id)
+    .bind(peer_type.as_str())
+    .execute(&mut **tx)
+    .await?;
+
+    for username in usernames {
+        upsert_telegram_username_alias_in_transaction(tx, peer_id, peer_type, source, &username)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn lock_telegram_peer_alias_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    peer_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("telegram_user_profile:{peer_id}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_telegram_username_alias_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    peer_id: i64,
+    peer_type: TelegramPeerType,
+    source: &str,
+    username: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"insert into public.telegram_username_aliases
+               (username_normalized, telegram_peer_id, peer_type, source, observed_at, is_active)
+           values ($1, $2, $3, $4, now(), true)
+           on conflict (username_normalized, telegram_peer_id, peer_type, source)
+           do update set observed_at = excluded.observed_at, is_active = true"#,
+    )
+    .bind(username)
+    .bind(peer_id)
+    .bind(peer_type.as_str())
+    .bind(source)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn normalize_telegram_username(value: &str) -> Option<String> {
+    let username = value.trim().trim_start_matches('@').to_ascii_lowercase();
+    (5..=32).contains(&username.len()).then_some(())?;
+    username
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .then_some(username)
 }
 
 struct ProfileIdentityObservation {
@@ -120,15 +245,48 @@ fn normalize_profile_identifier(value: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Records the durable audit trigger in the same transaction as the message
+/// row. The in-memory queue may be full or the process may die immediately
+/// after commit; the reconciler still sees this revision.
+async fn record_profile_refresh_intent_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &Config,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    if !config.new_user_audit_enabled || !config.chat_allows(chat_id, |chat| chat.moderation) {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"
+        insert into public.telegram_profile_refresh_intents
+            (instance_id, chat_id, telegram_user_id)
+        values ($1, $2, $3)
+        on conflict (instance_id, chat_id, telegram_user_id) do update set
+            revision = telegram_profile_refresh_intents.revision + 1,
+            attempts = 0,
+            next_attempt_at = now(),
+            failed_at = null,
+            last_error = null,
+            updated_at = now()
+        "#,
+    )
+    .bind(&config.community.instance.id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn save_telegram_message(
     pool: &PgPool,
     msg: &Message,
     config: &Config,
-) -> anyhow::Result<()> {
-    let (source_channel_id, source_message_id) = forwarded_channel_post(msg)
-        .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
-        .unwrap_or((None, None));
-    let user_id = msg.from.as_ref().map(|user| user.id.0 as i64);
+) -> anyhow::Result<MessagePersistenceOutcome> {
+    let projection = TelegramMessageProjection::from_message(msg)?;
+    let message = projection.message;
+    let revision = MessageRevision::from_message(msg);
     if let Some(user) = msg.from.as_ref() {
         upsert_user_profile(pool, user).await?;
     }
@@ -136,18 +294,7 @@ pub async fn save_telegram_message(
     if let Some(reply_user) = msg.reply_to_message().and_then(|reply| reply.from.as_ref()) {
         upsert_user_profile(pool, reply_user).await?;
     }
-
-    let reply_to_message_id = msg.reply_to_message().map(|reply| reply.id.0);
-    let reply_to_user_id = msg
-        .reply_to_message()
-        .and_then(|reply| reply.from.as_ref())
-        .map(|user| user.id.0 as i64);
-    let sender_chat_id = msg.sender_chat.as_ref().map(|chat| chat.id.0);
-    let via_bot_id = msg.via_bot.as_ref().map(|bot| bot.id.0 as i64);
-    // Keep the raw payload while the bot is young: Telegram update shapes vary,
-    // and raw_json makes production debugging much faster.
-    let raw_json = serde_json::to_value(msg)?;
-
+    let mut tx = pool.begin().await?;
     let (inserted,): (bool,) = sqlx::query_as(
         r#"
         insert into telegram_messages
@@ -181,27 +328,45 @@ pub async fn save_telegram_message(
     )
     .bind(msg.chat.id.0)
     .bind(msg.id.0)
-    .bind(user_id)
-    .bind(source_channel_id)
-    .bind(source_message_id)
-    .bind(msg.is_automatic_forward())
-    .bind(message_text(msg).as_deref())
-    .bind(raw_json)
-    .bind(reply_to_message_id)
-    .bind(reply_to_user_id)
-    .bind(sender_chat_id)
-    .bind(via_bot_id)
-    .bind(msg.photo().is_some())
-    .bind(msg.video().is_some())
-    .bind(msg.document().is_some())
-    .bind(msg.audio().is_some())
-    .bind(msg.voice().is_some())
-    .bind(msg.sticker().is_some())
-    .bind(msg.animation().is_some())
-    .bind(message_has_links(msg))
-    .bind(msg.forward_origin().is_some())
-    .fetch_one(pool)
+    .bind(projection.user_id)
+    .bind(projection.source_channel_id)
+    .bind(projection.source_message_id)
+    .bind(projection.is_automatic_forward)
+    .bind(projection.text.as_deref())
+    .bind(projection.raw_json)
+    .bind(projection.reply_to_message_id)
+    .bind(projection.reply_to_user_id)
+    .bind(projection.sender_chat_id)
+    .bind(projection.via_bot_id)
+    .bind(projection.has_photo)
+    .bind(projection.has_video)
+    .bind(projection.has_document)
+    .bind(projection.has_audio)
+    .bind(projection.has_voice)
+    .bind(projection.has_sticker)
+    .bind(projection.has_animation)
+    .bind(projection.has_links)
+    .bind(projection.is_forwarded)
+    .fetch_one(&mut *tx)
     .await?;
+    if inserted {
+        upsert_chat_user_activity(&mut tx, msg, projection.source_channel_id).await?;
+    }
+    if inserted
+        && !msg.is_automatic_forward()
+        && !msg.chat.is_private()
+        && projection.source_channel_id.is_none()
+        && let Some(user) = msg.from.as_ref().filter(|user| !user.is_bot)
+    {
+        record_profile_refresh_intent_in_transaction(
+            &mut tx,
+            config,
+            msg.chat.id.0,
+            user.id.0 as i64,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     if !teloxide_url::adapter::extract_from_message(msg).is_empty() {
         super::url_evidence::replace_message_url_evidence(pool, msg).await?;
@@ -215,7 +380,6 @@ pub async fn save_telegram_message(
     }
 
     if inserted {
-        upsert_chat_user_activity(pool, msg, source_channel_id).await?;
         enqueue_message_embedding_if_enabled(
             pool,
             config.chat_retrieval_embeddings_enabled,
@@ -227,14 +391,18 @@ pub async fn save_telegram_message(
 
     super::membership::observe_service_message(pool, msg).await?;
 
-    Ok(())
+    Ok(MessagePersistenceOutcome {
+        message,
+        revision,
+        inserted,
+    })
 }
 
 pub async fn save_edited_telegram_message(
     pool: &PgPool,
     msg: &Message,
     config: &Config,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MessagePersistenceOutcome> {
     let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
     let new_text = message_text(msg);
     let new_raw_json = serde_json::to_value(msg)?;
@@ -242,7 +410,7 @@ pub async fn save_edited_telegram_message(
         old.text.as_deref() != new_text.as_deref() || old.raw_json != new_raw_json
     });
 
-    save_telegram_message(pool, msg, config).await?;
+    let persistence = save_telegram_message(pool, msg, config).await?;
     super::url_evidence::supersede_qr_scan_jobs(
         pool,
         msg,
@@ -254,7 +422,7 @@ pub async fn save_edited_telegram_message(
     .await?;
 
     if !changed {
-        return Ok(());
+        return Ok(persistence);
     }
 
     if let Some(old) = old.as_ref()
@@ -326,7 +494,7 @@ pub async fn save_edited_telegram_message(
     )
     .await?;
 
-    Ok(())
+    Ok(persistence)
 }
 
 async fn load_message_snapshot(
@@ -382,7 +550,7 @@ pub async fn mark_message_deleted_by_bot(
 }
 
 async fn upsert_chat_user_activity(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     msg: &Message,
     source_channel_id: Option<i64>,
 ) -> anyhow::Result<()> {
@@ -499,13 +667,29 @@ async fn upsert_chat_user_activity(
     .bind(reply_to_message_id)
     .bind(message_has_links(msg))
     .bind(has_media)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
 pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<()> {
+    let user_id = user.id.0 as i64;
+    let new_username = user
+        .username
+        .as_deref()
+        .and_then(normalize_telegram_username);
+    let mut tx = pool.begin().await?;
+    // `FOR UPDATE` cannot serialize the first observation because there is no
+    // profile row yet. Lock by Telegram peer before reading so concurrent
+    // initial snapshots cannot leave multiple active aliases behind.
+    lock_telegram_peer_alias_snapshot(&mut tx, user_id).await?;
+    let previous: Option<(Option<String>, bool)> = sqlx::query_as(
+        "select username, is_bot from telegram_user_profiles where telegram_user_id = $1 for update",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     sqlx::query(
         r#"
         insert into telegram_user_profiles
@@ -522,16 +706,48 @@ pub async fn upsert_user_profile(pool: &PgPool, user: &User) -> anyhow::Result<(
             updated_at = now()
         "#,
     )
-    .bind(user.id.0 as i64)
+    .bind(user_id)
     .bind(&user.username)
     .bind(&user.first_name)
     .bind(&user.last_name)
     .bind(user.is_bot)
     .bind(user.is_premium)
     .bind(&user.language_code)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    let peer_type = if user.is_bot {
+        TelegramPeerType::Bot
+    } else {
+        TelegramPeerType::User
+    };
+    let old_username = previous
+        .as_ref()
+        .and_then(|(username, _)| username.as_deref())
+        .and_then(normalize_telegram_username);
+    let identity_changed = previous
+        .as_ref()
+        .is_some_and(|(_, is_bot)| old_username != new_username || *is_bot != user.is_bot);
+    if identity_changed {
+        sqlx::query(
+            "update public.telegram_username_aliases set is_active = false where telegram_peer_id = $1 and peer_type in ('user', 'bot')",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(username) = new_username {
+        upsert_telegram_username_alias_in_transaction(
+            &mut tx,
+            user_id,
+            peer_type,
+            "user_update",
+            &username,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -540,7 +756,21 @@ pub async fn update_user_profile_details(
     pool: &PgPool,
     details: UserProfileDetails,
 ) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    // Both profile writers must take the advisory snapshot lock before they
+    // touch the profile row. Otherwise `upsert_user_profile` can hold the
+    // advisory lock while waiting for this row, while this function holds the
+    // row and waits for the advisory lock inside alias replacement.
+    lock_telegram_peer_alias_snapshot(&mut tx, details.telegram_user_id).await?;
     let observation = ProfileIdentityObservation::from_details(&details);
+    let usernames = details
+        .active_usernames
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+        .chain(details.username.iter().cloned())
+        .collect::<Vec<_>>();
     sqlx::query(
         r#"
         insert into telegram_user_profiles
@@ -557,6 +787,7 @@ pub async fn update_user_profile_details(
                 personal_channel_has_adult_links, personal_channel_raw_json,
                 personal_channel_refreshed_at, personal_channel_fetch_error,
                 profile_raw_json, profile_refreshed_at, profile_refresh_error,
+                profile_refresh_failure_count, profile_refresh_retry_at,
                 updated_at
             )
         values (
@@ -565,38 +796,143 @@ pub async fn update_user_profile_details(
             $10, $11, $12, $13, $14,
             $15, $16,
             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
-            $28, now(), null, now()
+            $28, case when $29 then now() else null end, $30,
+            case when $30 is null then 0 else 1 end,
+            case
+                when $30 is null then null
+                else now() + interval '1 minute'
+            end,
+            now()
         )
         on conflict (telegram_user_id) do update set
-            username = excluded.username,
-            first_name = coalesce(excluded.first_name, telegram_user_profiles.first_name),
-            last_name = coalesce(excluded.last_name, telegram_user_profiles.last_name),
-            bio = excluded.bio,
-            profile_photo_small_file_id = excluded.profile_photo_small_file_id,
-            profile_photo_small_file_unique_id = excluded.profile_photo_small_file_unique_id,
-            profile_photo_big_file_id = excluded.profile_photo_big_file_id,
-            profile_photo_big_file_unique_id = excluded.profile_photo_big_file_unique_id,
-            profile_photo_file_id = excluded.profile_photo_file_id,
-            profile_photo_file_unique_id = excluded.profile_photo_file_unique_id,
-            profile_photo_width = excluded.profile_photo_width,
-            profile_photo_height = excluded.profile_photo_height,
-            profile_photo_count = excluded.profile_photo_count,
-            emoji_status_custom_emoji_id = excluded.emoji_status_custom_emoji_id,
-            profile_accent_color_id = excluded.profile_accent_color_id,
-            personal_channel_chat_id = excluded.personal_channel_chat_id,
-            personal_channel_title = excluded.personal_channel_title,
-            personal_channel_username = excluded.personal_channel_username,
-            personal_channel_message_count = excluded.personal_channel_message_count,
-            personal_channel_last_message_id = excluded.personal_channel_last_message_id,
-            personal_channel_last_message_at = excluded.personal_channel_last_message_at,
-            personal_channel_last_text = excluded.personal_channel_last_text,
-            personal_channel_has_adult_links = excluded.personal_channel_has_adult_links,
-            personal_channel_raw_json = excluded.personal_channel_raw_json,
+            username = case when $29 then excluded.username else telegram_user_profiles.username end,
+            first_name = case
+                when $29 then coalesce(excluded.first_name, telegram_user_profiles.first_name)
+                else telegram_user_profiles.first_name
+            end,
+            last_name = case
+                when $29 then coalesce(excluded.last_name, telegram_user_profiles.last_name)
+                else telegram_user_profiles.last_name
+            end,
+            bio = case when $29 then excluded.bio else telegram_user_profiles.bio end,
+            profile_photo_small_file_id = case
+                when $29 then excluded.profile_photo_small_file_id
+                else telegram_user_profiles.profile_photo_small_file_id
+            end,
+            profile_photo_small_file_unique_id = case
+                when $29 then excluded.profile_photo_small_file_unique_id
+                else telegram_user_profiles.profile_photo_small_file_unique_id
+            end,
+            profile_photo_big_file_id = case
+                when $29 then excluded.profile_photo_big_file_id
+                else telegram_user_profiles.profile_photo_big_file_id
+            end,
+            profile_photo_big_file_unique_id = case
+                when $29 then excluded.profile_photo_big_file_unique_id
+                else telegram_user_profiles.profile_photo_big_file_unique_id
+            end,
+            profile_photo_file_id = case
+                when $31 then excluded.profile_photo_file_id
+                else telegram_user_profiles.profile_photo_file_id
+            end,
+            profile_photo_file_unique_id = case
+                when $31 then excluded.profile_photo_file_unique_id
+                else telegram_user_profiles.profile_photo_file_unique_id
+            end,
+            profile_photo_width = case
+                when $31 then excluded.profile_photo_width
+                else telegram_user_profiles.profile_photo_width
+            end,
+            profile_photo_height = case
+                when $31 then excluded.profile_photo_height
+                else telegram_user_profiles.profile_photo_height
+            end,
+            profile_photo_count = case
+                when $31 then excluded.profile_photo_count
+                else telegram_user_profiles.profile_photo_count
+            end,
+            emoji_status_custom_emoji_id = case
+                when $29 then excluded.emoji_status_custom_emoji_id
+                else telegram_user_profiles.emoji_status_custom_emoji_id
+            end,
+            profile_accent_color_id = case
+                when $29 then excluded.profile_accent_color_id
+                else telegram_user_profiles.profile_accent_color_id
+            end,
+            personal_channel_chat_id = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_chat_id
+                else telegram_user_profiles.personal_channel_chat_id
+            end,
+            personal_channel_title = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_title
+                else telegram_user_profiles.personal_channel_title
+            end,
+            personal_channel_username = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_username
+                else telegram_user_profiles.personal_channel_username
+            end,
+            personal_channel_message_count = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_message_count
+                else telegram_user_profiles.personal_channel_message_count
+            end,
+            personal_channel_last_message_id = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_last_message_id
+                else telegram_user_profiles.personal_channel_last_message_id
+            end,
+            personal_channel_last_message_at = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_last_message_at
+                else telegram_user_profiles.personal_channel_last_message_at
+            end,
+            personal_channel_last_text = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_last_text
+                else telegram_user_profiles.personal_channel_last_text
+            end,
+            personal_channel_has_adult_links = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_has_adult_links
+                else telegram_user_profiles.personal_channel_has_adult_links
+            end,
+            personal_channel_raw_json = case
+                when excluded.personal_channel_refreshed_at is not null
+                then excluded.personal_channel_raw_json
+                else telegram_user_profiles.personal_channel_raw_json
+            end,
             personal_channel_refreshed_at = excluded.personal_channel_refreshed_at,
             personal_channel_fetch_error = excluded.personal_channel_fetch_error,
-            profile_raw_json = excluded.profile_raw_json,
-            profile_refreshed_at = excluded.profile_refreshed_at,
-            profile_refresh_error = null,
+            profile_raw_json = case
+                when $29 then excluded.profile_raw_json
+                else telegram_user_profiles.profile_raw_json
+            end,
+            profile_refreshed_at = case
+                when $29 then excluded.profile_refreshed_at
+                else telegram_user_profiles.profile_refreshed_at
+            end,
+            profile_refresh_error = case
+                when $29 then null
+                when $30 is not null then $30
+                else telegram_user_profiles.profile_refresh_error
+            end,
+            profile_refresh_failure_count = case
+                when $29 then 0
+                when $30 is not null then telegram_user_profiles.profile_refresh_failure_count + 1
+                else telegram_user_profiles.profile_refresh_failure_count
+            end,
+            profile_refresh_retry_at = case
+                when $29 then null
+                when $30 is not null then now() + least(
+                    interval '1 minute'
+                        * power(2, least(telegram_user_profiles.profile_refresh_failure_count, 9)),
+                    interval '6 hours'
+                )
+                else telegram_user_profiles.profile_refresh_retry_at
+            end,
             updated_at = now()
         "#,
     )
@@ -628,25 +964,40 @@ pub async fn update_user_profile_details(
     .bind(details.personal_channel_refreshed_at)
     .bind(details.personal_channel_fetch_error)
     .bind(details.raw_json)
-    .execute(pool)
+    .bind(details.chat_fetched)
+    .bind(details.profile_refresh_error)
+    .bind(details.photos_fetched)
+    .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
-        r#"
-        insert into telegram_profile_identity_observations
-            (telegram_user_id, snapshot_key, username_normalized, display_name_normalized, profile_photo_file_unique_id)
-        values ($1, $2, $3, $4, $5)
-        on conflict (telegram_user_id, snapshot_key) do update set last_seen_at = now()
-        "#,
-    )
-    .bind(observation.telegram_user_id)
-    .bind(observation.snapshot_key)
-    .bind(observation.username_normalized)
-    .bind(observation.display_name_normalized)
-    .bind(observation.profile_photo_file_unique_id)
-    .execute(pool)
-    .await?;
+    if details.chat_fetched {
+        sqlx::query(
+            r#"
+            insert into telegram_profile_identity_observations
+                (telegram_user_id, snapshot_key, username_normalized, display_name_normalized, profile_photo_file_unique_id)
+            values ($1, $2, $3, $4, $5)
+            on conflict (telegram_user_id, snapshot_key) do update set last_seen_at = now()
+            "#,
+        )
+        .bind(observation.telegram_user_id)
+        .bind(observation.snapshot_key)
+        .bind(observation.username_normalized)
+        .bind(observation.display_name_normalized)
+        .bind(observation.profile_photo_file_unique_id)
+        .execute(&mut *tx)
+        .await?;
 
+        replace_current_telegram_username_aliases_in_transaction(
+            &mut tx,
+            details.telegram_user_id,
+            TelegramPeerType::User,
+            "profile_refresh",
+            &usernames,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -659,11 +1010,21 @@ pub async fn mark_user_profile_refresh_error(
     sqlx::query(
         r#"
         insert into telegram_user_profiles
-            (telegram_user_id, profile_refreshed_at, profile_refresh_error, updated_at)
-        values ($1, now(), $2, now())
+            (
+                telegram_user_id, profile_refresh_error,
+                profile_refresh_failure_count, profile_refresh_retry_at,
+                updated_at
+            )
+        values ($1, $2, 1, now() + interval '1 minute', now())
         on conflict (telegram_user_id) do update set
-            profile_refreshed_at = excluded.profile_refreshed_at,
             profile_refresh_error = excluded.profile_refresh_error,
+            profile_refresh_failure_count =
+                telegram_user_profiles.profile_refresh_failure_count + 1,
+            profile_refresh_retry_at = now() + least(
+                interval '1 minute'
+                    * power(2, least(telegram_user_profiles.profile_refresh_failure_count, 9)),
+                interval '6 hours'
+            ),
             updated_at = now()
         "#,
     )
@@ -687,6 +1048,12 @@ pub async fn user_profile_needs_refresh(
                    and (
                         profile_refreshed_at is null
                         or personal_channel_refreshed_at is null
+                        or profile_refresh_error is not null
+                   )
+                   and (
+                        profile_refresh_error is null
+                        or profile_refresh_retry_at is null
+                        or profile_refresh_retry_at <= now()
                    )
                 from telegram_user_profiles
                 where telegram_user_id = $1

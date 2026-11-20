@@ -1,0 +1,13 @@
+# TEMPLATE ONLY, not an active GitHub workflow. Adapt to current NedoBot or teloxide-antispam workflow.
+# PR lane: run real property tests + existing PostgreSQL integration tests and verify nonzero test counts.
+# Nightly: separately execute long proptest and (if compatible with runner) isolated cargo-fuzz targets.
+# Never put private corpora, real chat contents, secrets or raw fuzz crash artifacts into Actions artifacts.
+# Do not simply copy these placeholders as valid CI YAML without adapting Rust matrix & services.
+#
+# Commands to design around (adapt crate targets to actual project):
+#   cargo fmt --all -- --check
+#   cargo test --workspace --all-targets --locked
+#   cargo clippy --workspace --all-targets --locked -- -D warnings
+#   PROPTEST_CASES=1024 cargo test -p teloxide-url --tests
+#   RUN_SLOW_TESTS=1 PROPTEST_CASES=100000 cargo test --release -p teloxide-url --tests
+#   cargo fuzz list   # nightly, after fuzz workspace exists

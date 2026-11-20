@@ -58,6 +58,23 @@ Runner сам выполняет следующие действия:
 
 Test database не совпадает с development database, поэтому integration tests могут свободно вставлять и удалять данные. Обычный `cargo test` не стартует Podman и не требует PostgreSQL.
 
+Обычные локальные Rust-проверки (без PostgreSQL):
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+cargo test --no-default-features --workspace --all-targets --locked
+cargo check --no-default-features --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+CI выполняет оба feature-набора. `./scripts/test.sh` остаётся отдельным требованием для disposable PostgreSQL migration/integration suites; успешные unit tests его не заменяют.
+
+## Release gates
+
+Release preflight, staging smoke, production install, health window и rollback описаны в [REFACTOR_RELEASE_GATES.md](REFACTOR_RELEASE_GATES.md). Deployment идёт из слитого `main`, по точному immutable tag и с проверкой обоих community-инстансов. CI/review сами по себе не выкатывают код.
+
 ## Сброс
 
 Сбросить только test database:

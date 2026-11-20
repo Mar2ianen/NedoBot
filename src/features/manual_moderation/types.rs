@@ -66,10 +66,66 @@ pub struct ParsedCommand {
     pub limit: i64,
 }
 
+/// How the numeric target was selected. Only `Username` carries a live
+/// ownership obligation before any Telegram effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetResolutionSource {
+    Username,
+    UserId,
+    Reply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchTarget {
+    pub user_id: i64,
+    pub resolution_source: TargetResolutionSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_username: Option<String>,
+}
+
+impl BatchTarget {
+    pub fn reply(user_id: i64) -> Self {
+        Self {
+            user_id,
+            resolution_source: TargetResolutionSource::Reply,
+            requested_username: None,
+        }
+    }
+
+    pub fn numeric(user_id: i64) -> Self {
+        Self {
+            user_id,
+            resolution_source: TargetResolutionSource::UserId,
+            requested_username: None,
+        }
+    }
+
+    pub fn username(user_id: i64, requested_username: String) -> Self {
+        Self {
+            user_id,
+            resolution_source: TargetResolutionSource::Username,
+            requested_username: Some(requested_username),
+        }
+    }
+
+    /// Returns the normalized username only for targets whose command text was
+    /// an `@username`; the recipient must re-confirm it against the live API.
+    pub fn requested_username(&self) -> Option<&str> {
+        (self.resolution_source == TargetResolutionSource::Username)
+            .then_some(self.requested_username.as_deref())
+            .flatten()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchRequestSnapshot {
     pub kind: CommandKind,
+    /// Kept for compatibility with already persisted request JSON. New
+    /// snapshots always fill both this list and `targets` consistently.
     pub target_user_ids: Vec<i64>,
+    #[serde(default)]
+    pub targets: Vec<BatchTarget>,
     pub duration_seconds: Option<u64>,
     pub reason: Option<String>,
     pub warn_id: Option<i64>,
@@ -78,16 +134,54 @@ pub struct BatchRequestSnapshot {
 }
 
 impl BatchRequestSnapshot {
-    pub fn from_parsed(parsed: &ParsedCommand, target_user_ids: Vec<i64>) -> Self {
+    pub fn from_parsed(parsed: &ParsedCommand, targets: Vec<BatchTarget>) -> Self {
         Self {
             kind: parsed.kind,
-            target_user_ids,
+            target_user_ids: targets.iter().map(|target| target.user_id).collect(),
+            targets,
             duration_seconds: parsed.duration.map(|duration| duration.as_secs()),
             reason: parsed.reason.clone(),
             warn_id: parsed.warn_id,
             warn_all: parsed.warn_all,
             limit: parsed.limit,
         }
+    }
+
+    /// Rebuilds the exact provenance captured at command creation. Legacy
+    /// snapshots that only stored `target_user_ids` cannot prove that a target
+    /// was not a username and therefore fail closed on resume.
+    pub fn resume_targets(&self) -> Result<Vec<BatchTarget>, String> {
+        if self.targets.is_empty() {
+            if self.target_user_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(
+                "сохранённая команда не содержит сведений о том, как выбраны цели; повтори команду через reply или Telegram ID"
+                    .to_string(),
+            );
+        }
+        if self.targets.len() != self.target_user_ids.len()
+            || self
+                .targets
+                .iter()
+                .zip(&self.target_user_ids)
+                .any(|(target, user_id)| target.user_id != *user_id)
+        {
+            return Err(
+                "сохранённая команда содержит несогласованные цели; действие остановлено"
+                    .to_string(),
+            );
+        }
+        if self.targets.iter().any(|target| {
+            target.resolution_source == TargetResolutionSource::Username
+                && target.requested_username.is_none()
+        }) {
+            return Err(
+                "сохранённая команда потеряла username цели; повтори команду через reply или Telegram ID"
+                    .to_string(),
+            );
+        }
+        Ok(self.targets.clone())
     }
 
     pub fn duration(&self) -> Option<Duration> {

@@ -1066,6 +1066,30 @@ pub async fn active_restriction_action(
     .map_err(Into::into)
 }
 
+/// Serializes a captcha permission restore against a manual restriction or undo.
+/// Callers keep this transaction open across the Telegram effect and final state write.
+pub async fn lock_automatic_restriction_restore(
+    tx: &mut Transaction<'_, Postgres>,
+    chat_id: i64,
+    target_user_id: i64,
+) -> anyhow::Result<bool> {
+    lock_target(tx, chat_id, target_user_id).await?;
+    sqlx::query_scalar(
+        r#"select exists (
+             select 1 from manual_moderation_actions
+             where chat_id = $1 and target_user_id = $2
+               and action in ('mute', 'ban', 'auto_mute')
+               and status in ('pending', 'processing', 'applied', 'unknown')
+               and (expires_at is null or expires_at > now())
+           )"#,
+    )
+    .bind(chat_id)
+    .bind(target_user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
 pub async fn latest_batch(
     pool: &PgPool,
     chat_id: i64,
@@ -1786,21 +1810,17 @@ pub async fn find_username(
     chat_id: i64,
     username: &str,
 ) -> anyhow::Result<Option<i64>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        r#"select distinct p.telegram_user_id
-           from telegram_user_profiles p
-           join telegram_chat_users u on u.telegram_user_id = p.telegram_user_id
-           where u.chat_id = $1 and lower(p.username) = $2
-           order by p.telegram_user_id limit 2"#,
-    )
-    .bind(chat_id)
-    .bind(username.to_ascii_lowercase())
-    .fetch_all(pool)
-    .await?;
-    match rows.as_slice() {
-        [(user_id,)] => Ok(Some(*user_id)),
-        [] => Ok(None),
-        _ => anyhow::bail!("username неоднозначен; используй reply или Telegram ID"),
+    use crate::db::username_aliases::{TelegramUsernameResolution, resolve_telegram_username};
+    match resolve_telegram_username(pool, username).await? {
+        TelegramUsernameResolution::Unique(peer) if peer.peer_type == "user" => {
+            Ok(known_chat_user(pool, chat_id, peer.peer_id)
+                .await?
+                .then_some(peer.peer_id))
+        }
+        TelegramUsernameResolution::Ambiguous => {
+            anyhow::bail!("username неоднозначен; используй reply или Telegram ID")
+        }
+        _ => Ok(None),
     }
 }
 

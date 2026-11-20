@@ -267,6 +267,11 @@ use std::collections::HashMap;
 mod tests {
     use super::*;
     use crate::config::SearchMcpTools;
+    use proptest::{
+        collection,
+        prelude::*,
+        test_runner::{Config as TestConfig, RngSeed, TestRunner},
+    };
 
     fn config() -> Config {
         Config {
@@ -384,21 +389,12 @@ mod tests {
             amd_custom_emoji_id: None,
             radeon_custom_emoji_id: None,
             ryzen_custom_emoji_id: None,
-            voice_transcription_enabled: false,
-            voice_auto_transcribe: false,
-            voice_max_duration_sec: 600,
-            voice_max_file_mb: 20,
-            voice_short_text_max_chars: 400,
-            voice_language: "ru".to_string(),
-            voice_asr_provider: "groq".to_string(),
-            voice_asr_model: "whisper-large-v3-turbo".to_string(),
-            voice_asr_shadow_enabled: false,
-            voice_asr_shadow_model: "gemini-3.5-transcribe".to_string(),
-            voice_asr_temperature: 0.0,
-            voice_cleanup_temperature: 0.2,
-            voice_cleanup_max_tokens: 1800,
-            voice_render_expandable_chapters: true,
-            voice_send_full_file: true,
+            voice: crate::config::VoiceConfig {
+                asr_provider: "groq".to_string(),
+                asr_model: "whisper-large-v3-turbo".to_string(),
+                asr_shadow_model: "gemini-3.5-transcribe".to_string(),
+                ..crate::config::VoiceConfig::default()
+            },
             public_base_url: None,
             static_files_dir: "/tmp/tg-ai-bot-static".to_string(),
         }
@@ -445,6 +441,58 @@ mod tests {
 
         assert!(html.contains("&lt;b&gt;сырой html&lt;/b&gt;"));
         assert!(!html.contains("<b>сырой html</b>"));
+    }
+
+    #[test]
+    fn validated_first_comment_keeps_configured_native_custom_emoji_markup() {
+        let mut config = config();
+        config.comment_custom_emoji_id = Some("123456".to_owned());
+
+        let html = build_comment_html("AMD драйвер обновился", &config);
+
+        assert!(html.contains(r#"<tg-emoji emoji-id="123456">😎</tg-emoji>"#));
+        assert!(html.ends_with("AMD драйвер обновился"));
+    }
+
+    #[test]
+    fn generated_unicode_and_control_text_never_becomes_untrusted_html() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .map(|value| value.parse::<u64>().expect("seed must be unsigned"))
+            .unwrap_or(0x0807_0605_0403_0201);
+        let strategy = collection::vec(
+            prop_oneof![
+                Just("слово".to_owned()),
+                Just("Ж".to_owned()),
+                Just("😀".to_owned()),
+                Just("<script>".to_owned()),
+                Just("<b>".to_owned()),
+                Just("&".to_owned()),
+                Just("\"".to_owned()),
+                Just("\0".to_owned()),
+                Just("\u{0001}".to_owned()),
+                Just("\n".to_owned()),
+            ],
+            0..32,
+        )
+        .prop_map(|parts| parts.concat());
+        let mut runner = TestRunner::new(TestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..TestConfig::default()
+        });
+        runner
+            .run(&strategy, |body| {
+                let rendered = build_comment_html(&body, &config());
+                prop_assert!(
+                    !rendered.contains('<'),
+                    "untrusted text became an HTML tag: input={body:?} output={rendered:?}"
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!("case_id=first-comment-render seed={seed} replay=sh scripts/replay_quality_case.sh first-comment-render {seed}: {error}")
+            });
     }
 
     #[test]

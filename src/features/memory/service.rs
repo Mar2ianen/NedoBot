@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +62,17 @@ enum HistoryRetryAction {
     Retry { delay_seconds: i64 },
     Fail,
 }
+
+#[derive(Debug)]
+struct MemorySummaryValidationError(&'static str);
+
+impl fmt::Display for MemorySummaryValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MemorySummaryValidationError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -244,10 +255,10 @@ pub async fn process_next_history_entry(pool: &PgPool, config: &Config) -> anyho
             let error_kind = classify_error(&err);
             let updated = match history_retry_action(entry.attempts) {
                 HistoryRetryAction::Retry { .. } => {
-                    finalize_history_retry(pool, &entry, error_kind).await?
+                    finalize_history_retry(pool, &entry, &error_kind).await?
                 }
                 HistoryRetryAction::Fail => {
-                    finalize_history_failed(pool, &entry, error_kind).await?
+                    finalize_history_failed(pool, &entry, &error_kind).await?
                 }
             };
             if updated == CasResult::Applied {
@@ -359,7 +370,9 @@ async fn build_history_entry(
     .await?;
     let summary = parse_memory_summary(&generation.content)?;
     if entry.used_search_result.is_none() && summary.external_fact.is_some() {
-        anyhow::bail!("external_fact requires used_search_result");
+        return Err(anyhow::Error::new(MemorySummaryValidationError(
+            "external_fact requires used_search_result",
+        )));
     }
     let embedding = match summary.summary.as_deref() {
         Some(_) => Some(embed_rag_document(config, &embedding_text(&summary)).await?),
@@ -512,7 +525,9 @@ fn parse_memory_summary(value: &str) -> anyhow::Result<MemorySummaryOutput> {
 
     if parsed.summary.is_none() {
         if parsed.skip_reason.is_none() {
-            anyhow::bail!("summary=null requires skip_reason");
+            return Err(anyhow::Error::new(MemorySummaryValidationError(
+                "summary=null requires skip_reason",
+            )));
         }
         parsed.entities.clear();
         parsed.used_angle = None;
@@ -523,7 +538,9 @@ fn parse_memory_summary(value: &str) -> anyhow::Result<MemorySummaryOutput> {
             .as_ref()
             .is_some_and(|summary| summary.chars().count() < 20)
         {
-            anyhow::bail!("summary is too short for a reusable fact card");
+            return Err(anyhow::Error::new(MemorySummaryValidationError(
+                "summary is too short for a reusable fact card",
+            )));
         }
         parsed.skip_reason = None;
     }
@@ -578,17 +595,39 @@ fn embedding_text(summary: &MemorySummaryOutput) -> String {
     .join("\n")
 }
 
-fn classify_error(error: &anyhow::Error) -> &'static str {
-    let value = error.to_string().to_lowercase();
-    if value.contains("429") {
-        "http_429"
-    } else if value.contains("timeout") || value.contains("timed out") {
-        "timeout"
-    } else if value.contains("json") || value.contains("summary=null") {
-        "validation_failed"
-    } else {
-        "error"
+fn classify_error(error: &anyhow::Error) -> String {
+    use crate::llm::types::{LlmTransportError, ValidationFailure};
+
+    for cause in error.chain() {
+        if let Some(transport) = cause.downcast_ref::<LlmTransportError>() {
+            match transport {
+                LlmTransportError::HttpStatus(status) => return format!("http_{status}"),
+                LlmTransportError::Timeout => return "timeout".to_owned(),
+                LlmTransportError::InvalidResponse
+                | LlmTransportError::StructuredOutputRejected => {
+                    return "validation_failed".to_owned();
+                }
+                LlmTransportError::Configuration
+                | LlmTransportError::EmptyResponse
+                | LlmTransportError::UnsupportedFeature => {}
+            }
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            if request.is_timeout() {
+                return "timeout".to_owned();
+            }
+            if let Some(status) = request.status() {
+                return format!("http_{}", status.as_u16());
+            }
+        }
+        if cause.is::<serde_json::Error>()
+            || cause.is::<MemorySummaryValidationError>()
+            || cause.is::<ValidationFailure>()
+        {
+            return "validation_failed".to_owned();
+        }
     }
+    "error".to_owned()
 }
 
 pub fn memory_summary_schema() -> Value {
@@ -621,7 +660,62 @@ const MEMORY_SYSTEM_PROMPT: &str = r#"Ты ведёшь атомарную RAG-�
 
 #[cfg(test)]
 mod tests {
+    use proptest::{
+        prelude::*,
+        test_runner::{Config, RngSeed, TestRunner},
+    };
+
     use super::*;
+
+    #[test]
+    fn history_error_classification_uses_typed_sources() {
+        assert_eq!(
+            classify_error(&anyhow::Error::new(
+                crate::llm::types::LlmTransportError::http_status(429)
+            )),
+            "http_429"
+        );
+        assert_eq!(
+            classify_error(&anyhow::Error::new(
+                crate::llm::types::LlmTransportError::timeout()
+            )),
+            "timeout"
+        );
+        assert_eq!(
+            classify_error(&anyhow::Error::new(MemorySummaryValidationError(
+                "summary=null requires skip_reason",
+            ))),
+            "validation_failed"
+        );
+        assert_eq!(classify_error(&anyhow::anyhow!("unclassified")), "error");
+    }
+
+    #[test]
+    fn error_classifier_preserves_all_typed_statuses_and_validation_causes_in_chains() {
+        use crate::llm::types::{LlmTransportError, ValidationFailure, ValidationFailureReason};
+
+        let status_503 = anyhow::Error::new(LlmTransportError::http_status(503));
+        assert_eq!(classify_error(&status_503), "http_503");
+
+        let nested_status =
+            anyhow::Error::new(LlmTransportError::http_status(429)).context("outer context");
+        assert_eq!(classify_error(&nested_status), "http_429");
+
+        let invalid_response =
+            anyhow::Error::new(LlmTransportError::invalid_response()).context("provider context");
+        assert_eq!(classify_error(&invalid_response), "validation_failed");
+
+        let structured_rejected =
+            anyhow::Error::new(LlmTransportError::structured_output_rejected());
+        assert_eq!(classify_error(&structured_rejected), "validation_failed");
+
+        let schema_failure =
+            anyhow::Error::new(ValidationFailure::new(ValidationFailureReason::EmptyOutput));
+        assert_eq!(classify_error(&schema_failure), "validation_failed");
+
+        let spoof = anyhow::anyhow!("HTTP 503 HTTP 429 timeout JSON summary=null");
+        assert_eq!(classify_error(&spoof), "error");
+    }
 
     #[test]
     fn summary_schema_is_strict_and_nullable() {
@@ -706,5 +800,117 @@ mod tests {
     fn history_retry_schedule_fails_after_last_attempt() {
         assert_eq!(history_retry_action(10), HistoryRetryAction::Fail);
         assert_eq!(history_retry_action(11), HistoryRetryAction::Fail);
+    }
+
+    #[test]
+    fn error_classification_uses_typed_failures_not_message_substrings() {
+        let untrusted_error =
+            anyhow::anyhow!("model text mentions HTTP 429, timeout, and invalid JSON");
+        assert_eq!(classify_error(&untrusted_error), "error");
+
+        let rate_limited =
+            anyhow::Error::new(crate::llm::types::LlmTransportError::http_status(429));
+        assert_eq!(classify_error(&rate_limited), "http_429");
+
+        let timeout = anyhow::Error::new(crate::llm::types::LlmTransportError::timeout());
+        assert_eq!(classify_error(&timeout), "timeout");
+
+        let invalid_json = anyhow::Error::new(
+            serde_json::from_str::<Value>("{").expect_err("fixture must be invalid JSON"),
+        );
+        assert_eq!(classify_error(&invalid_json), "validation_failed");
+    }
+
+    #[test]
+    fn generated_summary_entities_match_normalization_contract() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x12_01_02_03_04_05_06_07);
+        let entity = prop::collection::vec(any::<char>(), 0..=100)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let strategy = prop::collection::vec(entity, 0..=20);
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+
+        runner
+            .run(&strategy, |entities| {
+                let input = json!({
+                    "summary": "A sufficiently long synthetic fact summary.",
+                    "entities": entities,
+                    "used_angle": null,
+                    "external_fact": null,
+                    "skip_reason": null,
+                })
+                .to_string();
+                let parsed = parse_memory_summary(&input).expect("valid summary object");
+
+                // Independent spec oracle: trim, cap by Unicode scalar values,
+                // remove empty/case-insensitive duplicates, preserve first occurrence,
+                // then retain no more than the documented 12 entities.
+                let mut seen = HashSet::new();
+                let expected = entities
+                    .iter()
+                    .map(|value| {
+                        let trimmed = value.trim();
+                        let chars = trimmed.chars().collect::<Vec<_>>();
+                        if chars.len() > MAX_ENTITY_CHARS {
+                            format!(
+                                "{}…",
+                                chars.iter().take(MAX_ENTITY_CHARS).collect::<String>()
+                            )
+                        } else {
+                            trimmed.to_owned()
+                        }
+                    })
+                    .filter(|value| !value.is_empty())
+                    .filter(|value| seen.insert(value.to_lowercase()))
+                    .take(MAX_ENTITIES)
+                    .collect::<Vec<_>>();
+                prop_assert_eq!(parsed.entities, expected);
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=memory-summary-normalization seed={seed} sha={} replay=sh scripts/replay_quality_case.sh memory-summary-normalization {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
+    }
+
+    #[test]
+    fn generated_error_text_cannot_impersonate_transport_statuses() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x12_02_02_03_04_05_06_07);
+        let strategy = prop::collection::vec(any::<char>(), 0..=160)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+
+        runner
+            .run(&strategy, |text| {
+                let message = format!("{text} HTTP 429 timeout timed out JSON summary=null");
+                let error = anyhow::anyhow!("{message}");
+                prop_assert_eq!(classify_error(&error), "error");
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=memory-error-classification seed={seed} sha={} replay=sh scripts/replay_quality_case.sh memory-error-classification {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
     }
 }

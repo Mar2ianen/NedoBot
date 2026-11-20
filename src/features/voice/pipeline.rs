@@ -1,5 +1,5 @@
-use teloxide::types::{InputFile, InputRichMessage, MessageId, ReplyParameters};
-use teloxide::{RequestError, prelude::*};
+use teloxide::prelude::*;
+use teloxide::types::{InputRichMessage, MessageId};
 
 use crate::features::ingest::managed_chat_allows;
 use crate::features::voice::asr::transcribe_audio_with_shadow;
@@ -7,14 +7,18 @@ use crate::features::voice::cleanup::cleanup_transcript;
 use crate::features::voice::download::{download_media_file, validate_media};
 use crate::features::voice::render::{RenderedTranscript, render_transcript};
 use crate::features::voice::repo::{
-    VoiceJob, VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
+    VoiceJob, VoiceJobPhase, VoiceTransition, claim_next_voice_job, enqueue_voice_job,
     mark_voice_job_delivery_unknown, mark_voice_job_failed, mark_voice_job_phase,
     mark_voice_job_retry_or_failed, mark_voice_job_skipped, recover_expired_voice_deliveries,
     save_asr_result, save_progress_message, save_voice_result,
 };
-use crate::features::voice::types::{AsrTranscript, VoiceMedia};
+use crate::features::voice::types::{AsrTranscript, VoiceEnqueueOutcome, VoiceMedia};
 use crate::state::AppState;
-use crate::telegram::render::{send_html_reply, send_rich_message_reply};
+use crate::telegram::delivery::{
+    BotTelegramSendPort, DeliveryEffect, DeliveryErrorKind, TelegramSendPort,
+    classify_request_result,
+};
+use crate::telegram::render::{normalize_rich_text, send_html_reply};
 
 const NO_SPEECH_MESSAGE: &str = "В записи не нашёл распознаваемой речи — не буду додумывать текст.";
 
@@ -38,12 +42,11 @@ const NO_SPEECH_ARTIFACTS: &[&str] = &[
 ];
 
 pub async fn maybe_transcribe_voice(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
-) -> anyhow::Result<bool> {
-    if !state.config.voice_transcription_enabled || !state.config.voice_auto_transcribe {
-        return Ok(false);
+) -> anyhow::Result<VoiceEnqueueOutcome> {
+    if !state.config.voice.enabled || !state.config.voice.auto_transcribe {
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
     if !voice_chat_is_supported(msg, state)
@@ -53,53 +56,56 @@ pub async fn maybe_transcribe_voice(
             .is_some_and(|text| text.trim_start().starts_with('/'))
         || msg.is_automatic_forward()
     {
-        return Ok(false);
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
-    transcribe_media_message(bot, msg, state).await
+    transcribe_media_message(msg, state).await
 }
 
 pub async fn transcribe_reply(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     command_message: &Message,
     state: &AppState,
-) -> anyhow::Result<()> {
-    if !state.config.voice_transcription_enabled {
-        return send_voice_command_message(
+) -> anyhow::Result<VoiceEnqueueOutcome> {
+    if !state.config.voice.enabled {
+        send_voice_command_message(
             bot,
             command_message,
             "Расшифровка голосовых сейчас отключена.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
     if !voice_chat_is_supported(command_message, state) {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Эта команда доступна только в личном чате или основном чате.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
     let Some(reply) = command_message.reply_to_message() else {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Ответьте командой /transcribe на voice, audio или кружок.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     };
     if VoiceMedia::from_message(reply).is_none() {
-        return send_voice_command_message(
+        send_voice_command_message(
             bot,
             command_message,
             "Нужен reply на voice, audio или кружок.",
         )
-        .await;
+        .await?;
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     }
 
-    transcribe_media_message(bot, reply, state).await?;
-    Ok(())
+    transcribe_media_message(reply, state).await
 }
 
 fn voice_chat_is_supported(msg: &Message, state: &AppState) -> bool {
@@ -123,37 +129,22 @@ async fn send_voice_command_message(
 }
 
 async fn transcribe_media_message(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VoiceEnqueueOutcome> {
     let Some(media) = VoiceMedia::from_message(msg) else {
-        return Ok(false);
+        return Ok(VoiceEnqueueOutcome::NotTriggered);
     };
 
-    let recovered = recover_expired_voice_deliveries(&state.pool).await?;
-    if recovered > 0 {
-        tracing::warn!(count = recovered, "recovered expired voice delivery leases");
-    }
-
-    let Some(job_id) = create_voice_job(&state.pool, &media).await? else {
+    let Some(job_id) = enqueue_voice_job(&state.pool, &media).await? else {
         tracing::debug!(
             chat_id = media.chat_id,
             message_id = media.message_id,
-            "voice transcription job is already processing or terminal"
+            "voice transcription job already exists; duplicate update was not enqueued"
         );
-        return Ok(true);
+        return Ok(VoiceEnqueueOutcome::AlreadyPresent);
     };
-
-    let Some(job) = claim_voice_job(&state.pool, job_id).await? else {
-        tracing::debug!(
-            job_id,
-            "voice transcription job was claimed by another worker"
-        );
-        return Ok(true);
-    };
-    process_claimed_voice_job(bot, state, job, media).await?;
-    Ok(true)
+    Ok(VoiceEnqueueOutcome::Enqueued { job_id })
 }
 
 pub async fn process_next_voice_job(
@@ -167,6 +158,15 @@ pub async fn process_next_voice_job(
     let Some(job) = claim_next_voice_job(&state.pool).await? else {
         return Ok(false);
     };
+    let queue_latency_seconds = chrono::Utc::now()
+        .signed_duration_since(job.created_at)
+        .num_seconds()
+        .max(0);
+    tracing::info!(
+        job_id = job.id,
+        queue_latency_seconds,
+        "claimed voice transcription job"
+    );
     let media = job.media()?;
     process_claimed_voice_job(bot, state, job, media).await?;
     Ok(true)
@@ -322,19 +322,21 @@ enum VoiceDeliveryFailure {
     Unknown,
 }
 
-fn classify_voice_delivery_error(error: &RequestError) -> VoiceDeliveryFailure {
-    if crate::telegram::service_messages::should_fallback_after_payload_rejection(error) {
-        return VoiceDeliveryFailure::PayloadRejected;
-    }
-    match error {
-        RequestError::RetryAfter(_)
-        | RequestError::Api(_)
-        | RequestError::MigrateToChatId(_)
-        | RequestError::Validation(_)
-        | RequestError::Serialization(_) => VoiceDeliveryFailure::Rejected,
-        RequestError::Network(_) | RequestError::InvalidJson { .. } | RequestError::Io(_) => {
-            VoiceDeliveryFailure::Unknown
+fn classify_voice_delivery_effect<T>(effect: &DeliveryEffect<T>) -> VoiceDeliveryFailure {
+    match effect {
+        DeliveryEffect::NotAttempted(failure)
+            if failure.kind == DeliveryErrorKind::InvalidInput =>
+        {
+            VoiceDeliveryFailure::PayloadRejected
         }
+        DeliveryEffect::Rejected(failure) if failure.kind == DeliveryErrorKind::PayloadRejected => {
+            VoiceDeliveryFailure::PayloadRejected
+        }
+        DeliveryEffect::NotAttempted(_) | DeliveryEffect::Rejected(_) => {
+            VoiceDeliveryFailure::Rejected
+        }
+        DeliveryEffect::Unknown(_) => VoiceDeliveryFailure::Unknown,
+        DeliveryEffect::Confirmed(_) => unreachable!("confirmed delivery has no failure"),
     }
 }
 
@@ -356,13 +358,14 @@ async fn process_voice_job(
     media: &VoiceMedia,
     progress_message_id: MessageId,
 ) -> Result<(), VoiceProcessingFailure> {
-    mark_voice_job_phase(&state.pool, job, "downloading")
+    mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Downloading)
         .await
         .map_err(|_| VoiceProcessingFailure::Download)?
         .then_some(())
         .ok_or(VoiceProcessingFailure::LeaseLost)?;
     let (transcript, alternatives) = {
-        let downloaded = download_media_file(bot, media)
+        let max_download_bytes = u64::from(state.config.voice.max_file_mb) * 1024 * 1024;
+        let downloaded = download_media_file(bot, media, max_download_bytes)
             .await
             .map_err(|_| VoiceProcessingFailure::Download)?;
         tracing::info!(
@@ -372,7 +375,7 @@ async fn process_voice_job(
             "downloaded media file for transcription"
         );
 
-        mark_voice_job_phase(&state.pool, job, "transcribing")
+        mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Transcribing)
             .await
             .map_err(|_| VoiceProcessingFailure::Asr)?
             .then_some(())
@@ -408,7 +411,7 @@ async fn process_voice_job(
         return Ok(());
     }
 
-    mark_voice_job_phase(&state.pool, job, "cleaning")
+    mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Cleaning)
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?
         .then_some(())
@@ -417,13 +420,14 @@ async fn process_voice_job(
         .await
         .map_err(|_| VoiceProcessingFailure::Cleanup)?;
     let rendered = render_transcript(&cleanup.transcript, &state.config);
-    mark_voice_job_phase(&state.pool, job, "delivering")
+    mark_voice_job_phase(&state.pool, job, VoiceJobPhase::Delivering)
         .await
         .map_err(|_| VoiceProcessingFailure::DeliveryUnknown)?
         .then_some(())
         .ok_or(VoiceProcessingFailure::LeaseLost)?;
     let sent = send_rendered_transcript(
         bot,
+        &BotTelegramSendPort::new(bot),
         ChatId(media.chat_id),
         MessageId(media.message_id),
         progress_message_id,
@@ -502,6 +506,7 @@ async fn edit_transcription_message(
 
 async fn send_rendered_transcript(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    send_port: &impl TelegramSendPort,
     chat_id: ChatId,
     source_message_id: MessageId,
     progress_message_id: MessageId,
@@ -511,7 +516,9 @@ async fn send_rendered_transcript(
         RenderedTranscript::Message { html } => {
             edit_transcription_message(bot, chat_id, progress_message_id, html)
                 .await
-                .map_err(|error| classify_voice_delivery_error(&error))?;
+                .map_err(|error| {
+                    classify_voice_delivery_effect(&classify_request_result::<()>(Err(error)))
+                })?;
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: None,
@@ -525,28 +532,19 @@ async fn send_rendered_transcript(
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
             .await
-            .map_err(|error| classify_voice_delivery_error(&error))?;
-            let rich = InputRichMessage::html(html.clone()).skip_entity_detection(true);
-            match send_rich_message_reply(bot, chat_id, source_message_id, rich).await {
-                Ok(_) => Ok(SentRenderedTranscript {
-                    html: html.clone(),
-                    file_id: None,
-                }),
-                Err(error) => match classify_voice_delivery_error(&error) {
-                    VoiceDeliveryFailure::PayloadRejected => {
-                        send_regular_transcript(
-                            bot,
-                            chat_id,
-                            source_message_id,
-                            progress_message_id,
-                            fallback,
-                        )
-                        .await
-                    }
-                    VoiceDeliveryFailure::Rejected => Err(VoiceDeliveryFailure::Rejected),
-                    VoiceDeliveryFailure::Unknown => Err(VoiceDeliveryFailure::Unknown),
-                },
-            }
+            .map_err(|error| {
+                classify_voice_delivery_effect(&classify_request_result::<()>(Err(error)))
+            })?;
+            send_rich_transcript_with_fallback(
+                bot,
+                send_port,
+                chat_id,
+                source_message_id,
+                progress_message_id,
+                html,
+                fallback,
+            )
+            .await
         }
         RenderedTranscript::MessageAndFile { .. } => {
             edit_transcription_message(
@@ -556,9 +554,12 @@ async fn send_rendered_transcript(
                 "Расшифровка готова. Полный текст — следующим сообщением.",
             )
             .await
-            .map_err(|error| classify_voice_delivery_error(&error))?;
+            .map_err(|error| {
+                classify_voice_delivery_effect(&classify_request_result::<()>(Err(error)))
+            })?;
             send_regular_transcript(
                 bot,
+                send_port,
                 chat_id,
                 source_message_id,
                 progress_message_id,
@@ -569,8 +570,50 @@ async fn send_rendered_transcript(
     }
 }
 
+async fn send_rich_transcript_with_fallback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    send_port: &impl TelegramSendPort,
+    chat_id: ChatId,
+    source_message_id: MessageId,
+    progress_message_id: MessageId,
+    html: &str,
+    fallback: &RenderedTranscript,
+) -> Result<SentRenderedTranscript, VoiceDeliveryFailure> {
+    let effect = match normalize_rich_text(html.to_owned()) {
+        Ok(bounded_html) => {
+            let rich = InputRichMessage::html(bounded_html).skip_entity_detection(true);
+            send_port
+                .send_rich_message_reply(chat_id, source_message_id, rich)
+                .await
+        }
+        Err(error) => classify_request_result::<Message>(Err(error)),
+    };
+    match effect {
+        DeliveryEffect::Confirmed(_) => Ok(SentRenderedTranscript {
+            html: html.to_owned(),
+            file_id: None,
+        }),
+        effect => match classify_voice_delivery_effect(&effect) {
+            VoiceDeliveryFailure::PayloadRejected => {
+                send_regular_transcript(
+                    bot,
+                    send_port,
+                    chat_id,
+                    source_message_id,
+                    progress_message_id,
+                    fallback,
+                )
+                .await
+            }
+            VoiceDeliveryFailure::Rejected => Err(VoiceDeliveryFailure::Rejected),
+            VoiceDeliveryFailure::Unknown => Err(VoiceDeliveryFailure::Unknown),
+        },
+    }
+}
+
 async fn send_regular_transcript(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    send_port: &impl TelegramSendPort,
     chat_id: ChatId,
     source_message_id: MessageId,
     progress_message_id: MessageId,
@@ -578,9 +621,13 @@ async fn send_regular_transcript(
 ) -> Result<SentRenderedTranscript, VoiceDeliveryFailure> {
     match rendered {
         RenderedTranscript::Message { html } => {
-            send_html_reply(bot, chat_id, source_message_id, html)
+            match send_port
+                .send_html_reply(chat_id, source_message_id, html.clone())
                 .await
-                .map_err(|error| classify_voice_delivery_error(&error))?;
+            {
+                DeliveryEffect::Confirmed(_) => {}
+                effect => return Err(classify_voice_delivery_effect(&effect)),
+            }
             Ok(SentRenderedTranscript {
                 html: html.clone(),
                 file_id: None,
@@ -591,31 +638,34 @@ async fn send_regular_transcript(
             filename,
             body,
         } => {
-            send_html_reply(bot, chat_id, source_message_id, html)
+            match send_port
+                .send_html_reply(chat_id, source_message_id, html.clone())
                 .await
-                .map_err(|error| classify_voice_delivery_error(&error))?;
-            let sent = bot
-                .send_document(
-                    InputFile::memory(body.clone().into_bytes()).file_name(filename.clone()),
-                )
-                .chat_id(chat_id)
-                .reply_parameters(
-                    ReplyParameters::new(source_message_id).allow_sending_without_reply(),
-                )
+            {
+                DeliveryEffect::Confirmed(_) => {}
+                effect => return Err(classify_voice_delivery_effect(&effect)),
+            }
+            let sent = send_port
+                .send_document_reply(chat_id, source_message_id, filename.clone(), body.clone())
                 .await;
             let sent = match sent {
-                Ok(sent) => sent,
-                Err(error) => {
-                    tracing::warn!(%error, chat_id = chat_id.0, "failed to send full voice transcript file after preview was delivered");
-                    if let Err(edit_error) = edit_transcription_message(
+                DeliveryEffect::Confirmed(sent) => sent,
+                effect => {
+                    tracing::warn!(
+                        certainty = ?effect.certainty(),
+                        chat_id = chat_id.0,
+                        "full voice transcript file delivery failed after preview was delivered"
+                    );
+                    if edit_transcription_message(
                         bot,
                         chat_id,
                         progress_message_id,
                         "Не удалось отправить файл расшифровки. Предварительный текст уже отправлен; автоматическая повторная отправка остановлена, чтобы не дублировать сообщение.",
                     )
                     .await
+                    .is_err()
                     {
-                        tracing::warn!(%edit_error, "failed to update voice transcription delivery status");
+                        tracing::warn!("failed to update voice transcription delivery status");
                     }
                     return Err(VoiceDeliveryFailure::Unknown);
                 }
@@ -631,8 +681,85 @@ async fn send_regular_transcript(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
     use super::*;
     use crate::features::voice::types::AsrSegment;
+    use axum::{Router, body::Bytes, extract::State, routing::post};
+    use sqlx::postgres::PgPoolOptions;
+    use teloxide::{prelude::RequesterExt, types::ParseMode};
+
+    type CapturedTelegramRequest = Arc<Mutex<Option<String>>>;
+
+    struct FaultInjectingSendPort {
+        outcomes: Mutex<VecDeque<DeliveryEffect<Message>>>,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl FaultInjectingSendPort {
+        fn new(outcomes: impl IntoIterator<Item = DeliveryEffect<Message>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn next(&self, name: &'static str) -> DeliveryEffect<Message> {
+            self.calls.lock().unwrap().push(name);
+            self.outcomes.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TelegramSendPort for FaultInjectingSendPort {
+        async fn send_html_reply(
+            &self,
+            _: ChatId,
+            _: MessageId,
+            _: String,
+        ) -> DeliveryEffect<Message> {
+            self.next("html")
+        }
+
+        async fn send_rich_message_reply(
+            &self,
+            _: ChatId,
+            _: MessageId,
+            _: InputRichMessage,
+        ) -> DeliveryEffect<Message> {
+            self.next("rich")
+        }
+
+        async fn send_document_reply(
+            &self,
+            _: ChatId,
+            _: MessageId,
+            _: String,
+            _: String,
+        ) -> DeliveryEffect<Message> {
+            self.next("document")
+        }
+    }
+
+    fn delivery_failure(kind: DeliveryErrorKind) -> crate::telegram::delivery::DeliveryFailure {
+        crate::telegram::delivery::DeliveryFailure {
+            kind,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn sent_message() -> Message {
+        serde_json::from_value(serde_json::json!({
+            "message_id": 77,
+            "date": 1_700_000_000,
+            "chat": {"id": 10, "type": "private"},
+            "text": "sent"
+        }))
+        .unwrap()
+    }
 
     fn transcript(text: &str, segments: Vec<&str>) -> AsrTranscript {
         AsrTranscript {
@@ -659,30 +786,262 @@ mod tests {
 
     #[test]
     fn voice_delivery_classification_retries_only_confirmed_rejections() {
-        let rejected = RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(1));
         assert_eq!(
-            classify_voice_delivery_error(&rejected),
+            classify_voice_delivery_effect(&DeliveryEffect::<()>::Rejected(
+                crate::telegram::delivery::DeliveryFailure {
+                    kind: DeliveryErrorKind::RateLimited,
+                    retry_after_seconds: Some(1),
+                }
+            )),
             VoiceDeliveryFailure::Rejected
         );
         assert_eq!(
-            classify_voice_delivery_error(&RequestError::Api(
-                teloxide::ApiError::CantParseEntities("can't parse entities".to_owned())
+            classify_voice_delivery_effect(&DeliveryEffect::<()>::Rejected(
+                crate::telegram::delivery::DeliveryFailure {
+                    kind: DeliveryErrorKind::PayloadRejected,
+                    retry_after_seconds: None,
+                }
             )),
             VoiceDeliveryFailure::PayloadRejected
         );
         assert_eq!(
-            classify_voice_delivery_error(&RequestError::Api(teloxide::ApiError::BotBlocked)),
+            classify_voice_delivery_effect(&DeliveryEffect::<()>::Rejected(
+                crate::telegram::delivery::DeliveryFailure {
+                    kind: DeliveryErrorKind::TelegramRejected,
+                    retry_after_seconds: None,
+                }
+            )),
             VoiceDeliveryFailure::Rejected
         );
 
-        let unknown = RequestError::Io(std::sync::Arc::new(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "telegram request timed out",
-        )));
         assert_eq!(
-            classify_voice_delivery_error(&unknown),
+            classify_voice_delivery_effect(&DeliveryEffect::<()>::Unknown(
+                crate::telegram::delivery::DeliveryFailure {
+                    kind: DeliveryErrorKind::Transport,
+                    retry_after_seconds: None,
+                }
+            )),
             VoiceDeliveryFailure::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_rich_send_never_starts_a_second_message_fallback() {
+        let port = FaultInjectingSendPort::new([DeliveryEffect::Unknown(delivery_failure(
+            DeliveryErrorKind::Transport,
+        ))]);
+        let bot = Bot::new("123456:TEST_TOKEN").parse_mode(ParseMode::Html);
+        let fallback = RenderedTranscript::Message {
+            html: "safe fallback".to_owned(),
+        };
+
+        let result = send_rich_transcript_with_fallback(
+            &bot,
+            &port,
+            ChatId(-100),
+            MessageId(70),
+            MessageId(71),
+            "<p>full</p>",
+            &fallback,
+        )
+        .await;
+
+        assert!(matches!(result, Err(VoiceDeliveryFailure::Unknown)));
+        assert_eq!(*port.calls.lock().unwrap(), ["rich"]);
+    }
+
+    #[tokio::test]
+    async fn document_failure_after_confirmed_preview_is_unknown_without_redelivery() {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram_edit))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram listener must bind");
+        let address = listener.local_addr().expect("fake listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let port = FaultInjectingSendPort::new([
+            DeliveryEffect::Confirmed(sent_message()),
+            DeliveryEffect::Unknown(delivery_failure(DeliveryErrorKind::Transport)),
+        ]);
+
+        let result = send_rendered_transcript(
+            &bot,
+            &port,
+            ChatId(-1001),
+            MessageId(11),
+            MessageId(27),
+            &RenderedTranscript::MessageAndFile {
+                html: "preview already delivered".to_owned(),
+                filename: "transcript.txt".to_owned(),
+                body: "complete transcript".to_owned(),
+            },
+        )
+        .await;
+        server.abort();
+
+        assert!(matches!(result, Err(VoiceDeliveryFailure::Unknown)));
+        assert_eq!(*port.calls.lock().unwrap(), ["html", "document"]);
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "progress message was updated"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run against the disposable local test database"]
+    async fn voice_partial_delivery_is_persisted_and_never_replayed_after_restart() {
+        use crate::features::voice::repo::{
+            VoiceJobPhase, VoiceTransition, claim_voice_job, enqueue_voice_job,
+            mark_voice_job_delivery_unknown, mark_voice_job_phase,
+        };
+        use crate::features::voice::types::{VoiceMedia, VoiceMediaKind};
+
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point to the disposable test database");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("test PostgreSQL must be reachable");
+        let suffix = chrono::Utc::now().timestamp_micros();
+        let media = VoiceMedia {
+            chat_id: -1001932061163,
+            message_id: (suffix.rem_euclid(1_000_000_000) as i32).saturating_add(1_000_000_000),
+            user_id: Some(suffix),
+            kind: VoiceMediaKind::Voice,
+            file_id: format!("partial-delivery-{suffix}"),
+            file_unique_id: Some(format!("partial-delivery-unique-{suffix}")),
+            duration_sec: Some(60),
+            file_size: Some(1024),
+            mime_type: Some("audio/ogg".to_owned()),
+        };
+        let job_id = enqueue_voice_job(&pool, &media)
+            .await
+            .expect("voice job must enqueue")
+            .expect("new voice job must be returned");
+        let job = claim_voice_job(&pool, job_id)
+            .await
+            .expect("voice claim must succeed")
+            .expect("job must be claimed");
+        assert!(
+            mark_voice_job_phase(&pool, &job, VoiceJobPhase::Delivering)
+                .await
+                .expect("delivery phase must persist")
+        );
+
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram_edit))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram listener must bind");
+        let address = listener.local_addr().expect("mock listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let port = FaultInjectingSendPort::new([
+            DeliveryEffect::Confirmed(sent_message()),
+            DeliveryEffect::Unknown(delivery_failure(DeliveryErrorKind::Transport)),
+        ]);
+
+        let delivery = send_rendered_transcript(
+            &bot,
+            &port,
+            ChatId(media.chat_id),
+            MessageId(media.message_id),
+            MessageId(27),
+            &RenderedTranscript::MessageAndFile {
+                html: "confirmed preview".to_owned(),
+                filename: "transcript.txt".to_owned(),
+                body: "complete transcript".to_owned(),
+            },
+        )
+        .await;
+        server.abort();
+        assert!(matches!(delivery, Err(VoiceDeliveryFailure::Unknown)));
+        assert_eq!(*port.calls.lock().unwrap(), ["html", "document"]);
+        assert!(captured.lock().unwrap().is_some());
+        assert_eq!(
+            mark_voice_job_delivery_unknown(&pool, &job, "ambiguous full transcript send")
+                .await
+                .expect("partial delivery state must persist"),
+            VoiceTransition::DeliveryUnknown
+        );
+        pool.close().await;
+
+        // A fresh pool models process restart and must not reclaim or duplicate
+        // either the confirmed preview or the ambiguous full transcript send.
+        let restarted_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("restarted test pool must connect");
+        assert!(
+            claim_voice_job(&restarted_pool, job_id)
+                .await
+                .expect("delivery_unknown job must remain queryable")
+                .is_none()
+        );
+        assert_eq!(*port.calls.lock().unwrap(), ["html", "document"]);
+        restarted_pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_rich_payload_rejection_uses_one_html_fallback() {
+        let port = FaultInjectingSendPort::new([
+            DeliveryEffect::Rejected(delivery_failure(DeliveryErrorKind::PayloadRejected)),
+            DeliveryEffect::Confirmed(sent_message()),
+        ]);
+        let bot = Bot::new("123456:TEST_TOKEN").parse_mode(ParseMode::Html);
+        let fallback = RenderedTranscript::Message {
+            html: "bounded fallback".to_owned(),
+        };
+
+        let result = send_rich_transcript_with_fallback(
+            &bot,
+            &port,
+            ChatId(-100),
+            MessageId(70),
+            MessageId(71),
+            "<p>full</p>",
+            &fallback,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.html, "bounded fallback");
+        assert_eq!(*port.calls.lock().unwrap(), ["rich", "html"]);
+    }
+
+    #[tokio::test]
+    async fn oversized_rich_transcript_is_rejected_locally_before_port_send() {
+        let port = FaultInjectingSendPort::new([DeliveryEffect::Confirmed(sent_message())]);
+        let bot = Bot::new("123456:TEST_TOKEN").parse_mode(ParseMode::Html);
+        let fallback = RenderedTranscript::Message {
+            html: "bounded fallback".to_owned(),
+        };
+
+        let result = send_rich_transcript_with_fallback(
+            &bot,
+            &port,
+            ChatId(-100),
+            MessageId(70),
+            MessageId(71),
+            &"x".repeat(crate::telegram::render::TELEGRAM_RICH_TEXT_LIMIT + 1),
+            &fallback,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.html, "bounded fallback");
+        assert_eq!(*port.calls.lock().unwrap(), ["html"]);
     }
 
     #[test]
@@ -710,5 +1069,70 @@ mod tests {
             "Музыка сегодня громкая",
             Vec::new()
         )));
+    }
+
+    async fn fake_telegram_edit(
+        State(captured): State<CapturedTelegramRequest>,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        *captured.lock().expect("captured request lock") =
+            Some(String::from_utf8_lossy(&body).into_owned());
+        axum::Json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 27,
+                "date": 1,
+                "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
+                "text": "<b>recognized words</b>"
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn transcript_delivery_uses_the_fake_telegram_api() {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/{*path}", post(fake_telegram_edit))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram listener must bind");
+        let address = listener.local_addr().expect("fake listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(teloxide::types::ParseMode::Html);
+
+        let delivered = send_rendered_transcript(
+            &bot,
+            &FaultInjectingSendPort::new(std::iter::empty::<DeliveryEffect<Message>>()),
+            ChatId(-1001),
+            MessageId(11),
+            MessageId(27),
+            &RenderedTranscript::Message {
+                html: "<b>recognized words</b>".to_owned(),
+            },
+        )
+        .await
+        .expect("fake Telegram API should accept the transcript edit");
+        server.abort();
+
+        assert_eq!(delivered.html, "<b>recognized words</b>");
+        let payload = captured
+            .lock()
+            .expect("captured request lock")
+            .take()
+            .expect("transcript delivery should call Telegram");
+        assert!(payload.contains("chat_id"), "Telegram request: {payload}");
+        assert!(payload.contains("-1001"), "Telegram request: {payload}");
+        assert!(
+            payload.contains("message_id"),
+            "Telegram request: {payload}"
+        );
+        assert!(payload.contains("27"), "Telegram request: {payload}");
+        assert!(
+            payload.contains("<b>recognized words</b>"),
+            "Telegram request: {payload}"
+        );
     }
 }

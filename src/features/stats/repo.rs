@@ -452,7 +452,7 @@ pub async fn period_top_users(
         where m.chat_id = $1 and {human_message_filter}
           and m.created_at >= (select start_at from bounds) and m.created_at < (select end_at from bounds)
         group by m.user_id, p.username, p.first_name, p.last_name, s.status, s.is_admin, s.is_present
-        order by messages desc
+        order by messages desc, m.user_id asc
         limit $5
         "#;
     let sql = with_user_activity_aggregates(&with_human_message_filter(sql, "$2"));
@@ -499,7 +499,8 @@ pub async fn bot_comments_for_period(
         where j.discussion_chat_id = $1 and j.status = 'sent'
           and j.sent_at >= (select start_at from bounds) and j.sent_at < (select end_at from bounds)
         group by j.source_message_id, g.response, j.sent_at
-        order by messages_30m desc nulls last, direct_replies desc nulls last, reactions desc
+        order by messages_30m desc nulls last, direct_replies desc nulls last, reactions desc,
+                 j.source_message_id desc
         limit $5
         "#;
     let sql = with_human_message_filter(sql, "$2");
@@ -590,9 +591,9 @@ async fn ranked_message_users(
     ascending: bool,
 ) -> anyhow::Result<Vec<TopMessage>> {
     let order = if ascending {
-        "messages asc, reactions_received asc"
+        "messages asc, reactions_received asc, m.user_id asc"
     } else {
-        "messages desc, reactions_received desc"
+        "messages desc, reactions_received desc, m.user_id asc"
     };
     let message_aggregates = USER_ACTIVITY_MESSAGE_AGGREGATES;
     let reactions_received_aggregate = USER_ACTIVITY_REACTIONS_RECEIVED_AGGREGATE;
@@ -781,7 +782,7 @@ pub async fn top_reacted_messages(
             order by tm.created_at desc limit 1
         ) raw_name on true
         where rc.chat_id = $1 and rc.total_count > 0 and {human_message_filter}
-        order by rc.total_count desc, m.created_at desc
+        order by rc.total_count desc, m.created_at desc, m.message_id desc
         limit $3
         "#;
     let sql = with_human_message_filter(sql, "$2");
@@ -804,7 +805,7 @@ pub async fn top_message_user_ids(
         select m.user_id from telegram_messages m
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         where m.chat_id = $1 and {human_message_filter}
-        group by m.user_id order by count(*) desc limit $3
+        group by m.user_id order by count(*) desc, m.user_id asc limit $3
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
@@ -827,7 +828,7 @@ pub async fn top_reacted_user_ids(
         join telegram_messages m on m.chat_id = rc.chat_id and m.message_id = rc.message_id
         left join telegram_user_profiles p on p.telegram_user_id = m.user_id
         where rc.chat_id = $1 and rc.total_count > 0 and {human_message_filter}
-        group by m.user_id order by max(rc.total_count) desc limit $3
+        group by m.user_id order by max(rc.total_count) desc, m.user_id asc limit $3
         "#;
     let sql = with_human_message_filter(sql, "$2");
 
@@ -1050,6 +1051,7 @@ pub async fn user_top_words(
 
 pub async fn resolve_user_id(
     pool: &PgPool,
+    chat_id: i64,
     target: Option<&str>,
     reply_user_id: Option<i64>,
 ) -> anyhow::Result<Option<i64>> {
@@ -1061,15 +1063,26 @@ pub async fn resolve_user_id(
         return Ok(Some(user_id));
     }
 
-    let username = clean.trim_start_matches('@').to_lowercase();
-    let row: Option<(i64,)> = sqlx::query_as(
-        r#"select telegram_user_id from telegram_user_profiles
-           where lower(username) = $1 order by updated_at desc limit 1"#,
+    // A historical profile row is not proof of current ownership: usernames are
+    // reassigned. Resolve only from the fresh unique alias index, then require
+    // the selected user to belong to the requested chat. Ambiguous, stale, or
+    // cross-chat names fail closed instead of selecting an arbitrary row.
+    let crate::db::username_aliases::TelegramUsernameResolution::Unique(peer) =
+        crate::db::username_aliases::resolve_telegram_username(pool, clean).await?
+    else {
+        return Ok(None);
+    };
+    if peer.peer_type != "user" {
+        return Ok(None);
+    }
+    let is_chat_member: bool = sqlx::query_scalar(
+        "select exists(select 1 from telegram_chat_users where chat_id = $1 and telegram_user_id = $2)",
     )
-    .bind(username)
-    .fetch_optional(pool)
+    .bind(chat_id)
+    .bind(peer.peer_id)
+    .fetch_one(pool)
     .await?;
-    Ok(row.map(|(user_id,)| user_id))
+    Ok(is_chat_member.then_some(peer.peer_id))
 }
 
 fn period_start_sql(period: StatsPeriod) -> &'static str {

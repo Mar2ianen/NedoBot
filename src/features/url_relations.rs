@@ -1,5 +1,10 @@
 //! Осторожные связи для уже разобранных ссылок Telegram.
-//! Username не разрешаются; членство читается только из локальных снимков.
+//! Username разрешаются только по свежим локальным снимкам.
+
+pub use crate::db::username_aliases::{
+    ResolvedTelegramPeer, TelegramUsernameResolution, resolve_telegram_username,
+};
+use crate::db::username_aliases::{normalize_username, resolve_current_username_aliases};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -10,17 +15,21 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use teloxide::{
     prelude::{Bot, Requester},
-    types::ChatId,
+    types::{ChatFullInfo, ChatId},
 };
 use teloxide_url::{
     Found, Kind, Source, TelegramLink, TelegramPeer, find_urls, parse_telegram_link,
 };
-use tokio::time::MissedTickBehavior;
 
+use crate::features::jobs::worker::{WorkerId, WorkerSupervisor, run_interval_worker};
 use crate::features::url_feeds::FeedSnapshot;
 use crate::{
     config::Config,
-    db::{membership::MembershipContext, url_evidence::QrUrlRelation},
+    db::{
+        membership::MembershipContext,
+        telegram::{TelegramPeerType, replace_current_telegram_username_aliases},
+        url_evidence::QrUrlRelation,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +41,22 @@ pub enum LinkRelation {
     KnownExternal,
     Unresolved,
 }
+
+#[derive(Clone, Copy)]
+enum UsernameLinkKind {
+    Any,
+    Bot,
+    Chat,
+}
+
+type LinkedUserSnapshot = (
+    i64,
+    Option<String>,
+    Option<bool>,
+    bool,
+    bool,
+    Option<String>,
+);
 
 pub struct RelationContext<'a> {
     pub chat_id: i64,
@@ -84,6 +109,31 @@ pub async fn refresh_configured_linked_chats(
                 .bind(chat.linked_chat_id())
                 .execute(pool)
                 .await?;
+                persist_chat_username_aliases(
+                    pool,
+                    &chat,
+                    Some(TelegramPeerType::Channel),
+                    "configured_chat_refresh",
+                )
+                .await?;
+                if let Some(linked_chat_id) = chat.linked_chat_id() {
+                    match bot.get_chat(ChatId(linked_chat_id)).await {
+                        Ok(linked_chat) => {
+                            persist_chat_username_aliases(
+                                pool,
+                                &linked_chat,
+                                Some(TelegramPeerType::Supergroup),
+                                "configured_chat_refresh",
+                            )
+                            .await?;
+                        }
+                        Err(error) => tracing::warn!(
+                            linked_chat_id,
+                            %error,
+                            "failed to refresh configured Telegram linked-chat aliases"
+                        ),
+                    }
+                }
             }
             Err(error) => {
                 // Keep the last successful observation. Freshness expires it;
@@ -98,20 +148,101 @@ pub async fn refresh_configured_linked_chats(
             }
         }
     }
+    refresh_known_bot_aliases(bot, pool).await?;
     Ok(())
 }
 
-pub fn spawn_linked_chat_refresh_worker(bot: Bot, pool: PgPool, config: Config) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(LINKED_CHAT_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(error) = refresh_configured_linked_chats(&bot, &pool, &config).await {
-                tracing::warn!(%error, "Telegram linked-chat refresh pass failed");
+async fn persist_chat_username_aliases(
+    pool: &PgPool,
+    chat: &ChatFullInfo,
+    peer_type_override: Option<TelegramPeerType>,
+    source: &str,
+) -> anyhow::Result<()> {
+    let peer_type = peer_type_override.unwrap_or_else(|| {
+        if chat.is_private() {
+            TelegramPeerType::PrivateChat
+        } else if chat.is_group() {
+            TelegramPeerType::Group
+        } else if chat.is_supergroup() {
+            TelegramPeerType::Supergroup
+        } else {
+            TelegramPeerType::Channel
+        }
+    });
+    let usernames = chat
+        .active_usernames()
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+        .chain(chat.username().map(str::to_owned))
+        .collect::<Vec<_>>();
+    replace_current_telegram_username_aliases(pool, chat.id.0, peer_type, source, &usernames).await
+}
+
+async fn refresh_known_bot_aliases(bot: &Bot, pool: &PgPool) -> anyhow::Result<()> {
+    const MAX_BOTS_PER_PASS: i64 = 32;
+    let bot_ids: Vec<i64> = sqlx::query_scalar(
+        r#"select profile.telegram_user_id
+             from public.telegram_user_profiles profile
+            where profile.is_bot and profile.username is not null
+              and not exists (
+                    select 1 from public.telegram_username_aliases alias
+                     where alias.telegram_peer_id = profile.telegram_user_id
+                       and alias.peer_type = 'bot'
+                       and alias.source = 'known_bot_refresh'
+                       and alias.is_active
+                       and alias.observed_at >= now() - interval '12 hours'
+              )
+            order by profile.updated_at asc
+            limit $1"#,
+    )
+    .bind(MAX_BOTS_PER_PASS)
+    .fetch_all(pool)
+    .await?;
+
+    for bot_id in bot_ids {
+        match bot.get_chat(ChatId(bot_id)).await {
+            Ok(chat) => {
+                if let Err(error) = persist_chat_username_aliases(
+                    pool,
+                    &chat,
+                    Some(TelegramPeerType::Bot),
+                    "known_bot_refresh",
+                )
+                .await
+                {
+                    tracing::warn!(bot_id, %error, "failed to store known bot username aliases");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(bot_id, %error, "failed to refresh known bot username aliases")
             }
         }
+    }
+    Ok(())
+}
+
+pub fn spawn_linked_chat_refresh_worker(
+    supervisor: &mut WorkerSupervisor,
+    bot: Bot,
+    pool: PgPool,
+    config: Config,
+) {
+    supervisor.spawn(WorkerId::LinkedChatRefresh, move |shutdown| async move {
+        run_interval_worker(
+            WorkerId::LinkedChatRefresh,
+            shutdown,
+            LINKED_CHAT_REFRESH_INTERVAL,
+            true,
+            true,
+            || async {
+                refresh_configured_linked_chats(&bot, &pool, &config)
+                    .await
+                    .err()
+                    .map(|_| "linked_chat_refresh_failed")
+            },
+        )
+        .await;
     });
 }
 
@@ -178,6 +309,7 @@ pub async fn recent_link_relationship_summary(
     let mut verified_threat_feed_hit = false;
     let mut user_target_ids = HashSet::new();
     let mut username_targets = HashSet::new();
+    let mut pending_username_links = Vec::<(String, UsernameLinkKind)>::new();
     let mut bot_candidate_usernames = HashSet::new();
     let mut scanned_targets = 0usize;
     let mut native_user_id_entity_count = 0u16;
@@ -226,9 +358,23 @@ pub async fn recent_link_relationship_summary(
                 continue;
             };
             match &link {
-                TelegramLink::Profile { username }
-                | TelegramLink::BotStart { username, .. }
-                | TelegramLink::Message {
+                TelegramLink::Profile { username } => {
+                    let username = username.to_ascii_lowercase();
+                    if is_bot_candidate(&username) {
+                        bot_candidate_usernames.insert(username.clone());
+                    }
+                    username_targets.insert(username.clone());
+                    pending_username_links.push((username, UsernameLinkKind::Any));
+                }
+                TelegramLink::BotStart { username, .. } => {
+                    let username = username.to_ascii_lowercase();
+                    if is_bot_candidate(&username) {
+                        bot_candidate_usernames.insert(username.clone());
+                    }
+                    username_targets.insert(username.clone());
+                    pending_username_links.push((username, UsernameLinkKind::Bot));
+                }
+                TelegramLink::Message {
                     peer: TelegramPeer::Username(username),
                     ..
                 } => {
@@ -236,7 +382,8 @@ pub async fn recent_link_relationship_summary(
                     if is_bot_candidate(&username) {
                         bot_candidate_usernames.insert(username.clone());
                     }
-                    username_targets.insert(username);
+                    username_targets.insert(username.clone());
+                    pending_username_links.push((username, UsernameLinkKind::Chat));
                 }
                 _ => {}
             }
@@ -257,9 +404,10 @@ pub async fn recent_link_relationship_summary(
                         external_message_links = external_message_links.saturating_add(1);
                     }
                 }
-                TelegramLink::Message { .. } => {
-                    unresolved_telegram_links = unresolved_telegram_links.saturating_add(1);
-                }
+                TelegramLink::Message {
+                    peer: TelegramPeer::Username(_),
+                    ..
+                } => {}
                 _ => unresolved_telegram_links = unresolved_telegram_links.saturating_add(1),
             }
         }
@@ -268,33 +416,58 @@ pub async fn recent_link_relationship_summary(
         }
     }
 
-    // Только один актуальный профиль может разрешить username. История
-    // прежних username намеренно не считается владением: Telegram переиспользует имена.
+    // Resolve only fresh aliases from authoritative current snapshots. History is
+    // deliberately excluded because Telegram may reassign usernames.
     let usernames = username_targets.into_iter().collect::<Vec<_>>();
-    let resolved_names: Vec<(String, i64, bool, i64)> = if usernames.is_empty() {
-        Vec::new()
-    } else {
-        sqlx::query_as(
-            r#"select lower(username), min(telegram_user_id), bool_or(is_bot), count(*)::bigint
-                 from telegram_user_profiles
-                where lower(username) = any($1)
-                  and updated_at >= now() - interval '24 hours'
-                group by lower(username)"#,
-        )
-        .bind(&usernames)
-        .fetch_all(pool)
-        .await?
-    };
+    let resolved_names = resolve_current_username_aliases(pool, &usernames).await?;
     let mut resolved_username_count = 0u16;
     let mut confirmed_bot_candidate_count = 0u16;
-    for (username, user_id, is_bot, match_count) in resolved_names {
-        if match_count != 1 {
+    let mut resolved_bot_count = 0u16;
+    let mut resolved_chat_count = 0u16;
+    let mut resolved_user_count = 0u16;
+    for (username, resolution) in &resolved_names {
+        let TelegramUsernameResolution::Unique(peer) = resolution else {
             continue;
+        };
+        let peer_id = peer.peer_id;
+        let peer_type = &peer.peer_type;
+        if matches!(peer_type.as_str(), "user" | "bot") {
+            user_target_ids.insert(peer_id);
         }
-        user_target_ids.insert(user_id);
         resolved_username_count = resolved_username_count.saturating_add(1);
-        if is_bot && bot_candidate_usernames.contains(&username) {
-            confirmed_bot_candidate_count = confirmed_bot_candidate_count.saturating_add(1);
+        match peer_type.as_str() {
+            "bot" => {
+                resolved_bot_count = resolved_bot_count.saturating_add(1);
+                if bot_candidate_usernames.contains(username) {
+                    confirmed_bot_candidate_count = confirmed_bot_candidate_count.saturating_add(1);
+                }
+            }
+            "user" => resolved_user_count = resolved_user_count.saturating_add(1),
+            "private_chat" | "group" | "supergroup" | "channel" => {
+                resolved_chat_count = resolved_chat_count.saturating_add(1)
+            }
+            _ => {}
+        }
+    }
+    for (username, kind) in pending_username_links {
+        let resolved = match resolved_names.get(&username) {
+            Some(TelegramUsernameResolution::Unique(peer)) => Some(peer),
+            Some(TelegramUsernameResolution::Ambiguous | TelegramUsernameResolution::Unknown)
+            | None => None,
+        };
+        match (kind, resolved) {
+            (UsernameLinkKind::Any, Some(_)) => {}
+            (UsernameLinkKind::Bot, Some(peer)) if peer.peer_type == "bot" => {}
+            (UsernameLinkKind::Chat, Some(peer))
+                if matches!(peer.peer_type.as_str(), "supergroup" | "channel" | "group") =>
+            {
+                if peer.peer_id == chat_id || affiliated.contains(&peer.peer_id) {
+                    affiliated_message_links = affiliated_message_links.saturating_add(1);
+                } else {
+                    external_message_links = external_message_links.saturating_add(1);
+                }
+            }
+            _ => unresolved_telegram_links = unresolved_telegram_links.saturating_add(1),
         }
     }
 
@@ -302,18 +475,28 @@ pub async fn recent_link_relationship_summary(
         .into_iter()
         .take(MAX_TARGETS)
         .collect::<Vec<_>>();
-    let user_rows: Vec<(i64, Option<String>, Option<bool>, bool)> = if user_ids.is_empty() {
+    let user_rows: Vec<LinkedUserSnapshot> = if user_ids.is_empty() {
         Vec::new()
     } else {
         sqlx::query_as(
-            r#"select telegram_user_id,
+            r#"select user_row.telegram_user_id,
                       case when member_observed_at >= now() - make_interval(secs => $3)
                            then member_status else null end,
                       case when member_observed_at >= now() - make_interval(secs => $3)
                            then is_present else null end,
-                      membership_first_confirmed_at is not null
-               from telegram_chat_users
-               where chat_id = $1 and telegram_user_id = any($2)"#,
+                      membership_first_confirmed_at is not null,
+                      coalesce(user_row.is_spammer, false), human_label.label
+               from telegram_chat_users user_row
+               left join lateral (
+                    select event.label
+                      from public.spam_label_events event
+                     where event.chat_id = user_row.chat_id
+                       and event.telegram_user_id = user_row.telegram_user_id
+                       and event.source in ('owner_review', 'owner_manual', 'legacy_backfill')
+                     order by event.created_at desc, event.id desc
+                     limit 1
+               ) human_label on true
+               where user_row.chat_id = $1 and user_row.telegram_user_id = any($2)"#,
         )
         .bind(chat_id)
         .bind(&user_ids)
@@ -321,14 +504,34 @@ pub async fn recent_link_relationship_summary(
         .fetch_all(pool)
         .await?
     };
+    let mut currently_flagged_spammer_user_links = 0u16;
+    let mut operator_confirmed_spammer_user_links = 0u16;
+    let mut operator_confirmed_normal_user_links = 0u16;
     let user_membership = user_rows
         .into_iter()
-        .map(|(id, status, present, confirmed)| {
-            (
-                id as u64,
-                MembershipContext::from_snapshot(status.as_deref(), present, confirmed),
-            )
-        })
+        .map(
+            |(id, status, present, confirmed, is_spammer, human_label)| {
+                if is_spammer {
+                    currently_flagged_spammer_user_links =
+                        currently_flagged_spammer_user_links.saturating_add(1);
+                }
+                match human_label.as_deref() {
+                    Some("spam") => {
+                        operator_confirmed_spammer_user_links =
+                            operator_confirmed_spammer_user_links.saturating_add(1);
+                    }
+                    Some("not_spam") => {
+                        operator_confirmed_normal_user_links =
+                            operator_confirmed_normal_user_links.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                (
+                    id as u64,
+                    MembershipContext::from_snapshot(status.as_deref(), present, confirmed),
+                )
+            },
+        )
         .collect::<HashMap<_, _>>();
     let mut current_member_user_links = 0u16;
     let mut former_member_user_links = 0u16;
@@ -413,7 +616,14 @@ pub async fn recent_link_relationship_summary(
         "external_telegram_message_links": external_message_links,
         "unresolved_telegram_links": unresolved_telegram_links,
         "locally_resolved_current_usernames": resolved_username_count,
+        "locally_resolved_username_count": resolved_username_count,
+        "locally_resolved_users": resolved_user_count,
+        "locally_resolved_bots": resolved_bot_count,
+        "locally_resolved_chats": resolved_chat_count,
         "confirmed_bot_candidates": confirmed_bot_candidate_count,
+        "currently_flagged_spammer_user_links": currently_flagged_spammer_user_links,
+        "operator_confirmed_spammer_user_links": operator_confirmed_spammer_user_links,
+        "operator_confirmed_normal_user_links": operator_confirmed_normal_user_links,
         "username_snapshot_max_age_hours": 24,
         "unique_external_url_count": unique_external_url_count,
         // Compatibility/diagnostic alias; URL shadow uses only the unified unique count.
@@ -459,15 +669,6 @@ fn is_external_web_host(host: &str) -> bool {
         && !host.ends_with(".telegram.dog")
 }
 
-fn normalize_username(value: &str) -> Option<String> {
-    let username = value.trim().trim_start_matches('@').to_ascii_lowercase();
-    (5..=32).contains(&username.len()).then_some(())?;
-    username
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        .then_some(username)
-}
-
 fn is_bot_candidate(username: &str) -> bool {
     ["bot", "agent", "ai", "app", "game", "gay"]
         .iter()
@@ -490,23 +691,36 @@ pub fn classify_qr_url(
     chat_id: i64,
     affiliated_channels: &HashSet<i64>,
 ) -> QrUrlRelation {
-    match parse_telegram_link(target) {
-        Some(TelegramLink::Message {
-            peer: TelegramPeer::ChatId(id),
-            ..
-        }) if id == chat_id || affiliated_channels.contains(&id) => QrUrlRelation::Affiliated,
-        Some(TelegramLink::Message {
-            peer: TelegramPeer::ChatId(_),
-            ..
-        }) => QrUrlRelation::External,
-        Some(_) => QrUrlRelation::Unresolved,
-        None if teloxide_url::parse_url(target)
-            .is_some_and(|url| matches!(url.scheme(), "http" | "https")) =>
-        {
-            QrUrlRelation::External
-        }
-        None => QrUrlRelation::Unresolved,
+    domain::classify_qr_url(target, chat_id, affiliated_channels)
+}
+
+pub async fn classify_qr_url_with_aliases(
+    pool: &PgPool,
+    target: &str,
+    chat_id: i64,
+    affiliated_channels: &HashSet<i64>,
+) -> anyhow::Result<QrUrlRelation> {
+    if let Some(TelegramLink::Message {
+        peer: TelegramPeer::Username(username),
+        ..
+    }) = parse_telegram_link(target)
+    {
+        return Ok(match resolve_telegram_username(pool, &username).await? {
+            TelegramUsernameResolution::Unique(peer)
+                if matches!(peer.peer_type.as_str(), "channel" | "group" | "supergroup")
+                    && (peer.peer_id == chat_id || affiliated_channels.contains(&peer.peer_id)) =>
+            {
+                QrUrlRelation::Affiliated
+            }
+            TelegramUsernameResolution::Unique(peer)
+                if matches!(peer.peer_type.as_str(), "channel" | "group" | "supergroup") =>
+            {
+                QrUrlRelation::External
+            }
+            _ => QrUrlRelation::Unresolved,
+        });
     }
+    Ok(classify_qr_url(target, chat_id, affiliated_channels))
 }
 
 fn unix_now() -> u64 {
@@ -516,35 +730,7 @@ fn unix_now() -> u64 {
 }
 
 pub fn relation(link: &TelegramLink, context: &RelationContext<'_>) -> LinkRelation {
-    match link {
-        TelegramLink::UserId(id) => {
-            let Some((known_id, membership)) = context.user_membership else {
-                return LinkRelation::Unresolved;
-            };
-            if *id != known_id {
-                return LinkRelation::Unresolved;
-            }
-            match membership {
-                MembershipContext::CurrentMember => LinkRelation::CurrentMember,
-                MembershipContext::FormerMember => LinkRelation::FormerMember,
-                MembershipContext::Banned => LinkRelation::BannedMember,
-                MembershipContext::Unknown | MembershipContext::NonMemberHistoryUnknown => {
-                    LinkRelation::Unresolved
-                }
-            }
-        }
-        TelegramLink::Message {
-            peer: TelegramPeer::ChatId(id),
-            ..
-        } => {
-            if *id == context.chat_id || context.affiliated_channels.contains(id) {
-                LinkRelation::AffiliatedChannel
-            } else {
-                LinkRelation::KnownExternal
-            }
-        }
-        _ => LinkRelation::Unresolved,
-    }
+    domain::relation(link, context)
 }
 
 #[cfg(test)]
@@ -686,4 +872,253 @@ mod tests {
             LinkRelation::Unresolved
         );
     }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn current_username_aliases_resolve_only_fresh_unique_owners() {
+        const OWNER_A: i64 = 9_100_000_000_001;
+        const OWNER_B: i64 = 9_100_000_000_002;
+        const OWNER_C: i64 = 9_100_000_000_003;
+        const OWNER_D: i64 = 9_100_000_000_004;
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point at a disposable test database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let readonly_role_exists: bool = sqlx::query_scalar(
+            "select exists(select 1 from pg_roles where rolname = 'nedobot_mcp_ro')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if readonly_role_exists {
+            let can_read_aliases: bool = sqlx::query_scalar(
+                "select has_table_privilege('nedobot_mcp_ro', 'public.telegram_username_aliases', 'select')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                !can_read_aliases,
+                "private alias index must stay outside MCP read access"
+            );
+        }
+        sqlx::query(
+            "delete from public.telegram_username_aliases where telegram_peer_id = any($1)",
+        )
+        .bind([OWNER_A, OWNER_B, OWNER_C, OWNER_D])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first_user: teloxide::types::User = serde_json::from_value(serde_json::json!({
+            "id": OWNER_A,
+            "is_bot": false,
+            "first_name": "Synthetic",
+            "username": "OldName"
+        }))
+        .unwrap();
+        crate::db::telegram::upsert_user_profile(&pool, &first_user)
+            .await
+            .unwrap();
+        replace_current_telegram_username_aliases(
+            &pool,
+            OWNER_A,
+            TelegramPeerType::User,
+            "profile_refresh",
+            &["OldName".to_owned(), "ExtraName".to_owned()],
+        )
+        .await
+        .unwrap();
+        crate::db::telegram::upsert_user_profile(&pool, &first_user)
+            .await
+            .unwrap();
+        let names = vec!["oldname".to_owned(), "extraname".to_owned()];
+        let resolved = resolve_current_username_aliases(&pool, &names)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resolved.get("oldname"),
+            Some(TelegramUsernameResolution::Unique(peer))
+                if peer.peer_id == OWNER_A && peer.peer_type == "user"
+        ));
+        assert!(matches!(
+            resolved.get("extraname"),
+            Some(TelegramUsernameResolution::Unique(peer))
+                if peer.peer_id == OWNER_A && peer.peer_type == "user"
+        ));
+
+        let renamed_user: teloxide::types::User = serde_json::from_value(serde_json::json!({
+            "id": OWNER_A,
+            "is_bot": false,
+            "first_name": "Synthetic",
+            "username": "CurrentName"
+        }))
+        .unwrap();
+        crate::db::telegram::upsert_user_profile(&pool, &renamed_user)
+            .await
+            .unwrap();
+        let names = vec![
+            "oldname".to_owned(),
+            "extraname".to_owned(),
+            "currentname".to_owned(),
+        ];
+        let resolved = resolve_current_username_aliases(&pool, &names)
+            .await
+            .unwrap();
+        assert!(!resolved.contains_key("oldname"));
+        assert!(!resolved.contains_key("extraname"));
+        assert!(matches!(
+            resolved.get("currentname"),
+            Some(TelegramUsernameResolution::Unique(peer))
+                if peer.peer_id == OWNER_A && peer.peer_type == "user"
+        ));
+
+        for (owner_id, usernames) in [
+            (OWNER_B, vec!["SharedAlias", "AffiliatedChannel"]),
+            (OWNER_C, vec!["SharedAlias", "OutsideChannel"]),
+        ] {
+            replace_current_telegram_username_aliases(
+                &pool,
+                owner_id,
+                TelegramPeerType::Channel,
+                "configured_chat_refresh",
+                &usernames.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        }
+        replace_current_telegram_username_aliases(
+            &pool,
+            OWNER_D,
+            TelegramPeerType::Bot,
+            "known_bot_refresh",
+            &["PrimaryBot".to_owned(), "ExtraBotName".to_owned()],
+        )
+        .await
+        .unwrap();
+        for username in ["primarybot", "extrabotname"] {
+            assert_eq!(
+                resolve_telegram_username(&pool, username).await.unwrap(),
+                TelegramUsernameResolution::Unique(ResolvedTelegramPeer {
+                    peer_id: OWNER_D,
+                    peer_type: "bot".to_owned(),
+                })
+            );
+        }
+        assert_eq!(
+            resolve_telegram_username(&pool, "@SharedAlias")
+                .await
+                .unwrap(),
+            TelegramUsernameResolution::Ambiguous,
+            "ambiguous aliases must fail closed"
+        );
+        let affiliated = HashSet::from([OWNER_B]);
+        assert_eq!(
+            classify_qr_url_with_aliases(
+                &pool,
+                "https://t.me/AffiliatedChannel/123",
+                -1001,
+                &affiliated
+            )
+            .await
+            .unwrap(),
+            QrUrlRelation::Affiliated
+        );
+        assert_eq!(
+            classify_qr_url_with_aliases(
+                &pool,
+                "https://t.me/OutsideChannel/123",
+                -1001,
+                &affiliated
+            )
+            .await
+            .unwrap(),
+            QrUrlRelation::External
+        );
+        assert_eq!(
+            classify_qr_url_with_aliases(
+                &pool,
+                "https://t.me/UnknownChannel/123",
+                -1001,
+                &affiliated
+            )
+            .await
+            .unwrap(),
+            QrUrlRelation::Unresolved
+        );
+        replace_current_telegram_username_aliases(
+            &pool,
+            OWNER_B,
+            TelegramPeerType::Channel,
+            "configured_chat_refresh",
+            &["ReusedAlias".to_owned()],
+        )
+        .await
+        .unwrap();
+        replace_current_telegram_username_aliases(
+            &pool,
+            OWNER_B,
+            TelegramPeerType::Channel,
+            "configured_chat_refresh",
+            &["FormerAlias".to_owned()],
+        )
+        .await
+        .unwrap();
+        replace_current_telegram_username_aliases(
+            &pool,
+            OWNER_C,
+            TelegramPeerType::Channel,
+            "configured_chat_refresh",
+            &["ReusedAlias".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve_telegram_username(&pool, "ReusedAlias")
+                .await
+                .unwrap(),
+            TelegramUsernameResolution::Unique(ResolvedTelegramPeer {
+                peer_id: OWNER_C,
+                peer_type: "channel".to_owned(),
+            })
+        );
+
+        replace_current_telegram_username_aliases(
+            &pool,
+            OWNER_B,
+            TelegramPeerType::Channel,
+            "configured_chat_refresh",
+            &["StaleAlias".to_owned()],
+        )
+        .await
+        .unwrap();
+        sqlx::query("update public.telegram_username_aliases set observed_at = now() - interval '25 hours' where telegram_peer_id = $1")
+            .bind(OWNER_B)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            resolve_current_username_aliases(&pool, &["stalealias".to_owned()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "stale aliases must not be treated as current"
+        );
+
+        sqlx::query(
+            "delete from public.telegram_username_aliases where telegram_peer_id = any($1)",
+        )
+        .bind([OWNER_A, OWNER_B, OWNER_C, OWNER_D])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("delete from public.telegram_user_profiles where telegram_user_id = $1")
+            .bind(OWNER_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
 }
+
+mod domain;

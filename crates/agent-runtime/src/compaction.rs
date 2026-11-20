@@ -207,6 +207,10 @@ impl CompactionPolicy for GreedyCompactionPolicy {
 mod tests {
     use super::*;
     use crate::context::{ContextBudget, ContextEntry, EstimateConfidence, TokenEstimate};
+    use proptest::{
+        prelude::*,
+        test_runner::{Config as ProptestConfig, RngSeed, TestRunner},
+    };
 
     fn entry(
         id: &str,
@@ -352,5 +356,87 @@ mod tests {
             economic_threshold: None,
         };
         assert!(GreedyCompactionPolicy::default().plan(&snapshot).is_err());
+    }
+
+    #[test]
+    fn generated_compaction_plans_match_independent_budget_oracle() {
+        let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0x12_03_02_03_04_05_06_07);
+        let strategy = (
+            prop::collection::vec((1_u32..=250, 0_u8..=10), 1..=24),
+            0_u32..=500,
+        );
+        let mut runner = TestRunner::new(ProptestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        });
+
+        runner
+            .run(&strategy, |(costs, target)| {
+                let entries = costs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (tokens, priority))| ContextEntry {
+                        id: format!("synthetic-{index}"),
+                        class: ContextClass::UserMessage,
+                        estimate: TokenEstimate {
+                            text: *tokens,
+                            framing: 0,
+                            confidence: EstimateConfidence::Exact,
+                        },
+                        priority: *priority,
+                        generation: 0,
+                        pair: None,
+                    })
+                    .collect::<Vec<_>>();
+                let used = entries.iter().map(ContextEntry::tokens).sum::<u32>();
+                let budget = ContextBudget {
+                    hard_input_limit: 10_000,
+                    target_input_limit: target,
+                    output_reserve: 0,
+                    tool_reserve: 0,
+                    safety_margin: 0,
+                };
+                let snapshot = ContextSnapshot {
+                    entries: &entries,
+                    budget,
+                    used_tokens: used,
+                    economic_threshold: None,
+                };
+                let plan = GreedyCompactionPolicy::default()
+                    .plan(&snapshot)
+                    .expect("all synthetic user entries can be dropped to meet the budget");
+                let dropped = plan
+                    .actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        CompactionAction::Drop(id) => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                let independently_freed = entries
+                    .iter()
+                    .filter(|entry| dropped.contains(entry.id.as_str()))
+                    .map(ContextEntry::tokens)
+                    .sum::<u32>();
+                let required_freed = used.saturating_sub(target);
+
+                prop_assert_eq!(plan.freed_estimate, independently_freed);
+                prop_assert!(independently_freed >= required_freed);
+                prop_assert!(used.saturating_sub(independently_freed) <= target);
+                prop_assert!(GreedyCompactionPolicy::check_pairs(&plan, &snapshot));
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=agent-compaction-budget seed={seed} sha={} replay=sh scripts/replay_quality_case.sh agent-compaction-budget {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
     }
 }

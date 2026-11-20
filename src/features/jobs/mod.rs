@@ -4,3 +4,4 @@ pub mod claim;
 #[allow(dead_code)]
 pub mod observability;
 pub mod policy;
+pub mod worker;

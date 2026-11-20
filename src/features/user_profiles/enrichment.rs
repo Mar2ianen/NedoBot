@@ -1,6 +1,9 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use sqlx::PgPool;
@@ -10,16 +13,39 @@ use tokio::sync::mpsc;
 use crate::{
     config::Config,
     db::telegram::{mark_user_profile_refresh_error, user_profile_needs_refresh},
+    features::jobs::worker::{WorkerId, WorkerSupervisor},
     features::user_profiles::service::refresh_profile,
 };
 
 #[cfg(feature = "moderation")]
+use crate::features::jobs::{
+    policy::PROFILE_REFRESH_INTENT_POLL,
+    worker::{PollOutcome, WorkerSpec, run_poll_worker},
+};
+
+#[cfg(feature = "moderation")]
 use crate::features::{
-    new_user_analysis::enqueue_new_user_audit_for_profile_refresh_with_url_feed,
+    new_user_analysis::{ProfileAuditOutcome, materialize_profile_refresh_audit},
     url_feeds::FeedSnapshot,
 };
 
 const PROFILE_REFRESH_QUEUE_CAPACITY: usize = 256;
+#[cfg(feature = "moderation")]
+const PROFILE_REFRESH_INTENT_BATCH: i64 = 64;
+#[cfg(feature = "moderation")]
+const PROFILE_REFRESH_INTENT_MAX_ATTEMPTS: i32 = 8;
+
+/// Profile snapshots are global per Telegram user while refresh jobs are keyed
+/// by chat. Two chats can therefore race one upstream fetch. This process-wide
+/// per-user gate admits at most one fetch at a time; the losing worker still
+/// runs its own per-chat audit.
+const PROFILE_REFRESH_STRIPES: usize = 256;
+static PROFILE_REFRESH_GATES: LazyLock<[tokio::sync::Mutex<()>; PROFILE_REFRESH_STRIPES]> =
+    LazyLock::new(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())));
+
+fn profile_refresh_gate(user_id: i64) -> &'static tokio::sync::Mutex<()> {
+    &PROFILE_REFRESH_GATES[user_id as usize % PROFILE_REFRESH_STRIPES]
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileRefreshEnqueueResult {
@@ -33,6 +59,7 @@ pub enum ProfileRefreshEnqueueResult {
 pub struct ProfileRefreshQueue {
     sender: mpsc::Sender<ProfileRefreshJob>,
     queued_jobs: Arc<Mutex<HashSet<(i64, i64)>>>,
+    full_events: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +79,7 @@ impl ProfileRefreshQueue {
         let queue = Self {
             sender,
             queued_jobs: Arc::new(Mutex::new(HashSet::new())),
+            full_events: Arc::new(AtomicU64::new(0)),
         };
         (queue, Arc::new(tokio::sync::Mutex::new(receiver)))
     }
@@ -71,6 +99,7 @@ impl ProfileRefreshQueue {
             Ok(()) => ProfileRefreshEnqueueResult::Queued,
             Err(mpsc::error::TrySendError::Full(job)) => {
                 queued_jobs.remove(&(job.chat_id, job.user_id));
+                self.full_events.fetch_add(1, Ordering::Relaxed);
                 ProfileRefreshEnqueueResult::Full
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
@@ -86,12 +115,19 @@ impl ProfileRefreshQueue {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&(job.chat_id, job.user_id));
     }
+
+    /// Number of events rejected by the bounded accelerator. The durable
+    /// intent table is still authoritative and reports recovery separately.
+    pub fn full_events(&self) -> u64 {
+        self.full_events.load(Ordering::Relaxed)
+    }
 }
 
 pub fn spawn_profile_refresh_workers(
+    supervisor: &mut WorkerSupervisor,
     bot: Bot,
     pool: PgPool,
-    config: Config,
+    config: Arc<Config>,
     #[cfg(feature = "moderation")] url_feed_snapshot: Arc<
         tokio::sync::RwLock<Option<Arc<FeedSnapshot>>>,
     >,
@@ -101,13 +137,16 @@ pub fn spawn_profile_refresh_workers(
     for worker_index in 0..config.profile_refresh_concurrency {
         let bot = bot.clone();
         let pool = pool.clone();
-        let config = config.clone();
+        let config = Arc::clone(&config);
         #[cfg(feature = "moderation")]
         let url_feed_snapshot = url_feed_snapshot.clone();
         let queue = queue.clone();
         let receiver = receiver.clone();
-        tokio::spawn(async move {
-            while let Some(job) = receiver.lock().await.recv().await {
+        supervisor.spawn(WorkerId::ProfileRefresh, move |mut shutdown| async move {
+            let mut draining = false;
+            while let Some(job) =
+                next_profile_refresh_job(&receiver, &mut shutdown, &mut draining).await
+            {
                 process_profile_refresh_job(
                     &bot,
                     &pool,
@@ -126,6 +165,69 @@ pub fn spawn_profile_refresh_workers(
     queue
 }
 
+#[cfg(feature = "moderation")]
+pub fn spawn_profile_refresh_intent_reconciler(
+    supervisor: &mut WorkerSupervisor,
+    pool: PgPool,
+    config: Arc<Config>,
+    url_feed_snapshot: Arc<tokio::sync::RwLock<Option<Arc<FeedSnapshot>>>>,
+) {
+    supervisor.spawn(
+        WorkerId::ProfileRefreshReconciler,
+        move |shutdown| async move {
+            run_poll_worker(
+                WorkerSpec::new(
+                    WorkerId::ProfileRefreshReconciler,
+                    PROFILE_REFRESH_INTENT_POLL,
+                ),
+                shutdown,
+                || {
+                    let pool = pool.clone();
+                    let config = Arc::clone(&config);
+                    let url_feed_snapshot = Arc::clone(&url_feed_snapshot);
+                    async move {
+                        let url_feed = url_feed_snapshot.read().await.clone();
+                        match reconcile_profile_refresh_intents(
+                            &pool,
+                            &config,
+                            url_feed,
+                            PROFILE_REFRESH_INTENT_BATCH,
+                        )
+                        .await
+                        {
+                            Ok(0) => PollOutcome::Idle,
+                            Ok(_) => PollOutcome::Processed,
+                            Err(_) => PollOutcome::Failed("intent_reconcile_failed"),
+                        }
+                    }
+                },
+            )
+            .await;
+        },
+    );
+}
+
+async fn next_profile_refresh_job(
+    receiver: &Arc<tokio::sync::Mutex<mpsc::Receiver<ProfileRefreshJob>>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    draining: &mut bool,
+) -> Option<ProfileRefreshJob> {
+    loop {
+        if *draining {
+            return receiver.lock().await.recv().await;
+        }
+        tokio::select! {
+            job = async { receiver.lock().await.recv().await } => return job,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    receiver.lock().await.close();
+                    *draining = true;
+                }
+            }
+        }
+    }
+}
+
 async fn process_profile_refresh_job(
     bot: &Bot,
     pool: &PgPool,
@@ -135,36 +237,41 @@ async fn process_profile_refresh_job(
     >,
     job: ProfileRefreshJob,
 ) {
-    let should_refresh = match user_profile_needs_refresh(pool, job.user_id).await {
-        Ok(should_refresh) => should_refresh,
-        Err(err) => {
-            tracing::warn!(%err, user_id = job.user_id, "failed to check user profile refresh state");
-            false
-        }
-    };
+    // A second chat for the same user must not start a concurrent upstream
+    // fetch. The winner re-checks freshness after taking the gate, so a queue
+    // backlog that became stale while waiting performs no extra API call.
+    {
+        let _gate = profile_refresh_gate(job.user_id).lock().await;
+        let should_refresh = match user_profile_needs_refresh(pool, job.user_id).await {
+            Ok(should_refresh) => should_refresh,
+            Err(err) => {
+                tracing::warn!(%err, user_id = job.user_id, "failed to check user profile refresh state");
+                false
+            }
+        };
 
-    if should_refresh {
-        match refresh_profile(bot, pool, job.user_id).await {
-            Ok(()) => {
-                if let Err(err) =
-                    crate::features::spammer_avatar_embeddings::enqueue_refreshed_spammer_avatars(
+        if should_refresh {
+            match refresh_profile(bot, pool, job.user_id).await {
+                Ok(()) => {
+                    if let Err(err) = crate::features::spammer_avatar_embeddings::enqueue_refreshed_spammer_avatars(
                         pool,
                         config.avatar_embeddings_enabled,
                         job.user_id,
                     )
                     .await
-                {
-                    tracing::warn!(%err, user_id = job.user_id, "failed to queue confirmed spammer avatar");
+                    {
+                        tracing::warn!(%err, user_id = job.user_id, "failed to queue confirmed spammer avatar");
+                    }
                 }
-            }
-            Err(err) => {
-                let message = err.to_string();
-                if let Err(save_err) =
-                    mark_user_profile_refresh_error(pool, job.user_id, &message).await
-                {
-                    tracing::warn!(%save_err, user_id = job.user_id, "failed to save profile refresh error");
+                Err(err) => {
+                    let message = err.to_string();
+                    if let Err(save_err) =
+                        mark_user_profile_refresh_error(pool, job.user_id, &message).await
+                    {
+                        tracing::warn!(%save_err, user_id = job.user_id, "failed to save profile refresh error");
+                    }
+                    tracing::warn!(%err, user_id = job.user_id, "failed to refresh message author profile");
                 }
-                tracing::warn!(%err, user_id = job.user_id, "failed to refresh message author profile");
             }
         }
     }
@@ -210,23 +317,559 @@ async fn process_profile_audit(
 
     #[cfg(feature = "moderation")]
     if config.new_user_audit_enabled
-        && config.chat_allows(job.chat_id, |chat| chat.moderation)
-        && let Err(err) = enqueue_new_user_audit_for_profile_refresh_with_url_feed(
-            pool,
-            config,
-            job.chat_id,
-            job.user_id,
-            url_feed_snapshot.read().await.clone(),
-        )
-        .await
+        && config.chat_allows(job.chat_id, |chat| chat.ingest && chat.moderation)
+        && let Err(err) =
+            process_fast_audit_intent(pool, config, url_feed_snapshot.read().await.clone(), job)
+                .await
     {
         tracing::warn!(%err, user_id = job.user_id, "failed to save unified new user audit baseline and job");
     }
 }
 
+#[cfg(feature = "moderation")]
+async fn process_fast_audit_intent(
+    pool: &PgPool,
+    config: &Config,
+    url_feed: Option<Arc<FeedSnapshot>>,
+    job: ProfileRefreshJob,
+) -> anyhow::Result<()> {
+    let instance_id = &config.community.instance.id;
+    let Some((revision, attempt)) = claim_fast_audit_intent(pool, instance_id, job).await? else {
+        return Ok(());
+    };
+    // Аудит читает снимок только после claim. Ошибка или остановка до ACK
+    // оставляет запись для reconciler после истечения lease.
+    materialize_claimed_audit(pool, config, url_feed, job).await?;
+    acknowledge_audit_intent(pool, instance_id, job, revision, attempt).await?;
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn materialize_claimed_audit(
+    pool: &PgPool,
+    config: &Config,
+    url_feed: Option<Arc<FeedSnapshot>>,
+    job: ProfileRefreshJob,
+) -> anyhow::Result<()> {
+    match materialize_profile_refresh_audit(pool, config, job.chat_id, job.user_id, url_feed)
+        .await?
+    {
+        ProfileAuditOutcome::Materialized => Ok(()),
+        ProfileAuditOutcome::NoSnapshot => anyhow::bail!("profile audit snapshot is unavailable"),
+    }
+}
+
+#[cfg(feature = "moderation")]
+async fn claim_fast_audit_intent(
+    pool: &PgPool,
+    instance_id: &str,
+    job: ProfileRefreshJob,
+) -> anyhow::Result<Option<(i64, i32)>> {
+    Ok(sqlx::query_as(
+        r#"update public.telegram_profile_refresh_intents
+           set attempts = attempts + 1,
+               next_attempt_at = clock_timestamp() + interval '2 minutes',
+               updated_at = now()
+           where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
+             and (completed_revision is null or completed_revision < revision)
+             and failed_at is null and next_attempt_at <= clock_timestamp()
+             and attempts < $4
+           returning revision, attempts"#,
+    )
+    .bind(instance_id)
+    .bind(job.chat_id)
+    .bind(job.user_id)
+    .bind(PROFILE_REFRESH_INTENT_MAX_ATTEMPTS)
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[cfg(feature = "moderation")]
+async fn acknowledge_audit_intent(
+    pool: &PgPool,
+    instance_id: &str,
+    job: ProfileRefreshJob,
+    revision: i64,
+    attempt: i32,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"update public.telegram_profile_refresh_intents
+           set completed_revision = $4, last_error = null, updated_at = now()
+           where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
+             and revision = $4 and attempts = $5
+             and failed_at is null and completed_revision is distinct from $4
+             and next_attempt_at > clock_timestamp()"#,
+    )
+    .bind(instance_id)
+    .bind(job.chat_id)
+    .bind(job.user_id)
+    .bind(revision)
+    .bind(attempt)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Replays durable ingest intents that the bounded queue could not accept or
+/// that were interrupted by a crash. Each stored revision is completed at most
+/// once; a newer message increments the revision and reopens the intent.
+#[cfg(feature = "moderation")]
+pub async fn reconcile_profile_refresh_intents(
+    pool: &PgPool,
+    config: &Config,
+    url_feed: Option<Arc<FeedSnapshot>>,
+    limit: i64,
+) -> anyhow::Result<usize> {
+    if !config.new_user_audit_enabled || limit <= 0 {
+        return Ok(0);
+    }
+    let instance_id = &config.community.instance.id;
+    let chat_ids: Vec<i64> = config
+        .community
+        .chats
+        .values()
+        .filter(|chat| chat.ingest && chat.moderation)
+        .map(|chat| chat.id)
+        .collect();
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(i64, i64, i64, i32, i64)> = sqlx::query_as(
+        r#"
+        select chat_id, telegram_user_id, revision, attempts,
+               greatest(0, extract(epoch from now() - created_at))::bigint
+        from public.telegram_profile_refresh_intents
+        where instance_id = $1 and chat_id = any($3)
+          and (completed_revision is null or completed_revision < revision)
+          and failed_at is null
+          and next_attempt_at <= now()
+        order by next_attempt_at, chat_id, telegram_user_id
+        for update skip locked
+        limit $2
+        "#,
+    )
+    .bind(instance_id)
+    .bind(limit)
+    .bind(&chat_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (chat_id, user_id, revision, attempts, _) in &rows {
+        sqlx::query(
+            r#"
+            update public.telegram_profile_refresh_intents
+            set attempts = case when $5 then attempts else attempts + 1 end,
+                failed_at = case when $5 then now() else null end,
+                last_error = case when $5 then 'lease_exhausted' else last_error end,
+                next_attempt_at = now() + interval '2 minutes',
+                updated_at = now()
+            where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
+              and revision = $4
+            "#,
+        )
+        .bind(instance_id)
+        .bind(chat_id)
+        .bind(user_id)
+        .bind(revision)
+        .bind(*attempts >= PROFILE_REFRESH_INTENT_MAX_ATTEMPTS)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    let mut recovered = 0usize;
+    for (chat_id, user_id, revision, attempts, pending_age_seconds) in rows {
+        if attempts >= PROFILE_REFRESH_INTENT_MAX_ATTEMPTS {
+            continue;
+        }
+        let job = ProfileRefreshJob { chat_id, user_id };
+        match materialize_claimed_audit(pool, config, url_feed.clone(), job).await {
+            Ok(()) => {
+                if !acknowledge_audit_intent(pool, instance_id, job, revision, attempts + 1).await?
+                {
+                    continue;
+                }
+                recovered += 1;
+                tracing::info!(
+                    chat_id,
+                    user_id,
+                    revision,
+                    attempts = attempts + 1,
+                    pending_age_seconds,
+                    recovery_count = recovered,
+                    "recovered durable profile refresh intent"
+                );
+            }
+            Err(error) => {
+                let terminal = attempts + 1 >= PROFILE_REFRESH_INTENT_MAX_ATTEMPTS;
+                let delay_seconds = 15_i64
+                    .saturating_mul(1_i64 << (attempts.clamp(0, 10) as u32))
+                    .min(3_600);
+                sqlx::query(
+                    r#"
+                    update public.telegram_profile_refresh_intents
+                    set next_attempt_at = case
+                            when $5 then now() + interval '1 day'
+                            else now() + make_interval(secs => $6)
+                        end,
+                        failed_at = case when $5 then now() else failed_at end,
+                        last_error = 'audit_materialization_failed',
+                        updated_at = now()
+                    where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
+                      and revision = $4 and attempts = $7
+                      and failed_at is null and completed_revision is distinct from $4
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(chat_id)
+                .bind(user_id)
+                .bind(revision)
+                .bind(terminal)
+                .bind(delay_seconds)
+                .bind(attempts + 1)
+                .execute(pool)
+                .await?;
+                tracing::warn!(
+                    %error,
+                    chat_id,
+                    user_id,
+                    revision,
+                    attempts = attempts + 1,
+                    terminal,
+                    "durable profile refresh intent failed"
+                );
+            }
+        }
+    }
+    Ok(recovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "moderation")]
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn fast_audit_ack_fences_revisions_and_reclaims() {
+        let pool = PgPool::connect(&std::env::var("TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let suffix = i64::from(uuid::Uuid::new_v4().as_u128() as u32);
+        let job = ProfileRefreshJob {
+            chat_id: -1_008_320_000_000 - suffix,
+            user_id: 8_503_000_000_000 + suffix,
+        };
+        let mut config = crate::config::test_config();
+        config.community.instance.id = format!("fast_ack_{suffix}");
+        config.community.chats.get_mut("main").unwrap().id = job.chat_id;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        config.new_user_audit_enabled = true;
+        let instance = &config.community.instance.id;
+        let ingest = async |message_id| {
+            let message = serde_json::from_value(serde_json::json!({
+                "message_id": message_id, "date": chrono::Utc::now().timestamp(),
+                "chat": {"id": job.chat_id, "type": "supergroup", "title": "Fixture"},
+                "from": {"id": job.user_id, "is_bot": false, "first_name": "Fixture"},
+                "text": "Synthetic message"
+            }))
+            .unwrap();
+            assert!(
+                crate::features::ingest::ingest_message(&pool, &message, &config)
+                    .await
+                    .unwrap()
+                    .was_persisted()
+            );
+        };
+        let state = || async {
+            sqlx::query_as::<_, (i64, Option<i64>, i32)>(
+                "select revision, completed_revision, attempts from telegram_profile_refresh_intents
+                 where instance_id=$1 and chat_id=$2 and telegram_user_id=$3",
+            ).bind(instance).bind(job.chat_id).bind(job.user_id).fetch_one(&pool).await.unwrap()
+        };
+        let expire = || async {
+            sqlx::query("update telegram_profile_refresh_intents set next_attempt_at=now()-interval '1 second'
+                         where instance_id=$1 and chat_id=$2 and telegram_user_id=$3")
+                .bind(instance).bind(job.chat_id).bind(job.user_id).execute(&pool).await.unwrap();
+        };
+        let recover = || reconcile_profile_refresh_intents(&pool, &config, None, 8);
+
+        ingest(1_i32).await;
+        process_profile_audit(&pool, &config, Arc::default(), job).await;
+        assert_eq!(state().await, (1, Some(1), 1));
+        expire().await;
+        assert_eq!(
+            recover().await.unwrap(),
+            0,
+            "confirmed fast-path is not replayed"
+        );
+
+        ingest(2).await;
+        let (revision, attempt) = claim_fast_audit_intent(&pool, instance, job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recover().await.unwrap(),
+            0,
+            "live claim excludes reconciler"
+        );
+        materialize_claimed_audit(&pool, &config, None, job)
+            .await
+            .unwrap();
+        assert_eq!(state().await, (2, Some(1), 1));
+        // Имитируем остановку после commit аудита, до ACK, и повторный claim.
+        expire().await;
+        assert_eq!(
+            claim_fast_audit_intent(&pool, instance, job).await.unwrap(),
+            Some((2, 2))
+        );
+        assert!(
+            !acknowledge_audit_intent(&pool, instance, job, revision, attempt)
+                .await
+                .unwrap()
+        );
+        expire().await;
+        assert_eq!(recover().await.unwrap(), 1);
+        assert_eq!(state().await, (2, Some(2), 3));
+
+        ingest(3).await;
+        let (revision, attempt) = claim_fast_audit_intent(&pool, instance, job)
+            .await
+            .unwrap()
+            .unwrap();
+        materialize_claimed_audit(&pool, &config, None, job)
+            .await
+            .unwrap();
+        ingest(4).await;
+        assert_eq!(
+            claim_fast_audit_intent(&pool, instance, job).await.unwrap(),
+            Some((4, 1))
+        );
+        assert!(
+            !acknowledge_audit_intent(&pool, instance, job, revision, attempt)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state().await, (4, Some(2), 1));
+        expire().await;
+        assert_eq!(recover().await.unwrap(), 1);
+        assert_eq!(state().await, (4, Some(4), 2));
+
+        ingest(5).await;
+        sqlx::query("delete from telegram_chat_users where chat_id=$1 and telegram_user_id=$2")
+            .bind(job.chat_id)
+            .bind(job.user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            process_fast_audit_intent(&pool, &config, None, job)
+                .await
+                .is_err(),
+            "an unavailable snapshot is not a materialized audit"
+        );
+        assert_eq!(state().await, (5, Some(4), 1));
+    }
+
+    #[cfg(feature = "moderation")]
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn two_chats_share_profile_fetch_but_keep_both_audits() {
+        use axum::{Json, Router, http::Uri, routing::post};
+        use serde_json::json;
+        use tokio::sync::{Notify, RwLock};
+
+        let pool = PgPool::connect(&std::env::var("TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().as_u128() as u32;
+        let user = 8_992_000_000_000 + i64::from(suffix);
+        let chat = -1_008_992_000_000 - 2 * i64::from(suffix);
+        let mut cfg = crate::config::test_config();
+        cfg.new_user_audit_enabled = true;
+        cfg.community.instance.id = format!("singleflight_{suffix}");
+        let main = cfg.community.chats.get_mut("main").unwrap();
+        main.id = chat;
+        let mut other = main.clone();
+        other.id = chat - 1;
+        cfg.community.chats.insert("other".into(), other);
+        cfg.chat_registry = crate::community::ChatRegistry::new(&cfg.community).unwrap();
+        for chat in [chat, chat - 1] {
+            let msg = serde_json::from_value(json!({
+                "message_id":1, "date":chrono::Utc::now().timestamp(),
+                "chat":{"id":chat,"type":"supergroup","title":"Fixture"},
+                "from":{"id":user,"is_bot":false,"first_name":"Fixture"},"text":"Fixture"
+            }))
+            .unwrap();
+            assert!(
+                crate::features::ingest::ingest_message(&pool, &msg, &cfg)
+                    .await
+                    .unwrap()
+                    .was_persisted()
+            );
+        }
+
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicU64::new(0));
+        let fake = {
+            let (arrived, release, calls) = (arrived.clone(), release.clone(), calls.clone());
+            move |uri: Uri| {
+                let (arrived, release, calls) = (arrived.clone(), release.clone(), calls.clone());
+                async move {
+                    let result = match uri
+                        .path()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "getchat" => {
+                            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                arrived.notify_one();
+                                release.notified().await;
+                            }
+                            json!({"id":user,"type":"private","first_name":"Fixture",
+                                "username":"fixture_current","max_reaction_count":0,
+                                "accepted_gift_types":{"unlimited_gifts":false,"limited_gifts":false,
+                                     "unique_gifts":false,"premium_subscription":false}})
+                        }
+                        "getuserprofilephotos" => json!({"total_count":0,"photos":[]}),
+                        "getuserpersonalchatmessages" => json!([]),
+                        other => panic!("unexpected method {other}"),
+                    };
+                    Json(json!({"ok":true,"result":result}))
+                }
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(post(fake)))
+                .await
+                .unwrap()
+        });
+        let bot = Bot::new("fixture").set_api_url(format!("http://{address}/").parse().unwrap());
+        let feed = Arc::new(RwLock::new(None));
+        let run = |chat_id| {
+            process_profile_refresh_job(
+                &bot,
+                &pool,
+                &cfg,
+                feed.clone(),
+                ProfileRefreshJob {
+                    chat_id,
+                    user_id: user,
+                },
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let first = run(chat);
+            tokio::pin!(first);
+            tokio::select! {
+                _ = &mut first => panic!("refresh returned before upstream was released"),
+                _ = arrived.notified() => {}
+            }
+            assert!(
+                profile_refresh_gate(user).try_lock().is_err(),
+                "fetch must own the gate"
+            );
+            let second = run(chat - 1);
+            tokio::pin!(second);
+            // Poll the second job while the first still owns the gate.
+            tokio::select! {
+                biased;
+                _ = &mut second => panic!("second job bypassed the active refresh"),
+                _ = std::future::ready(()) => {}
+            }
+            release.notify_one();
+            tokio::join!(first, second);
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let alias: String = sqlx::query_scalar(
+            "select username_normalized from telegram_username_aliases where telegram_peer_id=$1 and is_active",
+        ).bind(user).fetch_one(&pool).await.unwrap();
+        assert_eq!(alias, "fixture_current");
+        let chats: Vec<i64> = sqlx::query_scalar("select chat_id from telegram_new_user_profile_audits where telegram_user_id=$1 order by chat_id")
+            .bind(user).fetch_all(&pool).await.unwrap();
+        assert_eq!(chats, [chat - 1, chat]);
+        server.abort();
+    }
+
+    #[cfg(feature = "moderation")]
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn saturated_and_closed_queue_preserves_ingested_audit_intents() {
+        let pool = PgPool::connect(&std::env::var("TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let mut config = crate::config::test_config();
+        let fixture = uuid::Uuid::new_v4().as_u128() as u32;
+        let chat_id = -1_008_000_000_000 - i64::from(fixture);
+        let user_base = 8_000_000_000_000 + i64::from(fixture) * 512;
+        config.community.instance.id = format!("queue_fixture_{fixture}");
+        config.community.chats.get_mut("main").unwrap().id = chat_id;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        config.new_user_audit_enabled = true;
+
+        let (queue, receiver) = ProfileRefreshQueue::new(PROFILE_REFRESH_QUEUE_CAPACITY);
+        let total = PROFILE_REFRESH_QUEUE_CAPACITY + 3;
+        for index in 0..total {
+            let user_id = user_base + index as i64;
+            let msg: Message = serde_json::from_value(serde_json::json!({
+                "message_id": index + 1,
+                "date": chrono::Utc::now().timestamp(),
+                "chat": {"id": chat_id, "type": "supergroup", "title": "Queue fixture"},
+                "from": {"id": user_id, "is_bot": false, "first_name": "Fixture"},
+                "text": "Synthetic audit fixture"
+            }))
+            .unwrap();
+            let ingest = || crate::features::ingest::ingest_message(&pool, &msg, &config);
+            assert!(ingest().await.unwrap().was_persisted());
+            if index == total - 1 {
+                // Commit before a simulated process exit: no queue send at all.
+                assert!(ingest().await.unwrap().was_persisted());
+                break;
+            }
+            let expected = match index {
+                PROFILE_REFRESH_QUEUE_CAPACITY => ProfileRefreshEnqueueResult::Full,
+                index if index > PROFILE_REFRESH_QUEUE_CAPACITY => {
+                    receiver.lock().await.close();
+                    ProfileRefreshEnqueueResult::Closed
+                }
+                _ => ProfileRefreshEnqueueResult::Queued,
+            };
+            assert_eq!(queue.try_enqueue(chat_id, user_id), expected);
+        }
+        assert_eq!(queue.full_events(), 1);
+        drop((queue, receiver));
+
+        let mut recovered = 0;
+        loop {
+            let count = reconcile_profile_refresh_intents(&pool, &config, None, 32)
+                .await
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            recovered += count;
+            assert!(recovered <= total);
+        }
+        assert_eq!(recovered, total);
+        let (intents, baselines): (i64, i64) = sqlx::query_as(
+            r#"select
+                (select count(*) from telegram_profile_refresh_intents
+                  where instance_id=$1 and chat_id=$2 and revision=1 and completed_revision=1),
+                (select count(*) from telegram_new_user_profile_audits where chat_id=$2)"#,
+        )
+        .bind(&config.community.instance.id)
+        .bind(chat_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((intents, baselines), (total as i64, total as i64));
+    }
 
     #[tokio::test]
     async fn queue_coalesces_user_events_and_releases_them_after_completion() {
@@ -256,6 +899,49 @@ mod tests {
         assert_eq!(
             queue.try_enqueue(-1001, 42),
             ProfileRefreshEnqueueResult::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_intake_then_drains_already_queued_profiles() {
+        let (empty_queue, empty_receiver) = ProfileRefreshQueue::new(1);
+        let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let mut draining = false;
+        shutdown_tx.send_replace(true);
+        assert!(
+            next_profile_refresh_job(&empty_receiver, &mut shutdown, &mut draining)
+                .await
+                .is_none()
+        );
+        assert!(draining);
+        assert_eq!(
+            empty_queue.try_enqueue(-1001, 41),
+            ProfileRefreshEnqueueResult::Closed
+        );
+
+        let (queue, receiver) = ProfileRefreshQueue::new(2);
+        assert_eq!(
+            queue.try_enqueue(-1001, 42),
+            ProfileRefreshEnqueueResult::Queued
+        );
+        receiver.lock().await.close();
+        let (_shutdown_tx, mut shutdown) = tokio::sync::watch::channel(true);
+        let mut draining = true;
+
+        let queued = next_profile_refresh_job(&receiver, &mut shutdown, &mut draining)
+            .await
+            .expect("shutdown should retain already queued work");
+        assert_eq!(queued.user_id, 42);
+        assert_eq!(
+            queue.try_enqueue(-1001, 43),
+            ProfileRefreshEnqueueResult::Closed
+        );
+
+        queue.mark_completed(queued);
+        assert!(
+            next_profile_refresh_job(&receiver, &mut shutdown, &mut draining)
+                .await
+                .is_none()
         );
     }
 }

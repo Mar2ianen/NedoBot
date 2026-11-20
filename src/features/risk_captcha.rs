@@ -82,6 +82,40 @@ struct MathChallenge {
     correct_option: i16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptchaStatus {
+    Preparing,
+    SettingUp,
+    Pending,
+    Solving,
+    Passed,
+    Failed,
+    Overridden,
+    SetupFailed,
+    Expired,
+    Expiring,
+}
+
+impl TryFrom<&str> for CaptchaStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "setting_up" => Ok(Self::SettingUp),
+            "pending" => Ok(Self::Pending),
+            "solving" => Ok(Self::Solving),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "overridden" => Ok(Self::Overridden),
+            "setup_failed" => Ok(Self::SetupFailed),
+            "expired" => Ok(Self::Expired),
+            "expiring" => Ok(Self::Expiring),
+            _ => anyhow::bail!("unknown risk captcha status: {value}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CaptchaChallenge {
     id: Uuid,
@@ -95,7 +129,7 @@ struct CaptchaChallenge {
     message_id: Option<i32>,
     ephemeral_message_id: Option<i32>,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    status: String,
+    status: CaptchaStatus,
     setup_attempts: i32,
     decision_job_id: Option<i64>,
     ban_on_failure: bool,
@@ -223,8 +257,8 @@ async fn apply_captcha(
     }
     let challenge = match load_user_challenge(pool, job.chat_id, job.telegram_user_id).await? {
         Some(challenge)
-            if challenge.status == "expired"
-                || (challenge.status == "overridden"
+            if challenge.status == CaptchaStatus::Expired
+                || (challenge.status == CaptchaStatus::Overridden
                     && challenge.decision_job_id.is_some()
                     && challenge.setup_error_kind.as_deref()
                         == Some("decision_source_changed")
@@ -274,14 +308,14 @@ async fn apply_captcha(
         }
     };
 
-    match challenge.status.as_str() {
-        "passed" => return Ok(CaptchaOutcome::AlreadyPassed),
-        "failed" => return Ok(CaptchaOutcome::FailedAttempts),
-        "setup_failed" => return Ok(CaptchaOutcome::SetupFailed),
-        "overridden" => return Ok(CaptchaOutcome::Overridden),
-        "expired" => return Ok(CaptchaOutcome::Expired),
-        "solving" => return Ok(CaptchaOutcome::AlreadyPending),
-        "pending" if challenge.message_id.is_some() => {
+    match challenge.status {
+        CaptchaStatus::Passed => return Ok(CaptchaOutcome::AlreadyPassed),
+        CaptchaStatus::Failed => return Ok(CaptchaOutcome::FailedAttempts),
+        CaptchaStatus::SetupFailed => return Ok(CaptchaOutcome::SetupFailed),
+        CaptchaStatus::Overridden => return Ok(CaptchaOutcome::Overridden),
+        CaptchaStatus::Expired => return Ok(CaptchaOutcome::Expired),
+        CaptchaStatus::Solving => return Ok(CaptchaOutcome::AlreadyPending),
+        CaptchaStatus::Pending if challenge.message_id.is_some() => {
             if ensure_verification_state(bot, pool, &challenge)
                 .await?
                 .is_none()
@@ -291,8 +325,8 @@ async fn apply_captcha(
             delete_audited_messages(bot, pool, &challenge).await?;
             return Ok(CaptchaOutcome::AlreadyPending);
         }
-        "preparing" | "setting_up" | "pending" => {}
-        _ => return Ok(CaptchaOutcome::Overridden),
+        CaptchaStatus::Preparing | CaptchaStatus::SettingUp | CaptchaStatus::Pending => {}
+        CaptchaStatus::Expiring => return Ok(CaptchaOutcome::Overridden),
     }
     let Some(claimed) = claim_setup_by_id(pool, challenge.id).await? else {
         return Ok(CaptchaOutcome::AlreadyPending);
@@ -313,7 +347,7 @@ pub async fn process_next_setup(
     if !decision_source_valid(bot, pool, &challenge).await? {
         return Ok(true);
     }
-    if challenge.status == "pending" && challenge.message_id.is_some() {
+    if challenge.status == CaptchaStatus::Pending && challenge.message_id.is_some() {
         // Cleanup retry не должен накладывать новый mute, если автор успел
         // вступить в группу, пройти проверку или был размучен администратором.
         let member = bot
@@ -635,12 +669,15 @@ pub async fn handle_callback(
         return Ok(CaptchaCallbackOutcome::Expired);
     }
     if !matches!(
-        challenge.status.as_str(),
-        "preparing" | "setting_up" | "pending" | "solving"
+        challenge.status,
+        CaptchaStatus::Preparing
+            | CaptchaStatus::SettingUp
+            | CaptchaStatus::Pending
+            | CaptchaStatus::Solving
     ) {
-        return Ok(match challenge.status.as_str() {
-            "failed" => CaptchaCallbackOutcome::Failed,
-            "expired" | "expiring" => CaptchaCallbackOutcome::Expired,
+        return Ok(match challenge.status {
+            CaptchaStatus::Failed => CaptchaCallbackOutcome::Failed,
+            CaptchaStatus::Expired | CaptchaStatus::Expiring => CaptchaCallbackOutcome::Expired,
             _ => CaptchaCallbackOutcome::Stale,
         });
     }
@@ -650,48 +687,193 @@ pub async fn handle_callback(
     if !mark_solving(pool, challenge.id).await? {
         return Ok(CaptchaCallbackOutcome::Stale);
     }
+    finish_captcha_solution(bot, pool, &challenge).await
+}
 
-    #[cfg(feature = "manual-moderation")]
-    if crate::features::manual_moderation::active_restriction_action(
-        pool,
+async fn finish_captcha_solution(
+    bot: &Bot,
+    pool: &PgPool,
+    challenge: &CaptchaChallenge,
+) -> anyhow::Result<CaptchaCallbackOutcome> {
+    let mut tx = pool.begin().await?;
+    let has_other_restriction =
+        crate::features::manual_moderation::lock_automatic_restriction_restore(
+            &mut tx,
+            challenge.chat_id,
+            challenge.user_id,
+        )
+        .await?;
+
+    let status: Option<String> = sqlx::query_scalar(
+        "select status from telegram_risk_captcha_challenges where id = $1 for update",
+    )
+    .bind(challenge.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if status.as_deref() != Some("solving") {
+        tx.commit().await?;
+        return Ok(CaptchaCallbackOutcome::Stale);
+    }
+
+    let result = if has_other_restriction {
+        sqlx::query("update telegram_risk_captcha_challenges set status = 'overridden', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'solving'")
+            .bind(challenge.id)
+            .execute(&mut *tx)
+            .await?;
+        CaptchaCallbackOutcome::PassedButOtherRestrictionRemains
+    } else if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+        sqlx::query("update telegram_risk_captcha_challenges set status = 'overridden', setup_error_kind = 'decision_source_changed', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'solving'")
+            .bind(challenge.id)
+            .execute(&mut *tx)
+            .await?;
+        CaptchaCallbackOutcome::Stale
+    } else {
+        let member = bot
+            .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
+            .await?;
+        match captcha_solve_decision(
+            captcha_member_state(&member.kind),
+            challenge.restriction_applied_at.is_some(),
+        ) {
+            CaptchaSolveDecision::PassedWithoutRestriction => {
+                set_passed_in_tx(&mut tx, challenge.id).await?;
+                CaptchaCallbackOutcome::PassedWithoutRestriction
+            }
+            CaptchaSolveDecision::Passed => {
+                set_passed_in_tx(&mut tx, challenge.id).await?;
+                CaptchaCallbackOutcome::Passed
+            }
+            CaptchaSolveDecision::RestoreCaptchaRestriction => {
+                // Manual moderation reserves the same target lock before its Telegram
+                // effect. Keep it through the live membership check, restore, and commit.
+                restore_permissions(bot, challenge).await?;
+                if captcha_source_current_in_tx(&mut tx, challenge).await? {
+                    set_passed_in_tx(&mut tx, challenge.id).await?;
+                    CaptchaCallbackOutcome::Passed
+                } else {
+                    set_overridden_source_changed_in_tx(&mut tx, challenge.id).await?;
+                    CaptchaCallbackOutcome::Stale
+                }
+            }
+            CaptchaSolveDecision::PreserveOtherRestriction => {
+                set_overridden_in_tx(&mut tx, challenge.id).await?;
+                CaptchaCallbackOutcome::PassedButOtherRestrictionRemains
+            }
+        }
+    };
+    tx.commit().await?;
+    if result == CaptchaCallbackOutcome::Stale {
+        remove_captcha_card(bot, challenge).await;
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptchaMemberState {
+    Left,
+    Member,
+    CaptchaRestricted,
+    OtherRestriction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptchaSolveDecision {
+    PassedWithoutRestriction,
+    Passed,
+    RestoreCaptchaRestriction,
+    PreserveOtherRestriction,
+}
+
+fn captcha_member_state(member: &ChatMemberKind) -> CaptchaMemberState {
+    match member {
+        ChatMemberKind::Left => CaptchaMemberState::Left,
+        ChatMemberKind::Member(_) => CaptchaMemberState::Member,
+        ChatMemberKind::Restricted(restricted)
+            if restricted.is_member && has_no_permissions(restricted) =>
+        {
+            CaptchaMemberState::CaptchaRestricted
+        }
+        _ => CaptchaMemberState::OtherRestriction,
+    }
+}
+
+/// Policy for a successful answer, evaluated from the live member returned by Telegram.
+/// A stale challenge snapshot never authorizes restoring permissions over another sanction.
+fn captcha_solve_decision(
+    current_member: CaptchaMemberState,
+    captcha_applied_restriction: bool,
+) -> CaptchaSolveDecision {
+    match current_member {
+        CaptchaMemberState::Left if !captcha_applied_restriction => {
+            CaptchaSolveDecision::PassedWithoutRestriction
+        }
+        CaptchaMemberState::Member => CaptchaSolveDecision::Passed,
+        CaptchaMemberState::CaptchaRestricted if captcha_applied_restriction => {
+            CaptchaSolveDecision::RestoreCaptchaRestriction
+        }
+        CaptchaMemberState::Left
+        | CaptchaMemberState::CaptchaRestricted
+        | CaptchaMemberState::OtherRestriction => CaptchaSolveDecision::PreserveOtherRestriction,
+    }
+}
+
+async fn captcha_source_current_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    challenge: &CaptchaChallenge,
+) -> anyhow::Result<bool> {
+    let Some(decision_job_id) = challenge.decision_job_id else {
+        return Ok(true);
+    };
+    crate::features::decision_audit::repo::captcha_source_is_current_in_tx(
+        tx,
+        decision_job_id,
         challenge.chat_id,
         challenge.user_id,
     )
-    .await?
-    .is_some()
-    {
-        set_status(pool, challenge.id, "overridden").await?;
-        return Ok(CaptchaCallbackOutcome::PassedButOtherRestrictionRemains);
-    }
+    .await
+}
 
-    let member = bot
-        .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
-        .await?;
-    match member.kind {
-        ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => {
-            set_passed(pool, challenge.id).await?;
-            Ok(CaptchaCallbackOutcome::PassedWithoutRestriction)
-        }
-        ChatMemberKind::Member(_) => {
-            set_passed(pool, challenge.id).await?;
-            Ok(CaptchaCallbackOutcome::Passed)
-        }
-        ChatMemberKind::Restricted(restricted)
-            if restricted.is_member && has_no_permissions(&restricted) =>
-        {
-            if challenge.restriction_applied_at.is_none() {
-                set_status(pool, challenge.id, "overridden").await?;
-                return Ok(CaptchaCallbackOutcome::PassedButOtherRestrictionRemains);
-            }
-            restore_permissions(bot, &challenge).await?;
-            set_passed(pool, challenge.id).await?;
-            Ok(CaptchaCallbackOutcome::Passed)
-        }
-        _ => {
-            set_status(pool, challenge.id, "overridden").await?;
-            Ok(CaptchaCallbackOutcome::PassedButOtherRestrictionRemains)
-        }
-    }
+async fn set_passed_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    let changed = sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'passed', setup_lease_expires_at = null, solved_at = now(), updated_at = now() where id = $1 and status = 'solving'",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    anyhow::ensure!(changed == 1, "captcha solution lost its state fence");
+    Ok(())
+}
+
+async fn set_overridden_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'overridden', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'solving'",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn set_overridden_source_changed_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    let changed = sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'overridden', setup_error_kind = 'decision_source_changed', setup_lease_expires_at = null, updated_at = now() where id = $1 and status in ('solving', 'setting_up', 'pending')",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    anyhow::ensure!(changed == 1, "captcha source override lost its state fence");
+    Ok(())
 }
 
 async fn ensure_verification_state(
@@ -699,7 +881,37 @@ async fn ensure_verification_state(
     pool: &PgPool,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<Option<VerificationState>> {
-    if !decision_source_valid(bot, pool, challenge).await? {
+    // Serialize the initial automatic restriction with manual mute/ban/undo.
+    // Hold the same target lock through Telegram's effect and the durable marker
+    // so a manual sanction can never be overwritten by captcha setup.
+    let mut tx = pool.begin().await?;
+    if crate::features::manual_moderation::lock_automatic_restriction_restore(
+        &mut tx,
+        challenge.chat_id,
+        challenge.user_id,
+    )
+    .await?
+    {
+        set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+        tx.commit().await?;
+        remove_captcha_card(bot, challenge).await;
+        return Ok(None);
+    }
+
+    let status: Option<String> = sqlx::query_scalar(
+        "select status from telegram_risk_captcha_challenges where id = $1 for update",
+    )
+    .bind(challenge.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if !matches!(status.as_deref(), Some("setting_up" | "pending")) {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+        set_overridden_source_changed_in_tx(&mut tx, challenge.id).await?;
+        tx.commit().await?;
+        remove_captcha_card(bot, challenge).await;
         return Ok(None);
     }
     let member = bot
@@ -708,7 +920,8 @@ async fn ensure_verification_state(
     match member.kind {
         ChatMemberKind::Member(_) => {
             if challenge.restriction_applied_at.is_some() {
-                set_status(pool, challenge.id, "overridden").await?;
+                set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+                tx.commit().await?;
                 return Ok(None);
             }
             bot.restrict_chat_member(
@@ -718,25 +931,40 @@ async fn ensure_verification_state(
             )
             .use_independent_chat_permissions(true)
             .await?;
-            mark_restriction_applied(pool, challenge.id).await?;
+            // Message edits and normal labels do not share the target lock.
+            // Recheck after the external effect and restore if the source became
+            // stale while Telegram was processing the restriction.
+            if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+                restore_permissions(bot, challenge).await?;
+                set_overridden_source_changed_in_tx(&mut tx, challenge.id).await?;
+                tx.commit().await?;
+                remove_captcha_card(bot, challenge).await;
+                return Ok(None);
+            }
+            mark_restriction_applied_in_tx(&mut tx, challenge.id).await?;
+            tx.commit().await?;
             Ok(Some(VerificationState::RestrictedMember))
         }
         ChatMemberKind::Restricted(restricted)
             if restricted.is_member && has_no_permissions(&restricted) =>
         {
             if challenge.restriction_applied_at.is_none() {
-                set_status(pool, challenge.id, "overridden").await?;
+                set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+                tx.commit().await?;
                 return Ok(None);
             }
+            tx.commit().await?;
             Ok(Some(VerificationState::RestrictedMember))
         }
         ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => {
             // Не пытаемся мутить/вступать за non-member. Доставка ephemeral
             // reply проверяется отдельно; отказ API не запускает TTL.
+            tx.commit().await?;
             Ok(Some(VerificationState::Commenter))
         }
         _ => {
-            set_status(pool, challenge.id, "overridden").await?;
+            set_status_in_tx(&mut tx, challenge.id, "overridden").await?;
+            tx.commit().await?;
             Ok(None)
         }
     }
@@ -758,15 +986,15 @@ async fn restore_after_failed_delivery(
     pool: &PgPool,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<bool> {
-    #[cfg(feature = "manual-moderation")]
-    if crate::features::manual_moderation::active_restriction_action(
-        pool,
+    let mut tx = pool.begin().await?;
+    if crate::features::manual_moderation::lock_automatic_restriction_restore(
+        &mut tx,
         challenge.chat_id,
         challenge.user_id,
     )
     .await?
-    .is_some()
     {
+        tx.commit().await?;
         return Ok(false);
     }
 
@@ -774,18 +1002,29 @@ async fn restore_after_failed_delivery(
         .get_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
         .await?;
     match member.kind {
-        ChatMemberKind::Member(_) => Ok(true),
-        ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => Ok(true),
+        ChatMemberKind::Member(_) => {
+            tx.commit().await?;
+            Ok(true)
+        }
+        ChatMemberKind::Left if challenge.restriction_applied_at.is_none() => {
+            tx.commit().await?;
+            Ok(true)
+        }
         ChatMemberKind::Restricted(restricted)
             if restricted.is_member && has_no_permissions(&restricted) =>
         {
             if challenge.restriction_applied_at.is_none() {
+                tx.commit().await?;
                 return Ok(false);
             }
             restore_permissions(bot, challenge).await?;
+            tx.commit().await?;
             Ok(true)
         }
-        _ => Ok(false),
+        _ => {
+            tx.commit().await?;
+            Ok(false)
+        }
     }
 }
 
@@ -1051,21 +1290,30 @@ async fn expire_claimed_challenge(
     pool: &PgPool,
     challenge: &CaptchaChallenge,
 ) -> anyhow::Result<()> {
-    #[cfg(feature = "manual-moderation")]
-    if crate::features::manual_moderation::active_restriction_action(
-        pool,
+    if !decision_source_valid(bot, pool, challenge).await? {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    if crate::features::manual_moderation::lock_automatic_restriction_restore(
+        &mut tx,
         challenge.chat_id,
         challenge.user_id,
     )
     .await?
-    .is_some()
     {
-        set_status(pool, challenge.id, "overridden").await?;
+        set_overridden_expiring_in_tx(&mut tx, challenge.id).await?;
+        tx.commit().await?;
         remove_captcha_card(bot, challenge).await;
         return Ok(());
     }
-
-    if !decision_source_valid(bot, pool, challenge).await? {
+    let current_status: Option<String> = sqlx::query_scalar(
+        "select status from telegram_risk_captcha_challenges where id = $1 for update",
+    )
+    .bind(challenge.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if current_status.as_deref() != Some("expiring") {
+        tx.commit().await?;
         return Ok(());
     }
     let member = bot
@@ -1080,20 +1328,25 @@ async fn expire_claimed_challenge(
             ChatMemberKind::Member(_) => challenge.restriction_applied_at.is_none(),
             ChatMemberKind::Banned(_) => false,
             _ => {
-                set_status(pool, challenge.id, "overridden").await?;
+                set_overridden_expiring_in_tx(&mut tx, challenge.id).await?;
+                tx.commit().await?;
                 remove_captcha_card(bot, challenge).await;
                 return Ok(());
             }
         };
         if may_ban {
             // Старый source/normal label проверяются повторно непосредственно перед баном.
-            if !decision_source_valid(bot, pool, challenge).await? {
+            if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+                set_overridden_source_changed_expiring_in_tx(&mut tx, challenge.id).await?;
+                tx.commit().await?;
+                remove_captcha_card(bot, challenge).await;
                 return Ok(());
             }
             bot.ban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
                 .await?;
         }
-        set_expired(pool, challenge.id).await?;
+        set_expired_in_tx(&mut tx, challenge.id).await?;
+        tx.commit().await?;
         tracing::warn!(chat_id=challenge.chat_id,user_id=challenge.user_id,challenge_id=%challenge.id,decision_job_id=challenge.decision_job_id,"Decision captcha failed; chat access blocked");
         remove_captcha_card(bot, challenge).await;
         return Ok(());
@@ -1104,26 +1357,31 @@ async fn expire_claimed_challenge(
                 && has_no_permissions(&restricted)
                 && challenge.restriction_applied_at.is_some() =>
         {
+            if !captcha_source_current_in_tx(&mut tx, challenge).await? {
+                set_overridden_source_changed_expiring_in_tx(&mut tx, challenge.id).await?;
+                tx.commit().await?;
+                remove_captcha_card(bot, challenge).await;
+                return Ok(());
+            }
             bot.ban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
                 .await?;
             bot.unban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
                 .only_if_banned(true)
                 .await?;
         }
-        ChatMemberKind::Banned(_) if challenge.restriction_applied_at.is_some() => {
-            bot.unban_chat_member(ChatId(challenge.chat_id), UserId(challenge.user_id as u64))
-                .only_if_banned(true)
-                .await?;
-        }
         ChatMemberKind::Left => {}
         _ => {
-            set_status(pool, challenge.id, "overridden").await?;
+            // Captcha only applies a restriction, never a ban. A banned member
+            // may have a manual or external ban; preserve it instead of unbanning.
+            set_overridden_expiring_in_tx(&mut tx, challenge.id).await?;
+            tx.commit().await?;
             remove_captcha_card(bot, challenge).await;
             return Ok(());
         }
     }
 
-    set_expired(pool, challenge.id).await?;
+    set_expired_in_tx(&mut tx, challenge.id).await?;
+    tx.commit().await?;
     remove_captcha_card(bot, challenge).await;
     Ok(())
 }
@@ -1239,7 +1497,7 @@ fn decode_challenge(row: PgRow) -> anyhow::Result<CaptchaChallenge> {
         message_id: row.try_get("message_id")?,
         ephemeral_message_id: row.try_get("ephemeral_message_id")?,
         expires_at: row.try_get("expires_at")?,
-        status: row.try_get("status")?,
+        status: CaptchaStatus::try_from(row.try_get::<&str, _>("status")?)?,
         setup_attempts: row.try_get("setup_attempts")?,
         decision_job_id: row.try_get("decision_job_id")?,
         ban_on_failure: row.try_get("ban_on_failure")?,
@@ -1266,12 +1524,35 @@ async fn set_message_sent(
     Ok(())
 }
 
-async fn mark_restriction_applied(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
-    sqlx::query(
+async fn mark_restriction_applied_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    let changed = sqlx::query(
         "update telegram_risk_captcha_challenges set restriction_applied_at = coalesce(restriction_applied_at, now()), updated_at = now() where id = $1 and status in ('setting_up', 'pending', 'solving')",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    anyhow::ensure!(
+        changed == 1,
+        "captcha restriction marker lost its state fence"
+    );
+    Ok(())
+}
+
+async fn set_status_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    status: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set status = $2, setup_lease_expires_at = null, updated_at = now() where id = $1 and status not in ('passed', 'failed', 'overridden', 'setup_failed')",
+    )
+    .bind(id)
+    .bind(status)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -1287,12 +1568,41 @@ async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn set_expired(pool: &PgPool, id: Uuid) -> anyhow::Result<()> {
+async fn set_expired_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
     sqlx::query(
         "update telegram_risk_captcha_challenges set status = 'expired', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'expiring'",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn set_overridden_expiring_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'overridden', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'expiring'",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn set_overridden_source_changed_expiring_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "update telegram_risk_captcha_challenges set status = 'overridden', setup_error_kind = 'decision_source_changed', setup_lease_expires_at = null, updated_at = now() where id = $1 and status = 'expiring'",
+    )
+    .bind(id)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -1343,8 +1653,8 @@ pub async fn record_wrong_answer(
         return Ok(CaptchaCallbackOutcome::Stale);
     };
     let attempts: i32 = row.try_get("attempts")?;
-    let status: String = row.try_get("status")?;
-    if status == "failed" {
+    let status = CaptchaStatus::try_from(row.try_get::<&str, _>("status")?)?;
+    if status == CaptchaStatus::Failed {
         Ok(CaptchaCallbackOutcome::Failed)
     } else {
         Ok(CaptchaCallbackOutcome::Wrong {
@@ -1358,10 +1668,13 @@ async fn decision_source_valid(
     pool: &PgPool,
     c: &CaptchaChallenge,
 ) -> anyhow::Result<bool> {
-    if matches!(c.status.as_str(), "passed" | "expired") {
+    if matches!(c.status, CaptchaStatus::Passed | CaptchaStatus::Expired) {
         return Ok(true);
     }
-    if matches!(c.status.as_str(), "overridden" | "setup_failed") {
+    if matches!(
+        c.status,
+        CaptchaStatus::Overridden | CaptchaStatus::SetupFailed
+    ) {
         return Ok(false);
     }
     let Some(id) = c.decision_job_id else {
@@ -1405,7 +1718,8 @@ async fn decision_message_ids(
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptchaCallbackOutcome, generate_math_challenge, is_callback_data, parse_callback_data,
+        CaptchaCallbackOutcome, CaptchaMemberState, CaptchaSolveDecision, CaptchaStatus,
+        captcha_solve_decision, generate_math_challenge, is_callback_data, parse_callback_data,
         with_captcha_ephemeral_parameters,
     };
     use teloxide::{
@@ -1500,5 +1814,54 @@ mod tests {
         assert_eq!(parse_callback_data(&data), Some((id, 3)));
         assert_eq!(parse_callback_data(&format!("rc:{id}:4")), None);
         assert_eq!(parse_callback_data("other:uuid:1"), None);
+    }
+
+    #[test]
+    fn persisted_captcha_statuses_round_trip_and_unknown_values_fail_closed() {
+        for status in [
+            "preparing",
+            "setting_up",
+            "pending",
+            "solving",
+            "passed",
+            "failed",
+            "overridden",
+            "setup_failed",
+            "expired",
+            "expiring",
+        ] {
+            assert!(CaptchaStatus::try_from(status).is_ok(), "{status}");
+        }
+        assert!(CaptchaStatus::try_from("unknown_status").is_err());
+    }
+
+    #[test]
+    fn captcha_restore_policy_uses_live_membership_and_preserves_other_sanctions() {
+        // The challenge snapshot says a captcha restriction was applied, but the live
+        // Telegram state shows the user is already a member. Never replay a restore effect.
+        assert_eq!(
+            captcha_solve_decision(CaptchaMemberState::Member, true),
+            CaptchaSolveDecision::Passed
+        );
+        assert_eq!(
+            captcha_solve_decision(CaptchaMemberState::CaptchaRestricted, true),
+            CaptchaSolveDecision::RestoreCaptchaRestriction
+        );
+        assert_eq!(
+            captcha_solve_decision(CaptchaMemberState::CaptchaRestricted, false),
+            CaptchaSolveDecision::PreserveOtherRestriction
+        );
+        assert_eq!(
+            captcha_solve_decision(CaptchaMemberState::OtherRestriction, true),
+            CaptchaSolveDecision::PreserveOtherRestriction
+        );
+        assert_eq!(
+            captcha_solve_decision(CaptchaMemberState::Left, false),
+            CaptchaSolveDecision::PassedWithoutRestriction
+        );
+        assert_eq!(
+            captcha_solve_decision(CaptchaMemberState::Left, true),
+            CaptchaSolveDecision::PreserveOtherRestriction
+        );
     }
 }

@@ -598,6 +598,26 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_threshold_policy_golden_cases_are_unchanged() {
+        let policy = AutoPolicy {
+            review_threshold: 70,
+            ban_threshold: 90,
+        };
+        for (score, expected) in [
+            (69, AutoAction::None),
+            (70, AutoAction::DeleteMessages),
+            (89, AutoAction::DeleteMessages),
+            (90, AutoAction::Ban),
+        ] {
+            assert_eq!(
+                decide_auto_action(score, &policy),
+                expected,
+                "moderation boundary score={score}"
+            );
+        }
+    }
+
+    #[test]
     fn deterministic_campaign_does_not_enter_captcha_path() {
         assert!(has_deterministic_campaign(&json!({
             "deterministic_campaign_rule": "fresh_money_work_private_contact"

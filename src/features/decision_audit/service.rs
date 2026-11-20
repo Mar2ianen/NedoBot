@@ -6,7 +6,10 @@ use crate::{
     config::Config,
     config_file::LocalCascadeMode,
     features::{
-        jobs::policy::EXTERNAL_ANALYSIS_POLL,
+        jobs::{
+            policy::EXTERNAL_ANALYSIS_POLL,
+            worker::{PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_poll_worker},
+        },
         new_user_audit::{deterministic, local_cascade::hash_bytes, structure},
         user_profiles::avatar::cache_profile_avatar,
     },
@@ -170,6 +173,7 @@ pub async fn observe_message(
             normalization_version: PREPROCESSING_VERSION.into(),
             policy_version: POLICY_VERSION.into(),
             model: settings.model.clone(),
+            status: repo::DecisionJobStatus::Pending,
             input_json: input,
             avatar_file_id,
             avatar_unique_id,
@@ -219,28 +223,35 @@ pub fn configuration_hash(config: &Config) -> String {
         .expect("validated serializable decision configuration"))
 }
 
-pub fn spawn_worker(bot: Bot, pool: PgPool, config: Config) -> anyhow::Result<()> {
+pub fn spawn_worker(
+    supervisor: &mut WorkerSupervisor,
+    bot: Bot,
+    pool: PgPool,
+    config: std::sync::Arc<Config>,
+) -> anyhow::Result<()> {
     if !config.community.moderation.enabled || !config.community.moderation.decision.enabled {
         return Ok(());
     }
     let client = DecisionClient::new(&config.community.moderation.decision)?;
-    tokio::spawn(async move {
-        loop {
-            match super::actions::process_next(&bot, &pool, &config).await {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(_) => tracing::warn!("Decision captcha outbox operation failed"),
-            }
-            let seconds = match process_next(&bot, &pool, &config, &client).await {
-                Ok(true) => continue,
-                Ok(false) => EXTERNAL_ANALYSIS_POLL.idle_seconds(),
-                Err(_) => {
-                    tracing::warn!("decision shadow database operation failed");
-                    EXTERNAL_ANALYSIS_POLL.error_seconds()
+    supervisor.spawn(WorkerId::DecisionAudit, move |shutdown| async move {
+        run_poll_worker(
+            WorkerSpec::new(WorkerId::DecisionAudit, EXTERNAL_ANALYSIS_POLL),
+            shutdown,
+            || async {
+                let action_failed = match super::actions::process_next(&bot, &pool, &config).await {
+                    Ok(true) => return PollOutcome::Processed,
+                    Ok(false) => false,
+                    Err(_) => true,
+                };
+                match process_next(&bot, &pool, &config, &client).await {
+                    Ok(true) => PollOutcome::Processed,
+                    Ok(false) if action_failed => PollOutcome::Failed("action_operation_failed"),
+                    Ok(false) => PollOutcome::Idle,
+                    Err(_) => PollOutcome::Failed("decision_operation_failed"),
                 }
-            };
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-        }
+            },
+        )
+        .await;
     });
     Ok(())
 }

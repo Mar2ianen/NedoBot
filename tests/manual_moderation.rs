@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use tg_ai_bot_teloxide::features::manual_moderation::{
     ActionPreparation, BatchClaim, UndoClaim, WarningSelection, add_warning, add_warnings_batch,
     claim_batch, claim_restriction_revokes_batch, claim_undo_action, create_batch,
-    create_batch_with_request, finish_batch, latest_batch, list_actions, mark_action_failed,
-    mark_action_succeeded, prepare_action, prepare_actions_batch, recover_expired_batch_actions,
-    revoke_warnings, start_prepared_action,
-    types::{BatchRequestSnapshot, CommandKind},
+    create_batch_with_request, finish_batch, finish_undo, latest_batch, list_actions,
+    lock_automatic_restriction_restore, mark_action_failed, mark_action_succeeded, prepare_action,
+    prepare_actions_batch, recover_expired_batch_actions, revoke_warnings, start_prepared_action,
+    start_undo_operation,
+    types::{BatchRequestSnapshot, BatchTarget, CommandKind},
 };
 
 const CHAT_ID: i64 = -1001932061163;
@@ -304,6 +305,215 @@ async fn cleanup(pool: &PgPool, user_ids: &[i64], batch_ids: &[i64]) {
 
 #[tokio::test]
 #[ignore = "run against the disposable local test database"]
+async fn concurrent_sanctions_for_one_target_are_serialized_by_postgres() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let target_user_id = Utc::now().timestamp_micros() + 7_000_000_000;
+    let actor_id = target_user_id + 1;
+    let locked_target_id = target_user_id + 10;
+    let locked_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute-lock-oracle",
+    )
+    .await
+    .expect("advisory-lock fixture batch must be created");
+    let mut lock_owner = pool
+        .begin()
+        .await
+        .expect("advisory-lock owner transaction must start");
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))")
+        .bind(CHAT_ID)
+        .bind(locked_target_id)
+        .execute(&mut *lock_owner)
+        .await
+        .expect("test transaction must acquire the target advisory lock");
+    let claimant_pool = pool.clone();
+    let claimant = tokio::spawn(async move {
+        prepare_action(
+            &claimant_pool,
+            ActionPreparation {
+                batch_id: locked_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id: locked_target_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: Some("advisory lock oracle"),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            },
+        )
+        .await
+    });
+    let observed_target_lock = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if claimant.is_finished() {
+                return Ok::<bool, sqlx::Error>(false);
+            }
+            let blocked: bool = sqlx::query_scalar(
+                "select exists(select 1 from pg_stat_activity where datname=current_database() and wait_event_type='Lock' and query ilike '%pg_advisory_xact_lock%')",
+            )
+            .fetch_one(&pool)
+            .await?;
+            if blocked {
+                return Ok::<bool, sqlx::Error>(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    lock_owner
+        .commit()
+        .await
+        .expect("target advisory lock must be released");
+    let lock_claim_result = claimant
+        .await
+        .expect("action preparation must finish after releasing the lock");
+    cleanup(&pool, &[locked_target_id], &[locked_batch.id]).await;
+    let lock_claim = lock_claim_result
+        .expect("action preparation must succeed after acquiring the lock")
+        .expect("first action must be prepared");
+    assert!(
+        observed_target_lock
+            .expect("lock observation must finish within liveness bound")
+            .expect("PostgreSQL lock-state query must succeed"),
+        "PostgreSQL must show the competing moderation transaction waiting on the target lock"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "select not exists(select 1 from manual_moderation_actions where id=$1)"
+        )
+        .bind(lock_claim)
+        .fetch_one(&pool)
+        .await
+        .expect("advisory-lock fixture cleanup must complete")
+    );
+
+    let mute_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .expect("first synthetic moderation batch must be created");
+    let ban_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "ban",
+    )
+    .await
+    .expect("second synthetic moderation batch must be created");
+    let (mute, ban) = tokio::join!(
+        prepare_action(
+            &pool,
+            ActionPreparation {
+                batch_id: mute_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: Some("synthetic race"),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            }
+        ),
+        prepare_action(
+            &pool,
+            ActionPreparation {
+                batch_id: ban_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id,
+                actor_user_id: actor_id,
+                action: "ban",
+                reason: Some("synthetic race"),
+                expires_at: None,
+                automatic: false,
+            }
+        )
+    );
+    let outcomes = [mute, ban];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(Some(_))))
+            .count(),
+        1,
+        "the target advisory lock must let exactly one concurrent sanction prepare"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1,
+        "the second transaction must observe the first processing action"
+    );
+    let processing: i64 = sqlx::query_scalar(
+        "select count(*) from manual_moderation_actions where chat_id=$1 and target_user_id=$2 and status='processing'",
+    )
+    .bind(CHAT_ID)
+    .bind(target_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("race result must be readable from PostgreSQL");
+    assert_eq!(processing, 1);
+    cleanup(&pool, &[target_user_id], &[mute_batch.id, ban_batch.id]).await;
+
+    // Exercise the same transactional API with a single-connection pool. The
+    // worker must not try to acquire a second connection while holding its tx.
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("single-connection test pool must connect");
+    let single_target = target_user_id + 10;
+    let single_batch = create_batch(
+        &single,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .expect("single-connection moderation batch must be created");
+    let action_id = prepare_action(
+        &single,
+        ActionPreparation {
+            batch_id: single_batch.id,
+            chat_id: CHAT_ID,
+            target_user_id: single_target,
+            actor_user_id: actor_id,
+            action: "mute",
+            reason: Some("single connection"),
+            expires_at: Some(Utc::now() + Duration::days(1)),
+            automatic: false,
+        },
+    )
+    .await
+    .expect("single-connection action preparation must not deadlock")
+    .expect("single-connection action must be prepared");
+    cleanup(&single, &[single_target], &[single_batch.id]).await;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "select not exists(select 1 from manual_moderation_actions where id=$1)"
+        )
+        .bind(action_id)
+        .fetch_one(&single)
+        .await
+        .expect("single-connection fixture cleanup must complete")
+    );
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
 async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_safely() {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must point to the disposable test database");
@@ -457,6 +667,7 @@ async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_sa
     let request = BatchRequestSnapshot {
         kind: CommandKind::Ban,
         target_user_ids: vec![user_id + 2],
+        targets: vec![BatchTarget::numeric(user_id + 2)],
         duration_seconds: None,
         reason: Some("retry snapshot".to_string()),
         warn_id: None,
@@ -562,13 +773,250 @@ async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_sa
 
 #[tokio::test]
 #[ignore = "run against the disposable local test database"]
-async fn unwarn_defaults_to_latest_and_only_explicit_all_revokes_every_warning() {
+async fn captcha_restore_lock_serializes_manual_restriction_and_parallel_undo() {
     let database_url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must point to the disposable test database");
     let pool = PgPool::connect(&database_url)
         .await
         .expect("test PostgreSQL must be reachable");
     let user_id = Utc::now().timestamp_micros() + 4_000_000_000;
+    let actor_id = user_id + 1;
+    let restore_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "captcha_restore_race",
+    )
+    .await
+    .expect("captcha restore test batch must exist");
+
+    // Captcha restore owns the same per-target transaction lock as manual
+    // moderation. A manual restriction that starts during the Telegram effect
+    // waits, then applies after captcha's passed state has committed.
+    let mut captcha_tx = pool.begin().await.unwrap();
+    assert!(
+        !lock_automatic_restriction_restore(&mut captcha_tx, CHAT_ID, user_id)
+            .await
+            .unwrap()
+    );
+    let manual_pool = pool.clone();
+    let manual_batch_id = restore_batch.id;
+    let manual = tokio::spawn(async move {
+        prepare_actions_batch(
+            &manual_pool,
+            &[ActionPreparation {
+                batch_id: manual_batch_id,
+                chat_id: CHAT_ID,
+                target_user_id: user_id,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: Some("manual race"),
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            }],
+        )
+        .await
+    });
+    let lock_waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                r#"with target_lock as (
+                       select hashtextextended($1::text || ':' || $2::text, 0) as key
+                   )
+                   select exists (
+                       select 1 from pg_locks l, target_lock k
+                       where l.locktype = 'advisory' and not l.granted
+                         and l.database = (select oid from pg_database where datname = current_database())
+                         and l.classid = ((k.key >> 32) & 4294967295)::oid
+                         and l.objid = (k.key & 4294967295)::oid
+                         and l.objsubid = 1
+                   )"#,
+            )
+            .bind(CHAT_ID)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("PostgreSQL must expose the blocked advisory lock");
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        lock_waiting.is_ok(),
+        "manual restriction must reach PostgreSQL's waiter queue while captcha owns the target lock"
+    );
+    captcha_tx.commit().await.unwrap();
+    let prepared = manual
+        .await
+        .expect("manual action task must not panic")
+        .expect("manual action reservation must complete")
+        .into_iter()
+        .next()
+        .unwrap()
+        .expect("manual action reservation must be created");
+
+    let mut captcha_tx = pool.begin().await.unwrap();
+    assert!(
+        lock_automatic_restriction_restore(&mut captcha_tx, CHAT_ID, user_id)
+            .await
+            .unwrap(),
+        "a pending manual restriction blocks captcha permission restoration"
+    );
+    captcha_tx.commit().await.unwrap();
+    assert!(start_prepared_action(&pool, prepared.id).await.unwrap());
+    let mut captcha_tx = pool.begin().await.unwrap();
+    assert!(
+        lock_automatic_restriction_restore(&mut captcha_tx, CHAT_ID, user_id)
+            .await
+            .unwrap(),
+        "a processing manual restriction also blocks restoration"
+    );
+    captcha_tx.commit().await.unwrap();
+    mark_action_failed(&pool, prepared.id, false, "test cleanup")
+        .await
+        .unwrap();
+
+    // Two reviewers may both observe the same batch, but only one wins its
+    // claim. This is the database boundary before any Telegram action.
+    let reviewer_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "mute",
+    )
+    .await
+    .unwrap();
+    let (first_claim, second_claim) = tokio::join!(
+        claim_batch(&pool, reviewer_batch.id),
+        claim_batch(&pool, reviewer_batch.id)
+    );
+    let claims = [first_claim.unwrap(), second_claim.unwrap()];
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|claim| **claim == BatchClaim::Claimed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|claim| **claim == BatchClaim::Busy)
+            .count(),
+        1
+    );
+
+    // An undo and a replacement action contend on the same target lock. The
+    // old restriction remains authoritative until undo is claimed/finalized.
+    let original_action = prepare_action(
+        &pool,
+        ActionPreparation {
+            batch_id: reviewer_batch.id,
+            chat_id: CHAT_ID,
+            target_user_id: user_id + 10,
+            actor_user_id: actor_id,
+            action: "mute",
+            reason: None,
+            expires_at: Some(Utc::now() + Duration::days(1)),
+            automatic: false,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    mark_action_succeeded(&pool, original_action).await.unwrap();
+    let undo_batch = create_batch(
+        &pool,
+        CHAT_ID,
+        actor_id,
+        MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
+        "undo",
+    )
+    .await
+    .unwrap();
+    let (replacement, undo) = tokio::join!(
+        prepare_action(
+            &pool,
+            ActionPreparation {
+                batch_id: undo_batch.id,
+                chat_id: CHAT_ID,
+                target_user_id: user_id + 10,
+                actor_user_id: actor_id,
+                action: "mute",
+                reason: None,
+                expires_at: Some(Utc::now() + Duration::days(1)),
+                automatic: false,
+            }
+        ),
+        claim_undo_action(
+            &pool,
+            undo_batch.id,
+            reviewer_batch.id,
+            original_action,
+            actor_id
+        )
+    );
+    let undo = undo.unwrap();
+    match (replacement, undo) {
+        (Ok(Some(replacement)), UndoClaim::Conflict) => {
+            mark_action_failed(&pool, replacement, false, "concurrent undo won")
+                .await
+                .unwrap();
+            assert_eq!(
+                claim_undo_action(
+                    &pool,
+                    undo_batch.id,
+                    reviewer_batch.id,
+                    original_action,
+                    actor_id
+                )
+                .await
+                .unwrap(),
+                UndoClaim::RestrictionClaimed
+            );
+        }
+        (Err(_), UndoClaim::RestrictionClaimed) => {}
+        result => panic!("parallel action/undo must serialize safely: {result:?}"),
+    }
+    assert!(
+        start_undo_operation(&pool, undo_batch.id, original_action)
+            .await
+            .unwrap()
+    );
+    finish_undo(
+        &pool,
+        undo_batch.id,
+        original_action,
+        actor_id,
+        true,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    cleanup(
+        &pool,
+        &[user_id, user_id + 10],
+        &[restore_batch.id, reviewer_batch.id, undo_batch.id],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn unwarn_defaults_to_latest_and_only_explicit_all_revokes_every_warning() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let user_id = Utc::now().timestamp_micros() + 5_000_000_000;
     let actor_id = user_id + 1;
     let mut batch_ids = Vec::new();
     let mut warning_ids = Vec::new();

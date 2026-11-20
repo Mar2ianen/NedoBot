@@ -9,4 +9,5 @@ pub mod llm;
 pub mod mcp;
 pub mod state;
 pub mod telegram;
+pub mod url_history;
 pub use teloxide_antispam::text;

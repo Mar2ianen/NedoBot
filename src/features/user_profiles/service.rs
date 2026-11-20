@@ -43,8 +43,18 @@ pub async fn load_user_ids(
         where cu.chat_id = $1
           and (
               $2
-              or p.profile_refreshed_at is null
-              or p.personal_channel_refreshed_at is null
+              or (
+                  (
+                      p.profile_refreshed_at is null
+                      or p.personal_channel_refreshed_at is null
+                      or p.profile_refresh_error is not null
+                  )
+                  and (
+                      p.profile_refresh_error is null
+                      or p.profile_refresh_retry_at is null
+                      or p.profile_refresh_retry_at <= now()
+                  )
+              )
           )
           and (not $3 or cu.is_spammer)
           and not coalesce(p.is_bot, false)
@@ -113,13 +123,13 @@ pub async fn refresh_profile(bot: &Bot, pool: &PgPool, user_id: i64) -> anyhow::
     let chat = chat_result.as_ref().ok();
     let photos = photos_result.as_ref().ok();
     let personal_channel = personal_channel_result.as_ref().ok();
+    let chat_error = chat_result.as_ref().err().map(|err| err.to_string());
     let personal_channel_error = personal_channel_result
         .as_ref()
         .err()
         .map(|err| err.to_string());
     if chat.is_none() && photos.is_none() && personal_channel.is_none() {
-        let chat_error = chat_result.err().map(|err| err.to_string());
-        let photos_error = photos_result.err().map(|err| err.to_string());
+        let photos_error = photos_result.as_ref().err().map(|err| err.to_string());
         bail!(
             "profile API calls failed: chat={:?}, photos={:?}, personal_channel={:?}",
             chat_error,
@@ -133,6 +143,7 @@ pub async fn refresh_profile(bot: &Bot, pool: &PgPool, user_id: i64) -> anyhow::
         chat,
         photos,
         personal_channel,
+        chat_error,
         personal_channel_error,
     );
     update_user_profile_details(pool, details).await?;
@@ -144,6 +155,7 @@ fn build_details(
     chat: Option<&ChatFullInfo>,
     photos: Option<&UserProfilePhotos>,
     personal_channel: Option<&PersonalChannelData>,
+    chat_error: Option<String>,
     personal_channel_error: Option<String>,
 ) -> UserProfileDetails {
     let chat_photo = chat.and_then(|chat| chat.photo.as_ref());
@@ -162,7 +174,10 @@ fn build_details(
 
     UserProfileDetails {
         telegram_user_id,
+        chat_fetched: chat.is_some(),
+        photos_fetched: photos.is_some(),
         username: chat.and_then(|chat| chat.username().map(str::to_owned)),
+        active_usernames: chat.and_then(|chat| chat.active_usernames().map(<[String]>::to_vec)),
         first_name: chat.and_then(|chat| chat.first_name().map(str::to_owned)),
         last_name: chat.and_then(|chat| chat.last_name().map(str::to_owned)),
         bio: chat.and_then(|chat| chat.bio().map(str::to_owned)),
@@ -198,6 +213,7 @@ fn build_details(
             "profile_photos": photos,
             "personal_channel": personal_channel.map(|channel| &channel.raw_json),
         }),
+        profile_refresh_error: chat_error,
     }
 }
 
@@ -265,4 +281,80 @@ fn message_text(message: &Message) -> Option<std::borrow::Cow<'_, str>> {
 
 fn is_definitive_personal_channel_error(error: &str) -> bool {
     error.contains("USER_PERSONAL_CHANNEL_MISSING")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_chat(username: Option<&str>) -> ChatFullInfo {
+        let mut chat = json!({
+            "id": 42,
+            "type": "private",
+            "first_name": "Alice",
+            "accepted_gift_types": {
+                "unlimited_gifts": true,
+                "limited_gifts": true,
+                "unique_gifts": true,
+                "premium_subscription": true
+            },
+            "max_reaction_count": 0
+        });
+        if let Some(username) = username {
+            chat["username"] = json!(username);
+        }
+        serde_json::from_value(chat).expect("synthetic private chat must deserialize")
+    }
+
+    fn synthetic_photos() -> UserProfilePhotos {
+        serde_json::from_value(json!({
+            "total_count": 1,
+            "photos": [[{
+                "file_id": "synthetic-profile-photo",
+                "file_unique_id": "synthetic-profile-photo-unique",
+                "width": 320,
+                "height": 320
+            }]]
+        }))
+        .expect("synthetic profile photos must deserialize")
+    }
+
+    #[test]
+    fn failed_chat_fetch_is_not_a_confirmed_username_removal() {
+        let photos = synthetic_photos();
+        let details = build_details(
+            42,
+            None,
+            Some(&photos),
+            None,
+            Some("getChat failed: synthetic timeout".to_owned()),
+            None,
+        );
+
+        assert!(!details.chat_fetched);
+        assert!(details.photos_fetched);
+        assert_eq!(details.username, None);
+        assert_eq!(details.first_name, None);
+        assert_eq!(
+            details.profile_refresh_error.as_deref(),
+            Some("getChat failed: synthetic timeout")
+        );
+        assert_eq!(
+            details.profile_photo_file_id.as_deref(),
+            Some("synthetic-profile-photo")
+        );
+    }
+
+    #[test]
+    fn successful_chat_without_username_is_authoritative() {
+        let chat = synthetic_chat(None);
+        let photos = synthetic_photos();
+        let details = build_details(42, Some(&chat), Some(&photos), None, None, None);
+
+        assert!(details.chat_fetched);
+        assert!(details.photos_fetched);
+        assert_eq!(details.username, None);
+        assert_eq!(details.first_name.as_deref(), Some("Alice"));
+        assert_eq!(details.profile_refresh_error, None);
+    }
 }

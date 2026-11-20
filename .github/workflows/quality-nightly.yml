@@ -1,0 +1,204 @@
+name: Quality stress and mutation
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Monday 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      collect_coverage:
+        description: Run the longer default-workspace coverage profile
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stress-and-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate default and feature-disabled builds
+        run: sh scripts/test_feature_matrix.sh
+
+      - name: Replay every selected pure property and regression target with fixed seeds
+        env:
+          CARGO_BUILD_JOBS: "3"
+          QUALITY_EXECUTION_MANIFEST: target/quality/executed-tests.tsv
+        run: sh scripts/run_quality_nightly.sh
+
+      - name: Install pinned mutation tool
+        run: cargo install cargo-mutants --version 27.1.0 --locked
+
+      - name: Run bounded URL, scope, error, worker and router mutation checks
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: sh scripts/run_targeted_mutations.sh
+
+      - name: Upload sanitized test and mutation execution manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-summary-${{ github.sha }}
+          path: |
+            target/quality/executed-tests.tsv
+            mutants.out/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  stateful-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg16-bookworm
+        env:
+          POSTGRES_DB: tg_ai_bot_test
+          POSTGRES_USER: tg_ai_bot_dev
+          POSTGRES_PASSWORD: tg_ai_bot_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tg_ai_bot_dev -d tg_ai_bot_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare two disposable synthetic databases
+        env:
+          PGPASSWORD: tg_ai_bot_dev
+        run: |
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE tg_ai_bot_test_b'
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE tg_ai_bot_corpus_a'
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE tg_ai_bot_corpus_b'
+          psql -h 127.0.0.1 -U tg_ai_bot_dev -d tg_ai_bot_test -v ON_ERROR_STOP=1 \
+            -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'nedobot_mcp_ro') THEN CREATE ROLE nedobot_mcp_ro NOLOGIN; END IF; END \$\$" \
+            -c 'GRANT nedobot_mcp_ro TO tg_ai_bot_dev'
+      - name: Apply migrations to synthetic MCP databases
+        env:
+          DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+          TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          cargo run --locked --bin migrate
+          DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --locked --bin migrate
+      - name: Run integrated PostgreSQL lifecycle suite
+        env:
+          TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+        run: |
+          mkdir -p target/quality
+          printf '%s\t%s\n' "$GITHUB_SHA" 'postgres-migrations-lifecycle' >> target/quality/postgres-executed-tests.tsv
+          python3 scripts/run_cargo_test_checked.py cargo test --test postgres_migrations --locked -- --ignored
+      - name: Run stateful URL alias and shadow cases
+        env:
+          TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+        run: |
+          mkdir -p target/quality
+          printf '%s\t%s\n' "$GITHUB_SHA" 'url-shadow-lock-and-cancellation' >> target/quality/postgres-executed-tests.tsv
+          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::url_shadow_lock_serializes_same_user_without_blocking_other_users --locked -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock --locked -- --ignored --exact
+          printf '%s\t%s\n' "$GITHUB_SHA" 'username-alias-current-ownership' >> target/quality/postgres-executed-tests.tsv
+          python3 scripts/run_cargo_test_checked.py cargo test --lib features::url_relations::tests::current_username_aliases_resolve_only_fresh_unique_owners --locked -- --ignored --exact
+      - name: Run two-database instance isolation and synthetic history cases
+        env:
+          TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+          TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
+          TEST_PRIVATE_HISTORY_DATABASE_URL_A: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_corpus_a
+          TEST_PRIVATE_HISTORY_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_corpus_b
+        run: |
+          printf '%s\t%s\n' "$GITHUB_SHA" 'two-instance-mcp-isolation' >> target/quality/postgres-executed-tests.tsv
+          python3 scripts/run_cargo_test_checked.py cargo test --test chat_db_mcp independent_community_databases_generate_manifests_and_start_isolated_mcp_servers --locked -- --ignored --exact
+          printf '%s\t%s\n' "$GITHUB_SHA" 'two-database-synthetic-url-history' >> target/quality/postgres-executed-tests.tsv
+          python3 scripts/run_cargo_test_checked.py cargo test --test private_url_history two_synthetic_databases_extract_only_their_scoped_messages_and_qr_hashes --locked -- --ignored --exact
+      - name: Upload stateful target execution manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-postgres-${{ github.sha }}
+          path: target/quality/postgres-executed-tests.tsv
+          if-no-files-found: warn
+          retention-days: 14
+
+  coverage:
+    if: github.event_name == 'workflow_dispatch' && inputs.collect_coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg16-bookworm
+        env:
+          POSTGRES_DB: tg_ai_bot_test
+          POSTGRES_USER: tg_ai_bot_dev
+          POSTGRES_PASSWORD: tg_ai_bot_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tg_ai_bot_dev -d tg_ai_bot_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
+      RUST_MIN_STACK: 8388608
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install pinned coverage tool
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+
+      - name: Collect test and subsystem coverage summary
+        run: |
+          mkdir -p target/quality-coverage
+          cargo llvm-cov --workspace --all-targets --locked --no-report
+          cargo llvm-cov report --json --summary-only --output-path target/quality-coverage/default.json
+      - name: Collect disposable PostgreSQL coverage
+        env:
+          PGPASSWORD: tg_ai_bot_dev
+        run: |
+          psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE ROLE nedobot_mcp_ro NOLOGIN' -c 'GRANT nedobot_mcp_ro TO tg_ai_bot_dev'
+          DATABASE_URL="$TEST_DATABASE_URL" cargo run --locked --bin migrate
+          cargo llvm-cov clean --profraw-only
+          python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test postgres_migrations -- --ignored
+          python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+          for name in \
+            features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents \
+            features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits \
+            features::user_profiles::enrichment::tests::fast_audit_ack_fences_revisions_and_reclaims \
+            features::qr_url::tests::qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media \
+            telegram::manual_moderation::tests::username_sanctions_require_live_ownership_and_resume_preserves_provenance
+          do
+            python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --lib "$name" -- --ignored --exact
+          done
+          cargo llvm-cov report --lcov --output-path target/quality-coverage/postgres.lcov
+          python3 scripts/report_diff_coverage.py \
+            c3571fed1e30dd2c34d07d48f0a403d164b11aea \
+            target/quality-coverage/postgres.lcov > target/quality-coverage/postgres-diff.tsv
+          git rev-parse HEAD > target/quality-coverage/head.txt
+
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary-${{ github.sha }}
+          path: target/quality-coverage/
+          if-no-files-found: error
+          retention-days: 14

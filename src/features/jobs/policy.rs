@@ -75,6 +75,7 @@ pub const VOICE_TRANSCRIPTION_RETRY: RetryPolicy =
 pub const MATERIALIZATION_RETRY: RetryPolicy =
     RetryPolicy::new(&[15, 30, 60, 5 * 60, 24 * 60 * 60]);
 pub const EXTERNAL_ANALYSIS_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
+pub const PROFILE_REFRESH_INTENT_POLL: WorkerPollPolicy = WorkerPollPolicy::new(15, 15);
 pub const POST_HISTORY_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);
 pub const SPAMMER_AVATAR_EMBEDDING_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 10);
 pub const VOICE_TRANSCRIPTION_POLL: WorkerPollPolicy = WorkerPollPolicy::new(5, 5);

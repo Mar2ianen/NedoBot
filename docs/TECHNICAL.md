@@ -120,7 +120,7 @@ deploy hook перезагружает контейнерный Nginx после
 
 GenAiTransport создаёт два долгоживущих клиента: direct и proxied, если задан LLM_PROXY_URL. Profile provider выбирает egress явно через egress = "direct" или "proxy". Telegram polling, MCP и прочие HTTP-клиенты в этот proxy boundary не входят. Ошибки transport преобразуются в безопасные доменные категории без provider response body.
 
-HTTP-клиенты используют `reqwest`: его TLS backend — rustls с `rustls-platform-verifier`; GenAI и Telegram также включают `native-tls`. На Linux оба backend-а опираются на системные CA roots. Обновление Cargo.lock обновляет TLS реализации, но не список доверенных CA и не гарантирует проверку отзыва промежуточных сертификатов. После массового отзыва надо проверить реакцию пакета `ca-certificates` и, если системный bundle не блокирует скомпрометированную цепочку, применить отдельную политику distrust. Долгоживущие клиенты перечитывают trust store при создании, поэтому после его изменения перезапусти сервисы. Статический `webpki-roots` сейчас не используется.
+HTTP-клиенты (`reqwest`, GenAI и Telegram) используют rustls с `rustls-platform-verifier`, PostgreSQL-клиент SQLx — rustls с системными корневыми сертификатами. Бинарники NedoBot не требуют системных `libssl` или `libcrypto`; это не меняет TLS в Nginx или PostgreSQL на сервере. Обновление Cargo.lock обновляет TLS-реализации, но не список доверенных CA и не гарантирует проверку отзыва промежуточных сертификатов. После массового отзыва надо проверить реакцию пакета `ca-certificates` и, если системный bundle не блокирует скомпрометированную цепочку, применить отдельную политику distrust. После изменения trust store перезапусти долгоживущие клиенты.
 
 `LLM_PROFILES_PATH` необязателен только для локального запуска: без него загружается `config/llm_profiles.toml.example`. Для production unit обязан задавать абсолютный `LLM_PROFILES_PATH=/etc/tg-ai-bot/llm_profiles.toml`; на относительный путь под systemd рассчитывать нельзя. Каждая генерация использует явный task route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`). Выбранная модель route задаёт driver, base URL, model ID, capabilities, request timeout и `api_key_env`; provider/model overrides через env больше не поддерживаются.
 
@@ -1059,3 +1059,7 @@ routes и не даёт права на санкции. Транспорт, ве
 
 Decision может участвовать в общей метрике с ephemeral captcha: [контракт,
 настройки и migration-aware rollback](DECISION_SCORING.md). Shadow остаётся default.
+
+### Worker supervision
+
+Long-lived workers регистрируются в общем `WorkerSupervisor`. Если такой worker неожиданно завершается или паникует, supervisor сигналит остановку оставшимся workers, ждёт ограниченный drain и возвращает ошибку из процесса. Systemd `Restart=on-failure` поднимает процесс заново; PostgreSQL leases восстанавливают durable jobs. Ошибка worker не маскируется как обычный здоровый Telegram poller. При штатном завершении dispatcher supervisor только останавливает и drain-ит workers.

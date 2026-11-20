@@ -1184,7 +1184,8 @@ run, затем `--apply`; повторный запуск идемпотент�
 Smoke после выкладки: reply на старый rich-ответ, вопрос о родительском
 посте, точный word count с повтором слова в одной строке, групповой scope
 при включённом private default chat, оба service PID/hash и journal.
-Deployment tag ставить только после фактического успешного deploy.
+Тег кандидата и факт успешной выкладки фиксировать раздельно (см. раздел
+«Фиксация release и rollback» ниже).
 
 1. Проверить, что PR слит в main, worktree чистый, а remote head известен:
 
@@ -1426,7 +1427,10 @@ GET могут быть нормальным результатом: health-chec
 
 ## Фиксация release и rollback
 
-Только после успешного restart и smoke создать и запушить annotated tag:
+Для workflow `release` с `deploy=true` сначала пройти release gates, затем
+создать annotated tag на утверждённый коммит `main`. Запускать workflow с
+`main`, передав тег как `ref`. Публикация тега фиксирует кандидата, а не
+успех выкладки; факт выкладки подтверждают restart, smoke и запись релиза.
 
 ```bash
 git tag -a deploy-YYYY-MM-DD-scope <merged-main-sha> \
@@ -1434,8 +1438,15 @@ git tag -a deploy-YYYY-MM-DD-scope <merged-main-sha> \
 git push origin deploy-YYYY-MM-DD-scope
 ```
 
-Rollback — это повторная выкладка предыдущего release tag тем же способом:
-checkout/archive exact tag, dry-run rsync, profile check, build, restart и
-тот же post-deploy smoke. Не использовать git reset --hard на рабочем сервере
-и не удалять .env, /etc/tg-ai-bot/llm_profiles.toml, static/, backups или
-database dumps.
+Перед заменой workflow сохраняет бинарники обоих инстансов и два TOML-профиля
+в закрытый каталог под `/var/backups/nedobot`, проверяет копии и выводит путь
+в журнал. `ABSENT`, если есть, перечисляет бинарники, которых до установки
+не было. Backup не копирует `.env` и не заменяет отдельную проверку upgrade
+миграций и совместимости rollback.
+
+При rollback проверить `sha256sum -c SHA256SUMS` в каталоге backup. Восстановить
+бинарники каждого инстанса из его подкаталога под той же блокировкой
+`/var/lock/nedobot-release.lock`, через временный файл и `mv` внутри каталога
+назначения. Перезапустить затронутые сервисы и повторить проверку хешей и smoke.
+Профили и БД автоматически не восстанавливать. Не использовать
+`git reset --hard` на рабочем сервере и не удалять `.env`, `static/` или backups.

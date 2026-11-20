@@ -35,6 +35,11 @@ fn print_queue(queue: &JobQueueMetrics) {
         "  oldest_ready_age_seconds={}",
         format_age(queue.oldest_ready_age_seconds)
     );
+    println!(
+        "  oldest_processing_age_seconds={}",
+        format_age(queue.oldest_processing_age_seconds)
+    );
+    println!("  expired_lease_count={}", queue.expired_lease_count);
     println!("  lease_reclaim_count={}", queue.lease_reclaim_count);
     for status in &queue.statuses {
         println!(

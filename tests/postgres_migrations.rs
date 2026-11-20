@@ -1,14 +1,26 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpListener,
-    sync::{Arc, mpsc::sync_channel},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::sync_channel,
+    },
 };
 
 use axum::{Json, Router, routing::post};
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions, query, query_as, query_scalar};
-use teloxide::Bot;
+use sqlx::{
+    PgPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
+    query, query_as, query_scalar,
+};
 use teloxide::utils::time::TimeContext;
+use teloxide::{
+    Bot,
+    prelude::ChatId,
+    types::{InputRichMessage, Message, MessageId},
+};
 use teloxide_antispam::policy::AutoAction;
 use teloxide_antispam::scoring::ScoreComponents;
 use uuid::Uuid;
@@ -16,6 +28,10 @@ use uuid::Uuid;
 use tg_ai_bot_teloxide::{
     community::ChatRegistry,
     config::Config,
+    db::telegram::{
+        UserProfileDetails, mark_user_profile_refresh_error, update_user_profile_details,
+        upsert_user_profile, user_profile_needs_refresh,
+    },
     features::{
         ask::{
             conversation_memory::{self, ConversationScope, ConversationTurn},
@@ -47,6 +63,7 @@ use tg_ai_bot_teloxide::{
             mark_operator_retry_post_comment_terminal_failed, mark_post_comment_delivery_unknown,
             mark_post_comment_pre_send_failed, mark_post_comment_send_rejected,
         },
+        ingest::ingest_message,
         jobs::{claim::CasResult, observability::load_job_lifecycle_report},
         labels::{LabelSource, SpamLabel, read_journal, record_not_spam, record_spam},
         memory::embedding::EMBEDDINGGEMMA2_MODEL_ID,
@@ -55,12 +72,12 @@ use tg_ai_bot_teloxide::{
             finalize_history_failed, finalize_history_retry, load_relevant_memory_notes,
         },
         new_user_audit::repo::{
-            NewUserAuditJobParams, claim_next_new_user_audit_job, enqueue_new_user_audit_job,
-            finalize_new_user_audit_job, has_materialized_audit_for_first_message,
-            latest_audit_trigger_fingerprint, mark_new_user_audit_failed,
-            mark_new_user_audit_materialization_retry, mark_new_user_audit_materialization_stale,
-            mark_new_user_audit_retry, materialize_new_user_audit_job,
-            reopen_obsolete_materialization_in_transaction,
+            NewUserAuditJobParams, NewUserAuditStatus, claim_next_new_user_audit_job,
+            enqueue_new_user_audit_job, finalize_new_user_audit_job,
+            has_materialized_audit_for_first_message, latest_audit_trigger_fingerprint,
+            mark_new_user_audit_failed, mark_new_user_audit_materialization_retry,
+            mark_new_user_audit_materialization_stale, mark_new_user_audit_retry,
+            materialize_new_user_audit_job, reopen_obsolete_materialization_in_transaction,
             supersede_unneeded_new_user_audit_jobs_in_transaction,
             sync_spam_review_from_audit_in_transaction,
         },
@@ -75,16 +92,18 @@ use tg_ai_bot_teloxide::{
             render_html, render_rich, repo as stats_repo,
             types::{AttractionMetrics, ChatStatsReportData, ReportWindow, StatsPeriod},
         },
+        user_profiles::service::{RefreshUserProfilesQuery, load_user_ids},
         voice::{
             repo::{
-                VoiceTransition, claim_next_voice_job, claim_voice_job, create_voice_job,
-                mark_voice_job_delivery_unknown, mark_voice_job_phase,
+                VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
+                enqueue_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_phase,
                 mark_voice_job_retry_or_failed, recover_expired_voice_deliveries,
                 save_progress_message,
             },
             types::{VoiceMedia, VoiceMediaKind},
         },
     },
+    telegram::delivery::{DeliveryEffect, TelegramSendPort},
 };
 
 #[path = "support/local_cascade.rs"]
@@ -98,13 +117,74 @@ mod membership_history;
 #[path = "support/decision_shadow.rs"]
 mod decision_shadow;
 
+#[path = "support/ingress_persistence.rs"]
+mod ingress_persistence;
+
 type ReviewDeliveryPauseState = (i64, String, Option<String>, bool, Option<i32>);
+
+struct AcknowledgingSendPort {
+    calls: AtomicUsize,
+    message: Message,
+}
+
+impl AcknowledgingSendPort {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            message: serde_json::from_value(serde_json::json!({
+                "message_id": 9_400_201,
+                "date": 1_700_000_000,
+                "chat": {"id": -1001932061163_i64, "type": "supergroup", "title": "Test"},
+                "text": "acknowledged test comment"
+            }))
+            .expect("test Telegram response must deserialize"),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn acknowledged(&self) -> DeliveryEffect<Message> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        DeliveryEffect::Confirmed(self.message.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl TelegramSendPort for AcknowledgingSendPort {
+    async fn send_html_reply(&self, _: ChatId, _: MessageId, _: String) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+
+    async fn send_rich_message_reply(
+        &self,
+        _: ChatId,
+        _: MessageId,
+        _: InputRichMessage,
+    ) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+
+    async fn send_document_reply(
+        &self,
+        _: ChatId,
+        _: MessageId,
+        _: String,
+        _: String,
+    ) -> DeliveryEffect<Message> {
+        self.acknowledged()
+    }
+}
 
 #[path = "support/risk_captcha_cleanup.rs"]
 mod risk_captcha_cleanup;
 
 #[path = "support/known_spammer_risk.rs"]
 mod known_spammer_risk;
+
+#[path = "support/url_alias_churn.rs"]
+mod url_alias_churn;
 
 #[tokio::test]
 #[ignore = "run with ./scripts/test.sh against the local test database"]
@@ -116,6 +196,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .expect("local test database must be reachable");
 
     assert_clean_database_migrations(&pool).await;
+    assert_ingest_disabled_is_noop(&pool).await;
     membership_history::assert_membership_history(&pool).await;
     decision_shadow::assert_decision_shadow(&pool).await;
     local_cascade::assert_local_cascade(&pool).await;
@@ -129,17 +210,21 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_risk_captcha_state_transitions(&pool).await;
     risk_captcha_cleanup::assert_cleanup(&pool).await;
     known_spammer_risk::assert_known_spammer_is_rechecked(&pool).await;
+    url_alias_churn::assert_current_alias_resolution(&pool).await;
     assert_review_decisions_write_spam_label_events(&pool).await;
     assert_ask_time_render_audit(&pool).await;
     assert_spam_review_safety_backfill_upgrade(&pool).await;
     assert_post_comment_delivery_lifecycle_upgrade(&pool).await;
     assert_sent_comment_requires_sent_at(&pool).await;
+    assert_comment_job_lifecycle(&pool).await;
     assert_public_mcp_scope(&pool).await;
     assert_mcp_instance_scope_isolation(&pool).await;
     assert_chat_search_quality_path(&pool).await;
     assert_rich_backfill_and_exact_word_counts(&pool).await;
     assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
+    assert_stats_rank_ties_follow_the_reference_order(&pool).await;
+    assert_user_stats_username_uses_fresh_unique_alias(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_ask_conversation_memory(&pool).await;
@@ -170,7 +255,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_stale_review_delivery_failure_does_not_finalize_replaced_payload(&pool).await;
     assert_review_delivery_retry_uses_consecutive_failures(&pool).await;
     assert_terminal_review_delivery_stays_closed(&pool).await;
-    assert_comment_job_lifecycle(&pool).await;
+    assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
     assert_label_writer_roundtrip(&pool).await;
     assert_system_spam_label_transition(&pool).await;
     assert_spammer_avatar_embedding_label_gate(&pool).await;
@@ -180,6 +265,898 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_job_lifecycle_observability(&pool).await;
     assert_voice_transcription_job_lifecycle(&pool).await;
     assert_channel_scoring_migration_requeues_exhausted_materializations(&pool).await;
+    ingress_persistence::assert_message_persistence_effects(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn post_comment_claim_skips_a_locked_oldest_ready_job() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    assert_post_comment_claim_skips_locked_oldest_row(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn captcha_wrong_answers_are_atomic_with_one_database_connection() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let id = Uuid::new_v4();
+    let chat_id = -1_009_876_543_210_i64;
+    let user_id = 9_876_543_210_i64;
+    query(
+        r#"insert into telegram_risk_captcha_challenges
+               (id, chat_id, telegram_user_id, audit_job_id, risk_score, question,
+                options, correct_option, restore_permissions, status, expires_at)
+           values ($1, $2, $3, 1, 90, '1 + 1 = ?', '["2","3","4","5"]', 0,
+                   '{}', 'pending', now() + interval '1 hour')"#,
+    )
+    .bind(id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic pending captcha must be created");
+
+    let (first, second, third) = tokio::join!(
+        record_wrong_answer(&pool, id),
+        record_wrong_answer(&pool, id),
+        record_wrong_answer(&pool, id),
+    );
+    let outcomes = [
+        first.expect("first wrong answer must commit"),
+        second.expect("second wrong answer must commit"),
+        third.expect("third wrong answer must commit"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Wrong { attempts_left: 2 })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Wrong { attempts_left: 1 })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == CaptchaCallbackOutcome::Failed)
+            .count(),
+        1
+    );
+    let state: (i32, String) =
+        query_as("select attempts, status from telegram_risk_captcha_challenges where id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("concurrent captcha state must remain readable");
+    assert_eq!(state, (3, "failed".to_owned()));
+    assert_eq!(
+        record_wrong_answer(&pool, id)
+            .await
+            .expect("closed captcha must reject a late callback"),
+        CaptchaCallbackOutcome::Stale
+    );
+    query("delete from telegram_risk_captcha_challenges where id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("synthetic captcha must be removed");
+}
+
+fn synthetic_profile_user(id: i64, username: &str) -> teloxide::types::User {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "is_bot": false,
+        "first_name": "Synthetic",
+        "username": username
+    }))
+    .expect("synthetic Telegram profile must deserialize")
+}
+
+fn synthetic_profile_details(telegram_user_id: i64) -> UserProfileDetails {
+    UserProfileDetails {
+        telegram_user_id,
+        chat_fetched: false,
+        photos_fetched: false,
+        username: None,
+        active_usernames: None,
+        first_name: None,
+        last_name: None,
+        bio: None,
+        small_photo_file_id: None,
+        small_photo_file_unique_id: None,
+        big_photo_file_id: None,
+        big_photo_file_unique_id: None,
+        profile_photo_file_id: None,
+        profile_photo_file_unique_id: None,
+        profile_photo_width: None,
+        profile_photo_height: None,
+        profile_photo_count: None,
+        emoji_status_custom_emoji_id: None,
+        profile_accent_color_id: None,
+        personal_channel_chat_id: None,
+        personal_channel_title: None,
+        personal_channel_username: None,
+        personal_channel_message_count: None,
+        personal_channel_last_message_id: None,
+        personal_channel_last_message_at: None,
+        personal_channel_last_text: None,
+        personal_channel_has_adult_links: false,
+        personal_channel_raw_json: None,
+        personal_channel_refreshed_at: None,
+        personal_channel_fetch_error: None,
+        raw_json: serde_json::json!({}),
+        profile_refresh_error: None,
+    }
+}
+
+type PreservedProfileSnapshot = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    DateTime<Utc>,
+    Option<String>,
+);
+
+type ProfileRetryState = (
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    i32,
+    Option<String>,
+);
+
+fn synthetic_partial_profile_details(telegram_user_id: i64) -> UserProfileDetails {
+    let mut details = synthetic_profile_details(telegram_user_id);
+    details.photos_fetched = true;
+    details.profile_photo_file_id = Some("retry-profile-file".to_owned());
+    details.profile_photo_file_unique_id = Some("retry-profile-unique".to_owned());
+    details.profile_photo_count = Some(3);
+    // The reviewer counterexample: only `getChat` failed; photos and the
+    // personal channel succeeded, so both snapshot timestamps stay non-null.
+    details.personal_channel_refreshed_at = Some(Utc::now());
+    details.profile_refresh_error = Some("getChat failed: synthetic timeout".to_owned());
+    details
+}
+
+async fn load_profile_retry_state(pool: &PgPool, user_id: i64) -> ProfileRetryState {
+    query_as(
+        r#"
+        select profile_refreshed_at, profile_refresh_retry_at,
+               profile_refresh_failure_count, profile_refresh_error
+        from telegram_user_profiles
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .expect("profile retry state must be readable")
+}
+
+fn synthetic_profile_suffix() -> i64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_nanos()
+        % 900_000_000) as i64
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn partial_profile_refresh_preserves_confirmed_username_and_aliases() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let suffix = synthetic_profile_suffix();
+    let user_id = 9_310_000_000_000 + suffix;
+    let username = format!("a{suffix:08x}");
+
+    upsert_user_profile(&pool, &synthetic_profile_user(user_id, &username))
+        .await
+        .expect("synthetic profile must be created");
+    query(
+        r#"
+        update telegram_user_profiles
+        set first_name = 'Confirmed',
+            bio = 'confirmed bio',
+            profile_photo_small_file_id = 'old-small-file',
+            profile_photo_small_file_unique_id = 'old-small-unique',
+            profile_photo_file_id = 'old-profile-file',
+            profile_photo_file_unique_id = 'old-profile-unique',
+            profile_photo_count = 1,
+            profile_refreshed_at = '2020-01-01 00:00:00+00',
+            profile_refresh_error = null
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("confirmed synthetic profile snapshot must be stored");
+    let refreshed_before: DateTime<Utc> = query_scalar(
+        "select profile_refreshed_at from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed profile timestamp must be readable");
+
+    // `getChat` failed while `getUserProfilePhotos` succeeded. This must not
+    // turn the missing username into a confirmed username removal.
+    let mut partial = synthetic_profile_details(user_id);
+    partial.photos_fetched = true;
+    partial.profile_photo_file_id = Some("new-profile-file".to_owned());
+    partial.profile_photo_file_unique_id = Some("new-profile-unique".to_owned());
+    partial.profile_photo_width = Some(64);
+    partial.profile_photo_height = Some(64);
+    partial.profile_photo_count = Some(2);
+    partial.profile_refresh_error = Some("getChat failed: synthetic timeout".to_owned());
+    update_user_profile_details(&pool, partial)
+        .await
+        .expect("partial profile refresh must commit");
+
+    let preserved: PreservedProfileSnapshot = query_as(
+        r#"
+        select username, first_name, bio, profile_photo_small_file_id,
+               profile_refreshed_at, profile_refresh_error
+        from telegram_user_profiles
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("partially refreshed profile must be readable");
+    assert_eq!(preserved.0.as_deref(), Some(username.as_str()));
+    assert_eq!(preserved.1.as_deref(), Some("Confirmed"));
+    assert_eq!(preserved.2.as_deref(), Some("confirmed bio"));
+    assert_eq!(preserved.3.as_deref(), Some("old-small-file"));
+    assert_eq!(
+        preserved.4, refreshed_before,
+        "a failed getChat must not claim a fresher profile snapshot"
+    );
+    assert_eq!(
+        preserved.5.as_deref(),
+        Some("getChat failed: synthetic timeout")
+    );
+    let updated_photo: Option<String> = query_scalar(
+        "select profile_photo_file_id from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("independently fetched profile photo must be stored");
+    assert_eq!(updated_photo.as_deref(), Some("new-profile-file"));
+    let alias_active: bool = query_scalar(
+        r#"
+        select is_active
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and source = 'user_update'
+          and username_normalized = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed username alias must remain present");
+    assert!(
+        alias_active,
+        "a failed getChat must not deactivate the last confirmed alias"
+    );
+
+    // A successful getChat without a username is authoritative and must clear
+    // the alias, unlike the failed call above.
+    let mut confirmed_removal = synthetic_profile_details(user_id);
+    confirmed_removal.chat_fetched = true;
+    confirmed_removal.photos_fetched = true;
+    confirmed_removal.first_name = Some("Alice".to_owned());
+    confirmed_removal.profile_photo_file_id = Some("new-profile-file".to_owned());
+    confirmed_removal.profile_photo_file_unique_id = Some("new-profile-unique".to_owned());
+    confirmed_removal.profile_photo_count = Some(2);
+    update_user_profile_details(&pool, confirmed_removal)
+        .await
+        .expect("confirmed username removal must commit");
+
+    let removed: (Option<String>, DateTime<Utc>, Option<String>) = query_as(
+        "select username, profile_refreshed_at, profile_refresh_error from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed removal must be readable");
+    assert_eq!(removed.0, None);
+    assert!(removed.1 > refreshed_before);
+    assert_eq!(removed.2, None);
+    let alias_active: bool = query_scalar(
+        r#"
+        select is_active
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and source = 'user_update'
+          and username_normalized = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .expect("historically confirmed alias must remain readable");
+    assert!(
+        !alias_active,
+        "a successful getChat without a username must clear the alias"
+    );
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic profile fixture must be removed");
+}
+
+async fn wait_for_profile_observation_pause(pool: &PgPool, application_name: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let paused: bool = query_scalar(
+            r#"
+            select exists(
+                select 1
+                from pg_stat_activity
+                where datname = current_database()
+                  and application_name = $1
+                  and wait_event = 'PgSleep'
+                  and query like '%telegram_profile_identity_observations%'
+            )
+            "#,
+        )
+        .bind(application_name)
+        .fetch_one(pool)
+        .await
+        .expect("profile pause state must be readable");
+        if paused {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "profile detail transaction did not reach the observation insert pause"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn concurrent_profile_refreshes_share_one_lock_order() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let suffix = synthetic_profile_suffix();
+    let user_id = 9_320_000_001_i64;
+    let initial_username = format!("l{suffix:08x}");
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic aliases must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic profile must be removed");
+    upsert_user_profile(&pool, &synthetic_profile_user(user_id, &initial_username))
+        .await
+        .expect("synthetic profile must be created");
+
+    let application_name = format!("synthetic-profile-lock-{suffix}");
+    let details_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            database_url
+                .parse::<PgConnectOptions>()
+                .expect("test database URL must parse")
+                .application_name(&application_name),
+        )
+        .await
+        .expect("profile detail pool must connect");
+
+    query(
+        "drop trigger if exists synthetic_profile_pause on telegram_profile_identity_observations",
+    )
+    .execute(&pool)
+    .await
+    .expect("previous profile pause trigger must be removable");
+    query("drop function if exists synthetic_profile_pause()")
+        .execute(&pool)
+        .await
+        .expect("previous profile pause function must be removable");
+    query(
+        "create function synthetic_profile_pause() returns trigger language plpgsql as $$ begin perform pg_sleep(1.0); return new; end; $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("profile pause trigger function must be created");
+    query(
+        "create trigger synthetic_profile_pause before insert on telegram_profile_identity_observations for each row when (new.telegram_user_id = 9320000001) execute function synthetic_profile_pause()",
+    )
+    .execute(&pool)
+    .await
+    .expect("profile pause trigger must be created");
+
+    let mut details = synthetic_profile_details(user_id);
+    details.chat_fetched = true;
+    details.photos_fetched = true;
+    details.username = Some(format!("d{suffix:08x}"));
+    details.first_name = Some("Refresh".to_owned());
+    let details_task =
+        tokio::spawn(async move { update_user_profile_details(&details_pool, details).await });
+    wait_for_profile_observation_pause(&pool, &application_name).await;
+
+    let upsert_pool = pool.clone();
+    let upsert_task = tokio::spawn(async move {
+        upsert_user_profile(
+            &upsert_pool,
+            &synthetic_profile_user(user_id, &format!("u{suffix:08x}")),
+        )
+        .await
+    });
+
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        (
+            details_task.await.expect("detail writer task must join"),
+            upsert_task.await.expect("upsert writer task must join"),
+        )
+    })
+    .await
+    .expect("concurrent profile writers must not hang");
+
+    query("drop trigger synthetic_profile_pause on telegram_profile_identity_observations")
+        .execute(&pool)
+        .await
+        .expect("profile pause trigger must be removed");
+    query("drop function synthetic_profile_pause()")
+        .execute(&pool)
+        .await
+        .expect("profile pause trigger function must be removed");
+
+    joined
+        .0
+        .expect("profile detail writer must not be a deadlock victim");
+    joined
+        .1
+        .expect("profile upsert writer must not be a deadlock victim");
+    let active_aliases: i64 = query_scalar(
+        r#"
+        select count(*)
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and is_active
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("active alias count must be readable");
+    assert_eq!(
+        active_aliases, 1,
+        "one serialized profile writer must leave one current alias"
+    );
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic profile fixture must be removed");
+}
+
+#[tokio::test]
+#[ignore = "run with ./scripts/test.sh against the local test database"]
+async fn partial_profile_refresh_retries_after_bounded_cooldown() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must be set by scripts/test.sh");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("local test database must be reachable");
+    let suffix = synthetic_profile_suffix();
+    let user_id = 9_330_000_000_000 + suffix;
+    let chat_id = -1_009_330_000_000 - suffix;
+    let username = format!("r{suffix:08x}");
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic aliases must be removed");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic chat user must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("previous synthetic profile must be removed");
+
+    upsert_user_profile(&pool, &synthetic_profile_user(user_id, &username))
+        .await
+        .expect("synthetic profile must be created");
+    // Both snapshots are already confirmed. Only `getChat` will fail, so the
+    // scheduler must use `profile_refresh_error`, not a missing timestamp.
+    query(
+        r#"
+        update telegram_user_profiles
+        set profile_refreshed_at = '2020-01-01 00:00:00+00',
+            personal_channel_refreshed_at = '2020-01-02 00:00:00+00',
+            profile_refresh_error = null,
+            profile_refresh_failure_count = 0,
+            profile_refresh_retry_at = null
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("confirmed synthetic profile snapshots must be stored");
+    query(
+        "insert into telegram_chat_users (chat_id, telegram_user_id, first_message_id) values ($1, $2, 301)",
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic chat user must be created");
+    let refreshed_before: DateTime<Utc> = query_scalar(
+        "select profile_refreshed_at from telegram_user_profiles where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed profile timestamp must be readable");
+
+    update_user_profile_details(&pool, synthetic_partial_profile_details(user_id))
+        .await
+        .expect("partial profile refresh must commit");
+
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(
+        state.0,
+        Some(refreshed_before),
+        "a partial failure must keep the last successful profile snapshot"
+    );
+    assert_eq!(
+        state.2, 1,
+        "a partial failure must start the retry backoff counter"
+    );
+    assert_eq!(
+        state.3.as_deref(),
+        Some("getChat failed: synthetic timeout")
+    );
+    let first_retry_at = state.1.expect("a partial failure must schedule a retry");
+    let now = Utc::now();
+    assert!(
+        first_retry_at > now,
+        "the first retry must not be due immediately"
+    );
+    assert!(
+        first_retry_at <= now + Duration::minutes(2),
+        "the first retry must stay inside the bounded first cooldown"
+    );
+
+    let preserved_username: Option<String> =
+        query_scalar("select username from telegram_user_profiles where telegram_user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("partially refreshed username must be readable");
+    assert_eq!(preserved_username.as_deref(), Some(username.as_str()));
+    let alias_active: bool = query_scalar(
+        r#"
+        select is_active
+        from telegram_username_aliases
+        where telegram_peer_id = $1
+          and peer_type = 'user'
+          and source = 'user_update'
+          and username_normalized = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .expect("confirmed username alias must remain present");
+    assert!(
+        alias_active,
+        "a partial failure must not deactivate the last confirmed alias"
+    );
+
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable"),
+        "the scheduler must not retry before the cooldown expires"
+    );
+    let selection = RefreshUserProfilesQuery {
+        chat_id,
+        limit: 10,
+        include_refreshed: false,
+        only_spammers: false,
+    };
+    assert!(
+        load_user_ids(&pool, &selection)
+            .await
+            .expect("batch profile selection must execute")
+            .is_empty(),
+        "the batch refresher must also respect the cooldown"
+    );
+
+    query(
+        "update telegram_user_profiles set profile_refresh_retry_at = now() - interval '1 second' where telegram_user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic cooldown must be rewound");
+    assert!(
+        user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable"),
+        "the scheduler must retry a partial failure once the cooldown expires"
+    );
+    assert_eq!(
+        load_user_ids(&pool, &selection)
+            .await
+            .expect("batch profile selection must execute"),
+        vec![user_id],
+        "the batch refresher must pick the profile up when the cooldown expires"
+    );
+
+    // A second failure must increase, not reset, the backoff delay.
+    update_user_profile_details(&pool, synthetic_partial_profile_details(user_id))
+        .await
+        .expect("second partial profile refresh must commit");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(state.2, 2);
+    let second_retry_at = state
+        .1
+        .expect("second partial failure must schedule a retry");
+    let now = Utc::now();
+    assert!(
+        second_retry_at > now + Duration::seconds(60),
+        "the second retry must use the exponential step, not the base delay"
+    );
+    assert!(
+        second_retry_at < now + Duration::minutes(3),
+        "the second retry must stay inside the exponential step"
+    );
+
+    // A corrupted or very large counter must not produce an unbounded delay.
+    query(
+        r#"
+        update telegram_user_profiles
+        set profile_refresh_failure_count = 100,
+            profile_refresh_retry_at = now() - interval '1 second'
+        where telegram_user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("synthetic backoff counter must be seeded");
+    update_user_profile_details(&pool, synthetic_partial_profile_details(user_id))
+        .await
+        .expect("capped partial profile refresh must commit");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(state.2, 101);
+    let capped_retry_at = state.1.expect("capped failure must schedule a retry");
+    let now = Utc::now();
+    assert!(
+        capped_retry_at > now + Duration::hours(5) + Duration::minutes(58),
+        "the retry delay must remain close to the six-hour cap"
+    );
+    assert!(
+        capped_retry_at < now + Duration::hours(6) + Duration::minutes(2),
+        "the retry delay must never exceed the six-hour cap"
+    );
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable"),
+        "the capped retry must still respect the cooldown"
+    );
+
+    // A total failure must schedule a retry without pretending the profile
+    // snapshot is fresh.
+    mark_user_profile_refresh_error(&pool, user_id, "all profile APIs failed")
+        .await
+        .expect("total profile refresh error must be stored");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(
+        state.0,
+        Some(refreshed_before),
+        "a total failure must keep the last successful profile snapshot"
+    );
+    assert_eq!(state.2, 102);
+    assert_eq!(state.3.as_deref(), Some("all profile APIs failed"));
+    assert!(
+        state.1.expect("total failure must schedule a retry") > Utc::now(),
+        "a total failure must schedule a future retry"
+    );
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable")
+    );
+
+    // A successful refresh must clear the whole retry state.
+    let mut success = synthetic_profile_details(user_id);
+    success.chat_fetched = true;
+    success.photos_fetched = true;
+    success.username = Some(username.clone());
+    success.active_usernames = Some(vec![username.clone()]);
+    success.first_name = Some("Retried".to_owned());
+    success.personal_channel_refreshed_at = Some(Utc::now());
+    update_user_profile_details(&pool, success)
+        .await
+        .expect("successful profile refresh must commit");
+    let state = load_profile_retry_state(&pool, user_id).await;
+    assert_eq!(state.1, None, "success must clear the scheduled retry");
+    assert_eq!(state.2, 0, "success must reset the backoff counter");
+    assert_eq!(state.3, None, "success must clear the refresh error");
+    assert!(
+        state
+            .0
+            .expect("successful refresh must set the snapshot time")
+            > refreshed_before
+    );
+    assert!(
+        !user_profile_needs_refresh(&pool, user_id)
+            .await
+            .expect("profile refresh state must be readable")
+    );
+
+    query("delete from telegram_username_aliases where telegram_peer_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic alias fixture must be removed");
+    query("delete from telegram_chat_users where chat_id = $1 and telegram_user_id = $2")
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic chat user must be removed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic profile fixture must be removed");
+}
+
+async fn assert_ingest_disabled_is_noop(pool: &PgPool) {
+    const CHAT_ID: i64 = -100_900_333;
+    const MESSAGE_ID: i32 = 900_333;
+    const USER_ID: i64 = 900_333;
+
+    query("delete from telegram_messages where chat_id = $1 and message_id = $2")
+        .bind(CHAT_ID)
+        .bind(MESSAGE_ID)
+        .execute(pool)
+        .await
+        .expect("synthetic ingress fixture cleanup must succeed");
+    query("delete from telegram_user_profiles where telegram_user_id = $1")
+        .bind(USER_ID)
+        .execute(pool)
+        .await
+        .expect("synthetic profile fixture cleanup must succeed");
+
+    let example_profile = format!(
+        "{}/config/llm_profiles.toml.example",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let previous_profile_path = std::env::var_os("LLM_PROFILES_PATH");
+    unsafe { std::env::set_var("LLM_PROFILES_PATH", &example_profile) };
+    let config_result = Config::from_env();
+    unsafe {
+        if let Some(previous_profile_path) = previous_profile_path {
+            std::env::set_var("LLM_PROFILES_PATH", previous_profile_path);
+        } else {
+            std::env::remove_var("LLM_PROFILES_PATH");
+        }
+    }
+    let mut config = config_result.expect("committed example runtime config must load");
+    let chat = config
+        .community
+        .chats
+        .get_mut("main")
+        .expect("committed test config must include main chat");
+    chat.id = CHAT_ID;
+    chat.ingest = false;
+    config.discussion_chat_id = CHAT_ID;
+    config.chat_registry = ChatRegistry::new(&config.community)
+        .expect("synthetic disabled-ingest chat registry must build");
+
+    let message: Message = serde_json::from_value(serde_json::json!({
+        "message_id": MESSAGE_ID,
+        "date": 1_700_000_000,
+        "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Synthetic"},
+        "from": {"id": USER_ID, "is_bot": false, "first_name": "Synthetic"},
+        "text": "synthetic https://example.invalid/disabled-ingest"
+    }))
+    .expect("synthetic Message must decode");
+
+    assert!(matches!(
+        ingest_message(pool, &message, &config)
+            .await
+            .expect("disabled ingest must return without an error"),
+        tg_ai_bot_teloxide::features::ingest::IngressOutcome::Ignored {
+            reason: tg_ai_bot_teloxide::features::ingest::IngressSkipReason::IngestDisabled,
+            ..
+        }
+    ));
+    let message_rows: i64 = query_scalar(
+        "select count(*) from telegram_messages where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("synthetic message row count must be queryable");
+    let profile_rows: i64 =
+        query_scalar("select count(*) from telegram_user_profiles where telegram_user_id = $1")
+            .bind(USER_ID)
+            .fetch_one(pool)
+            .await
+            .expect("synthetic profile row count must be queryable");
+    let evidence_rows: i64 = query_scalar(
+        "select count(*) from telegram_message_url_evidence where chat_id = $1 and message_id = $2",
+    )
+    .bind(CHAT_ID)
+    .bind(MESSAGE_ID)
+    .fetch_one(pool)
+    .await
+    .expect("synthetic evidence row count must be queryable");
+    assert_eq!(message_rows, 0, "ingest=false must not persist the message");
+    assert_eq!(profile_rows, 0, "ingest=false must not persist its profile");
+    assert_eq!(
+        evidence_rows, 0,
+        "ingest=false must not persist URL evidence"
+    );
 }
 
 async fn assert_channel_scoring_migration_requeues_exhausted_materializations(pool: &PgPool) {
@@ -437,6 +1414,7 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     const MESSAGE_ID: i32 = 9_300_003;
     const HIGH_RISK_USER_ID: i64 = 9_000_101;
     const LOW_RISK_USER_ID: i64 = 9_000_102;
+    const EXPIRED_REVIEW_USER_ID: i64 = 9_000_103;
     query(
         "update telegram_message_embeddings_gemma2 set error_kind = 'embedding_batch_cardinality' where chat_id = $1 and message_id = $2",
     )
@@ -448,15 +1426,18 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
     query(
         r#"
         insert into spam_review_requests
-            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at)
+            (chat_id, telegram_user_id, risk_score, notification_status, notification_next_attempt_at,
+             notification_processing_started_at, notification_lease_expires_at)
         values
-            ($1, $2, 80, 'pending', now() - interval '1 minute'),
-            ($1, $3, 65, 'pending', now() - interval '1 day')
+            ($1, $2, 80, 'pending', now() - interval '1 minute', null, null),
+            ($1, $3, 65, 'pending', now() - interval '1 day', null, null),
+            ($1, $4, 85, 'processing', now(), now() - interval '3 minutes', now() - interval '1 second')
         "#,
     )
     .bind(CHAT_ID)
     .bind(HIGH_RISK_USER_ID)
     .bind(LOW_RISK_USER_ID)
+    .bind(EXPIRED_REVIEW_USER_ID)
     .execute(pool)
     .await
     .expect("high- and low-risk ready review fixtures must be inserted");
@@ -500,6 +1481,12 @@ async fn assert_job_lifecycle_observability(pool: &PgPool) {
         .find(|queue| queue.queue == "reviews")
         .expect("reviews queue must be reported");
     assert!(reviews.lease_reclaim_count >= 1);
+    assert!(reviews.expired_lease_count >= 1);
+    assert!(
+        reviews
+            .oldest_processing_age_seconds
+            .is_some_and(|age| age >= 120.0)
+    );
     let oldest_ready_age = reviews
         .oldest_ready_age_seconds
         .expect("due high-risk review must contribute to oldest_ready_age");
@@ -528,10 +1515,34 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_size: Some(1_024),
         mime_type: Some("audio/ogg".to_owned()),
     };
-    let job_id = create_voice_job(pool, &media)
+    let job_id = enqueue_voice_job(pool, &media)
         .await
         .expect("voice job must be created")
         .expect("new voice job must return its id");
+    assert_eq!(
+        enqueue_voice_job(pool, &media)
+            .await
+            .expect("duplicate voice enqueue must succeed"),
+        None,
+        "duplicate update must leave the existing job to the worker"
+    );
+    let duplicate_count: i64 = query_scalar(
+        "select count(*) from voice_transcription_jobs where chat_id = $1 and message_id = $2",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .expect("duplicate voice count must be readable");
+    assert_eq!(duplicate_count, 1);
+    let queued_state: (String, i32, Option<i32>, bool) = query_as(
+        "select status, attempts, progress_message_id, lease_expires_at is null from voice_transcription_jobs where id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("new voice job must remain unclaimed until the worker runs");
+    assert_eq!(queued_state, ("pending".to_owned(), 0, None, true));
 
     let (first_result, second_result) =
         tokio::join!(claim_voice_job(pool, job_id), claim_voice_job(pool, job_id));
@@ -551,12 +1562,12 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .expect("progress message must be persisted")
     );
     assert!(
-        mark_voice_job_phase(pool, &job, "downloading")
+        mark_voice_job_phase(pool, &job, VoiceJobPhase::Downloading)
             .await
             .expect("voice phase transition must succeed")
     );
     assert!(
-        mark_voice_job_phase(pool, &job, "transcribing")
+        mark_voice_job_phase(pool, &job, VoiceJobPhase::Transcribing)
             .await
             .expect("voice phase transition must refresh the lease")
     );
@@ -622,7 +1633,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("unknown-unique-{suffix}")),
         ..media.clone()
     };
-    let unknown_id = create_voice_job(pool, &unknown_media)
+    let unknown_id = enqueue_voice_job(pool, &unknown_media)
         .await
         .expect("delivery-unknown voice job must be created")
         .expect("delivery-unknown voice job id must be returned");
@@ -631,7 +1642,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("delivery-unknown voice job must be claimable")
         .expect("delivery-unknown voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &unknown_job, "delivering")
+        mark_voice_job_phase(pool, &unknown_job, VoiceJobPhase::Delivering)
             .await
             .expect("voice delivering phase must be persisted")
     );
@@ -653,7 +1664,14 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .await
             .expect("delivery-unknown job must be queryable")
             .is_none(),
-        "an unknown Telegram outcome must never be retried automatically"
+        "a fresh worker after restart must not replay an unknown Telegram outcome"
+    );
+    assert_eq!(
+        enqueue_voice_job(pool, &unknown_media)
+            .await
+            .expect("terminal duplicate voice enqueue must succeed"),
+        None,
+        "delivery_unknown is terminal and cannot silently create another job"
     );
 
     let active_delivery_media = VoiceMedia {
@@ -662,7 +1680,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("active-delivery-unique-{suffix}")),
         ..media.clone()
     };
-    let active_delivery_id = create_voice_job(pool, &active_delivery_media)
+    let active_delivery_id = enqueue_voice_job(pool, &active_delivery_media)
         .await
         .expect("active-delivery voice job must be created")
         .expect("active-delivery voice job id must be returned");
@@ -671,7 +1689,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("active-delivery voice job must be claimable")
         .expect("active-delivery voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &active_delivery_job, "delivering")
+        mark_voice_job_phase(pool, &active_delivery_job, VoiceJobPhase::Delivering)
             .await
             .expect("active delivering phase must be persisted")
     );
@@ -696,7 +1714,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("expired-delivery-unique-{suffix}")),
         ..media.clone()
     };
-    let expired_delivery_id = create_voice_job(pool, &expired_delivery_media)
+    let expired_delivery_id = enqueue_voice_job(pool, &expired_delivery_media)
         .await
         .expect("expired-delivery voice job must be created")
         .expect("expired-delivery voice job id must be returned");
@@ -705,7 +1723,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         .expect("expired-delivery voice job must be claimable")
         .expect("expired-delivery voice claim must be present");
     assert!(
-        mark_voice_job_phase(pool, &expired_delivery_job, "delivering")
+        mark_voice_job_phase(pool, &expired_delivery_job, VoiceJobPhase::Delivering)
             .await
             .expect("expired delivering phase must be persisted")
     );
@@ -743,7 +1761,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("terminal-unique-{suffix}")),
         ..media.clone()
     };
-    let terminal_id = create_voice_job(pool, &terminal_media)
+    let terminal_id = enqueue_voice_job(pool, &terminal_media)
         .await
         .expect("terminal voice job must be created")
         .expect("terminal voice job id must be returned");
@@ -774,7 +1792,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("sent-unique-{suffix}")),
         ..media
     };
-    let sent_id = create_voice_job(pool, &sent_media)
+    let sent_id = enqueue_voice_job(pool, &sent_media)
         .await
         .expect("sent voice job must be created")
         .expect("sent voice job id must be returned");
@@ -2097,7 +3115,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("pending trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-21".to_string(),
-            "pending".to_string(),
+            NewUserAuditStatus::Pending,
             false
         ))
     );
@@ -2113,7 +3131,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("in-flight trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-21".to_string(),
-            "processing".to_string(),
+            NewUserAuditStatus::Processing,
             false
         ))
     );
@@ -2143,7 +3161,7 @@ async fn assert_audit_trigger_fingerprint_tracks_pending_and_in_flight_jobs(pool
             .expect("latest changed trigger fingerprint must be readable"),
         Some((
             "hidden-link-message-22".to_string(),
-            "pending".to_string(),
+            NewUserAuditStatus::Pending,
             false
         ))
     );
@@ -3750,8 +4768,16 @@ async fn assert_review_delivery_retry_uses_consecutive_failures(pool: &PgPool) {
             .expect("local transient failure listener must accept the request");
         let mut request = [0; 1_024];
         let _ = stream.read(&mut request);
+        let body = br#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#;
         stream
-            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .and_then(|()| stream.write_all(body))
             .expect("local transient failure response must be written");
     });
     let bot = Bot::new("test-token").set_api_url(
@@ -6580,8 +7606,23 @@ async fn assert_first_comment_context_isolated(
     .await
     .expect("other-discussion post job must be created")
     .expect("other-discussion post job must be unique");
+    let same_scope_tie_job_id = create_post_comment_job(
+        pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: DISCUSSION_CHAT_ID,
+            discussion_message_id: suffix + 20_003,
+            source_channel_id: SOURCE_CHANNEL_ID,
+            source_message_id: source_message_id + 3,
+            cleaned_post_text: "same-score tie post",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .expect("same-scope tie job must be created")
+    .expect("same-scope tie job must be unique");
     query("update post_comment_jobs set status = 'failed', error = 'context isolation fixture' where id = any($1)")
-        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id])
+        .bind(vec![target_job_id, other_channel_job_id, other_discussion_job_id, same_scope_tie_job_id])
         .execute(pool)
         .await
         .expect("context fixture jobs must not enter the pending delivery queue");
@@ -6624,14 +7665,20 @@ async fn assert_first_comment_context_isolated(
             2,
             "foreign discussion summary",
         ),
+        (
+            same_scope_tie_job_id,
+            SOURCE_CHANNEL_ID,
+            3,
+            "same-score tie summary",
+        ),
     ] {
         query(
             r#"
             insert into post_history_entries
                 (post_comment_job_id, source_channel_id, source_message_id, post_text,
-                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model)
+                 bot_comment, status, summary, embedding_gemma2, embedding_gemma2_model, created_at)
             values ($1, $2, $3, 'fixture post', 'fixture comment', 'ready', $4,
-                    $5::vector, $6)
+                    $5::vector, $6, '2020-01-01 00:00:00+00'::timestamptz)
             "#,
         )
         .bind(job_id)
@@ -6682,6 +7729,31 @@ async fn assert_first_comment_context_isolated(
     assert!(!memory_notes.iter().any(|note| {
         note.summary == "foreign source summary" || note.summary == "foreign discussion summary"
     }));
+    assert_eq!(
+        memory_notes
+            .iter()
+            .map(|note| note.source_message_id)
+            .collect::<Vec<_>>(),
+        vec![source_message_id + 3, source_message_id],
+        "independent tie oracle orders equal rank by descending source_message_id"
+    );
+    assert_eq!(
+        memory_notes[0].rank_score, memory_notes[1].rank_score,
+        "synthetic equal-vector rows at the same timestamp must tie"
+    );
+
+    config.rag_top_k = 1;
+    let top_one = load_relevant_memory_notes(
+        pool,
+        &config,
+        DISCUSSION_CHAT_ID,
+        SOURCE_CHANNEL_ID,
+        "semantic memory scope query",
+    )
+    .await
+    .expect("top-k retrieval must use deterministic tie order");
+    assert_eq!(top_one.len(), 1);
+    assert_eq!(top_one[0].source_message_id, source_message_id + 3);
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
@@ -6893,6 +7965,71 @@ async fn assert_stats_renderers_share_period_data(pool: &PgPool) {
     assert!(html.contains(strings.sentiment_mood));
     assert!(rich.contains(strings.sentiment_mood));
     assert!(html.contains("позитив"));
+}
+
+async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
+    const CHAT_ID: i64 = -1_009_876_543_201;
+    const USERS: [(i64, i64); 3] = [(30_003, 2), (30_001, 2), (30_002, 1)];
+
+    for (user_index, (user_id, message_count)) in USERS.iter().copied().enumerate() {
+        for offset in 0..usize::try_from(message_count).unwrap() {
+            query(
+                r#"
+                insert into telegram_messages
+                    (chat_id, message_id, user_id, text, created_at)
+                values ($1, $2, $3, 'synthetic stats ledger', '2026-01-01 12:00:00+00')
+                "#,
+            )
+            .bind(CHAT_ID)
+            .bind(900_000_i32 + i32::try_from(user_index * 10 + offset).unwrap())
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("synthetic equal-count ledger row must insert");
+        }
+    }
+
+    // Independent ledger oracle: activity descending for top-N, ascending for
+    // bottom-N, and stable user ID ascending for every equal-count group.
+    let mut expected_top = USERS.to_vec();
+    expected_top.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count.cmp(left_count).then(left_id.cmp(right_id))
+    });
+    let top = stats_repo::top_message_users(pool, CHAT_ID, 3)
+        .await
+        .expect("top user query must use deterministic ordering");
+    assert_eq!(
+        top.iter()
+            .map(|row| (row.user_id, row.messages))
+            .collect::<Vec<_>>(),
+        expected_top
+    );
+
+    let mut expected_bottom = USERS.to_vec();
+    expected_bottom.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        left_count.cmp(right_count).then(left_id.cmp(right_id))
+    });
+    let bottom = stats_repo::bottom_message_users(pool, CHAT_ID, 3)
+        .await
+        .expect("bottom user query must use deterministic ordering");
+    assert_eq!(
+        bottom
+            .iter()
+            .map(|row| (row.user_id, row.messages))
+            .collect::<Vec<_>>(),
+        expected_bottom
+    );
+
+    let top_ids = stats_repo::top_message_user_ids(pool, CHAT_ID, 2)
+        .await
+        .expect("top message user IDs must preserve the same tie rule");
+    assert_eq!(
+        top_ids,
+        expected_top[..2]
+            .iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>()
+    );
 }
 
 async fn assert_feature_gated_jobs(pool: &PgPool) {
@@ -7513,6 +8650,262 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         CasResult::LeaseLost,
         "a completed send cannot be finalized twice"
     );
+
+    let expired_job_id = create_job(pool, 6).await;
+    query(
+        "update post_comment_jobs set status = 'processing', attempts = 1, lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(expired_job_id)
+    .execute(pool)
+    .await
+    .expect("expired-before-reclaim fixture must be prepared");
+    let expired_job = tg_ai_bot_teloxide::features::first_comment::repo::PostCommentJob {
+        id: expired_job_id,
+        discussion_chat_id: -1001932061163,
+        discussion_message_id: 6,
+        source_channel_id: -1001575496091,
+        source_message_id: 6,
+        cleaned_post_text: "Тестовый пост".to_string(),
+        image_file_id: None,
+        attempts: 1,
+        operator_retry_only: false,
+    };
+    let before: (String, i32, bool) = query_as(
+        "select status, attempts, lease_expires_at <= now() from post_comment_jobs where id = $1",
+    )
+    .bind(expired_job_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired job state must exist");
+    assert_eq!(
+        mark_post_comment_pre_send_failed(pool, &expired_job, CommentErrorKind::Transient)
+            .await
+            .expect("expired pre-send finalizer must execute"),
+        CasResult::LeaseLost,
+        "pre-send failure without a live processing lease must not mutate the job"
+    );
+    let after: (String, i32, bool) = query_as(
+        "select status, attempts, lease_expires_at <= now() from post_comment_jobs where id = $1",
+    )
+    .bind(expired_job_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired job state must remain readable");
+    assert_eq!(
+        after, before,
+        "lost lease must leave status and attempts unchanged"
+    );
+    let reclaimed = claim_next_post_comment_job(pool)
+        .await
+        .expect("reclaim after lost pre-send finalizer must execute")
+        .expect("another worker must be able to claim the expired job");
+    assert_eq!(reclaimed.id, expired_job_id);
+    assert_eq!(reclaimed.attempts, 2);
+}
+
+async fn assert_user_stats_username_uses_fresh_unique_alias(pool: &PgPool) {
+    use tg_ai_bot_teloxide::features::stats::service::user_stats_report_data;
+
+    let chat = -1_009_876_540_000;
+    let old_owner = 8_976_540_001_i64;
+    let current_owner = old_owner + 1;
+    let name = "fixture_stats_alias";
+    query("insert into telegram_user_profiles (telegram_user_id, username, updated_at) values ($1,$3,now()), ($2,$3,now()-interval '1 hour')")
+        .bind(old_owner).bind(current_owner).bind(name).execute(pool).await.unwrap();
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1,$2), ($3,$4)")
+        .bind(chat)
+        .bind(old_owner)
+        .bind(chat - 1)
+        .bind(current_owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    query("insert into public.telegram_username_aliases (username_normalized,telegram_peer_id,peer_type,source,observed_at) values ($1,$2,'user','profile_refresh',now()-interval '25 hours'), ($1,$3,'user','profile_refresh',now())")
+        .bind(name).bind(old_owner).bind(current_owner).execute(pool).await.unwrap();
+    let target = "@FIXTURE_STATS_ALIAS";
+    let resolve = |chat_id, target, reply| async move {
+        user_stats_report_data(pool, chat_id, target, reply, 0)
+            .await
+            .unwrap()
+            .map(|data| data.user.user_id)
+    };
+    assert_eq!(resolve(chat, Some(target), None).await, None);
+    assert_eq!(
+        resolve(chat - 1, Some(target), None).await,
+        Some(current_owner)
+    );
+    assert_eq!(
+        resolve(chat, Some("8976540001"), None).await,
+        Some(old_owner)
+    );
+    assert_eq!(resolve(chat, None, Some(old_owner)).await, Some(old_owner));
+    assert_eq!(
+        resolve(chat, Some("@fixture_stats_unknown"), None).await,
+        None
+    );
+    query("update public.telegram_username_aliases set observed_at=now() where username_normalized=$1")
+        .bind(name).execute(pool).await.unwrap();
+    assert_eq!(resolve(chat - 1, Some(target), None).await, None);
+    query("update public.telegram_username_aliases set observed_at=now()-interval '25 hours' where username_normalized=$1")
+        .bind(name).execute(pool).await.unwrap();
+    assert_eq!(resolve(chat - 1, Some(target), None).await, None);
+}
+
+#[tokio::test]
+#[ignore = "run against the disposable local test database"]
+async fn concurrent_duplicate_post_comment_events_create_one_semantic_job() {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point to the disposable test database");
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("test PostgreSQL must be reachable");
+    let discussion_chat_id = -1_001_888_000_123;
+    let discussion_message_id =
+        (Utc::now().timestamp_micros().unsigned_abs() % 1_000_000_000) as i32 + 1;
+    let mut workers = Vec::new();
+    for _ in 0..16 {
+        let worker_pool = pool.clone();
+        workers.push(tokio::spawn(async move {
+            create_post_comment_job(
+                &worker_pool,
+                CreatePostCommentJobParams {
+                    discussion_chat_id,
+                    discussion_message_id,
+                    source_channel_id: -1_001_888_000_124,
+                    source_message_id: discussion_message_id,
+                    cleaned_post_text: "synthetic duplicate post event",
+                    image_file_id: None,
+                    image_file_unique_id: None,
+                },
+            )
+            .await
+        }));
+    }
+    let mut results = Vec::with_capacity(workers.len());
+    for worker in workers {
+        results.push(worker.await.expect("duplicate enqueue worker must finish"));
+    }
+    let row_count: i64 = query_scalar(
+        "select count(*) from post_comment_jobs where discussion_chat_id=$1 and discussion_message_id=$2",
+    )
+    .bind(discussion_chat_id)
+    .bind(discussion_message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("duplicate job row count must be readable");
+    query("delete from post_comment_jobs where discussion_chat_id=$1 and discussion_message_id=$2")
+        .bind(discussion_chat_id)
+        .bind(discussion_message_id)
+        .execute(&pool)
+        .await
+        .expect("synthetic post jobs must be cleaned before assertions");
+
+    let ids = results
+        .into_iter()
+        .map(|result| result.expect("duplicate enqueue must not fail"))
+        .collect::<Vec<_>>();
+    assert_eq!(row_count, 1, "one semantic post must persist one job");
+    assert_eq!(
+        ids.iter().filter(|id| id.is_some()).count(),
+        1,
+        "exactly one concurrent duplicate event may create the job"
+    );
+}
+
+async fn assert_post_comment_claim_skips_locked_oldest_row(pool: &PgPool) {
+    let suffix = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        % 900_000) as i32;
+    let first_message_id = 8_000_000 + suffix;
+    let second_message_id = first_message_id + 1;
+    let first_id = create_job(pool, first_message_id).await;
+    let second_id = create_job(pool, second_message_id).await;
+
+    // Equalize the due time so the deterministic `id` ordering picks first_id.
+    query("update post_comment_jobs set next_attempt_at = '2000-01-01 00:00:00+00' where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("two ready jobs must receive the same due timestamp");
+    let oldest_id: i64 = query_scalar(
+        "select id from post_comment_jobs where id = any($1) order by next_attempt_at, id limit 1",
+    )
+    .bind(vec![first_id, second_id])
+    .fetch_one(pool)
+    .await
+    .expect("oldest ready fixture must exist");
+    let expected_unlocked_id = if oldest_id == first_id {
+        second_id
+    } else {
+        first_id
+    };
+
+    let mut owner = pool
+        .begin()
+        .await
+        .expect("row-lock owner transaction must start");
+    let locked_id: i64 = query_scalar("select id from post_comment_jobs where id = $1 for update")
+        .bind(oldest_id)
+        .fetch_one(&mut *owner)
+        .await
+        .expect("oldest ready row must be locked by the test transaction");
+    assert_eq!(locked_id, oldest_id);
+
+    let claim_pool = pool.clone();
+    let claim = tokio::spawn(async move { claim_next_post_comment_job(&claim_pool).await });
+    // Poll PostgreSQL's actual wait state. The short sleeps only pace these
+    // observations; a timeout is a liveness guard and is never treated as
+    // evidence that the competing worker is blocked on this lock.
+    let observed_lock_wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if claim.is_finished() {
+                return Ok::<bool, sqlx::Error>(false);
+            }
+            let waiting_on_row_lock: bool = query_scalar(
+                "select exists(select 1 from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and query ilike '%with expired_sends as%')",
+            )
+            .fetch_one(pool)
+            .await?;
+            if waiting_on_row_lock {
+                return Ok::<bool, sqlx::Error>(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    owner
+        .commit()
+        .await
+        .expect("test row lock must be released cleanly");
+    query("delete from post_comment_jobs where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("synthetic locked-claim fixtures must be removed");
+
+    let claim_result = claim
+        .await
+        .expect("claim task must complete after the test releases its lock");
+    query("delete from post_comment_jobs where id = any($1)")
+        .bind(vec![first_id, second_id])
+        .execute(pool)
+        .await
+        .expect("synthetic locked-claim fixtures must be removed");
+    let observed_lock_wait = observed_lock_wait
+        .expect("claim lock-state observation must complete within the liveness bound")
+        .expect("PostgreSQL lock-state query must succeed");
+    assert!(
+        !observed_lock_wait,
+        "claim query waited on a row another worker already locked"
+    );
+    let claimed = claim_result
+        .expect("concurrent claim query must succeed")
+        .expect("second ready fixture must remain claimable");
+    assert_eq!(claimed.id, expected_unlocked_id);
+    assert_eq!(claimed.attempts, 1);
 }
 
 async fn assert_comment_reconciliation_requires_operator_claim(pool: &PgPool) {
@@ -7761,6 +9154,21 @@ async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool)
         CasResult::Applied
     );
 
+    let send_port = AcknowledgingSendPort::new();
+    let send_result = send_port
+        .send_html_reply(
+            ChatId(job.discussion_chat_id),
+            MessageId(job.discussion_message_id),
+            "test comment".to_owned(),
+        )
+        .await;
+    assert!(matches!(send_result, DeliveryEffect::Confirmed(_)));
+    assert_eq!(
+        send_port.calls(),
+        1,
+        "fake Telegram accepted exactly one send"
+    );
+
     query("drop trigger if exists post_comment_history_failure_trigger on post_history_entries")
         .execute(pool)
         .await
@@ -7841,6 +9249,33 @@ async fn assert_comment_finalization_rolls_back_on_database_error(pool: &PgPool)
         .await
         .expect("sending job must remain queryable after rollback");
     assert_eq!(status, "sending");
+
+    query(
+        "update post_comment_jobs set lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .expect("delivery lease can be expired after the simulated acknowledgement");
+    assert!(
+        claim_next_post_comment_job(pool)
+            .await
+            .expect("expired sending recovery must execute")
+            .is_none(),
+        "an acknowledged send whose finalization rolled back must not be reclaimed for sending"
+    );
+    assert_eq!(
+        send_port.calls(),
+        1,
+        "the failed DB finalization must not resend"
+    );
+    let recovered_status: String =
+        query_scalar("select status from post_comment_jobs where id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .expect("expired acknowledged job must remain queryable");
+    assert_eq!(recovered_status, "delivery_unknown");
 }
 
 async fn assert_comment_finalization_is_idempotent_when_audit_rows_exist(pool: &PgPool) {
