@@ -183,6 +183,7 @@ jobs:
           for name in \
             features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents \
             features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits \
+            features::user_profiles::enrichment::tests::fast_audit_ack_fences_revisions_and_reclaims \
             features::qr_url::tests::qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media \
             telegram::manual_moderation::tests::username_sanctions_require_live_ownership_and_resume_preserves_provenance
           do

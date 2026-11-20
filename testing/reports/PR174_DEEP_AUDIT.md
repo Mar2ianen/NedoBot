@@ -51,9 +51,29 @@ Nightly: 58 запусков селекторов, 62 записи успешн�
 
 - ID: изменение имени между последней сверкой и Bot API effect, старый batch
   без provenance в полном Telegram adapter.
-- QUEUE: остановка после commit audit, но до ACK intent; состязание повторных
-  claims после expiry; несколько процессов, обновляющих один глобальный профиль.
+- QUEUE: несколько процессов, обновляющих один глобальный профиль.
 - QR: недоступность alias storage во время materialization; отдельная проверка
   retry после такого сбоя.
 - STATS: явные ID/reply намеренно сохраняют прежний scope; новый scope применяется
   только к имени.
+
+### Дополнительная P2: подтверждение fast-path intent
+
+На `b8c64c2` `process_profile_audit` сохранял аудит, но не обновлял
+`completed_revision`, поэтому reconciler повторял успешно выполненную работу.
+Теперь fast-path берёт текущую незавершённую ревизию с lease до чтения снимка.
+Оба пути подтверждают только материализованный аудит, через общий CAS по
+ревизии, номеру попытки и действующему lease. Ошибка или отсутствие снимка
+не подтверждает intent. Если процесс остановился между commit аудита и ACK,
+reconciler вправе повторить его после expiry: это восстановление, не exactly-once.
+
+`fast_audit_ack_fences_revisions_and_reclaims` на disposable PG проверяет обычный
+ACK и отсутствие повтора даже после перевода записи в due, восстановление
+после commit без ACK, новый revision между audit и ACK, повторный claim и
+отсутствие ACK без снимка. Удаление ACK fast-path дало ожидаемое падение:
+`(1, None, 1)` вместо `(1, Some(1), 1)`. После возврата ACK все три ignored
+теста `features::user_profiles::enrichment::tests` прошли.
+Полный `scripts/test.sh`: 781 workspace-тест и 32 дополнительных успешных
+исполнения. Форматирование, Clippy all-features и no-default check прошли.
+Предыдущая голова `b8c64c2` прошла [PR CI 44701096692](https://github.com/Mar2ianen/NedoBot/actions/runs/44701096692);
+это не результат CI для дополнительной правки.

@@ -25,7 +25,7 @@ use crate::features::jobs::{
 
 #[cfg(feature = "moderation")]
 use crate::features::{
-    new_user_analysis::enqueue_new_user_audit_for_profile_refresh_with_url_feed,
+    new_user_analysis::{ProfileAuditOutcome, materialize_profile_refresh_audit},
     url_feeds::FeedSnapshot,
 };
 
@@ -317,18 +317,97 @@ async fn process_profile_audit(
 
     #[cfg(feature = "moderation")]
     if config.new_user_audit_enabled
-        && config.chat_allows(job.chat_id, |chat| chat.moderation)
-        && let Err(err) = enqueue_new_user_audit_for_profile_refresh_with_url_feed(
-            pool,
-            config,
-            job.chat_id,
-            job.user_id,
-            url_feed_snapshot.read().await.clone(),
-        )
-        .await
+        && config.chat_allows(job.chat_id, |chat| chat.ingest && chat.moderation)
+        && let Err(err) =
+            process_fast_audit_intent(pool, config, url_feed_snapshot.read().await.clone(), job)
+                .await
     {
         tracing::warn!(%err, user_id = job.user_id, "failed to save unified new user audit baseline and job");
     }
+}
+
+#[cfg(feature = "moderation")]
+async fn process_fast_audit_intent(
+    pool: &PgPool,
+    config: &Config,
+    url_feed: Option<Arc<FeedSnapshot>>,
+    job: ProfileRefreshJob,
+) -> anyhow::Result<()> {
+    let instance_id = &config.community.instance.id;
+    let Some((revision, attempt)) = claim_fast_audit_intent(pool, instance_id, job).await? else {
+        return Ok(());
+    };
+    // Аудит читает снимок только после claim. Ошибка или остановка до ACK
+    // оставляет запись для reconciler после истечения lease.
+    materialize_claimed_audit(pool, config, url_feed, job).await?;
+    acknowledge_audit_intent(pool, instance_id, job, revision, attempt).await?;
+    Ok(())
+}
+
+#[cfg(feature = "moderation")]
+async fn materialize_claimed_audit(
+    pool: &PgPool,
+    config: &Config,
+    url_feed: Option<Arc<FeedSnapshot>>,
+    job: ProfileRefreshJob,
+) -> anyhow::Result<()> {
+    match materialize_profile_refresh_audit(pool, config, job.chat_id, job.user_id, url_feed)
+        .await?
+    {
+        ProfileAuditOutcome::Materialized => Ok(()),
+        ProfileAuditOutcome::NoSnapshot => anyhow::bail!("profile audit snapshot is unavailable"),
+    }
+}
+
+#[cfg(feature = "moderation")]
+async fn claim_fast_audit_intent(
+    pool: &PgPool,
+    instance_id: &str,
+    job: ProfileRefreshJob,
+) -> anyhow::Result<Option<(i64, i32)>> {
+    Ok(sqlx::query_as(
+        r#"update public.telegram_profile_refresh_intents
+           set attempts = attempts + 1,
+               next_attempt_at = clock_timestamp() + interval '2 minutes',
+               updated_at = now()
+           where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
+             and (completed_revision is null or completed_revision < revision)
+             and failed_at is null and next_attempt_at <= clock_timestamp()
+             and attempts < $4
+           returning revision, attempts"#,
+    )
+    .bind(instance_id)
+    .bind(job.chat_id)
+    .bind(job.user_id)
+    .bind(PROFILE_REFRESH_INTENT_MAX_ATTEMPTS)
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[cfg(feature = "moderation")]
+async fn acknowledge_audit_intent(
+    pool: &PgPool,
+    instance_id: &str,
+    job: ProfileRefreshJob,
+    revision: i64,
+    attempt: i32,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"update public.telegram_profile_refresh_intents
+           set completed_revision = $4, last_error = null, updated_at = now()
+           where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
+             and revision = $4 and attempts = $5
+             and failed_at is null and completed_revision is distinct from $4
+             and next_attempt_at > clock_timestamp()"#,
+    )
+    .bind(instance_id)
+    .bind(job.chat_id)
+    .bind(job.user_id)
+    .bind(revision)
+    .bind(attempt)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Replays durable ingest intents that the bounded queue could not accept or
@@ -400,36 +479,14 @@ pub async fn reconcile_profile_refresh_intents(
         if attempts >= PROFILE_REFRESH_INTENT_MAX_ATTEMPTS {
             continue;
         }
-        match enqueue_new_user_audit_for_profile_refresh_with_url_feed(
-            pool,
-            config,
-            chat_id,
-            user_id,
-            url_feed.clone(),
-        )
-        .await
-        {
+        let job = ProfileRefreshJob { chat_id, user_id };
+        match materialize_claimed_audit(pool, config, url_feed.clone(), job).await {
             Ok(()) => {
-                let result = sqlx::query(
-                    r#"
-                    update public.telegram_profile_refresh_intents
-                    set completed_revision = $4,
-                        failed_at = null,
-                        last_error = null,
-                        updated_at = now()
-                    where instance_id = $1 and chat_id = $2 and telegram_user_id = $3
-                      and revision = $4 and attempts = $5
-                      and failed_at is null and completed_revision is distinct from $4
-                    "#,
-                )
-                .bind(instance_id)
-                .bind(chat_id)
-                .bind(user_id)
-                .bind(revision)
-                .bind(attempts + 1)
-                .execute(pool)
-                .await?;
-                recovered += result.rows_affected() as usize;
+                if !acknowledge_audit_intent(pool, instance_id, job, revision, attempts + 1).await?
+                {
+                    continue;
+                }
+                recovered += 1;
                 tracing::info!(
                     chat_id,
                     user_id,
@@ -487,6 +544,130 @@ pub async fn reconcile_profile_refresh_intents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "moderation")]
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn fast_audit_ack_fences_revisions_and_reclaims() {
+        let pool = PgPool::connect(&std::env::var("TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let suffix = i64::from(uuid::Uuid::new_v4().as_u128() as u32);
+        let job = ProfileRefreshJob {
+            chat_id: -1_008_320_000_000 - suffix,
+            user_id: 8_503_000_000_000 + suffix,
+        };
+        let mut config = crate::config::test_config();
+        config.community.instance.id = format!("fast_ack_{suffix}");
+        config.community.chats.get_mut("main").unwrap().id = job.chat_id;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        config.new_user_audit_enabled = true;
+        let instance = &config.community.instance.id;
+        let ingest = async |message_id| {
+            let message = serde_json::from_value(serde_json::json!({
+                "message_id": message_id, "date": chrono::Utc::now().timestamp(),
+                "chat": {"id": job.chat_id, "type": "supergroup", "title": "Fixture"},
+                "from": {"id": job.user_id, "is_bot": false, "first_name": "Fixture"},
+                "text": "Synthetic message"
+            }))
+            .unwrap();
+            assert!(
+                crate::features::ingest::ingest_message(&pool, &message, &config)
+                    .await
+                    .unwrap()
+                    .was_persisted()
+            );
+        };
+        let state = || async {
+            sqlx::query_as::<_, (i64, Option<i64>, i32)>(
+                "select revision, completed_revision, attempts from telegram_profile_refresh_intents
+                 where instance_id=$1 and chat_id=$2 and telegram_user_id=$3",
+            ).bind(instance).bind(job.chat_id).bind(job.user_id).fetch_one(&pool).await.unwrap()
+        };
+        let expire = || async {
+            sqlx::query("update telegram_profile_refresh_intents set next_attempt_at=now()-interval '1 second'
+                         where instance_id=$1 and chat_id=$2 and telegram_user_id=$3")
+                .bind(instance).bind(job.chat_id).bind(job.user_id).execute(&pool).await.unwrap();
+        };
+        let recover = || reconcile_profile_refresh_intents(&pool, &config, None, 8);
+
+        ingest(1_i32).await;
+        process_profile_audit(&pool, &config, Arc::default(), job).await;
+        assert_eq!(state().await, (1, Some(1), 1));
+        expire().await;
+        assert_eq!(
+            recover().await.unwrap(),
+            0,
+            "confirmed fast-path is not replayed"
+        );
+
+        ingest(2).await;
+        let (revision, attempt) = claim_fast_audit_intent(&pool, instance, job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recover().await.unwrap(),
+            0,
+            "live claim excludes reconciler"
+        );
+        materialize_claimed_audit(&pool, &config, None, job)
+            .await
+            .unwrap();
+        assert_eq!(state().await, (2, Some(1), 1));
+        // Имитируем остановку после commit аудита, до ACK, и повторный claim.
+        expire().await;
+        assert_eq!(
+            claim_fast_audit_intent(&pool, instance, job).await.unwrap(),
+            Some((2, 2))
+        );
+        assert!(
+            !acknowledge_audit_intent(&pool, instance, job, revision, attempt)
+                .await
+                .unwrap()
+        );
+        expire().await;
+        assert_eq!(recover().await.unwrap(), 1);
+        assert_eq!(state().await, (2, Some(2), 3));
+
+        ingest(3).await;
+        let (revision, attempt) = claim_fast_audit_intent(&pool, instance, job)
+            .await
+            .unwrap()
+            .unwrap();
+        materialize_claimed_audit(&pool, &config, None, job)
+            .await
+            .unwrap();
+        ingest(4).await;
+        assert_eq!(
+            claim_fast_audit_intent(&pool, instance, job).await.unwrap(),
+            Some((4, 1))
+        );
+        assert!(
+            !acknowledge_audit_intent(&pool, instance, job, revision, attempt)
+                .await
+                .unwrap()
+        );
+        assert_eq!(state().await, (4, Some(2), 1));
+        expire().await;
+        assert_eq!(recover().await.unwrap(), 1);
+        assert_eq!(state().await, (4, Some(4), 2));
+
+        ingest(5).await;
+        sqlx::query("delete from telegram_chat_users where chat_id=$1 and telegram_user_id=$2")
+            .bind(job.chat_id)
+            .bind(job.user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            process_fast_audit_intent(&pool, &config, None, job)
+                .await
+                .is_err(),
+            "an unavailable snapshot is not a materialized audit"
+        );
+        assert_eq!(state().await, (5, Some(4), 1));
+    }
 
     #[cfg(feature = "moderation")]
     #[tokio::test]

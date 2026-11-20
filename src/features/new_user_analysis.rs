@@ -85,6 +85,24 @@ pub async fn enqueue_new_user_audit_for_profile_refresh_with_url_feed(
     telegram_user_id: i64,
     url_feed: Option<std::sync::Arc<crate::features::url_feeds::FeedSnapshot>>,
 ) -> anyhow::Result<()> {
+    materialize_profile_refresh_audit(pool, runtime_config, chat_id, telegram_user_id, url_feed)
+        .await
+        .map(|_| ())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProfileAuditOutcome {
+    Materialized,
+    NoSnapshot,
+}
+
+pub(crate) async fn materialize_profile_refresh_audit(
+    pool: &PgPool,
+    runtime_config: &Config,
+    chat_id: i64,
+    telegram_user_id: i64,
+    url_feed: Option<std::sync::Arc<crate::features::url_feeds::FeedSnapshot>>,
+) -> anyhow::Result<ProfileAuditOutcome> {
     with_url_shadow_advisory_lock(
         pool,
         &runtime_config.community.instance.id,
@@ -107,7 +125,7 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
     chat_id: i64,
     telegram_user_id: i64,
     url_feed: Option<std::sync::Arc<crate::features::url_feeds::FeedSnapshot>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ProfileAuditOutcome> {
     let Some(snapshot) = SnapshotLoader::load(
         pool,
         chat_id,
@@ -116,7 +134,7 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
     )
     .await?
     else {
-        return Ok(());
+        return Ok(ProfileAuditOutcome::NoSnapshot);
     };
     let features = snapshot.features;
     let membership_context = snapshot.membership_context;
@@ -284,7 +302,7 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
         audit_job_queued = run_audit_job && !preserved_in_flight,
         "unified new user audit baseline and job saved"
     );
-    Ok(())
+    Ok(ProfileAuditOutcome::Materialized)
 }
 
 const UNIFIED_AUDIT_TEXT_LIMIT: usize = 280;
