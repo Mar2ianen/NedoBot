@@ -15,6 +15,10 @@ Audit snapshot: 2026-11-18. Baseline main SHA: `7b8815bbff80c4665b64076a063f5f49
 > (P2.9) and stops total failures from refreshing `profile_refreshed_at`.
 > All three have failing-before/passing-after PostgreSQL regressions in the
 > integration report.
+>
+> Новый углублённый аудит PR #174 и статус проверок по матрице:
+> [PR174_DEEP_AUDIT.md](reports/PR174_DEEP_AUDIT.md).
+> Отчёт отделяет рабочие изменения и локальные прогоны от подтверждённого CI.
 
 ## Test contours and evidence
 

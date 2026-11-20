@@ -19,6 +19,11 @@ run_test() {
     python3 scripts/run_cargo_test_checked.py cargo test --locked "$@"
 }
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations -- --ignored
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::qr_url::tests::qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib telegram::manual_moderation::tests::username_sanctions_require_live_ownership_and_resume_preserves_provenance -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations post_comment_claim_skips_a_locked_oldest_ready_job -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations concurrent_duplicate_post_comment_events_create_one_semantic_job -- --ignored --exact

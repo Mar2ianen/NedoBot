@@ -90,7 +90,7 @@ case "$case_id" in
     agent-compaction-budget)
         test_target_flag=--package
         test_target=agent-runtime
-        test_filter=generated_compaction_plans_match_independent_budget_oracle
+        test_filter=compaction::tests::generated_compaction_plans_match_independent_budget_oracle
         ;;
     report-render-html-escape)
         test_target_flag=--lib
@@ -125,13 +125,32 @@ case "$case_id" in
 esac
 
 export NEDOBOT_PROPTEST_SEED="$seed"
-if [ -z "${GITHUB_SHA:-}" ]; then
-    export NEDOBOT_TEST_SHA="$(git rev-parse HEAD)"
-fi
-if [ "$test_target_flag" = --lib ]; then
-    python3 scripts/run_cargo_test_checked.py cargo test --lib --locked "$test_filter" -- --nocapture
-elif [ "$test_target_flag" = --package ]; then
-    python3 scripts/run_cargo_test_checked.py cargo test --package "$test_target" --locked "$test_filter" -- --nocapture
+export NEDOBOT_TEST_SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+export QUALITY_CASE_ID="$case_id"
+export QUALITY_SEED_APPLICABILITY="$seed"
+case "$case_id" in
+    reference-models|safe-report|minimal-url-trace|telegram-route-command-precedence|ask-tool-authorization|ask-mcp-untrusted-preview|fetch-url-ip-literals|mcp-youtube-timeout|media-writer-boundary)
+        export QUALITY_SEED_APPLICABILITY=not-applicable ;;
+esac
+case "$test_target" in
+    nedobot-qr)
+        set -- --package nedobot-qr --test qr
+        export QUALITY_EXPECTED_TARGET=tests/qr.rs:qr ;;
+    agent-runtime)
+        set -- --package agent-runtime --lib
+        export QUALITY_EXPECTED_TARGET=src/lib.rs:agent_runtime ;;
+    adversarial_harness)
+        set -- --test adversarial_harness
+        export QUALITY_EXPECTED_TARGET=tests/adversarial_harness.rs:adversarial_harness ;;
+    *)
+        set -- "$test_target_flag"
+        export QUALITY_EXPECTED_TARGET=src/lib.rs:tg_ai_bot_teloxide ;;
+esac
+export QUALITY_EXPECTED_NAMES="$test_filter"
+if [ "$case_id" = fetch-url-ip-literals ]; then
+    prefix=features::search::mcp::tests::
+    export QUALITY_EXPECTED_NAMES="${prefix}fetch_url_filter_rejects_private_and_non_http_targets ${prefix}fetch_url_filter_accepts_public_http_targets ${prefix}fetch_url_limit_zero_returns_no_targets ${prefix}fetch_urls_skips_blocked_source_domains ${prefix}fetch_urls_never_forwards_blocked_ip_literals_and_keeps_lookalike_hosts_distinct"
+    python3 scripts/run_cargo_test_checked.py cargo test "$@" --locked "$test_filter"
 else
-    python3 scripts/run_cargo_test_checked.py cargo test "$test_target_flag" "$test_target" --locked "$test_filter" -- --nocapture
+    python3 scripts/run_cargo_test_checked.py cargo test "$@" --locked "$test_filter" -- --exact
 fi
