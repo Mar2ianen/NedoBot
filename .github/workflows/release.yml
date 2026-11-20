@@ -73,6 +73,13 @@ jobs:
       - name: Collect artifacts
         run: |
           bash scripts/release_bundle.sh pack target/release dist
+          while IFS= read -r binary; do
+            dependencies=$(readelf -d "dist/$binary")
+            if grep -Eq 'NEEDED.*\[lib(ssl|crypto)\.so' <<< "$dependencies"; then
+              echo "unexpected OpenSSL dependency: $binary" >&2
+              exit 1
+            fi
+          done < <(bash dist/install_release_binaries.sh --list-binaries)
           rustc --version > dist/BUILD_INFO.txt
           git rev-parse HEAD >> dist/BUILD_INFO.txt
       - uses: actions/upload-artifact@v4

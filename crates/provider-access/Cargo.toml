@@ -17,7 +17,7 @@ async-trait = "0.1"
 async-stream = "0.3"
 base64 = "0.23"
 futures-util = "0.3"
-genai = { version = "=0.7.3", default-features = false, features = ["native-tls"], optional = true }
+genai = { version = "=0.7.3", default-features = false, features = ["rustls-tls"], optional = true }
 fs2 = "0.4"
 jiff = "0.2"
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
