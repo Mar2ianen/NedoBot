@@ -128,6 +128,9 @@ pub async fn observe_message(
     let Some(source) = source else {
         return Ok(());
     };
+    if crate::telegram::identity::is_channel_sender_proxy(source.user_id) {
+        return Ok(());
+    }
     let eligible = deterministic::text_stream_eligible(source.message_count, source.age_seconds)
         && !source.normal_veto
         && !source.trusted;

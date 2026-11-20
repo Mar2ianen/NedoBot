@@ -267,6 +267,9 @@ pub(crate) async fn current_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job: &DecisionJob,
 ) -> anyhow::Result<bool> {
+    if crate::telegram::identity::is_channel_sender_proxy(job.user_id) {
+        return Ok(false);
+    }
     let current: Option<(String,Option<DateTime<Utc>>,i64,bool)> = sqlx::query_as(r#"
         select coalesce(m.text,''),m.edited_at,coalesce(l.id,0),coalesce(l.label='not_spam',false)
         from telegram_messages m
@@ -392,6 +395,9 @@ async fn captcha_source_is_current_on(
     chat: i64,
     user: i64,
 ) -> anyhow::Result<bool> {
+    if crate::telegram::identity::is_channel_sender_proxy(user) {
+        return Ok(false);
+    }
     let row:Option<CaptchaSource>=sqlx::query_as(r#"
         select j.source_hash,j.source_edited_at,coalesce(m.text,'') as current_text,m.edited_at as current_edit,coalesce(l.label='not_spam',false) as normal_veto,j.input_json
         from moderation_decision_jobs j join telegram_messages m on m.chat_id=j.chat_id and m.message_id=j.message_id and m.user_id=j.user_id

@@ -156,6 +156,7 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
     assert_short_bait_profile_gate(pool, &c).await;
     assert_temporal_id_context_snapshot(pool, &c).await;
     assert_post_topic_provenance(pool, &c).await;
+    assert_channel_sender_is_not_a_person(pool, &c).await;
     // Новые таблицы недоступны настоящей MCP роли и не входят в public views.
     let mut tx = pool.begin().await.unwrap();
     query("set local role nedobot_mcp_ro")
@@ -477,4 +478,47 @@ async fn assert_post_topic_provenance(pool: &PgPool, config: &Config) {
     let newest:Value=query_scalar("select input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002 order by id desc limit 1")
         .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
     assert!(newest["topic_context"]["post_topic"].is_null());
+}
+
+// Даже без profile.is_bot технический sender не становится человеком.
+async fn assert_channel_sender_is_not_a_person(pool: &PgPool, config: &Config) {
+    let proxy = tg_ai_bot_teloxide::telegram::identity::CHANNEL_SENDER_PROXY_ID;
+    source(pool, proxy, 5000).await;
+    observe_message(pool, config, CHAT, 5000).await.unwrap();
+    tg_ai_bot_teloxide::features::new_user_analysis::enqueue_new_user_audit_for_profile_refresh(
+        pool, config, CHAT, proxy,
+    )
+    .await
+    .unwrap();
+    let jobs: i64 = query_scalar(
+        "select count(*) from moderation_decision_jobs where chat_id=$1 and user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(proxy)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 0);
+    let audits:i64=query_scalar("select count(*) from telegram_new_user_profile_audits where chat_id=$1 and telegram_user_id=$2")
+        .bind(CHAT).bind(proxy).fetch_one(pool).await.unwrap();
+    assert_eq!(audits, 0);
+    let text: String =
+        query_scalar("select text from telegram_messages where chat_id=$1 and message_id=5000")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(text, TEXT);
+    // Та же реплика обычного автора по-прежнему проходит в Decision.
+    source(pool, USER + 5000, 5001).await;
+    observe_message(pool, config, CHAT, 5001).await.unwrap();
+    let count: i64 = query_scalar(
+        "select count(*) from moderation_decision_jobs where chat_id=$1 and user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(USER + 5000)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
 }
