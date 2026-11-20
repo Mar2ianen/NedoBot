@@ -75,6 +75,63 @@ pub async fn handle(
         return Ok(());
     };
     let actor_id = actor.user_id.0 as i64;
+    match super::manual_sender_chat::target(msg, &parsed) {
+        Ok(Some((action, sender))) => {
+            if !matches!(
+                manual_moderation::find_batch(&state.pool, msg.chat.id.0, msg.id.0).await,
+                Ok(None)
+            ) {
+                send_reply(bot,msg,state,"Эта команда уже зарегистрирована для пользователя; отправь новую команду канала.").await?;
+                return Ok(());
+            }
+
+            if !state
+                .config
+                .chat_allows(msg.chat.id.0, |chat| chat.ingest && chat.moderation)
+            {
+                send_reply(bot, msg, state, "Модерация этого чата не включена.").await?;
+                return Ok(());
+            }
+            let result = super::manual_sender_chat::execute(
+                bot,
+                &state.pool,
+                msg,
+                actor.user_id,
+                action,
+                &sender,
+                parsed.reason.as_deref(),
+            )
+            .await;
+            let text = match result {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::error!(%error, "manual channel moderation failed");
+                    "Не удалось завершить команду канала. Проверь журнал и ограничения Telegram; повтор автоматически не выполняется.".into()
+                }
+            };
+            send_reply(bot, msg, state, &text).await?;
+            return Ok(());
+        }
+        Err(error) => {
+            send_reply(bot, msg, state, &error.to_string()).await?;
+            return Ok(());
+        }
+        Ok(None) => {
+            match manual_moderation::sender_chat::command_exists(
+                &state.pool,
+                msg.chat.id.0,
+                msg.id.0,
+            )
+            .await
+            {
+                Ok(false) => {}
+                _ => {
+                    send_reply(bot,msg,state,"Команда канала не может быть изменена на пользовательскую; отправь новую команду.").await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
 
     if matches!(kind, CommandKind::Warns | CommandKind::Modlog) {
         let targets = match resolve_target_ids(&state.pool, msg, &parsed).await {
@@ -535,6 +592,10 @@ async fn resolve_target_requests(
                 .map_err(|_| anyhow::anyhow!("цель должна быть Telegram ID или @username"))?;
             Target::numeric(user_id)
         };
+        anyhow::ensure!(
+            !crate::telegram::identity::is_channel_sender_proxy(target.user_id),
+            "Это технический отправитель канала. Используй /ban или /unban по reply на комментарий канала."
+        );
         if target.user_id <= 0 {
             anyhow::bail!("Telegram ID должен быть положительным");
         }
@@ -1562,6 +1623,19 @@ mod tests {
                 "text":payload["text"]}}),
             );
         }
+        if matches!(method.as_str(), "banchatsenderchat" | "unbanchatsenderchat") {
+            assert!(payload.get("user_id").is_none());
+            stub.effects
+                .lock()
+                .unwrap()
+                .push((method, payload["sender_chat_id"].as_i64().unwrap()));
+            if *stub.api_error.lock().unwrap() {
+                return Json(
+                    json!({"ok":false,"error_code":400,"description":"synthetic ambiguous effect"}),
+                );
+            }
+            return Json(json!({"ok":true,"result":true}));
+        }
         let user_id = payload["user_id"].as_i64().expect("user id");
         if matches!(method.as_str(), "banchatmember" | "restrictchatmember") {
             stub.effects.lock().unwrap().push((method, user_id));
@@ -1594,6 +1668,185 @@ mod tests {
             .parse_mode(teloxide::types::ParseMode::Html)
     }
 
+    async fn assert_manual_channel_path(pool: &PgPool) {
+        use crate::features::manual_moderation::sender_chat::{self, Action, Request, Reservation};
+        let mut config = crate::config::test_config();
+        let chat_id = -1_009_900_000_101i64;
+        let sender_id = -1_009_900_000_102i64;
+        let chat = config.community.chats.get_mut("main").unwrap();
+        chat.id = chat_id;
+        chat.ingest = true;
+        chat.moderation = true;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        let state = AppState::new(pool.clone(), config);
+        let stub = Arc::new(MemberStub::default());
+        let bot = fake_member_bot(stub.clone()).await;
+        let base = (Utc::now().timestamp_micros().unsigned_abs() % 500_000_000) as i32;
+        let message = |id, actor, sender, auto_forward| -> Message {
+            serde_json::from_value(json!({"message_id":id,"date":1700000000,
+              "chat":{"id":chat_id,"type":"supergroup","title":"Synthetic"},
+              "from":{"id":actor,"is_bot":false,"first_name":"Actor"},"text":"synthetic command",
+              "reply_to_message":{"message_id":1,"date":1700000000,
+                "chat":{"id":chat_id,"type":"supergroup","title":"Synthetic"},
+                "sender_chat":{"id":sender,"type":"channel","title":"Synthetic"},
+                "is_automatic_forward":auto_forward,"text":"Synthetic channel comment"}}))
+            .unwrap()
+        };
+        let ban = message(base, 9002, sender_id, false);
+        handle(&bot, &ban, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        handle(&bot, &ban, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap().as_slice(),
+            &[("banchatsenderchat".into(), sender_id)]
+        );
+        handle(
+            &bot,
+            &message(base + 1, 9002, sender_id, false),
+            &state,
+            CommandKind::Unban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap()[1],
+            ("unbanchatsenderchat".into(), sender_id)
+        );
+        for (offset, actor, sender, auto_forward, args) in [
+            (2, 9003, sender_id, false, ""),
+            (3, 9002, sender_id, true, ""),
+            (4, 9002, chat_id, false, ""),
+            (5, 9002, sender_id, false, "1h"),
+            (0, 9002, sender_id - 1, false, ""),
+        ] {
+            handle(
+                &bot,
+                &message(base + offset, actor, sender, auto_forward),
+                &state,
+                CommandKind::Ban,
+                args,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(stub.effects.lock().unwrap().len(), 2);
+        *stub.api_error.lock().unwrap() = true;
+        let uncertain = message(base + 6, 9002, sender_id, false);
+        handle(&bot, &uncertain, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        handle(&bot, &uncertain, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        handle(
+            &bot,
+            &message(base + 7, 9002, sender_id, false),
+            &state,
+            CommandKind::Unban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(stub.effects.lock().unwrap().len(), 3);
+        assert!(
+            stub.replies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("не подтвердил"))
+        );
+        // Два конкурентных claims и crash сразу после durable reserve.
+        let a = Request {
+            chat_id,
+            command_message_id: base + 8,
+            sender_chat_id: sender_id - 5,
+            actor_user_id: 9002,
+            action: Action::Ban,
+            reason: None,
+        };
+        let b = Request {
+            command_message_id: base + 9,
+            action: Action::Unban,
+            ..a
+        };
+        let (x, y) = tokio::join!(
+            sender_chat::reserve(pool, &a),
+            sender_chat::reserve(pool, &b)
+        );
+        let results = [x.unwrap(), y.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Reservation::Started(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results.iter().filter(|r| **r == Reservation::Busy).count(),
+            1
+        );
+        let id = results
+            .iter()
+            .find_map(|r| {
+                if let Reservation::Started(id) = r {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let c = Request {
+            command_message_id: base + 10,
+            sender_chat_id: sender_id - 6,
+            ..a
+        };
+        let (channel, user) = tokio::join!(
+            sender_chat::reserve(pool, &c),
+            manual_moderation::create_batch(pool, chat_id, 9002, base + 10, "ban")
+        );
+        assert_ne!(
+            channel.is_ok(),
+            user.is_ok(),
+            "one command cannot reserve both target types"
+        );
+        assert!(
+            resolve_target_requests(
+                pool,
+                chat_id,
+                &[crate::telegram::identity::CHANNEL_SENDER_PROXY_ID.to_string()],
+                None
+            )
+            .await
+            .is_err()
+        );
+        sender_chat::finish(pool, id, false).await.unwrap();
+        assert!(matches!(
+            sender_chat::reserve(pool, &a).await.unwrap(),
+            Reservation::Uncertain | Reservation::Busy
+        ));
+        let readable: bool = sqlx::query_scalar(
+            "select has_table_privilege('nedobot_mcp_ro','manual_sender_chat_operations','SELECT')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(!readable);
+        sqlx::query("delete from manual_moderation_batches where chat_id=$1")
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from manual_sender_chat_operations where chat_id=$1")
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     fn parsed_ban(username: &str) -> ParsedCommand {
         parse_command(CommandKind::Ban, username).expect("synthetic ban command")
     }
@@ -1605,6 +1858,7 @@ mod tests {
             .expect("TEST_DATABASE_URL must point to the disposable test database");
         let pool = PgPool::connect(&database_url).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
+        assert_manual_channel_path(&pool).await;
         let suffix = (Utc::now().timestamp_micros().unsigned_abs() % 900_000_000) as i64;
         let chat_id = -1_008_970_032_163;
         let user_id = 9_320_000_000_000 + suffix;

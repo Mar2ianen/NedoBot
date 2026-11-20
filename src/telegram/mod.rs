@@ -20,3 +20,6 @@ pub mod service_messages;
 pub mod updates;
 
 pub(crate) mod url_targets;
+
+#[cfg(feature = "manual-moderation")]
+mod manual_sender_chat;
