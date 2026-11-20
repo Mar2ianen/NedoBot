@@ -5,16 +5,6 @@
 # safe against the running executable (Linux ETXTBSY).
 set -euo pipefail
 
-STAGE_DIR="${1:?usage: install_release_binaries.sh <staged-artifact-dir>}"
-RELEASE_ROOT="${NEDOBOT_RELEASE_ROOT:-/opt}"
-LOCK_PATH="${NEDOBOT_RELEASE_LOCK:-/var/lock/nedobot-release.lock}"
-exec 9>"$LOCK_PATH"
-flock 9
-# Both community instances run the same binaries from their own checkouts.
-DEST_DIRS=(
-    "$RELEASE_ROOT/tg-ai-bot-teloxide/target/release"
-    "$RELEASE_ROOT/nedobot-pvo/target/release"
-)
 BINARIES=(
     tg_ai_bot_teloxide
     nedonews_mcp_http
@@ -33,11 +23,58 @@ BINARIES=(
     backfill_audit_embeddings
     backfill_chat_embeddings
     import_telegram_export
+    probe_ask_route
+)
+
+if [[ "${1:-}" == --list-binaries ]]; then
+    printf '%s\n' "${BINARIES[@]}"
+    exit
+fi
+
+STAGE_DIR="${1:?usage: install_release_binaries.sh <staged-artifact-dir> [--backup]}"
+RELEASE_ROOT="${NEDOBOT_RELEASE_ROOT:-/opt}"
+LOCK_PATH="${NEDOBOT_RELEASE_LOCK:-/var/lock/nedobot-release.lock}"
+exec 9>"$LOCK_PATH"
+flock 9
+DEST_DIRS=(
+    "$RELEASE_ROOT/tg-ai-bot-teloxide/target/release"
+    "$RELEASE_ROOT/nedobot-pvo/target/release"
 )
 
 for binary in "${BINARIES[@]}"; do
     test -x "${STAGE_DIR}/${binary}" || { echo "missing executable: $binary" >&2; exit 1; }
 done
+if [[ "${2:-}" == --backup ]]; then
+    backup_root="${NEDOBOT_BACKUP_ROOT:-/var/backups/nedobot}"
+    config_root="${NEDOBOT_CONFIG_ROOT:-/etc/tg-ai-bot}"
+    umask 077
+    install -d -m 0700 -- "$backup_root"
+    backup="$(mktemp -d "$backup_root/release.XXXXXXXX")"
+    for profile in llm_profiles.toml pvo-llm_profiles.toml; do
+        install -m 0600 -- "$config_root/$profile" "$backup/$profile"
+        cmp --silent -- "$config_root/$profile" "$backup/$profile"
+    done
+    for dest_dir in "${DEST_DIRS[@]}"; do
+        instance="${dest_dir#"$RELEASE_ROOT"/}"
+        instance="${instance%%/*}"
+        install -d -m 0700 -- "$backup/$instance"
+        test -x "$dest_dir/tg_ai_bot_teloxide"
+        for binary in "${BINARIES[@]}"; do
+            if [[ -e "$dest_dir/$binary" || -L "$dest_dir/$binary" ]]; then
+                cp -pL -- "$dest_dir/$binary" "$backup/$instance/$binary"
+                cmp --silent -- "$dest_dir/$binary" "$backup/$instance/$binary"
+            else
+                printf '%s\n' "$instance/$binary" >> "$backup/ABSENT"
+            fi
+        done
+    done
+    (
+        cd "$backup"
+        find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+        sha256sum --check --status SHA256SUMS
+    )
+    echo "verified rollback backup: $backup"
+fi
 TEMP_DIRS=()
 cleanup() { for temp_dir in "${TEMP_DIRS[@]}"; do rm -rf -- "$temp_dir"; done; }
 trap cleanup EXIT

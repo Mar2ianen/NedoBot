@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref to build (must be merged to main for production deploys)"
+        description: "Git ref to build (production requires an annotated deploy-YYYY-MM-DD-scope tag)"
         default: "main"
         required: true
       deploy:
@@ -36,10 +36,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
-      - name: Record source and require merged main for deployment
+      - name: Record source and verify production deploy tag
         id: source
         env:
           DEPLOY_REQUESTED: ${{ inputs.deploy }}
+          SOURCE_REF: ${{ inputs.ref }}
         run: |
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           migration_version=$(find migrations -maxdepth 1 -type f -name '*.sql' -printf '%f\n' \
@@ -50,6 +51,11 @@ jobs:
           fi
           echo "migration_version=$migration_version" >> "$GITHUB_OUTPUT"
           if [ "$DEPLOY_REQUESTED" = true ]; then
+            test "$GITHUB_REF" = refs/heads/main
+            [[ "$SOURCE_REF" =~ ^(refs/tags/)?deploy-[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9][a-z0-9-]*$ ]]
+            tag="refs/tags/${SOURCE_REF#refs/tags/}"
+            test "$(git cat-file -t "$tag")" = tag
+            test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)"
             git merge-base --is-ancestor HEAD origin/main
           fi
       - uses: dtolnay/rust-toolchain@stable
@@ -66,16 +72,7 @@ jobs:
           fi
       - name: Collect artifacts
         run: |
-          mkdir -p dist
-          for binary in tg_ai_bot_teloxide nedonews_mcp_http chat_db_mcp \
-              migrate provision_mcp_instance_scope generate_mcp_db_manifest validate_instance_config \
-              probe_new_user_audit spam_cascade spam_decision retry_pending_comments reconcile_comment_delivery backfill_rich_messages \
-              backfill_post_history_embeddings backfill_audit_embeddings \
-              backfill_chat_embeddings import_telegram_export probe_ask_route; do
-            cp "target/release/$binary" dist/
-          done
-          cp scripts/install_release_binaries.sh dist/
-          ( cd dist && sha256sum * > SHA256SUMS )
+          bash scripts/release_bundle.sh pack target/release dist
           rustc --version > dist/BUILD_INFO.txt
           git rev-parse HEAD >> dist/BUILD_INFO.txt
       - uses: actions/upload-artifact@v4
@@ -88,6 +85,7 @@ jobs:
     if: ${{ inputs.deploy }}
     needs: build
     runs-on: ubuntu-24.04
+    environment: production
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -95,17 +93,8 @@ jobs:
           path: dist/
       - name: Verify artifact checksums
         run: |
-          ( cd dist && sha256sum -c SHA256SUMS )
-          # Скачанные из artifact файлы теряют exec-бит — возвращаем явно.
-          chmod +x dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
-            dist/migrate dist/provision_mcp_instance_scope dist/generate_mcp_db_manifest dist/validate_instance_config \
-            dist/probe_new_user_audit dist/spam_cascade dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
-            dist/backfill_post_history_embeddings dist/backfill_audit_embeddings \
-            dist/backfill_chat_embeddings \
-            dist/import_telegram_export \
-            dist/probe_ask_route \
-            dist/install_release_binaries.sh
-          test -x dist/tg_ai_bot_teloxide
+          ( cd dist && sha256sum --strict -c SHA256SUMS )
+          bash dist/release_bundle.sh verify dist
       - name: Configure SSH
         env:
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
@@ -122,16 +111,8 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           stage="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" 'mktemp -d')"
-          scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
-            dist/tg_ai_bot_teloxide dist/nedonews_mcp_http dist/chat_db_mcp \
-            dist/migrate dist/provision_mcp_instance_scope dist/generate_mcp_db_manifest dist/validate_instance_config \
-            dist/probe_new_user_audit dist/spam_cascade dist/retry_pending_comments dist/reconcile_comment_delivery dist/backfill_rich_messages \
-            dist/backfill_post_history_embeddings dist/backfill_audit_embeddings \
-            dist/backfill_chat_embeddings \
-            dist/import_telegram_export \
-            dist/probe_ask_route \
-            dist/install_release_binaries.sh \
-            "$VPS_USER@$VPS_HOST:$stage/"
+          scp -pr -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            dist "$VPS_USER@$VPS_HOST:$stage/"
           echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
       - name: Atomic install, restart, verify
         env:
@@ -152,8 +133,7 @@ jobs:
           main_restarts_before=$(systemctl show tg-ai-bot-teloxide -p NRestarts --value)
           pvo_restarts_before=$(systemctl show nedobot-pvo -p NRestarts --value)
           mcp_restarts_before=$(systemctl show nedonews-mcp -p NRestarts --value)
-          bash "$stage_dir/install_release_binaries.sh" "$stage_dir"
-          rm -rf "$stage_dir"
+          bash "$stage_dir/dist/release_bundle.sh" verify "$stage_dir/dist"
           # Preflight uses systemd's EnvironmentFile parser, exactly like each service.
           # Profiles and secrets are operator-owned and are never overwritten by CI.
           for instance in tg-ai-bot-teloxide nedobot-pvo; do
@@ -166,8 +146,10 @@ jobs:
               --property="WorkingDirectory=/opt/$instance" \
               --property="EnvironmentFile=/opt/$instance/.env" \
               --setenv="LLM_PROFILES_PATH=$profile" \
-              "/opt/$instance/target/release/validate_instance_config"
+              "$stage_dir/dist/validate_instance_config"
           done
+          bash "$stage_dir/dist/install_release_binaries.sh" "$stage_dir/dist" --backup
+          rm -rf "$stage_dir"
           systemctl restart tg-ai-bot-teloxide nedobot-pvo
           systemctl is-active tg-ai-bot-teloxide nedobot-pvo
 
