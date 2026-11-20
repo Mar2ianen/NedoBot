@@ -6,7 +6,15 @@ use super::{
 use crate::config_file::DecisionConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub const VERSION: &str = "decision-score-v1";
+pub const VERSION: &str = "decision-score-v2";
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewBasis {
+    #[default]
+    None,
+    Promotion,
+    OfftopicWithContext,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contribution {
     pub version: String,
@@ -14,20 +22,37 @@ pub struct Contribution {
     pub contact_score: i32,
     pub review_candidate: bool,
     pub semantic_probability: f64,
+    #[serde(default)]
+    pub review_basis: ReviewBasis,
 }
 pub fn contribution(
     a: &DecisionAssessment,
     contacts: &ContactFeatures,
     cfg: &DecisionConfig,
 ) -> Contribution {
+    contribution_with_context(a, contacts, cfg, &Value::Null)
+}
+
+pub fn contribution_with_context(
+    a: &DecisionAssessment,
+    contacts: &ContactFeatures,
+    cfg: &DecisionConfig,
+    input: &Value,
+) -> Contribution {
     let probability = |key: &str| match a.answers.get(key) {
         Some(Answer::Noul { noul, .. }) => *noul,
         _ => 0.0,
     };
-    let candidate = a.captcha_verdict() == ShadowVerdict::ReviewCandidate;
+    let promotion = a.captcha_verdict() == ShadowVerdict::ReviewCandidate;
+    let off_topic = a.off_topic_context_candidate(input);
+    let candidate = promotion || off_topic;
     // Conservative rubric composition: marginal probabilities не перемножаем.
-    let semantic = probability("unsolicited_promotion")
-        .max(probability("work_solicitation").min(probability("private_contact_funnel")));
+    let semantic = if off_topic {
+        probability("offtopic_message")
+    } else {
+        probability("unsolicited_promotion")
+            .max(probability("work_solicitation").min(probability("private_contact_funnel")))
+    };
     Contribution {
         version: VERSION.into(),
         decision_score: if candidate {
@@ -42,6 +67,13 @@ pub fn contribution(
         },
         review_candidate: candidate,
         semantic_probability: semantic,
+        review_basis: if promotion {
+            ReviewBasis::Promotion
+        } else if off_topic {
+            ReviewBasis::OfftopicWithContext
+        } else {
+            ReviewBasis::None
+        },
     }
 }
 impl Contribution {
@@ -50,7 +82,12 @@ impl Contribution {
         if self.decision_score == 0 {
             return json!([]);
         }
-        json!([{"class":"decision_content","label":"decision_promotion","score":self.decision_score,
+        let label = match self.review_basis {
+            ReviewBasis::Promotion => "decision_promotion",
+            ReviewBasis::OfftopicWithContext => "decision_offtopic_with_context",
+            ReviewBasis::None => "decision_review",
+        };
+        json!([{"class":"decision_content","label":label,"score":self.decision_score,
             "coefficient":self.decision_score,"version":VERSION,"warning_strength":"strong","auto_ban_eligible":false}])
     }
     pub fn contact_signals(&self) -> Value {
@@ -64,6 +101,24 @@ impl Contribution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn off_topic_alone_has_no_spam_or_captcha_authority() {
+        let mut body: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/decision_response.json"
+        ))
+        .unwrap();
+        body["answers"]["offtopic_message"]["noul"] = json!(0.99);
+        let assessment: DecisionAssessment = serde_json::from_value(body).unwrap();
+        assert!(assessment.validate().is_ok());
+        assert_eq!(assessment.captcha_verdict(), ShadowVerdict::NoSignal);
+        let c = contribution(
+            &assessment,
+            &ContactFeatures::default(),
+            &DecisionConfig::default(),
+        );
+        assert!(!c.review_candidate);
+        assert_eq!(c.decision_score, 0);
+    }
     #[test]
     fn implicit_adult_promotion_can_qualify_for_captcha_review() {
         let mut body: Value = serde_json::from_str(include_str!(

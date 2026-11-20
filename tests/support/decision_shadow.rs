@@ -154,6 +154,8 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
     c.community.instance.id = "decision_fixture".into();
     assert_first_author_text_sampling(pool, &c).await;
     assert_short_bait_profile_gate(pool, &c).await;
+    assert_temporal_id_context_snapshot(pool, &c).await;
+    assert_post_topic_provenance(pool, &c).await;
     // Новые таблицы недоступны настоящей MCP роли и не входят в public views.
     let mut tx = pool.begin().await.unwrap();
     query("set local role nedobot_mcp_ro")
@@ -230,7 +232,7 @@ async fn assert_short_bait_profile_gate(pool: &PgPool, config: &Config) {
             .bind(CHAT).bind(user).bind(if veto=="count" {11_i64} else {2})
             .bind(if veto=="old" {259201.0_f64} else {0.0}).execute(pool).await.unwrap();
         query("insert into telegram_user_profiles (telegram_user_id,first_name,username,is_bot,profile_photo_file_id,profile_photo_file_unique_id) values ($1,$2,'synthetic_private_name',$3,$4,$5)")
-            .bind(user).bind(if name {"Анна"} else {"Тест"}).bind(veto=="bot")
+            .bind(user).bind(if name {"Катюша"} else {"Тест"}).bind(veto=="bot")
             .bind(avatar.then_some("synthetic-file")).bind(avatar.then_some("synthetic-unique"))
             .execute(pool).await.unwrap();
         if veto == "admin" {
@@ -267,7 +269,7 @@ async fn assert_short_bait_profile_gate(pool: &PgPool, config: &Config) {
             assert_eq!(action, "not_requested");
             let serialized = input.to_string();
             for private in [
-                "Анна",
+                "Катюша",
                 "synthetic_private_name",
                 "synthetic-file",
                 "synthetic-unique",
@@ -354,4 +356,125 @@ async fn assert_first_author_text_sampling(pool: &PgPool, config: &Config) {
         calls, 30,
         "enqueue не расходует API-квоту и не выполняет санкции"
     );
+}
+
+/// Числовая вероятность и дата доходят до модели; raw ID/имя остаются локальными.
+async fn assert_temporal_id_context_snapshot(pool: &PgPool, config: &Config) {
+    let user = 1_000_000_000;
+    source(pool, user, 3500).await;
+    query("insert into telegram_user_profiles (telegram_user_id,first_name) values ($1,'Катюша')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut c = config.clone();
+    let key = c.community.moderation.risk_profile.clone();
+    let profile = c.community.risk_profiles.get_mut(&key).unwrap();
+    let today = chrono::Utc::now().date_naive();
+    profile.telegram_id = Some(
+        serde_json::from_value(serde_json::json!({
+        "floor":0.0,"ceil":1.0,"k":2.0,"midpoint_billion":0.9,"version":"synthetic-id"}))
+        .unwrap(),
+    );
+    profile.telegram_id_time=Some(serde_json::from_value(serde_json::json!({
+        "reference_date":today-chrono::Days::new(100),"midpoint_billion_per_day":0.001,"version":"synthetic-time"})).unwrap());
+    observe_message(pool, &c, CHAT, 3500).await.unwrap();
+    let (id,input):(i64,Value)=sqlx::query_as("select id,input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=3500")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert!(
+        (input["profile_signals"]["telegram_id_spam_probability"]
+            .as_f64()
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-12
+    );
+    assert_eq!(
+        input["profile_signals"]["evaluated_on_utc"],
+        today.to_string()
+    );
+    assert_eq!(
+        input["profile_signals"]["feminine_first_name_pattern"],
+        true
+    );
+    assert_eq!(input["profile_signals"]["observed_message_count"], 1);
+    for private in [user.to_string(), "Катюша".into()] {
+        assert!(!input.to_string().contains(&private));
+    }
+    c.community
+        .risk_profiles
+        .get_mut(&key)
+        .unwrap()
+        .telegram_id_time
+        .as_mut()
+        .unwrap()
+        .midpoint_billion_per_day = 0.002;
+    assert!(repo::claim(pool, &c).await.unwrap().is_none());
+    let state: (String, Option<String>) =
+        sqlx::query_as("select status,error_kind from moderation_decision_jobs where id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("stale".into(), Some("obsolete_version".into())));
+}
+
+async fn assert_post_topic_provenance(pool: &PgPool, config: &Config) {
+    let channel = -1_009_913_000;
+    let user = USER + 300;
+    source(pool, user, 4002).await;
+    query("insert into telegram_messages (chat_id,message_id,source_channel_id,is_automatic_forward,text) values ($1,4000,$2,true,'Rust ownership https://example.invalid/private')")
+        .bind(CHAT).bind(channel).execute(pool).await.unwrap();
+    query("insert into telegram_messages (chat_id,message_id,source_channel_id,is_automatic_forward,text) values ($1,4000,$2,true,'PRIVATE_NEIGHBOR')")
+        .bind(CHAT-1).bind(channel).execute(pool).await.unwrap();
+    query("insert into telegram_messages (chat_id,message_id,user_id,reply_to_message_id,text) values ($1,4001,$2,4000,'ORDINARY_PARENT_REPLY')")
+        .bind(CHAT).bind(user+1).execute(pool).await.unwrap();
+    query("update telegram_messages set reply_to_message_id=4001 where chat_id=$1 and message_id=4002")
+        .bind(CHAT).execute(pool).await.unwrap();
+    let mut c = config.clone();
+    c.discussion_chat_id = CHAT;
+    c.source_channel_id = channel;
+    c.community.first_comment.routes.clear();
+    observe_message(pool, &c, CHAT, 4002).await.unwrap();
+    let job:repo::DecisionJob=sqlx::query_as("select * from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        job.input_json["topic_context"]["post_topic"],
+        "Rust ownership [link]"
+    );
+    for forbidden in [
+        "PRIVATE_NEIGHBOR",
+        "ORDINARY_PARENT_REPLY",
+        "example.invalid",
+    ] {
+        assert!(!job.input_json.to_string().contains(forbidden));
+    }
+    assert!(repo::source_is_current(pool, &job).await.unwrap());
+    c.community.moderation.decision.post_topics.push(
+        serde_json::from_value(serde_json::json!({
+        "discussion_chat_id":CHAT,"post_message_id":4000,"topic":"Ручная тема: Rust borrowing"}))
+        .unwrap(),
+    );
+    observe_message(pool, &c, CHAT, 4002).await.unwrap();
+    let overridden:Value=query_scalar("select input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002 order by id desc limit 1")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        overridden["topic_context"]["post_topic"],
+        "Ручная тема: Rust borrowing"
+    );
+    query("update telegram_messages set text='Другая тема' where chat_id=$1 and message_id=4000")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(!repo::source_is_current(pool, &job).await.unwrap());
+    query("delete from telegram_messages where chat_id=$1 and message_id=4000")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    observe_message(pool, &c, CHAT, 4002).await.unwrap();
+    let newest:Value=query_scalar("select input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002 order by id desc limit 1")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert!(newest["topic_context"]["post_topic"].is_null());
 }

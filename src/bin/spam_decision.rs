@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
               'text',m.text,'created_at',m.created_at,'edited_at',m.edited_at,'deleted_by_bot_at',m.deleted_by_bot_at,
               'message_count',u.message_count,'age_seconds',extract(epoch from now()-u.first_seen_at)::bigint,'member_status',u.member_status,
               'risk_score',a.risk_score,'risk_signals',jsonb_build_object('baseline',a.risk_baseline_signals,'first_message',a.risk_first_message_signals,'avatar',a.risk_avatar_signals,'external',a.risk_external_signals),
+              'id_profile_context',jsonb_build_object('model_version',a.telegram_id_model_version,'spam_probability',a.telegram_user_id_spam_probability,'is_recent_id',a.telegram_user_id_is_recent,'feminine_first_name_pattern',a.first_name_feminine_pattern,'baseline_score',a.risk_baseline_score,'decision_score',a.risk_decision_score),
               'audit',(select to_jsonb(j)-'input_json' from new_user_audit_jobs j where j.chat_id=m.chat_id and j.telegram_user_id=m.user_id and j.created_at>=m.created_at order by created_at,id limit 1),
               'captcha',(select jsonb_build_object('status',c.status,'setup_error_kind',c.setup_error_kind,'created_at',c.created_at,'updated_at',c.updated_at) from telegram_risk_captcha_challenges c where c.chat_id=m.chat_id and c.telegram_user_id=m.user_id),
               'observations',(select to_jsonb(o) from moderation_text_observations o where o.instance_id=$3 and o.chat_id=m.chat_id and o.message_id=m.message_id),

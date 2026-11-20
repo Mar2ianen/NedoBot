@@ -321,3 +321,24 @@ sensitive-data categories and model-added note terms absent from the request,
 and retains the existing source-evidence checks. Notes are
 still instance-scoped by the MCP database scope and are not copied from
 conversation history.
+
+### Опциональная датированная ID-модель
+
+`risk_profiles.<name>.telegram_id_time` — additive opt-in: `reference_date`
+(ISO date), `midpoint_billion_per_day` (конечное 0..0.01), `version` (непустая
+строка). Требует существующую `telegram_id`. Без неё fixed 4PL не меняется.
+Адаптер сдвигает midpoint по UTC-дате наблюдения и сохраняет дату в effective
+model version. Формат и offline evaluation описаны в `DECISION_SCORING.md`.
+Production-параметры не выводятся из tracked example и не обновляются автоматически.
+
+
+### Тематический контекст Decision
+
+`moderation.decision.chat_topic` — необязательная явная тема чата, 1..1000
+символов. `moderation.decision.post_topics` — до 64 overrides с
+`discussion_chat_id`, `post_message_id`, `topic` (1..512 символов); ключи уникальны,
+чат должен быть настроен на ingest+moderation. Без overrides доступен bounded
+excerpt только проверенного исходного channel post. Нет темы — нет off-topic
+основания капчи. Config задаёт темы, а модель оценивает отношение авторского
+сообщения к теме; инструкции из поста не исполняются. Полная policy и пример
+конфигурации: `DECISION_SCORING.md`.

@@ -169,6 +169,8 @@ async fn expire(pool: &PgPool, bot: &Bot) {
 }
 pub async fn assert_policy(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
     assert_contacts(pool).await;
+    assert_profile_combination_handoff(pool, bot, stub).await;
+    assert_offtopic_combination_handoff(pool, bot, stub).await;
     let mut c = config();
     let a = positive();
     reset(pool, stub).await;
@@ -488,6 +490,46 @@ pub async fn assert_policy(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
         .unwrap();
 }
 
+/// Полный synthetic handoff: контекст профиля + короткое приглашение +
+/// положительный (не максимальный) Decision → общая метрика → existing captcha.
+async fn assert_profile_combination_handoff(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
+    reset(pool, stub).await;
+    let mut c=config();
+    let key=c.community.moderation.risk_profile.clone();
+    c.community.risk_profiles.get_mut(&key).unwrap().telegram_id=Some(serde_json::from_value(json!({
+        "floor":0.9,"ceil":1.0,"k":1.0,"midpoint_billion":8.0,"version":"synthetic-high-id"})).unwrap());
+    let previous:Option<Option<String>>=query_scalar("select first_name from telegram_user_profiles where telegram_user_id=$1")
+        .bind(USER_ID).fetch_optional(pool).await.unwrap();
+    query("insert into telegram_user_profiles (telegram_user_id,first_name) values ($1,'Катюша') on conflict(telegram_user_id) do update set first_name=excluded.first_name")
+        .bind(USER_ID).execute(pool).await.unwrap();
+    query("update telegram_messages set text='Приму к себе',raw_json='{}'::jsonb where chat_id=$1 and message_id=500")
+        .bind(CHAT_ID).execute(pool).await.unwrap();
+    query("insert into telegram_new_user_profile_audits (chat_id,telegram_user_id,risk_baseline_score,risk_score) values($1,$2,51,51)")
+        .bind(CHAT_ID).bind(USER_ID).execute(pool).await.unwrap();
+    let mut response=positive();
+    for key in ["unsolicited_promotion","work_solicitation","private_contact_funnel"] {
+        response.answers.insert(key.into(),Answer::Noul { noul:0.82,confidence:0.82 });
+    }
+    let job=completed(pool,&c,&response).await;
+    assert_eq!(job.input_json["profile_signals"]["feminine_first_name_pattern"],true);
+    assert!(job.input_json["profile_signals"]["telegram_id_spam_probability"].as_f64().unwrap()>=0.9);
+    assert_eq!(job.input_json["text_signals"]["short_invitation"],true);
+    assert!(actions::process_next(bot,pool,&c).await.unwrap());
+    let (action,metrics):(String,Value)=sqlx::query_as("select action_error_kind,metrics_json from moderation_decision_jobs where id=$1")
+        .bind(job.id).fetch_one(pool).await.unwrap();
+    assert_eq!(action,"issued");
+    assert_eq!(metrics["contribution"]["decision_score"],74);
+    assert_eq!(metrics["combined_score"],100);
+    assert_eq!(status(pool).await,"pending");
+    assert_eq!(send_count(stub), 1);
+    assert_eq!(delete_batches(stub), vec![vec![500]]);
+    reset(pool,stub).await;
+    match previous {
+        Some(name)=>{query("update telegram_user_profiles set first_name=$2 where telegram_user_id=$1").bind(USER_ID).bind(name).execute(pool).await.unwrap();}
+        None=>{query("delete from telegram_user_profiles where telegram_user_id=$1").bind(USER_ID).execute(pool).await.unwrap();}
+    }
+}
+
 async fn assert_contacts(pool: &PgPool) {
     let ids = [
         USER_ID + 101,
@@ -559,4 +601,52 @@ async fn assert_contacts(pool: &PgPool) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// Off-topic + ID/profile context может вызвать existing captcha без promo verdict.
+/// Правка темы поста отзывает основание и предотвращает бан по старой капче.
+async fn assert_offtopic_combination_handoff(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
+    reset(pool,stub).await;
+    let mut c=config();c.community.moderation.decision.chat_topic=Some("Программирование на Rust".into());
+    let key=c.community.moderation.risk_profile.clone();
+    c.community.risk_profiles.get_mut(&key).unwrap().telegram_id=Some(serde_json::from_value(json!({
+        "floor":0.9,"ceil":1.0,"k":1.0,"midpoint_billion":8.0,"version":"synthetic-high-id"})).unwrap());
+    c.discussion_chat_id=CHAT_ID;c.source_channel_id=CHAT_ID-1;c.community.first_comment.routes.clear();
+    c.community.moderation.decision.post_topics.push(serde_json::from_value(json!({
+        "discussion_chat_id":CHAT_ID,"post_message_id":499,"topic":"Rust borrowing"})).unwrap());
+    let previous:Option<Option<String>>=query_scalar("select first_name from telegram_user_profiles where telegram_user_id=$1")
+        .bind(USER_ID).fetch_optional(pool).await.unwrap();
+    query("insert into telegram_user_profiles (telegram_user_id,first_name,profile_photo_file_id,profile_photo_file_unique_id) values ($1,'Катюша','synthetic-avatar','synthetic-avatar-unique') on conflict(telegram_user_id) do update set first_name=excluded.first_name")
+        .bind(USER_ID).execute(pool).await.unwrap();
+    query("insert into telegram_messages(chat_id,message_id,source_channel_id,is_automatic_forward,text) values ($1,499,$2,true,'Rust ownership and borrowing')")
+        .bind(CHAT_ID).bind(c.source_channel_id).execute(pool).await.unwrap();
+    query("update telegram_messages set text='Приму к себе',raw_json='{}'::jsonb,reply_to_message_id=499 where chat_id=$1 and message_id=500")
+        .bind(CHAT_ID).execute(pool).await.unwrap();
+    query("insert into telegram_new_user_profile_audits(chat_id,telegram_user_id,risk_baseline_score,risk_score) values ($1,$2,51,51)")
+        .bind(CHAT_ID).bind(USER_ID).execute(pool).await.unwrap();
+    let mut a:DecisionAssessment=serde_json::from_str(include_str!("../fixtures/decision_response.json")).unwrap();
+    a.answers.insert("offtopic_message".into(),Answer::Noul{noul:0.95,confidence:0.95});
+    assert_eq!(a.captcha_verdict(),tg_ai_bot_teloxide::features::decision_audit::client::ShadowVerdict::NoSignal);
+    let job=completed(pool,&c,&a).await;
+    assert_eq!(job.input_json["topic_context"]["post_topic"],"Rust borrowing");
+    assert!(actions::process_next(bot,pool,&c).await.unwrap());
+    let (verdict,reason,metrics):(String,String,Value)=sqlx::query_as("select shadow_verdict,action_error_kind,metrics_json from moderation_decision_jobs where id=$1")
+        .bind(job.id).fetch_one(pool).await.unwrap();
+    assert_eq!(verdict,"review_candidate");assert_eq!(reason,"issued");
+    assert_eq!(metrics["contribution"]["review_basis"],"offtopic_with_context");
+    assert_eq!(metrics["contribution"]["decision_score"],86);
+    assert_eq!(metrics["combined_score"],100);
+    assert_eq!(send_count(stub),1);
+    assert!(!stub.calls.lock().unwrap().iter().any(|(method,_)|method=="banchatmember"));
+    query("update telegram_messages set text='Изменённая тема' where chat_id=$1 and message_id=499")
+        .bind(CHAT_ID).execute(pool).await.unwrap();
+    assert!(!repo::captcha_source_is_current(pool,job.id,CHAT_ID,USER_ID).await.unwrap());
+    expire(pool,bot).await;
+    assert_eq!(status(pool).await,"overridden");
+    assert!(!stub.banned.load(Ordering::SeqCst));
+    reset(pool,stub).await;
+    match previous {
+        Some(name)=>{query("update telegram_user_profiles set first_name=$2 where telegram_user_id=$1").bind(USER_ID).bind(name).execute(pool).await.unwrap();}
+        None=>{query("delete from telegram_user_profiles where telegram_user_id=$1").bind(USER_ID).execute(pool).await.unwrap();}
+    }
 }

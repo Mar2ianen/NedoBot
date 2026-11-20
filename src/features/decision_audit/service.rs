@@ -10,6 +10,9 @@ use crate::{
             policy::EXTERNAL_ANALYSIS_POLL,
             worker::{PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_poll_worker},
         },
+        new_user_analysis::profile_context::{
+            PROFILE_CONTEXT_VERSION, looks_like_feminine_first_name, telegram_id_model_for_date,
+        },
         new_user_audit::{deterministic, local_cascade::hash_bytes, structure},
         user_profiles::avatar::cache_profile_avatar,
     },
@@ -20,7 +23,7 @@ use sqlx::{FromRow, PgPool};
 use teloxide::Bot;
 use teloxide_antispam::{
     preprocess::{PREPROCESSING_VERSION, prepare_text},
-    signals::looks_like_feminine_first_name,
+    signals::telegram_id_spam_probability,
 };
 
 #[derive(FromRow)]
@@ -28,6 +31,7 @@ struct Source {
     user_id: i64,
     text: String,
     edited_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
     message_count: i64,
     text_ordinal: i64,
     entities: serde_json::Value,
@@ -51,13 +55,26 @@ fn short_adult_contact_bait(text: &str) -> bool {
     let prepared = prepare_text(&bounded);
     let normalized = prepared
         .canonical
-        .trim_matches(|c: char| !c.is_alphanumeric());
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     if normalized.chars().count() > 80 {
         return false;
     }
     matches!(
-        normalized,
-        "приму" | "приму к себе" | "есть время сегодня" | "свободна сегодня" | "жду в гости"
+        normalized.as_str(),
+        "приму"
+            | "приму к себе"
+            | "приму мужчину"
+            | "есть время сегодня"
+            | "свободна сегодня"
+            | "жду в гости"
+            | "встречусь"
+            | "встречусь свободна"
+            | "свободна для встреч"
+            | "свободна для встреч есть выезд"
+            | "свободна сейчас встречусь пиши"
     ) || normalized == "кто в гости"
         || normalized.ends_with(" кто в гости")
 }
@@ -89,7 +106,7 @@ pub async fn observe_message(
         return Ok(());
     }
     let source: Option<Source> = sqlx::query_as(r#"
-        select m.user_id,coalesce(m.text,'') as text,m.edited_at,u.message_count,
+        select m.user_id,coalesce(m.text,'') as text,m.edited_at,m.created_at,u.message_count,
           (select count(*)+1 from (select 1 from telegram_messages earlier
             where earlier.chat_id=m.chat_id and earlier.user_id=m.user_id
               and earlier.message_id<m.message_id and earlier.source_channel_id is null
@@ -184,9 +201,22 @@ pub async fn observe_message(
         return Ok(());
     }
     let settings = &config.community.moderation.decision;
+    let post_topic = super::topics::load_post_topic(pool, config, chat_id, message_id).await?;
+    let id_model = config
+        .moderation_risk_profile()
+        .and_then(|profile| telegram_id_model_for_date(profile, source.created_at.date_naive()));
+    let id_probability = id_model
+        .as_ref()
+        .map(|model| telegram_id_spam_probability(source.user_id, model));
     let input = json!({"author_message":crate::features::new_user_analysis::bounded_audit_text_with_limit(Some(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()), settings.max_input_chars),
         "chat_policy":settings.chat_policy,"structural_features":features,"external_contacts":contacts,
-        "profile_signals":{"feminine_first_name_pattern":feminine_name_pattern,"avatar_observable":avatar_observable},
+        "profile_signals":{"version":PROFILE_CONTEXT_VERSION,
+            "feminine_first_name_pattern":feminine_name_pattern,"avatar_observable":avatar_observable,
+            "telegram_id_spam_probability":id_probability,"telegram_id_model_version":id_model.as_ref().map(|model|&model.version),
+            "evaluated_on_utc":source.created_at.date_naive(),"observed_message_count":source.message_count},
+        "text_signals":{"short_invitation":short_adult_contact_bait(&source.text)},
+        "topic_context":{"chat_topic":settings.chat_topic,"post_topic":post_topic.as_ref().map(|(text,_)|text)},
+        "_post_context":post_topic.as_ref().map(|(_,snapshot)|snapshot),
         "score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
         "configuration_hash":configuration_hash(config)});
     let (avatar_file_id, avatar_unique_id) = match (
@@ -265,6 +295,10 @@ pub async fn observe_latest_author_message(
 pub fn configuration_hash(config: &Config) -> String {
     let moderation = &config.community.moderation;
     hash_bytes(&serde_json::to_vec(&json!({"decision":moderation.decision,
+        "profile_context_version":PROFILE_CONTEXT_VERSION,
+        "topic_sources":{"primary_chat":config.discussion_chat_id,"primary_channel":config.source_channel_id,
+            "routes":config.community.first_comment.routes.iter().map(|r|(r.source_channel_id,&r.discussion_chat)).collect::<Vec<_>>()},
+        "id_risk_profile":config.moderation_risk_profile().map(|p|json!({"version":p.version,"telegram_id":p.telegram_id.as_ref().map(|m|json!({"floor":m.floor,"ceil":m.ceil,"k":m.k,"midpoint_billion":m.midpoint_billion,"version":m.version})),"telegram_id_time":p.telegram_id_time})),
         "captcha_enabled":moderation.captcha_enabled,"captcha_dry_run":moderation.captcha_dry_run,
         "captcha_threshold":moderation.captcha_threshold,"captcha_ttl_sec":moderation.captcha_ttl_sec}))
         .expect("validated serializable decision configuration"))
@@ -366,6 +400,9 @@ mod short_bait_tests {
             "Котики, мне скучно, кто в гости?",
             "\u{200b}Котики, мне скучно, кто в гости? 😘",
             "Есть время сегодня 💖",
+            "Приму мужчину ❤️",
+            "Встречусь,свободна ❤️🥰",
+            "Свободна для встреч\nЕсть выезд ❤️",
         ] {
             assert!(short_adult_contact_bait(sample), "{sample}");
         }
@@ -389,6 +426,8 @@ mod short_bait_tests {
             "Приём ведётся по записи",
             "Приму PR после тестов",
             "Есть время сегодня посмотреть логи?",
+            "Встречусь с командой после работы",
+            "Свободна для встреч с партнёрами по проекту",
             "Кто в гости к нам приехал на фестиваль? Тут будет длинное обсуждение, а не краткое приглашение.",
         ] {
             assert!(!short_adult_contact_bait(sample), "{sample}");

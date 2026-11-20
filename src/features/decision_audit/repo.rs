@@ -286,12 +286,13 @@ pub(crate) async fn current_in_tx(
         .bind(crate::features::new_user_audit::diagnostics::newcomer_limits().0)
         .bind(crate::features::new_user_audit::diagnostics::newcomer_limits().1 as f64)
         .fetch_optional(&mut **tx).await?;
-    Ok(current.is_some_and(|(text, edit, label, normal)| {
+    let current = current.is_some_and(|(text, edit, label, normal)| {
         hash_bytes(text.as_bytes()) == job.source_hash
             && edit == job.source_edited_at
             && label == job.label_event_id
             && !normal
-    }))
+    });
+    Ok(current && super::topics::snapshot_is_current(tx, job.chat_id, &job.input_json).await?)
 }
 
 /// CAS и повторная проверка источника/ручной метки; action outbox только в score_captcha.
@@ -312,7 +313,7 @@ pub async fn complete(
     }
     let current = current_in_tx(&mut tx, job).await?;
     let verdict = serde_json::to_value(if job.input_json["score_captcha"] == true {
-        assessment.captcha_verdict()
+        assessment.captcha_verdict_for_input(&job.input_json)
     } else {
         assessment.verdict()
     })?;
@@ -359,6 +360,7 @@ struct CaptchaSource {
     current_text: String,
     current_edit: Option<DateTime<Utc>>,
     normal_veto: bool,
+    input_json: Value,
 }
 /// После доставки challenge рост счётчика сообщений не отменяет проверку.
 /// Edit/delete/normal/admin/bot отзывают её; положительная ручная метка — нет.
@@ -391,7 +393,7 @@ async fn captcha_source_is_current_on(
     user: i64,
 ) -> anyhow::Result<bool> {
     let row:Option<CaptchaSource>=sqlx::query_as(r#"
-        select j.source_hash,j.source_edited_at,coalesce(m.text,'') as current_text,m.edited_at as current_edit,coalesce(l.label='not_spam',false) as normal_veto
+        select j.source_hash,j.source_edited_at,coalesce(m.text,'') as current_text,m.edited_at as current_edit,coalesce(l.label='not_spam',false) as normal_veto,j.input_json
         from moderation_decision_jobs j join telegram_messages m on m.chat_id=j.chat_id and m.message_id=j.message_id and m.user_id=j.user_id
         left join lateral(select label from spam_label_events where chat_id=j.chat_id and telegram_user_id=j.user_id order by created_at desc,id desc limit 1)l on true
         where j.id=$1 and j.chat_id=$2 and j.user_id=$3 and j.status='succeeded' and j.shadow_verdict='review_candidate' and j.input_json->'score_captcha'='true'::jsonb
@@ -400,11 +402,13 @@ async fn captcha_source_is_current_on(
         and not exists(select 1 from telegram_chat_member_snapshots s where s.chat_id=j.chat_id and s.telegram_user_id=j.user_id and s.is_admin)
         and not exists(select 1 from telegram_user_profiles p where p.telegram_user_id=j.user_id and p.is_bot)"#)
         .bind(id).bind(chat).bind(user).fetch_optional(&mut *connection).await?;
-    Ok(row.is_some_and(|r| {
-        !r.normal_veto
-            && r.source_edited_at == r.current_edit
-            && hash_bytes(r.current_text.as_bytes()) == r.source_hash
-    }))
+    let Some(r) = row else {
+        return Ok(false);
+    };
+    let current = !r.normal_veto
+        && r.source_edited_at == r.current_edit
+        && hash_bytes(r.current_text.as_bytes()) == r.source_hash;
+    Ok(current && super::topics::snapshot_is_current(connection, chat, &r.input_json).await?)
 }
 
 #[cfg(test)]
