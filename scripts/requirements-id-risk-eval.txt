@@ -1,0 +1,3 @@
+# Только offline-аналитика; не runtime dependencies бота.
+numpy==2.5.5
+scipy==1.18.1

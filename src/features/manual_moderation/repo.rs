@@ -365,6 +365,10 @@ async fn create_batch_inner(
     command: &str,
     request_json: &Value,
 ) -> anyhow::Result<BatchCreation> {
+    let mut tx = pool.begin().await?;
+    super::sender_chat::lock_command(&mut tx, chat_id, source_message_id).await?;
+    let channel_command:bool=sqlx::query_scalar("select exists(select 1 from manual_sender_chat_operations where chat_id=$1 and command_message_id=$2)").bind(chat_id).bind(source_message_id).fetch_one(&mut *tx).await?;
+    anyhow::ensure!(!channel_command, "command already registered for a channel");
     let inserted: Option<(i64,)> = sqlx::query_as(
         r#"insert into manual_moderation_batches
                (chat_id, actor_user_id, source_message_id, command, request_json, status)
@@ -377,7 +381,7 @@ async fn create_batch_inner(
     .bind(source_message_id)
     .bind(command)
     .bind(request_json)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let batch = if let Some((id,)) = inserted {
         sqlx::query_as::<_, BatchRow>(
@@ -385,17 +389,18 @@ async fn create_batch_inner(
                from manual_moderation_batches where id = $1"#,
         )
         .bind(id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?
         .into_creation()?
     } else {
-        find_batch(pool, chat_id, source_message_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("idempotent moderation batch disappeared"))?
+        sqlx::query_as::<_,BatchRow>("select id,actor_user_id,command,status,request_json,result_text from manual_moderation_batches where chat_id=$1 and source_message_id=$2")
+            .bind(chat_id).bind(source_message_id).fetch_one(&mut *tx).await?.into_creation()?
     };
     if batch.actor_user_id != actor_user_id {
         anyhow::bail!("эта команда уже зарегистрирована от другого администратора");
     }
+    anyhow::ensure!(batch.command == command, "command type changed");
+    tx.commit().await?;
     Ok(batch)
 }
 

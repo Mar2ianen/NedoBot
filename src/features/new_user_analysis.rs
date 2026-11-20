@@ -25,16 +25,17 @@ use crate::{
 };
 use teloxide_antispam::signals::{
     NewUserAnalysisConfig, NewUserFeatures, RiskAnalysis, SpamClass, TextTexture, analyze_risk,
-    char_count_i32, has_profile_photo, id_bucket, looks_like_feminine_first_name,
-    max_pairwise_message_similarity, message_style, message_style_persona,
-    only_channel_post_comments, only_replies_or_comments, personal_channel_has_external_link,
-    personal_channel_has_invite_link, telegram_id_risk_coefficient, telegram_id_spam_probability,
-    username_stats,
+    char_count_i32, has_profile_photo, id_bucket, max_pairwise_message_similarity, message_style,
+    message_style_persona, only_channel_post_comments, only_replies_or_comments,
+    personal_channel_has_external_link, personal_channel_has_invite_link,
+    telegram_id_risk_coefficient, telegram_id_spam_probability, username_stats,
 };
 mod audit_fingerprint;
 mod audit_materializer;
 mod audit_planner;
 mod audit_snapshot;
+pub(crate) mod profile_context;
+use profile_context::looks_like_feminine_first_name;
 
 use audit_fingerprint::{
     FingerprintCalculator, has_long_first_comment, load_latest_link_evidence,
@@ -140,7 +141,11 @@ async fn enqueue_new_user_audit_for_profile_refresh_locked(
     let membership_context = snapshot.membership_context;
     let analysis_config = analysis_config_from_runtime(runtime_config);
     let is_old_active_user = features.message_count >= analysis_config.old_user_message_threshold;
-    let risk = analyze_risk(&features, &analysis_config, is_old_active_user);
+    let risk = analyze_risk(
+        &profile_context::features_for_baseline(&features),
+        &analysis_config,
+        is_old_active_user,
+    );
     let previous_avatar_file_unique_id: Option<String> = sqlx::query_scalar(
         "select profile_photo_file_unique_id from telegram_new_user_profile_audits where chat_id = $1 and telegram_user_id = $2",
     )

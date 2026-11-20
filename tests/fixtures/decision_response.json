@@ -1,5 +1,10 @@
 {
   "answers": {
+    "offtopic_message": {
+      "type": "noul",
+      "noul": 0.01,
+      "confidence": 0.99
+    },
     "unsolicited_promotion": {
       "type": "noul",
       "noul": 0.01,

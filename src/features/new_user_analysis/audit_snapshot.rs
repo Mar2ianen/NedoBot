@@ -14,6 +14,9 @@ impl SnapshotLoader {
         telegram_user_id: i64,
         instance_id: &str,
     ) -> anyhow::Result<Option<LoadedAnalysisSnapshot>> {
+        if crate::telegram::identity::is_channel_sender_proxy(telegram_user_id) {
+            return Ok(None);
+        }
         let row = sqlx::query(
         r#"
         with user_messages as (
