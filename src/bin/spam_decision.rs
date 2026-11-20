@@ -143,7 +143,16 @@ async fn main() -> anyhow::Result<()> {
                 };
                 json!({"instance":config.community.instance.id,"message_id":message,"stage":stage,
                     "historical_gate_note":"Текущее состояние не доказывает историческую причину policy gate; сверять журнал по job ID. Отсутствие санкции не доказывает ошибку классификации.",
-                    "current_policy":{"enforce":config.community.moderation.enforce_enabled,"review_delivery":config.community.moderation.review_delivery_enabled,"captcha":config.community.moderation.captcha_enabled},"local_trace":local,"persisted":row})
+                    "current_policy":{"enforce":config.community.moderation.enforce_enabled,"review_delivery":config.community.moderation.review_delivery_enabled,"captcha":config.community.moderation.captcha_enabled,
+                        "captcha_dry_run":config.community.moderation.captcha_dry_run,"captcha_threshold":config.community.moderation.captcha_threshold},
+                    "decision_policy":{"enabled":config.community.moderation.decision.enabled,
+                        "external_processing_allowed":config.community.moderation.decision.external_processing_allowed,
+                        "eligible_for_chat":tg_ai_bot_teloxide::features::decision_audit::repo::enabled_for_chat(&config,chat),
+                        "mode":config.community.moderation.decision.mode,
+                        "avatar_enabled":config.community.moderation.decision.avatar_enabled,
+                        "initial_texts":config.community.moderation.decision.initial_texts,
+                        "max_pending_jobs":config.community.moderation.decision.max_pending_jobs},
+                    "local_trace":local,"persisted":row})
             } else {
                 json!({"stage":MissedStage::NotIngested,"message_id":message})
             };
