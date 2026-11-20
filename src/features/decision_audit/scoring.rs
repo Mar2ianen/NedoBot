@@ -65,6 +65,35 @@ impl Contribution {
 mod tests {
     use super::*;
     #[test]
+    fn implicit_adult_promotion_can_qualify_for_captcha_review() {
+        let mut body: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/decision_response.json"
+        ))
+        .unwrap();
+        body["answers"]["unsolicited_promotion"]["noul"] = json!(0.96);
+        body["answers"]["contextual_relevance"]["score"] = json!(0.0);
+        body["answers"]["contextual_relevance"]["probabilities"] =
+            json!({"0": 1.0, "1": 0.0, "2": 0.0});
+        body["answers"]["spam_campaign_type"]["choice"] = json!("adult_promotion");
+        body["answers"]["spam_campaign_type"]["probabilities"] = json!({
+            "adult_promotion": 0.97, "none": 0.03, "work_dm_bait": 0.0,
+            "financial_promotion": 0.0, "other_promotion": 0.0
+        });
+        let decision: DecisionAssessment = serde_json::from_value(body.clone()).unwrap();
+        assert!(decision.validate().is_ok());
+        assert_eq!(decision.captcha_verdict(), ShadowVerdict::ReviewCandidate);
+        let c = contribution(&decision, &ContactFeatures::default(), &DecisionConfig::default());
+        assert!(c.review_candidate);
+        assert!(c.decision_score >= 80);
+
+        // То же изображение/имя без рекламного поведения не разрешает капчу.
+        body["answers"]["unsolicited_promotion"]["noul"] = json!(0.1);
+        let normal: DecisionAssessment = serde_json::from_value(body).unwrap();
+        assert!(normal.validate().is_ok());
+        assert_eq!(normal.captcha_verdict(), ShadowVerdict::NoSignal);
+    }
+
+    #[test]
     fn contact_alone_and_quotes_do_not_authorize_captcha() {
         let mut a: DecisionAssessment = serde_json::from_str(include_str!(
             "../../../tests/fixtures/decision_response.json"
