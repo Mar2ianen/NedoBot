@@ -231,6 +231,8 @@ pub async fn claim(pool: &PgPool, config: &Config) -> anyhow::Result<Option<Deci
     .fetch_optional(&mut *tx)
     .await?;
     let Some(mut job) = job else {
+        // Даже без подходящего claim сохраняем инвалидирование старых snapshots.
+        tx.commit().await?;
         return Ok(None);
     };
     if job.attempts >= MAX_ATTEMPTS || !current_in_tx(&mut tx, &job).await? {
