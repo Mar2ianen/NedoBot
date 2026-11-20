@@ -48,9 +48,8 @@ fn short_adult_contact_bait(text: &str) -> bool {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    let normalized = normalized.trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '.' | '!' | '?' | ',' | '…')
-    });
+    let normalized = normalized
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '!' | '?' | ',' | '…'));
     if normalized.chars().count() > 80 {
         return false;
     }
@@ -61,7 +60,11 @@ fn short_adult_contact_bait(text: &str) -> bool {
         || normalized.ends_with(" кто в гости")
 }
 
-fn short_bait_for_decision(text: &str, feminine_name_pattern: bool, avatar_observable: bool) -> bool {
+fn short_bait_for_decision(
+    text: &str,
+    feminine_name_pattern: bool,
+    avatar_observable: bool,
+) -> bool {
     (feminine_name_pattern || avatar_observable) && short_adult_contact_bait(text)
 }
 
@@ -347,7 +350,6 @@ pub async fn process_next(
     Ok(true)
 }
 
-
 #[cfg(test)]
 mod short_bait_tests {
     use super::{short_adult_contact_bait, short_bait_for_decision};
@@ -369,7 +371,11 @@ mod short_bait_tests {
         assert!(!short_bait_for_decision("Приму", false, false));
         assert!(short_bait_for_decision("Приму", true, false));
         assert!(short_bait_for_decision("Приму", false, true));
-        assert!(!short_bait_for_decision("Приму PR после тестов", true, true));
+        assert!(!short_bait_for_decision(
+            "Приму PR после тестов",
+            true,
+            true
+        ));
     }
 
     #[test]
