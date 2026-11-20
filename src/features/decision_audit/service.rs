@@ -43,13 +43,15 @@ struct Source {
 /// Короткие завуалированные приглашения не доказывают спам.
 /// Это лишь повод запросить Decision с доступными сигналами профиля.
 fn short_adult_contact_bait(text: &str) -> bool {
-    let normalized = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    let normalized = normalized
-        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '!' | '?' | ',' | '…'));
+    // Общий versioned Unicode view. Не обрезаем длинный текст до bait-префикса.
+    let bounded: String = text.chars().take(structure::MAX_INPUT_CHARS + 1).collect();
+    if bounded.chars().count() > structure::MAX_INPUT_CHARS {
+        return false;
+    }
+    let prepared = prepare_text(&bounded);
+    let normalized = prepared
+        .canonical
+        .trim_matches(|c: char| !c.is_alphanumeric());
     if normalized.chars().count() > 80 {
         return false;
     }
@@ -359,8 +361,11 @@ mod short_bait_tests {
         for sample in [
             "Приму",
             "Приму к себе!!!",
+            "Пpиму\u{200b} к себе!!!",
             "Есть время сегодня?",
             "Котики, мне скучно, кто в гости?",
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            "Есть время сегодня 💖",
         ] {
             assert!(short_adult_contact_bait(sample), "{sample}");
         }
@@ -388,5 +393,9 @@ mod short_bait_tests {
         ] {
             assert!(!short_adult_contact_bait(sample), "{sample}");
         }
+        assert!(!short_adult_contact_bait(&format!(
+            "Приму{}",
+            " ".repeat(20_000)
+        )));
     }
 }

@@ -88,9 +88,10 @@ mod tests {
             &DecisionConfig::default(),
         );
         assert!(c.review_candidate);
-        assert!(c.decision_score >= 80);
+        assert_eq!(c.decision_score, 86);
 
-        // То же изображение/имя без рекламного поведения не разрешает капчу.
+        // Синтетический ответ с низкой вероятностью рекламы: это тест scoring,
+        // не проверка распознавания текста/изображения внешней моделью.
         body["answers"]["unsolicited_promotion"]["noul"] = json!(0.1);
         let normal: DecisionAssessment = serde_json::from_value(body).unwrap();
         assert!(normal.validate().is_ok());
