@@ -18,7 +18,10 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::{FromRow, PgPool};
 use teloxide::Bot;
-use teloxide_antispam::preprocess::{PREPROCESSING_VERSION, prepare_text};
+use teloxide_antispam::{
+    preprocess::{PREPROCESSING_VERSION, prepare_text},
+    signals::looks_like_feminine_first_name,
+};
 
 #[derive(FromRow)]
 struct Source {
@@ -32,8 +35,30 @@ struct Source {
     label_id: i64,
     normal_veto: bool,
     trusted: bool,
+    first_name: Option<String>,
     avatar_file_id: Option<String>,
     avatar_unique_id: Option<String>,
+}
+
+/// Короткие завуалированные приглашения не доказывают спам.
+/// Это лишь повод запросить Decision с доступными сигналами профиля.
+fn short_adult_contact_bait(text: &str) -> bool {
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let normalized = normalized.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '.' | '!' | '?' | ',' | '…')
+    });
+    if normalized.chars().count() > 80 {
+        return false;
+    }
+    matches!(
+        normalized,
+        "приму" | "приму к себе" | "есть время сегодня" | "свободна сегодня" | "жду в гости"
+    ) || normalized == "кто в гости"
+        || normalized.ends_with(" кто в гости")
 }
 
 /// SQL-only дешёвая стадия после ingest; не ждёт profile API, LLM или embedding.
@@ -65,6 +90,7 @@ pub async fn observe_message(
           extract(epoch from (now()-u.first_seen_at))::bigint as age_seconds,
           coalesce(l.id,0) as label_id,coalesce(l.label='not_spam',false) as normal_veto,
           (coalesce(p.is_bot,false) or coalesce(s.is_admin,false)) as trusted,
+          p.first_name,
           p.profile_photo_file_id as avatar_file_id,p.profile_photo_file_unique_id as avatar_unique_id
         from telegram_messages m join telegram_chat_users u on u.chat_id=m.chat_id and u.telegram_user_id=m.user_id
         left join telegram_user_profiles p on p.telegram_user_id=m.user_id
@@ -101,7 +127,16 @@ pub async fn observe_message(
     } else {
         Default::default()
     };
-    let local_candidate = campaign.is_some();
+    // Местный hint не является диагнозом или санкцией: он только возвращает
+    // в очередь Decision короткий текст ПОСЛЕ первых initial_texts сообщений.
+    // ФИО и username не отправляем внешней модели; передаём только boolean.
+    let feminine_name_pattern = looks_like_feminine_first_name(source.first_name.as_deref());
+    let avatar_observable = config.community.moderation.decision.avatar_enabled
+        && source.avatar_file_id.is_some()
+        && source.avatar_unique_id.is_some();
+    let short_bait_candidate = short_adult_contact_bait(&source.text)
+        && (feminine_name_pattern || avatar_observable);
+    let local_candidate = campaign.is_some() || short_bait_candidate;
     let reason = if source.normal_veto {
         "manual_not_spam"
     } else if source.trusted {
@@ -123,7 +158,8 @@ pub async fn observe_message(
     let features = structure::extract(&source.text);
     let source_hash = hash_bytes(source.text.as_bytes());
     let observation = json!({"structure":features,"normalization":prepare_text(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()).flags,
-        "external_contacts":contacts,"normalization_version":PREPROCESSING_VERSION,"rule":campaign.as_ref().map(|c|&c.rule),"rule_version":deterministic::RULE_VERSION});
+        "external_contacts":contacts,"normalization_version":PREPROCESSING_VERSION,"rule":campaign.as_ref().map(|c|&c.rule),"rule_version":deterministic::RULE_VERSION,
+        "short_bait_candidate":short_bait_candidate});
     sqlx::query("insert into moderation_text_observations (instance_id,chat_id,message_id,user_id,source_hash,eligible,reason,local_candidate,features) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (instance_id,chat_id,message_id) do update set source_hash=excluded.source_hash,eligible=excluded.eligible,reason=excluded.reason,local_candidate=excluded.local_candidate,features=excluded.features,observed_at=now()")
         .bind(&config.community.instance.id).bind(chat_id).bind(message_id).bind(source.user_id).bind(&source_hash)
         .bind(eligible).bind(reason).bind(local_candidate).bind(&observation).execute(pool).await?;
@@ -140,7 +176,9 @@ pub async fn observe_message(
     }
     let settings = &config.community.moderation.decision;
     let input = json!({"author_message":crate::features::new_user_analysis::bounded_audit_text_with_limit(Some(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()), settings.max_input_chars),
-        "chat_policy":settings.chat_policy,"structural_features":features,"external_contacts":contacts,"score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
+        "chat_policy":settings.chat_policy,"structural_features":features,"external_contacts":contacts,
+        "profile_signals":{"feminine_first_name_pattern":feminine_name_pattern,"avatar_observable":avatar_observable},
+        "score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
         "configuration_hash":configuration_hash(config)});
     let (avatar_file_id, avatar_unique_id) = match (
         settings.avatar_enabled,
@@ -303,4 +341,34 @@ pub async fn process_next(
         }
     }
     Ok(true)
+}
+
+
+#[cfg(test)]
+mod short_bait_tests {
+    use super::short_adult_contact_bait;
+
+    #[test]
+    fn short_invitations_reach_decision_candidate_gate() {
+        for sample in [
+            "Приму",
+            "Приму к себе!!!",
+            "Есть время сегодня?",
+            "Котики, мне скучно, кто в гости?",
+        ] {
+            assert!(short_adult_contact_bait(sample), "{sample}");
+        }
+    }
+
+    #[test]
+    fn unrelated_mentions_do_not_match_short_invitation() {
+        for sample in [
+            "Приём ведётся по записи",
+            "Приму PR после тестов",
+            "Есть время сегодня посмотреть логи?",
+            "Кто в гости к нам приехал на фестиваль? Тут будет длинное обсуждение, а не краткое приглашение.",
+        ] {
+            assert!(!short_adult_contact_bait(sample), "{sample}");
+        }
+    }
 }
