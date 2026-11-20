@@ -137,3 +137,36 @@ runtime: старый production binary без новых embedded migrations н
 Нельзя заключать, что production recall=100% или что API ack означает прочтение
 капчи пользователем. Полные тексты, ID и ответы сохранены только в private
 диагностических файлах; в репозитории их нет.
+
+## Проверка short-bait изменений до выкладки
+
+`spam_decision trace` выводит `stage` по последней persisted Decision job
+(максимальный ID); её ID — `decision_job_id`. Старый profile audit остаётся в
+`legacy_audit_stage`. `not_enqueued` означает отсутствие сохранённой job:
+причину можно уточнить только по observations/журналу, а не по текущему возрасту
+пользователя. `failed`, `stale`, `abstain`, `no_signal`, `below_threshold`,
+`action_pending`, `policy`, `delivery` и `issued` — разные результаты.
+Все snapshots остаются в `persisted.decisions`; итог последнего snapshot не
+отменяет факт выдачи капчи предыдущим. `unknown` требует ручной проверки,
+новые persisted состояния не интерпретируются как отрицательный verdict.
+
+Текущие настройки и `configuration_hash` показываются отдельно от исторических
+jobs. Trace включает часовой бюджет, backlog limit, веса и допустимый возраст
+сообщения для капчи. Совпадение текущего hash с job не восстанавливает состояние
+участника и внешних сервисов в прошлом.
+
+Hint нормализует bounded Unicode view и допускает завершающие эмодзи, но
+не подменяет author_message и не выполняет действий. Если `initial_texts`
+уже покрывает все тексты в newcomer window, hint не расширяет enqueue:
+улучшение критериев модели нужно оценивать отдельно. Синтетический положительный
+ответ в unit test проверяет scoring, а не способность внешней модели распознать
+неоднозначное приглашение или фотографию.
+
+| Инвариант | Контрпример / oracle | Проверка |
+|---|---|---|
+| Короткий второй текст может быть queued при `initial_texts=1` | `Приму` + локальная форма имени; ожидается одна job с правильными message/user IDs | PG `decision_shadow::assert_short_bait_profile_gate`, duplicate replay |
+| Имя/аватар отдельно не создают дополнительный запрос | Обычная беседа или технический `Приму PR после тестов` | PG отрицательные контроли |
+| Avatar opt-in и veto сохраняются | Фото при `avatar_enabled=false`, bot/admin/not_spam/age/count/disabled/external-processing gates | PG таблица случаев |
+| Исходные имена, username и file IDs не уходят в input | Синтетические строки профиля отсутствуют в input; переданы только boolean | PG payload assertions |
+| Unicode/эмодзи не обходят hint | Homoglyph, невидимый символ, эмодзи; длинный текст не становится коротким префиксом | Unit + PG |
+| Отрицательный verdict не равен малому score или action gate | Независимые persisted fixtures для `no_signal`, `abstain`, positive below threshold, dry-run, issue | Unit `diagnostics` |
