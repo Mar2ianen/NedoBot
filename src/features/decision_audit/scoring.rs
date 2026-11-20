@@ -82,7 +82,11 @@ mod tests {
         let decision: DecisionAssessment = serde_json::from_value(body.clone()).unwrap();
         assert!(decision.validate().is_ok());
         assert_eq!(decision.captcha_verdict(), ShadowVerdict::ReviewCandidate);
-        let c = contribution(&decision, &ContactFeatures::default(), &DecisionConfig::default());
+        let c = contribution(
+            &decision,
+            &ContactFeatures::default(),
+            &DecisionConfig::default(),
+        );
         assert!(c.review_candidate);
         assert!(c.decision_score >= 80);
 
