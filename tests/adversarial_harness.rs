@@ -488,6 +488,108 @@ fn durable_job_reference_model_preserves_fences_and_uncertain_delivery() {
     assert_eq!(traces.get(), PROPERTY_CASES);
 }
 
+#[cfg(feature = "auto-comment")]
+#[tokio::test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+async fn post_comment_sql_matches_reference_lease_and_delivery_trace() {
+    use quality::{
+        durable_jobs::{DurableJobModel, DurableJobStatus},
+        generators::DurableJobOperation as Op,
+    };
+    use tg_ai_bot_teloxide::features::{
+        first_comment::repo::{
+            CommentErrorKind, CreatePostCommentJobParams, begin_post_comment_delivery,
+            claim_next_post_comment_job, create_post_comment_job,
+            mark_post_comment_delivery_unknown, mark_post_comment_pre_send_failed,
+        },
+        jobs::claim::CasResult,
+    };
+    let pool = sqlx::PgPool::connect(&env::var("TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let seed = replay_seed();
+    let worker = (seed % 100) as u8;
+    let next = worker + 1;
+    let fixture = uuid::Uuid::new_v4().as_u128() as u32;
+    let chat = -1_008_451_000_000 - i64::from(fixture);
+    let id = create_post_comment_job(
+        &pool,
+        CreatePostCommentJobParams {
+            discussion_chat_id: chat,
+            discussion_message_id: 1,
+            source_channel_id: chat - 1,
+            source_message_id: 1,
+            cleaned_post_text: "Synthetic trace",
+            image_file_id: None,
+            image_file_unique_id: None,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    sqlx::query("update post_comment_jobs set next_attempt_at='epoch' where id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let trace = [
+        Op::Claim { worker },
+        Op::AdvanceClock { seconds: 31 },
+        Op::FinalizeRetry { worker },
+        Op::Claim { worker: next },
+        Op::FinalizeRetry { worker },
+        Op::BeginExternalEffect { worker: next },
+        Op::MarkDeliveryUnknown { worker: next },
+    ];
+    let mut oracle = DurableJobModel::default();
+    let mut claims = BTreeMap::new();
+    let mut admitted_sends = 0;
+    for op in trace {
+        let expected = oracle.apply(op);
+        let observed = match op {
+            Op::Claim { worker } => {
+                let job = claim_next_post_comment_job(&pool).await.unwrap().unwrap();
+                assert_eq!(job.id, id);
+                claims.insert(worker, job);
+                true
+            }
+            Op::AdvanceClock { .. } => {
+                sqlx::query("update post_comment_jobs set lease_expires_at=now()-interval '1 second' where id=$1")
+                    .bind(id).execute(&pool).await.unwrap().rows_affected() == 1
+            }
+            Op::FinalizeRetry { worker } => mark_post_comment_pre_send_failed(
+                &pool, &claims[&worker], CommentErrorKind::Transient,
+            ).await.unwrap() == CasResult::Applied,
+            Op::BeginExternalEffect { worker } => {
+                let admitted = begin_post_comment_delivery(&pool, &claims[&worker]).await.unwrap()
+                    == CasResult::Applied;
+                admitted_sends += usize::from(admitted);
+                admitted
+            }
+            Op::MarkDeliveryUnknown { worker } => mark_post_comment_delivery_unknown(
+                &pool, &claims[&worker],
+            ).await.unwrap() == CasResult::Applied,
+            _ => unreachable!("this trace uses only common SQL/model operations"),
+        };
+        assert_eq!(observed, expected, "seed={seed} operation={op:?}");
+        let expected_status = match oracle.status {
+            DurableJobStatus::Processing if oracle.external_effect_started => "sending",
+            DurableJobStatus::Processing => "processing",
+            DurableJobStatus::DeliveryUnknown => "delivery_unknown",
+            other => panic!("unexpected oracle state {other:?}"),
+        };
+        let (status, attempts, sent): (String, i32, bool) = sqlx::query_as(
+            "select status, attempts, bot_comment_message_id is not null from post_comment_jobs where id=$1",
+        ).bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            (status.as_str(), attempts as u64, u64::from(sent)),
+            (expected_status, oracle.attempts, oracle.confirmed_effects),
+            "seed={seed} operation={op:?}"
+        );
+    }
+    assert_eq!(admitted_sends, 1);
+}
+
 #[test]
 fn moderation_reference_model_preserves_veto_ownership_and_uncertainty() {
     use quality::{

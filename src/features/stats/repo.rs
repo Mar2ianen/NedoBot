@@ -1051,6 +1051,7 @@ pub async fn user_top_words(
 
 pub async fn resolve_user_id(
     pool: &PgPool,
+    chat_id: i64,
     target: Option<&str>,
     reply_user_id: Option<i64>,
 ) -> anyhow::Result<Option<i64>> {
@@ -1062,15 +1063,26 @@ pub async fn resolve_user_id(
         return Ok(Some(user_id));
     }
 
-    let username = clean.trim_start_matches('@').to_lowercase();
-    let row: Option<(i64,)> = sqlx::query_as(
-        r#"select telegram_user_id from telegram_user_profiles
-           where lower(username) = $1 order by updated_at desc limit 1"#,
+    // A historical profile row is not proof of current ownership: usernames are
+    // reassigned. Resolve only from the fresh unique alias index, then require
+    // the selected user to belong to the requested chat. Ambiguous, stale, or
+    // cross-chat names fail closed instead of selecting an arbitrary row.
+    let crate::db::username_aliases::TelegramUsernameResolution::Unique(peer) =
+        crate::db::username_aliases::resolve_telegram_username(pool, clean).await?
+    else {
+        return Ok(None);
+    };
+    if peer.peer_type != "user" {
+        return Ok(None);
+    }
+    let is_chat_member: bool = sqlx::query_scalar(
+        "select exists(select 1 from telegram_chat_users where chat_id = $1 and telegram_user_id = $2)",
     )
-    .bind(username)
-    .fetch_optional(pool)
+    .bind(chat_id)
+    .bind(peer.peer_id)
+    .fetch_one(pool)
     .await?;
-    Ok(row.map(|(user_id,)| user_id))
+    Ok(is_chat_member.then_some(peer.peer_id))
 }
 
 fn period_start_sql(period: StatsPeriod) -> &'static str {

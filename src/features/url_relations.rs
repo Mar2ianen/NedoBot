@@ -1,5 +1,10 @@
 //! Осторожные связи для уже разобранных ссылок Telegram.
-//! Username не разрешаются; членство читается только из локальных снимков.
+//! Username разрешаются только по свежим локальным снимкам.
+
+pub use crate::db::username_aliases::{
+    ResolvedTelegramPeer, TelegramUsernameResolution, resolve_telegram_username,
+};
+use crate::db::username_aliases::{normalize_username, resolve_current_username_aliases};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -52,19 +57,6 @@ type LinkedUserSnapshot = (
     bool,
     Option<String>,
 );
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedTelegramPeer {
-    pub peer_id: i64,
-    pub peer_type: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TelegramUsernameResolution {
-    Unique(ResolvedTelegramPeer),
-    Ambiguous,
-    Unknown,
-}
 
 pub struct RelationContext<'a> {
     pub chat_id: i64,
@@ -661,55 +653,6 @@ pub async fn recent_link_relationship_summary(
     }))
 }
 
-async fn resolve_current_username_aliases(
-    pool: &PgPool,
-    usernames: &[String],
-) -> anyhow::Result<HashMap<String, TelegramUsernameResolution>> {
-    if usernames.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
-        r#"select username_normalized, min(telegram_peer_id), min(peer_type),
-                  count(distinct (telegram_peer_id, peer_type))::bigint
-             from public.telegram_username_aliases
-            where username_normalized = any($1)
-              and is_active
-              and observed_at >= now() - interval '24 hours'
-            group by username_normalized"#,
-    )
-    .bind(usernames)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(username, peer_id, peer_type, owner_count)| {
-            let resolution = if owner_count == 1 {
-                TelegramUsernameResolution::Unique(ResolvedTelegramPeer { peer_id, peer_type })
-            } else {
-                TelegramUsernameResolution::Ambiguous
-            };
-            (username, resolution)
-        })
-        .collect())
-}
-
-/// Resolves a Telegram username only from a fresh, unique local snapshot.
-/// Unknown and conflicting aliases remain distinct fail-closed outcomes.
-pub async fn resolve_telegram_username(
-    pool: &PgPool,
-    username: &str,
-) -> anyhow::Result<TelegramUsernameResolution> {
-    let Some(username) = normalize_username(username) else {
-        return Ok(TelegramUsernameResolution::Unknown);
-    };
-    let resolutions =
-        resolve_current_username_aliases(pool, std::slice::from_ref(&username)).await?;
-    Ok(resolutions
-        .get(&username)
-        .cloned()
-        .unwrap_or(TelegramUsernameResolution::Unknown))
-}
-
 fn is_external_web_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     ![
@@ -724,15 +667,6 @@ fn is_external_web_host(host: &str) -> bool {
         && !host.ends_with(".t.me")
         && !host.ends_with(".telegram.me")
         && !host.ends_with(".telegram.dog")
-}
-
-fn normalize_username(value: &str) -> Option<String> {
-    let username = value.trim().trim_start_matches('@').to_ascii_lowercase();
-    (5..=32).contains(&username.len()).then_some(())?;
-    username
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        .then_some(username)
 }
 
 fn is_bot_candidate(username: &str) -> bool {

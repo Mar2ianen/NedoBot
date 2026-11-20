@@ -11,7 +11,7 @@ use crate::{
     features::manual_moderation::{
         self, ActionRecord, UndoClaim,
         types::{
-            BatchRequestSnapshot, CommandKind, MAX_TARGETS_PER_BATCH, ParsedCommand,
+            BatchRequestSnapshot, BatchTarget, CommandKind, MAX_TARGETS_PER_BATCH, ParsedCommand,
             WARNING_MUTE_DURATION, parse_command,
         },
     },
@@ -19,10 +19,7 @@ use crate::{
     telegram::{html::Html, service_messages},
 };
 
-#[derive(Debug, Clone, Copy)]
-struct Target {
-    user_id: i64,
-}
+type Target = BatchTarget;
 
 #[derive(Debug, Clone, Copy)]
 enum ObservedRestriction {
@@ -178,12 +175,13 @@ pub async fn handle(
             return Ok(());
         }
         parsed = snapshot.parsed_command();
-        let ids = snapshot
-            .target_user_ids
-            .iter()
-            .copied()
-            .map(|user_id| Target { user_id })
-            .collect::<Vec<_>>();
+        let ids = match snapshot.resume_targets() {
+            Ok(targets) => targets,
+            Err(error) => {
+                send_reply(bot, msg, state, &error).await?;
+                return Ok(());
+            }
+        };
         let targets =
             match maybe_check_targets(bot, &state.pool, msg.chat.id, kind, ids, Some(batch.id))
                 .await
@@ -226,10 +224,7 @@ pub async fn handle(
                     return Ok(());
                 }
             };
-        let request = BatchRequestSnapshot::from_parsed(
-            &parsed,
-            targets.iter().map(|target| target.user_id).collect(),
-        );
+        let request = BatchRequestSnapshot::from_parsed(&parsed, targets.clone());
         let batch = match manual_moderation::create_batch_with_request(
             &state.pool,
             msg.chat.id.0,
@@ -458,12 +453,9 @@ async fn authorize_actor(
     };
     let actor_privileged = actor_member.kind.is_privileged();
     let actor_can_restrict = actor_member.kind.can_restrict_members();
-    if !actor_rights_allow_action(
-        actor_privileged,
-        actor_can_restrict,
-        false,
-        requires_restrict_right,
-    ) {
+    // The bot's rights are checked separately below; don't treat an
+    // observation we haven't made yet as an explicit denial.
+    if !actor_privileged || (requires_restrict_right && !actor_can_restrict) {
         return None;
     }
     if !requires_restrict_right {
@@ -501,8 +493,7 @@ async fn resolve_target_ids(
     msg: &Message,
     parsed: &ParsedCommand,
 ) -> anyhow::Result<Vec<Target>> {
-    let mut candidates = parsed.targets.clone();
-    if let Some(reply) = msg.reply_to_message() {
+    let reply_user_id = if let Some(reply) = msg.reply_to_message() {
         if reply.chat.id != msg.chat.id {
             anyhow::bail!("reply должен быть из этого же чата");
         }
@@ -515,34 +506,73 @@ async fn resolve_target_ids(
                     "не удалось определить автора reply; анонимные sender_chat не поддерживаются"
                 )
             })?;
-        candidates.push(user.id.0.to_string());
-    }
+        Some(user.id.0 as i64)
+    } else {
+        None
+    };
+    resolve_target_requests(pool, msg.chat.id.0, &parsed.targets, reply_user_id).await
+}
 
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
+async fn resolve_target_requests(
+    pool: &PgPool,
+    chat_id: i64,
+    candidates: &[String],
+    reply_user_id: Option<i64>,
+) -> anyhow::Result<Vec<Target>> {
+    let mut targets: Vec<Target> = Vec::new();
     for candidate in candidates {
-        let user_id = if let Some(username) = candidate.strip_prefix('@') {
-            manual_moderation::find_username(pool, msg.chat.id.0, username)
+        let target = if let Some(username) = candidate.strip_prefix('@') {
+            let username = username.to_ascii_lowercase();
+            let user_id = manual_moderation::find_username(pool, chat_id, &username)
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!("@{username} не найден среди известных участников этого чата")
-                })?
+                })?;
+            Target::username(user_id, username)
         } else {
-            candidate
+            let user_id = candidate
                 .parse::<i64>()
-                .map_err(|_| anyhow::anyhow!("цель должна быть Telegram ID или @username"))?
+                .map_err(|_| anyhow::anyhow!("цель должна быть Telegram ID или @username"))?;
+            Target::numeric(user_id)
         };
+        if target.user_id <= 0 {
+            anyhow::bail!("Telegram ID должен быть положительным");
+        }
+        merge_target(&mut targets, target)?;
+    }
+    if let Some(user_id) = reply_user_id {
         if user_id <= 0 {
             anyhow::bail!("Telegram ID должен быть положительным");
         }
-        if seen.insert(user_id) {
-            targets.push(Target { user_id });
-        }
+        merge_target(&mut targets, Target::reply(user_id))?;
     }
     if targets.len() > MAX_TARGETS_PER_BATCH {
         anyhow::bail!("за один раз можно указать не больше {MAX_TARGETS_PER_BATCH} пользователей");
     }
     Ok(targets)
+}
+
+fn merge_target(targets: &mut Vec<Target>, incoming: Target) -> anyhow::Result<()> {
+    if let Some(existing) = targets
+        .iter_mut()
+        .find(|existing| existing.user_id == incoming.user_id)
+    {
+        // A username in the same command is the stricter provenance: keep the
+        // live ownership check even if the same numeric ID was also given.
+        if incoming.requested_username().is_some() {
+            if existing.requested_username().is_some()
+                && existing.requested_username() != incoming.requested_username()
+            {
+                anyhow::bail!(
+                    "для одного пользователя указаны разные username; используй reply или Telegram ID"
+                );
+            }
+            *existing = incoming;
+        }
+        return Ok(());
+    }
+    targets.push(incoming);
+    Ok(())
 }
 
 async fn checked_targets(
@@ -567,6 +597,7 @@ async fn checked_targets(
         if member.user.is_bot || member.kind.is_privileged() {
             anyhow::bail!("ботов и администраторов нельзя включать в ручное наказание");
         }
+        verify_live_username(&member.user, candidate)?;
         let local_restriction =
             manual_moderation::active_restriction_action(pool, chat_id.0, candidate.user_id)
                 .await?;
@@ -601,11 +632,56 @@ async fn checked_targets(
                 );
             }
         }
-        targets.push(Target {
-            user_id: candidate.user_id,
-        });
+        targets.push(candidate.clone());
     }
     Ok(targets)
+}
+
+/// A username target is only the candidate lookup key. The effect boundary
+/// requires Telegram itself to still report that exact current username for the
+/// resolved numeric ID; missing, reassigned, or unavailable names fail closed.
+fn verify_live_username(member: &teloxide::types::User, target: &Target) -> anyhow::Result<()> {
+    let Some(requested) = target.requested_username() else {
+        return Ok(());
+    };
+    let live = member.username.as_deref().map(str::to_ascii_lowercase);
+    if member.id.0 != target.user_id as u64 || live.as_deref() != Some(requested) {
+        anyhow::bail!(
+            "@{requested} больше не подтверждается Telegram для пользователя {}; укажи reply или Telegram ID, если нужен именно этот участник",
+            target.user_id
+        );
+    }
+    Ok(())
+}
+
+/// Re-checks username provenance immediately before a Telegram effect. The
+/// earlier preflight is not enough: a warn escalation or a resumed batch can
+/// reach the effect boundary after an arbitrary delay.
+async fn reverify_live_usernames(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    chat_id: ChatId,
+    targets: &[Target],
+) -> anyhow::Result<()> {
+    for target in targets {
+        if target.requested_username().is_none() {
+            continue;
+        }
+        let member = bot
+            .get_chat_member(chat_id, UserId(target.user_id as u64))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "не удалось повторно проверить @{} для пользователя {}; действие остановлено",
+                    target.requested_username().unwrap_or(""),
+                    target.user_id
+                )
+            })?;
+        verify_live_username(&member.user, target)?;
+        if member.user.is_bot || member.kind.is_privileged() {
+            anyhow::bail!("ботов и администраторов нельзя включать в ручное наказание");
+        }
+    }
+    Ok(())
 }
 
 fn validate_observed_restriction(
@@ -656,6 +732,9 @@ async fn maybe_check_targets(
             | CommandKind::Unban
     ) {
         checked_targets(bot, pool, chat_id, kind, &targets, batch_id).await
+    } else if kind == CommandKind::Unwarn {
+        reverify_live_usernames(bot, chat_id, &targets).await?;
+        Ok(targets)
     } else {
         Ok(targets)
     }
@@ -685,6 +764,7 @@ async fn apply_batch_restriction(
             _ => "auto_mute",
         }
     };
+    reverify_live_usernames(bot, chat_id, targets).await?;
     let expires_at = duration.map(|duration| {
         Utc::now() + ChronoDuration::from_std(duration).expect("validated moderation duration")
     });
@@ -832,7 +912,7 @@ async fn apply_batch_warnings(
     let mut escalation_targets = Vec::new();
     for (target, warning) in targets.iter().zip(warning_results) {
         if warning.should_escalate {
-            escalation_targets.push(*target);
+            escalation_targets.push(target.clone());
         }
         outcomes.push(format!(
             "{} — предупреждение №{} ({}/3 активных)",
@@ -880,6 +960,7 @@ async fn revoke_restrictions(
     } else {
         None
     };
+    reverify_live_usernames(bot, chat_id, targets).await?;
     let claimed = manual_moderation::claim_restriction_revokes_batch(
         pool,
         batch_id,
@@ -1444,6 +1525,309 @@ async fn send_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, body::Bytes, extract::State, http::Uri, routing::post};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct MemberStub {
+        calls: Mutex<Vec<String>>,
+        replies: Mutex<Vec<Value>>,
+        effects: Mutex<Vec<(String, i64)>>,
+        username: Mutex<Option<String>>,
+        api_error: Mutex<bool>,
+    }
+
+    async fn member_api(State(stub): State<Arc<MemberStub>>, uri: Uri, body: Bytes) -> Json<Value> {
+        let method = uri
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        stub.calls.lock().unwrap().push(method.clone());
+        if method == "getme" {
+            return Json(
+                json!({"ok":true,"result":{"id":9001,"is_bot":true,"first_name":"Fake","username":"fixture_bot",
+                    "can_join_groups":true,"can_read_all_group_messages":false,
+                    "supports_inline_queries":false,"has_main_web_app":false}}),
+            );
+        }
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        if method == "sendmessage" {
+            stub.replies.lock().unwrap().push(payload["text"].clone());
+            return Json(
+                json!({"ok":true,"result":{"message_id": 700,"date":1700000000,
+                "chat":{"id":payload["chat_id"],"type":"supergroup","title":"Fixture"},
+                "text":payload["text"]}}),
+            );
+        }
+        let user_id = payload["user_id"].as_i64().expect("user id");
+        if matches!(method.as_str(), "banchatmember" | "restrictchatmember") {
+            stub.effects.lock().unwrap().push((method, user_id));
+            return Json(json!({"ok":true,"result":true}));
+        }
+        if matches!(user_id, 9001 | 9002) {
+            return Json(
+                json!({"ok":true,"result":{"status":"creator","is_anonymous":false,
+                "user":{"id":user_id,"is_bot":user_id==9001,"first_name":"Fixture"}}}),
+            );
+        }
+        if *stub.api_error.lock().unwrap() {
+            return Json(json!({"ok": false, "error_code": 400, "description": "fixture failure"}));
+        }
+        assert_eq!(method, "getchatmember");
+        let mut user = json!({"id": user_id, "is_bot": false, "first_name": "Fixture"});
+        if let Some(username) = stub.username.lock().unwrap().clone() {
+            user["username"] = json!(username);
+        }
+        Json(json!({"ok": true, "result": {"status": "member", "user": user}}))
+    }
+
+    async fn fake_member_bot(stub: Arc<MemberStub>) -> teloxide::adaptors::DefaultParseMode<Bot> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().fallback(post(member_api)).with_state(stub);
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        Bot::new("fixture-token")
+            .set_api_url(format!("http://{address}/").parse().unwrap())
+            .parse_mode(teloxide::types::ParseMode::Html)
+    }
+
+    fn parsed_ban(username: &str) -> ParsedCommand {
+        parse_command(CommandKind::Ban, username).expect("synthetic ban command")
+    }
+
+    #[tokio::test]
+    #[ignore = "run against the disposable local test database"]
+    async fn username_sanctions_require_live_ownership_and_resume_preserves_provenance() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must point to the disposable test database");
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let suffix = (Utc::now().timestamp_micros().unsigned_abs() % 900_000_000) as i64;
+        let chat_id = -1_008_970_032_163;
+        let user_id = 9_320_000_000_000 + suffix;
+        let username = format!("a{suffix:08x}");
+        sqlx::query("insert into telegram_user_profiles(telegram_user_id, username) values($1,$2) on conflict (telegram_user_id) do update set username=excluded.username")
+            .bind(user_id).bind(&username).execute(&pool).await.unwrap();
+        sqlx::query("insert into telegram_chat_users(chat_id, telegram_user_id) values($1,$2) on conflict do nothing")
+            .bind(chat_id).bind(user_id).execute(&pool).await.unwrap();
+        sqlx::query("insert into telegram_username_aliases(username_normalized,telegram_peer_id,peer_type,source) values($1,$2,'user','profile_refresh')")
+            .bind(&username).bind(user_id).execute(&pool).await.unwrap();
+
+        let stub = Arc::new(MemberStub::default());
+        *stub.username.lock().unwrap() = Some("renamed_away".to_string());
+        let bot = fake_member_bot(stub.clone()).await;
+
+        let resolved = resolve_target_requests(&pool, chat_id, &[format!("@{username}")], None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].user_id, user_id);
+        assert_eq!(resolved[0].requested_username(), Some(username.as_str()));
+
+        let error = checked_targets(
+            &bot,
+            &pool,
+            ChatId(chat_id),
+            CommandKind::Ban,
+            &resolved,
+            None,
+        )
+        .await
+        .expect_err("a reassigned username must fail closed");
+        assert!(error.to_string().contains("больше не подтверждается"));
+        assert_eq!(
+            stub.calls.lock().unwrap().as_slice(),
+            ["getchatmember"],
+            "the mismatch must stop before any sanction API call"
+        );
+
+        // Reply and explicit numeric ID keep their normal policy.
+        let reply = resolve_target_requests(&pool, chat_id, &[], Some(user_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].resolution_source,
+            crate::features::manual_moderation::types::TargetResolutionSource::Reply
+        );
+        assert!(
+            checked_targets(&bot, &pool, ChatId(chat_id), CommandKind::Ban, &reply, None)
+                .await
+                .is_ok()
+        );
+        let numeric = vec![Target::numeric(user_id)];
+        assert!(
+            checked_targets(
+                &bot,
+                &pool,
+                ChatId(chat_id),
+                CommandKind::Ban,
+                &numeric,
+                None
+            )
+            .await
+            .is_ok()
+        );
+
+        // Resume rebuilds the same live-ownership obligation from the snapshot.
+        let parsed = parsed_ban(&format!("@{username}"));
+        let snapshot = BatchRequestSnapshot::from_parsed(&parsed, resolved.clone());
+        let resumed = snapshot.resume_targets().unwrap();
+        assert!(
+            checked_targets(
+                &bot,
+                &pool,
+                ChatId(chat_id),
+                CommandKind::Ban,
+                &resumed,
+                None
+            )
+            .await
+            .is_err()
+        );
+        let legacy = BatchRequestSnapshot {
+            kind: CommandKind::Ban,
+            target_user_ids: vec![user_id],
+            targets: Vec::new(),
+            duration_seconds: None,
+            reason: None,
+            warn_id: None,
+            warn_all: false,
+            limit: 20,
+        };
+        assert!(
+            legacy.resume_targets().is_err(),
+            "legacy snapshots fail closed"
+        );
+
+        // Missing username and API errors also fail closed.
+        *stub.username.lock().unwrap() = None;
+        assert!(
+            checked_targets(
+                &bot,
+                &pool,
+                ChatId(chat_id),
+                CommandKind::Ban,
+                &resolved,
+                None
+            )
+            .await
+            .is_err()
+        );
+        *stub.api_error.lock().unwrap() = true;
+        assert!(
+            checked_targets(
+                &bot,
+                &pool,
+                ChatId(chat_id),
+                CommandKind::Ban,
+                &resolved,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            stub.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|method| method == "getchatmember"),
+            "no sanction API method may be reached while ownership is unconfirmed"
+        );
+
+        let state = AppState::new(pool.clone(), crate::config::test_config());
+        let message = |message_id, reply| {
+            let chat = json!({"id":chat_id,"type":"supergroup","title":"Fixture"});
+            let mut msg = json!({"message_id":message_id,"date":1700000000,"chat":chat,
+                "from":{"id":9002,"is_bot":false,"first_name":"Fixture"},"text":"synthetic command"});
+            if reply {
+                msg["reply_to_message"] = json!({"message_id":44,"date":1700000000,"chat":chat,
+                    "from":{"id":user_id,"is_bot":false,"first_name":"Fixture"},"text":"synthetic reply"});
+            }
+            serde_json::from_value::<Message>(msg).unwrap()
+        };
+        let first_message_id = (suffix as i32) * 2;
+        let target = format!("@{}", username.to_ascii_uppercase());
+        *stub.api_error.lock().unwrap() = false;
+        *stub.username.lock().unwrap() = Some("renamed_away".into());
+        for (index, kind) in [CommandKind::Ban, CommandKind::Mute, CommandKind::Warn]
+            .into_iter()
+            .enumerate()
+        {
+            let msg = message(first_message_id + index as i32, false);
+            handle(&bot, &msg, &state, kind, &target).await.unwrap();
+            assert!(
+                manual_moderation::find_batch(&pool, chat_id, msg.id.0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let resume_msg = message(first_message_id + 3, false);
+        manual_moderation::create_batch_with_request(
+            &pool,
+            chat_id,
+            9002,
+            resume_msg.id.0,
+            "ban",
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        handle(&bot, &resume_msg, &state, CommandKind::Ban, &target)
+            .await
+            .unwrap();
+        assert!(stub.effects.lock().unwrap().is_empty());
+        handle(
+            &bot,
+            &message(first_message_id + 4, true),
+            &state,
+            CommandKind::Mute,
+            "",
+        )
+        .await
+        .unwrap();
+        handle(
+            &bot,
+            &message(first_message_id + 5, false),
+            &state,
+            CommandKind::Ban,
+            &user_id.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap().as_slice(),
+            [
+                ("restrictchatmember".into(), user_id),
+                ("banchatmember".into(), user_id)
+            ],
+            "methods={:?}, replies={:?}",
+            stub.calls.lock().unwrap(),
+            stub.replies.lock().unwrap(),
+        );
+
+        sqlx::query("delete from telegram_username_aliases where username_normalized=$1")
+            .bind(&username)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from telegram_chat_users where chat_id=$1 and telegram_user_id=$2")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from telegram_user_profiles where telegram_user_id=$1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
 
     #[test]
     fn escalation_action_uses_fixed_five_day_expiration() {

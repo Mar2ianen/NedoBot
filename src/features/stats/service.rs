@@ -247,7 +247,7 @@ pub async fn user_stats_report_data(
     let Some(user_id) = timed_user_stats_query(
         trace_id,
         "sql_resolve_user",
-        repo::resolve_user_id(pool, target, reply_user_id),
+        repo::resolve_user_id(pool, chat_id, target, reply_user_id),
     )
     .await?
     else {

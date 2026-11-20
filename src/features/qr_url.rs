@@ -126,17 +126,21 @@ async fn process_job(
         crate::features::url_relations::load_affiliated_peer_ids(pool, &state.config, job.chat_id)
             .await
             .map_err(|_| "affiliated_channels_lookup_failed")?;
-    let classified_urls = urls
-        .into_iter()
-        .map(|target| QrUrlEvidence {
-            relation: crate::features::url_relations::classify_qr_url(
-                &target,
-                job.chat_id,
-                &affiliated,
-            ),
-            target,
-        })
-        .collect::<Vec<_>>();
+    let mut classified_urls = Vec::with_capacity(urls.len());
+    for target in urls {
+        // Persist the same fresh unique-ownership decision used elsewhere for
+        // Telegram username links. The pure classifier would silently turn
+        // every `t.me/<name>/...` link into Unresolved.
+        let relation = crate::features::url_relations::classify_qr_url_with_aliases(
+            pool,
+            &target,
+            job.chat_id,
+            &affiliated,
+        )
+        .await
+        .map_err(|_| "alias_resolution_failed")?;
+        classified_urls.push(QrUrlEvidence { relation, target });
+    }
     let materialized = replace_qr_evidence_for_job(
         pool,
         &state.config.community.instance.id,
@@ -257,6 +261,118 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{qr_urls_from_payloads, run_bounded_qr_decode_with};
+
+    #[tokio::test]
+    #[ignore = "requires a disposable migrated PostgreSQL database"]
+    async fn qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use serde_json::json;
+        use teloxide::prelude::*;
+
+        const PNG: &[u8] = include_bytes!("../../tests/fixtures/deep_audit_qr.png");
+        let pool = sqlx::PgPool::connect(&std::env::var("TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let mut config = crate::config::test_config();
+        let chat = config.discussion_chat_id;
+        config.community.instance.id = "qr_worker_fixture".into();
+        let state = crate::state::AppState::new(pool.clone(), config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route(
+                "/botfixture/GetFile",
+                post(|| async {
+                    Json(
+                        json!({"ok":true,"result":{"file_id":"fixture","file_unique_id":"qr-a",
+                    "file_size":PNG.len(),"file_path":"fixture.png"}}),
+                    )
+                }),
+            )
+            .route("/file/botfixture/fixture.png", get(|| async { PNG }));
+        let fake = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let bot = Bot::new("fixture").set_api_url(format!("http://{address}/").parse().unwrap());
+        let user_id = 8_975_501_031_i64;
+        let name = "fixture_qr_alias";
+        let owner = -1_009_755_010_000_i64;
+        let fixture_pool = &pool;
+        let insert_alias = |id, age| async move {
+            sqlx::query("insert into telegram_username_aliases (username_normalized,telegram_peer_id,peer_type,source,observed_at) values ($1,$2,'channel','configured_chat_refresh',now()-$3*interval '1 hour')")
+                .bind(name).bind(id).bind(age).execute(fixture_pool).await.unwrap();
+        };
+        sqlx::query("delete from telegram_username_aliases where username_normalized=$1")
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_alias(owner, 0_i32).await;
+        for (index, expected) in [
+            "external",
+            "unresolved",
+            "unresolved",
+            "affiliated",
+            "superseded",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match index {
+                1 => insert_alias(chat, 0).await,
+                2 => {
+                    sqlx::query("update telegram_username_aliases set observed_at=now()-interval '25 hours' where username_normalized=$1")
+                        .bind(name).execute(&pool).await.unwrap();
+                }
+                3 => {
+                    sqlx::query("update telegram_username_aliases set observed_at=now() where username_normalized=$1 and telegram_peer_id=$2")
+                        .bind(name).bind(chat).execute(&pool).await.unwrap();
+                }
+                _ => {}
+            }
+            let message_id = 1_712_340_000 + index as i32;
+            let media = if expected == "superseded" {
+                "qr-b"
+            } else {
+                "qr-a"
+            };
+            let msg = json!({
+                "message_id":message_id, "date":chrono::Utc::now().timestamp(),
+                "chat":{"id":chat,"type":"supergroup","title":"QR fixture"},
+                "from":{"id":user_id,"is_bot":false,"first_name":"Fixture"},
+                "photo":[{"file_id":"fixture","file_unique_id":media,"width":185,"height":185}]
+            });
+            sqlx::query("insert into telegram_messages (chat_id,message_id,user_id,raw_json) values ($1,$2,$3,$4) on conflict (chat_id,message_id) do update set raw_json=excluded.raw_json, created_at=now()")
+                .bind(chat).bind(message_id).bind(user_id).bind(msg).execute(&pool).await.unwrap();
+            let job = sqlx::query_as::<_, crate::db::url_evidence::QrScanJob>(
+                "insert into telegram_qr_scan_jobs (chat_id,message_id,file_id,file_unique_id,status,attempts,lease_generation,lease_expires_at) values ($1,$2,'fixture','qr-a','leased',1,1,now()+interval '10 minutes') on conflict (chat_id,message_id,file_unique_id) do update set status='leased',lease_expires_at=excluded.lease_expires_at returning id,chat_id,message_id,file_id,file_unique_id,attempts,lease_generation",
+            ).bind(chat).bind(message_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                super::process_job(&bot, &state, &job).await,
+                Ok((expected != "superseded").then_some(1))
+            );
+            let relation: Option<String> = sqlx::query_scalar("select qr_relation from telegram_message_url_evidence where chat_id=$1 and message_id=$2 and source='qr'")
+                .bind(chat).bind(message_id).fetch_optional(&pool).await.unwrap();
+            assert_eq!(
+                relation.as_deref(),
+                (expected != "superseded").then_some(expected)
+            );
+            if index == 0 {
+                let summary = crate::features::url_relations::recent_link_relationship_summary(
+                    &pool,
+                    &state.config,
+                    chat,
+                    user_id,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(summary["external_qr_url_count"], 1);
+            }
+        }
+        fake.abort();
+    }
 
     #[test]
     fn qr_deduplication_preserves_case_sensitive_path_and_query() {

@@ -7,10 +7,19 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from run_cargo_test_checked import run_checked  # noqa: E402
+from run_cargo_test_checked import run_checked, verify_inventory  # noqa: E402
 
 
 class CheckedCargoTest(unittest.TestCase):
+    def test_inventory_requires_exact_test_and_target(self):
+        output = "     Running unittests src/lib.rs (target/debug/probe)\n"
+        output += "test module::expected ... ok\n"
+        self.assertTrue(verify_inventory(output, "src/lib.rs", ["module::expected"]))
+        self.assertFalse(verify_inventory(output, "src/lib.rs", ["module::other"]))
+        self.assertFalse(verify_inventory(output, "tests/probe.rs", ["module::expected"]))
+        self.assertFalse(verify_inventory(output + "test module::other ... ok\n",
+                                          "src/lib.rs", ["module::expected"]))
+
     def fake_cargo(self, root: Path, output: str, exit_code: int) -> Path:
         cargo = root / "cargo"
         encoded_output = base64.b64encode(output.encode()).decode("ascii")

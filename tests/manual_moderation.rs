@@ -8,7 +8,7 @@ use tg_ai_bot_teloxide::features::manual_moderation::{
     lock_automatic_restriction_restore, mark_action_failed, mark_action_succeeded, prepare_action,
     prepare_actions_batch, recover_expired_batch_actions, revoke_warnings, start_prepared_action,
     start_undo_operation,
-    types::{BatchRequestSnapshot, CommandKind},
+    types::{BatchRequestSnapshot, BatchTarget, CommandKind},
 };
 
 const CHAT_ID: i64 = -1001932061163;
@@ -667,6 +667,7 @@ async fn moderation_batch_db_preflight_is_atomic_and_duplicate_updates_resume_sa
     let request = BatchRequestSnapshot {
         kind: CommandKind::Ban,
         target_user_ids: vec![user_id + 2],
+        targets: vec![BatchTarget::numeric(user_id + 2)],
         duration_seconds: None,
         reason: Some("retry snapshot".to_string()),
         warn_id: None,

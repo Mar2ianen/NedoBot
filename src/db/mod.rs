@@ -4,6 +4,7 @@ use std::collections::HashSet;
 pub mod membership;
 pub mod telegram;
 pub mod url_evidence;
+pub mod username_aliases;
 
 pub async fn build_pool() -> anyhow::Result<PgPool> {
     let database_url = std::env::var("DATABASE_URL")?;
@@ -19,7 +20,7 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes.
     // Touched with each migration addition because SQLx embeds this directory at compile time.
-    // Userstatus totals, URL evidence, linked-chat cache, and current Telegram username aliases are embedded here.
+    // Includes the durable profile refresh intent migration.
     const KNOWN_UNRESOLVED_PRODUCTION_MIGRATIONS: &[i64] = &[20260927120000];
 
     let migration_table_exists: bool =

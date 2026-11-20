@@ -1810,21 +1810,17 @@ pub async fn find_username(
     chat_id: i64,
     username: &str,
 ) -> anyhow::Result<Option<i64>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        r#"select distinct p.telegram_user_id
-           from telegram_user_profiles p
-           join telegram_chat_users u on u.telegram_user_id = p.telegram_user_id
-           where u.chat_id = $1 and lower(p.username) = $2
-           order by p.telegram_user_id limit 2"#,
-    )
-    .bind(chat_id)
-    .bind(username.to_ascii_lowercase())
-    .fetch_all(pool)
-    .await?;
-    match rows.as_slice() {
-        [(user_id,)] => Ok(Some(*user_id)),
-        [] => Ok(None),
-        _ => anyhow::bail!("username неоднозначен; используй reply или Telegram ID"),
+    use crate::db::username_aliases::{TelegramUsernameResolution, resolve_telegram_username};
+    match resolve_telegram_username(pool, username).await? {
+        TelegramUsernameResolution::Unique(peer) if peer.peer_type == "user" => {
+            Ok(known_chat_user(pool, chat_id, peer.peer_id)
+                .await?
+                .then_some(peer.peer_id))
+        }
+        TelegramUsernameResolution::Ambiguous => {
+            anyhow::bail!("username неоднозначен; используй reply или Telegram ID")
+        }
+        _ => Ok(None),
     }
 }
 

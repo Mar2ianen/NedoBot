@@ -245,6 +245,40 @@ fn normalize_profile_identifier(value: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Records the durable audit trigger in the same transaction as the message
+/// row. The in-memory queue may be full or the process may die immediately
+/// after commit; the reconciler still sees this revision.
+async fn record_profile_refresh_intent_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &Config,
+    chat_id: i64,
+    user_id: i64,
+) -> anyhow::Result<()> {
+    if !config.new_user_audit_enabled || !config.chat_allows(chat_id, |chat| chat.moderation) {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"
+        insert into public.telegram_profile_refresh_intents
+            (instance_id, chat_id, telegram_user_id)
+        values ($1, $2, $3)
+        on conflict (instance_id, chat_id, telegram_user_id) do update set
+            revision = telegram_profile_refresh_intents.revision + 1,
+            attempts = 0,
+            next_attempt_at = now(),
+            failed_at = null,
+            last_error = null,
+            updated_at = now()
+        "#,
+    )
+    .bind(&config.community.instance.id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn save_telegram_message(
     pool: &PgPool,
     msg: &Message,
@@ -260,6 +294,7 @@ pub async fn save_telegram_message(
     if let Some(reply_user) = msg.reply_to_message().and_then(|reply| reply.from.as_ref()) {
         upsert_user_profile(pool, reply_user).await?;
     }
+    let mut tx = pool.begin().await?;
     let (inserted,): (bool,) = sqlx::query_as(
         r#"
         insert into telegram_messages
@@ -312,8 +347,26 @@ pub async fn save_telegram_message(
     .bind(projection.has_animation)
     .bind(projection.has_links)
     .bind(projection.is_forwarded)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    if inserted {
+        upsert_chat_user_activity(&mut tx, msg, projection.source_channel_id).await?;
+    }
+    if inserted
+        && !msg.is_automatic_forward()
+        && !msg.chat.is_private()
+        && projection.source_channel_id.is_none()
+        && let Some(user) = msg.from.as_ref().filter(|user| !user.is_bot)
+    {
+        record_profile_refresh_intent_in_transaction(
+            &mut tx,
+            config,
+            msg.chat.id.0,
+            user.id.0 as i64,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     if !teloxide_url::adapter::extract_from_message(msg).is_empty() {
         super::url_evidence::replace_message_url_evidence(pool, msg).await?;
@@ -327,7 +380,6 @@ pub async fn save_telegram_message(
     }
 
     if inserted {
-        upsert_chat_user_activity(pool, msg, projection.source_channel_id).await?;
         enqueue_message_embedding_if_enabled(
             pool,
             config.chat_retrieval_embeddings_enabled,
@@ -498,7 +550,7 @@ pub async fn mark_message_deleted_by_bot(
 }
 
 async fn upsert_chat_user_activity(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     msg: &Message,
     source_channel_id: Option<i64>,
 ) -> anyhow::Result<()> {
@@ -615,7 +667,7 @@ async fn upsert_chat_user_activity(
     .bind(reply_to_message_id)
     .bind(message_has_links(msg))
     .bind(has_media)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())

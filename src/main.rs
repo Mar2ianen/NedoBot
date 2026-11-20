@@ -42,6 +42,8 @@ use features::spammer_avatar_embeddings::{
     worker_error_seconds as spammer_avatar_worker_error_seconds,
     worker_idle_seconds as spammer_avatar_worker_idle_seconds,
 };
+#[cfg(feature = "moderation")]
+use features::user_profiles::enrichment::spawn_profile_refresh_intent_reconciler;
 use features::user_profiles::enrichment::{
     ProfileRefreshEnqueueResult, ProfileRefreshQueue, spawn_profile_refresh_workers,
 };
@@ -209,6 +211,15 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "moderation")]
         state.url_feed_snapshot.clone(),
     );
+    #[cfg(feature = "moderation")]
+    if state.config.new_user_audit_enabled {
+        spawn_profile_refresh_intent_reconciler(
+            &mut workers,
+            state.pool.clone(),
+            Arc::clone(&state.config),
+            state.url_feed_snapshot.clone(),
+        );
+    }
     spawn_spammer_avatar_embedding_worker(&mut workers, bot.inner().clone(), state.clone());
     #[cfg(feature = "moderation")]
     if state.config.new_user_audit_enabled {
@@ -590,7 +601,9 @@ fn enqueue_message_author_profile_refresh(
         ProfileRefreshEnqueueResult::Full => {
             tracing::warn!(
                 user_id,
-                "skipped profile refresh because bounded queue is full"
+                chat_id = msg.chat.id.0,
+                queue_full = profile_refresh_queue.full_events(),
+                "bounded profile refresh queue is full"
             );
         }
         ProfileRefreshEnqueueResult::Closed => {

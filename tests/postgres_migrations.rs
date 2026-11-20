@@ -224,6 +224,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
     assert_stats_rank_ties_follow_the_reference_order(&pool).await;
+    assert_user_stats_username_uses_fresh_unique_alias(&pool).await;
     assert_feature_gated_jobs(&pool).await;
     assert_agent_note_contract(&pool).await;
     assert_ask_conversation_memory(&pool).await;
@@ -8649,6 +8650,105 @@ async fn assert_comment_job_lifecycle(pool: &PgPool) {
         CasResult::LeaseLost,
         "a completed send cannot be finalized twice"
     );
+
+    let expired_job_id = create_job(pool, 6).await;
+    query(
+        "update post_comment_jobs set status = 'processing', attempts = 1, lease_expires_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(expired_job_id)
+    .execute(pool)
+    .await
+    .expect("expired-before-reclaim fixture must be prepared");
+    let expired_job = tg_ai_bot_teloxide::features::first_comment::repo::PostCommentJob {
+        id: expired_job_id,
+        discussion_chat_id: -1001932061163,
+        discussion_message_id: 6,
+        source_channel_id: -1001575496091,
+        source_message_id: 6,
+        cleaned_post_text: "Тестовый пост".to_string(),
+        image_file_id: None,
+        attempts: 1,
+        operator_retry_only: false,
+    };
+    let before: (String, i32, bool) = query_as(
+        "select status, attempts, lease_expires_at <= now() from post_comment_jobs where id = $1",
+    )
+    .bind(expired_job_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired job state must exist");
+    assert_eq!(
+        mark_post_comment_pre_send_failed(pool, &expired_job, CommentErrorKind::Transient)
+            .await
+            .expect("expired pre-send finalizer must execute"),
+        CasResult::LeaseLost,
+        "pre-send failure without a live processing lease must not mutate the job"
+    );
+    let after: (String, i32, bool) = query_as(
+        "select status, attempts, lease_expires_at <= now() from post_comment_jobs where id = $1",
+    )
+    .bind(expired_job_id)
+    .fetch_one(pool)
+    .await
+    .expect("expired job state must remain readable");
+    assert_eq!(
+        after, before,
+        "lost lease must leave status and attempts unchanged"
+    );
+    let reclaimed = claim_next_post_comment_job(pool)
+        .await
+        .expect("reclaim after lost pre-send finalizer must execute")
+        .expect("another worker must be able to claim the expired job");
+    assert_eq!(reclaimed.id, expired_job_id);
+    assert_eq!(reclaimed.attempts, 2);
+}
+
+async fn assert_user_stats_username_uses_fresh_unique_alias(pool: &PgPool) {
+    use tg_ai_bot_teloxide::features::stats::service::user_stats_report_data;
+
+    let chat = -1_009_876_540_000;
+    let old_owner = 8_976_540_001_i64;
+    let current_owner = old_owner + 1;
+    let name = "fixture_stats_alias";
+    query("insert into telegram_user_profiles (telegram_user_id, username, updated_at) values ($1,$3,now()), ($2,$3,now()-interval '1 hour')")
+        .bind(old_owner).bind(current_owner).bind(name).execute(pool).await.unwrap();
+    query("insert into telegram_chat_users (chat_id, telegram_user_id) values ($1,$2), ($3,$4)")
+        .bind(chat)
+        .bind(old_owner)
+        .bind(chat - 1)
+        .bind(current_owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    query("insert into public.telegram_username_aliases (username_normalized,telegram_peer_id,peer_type,source,observed_at) values ($1,$2,'user','profile_refresh',now()-interval '25 hours'), ($1,$3,'user','profile_refresh',now())")
+        .bind(name).bind(old_owner).bind(current_owner).execute(pool).await.unwrap();
+    let target = "@FIXTURE_STATS_ALIAS";
+    let resolve = |chat_id, target, reply| async move {
+        user_stats_report_data(pool, chat_id, target, reply, 0)
+            .await
+            .unwrap()
+            .map(|data| data.user.user_id)
+    };
+    assert_eq!(resolve(chat, Some(target), None).await, None);
+    assert_eq!(
+        resolve(chat - 1, Some(target), None).await,
+        Some(current_owner)
+    );
+    assert_eq!(
+        resolve(chat, Some("8976540001"), None).await,
+        Some(old_owner)
+    );
+    assert_eq!(resolve(chat, None, Some(old_owner)).await, Some(old_owner));
+    assert_eq!(
+        resolve(chat, Some("@fixture_stats_unknown"), None).await,
+        None
+    );
+    query("update public.telegram_username_aliases set observed_at=now() where username_normalized=$1")
+        .bind(name).execute(pool).await.unwrap();
+    assert_eq!(resolve(chat - 1, Some(target), None).await, None);
+    query("update public.telegram_username_aliases set observed_at=now()-interval '25 hours' where username_normalized=$1")
+        .bind(name).execute(pool).await.unwrap();
+    assert_eq!(resolve(chat - 1, Some(target), None).await, None);
 }
 
 #[tokio::test]

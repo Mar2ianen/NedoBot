@@ -673,6 +673,7 @@ async fn mark_post_comment_failed(
             lease_expires_at = null,
             updated_at = now()
         where id = $1 and attempts = $2 and status = $3
+          and ($3 <> 'processing' or lease_expires_at > now())
         "#,
     )
     .bind(job.id)
