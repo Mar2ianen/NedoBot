@@ -61,6 +61,10 @@ fn short_adult_contact_bait(text: &str) -> bool {
         || normalized.ends_with(" кто в гости")
 }
 
+fn short_bait_for_decision(text: &str, feminine_name_pattern: bool, avatar_observable: bool) -> bool {
+    (feminine_name_pattern || avatar_observable) && short_adult_contact_bait(text)
+}
+
 /// SQL-only дешёвая стадия после ingest; не ждёт profile API, LLM или embedding.
 /// Родитель, биография и текст чужих сообщений в author_message не попадают.
 pub async fn observe_message(
@@ -134,8 +138,8 @@ pub async fn observe_message(
     let avatar_observable = config.community.moderation.decision.avatar_enabled
         && source.avatar_file_id.is_some()
         && source.avatar_unique_id.is_some();
-    let short_bait_candidate = short_adult_contact_bait(&source.text)
-        && (feminine_name_pattern || avatar_observable);
+    let short_bait_candidate =
+        short_bait_for_decision(&source.text, feminine_name_pattern, avatar_observable);
     let local_candidate = campaign.is_some() || short_bait_candidate;
     let reason = if source.normal_veto {
         "manual_not_spam"
@@ -346,7 +350,7 @@ pub async fn process_next(
 
 #[cfg(test)]
 mod short_bait_tests {
-    use super::short_adult_contact_bait;
+    use super::{short_adult_contact_bait, short_bait_for_decision};
 
     #[test]
     fn short_invitations_reach_decision_candidate_gate() {
@@ -358,6 +362,14 @@ mod short_bait_tests {
         ] {
             assert!(short_adult_contact_bait(sample), "{sample}");
         }
+    }
+
+    #[test]
+    fn profile_context_is_required_for_additional_decision_enqueue() {
+        assert!(!short_bait_for_decision("Приму", false, false));
+        assert!(short_bait_for_decision("Приму", true, false));
+        assert!(short_bait_for_decision("Приму", false, true));
+        assert!(!short_bait_for_decision("Приму PR после тестов", true, true));
     }
 
     #[test]
