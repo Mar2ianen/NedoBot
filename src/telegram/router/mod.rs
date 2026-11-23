@@ -138,6 +138,14 @@ mod tests {
             "can_join_groups": true,
             "can_read_all_group_messages": true,
             "supports_inline_queries": false,
+            "needs_inline_query_location": false,
+            "can_connect_to_business": false,
+            "supports_guest_queries": false,
+            "supports_join_request_queries": false,
+            "has_topics_enabled": false,
+            "allows_users_to_create_topics": false,
+            "has_topic_sidebar": false,
+            "can_manage_bots": false,
             "has_main_web_app": false
         }))
         .expect("synthetic bot identity must match the Telegram Me schema")
