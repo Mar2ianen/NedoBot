@@ -112,7 +112,7 @@ impl RichProjection {
                     self.credit(&v.credit);
                 }
                 RichBlockKind::ExpandableBlockquote(v) => {
-                    self.inline(&v.text);
+                    self.blocks(&v.blocks);
                     self.credit(&v.credit);
                 }
                 RichBlockKind::Pullquote(v) => {
@@ -180,6 +180,23 @@ mod tests {
             {"type":"paragraph", "text":{"type":"ton_address", "address":"EQsynthetic", "text":"Получатель"}}
         ]})).unwrap();
         assert_eq!(project(&rich).text, "Получатель");
+    }
+
+    #[test]
+    fn projects_expandable_quotation_rich_blocks() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks": [
+            {
+                "type": "expandable_blockquote",
+                "blocks": [
+                    {"type": "paragraph", "text": "Цитата"},
+                    {"type": "paragraph", "text": {"type": "bold", "text": "Из блоков"}}
+                ],
+                "credit": "источник"
+            }
+        ]}))
+        .unwrap();
+        let result = project(&rich);
+        assert_eq!(result.text, "Цитата\\nИз блоков\\n\\nисточник");
     }
 
     #[test]
