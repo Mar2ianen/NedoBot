@@ -196,7 +196,7 @@ mod tests {
         ]}))
         .unwrap();
         let result = project(&rich);
-        assert_eq!(result.text, "Цитата\\nИз блоков\\n\\nисточник");
+        assert_eq!(result.text, "Цитата\nИз блоков\n\nисточник");
     }
 
     #[test]
