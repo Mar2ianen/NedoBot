@@ -1,0 +1,26 @@
+name: Resolve Bot API 10.5 review lockfile
+on: [push]
+permissions:
+  contents: write
+jobs:
+  resolve:
+    if: github.ref == 'refs/heads/compat/teloxide-bot-api-10-5'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+      - name: Resolve lockfile from actual dependency graph
+        run: cargo update -w
+      - name: Commit new lockfile to review branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "build: resolve NedoBot 10.5 Cargo.lock"
+            git push origin HEAD:compat/teloxide-bot-api-10-5
+          fi
