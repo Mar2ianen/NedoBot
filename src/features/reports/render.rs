@@ -74,12 +74,12 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
 
     blocks.push(InputRichBlock::ExpandableBlockquote(
         InputRichBlockExpandableBlockQuotation {
-            text: plain(truncate(
+            blocks: vec![InputRichBlock::Paragraph(paragraph([plain(truncate(
                 card.target_text
                     .as_deref()
                     .unwrap_or("сообщение без текста"),
                 1_500,
-            )),
+            ))]))],
             credit: Some(plain("исходное сообщение")),
         },
     ));
