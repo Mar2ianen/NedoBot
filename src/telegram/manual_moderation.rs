@@ -2157,9 +2157,10 @@ mod tests {
             ReconcileOutcome::NotFound
         );
 
-        // Список ограничен страницей: 10 записей не помещаются в одно сообщение.
+        // 50 записей с длинными причинами не помещаются в одно сообщение:
+        // список обязан оставаться постраничным и ограниченным по длине.
         let pagination_channel = -1_009_900_000_300i64;
-        for index in 0..10 {
+        for index in 0..50 {
             sqlx::query(
                 "insert into manual_sender_chat_operations(chat_id,command_message_id,sender_chat_id,actor_user_id,action,reason,status)
                  values($1,$2,$3,$4,'ban',$5,'unknown')",
@@ -2174,35 +2175,34 @@ mod tests {
             .unwrap();
         }
         let replies_before = stub.replies.lock().unwrap().len();
-        crate::telegram::manual_sender_chat::handle_reconcile(
-            &bot,
-            &message(base + 40, pagination_channel, None),
-            &state,
-            "",
-        )
-        .await
-        .unwrap();
-        crate::telegram::manual_sender_chat::handle_reconcile(
-            &bot,
-            &message(base + 41, pagination_channel, None),
-            &state,
-            "2",
-        )
-        .await
-        .unwrap();
-        let (page1, page2) = {
+        for (offset, args) in [(40, ""), (41, "7"), (42, "8")] {
+            crate::telegram::manual_sender_chat::handle_reconcile(
+                &bot,
+                &message(base + offset, pagination_channel, None),
+                &state,
+                args,
+            )
+            .await
+            .unwrap();
+        }
+        let (page1, page7, page8) = {
             let replies = stub.replies.lock().unwrap();
             (
                 replies[replies_before].as_str().unwrap().to_string(),
                 replies[replies_before + 1].as_str().unwrap().to_string(),
+                replies[replies_before + 2].as_str().unwrap().to_string(),
             )
         };
-        assert!(page1.contains("страница 1 из 2"), "{page1}");
+        assert!(page1.contains("страница 1 из 7"), "{page1}");
         assert!(page1.contains("/channelops 2 — следующая"), "{page1}");
-        assert!(page2.contains("страница 2 из 2"), "{page2}");
-        assert!(page2.contains("/channelops 1 — предыдущая"), "{page2}");
-        assert!(page1.encode_utf16().count() <= 4096);
-        assert!(page2.encode_utf16().count() <= 4096);
+        assert!(page7.contains("страница 7 из 7"), "{page7}");
+        assert!(page7.contains("/channelops 6 — предыдущая"), "{page7}");
+        assert!(!page7.contains("следующая"), "{page7}");
+        assert!(page8.contains("На странице 8 незавершённых операций нет"));
+        assert!(page8.contains("доступны страницы 1..=7"));
+        for page in [&page1, &page7, &page8] {
+            assert!(page.encode_utf16().count() <= 4096);
+        }
 
         sqlx::query("delete from manual_sender_chat_operations where chat_id=$1")
             .bind(chat_id)
