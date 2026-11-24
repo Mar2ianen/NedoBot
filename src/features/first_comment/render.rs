@@ -86,8 +86,7 @@ fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
     let is_tech = lower.contains("windows")
         || lower.contains("драйвер")
         || lower.contains("fps")
-        || lower.contains("пк")
-        || lower.contains("видеокарт");
+        || lower.contains("пк");
 
     if is_tech {
         config
