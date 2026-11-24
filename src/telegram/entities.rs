@@ -1,4 +1,4 @@
-use super::rich_content::{project, project_blocks, rich_message};
+use super::rich_content::{legacy_quote_text, project, rich_message};
 use std::borrow::Cow;
 use teloxide::types::{Message, MessageEntityKind, MessageId, MessageOrigin, RichBlock};
 
@@ -41,7 +41,7 @@ fn add_legacy_expandable_quote_text(value: &mut serde_json::Value) -> anyhow::Re
                     let blocks: Vec<RichBlock> = serde_json::from_value(blocks)?;
                     object.insert(
                         "text".to_owned(),
-                        serde_json::Value::String(project_blocks(&blocks).text),
+                        serde_json::to_value(legacy_quote_text(&blocks))?,
                     );
                 }
                 pending.extend(object.values_mut());
@@ -393,7 +393,16 @@ mod tests {
             stored
         );
         let quote = stored.pointer("/rich_message/blocks/0").unwrap();
-        assert_eq!(quote["text"], "Цитата\nссылка");
+        assert_eq!(quote["text"][0], "Цитата");
+        assert_eq!(quote["text"][1], "\n");
+        assert_eq!(
+            quote["text"][2],
+            serde_json::json!({
+                "type": "url",
+                "url": "https://example.org/hidden",
+                "text": "ссылка"
+            })
+        );
         assert_eq!(quote["blocks"][0]["text"], "Цитата");
         assert_eq!(quote["credit"], "источник");
         assert!(
@@ -427,7 +436,11 @@ mod tests {
             "chat": {"id": -10042, "type": "supergroup"},
             "rich_message": {"blocks": [{
                 "type": "expandable_blockquote",
-                "text": {"type": "bold", "text": "Старая цитата"},
+                "text": [
+                    {"type": "bold", "text": "Старая цитата"},
+                    " ",
+                    {"type": "url", "url": "https://example.org/legacy", "text": "ссылка"}
+                ],
                 "credit": "старый источник"
             }]}
         });
@@ -435,7 +448,14 @@ mod tests {
         let restored = deserialize_stored_message(old_payload).unwrap();
         assert_eq!(
             message_text(&restored).as_deref(),
-            Some("Старая цитата\n\nстарый источник")
+            Some("Старая цитата ссылка\n\nстарый источник")
+        );
+        assert_eq!(
+            message_url_targets(&restored)
+                .iter()
+                .map(|found| found.value.as_str())
+                .collect::<Vec<_>>(),
+            ["https://example.org/legacy"]
         );
     }
 }

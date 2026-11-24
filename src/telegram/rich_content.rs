@@ -2,7 +2,7 @@
 //! File IDs, callback data и скрытые thinking-блоки в проекцию не попадают.
 use teloxide::types::{
     MediaKind, Message, MessageKind, RichBlock, RichBlockCaption, RichBlockKind, RichMessage,
-    RichText, RichTextObject,
+    RichText, RichTextButton, RichTextObject,
 };
 
 #[derive(Default)]
@@ -31,6 +31,117 @@ pub(super) fn project_blocks(blocks: &[RichBlock]) -> RichProjection {
     projection.blocks(blocks);
     projection.text = projection.text.trim().to_owned();
     projection
+}
+
+pub(super) fn legacy_quote_text(blocks: &[RichBlock]) -> RichText {
+    let mut parts = Vec::new();
+    append_legacy_blocks(blocks, &mut parts);
+    RichText::List(parts)
+}
+
+fn append_legacy_blocks(blocks: &[RichBlock], parts: &mut Vec<RichText>) {
+    let mut first = true;
+    for block in blocks {
+        let start = parts.len();
+        append_legacy_block(block, parts);
+        if parts.len() > start {
+            if !first {
+                parts.insert(start, RichText::Text("\n".to_owned()));
+            }
+            first = false;
+        }
+    }
+}
+
+fn append_legacy_block(block: &RichBlock, parts: &mut Vec<RichText>) {
+    let RichBlock::Known(block) = block else {
+        return;
+    };
+    match block.as_ref() {
+        RichBlockKind::Paragraph(value) => parts.push(value.text.clone()),
+        RichBlockKind::Heading(value) => parts.push(value.text.clone()),
+        RichBlockKind::Pre(value) => parts.push(value.text.clone()),
+        RichBlockKind::Footer(value) => parts.push(value.text.clone()),
+        RichBlockKind::MathematicalExpression(value) => {
+            parts.push(RichText::Text(value.expression.clone()));
+        }
+        RichBlockKind::List(value) => {
+            for item in &value.items {
+                if !item.label.is_empty() {
+                    parts.push(RichText::Text(item.label.clone()));
+                    if !item.blocks.is_empty() {
+                        parts.push(RichText::Text(" ".to_owned()));
+                    }
+                }
+                append_legacy_blocks(&item.blocks, parts);
+            }
+        }
+        RichBlockKind::Blockquote(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_credit(&value.credit, parts);
+        }
+        RichBlockKind::ExpandableBlockquote(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_credit(&value.credit, parts);
+        }
+        RichBlockKind::Pullquote(value) => {
+            parts.push(value.text.clone());
+            append_legacy_credit(&value.credit, parts);
+        }
+        RichBlockKind::Collage(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_caption(&value.caption, parts);
+        }
+        RichBlockKind::Slideshow(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_caption(&value.caption, parts);
+        }
+        RichBlockKind::Table(value) => {
+            for row in &value.cells {
+                for cell in row {
+                    if let Some(text) = &cell.text {
+                        parts.push(text.clone());
+                    }
+                }
+            }
+            append_legacy_credit(&value.caption, parts);
+        }
+        RichBlockKind::Buttons(value) => {
+            for button in &value.buttons {
+                parts.push(RichText::Object(RichTextObject::Button(RichTextButton {
+                    button: Box::new(button.clone()),
+                })));
+            }
+        }
+        RichBlockKind::Details(value) => {
+            parts.push(value.summary.clone());
+            append_legacy_blocks(&value.blocks, parts);
+        }
+        RichBlockKind::Document(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Map(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Animation(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Audio(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Photo(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Video(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::VoiceNote(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Divider(_) | RichBlockKind::Anchor(_) | RichBlockKind::Thinking(_) => {}
+    }
+}
+
+fn append_legacy_caption(caption: &Option<RichBlockCaption>, parts: &mut Vec<RichText>) {
+    if let Some(caption) = caption {
+        parts.push(caption.text.clone());
+        append_legacy_credit(&caption.credit, parts);
+    }
+}
+
+fn append_legacy_credit(credit: &Option<RichText>, parts: &mut Vec<RichText>) {
+    if let Some(credit) = credit {
+        if !parts.is_empty() {
+            parts.push(RichText::Text("\n".to_owned()));
+        }
+        parts.push(credit.clone());
+    }
 }
 
 impl RichProjection {
