@@ -590,6 +590,124 @@ async fn post_comment_sql_matches_reference_lease_and_delivery_trace() {
     assert_eq!(admitted_sends, 1);
 }
 
+/// A generated worker schedule against actual PostgreSQL CAS operations.
+/// Reclaiming a lease does not authorize the previous claim, even when the
+/// caller represents the same logical worker. The claim snapshot is the token.
+#[cfg(feature = "auto-comment")]
+#[tokio::test]
+#[ignore = "requires a disposable migrated PostgreSQL database"]
+async fn generated_post_comment_claims_reject_stale_and_duplicate_delivery() {
+    use tg_ai_bot_teloxide::features::{
+        first_comment::repo::{
+            CommentErrorKind, CreatePostCommentJobParams, begin_post_comment_delivery,
+            claim_next_post_comment_job, create_post_comment_job,
+            mark_post_comment_delivery_unknown, mark_post_comment_pre_send_failed,
+        },
+        jobs::claim::CasResult,
+    };
+
+    let pool = sqlx::PgPool::connect(&env::var("TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let seed = replay_seed();
+    let mut runner = fixed_runner(seed, 16);
+    // The synchronous generator materializes bounded schedules before any
+    // async operation. Failure logs retain the exact schedule for replay.
+    let schedules = std::cell::RefCell::new(Vec::new());
+    runner
+        .run(&(1_u8..=5, 1_u8..=4), |schedule| {
+            schedules.borrow_mut().push(schedule);
+            Ok(())
+        })
+        .unwrap();
+    for (reclaims, duplicates) in schedules.into_inner() {
+        let fixture = uuid::Uuid::new_v4().as_u128() as u32;
+        let chat = -1_008_452_000_000 - i64::from(fixture);
+        let id = create_post_comment_job(
+            &pool,
+            CreatePostCommentJobParams {
+                discussion_chat_id: chat,
+                discussion_message_id: 1,
+                source_channel_id: chat - 1,
+                source_message_id: 1,
+                cleaned_post_text: "Synthetic fenced delivery",
+                image_file_id: None,
+                image_file_unique_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        sqlx::query("update post_comment_jobs set next_attempt_at='epoch' where id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut claim = claim_next_post_comment_job(&pool).await.unwrap().unwrap();
+        assert_eq!(claim.id, id);
+        let mut stale = Vec::new();
+        for _ in 0..reclaims {
+            sqlx::query("update post_comment_jobs set lease_expires_at=now()-interval '1 second' where id=$1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let next = claim_next_post_comment_job(&pool).await.unwrap().unwrap();
+            assert_eq!(next.id, id);
+            assert_eq!(next.attempts, claim.attempts + 1);
+            stale.push(claim);
+            claim = next;
+        }
+        for previous in &stale {
+            assert_ne!(
+                begin_post_comment_delivery(&pool, previous).await.unwrap(),
+                CasResult::Applied,
+                "seed={seed} reclaims={reclaims} stale delivery"
+            );
+            assert_ne!(
+                mark_post_comment_pre_send_failed(&pool, previous, CommentErrorKind::Transient)
+                    .await
+                    .unwrap(),
+                CasResult::Applied,
+                "seed={seed} reclaims={reclaims} stale finalize"
+            );
+        }
+        assert_eq!(
+            begin_post_comment_delivery(&pool, &claim).await.unwrap(),
+            CasResult::Applied
+        );
+        for _ in 0..duplicates {
+            assert_ne!(
+                begin_post_comment_delivery(&pool, &claim).await.unwrap(),
+                CasResult::Applied,
+                "seed={seed} duplicate begin"
+            );
+        }
+        assert_eq!(
+            mark_post_comment_delivery_unknown(&pool, &claim).await.unwrap(),
+            CasResult::Applied
+        );
+        let (status, attempts, sent): (String, i32, bool) = sqlx::query_as(
+            "select status, attempts, bot_comment_message_id is not null from post_comment_jobs where id=$1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (status.as_str(), attempts, sent),
+            ("delivery_unknown", i32::from(reclaims) + 1, false),
+            "seed={seed} reclaims={reclaims} duplicates={duplicates}"
+        );
+        sqlx::query("delete from post_comment_jobs where id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+
 #[test]
 fn moderation_reference_model_preserves_veto_ownership_and_uncertainty() {
     use quality::{
