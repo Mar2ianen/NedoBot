@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         callback: Update::filter_callback_query()
             .endpoint(telegram::callbacks::handle_callback_query),
         chat_member: Update::filter_chat_member().endpoint(telegram::updates::handle_chat_member),
+        my_chat_member: Update::filter_my_chat_member().endpoint(handle_bot_membership_change),
     });
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
@@ -718,6 +719,39 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
     Ok(())
 }
 
+async fn handle_bot_membership_change(
+    member: ChatMemberUpdated,
+    state: AppState,
+) -> ResponseResult<()> {
+    let chat_id = member.chat.id.0;
+    if !is_managed_chat(&state.config, chat_id) {
+        return Ok(());
+    }
+    let old = &member.old_chat_member.kind;
+    let new = &member.new_chat_member.kind;
+    tracing::info!(
+        chat_id,
+        previous_status = ?old.status(),
+        status = ?new.status(),
+        is_present = new.is_present(),
+        is_admin = new.is_privileged(),
+        can_delete_messages = new.can_delete_messages(),
+        can_restrict_members = new.can_restrict_members(),
+        "Telegram bot membership changed"
+    );
+    if (old.is_present() && !new.is_present())
+        || (old.is_privileged() && !new.is_privileged())
+        || (old.can_delete_messages() && !new.can_delete_messages())
+        || (old.can_restrict_members() && !new.can_restrict_members())
+    {
+        tracing::warn!(
+            chat_id,
+            "Telegram bot lost capabilities; ingestion or moderation may be unavailable"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrivacyPolicy {
     Observe,
@@ -906,6 +940,23 @@ async fn preflight_bot_capabilities(
         }
     }
 
+    tracing::info!(
+        privacy_disabled = me.can_read_all_group_messages,
+        can_join_groups = me.can_join_groups,
+        supports_inline_queries = me.supports_inline_queries,
+        needs_inline_query_location = me.needs_inline_query_location,
+        can_connect_to_business = me.can_connect_to_business,
+        supports_guest_queries = me.supports_guest_queries,
+        supports_join_request_queries = me.supports_join_request_queries,
+        has_topics_enabled = me.has_topics_enabled,
+        allows_users_to_create_topics = me.allows_users_to_create_topics,
+        has_topic_sidebar = me.has_topic_sidebar,
+        can_manage_bots = me.can_manage_bots,
+        has_main_web_app = me.has_main_web_app,
+        active_username_count = me.active_usernames.as_ref().map_or(0, Vec::len),
+        "observed Telegram BotFullInfo capabilities"
+    );
+
     Ok(me)
 }
 
@@ -992,21 +1043,26 @@ mod tests {
 
     #[test]
     fn privacy_reconciliation_is_explicit_minimal_and_idempotent() {
-        for policy in [
-            PrivacyPolicy::Observe,
-            PrivacyPolicy::Reconcile,
-            PrivacyPolicy::Strict,
+        use PrivacyPolicy::{Observe, Reconcile, Strict};
+        for (policy, disabled, needs_ingest, expected) in [
+            (Observe, false, false, false),
+            (Observe, false, true, false),
+            (Observe, true, false, false),
+            (Observe, true, true, false),
+            (Strict, false, false, false),
+            (Strict, false, true, false),
+            (Strict, true, false, false),
+            (Strict, true, true, false),
+            (Reconcile, false, false, false),
+            (Reconcile, false, true, true),
+            (Reconcile, true, false, false),
+            (Reconcile, true, true, false),
         ] {
-            for privacy_disabled in [false, true] {
-                for non_admin_ingest_group in [false, true] {
-                    assert_eq!(
-                        privacy_patch_required(policy, privacy_disabled, non_admin_ingest_group),
-                        policy == PrivacyPolicy::Reconcile
-                            && !privacy_disabled
-                            && non_admin_ingest_group
-                    );
-                }
-            }
+            assert_eq!(
+                privacy_patch_required(policy, disabled, needs_ingest),
+                expected,
+                "policy={policy:?} privacy_disabled={disabled} ingest={needs_ingest}"
+            );
         }
         assert_eq!(
             PrivacyPolicy::parse("observe").unwrap(),
