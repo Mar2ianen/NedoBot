@@ -350,6 +350,22 @@ fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsString
     report
 }
 
+pub(super) fn reacted_author_link(
+    username: &Option<String>,
+    display_name: &str,
+    chat_id: i64,
+    message_id: i32,
+) -> String {
+    let url = username
+        .as_deref()
+        .map(str::trim)
+        .map(|value| value.trim_start_matches('@'))
+        .filter(|value| !value.is_empty())
+        .map(|username| format!("https://t.me/{username}"))
+        .unwrap_or_else(|| message_url(chat_id, message_id));
+    Html::link(display_name, url).into_string()
+}
+
 pub fn top_reacted(
     data: &TopReactedReportData,
     discussion_chat_id: i64,
@@ -364,21 +380,28 @@ pub fn top_reacted(
         return report;
     }
     for (index, row) in data.messages.iter().enumerate() {
-        let author_link = Html::link(
+        let author_link = reacted_author_link(
+            &row.username,
             &row.user.display_name,
+            discussion_chat_id,
+            row.message_id,
+        );
+        let message_link = Html::link(
+            strings.message_link_label,
             message_url(discussion_chat_id, row.message_id),
         )
         .into_string();
         report.push_str(&format!(
-            "\n{}. <b>{}</b> - {}: {}",
+            "\n{}. <b>{}</b> - {}: {} ({})",
             index + 1,
             row.total_count,
             author_link,
             Html::text(truncate_text(
                 &message_preview(row.text.as_deref(), row.media, strings),
-                64
+                120
             ))
             .into_string(),
+            message_link,
         ));
     }
     report
@@ -399,8 +422,8 @@ pub fn user_stats(
             None => strings.user_target_hint.to_string(),
         };
     };
-    let head = Section {
-        title: Some(strings.user_stats_title),
+    let mut head = Section {
+        title: None,
         rows: vec![
             Kv {
                 label: strings.status_updated,
@@ -442,6 +465,41 @@ pub fn user_stats(
             },
         ],
     };
+    if let Some(tag) = data
+        .written_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        head.rows.push(Kv {
+            label: strings.tag_row,
+            value: escape_html(tag),
+        });
+    }
+    if let Some(bio) = data
+        .bio
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        head.rows.push(Kv {
+            label: "Bio",
+            value: escape_html(bio),
+        });
+    }
+    let top_words = if data.top_words.is_empty() {
+        strings.no_timestamp.to_string()
+    } else {
+        data.top_words
+            .iter()
+            .map(|(word, count)| format!("{} ({count})", escape_html(word)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    head.rows.push(Kv {
+        label: strings.frequent_words,
+        value: top_words,
+    });
     let activity = Section {
         title: None,
         rows: vec![
