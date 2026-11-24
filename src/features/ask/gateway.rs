@@ -97,6 +97,24 @@ pub fn invocation_question(
     reply_enabled: bool,
     private_enabled: bool,
 ) -> Option<String> {
+    invocation_question_with_aliases(
+        message,
+        identity,
+        &[],
+        mention_enabled,
+        reply_enabled,
+        private_enabled,
+    )
+}
+
+pub fn invocation_question_with_aliases(
+    message: &Message,
+    identity: Option<&TelegramBotIdentity>,
+    active_usernames: &[String],
+    mention_enabled: bool,
+    reply_enabled: bool,
+    private_enabled: bool,
+) -> Option<String> {
     let sender = message.from.as_ref()?;
     if sender.is_bot
         || identity.is_some_and(|identity| sender.id.0 as i64 == identity.user_id)
@@ -122,14 +140,28 @@ pub fn invocation_question(
         return (private_enabled && !text.trim().is_empty()).then(|| text.trim().to_owned());
     }
 
-    let mention_ranges = if mention_enabled {
-        identity
-            .and_then(|identity| identity.username.as_deref())
-            .map(|username| matching_mentions(text, entities, username))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let mut mention_ranges = Vec::new();
+    if mention_enabled && let Some(identity) = identity {
+        for username in identity
+            .username
+            .as_deref()
+            .into_iter()
+            .chain(active_usernames.iter().map(String::as_str))
+            .filter(|name| !name.is_empty())
+        {
+            mention_ranges.extend(matching_mentions(text, entities, username));
+        }
+        mention_ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        mention_ranges.dedup();
+        // Malformed overlapping entities must not cause invalid byte ranges
+        // while removing mentions from the question.
+        if mention_ranges
+            .windows(2)
+            .any(|pair| pair[0].end > pair[1].start)
+        {
+            return None;
+        }
+    }
     let replied_to_bot = reply_enabled
         && identity.is_some()
         && message
@@ -254,6 +286,33 @@ mod tests {
             Some("😀 , помоги!")
         );
         assert!(invocation_question(&msg, Some(&identity()), false, false, false).is_none());
+    }
+
+    #[test]
+    fn active_aliases_and_duplicate_unsorted_mentions_are_safe() {
+        let msg = message(serde_json::json!({
+            "message_id": 9, "date": 1,
+            "chat": {"id": -10, "type": "supergroup", "title": "test"},
+            "from": {"id": 7, "is_bot": false, "first_name": "Alice"},
+            "text": "@Alias_Bot @Example_Bot help",
+            "entities": [
+                {"type": "mention", "offset": 11, "length": 12},
+                {"type": "mention", "offset": 0, "length": 10},
+                {"type": "mention", "offset": 11, "length": 12}
+            ]
+        }));
+        assert_eq!(
+            super::invocation_question_with_aliases(
+                &msg,
+                Some(&identity()),
+                &["Alias_Bot".to_owned(), "EXAMPLE_BOT".to_owned()],
+                true,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("help")
+        );
     }
 
     #[test]
