@@ -502,6 +502,113 @@ mod tests {
     }
 
     #[test]
+    fn generated_stored_quotes_preserve_typed_content_and_legacy_url_targets() {
+        use proptest::{
+            prelude::*,
+            test_runner::{Config, RngSeed, TestRunner},
+        };
+        use serde_json::json;
+        use std::collections::BTreeSet;
+
+        let seed = match std::env::var("NEDOBOT_PROPTEST_SEED") {
+            Ok(value) => value.parse::<u64>().expect("invalid property seed"),
+            Err(std::env::VarError::NotPresent) => 0x15_01_02_03_04_05_06_07,
+            Err(error) => panic!("invalid property seed: {error}"),
+        };
+        let strategy = prop::collection::vec(
+            (
+                prop_oneof![Just("🦀 Ж".to_owned()), "[a-z]{1,12}"],
+                any::<bool>(),
+                prop::collection::vec(0_u8..4, 0..=4),
+            ),
+            1..=6,
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(seed),
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner
+            .run(&strategy, |leaves| {
+                let mut expected = BTreeSet::new();
+                let mut blocks = Vec::new();
+                for (index, (label, button, wrappers)) in leaves.iter().enumerate() {
+                    let url = format!("https://example.org/generated/{index}");
+                    expected.insert(url.clone());
+                    let mut block = if *button {
+                        json!({"type": "buttons", "buttons": [{"text": label, "url": url}]})
+                    } else {
+                        json!({"type": "paragraph", "text": {
+                            "type": "url", "text": label, "url": url
+                        }})
+                    };
+                    for wrapper in wrappers {
+                        block = match wrapper {
+                            0 => json!({"type": "blockquote", "blocks": [block]}),
+                            1 => json!({"type": "expandable_blockquote", "blocks": [block]}),
+                            2 => json!({"type": "details", "summary": "Details", "blocks": [block]}),
+                            _ => json!({"type": "list", "items": [{"label": "1.", "blocks": [block]}]}),
+                        };
+                    }
+                    blocks.push(block);
+                }
+                let opaque = json!({"type": "future_block", "payload": {
+                    "type": "expandable_blockquote", "data": "opaque"
+                }});
+                blocks.push(opaque.clone());
+                let raw = json!({
+                    "message_id": 14,
+                    "date": 1_700_000_000,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "rich_message": {"blocks": [{
+                        "type": "expandable_blockquote", "blocks": blocks
+                    }]}
+                });
+                let message: Message = serde_json::from_value(raw).unwrap();
+                let canonical = serde_json::to_value(&message).unwrap();
+                let stored = super::serialize_stored_message(&message).unwrap();
+                let quote = &stored["rich_message"]["blocks"][0];
+                prop_assert_eq!(&quote["blocks"][leaves.len()], &opaque);
+                prop_assert!(canonical["rich_message"]["blocks"][0].get("text").is_none());
+                let restored = deserialize_stored_message(stored.clone()).unwrap();
+                prop_assert_eq!(serde_json::to_value(&restored).unwrap(), canonical);
+
+                let urls = |message: &Message| {
+                    message_url_targets(message)
+                        .into_iter()
+                        .map(|target| target.value)
+                        .collect::<BTreeSet<_>>()
+                };
+                prop_assert_eq!(urls(&restored), expected.clone());
+                // Exercise the legacy-only field independently from the RC2
+                // blocks. An actual RC1 binary is a separate compatibility gate.
+                let legacy = json!({
+                    "message_id": 14,
+                    "date": 1_700_000_000,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "rich_message": {"blocks": [{
+                        "type": "expandable_blockquote", "text": quote["text"]
+                    }]}
+                });
+                let restored_legacy = deserialize_stored_message(legacy).unwrap();
+                prop_assert_eq!(urls(&restored_legacy), expected);
+
+                let mut repeated = stored.clone();
+                super::add_legacy_expandable_quote_text(&mut repeated).unwrap();
+                prop_assert_eq!(repeated, stored);
+                Ok(())
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case_id=stored-rich-quotes seed={seed} sha={} replay=sh scripts/replay_quality_case.sh stored-rich-quotes {seed}: {error}",
+                    std::env::var("NEDOBOT_TEST_SHA")
+                        .unwrap_or_else(|_| "local-unpinned".to_owned())
+                )
+            });
+    }
+
+    #[test]
     fn stored_quote_normalization_preserves_opaque_blocks_and_nested_replies() {
         let opaque = serde_json::json!({
             "type": "future_block",
