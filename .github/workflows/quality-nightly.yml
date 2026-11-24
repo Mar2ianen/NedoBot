@@ -180,6 +180,7 @@ jobs:
           cargo llvm-cov clean --profraw-only
           python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test postgres_migrations -- --ignored
           python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test adversarial_harness generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact
           for name in \
             features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents \
             features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits \
