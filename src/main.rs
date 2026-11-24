@@ -251,9 +251,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_voice_transcription_worker(&mut workers, bot.clone(), state.clone());
 
     let handler = telegram::router::build(telegram::router::Routes {
-        command: dptree::entry()
-            .filter_map(telegram::router::parse_bot_command)
-            .endpoint(handle_command),
+        command: dptree::filter_map(telegram::router::parse_bot_command).endpoint(handle_command),
         message: dptree::endpoint(handle_message),
         reaction: Update::filter_message_reaction_updated()
             .endpoint(telegram::updates::handle_message_reaction),
@@ -799,6 +797,42 @@ fn privacy_patch_required(
     policy == PrivacyPolicy::Reconcile && !privacy_disabled && non_admin_ingest_group
 }
 
+async fn reconcile_group_privacy(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    mut me: BotFullInfo,
+    policy: PrivacyPolicy,
+    non_admin_ingest_group: bool,
+) -> anyhow::Result<BotFullInfo> {
+    if !privacy_patch_required(
+        policy,
+        me.can_read_all_group_messages,
+        non_admin_ingest_group,
+    ) {
+        return Ok(me);
+    }
+    let expected_id = me.id;
+    let deadline = std::time::Duration::from_secs(20);
+    tokio::time::timeout(
+        deadline,
+        bot.set_my_settings().can_read_all_group_messages(true).send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Telegram privacy update timed out; state is unknown"))?
+    .map_err(|_| anyhow::anyhow!("Telegram privacy settings reconciliation failed"))?;
+    me = tokio::time::timeout(deadline, bot.get_me().send())
+        .await
+        .map_err(|_| anyhow::anyhow!("Telegram privacy verification timed out"))?
+        .map_err(|_| anyhow::anyhow!("cannot verify Telegram privacy settings after update"))?;
+    anyhow::ensure!(
+        me.id == expected_id && me.can_read_all_group_messages,
+        "Telegram privacy settings reconciliation was not verified"
+    );
+    tracing::warn!(
+        "Group Privacy disabled via setMySettings; existing groups may require manually removing and re-adding the bot"
+    );
+    Ok(me)
+}
+
 /// One startup snapshot per configured chat. This is diagnostic state, not
 /// authorization for later moderation actions.
 async fn preflight_bot_capabilities(
@@ -907,28 +941,7 @@ async fn preflight_bot_capabilities(
         snapshots.push((chat_id, group, channel, ingest, is_present, is_admin));
     }
 
-    if privacy_patch_required(
-        policy,
-        me.can_read_all_group_messages,
-        non_admin_ingest_group,
-    ) {
-        let expected_id = me.id;
-        bot.set_my_settings()
-            .can_read_all_group_messages(true)
-            .await
-            .map_err(|_| anyhow::anyhow!("Telegram privacy settings reconciliation failed"))?;
-        me = bot
-            .get_me()
-            .await
-            .map_err(|_| anyhow::anyhow!("cannot verify Telegram privacy settings after update"))?;
-        anyhow::ensure!(
-            me.id == expected_id && me.can_read_all_group_messages,
-            "Telegram privacy settings reconciliation was not verified"
-        );
-        tracing::warn!(
-            "Group Privacy disabled via setMySettings; existing groups may require manually removing and re-adding the bot"
-        );
-    }
+    me = reconcile_group_privacy(bot, me, policy, non_admin_ingest_group).await?;
 
     for (chat_id, group, channel, ingest, is_present, is_admin) in snapshots {
         if !(ingest && (group || channel)) {
@@ -979,7 +992,10 @@ async fn preflight_bot_capabilities(
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivacyPolicy, privacy_mode_blocks_group_messages, privacy_patch_required};
+    use super::{
+        PrivacyPolicy, privacy_mode_blocks_group_messages, privacy_patch_required,
+        reconcile_group_privacy,
+    };
     use teloxide::types::{Update, UpdateKind};
 
     #[test]
@@ -1086,6 +1102,92 @@ mod tests {
             PrivacyPolicy::Observe
         );
         assert!(PrivacyPolicy::parse("invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn privacy_reconciliation_uses_minimal_patch_and_verifies_real_api_response() {
+        use axum::{Json, Router, body::Bytes, extract::State, http::Uri, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use teloxide::{prelude::*, types::ParseMode};
+
+        #[derive(Default)]
+        struct Stub {
+            calls: Vec<(String, Value)>,
+            privacy_disabled: bool,
+            ignore_update: bool,
+        }
+
+        async fn api(
+            State(stub): State<Arc<Mutex<Stub>>>,
+            uri: Uri,
+            body: Bytes,
+        ) -> Json<Value> {
+            let method = uri.path().rsplit('/').next().unwrap().to_ascii_lowercase();
+            let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let mut stub = stub.lock().unwrap();
+            stub.calls.push((method.clone(), payload.clone()));
+            match method.as_str() {
+                "getme" => Json(json!({"ok": true, "result": {
+                    "id": 9001, "is_bot": true, "first_name": "Synthetic",
+                    "can_join_groups": true,
+                    "can_read_all_group_messages": stub.privacy_disabled,
+                    "supports_inline_queries": false, "needs_inline_query_location": false,
+                    "can_connect_to_business": false, "supports_guest_queries": false,
+                    "supports_join_request_queries": false, "has_topics_enabled": false,
+                    "allows_users_to_create_topics": false, "has_topic_sidebar": false,
+                    "can_manage_bots": false, "has_main_web_app": false
+                }})),
+                "setmysettings" => {
+                    assert_eq!(payload, json!({"can_read_all_group_messages": true}));
+                    if !stub.ignore_update {
+                        stub.privacy_disabled = true;
+                    }
+                    Json(json!({"ok": true, "result": true}))
+                }
+                _ => panic!("unexpected API method: {method}"),
+            }
+        }
+
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().fallback(post(api)).with_state(stub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let bot = Bot::new("fixture-token")
+            .set_api_url(format!("http://{address}/").parse().unwrap())
+            .parse_mode(ParseMode::Html);
+        let me = bot.get_me().await.unwrap();
+        assert!(me.username_opt().is_none());
+        let observed = reconcile_group_privacy(&bot, me, PrivacyPolicy::Observe, true)
+            .await
+            .unwrap();
+        assert!(!observed.can_read_all_group_messages);
+        assert_eq!(stub.lock().unwrap().calls.len(), 1);
+
+        let updated = reconcile_group_privacy(&bot, observed, PrivacyPolicy::Reconcile, true)
+            .await
+            .unwrap();
+        assert!(updated.can_read_all_group_messages);
+        let updated = reconcile_group_privacy(&bot, updated, PrivacyPolicy::Reconcile, true)
+            .await
+            .unwrap();
+        assert!(updated.can_read_all_group_messages);
+        {
+            let mut state = stub.lock().unwrap();
+            let methods: Vec<_> = state.calls.iter().map(|call| call.0.as_str()).collect();
+            assert_eq!(methods, ["getme", "setmysettings", "getme"]);
+            state.privacy_disabled = false;
+            state.ignore_update = true;
+        }
+
+        let me = bot.get_me().await.unwrap();
+        assert!(
+            reconcile_group_privacy(&bot, me, PrivacyPolicy::Reconcile, true)
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[test]
