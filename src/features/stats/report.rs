@@ -113,11 +113,13 @@ pub async fn send_top_reacted(
     let data = service::top_reacted_report_data(pool, stats_scope_chat_id, STATS_TOP_LIMIT)
         .await
         .map_err(stats_error("failed to build top reacted report"))?;
-    let report = match render {
-        StatsRender::Html => render_html::top_reacted(&data, stats_scope_chat_id, strings),
-        StatsRender::Rich => render_rich::top_reacted(&data, stats_scope_chat_id, strings),
+    let reports = match render {
+        StatsRender::Html => render_html::top_reacted_pages(&data, stats_scope_chat_id, strings),
+        StatsRender::Rich => vec![render_rich::top_reacted(&data, stats_scope_chat_id, strings)],
     };
-    send_stats_report(bot, chat_id, report, render, audience).await?;
+    for report in reports {
+        send_stats_report(bot, chat_id, report, render, audience).await?;
+    }
     Ok(())
 }
 
