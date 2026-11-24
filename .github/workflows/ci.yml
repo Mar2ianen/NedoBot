@@ -70,7 +70,7 @@ jobs:
         run: python3 scripts/run_cargo_test_checked.py cargo test --test adversarial_harness --locked -- --nocapture
 
       - name: Test no-default feature set
-        run: cargo test --no-default-features --workspace --all-targets --locked
+        run: python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --workspace --all-targets --locked
 
       - name: Check no-default feature set
         run: cargo check --no-default-features --workspace --all-targets --locked
@@ -84,50 +84,50 @@ jobs:
           TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          cargo run --bin migrate
-          DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --bin migrate
+          cargo run --locked --bin migrate
+          DATABASE_URL="$TEST_DATABASE_URL_B" cargo run --locked --bin migrate
 
       - name: Run URL evidence PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: python3 scripts/run_cargo_test_checked.py cargo test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
 
       - name: Run URL shadow privacy PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
 
       - name: Run URL shadow lock PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
         run: |
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::url_shadow_lock_serializes_same_user_without_blocking_other_users -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::new_user_analysis::tests::url_shadow_lock_serializes_same_user_without_blocking_other_users -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::new_user_analysis::tests::cancelled_url_shadow_refresh_releases_its_session_lock -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::new_user_analysis::tests::qr_only_evidence_refreshes_shadow_and_removed_links_clear_positive_state -- --ignored --exact
 
       - name: Run URL inventory privacy and label PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: python3 scripts/run_cargo_test_checked.py cargo test --bin export_url_inventory tests::export_separates_current_flags_from_latest_operator_labels -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --bin export_url_inventory tests::export_separates_current_flags_from_latest_operator_labels -- --ignored --exact
 
       - name: Run Telegram username alias PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: cargo test --lib features::url_relations::tests::current_username_aliases_resolve_only_fresh_unique_owners -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::url_relations::tests::current_username_aliases_resolve_only_fresh_unique_owners -- --ignored --exact
 
       - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
           RUST_MIN_STACK: 8388608
         run: |
-          python3 scripts/run_cargo_test_checked.py cargo test --test postgres_migrations -- --ignored
-          python3 scripts/run_cargo_test_checked.py cargo test --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::user_profiles::enrichment::tests::fast_audit_ack_fences_revisions_and_reclaims -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::qr_url::tests::qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib telegram::manual_moderation::tests::username_sanctions_require_live_ownership_and_resume_preserves_provenance -- --ignored --exact
-          python3 scripts/run_cargo_test_checked.py cargo test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --test postgres_migrations -- --ignored
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::user_profiles::enrichment::tests::fast_audit_ack_fences_revisions_and_reclaims -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::qr_url::tests::qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib telegram::manual_moderation::tests::username_sanctions_require_live_ownership_and_resume_preserves_provenance -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
 
       - name: Validate synthetic public URL corpus
         run: |
@@ -138,15 +138,15 @@ jobs:
         env:
           TEST_PRIVATE_HISTORY_DATABASE_URL_A: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_corpus_a
           TEST_PRIVATE_HISTORY_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_corpus_b
-        run: cargo test --test private_url_history two_synthetic_databases_extract_only_their_scoped_messages_and_qr_hashes -- --ignored --exact
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --test private_url_history two_synthetic_databases_extract_only_their_scoped_messages_and_qr_hashes -- --ignored --exact
 
       - name: Run RMCP PostgreSQL integration test
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
           TEST_DATABASE_URL_B: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test_b
-        run: python3 scripts/run_cargo_test_checked.py cargo test --test chat_db_mcp -- --ignored
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --test chat_db_mcp -- --ignored
 
       - name: Run manual moderation PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
-        run: python3 scripts/run_cargo_test_checked.py cargo test --test manual_moderation -- --ignored
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --test manual_moderation -- --ignored
