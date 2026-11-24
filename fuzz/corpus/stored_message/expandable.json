@@ -1,0 +1,1 @@
+[{"type":"expandable_blockquote","blocks":[{"type":"paragraph","text":{"type":"url","text":"link","url":"https://example.org/hidden"}},{"type":"future_block","payload":{"type":"expandable_blockquote","data":"opaque"}}],"credit":"synthetic"}]
