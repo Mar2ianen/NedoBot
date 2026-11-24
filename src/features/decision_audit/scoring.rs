@@ -120,6 +120,43 @@ mod tests {
         assert_eq!(c.decision_score, 0);
     }
     #[test]
+    fn standalone_priimu_offtopic_qualifies_without_profile_signals() {
+        let mut body: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/decision_response.json"
+        ))
+        .unwrap();
+        body["answers"]["offtopic_message"]["noul"] = json!(0.95);
+        body["answers"]["offtopic_message"]["confidence"] = json!(0.95);
+        let assessment: DecisionAssessment = serde_json::from_value(body).unwrap();
+        let input = json!({
+            "topic_context":{"chat_topic":"Rust","post_topic":null},
+            "profile_signals":{"observed_message_count":1},
+            "text_signals":{"priimu_bait":true,"short_invitation":false}
+        });
+        let c = contribution_with_context(
+            &assessment,
+            &ContactFeatures::default(),
+            &DecisionConfig::default(),
+            &input,
+        );
+        assert!(c.review_candidate);
+        assert!(matches!(c.review_basis, ReviewBasis::OfftopicWithContext));
+        assert_eq!(c.decision_score, 86);
+        assert_eq!(c.semantic_probability, 0.95);
+
+        let mut without_token = input;
+        without_token["text_signals"]["priimu_bait"] = json!(false);
+        let c = contribution_with_context(
+            &assessment,
+            &ContactFeatures::default(),
+            &DecisionConfig::default(),
+            &without_token,
+        );
+        assert!(!c.review_candidate);
+        assert_eq!(c.decision_score, 0);
+    }
+
+    #[test]
     fn implicit_adult_promotion_can_qualify_for_captcha_review() {
         let mut body: Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/decision_response.json"

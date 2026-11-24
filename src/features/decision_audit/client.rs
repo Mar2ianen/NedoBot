@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 pub const QUESTIONS: &str = include_str!("questions.json");
-pub const POLICY_VERSION: &str = "decision-score-v3";
+pub const POLICY_VERSION: &str = "decision-score-v4";
 const MAX_RESPONSE_BYTES: usize = 256 * 1_024;
 
 /// Только содержательные поля уходят провайдеру. IDs provenance и mode/hash — private.
@@ -97,29 +97,19 @@ pub enum ShadowVerdict {
 }
 
 impl DecisionAssessment {
-    /// Оффтоп требует явной темы и сочетания локальных признаков, не одной картинки.
+    /// Отдельное «приму» + уверенный оффтоп относительно известной темы.
+    /// Имя, аватар и ID-risk — дополнительные признаки, не условия этого пути.
     pub fn off_topic_context_candidate(&self, input: &Value) -> bool {
         let topic = &input["topic_context"];
         let has_topic = ["chat_topic", "post_topic"]
             .iter()
             .any(|key| topic[*key].as_str().is_some_and(|s| !s.trim().is_empty()));
-        let p = &input["profile_signals"];
-        let name = p["feminine_first_name_pattern"] == true;
-        let avatar = p["avatar_observable"] == true;
-        let invitation = input["text_signals"]["short_invitation"] == true;
-        let corroborated_profile = (name && avatar) || (invitation && (name || avatar));
         self.captcha_verdict() == ShadowVerdict::NoSignal
             && has_topic
-            && p["observed_message_count"]
+            && input["text_signals"]["priimu_bait"] == true
+            && input["profile_signals"]["observed_message_count"]
                 .as_i64()
                 .is_some_and(|n| (1..=5).contains(&n))
-            && p["telegram_id_spam_probability"]
-                .as_f64()
-                .is_some_and(|n| (0.85..=1.0).contains(&n))
-            && p["telegram_id_model_version"]
-                .as_str()
-                .is_some_and(|s| !s.trim().is_empty())
-            && corroborated_profile
             && matches!(self.answers.get("offtopic_message"),Some(Answer::Noul{noul,confidence}) if *noul>=0.9 && *confidence>=0.8)
     }
 
@@ -537,9 +527,8 @@ mod topic_context_tests {
     use super::*;
     fn context() -> Value {
         json!({"topic_context":{"chat_topic":"Rust","post_topic":null},
-          "profile_signals":{"telegram_id_spam_probability":0.9,"telegram_id_model_version":"synthetic",
-            "observed_message_count":1,"feminine_first_name_pattern":true,"avatar_observable":true},
-          "text_signals":{"short_invitation":false}})
+          "profile_signals":{"observed_message_count":1},
+          "text_signals":{"priimu_bait":true,"short_invitation":false}})
     }
     fn off_topic() -> DecisionAssessment {
         let mut a: DecisionAssessment = serde_json::from_str(include_str!(
@@ -556,7 +545,7 @@ mod topic_context_tests {
         a
     }
     #[test]
-    fn off_topic_captcha_requires_topic_and_corroborating_newcomer_context() {
+    fn priimu_offtopic_captcha_needs_topic_and_newcomer_but_not_profile() {
         let a = off_topic();
         let input = context();
         assert_eq!(a.captcha_verdict(), ShadowVerdict::NoSignal);
@@ -566,14 +555,10 @@ mod topic_context_tests {
         );
         for (path, value) in [
             ("/topic_context/chat_topic", Value::Null),
-            (
-                "/profile_signals/telegram_id_spam_probability",
-                json!(0.8499),
-            ),
-            ("/profile_signals/telegram_id_model_version", json!("")),
+            ("/profile_signals/observed_message_count", json!(0)),
             ("/profile_signals/observed_message_count", json!(6)),
-            ("/profile_signals/feminine_first_name_pattern", json!(false)),
-            ("/profile_signals/avatar_observable", json!(false)),
+            ("/text_signals/priimu_bait", json!(false)),
+            ("/text_signals/priimu_bait", Value::Null),
         ] {
             let mut invalid = input.clone();
             *invalid.pointer_mut(path).unwrap() = value;
@@ -583,12 +568,52 @@ mod topic_context_tests {
                 "{path}"
             );
         }
-        let mut invitation = input.clone();
-        invitation["profile_signals"]["feminine_first_name_pattern"] = json!(false);
-        invitation["text_signals"]["short_invitation"] = json!(true);
+        let mut post_topic = input.clone();
+        post_topic["topic_context"]["chat_topic"] = Value::Null;
+        post_topic["topic_context"]["post_topic"] = json!("Ownership");
         assert_eq!(
-            a.captcha_verdict_for_input(&invitation),
+            a.captcha_verdict_for_input(&post_topic),
             ShadowVerdict::ReviewCandidate
+        );
+        // Старая ветка «имя+аватар разрешают оффтоп» удалена.
+        let mut profile_only = input.clone();
+        profile_only["text_signals"]["priimu_bait"] = json!(false);
+        profile_only["text_signals"]["short_invitation"] = json!(true);
+        profile_only["profile_signals"]["feminine_first_name_pattern"] = json!(true);
+        profile_only["profile_signals"]["avatar_observable"] = json!(true);
+        profile_only["profile_signals"]["telegram_id_spam_probability"] = json!(0.99);
+        profile_only["profile_signals"]["telegram_id_model_version"] = json!("synthetic");
+        assert_eq!(
+            a.captcha_verdict_for_input(&profile_only),
+            ShadowVerdict::NoSignal
+        );
+        // Дополнительные признаки не мешают и не обязательны.
+        let mut with_profile = input.clone();
+        with_profile["profile_signals"]["feminine_first_name_pattern"] = json!(true);
+        with_profile["profile_signals"]["avatar_observable"] = json!(true);
+        with_profile["profile_signals"]["telegram_id_spam_probability"] = json!(0.99);
+        with_profile["profile_signals"]["telegram_id_model_version"] = json!("synthetic");
+        assert_eq!(
+            a.captcha_verdict_for_input(&with_profile),
+            ShadowVerdict::ReviewCandidate
+        );
+        for (noul, confidence) in [(0.899, 0.95), (0.95, 0.799)] {
+            let mut weak = off_topic();
+            weak.answers
+                .insert("offtopic_message".into(), Answer::Noul { noul, confidence });
+            assert_eq!(
+                weak.captcha_verdict_for_input(&input),
+                ShadowVerdict::NoSignal,
+                "{noul}/{confidence}"
+            );
+        }
+        let on_topic: DecisionAssessment = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/decision_response.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            on_topic.captcha_verdict_for_input(&input),
+            ShadowVerdict::NoSignal
         );
         let mut quoted = off_topic();
         quoted.answers.insert(
@@ -601,18 +626,6 @@ mod topic_context_tests {
         assert_eq!(
             quoted.captcha_verdict_for_input(&input),
             ShadowVerdict::Abstain
-        );
-        let mut uncertain = off_topic();
-        uncertain.answers.insert(
-            "offtopic_message".into(),
-            Answer::Noul {
-                noul: 0.95,
-                confidence: 0.5,
-            },
-        );
-        assert_eq!(
-            uncertain.captcha_verdict_for_input(&input),
-            ShadowVerdict::NoSignal
         );
     }
     #[test]

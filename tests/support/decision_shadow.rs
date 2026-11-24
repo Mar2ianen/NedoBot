@@ -153,7 +153,7 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
     assert!(repo::claim(pool, &c).await.unwrap().is_none());
     c.community.instance.id = "decision_fixture".into();
     assert_first_author_text_sampling(pool, &c).await;
-    assert_short_bait_profile_gate(pool, &c).await;
+    assert_short_bait_enqueue_gate(pool, &c).await;
     assert_temporal_id_context_snapshot(pool, &c).await;
     assert_post_topic_provenance(pool, &c).await;
     assert_channel_sender_is_not_a_person(pool, &c).await;
@@ -182,13 +182,15 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
 
 /// Контрпример старой ветке: второй короткий текст при initial_texts=1.
 /// Проверяем реальный SQL enqueue, privacy и veto; внешние API не вызываются.
-async fn assert_short_bait_profile_gate(pool: &PgPool, config: &Config) {
+/// Отдельное «приму» больше не требует имени/аватара, остальные короткие
+/// приглашения сохраняют profile gate.
+async fn assert_short_bait_enqueue_gate(pool: &PgPool, config: &Config) {
     for (index, (text, name, avatar, avatar_enabled, veto, expected)) in [
+        ("Приму", false, false, false, "none", true),
         ("Приму", true, false, false, "none", true),
-        ("Приму", false, false, false, "none", false),
         ("Приму", false, true, true, "none", true),
-        ("Приму", false, true, false, "none", false),
-        ("Приму PR после тестов", true, true, true, "none", false),
+        ("Приму", false, true, false, "none", true),
+        ("Приму PR после тестов", true, true, true, "none", true),
         ("Прuму", true, false, false, "none", false),
         ("Пpиму\u{200b} к себе!!!", true, false, false, "none", true),
         ("Хороший день", true, true, true, "none", false),
@@ -206,6 +208,22 @@ async fn assert_short_bait_profile_gate(pool: &PgPool, config: &Config) {
             false,
             "none",
             true,
+        ),
+        (
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            false,
+            false,
+            false,
+            "none",
+            false,
+        ),
+        (
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            false,
+            true,
+            false,
+            "none",
+            false,
         ),
     ]
     .into_iter()
@@ -265,6 +283,19 @@ async fn assert_short_bait_profile_gate(pool: &PgPool, config: &Config) {
             assert_eq!(
                 input["profile_signals"]["feminine_first_name_pattern"],
                 name
+            );
+            assert_eq!(
+                input["text_signals"]["priimu_bait"],
+                ["Приму", "Приму PR после тестов", "Пpиму\u{200b} к себе!!!"].contains(&text)
+            );
+            assert_eq!(
+                input["text_signals"]["short_invitation"],
+                [
+                    "Приму",
+                    "Пpиму\u{200b} к себе!!!",
+                    "\u{200b}Котики, мне скучно, кто в гости? 😘"
+                ]
+                .contains(&text)
             );
             assert_eq!(avatar_file.is_some(), avatar && avatar_enabled);
             assert_eq!(action, "not_requested");

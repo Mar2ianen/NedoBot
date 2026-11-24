@@ -7,6 +7,10 @@ use sqlx::PgPool;
 /// операцию опасно — reconciliation мог бы разойтись с ещё идущим запросом.
 pub const STARTED_RECONCILE_GRACE_SECONDS: i64 = 120;
 
+/// Bounded Telegram-выдача: 8 строк с коротким preview причины помещаются
+/// в одно сообщение даже после HTML-экранирования.
+pub const PENDING_PAGE_SIZE: i64 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Ban,
@@ -139,20 +143,43 @@ pub struct PendingOperation {
     pub created_at: DateTime<Utc>,
 }
 
-/// Операции, которые блокируют новые команды этого канала.
-pub async fn pending(pool: &PgPool, chat_id: i64) -> anyhow::Result<Vec<PendingOperation>> {
-    sqlx::query_as::<_, PendingOperation>(
+#[derive(Debug)]
+pub struct PendingPage {
+    pub operations: Vec<PendingOperation>,
+    pub total: i64,
+    pub page: u32,
+}
+
+/// Операции, которые блокируют новые команды этого канала. Выдача ограничена
+/// одной страницей, чтобы `/channelops` не превышал лимит Telegram.
+pub async fn pending(pool: &PgPool, chat_id: i64, page: u32) -> anyhow::Result<PendingPage> {
+    anyhow::ensure!(page > 0, "invalid channel operations page");
+    let total: i64 = sqlx::query_scalar(
+        "select count(*) from manual_sender_chat_operations
+         where chat_id = $1 and status in ('started', 'unknown')",
+    )
+    .bind(chat_id)
+    .fetch_one(pool)
+    .await?;
+    let offset = i64::from(page - 1) * PENDING_PAGE_SIZE;
+    let operations = sqlx::query_as::<_, PendingOperation>(
         r#"select id, sender_chat_id, command_message_id, actor_user_id, action, reason,
                   status, created_at
            from manual_sender_chat_operations
            where chat_id = $1 and status in ('started', 'unknown')
            order by id
-           limit 50"#,
+           limit $2 offset $3"#,
     )
     .bind(chat_id)
+    .bind(PENDING_PAGE_SIZE)
+    .bind(offset)
     .fetch_all(pool)
-    .await
-    .map_err(Into::into)
+    .await?;
+    Ok(PendingPage {
+        operations,
+        total,
+        page,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]

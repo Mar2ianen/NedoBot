@@ -2157,6 +2157,53 @@ mod tests {
             ReconcileOutcome::NotFound
         );
 
+        // Список ограничен страницей: 10 записей не помещаются в одно сообщение.
+        let pagination_channel = -1_009_900_000_300i64;
+        for index in 0..10 {
+            sqlx::query(
+                "insert into manual_sender_chat_operations(chat_id,command_message_id,sender_chat_id,actor_user_id,action,reason,status)
+                 values($1,$2,$3,$4,'ban',$5,'unknown')",
+            )
+            .bind(chat_id)
+            .bind(base + 20 + index)
+            .bind(pagination_channel - i64::from(index))
+            .bind(9002_i64)
+            .bind("длинная причина ".repeat(100))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let replies_before = stub.replies.lock().unwrap().len();
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 40, pagination_channel, None),
+            &state,
+            "",
+        )
+        .await
+        .unwrap();
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 41, pagination_channel, None),
+            &state,
+            "2",
+        )
+        .await
+        .unwrap();
+        let (page1, page2) = {
+            let replies = stub.replies.lock().unwrap();
+            (
+                replies[replies_before].as_str().unwrap().to_string(),
+                replies[replies_before + 1].as_str().unwrap().to_string(),
+            )
+        };
+        assert!(page1.contains("страница 1 из 2"), "{page1}");
+        assert!(page1.contains("/channelops 2 — следующая"), "{page1}");
+        assert!(page2.contains("страница 2 из 2"), "{page2}");
+        assert!(page2.contains("/channelops 1 — предыдущая"), "{page2}");
+        assert!(page1.encode_utf16().count() <= 4096);
+        assert!(page2.encode_utf16().count() <= 4096);
+
         sqlx::query("delete from manual_sender_chat_operations where chat_id=$1")
             .bind(chat_id)
             .execute(pool)

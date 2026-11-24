@@ -44,13 +44,14 @@ struct Source {
     avatar_unique_id: Option<String>,
 }
 
-/// Короткие завуалированные приглашения не доказывают спам.
-/// Это лишь повод запросить Decision с доступными сигналами профиля.
-fn short_adult_contact_bait(text: &str) -> bool {
-    // Общий versioned Unicode view. Не обрезаем длинный текст до bait-префикса.
+const SHORT_BAIT_MAX_CHARS: usize = 80;
+
+/// Bounded versioned Unicode view для коротких эвфемизмов. Длинный текст
+/// не обрезается до bait-префикса и не считается коротким приглашением.
+fn normalized_short_text(text: &str) -> Option<String> {
     let bounded: String = text.chars().take(structure::MAX_INPUT_CHARS + 1).collect();
     if bounded.chars().count() > structure::MAX_INPUT_CHARS {
-        return false;
+        return None;
     }
     let prepared = prepare_text(&bounded);
     let normalized = prepared
@@ -59,11 +60,26 @@ fn short_adult_contact_bait(text: &str) -> bool {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    if normalized.chars().count() > 80 {
-        return false;
-    }
+    (normalized.chars().count() <= SHORT_BAIT_MAX_CHARS).then_some(normalized)
+}
+
+fn contains_word(normalized: &str, word: &str) -> bool {
+    normalized.split(' ').any(|token| token == word)
+}
+
+fn is_priimu_bait(normalized: &str) -> bool {
+    contains_word(normalized, "приму")
+}
+
+/// Отдельный токен «приму» после bounded Unicode-нормализации. Это только
+/// локальный hint: санкцию по-прежнему разрешает модель и общий threshold.
+fn contains_priimu_bait(text: &str) -> bool {
+    normalized_short_text(text).is_some_and(|normalized| is_priimu_bait(&normalized))
+}
+
+fn short_invitation_normalized(normalized: &str) -> bool {
     matches!(
-        normalized.as_str(),
+        normalized,
         "приму"
             | "приму к себе"
             | "приму мужчину"
@@ -79,12 +95,19 @@ fn short_adult_contact_bait(text: &str) -> bool {
         || normalized.ends_with(" кто в гости")
 }
 
+/// Короткие завуалированные приглашения не доказывают спам.
+/// Это лишь повод запросить Decision с доступными сигналами профиля.
+fn short_adult_contact_bait(text: &str) -> bool {
+    normalized_short_text(text).is_some_and(|normalized| short_invitation_normalized(&normalized))
+}
+
 fn short_bait_for_decision(
-    text: &str,
+    priimu_bait: bool,
+    short_invitation: bool,
     feminine_name_pattern: bool,
     avatar_observable: bool,
 ) -> bool {
-    (feminine_name_pattern || avatar_observable) && short_adult_contact_bait(text)
+    priimu_bait || ((feminine_name_pattern || avatar_observable) && short_invitation)
 }
 
 /// SQL-only дешёвая стадия после ingest; не ждёт profile API, LLM или embedding.
@@ -163,8 +186,14 @@ pub async fn observe_message(
     let avatar_observable = config.community.moderation.decision.avatar_enabled
         && source.avatar_file_id.is_some()
         && source.avatar_unique_id.is_some();
-    let short_bait_candidate =
-        short_bait_for_decision(&source.text, feminine_name_pattern, avatar_observable);
+    let short_invitation = short_adult_contact_bait(&source.text);
+    let priimu_bait = contains_priimu_bait(&source.text);
+    let short_bait_candidate = short_bait_for_decision(
+        priimu_bait,
+        short_invitation,
+        feminine_name_pattern,
+        avatar_observable,
+    );
     let local_candidate = campaign.is_some() || short_bait_candidate;
     let reason = if source.normal_veto {
         "manual_not_spam"
@@ -217,7 +246,7 @@ pub async fn observe_message(
             "feminine_first_name_pattern":feminine_name_pattern,"avatar_observable":avatar_observable,
             "telegram_id_spam_probability":id_probability,"telegram_id_model_version":id_model.as_ref().map(|model|&model.version),
             "evaluated_on_utc":source.created_at.date_naive(),"observed_message_count":source.message_count},
-        "text_signals":{"short_invitation":short_adult_contact_bait(&source.text)},
+        "text_signals":{"short_invitation":short_invitation,"priimu_bait":priimu_bait},
         "topic_context":{"chat_topic":settings.chat_topic,"post_topic":post_topic.as_ref().map(|(text,_)|text)},
         "_post_context":post_topic.as_ref().map(|(_,snapshot)|snapshot),
         "score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
@@ -391,7 +420,7 @@ pub async fn process_next(
 
 #[cfg(test)]
 mod short_bait_tests {
-    use super::{short_adult_contact_bait, short_bait_for_decision};
+    use super::{contains_priimu_bait, short_adult_contact_bait, short_bait_for_decision};
 
     #[test]
     fn short_invitations_reach_decision_candidate_gate() {
@@ -412,15 +441,37 @@ mod short_bait_tests {
     }
 
     #[test]
-    fn profile_context_is_required_for_additional_decision_enqueue() {
-        assert!(!short_bait_for_decision("Приму", false, false));
-        assert!(short_bait_for_decision("Приму", true, false));
-        assert!(short_bait_for_decision("Приму", false, true));
-        assert!(!short_bait_for_decision(
+    fn standalone_priimu_is_a_hint_without_profile_context() {
+        for sample in [
+            "Приму",
+            "Приму сегодня",
+            "Приму для встречи",
+            "Пpиму\u{200b} к себе!!!",
             "Приму PR после тестов",
-            true,
-            true
-        ));
+        ] {
+            assert!(contains_priimu_bait(sample), "{sample}");
+        }
+        for sample in [
+            "Прuму",
+            "Приём ведётся по записи",
+            "примут заявку",
+            "Хороший день",
+        ] {
+            assert!(!contains_priimu_bait(sample), "{sample}");
+        }
+        assert!(!contains_priimu_bait(&format!(
+            "Приму{}",
+            " ".repeat(20_000)
+        )));
+    }
+
+    #[test]
+    fn profile_context_is_only_needed_for_other_short_invitations() {
+        assert!(short_bait_for_decision(true, false, false, false));
+        assert!(short_bait_for_decision(false, true, true, false));
+        assert!(short_bait_for_decision(false, true, false, true));
+        assert!(!short_bait_for_decision(false, true, false, false));
+        assert!(!short_bait_for_decision(false, false, true, true));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Adapter ручного ban/unban канала; права проверяет вызывающий manual handler.
 use crate::features::manual_moderation::{
     sender_chat::{
-        self, Action, PendingOperation, ReconcileOutcome, Request, Reservation, Resolution,
+        self, Action, PENDING_PAGE_SIZE, PendingPage, ReconcileOutcome, Request, Reservation,
+        Resolution,
     },
     types::{CommandKind, ParsedCommand},
 };
@@ -96,7 +97,9 @@ pub(super) async fn execute(
 
 #[derive(Debug, PartialEq, Eq)]
 enum ReconcileRequest {
-    List,
+    List {
+        page: u32,
+    },
     Resolve {
         operation_id: i64,
         resolution: Resolution,
@@ -122,11 +125,27 @@ fn parse_reconcile_request(args: &str) -> anyhow::Result<ReconcileRequest> {
             note.is_none(),
             "примечание можно указать только вместе с подтверждением"
         );
-        return Ok(ReconcileRequest::List);
+        return Ok(ReconcileRequest::List { page: 1 });
+    }
+    if tokens.len() == 1 {
+        anyhow::ensure!(
+            note.is_none(),
+            "примечание можно указать только вместе с подтверждением"
+        );
+        let page = tokens[0]
+            .parse::<u32>()
+            .ok()
+            .filter(|page| (1..=10_000).contains(page))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "страница должна быть числом от 1 до 10000; для подтверждения используй /channelops <id> applied|not_applied"
+                )
+            })?;
+        return Ok(ReconcileRequest::List { page });
     }
     anyhow::ensure!(
         tokens.len() == 2,
-        "используй /channelops <id> applied|not_applied [-- примечание]"
+        "используй /channelops [страница] или /channelops <id> applied|not_applied [-- примечание]"
     );
     let operation_id = tokens[0]
         .parse::<i64>()
@@ -183,13 +202,15 @@ pub(super) async fn handle_reconcile(
         }
     };
     let text = match request {
-        ReconcileRequest::List => match sender_chat::pending(&state.pool, msg.chat.id.0).await {
-            Ok(operations) => render_pending(&operations),
-            Err(error) => {
-                tracing::error!(%error, "failed to list manual channel operations");
-                "Не удалось прочитать журнал операций с каналами.".to_string()
+        ReconcileRequest::List { page } => {
+            match sender_chat::pending(&state.pool, msg.chat.id.0, page).await {
+                Ok(page) => render_pending(&page),
+                Err(error) => {
+                    tracing::error!(%error, "failed to list manual channel operations");
+                    "Не удалось прочитать журнал операций с каналами.".to_string()
+                }
             }
-        },
+        }
         ReconcileRequest::Resolve {
             operation_id,
             resolution,
@@ -215,15 +236,29 @@ pub(super) async fn handle_reconcile(
     Ok(())
 }
 
-fn render_pending(operations: &[PendingOperation]) -> String {
-    if operations.is_empty() {
+const MAX_REASON_PREVIEW_CHARS: usize = 80;
+
+fn render_pending(page: &PendingPage) -> String {
+    if page.total == 0 {
         return "Незавершённых операций с каналами нет.".to_string();
     }
-    let mut lines = vec!["Незавершённые операции с каналами:".to_string()];
-    for operation in operations {
+    let total_pages = u32::try_from((page.total - 1) / PENDING_PAGE_SIZE + 1).unwrap_or(u32::MAX);
+    if page.operations.is_empty() {
+        return format!(
+            "На странице {} незавершённых операций нет. Всего: {}; доступны страницы 1..={total_pages}.",
+            page.page, page.total
+        );
+    }
+    let mut lines = vec![format!(
+        "Незавершённые операции с каналами (страница {} из {total_pages}, всего {}):",
+        page.page, page.total
+    )];
+    for operation in &page.operations {
         let reason = operation
             .reason
             .as_deref()
+            .map(reason_preview)
+            .filter(|reason| !reason.is_empty())
             .map(|reason| format!(" · причина: {reason}"))
             .unwrap_or_default();
         lines.push(format!(
@@ -238,11 +273,45 @@ fn render_pending(operations: &[PendingOperation]) -> String {
             reason
         ));
     }
+    if total_pages > 1 {
+        let mut navigation = Vec::new();
+        if page.page > 1 {
+            navigation.push(format!("/channelops {} — предыдущая", page.page - 1));
+        }
+        if page.page < total_pages {
+            navigation.push(format!("/channelops {} — следующая", page.page + 1));
+        }
+        if !navigation.is_empty() {
+            lines.push(format!("Навигация: {}.", navigation.join(", ")));
+        }
+    }
     lines.push(
         "Проверь ограничение в Telegram и подтверди: /channelops <id> applied|not_applied [-- примечание]."
             .to_string(),
     );
     lines.join("\n")
+}
+
+/// Preview причины не должен раздувать сообщение HTML-экранированием.
+fn reason_preview(reason: &str) -> String {
+    let flattened = reason
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | '&' | '"') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    let flattened = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flattened.chars();
+    let preview: String = chars.by_ref().take(MAX_REASON_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn render_reconcile(
@@ -306,13 +375,26 @@ fn success(action: Action) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::manual_moderation::sender_chat::PendingOperation;
+    use chrono::{TimeZone, Utc};
 
     #[test]
-    fn reconcile_command_lists_operations_without_arguments() {
-        assert_eq!(parse_reconcile_request("").unwrap(), ReconcileRequest::List);
+    fn reconcile_command_lists_the_first_page_without_arguments() {
+        assert_eq!(
+            parse_reconcile_request("").unwrap(),
+            ReconcileRequest::List { page: 1 }
+        );
         assert_eq!(
             parse_reconcile_request("   ").unwrap(),
-            ReconcileRequest::List
+            ReconcileRequest::List { page: 1 }
+        );
+        assert_eq!(
+            parse_reconcile_request("2").unwrap(),
+            ReconcileRequest::List { page: 2 }
+        );
+        assert_eq!(
+            parse_reconcile_request("10000").unwrap(),
+            ReconcileRequest::List { page: 10_000 }
         );
     }
 
@@ -335,7 +417,6 @@ mod tests {
             }
         );
         for args in [
-            "42",
             "42 maybe",
             "0 applied",
             "-1 applied",
@@ -347,10 +428,84 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_command_bounds_the_operator_note() {
+    fn reconcile_command_bounds_pages_and_the_operator_note() {
+        for args in ["0", "10001", "-1", "page", "2 -- примечание"] {
+            assert!(parse_reconcile_request(args).is_err(), "{args}");
+        }
         let note = "x".repeat(501);
         assert!(parse_reconcile_request(&format!("42 applied -- {note}")).is_err());
         let note = "x".repeat(500);
         assert!(parse_reconcile_request(&format!("42 applied -- {note}")).is_ok());
+    }
+
+    fn operation(id: i64, reason: Option<String>) -> PendingOperation {
+        PendingOperation {
+            id,
+            sender_chat_id: i64::MIN,
+            command_message_id: i32::MAX,
+            actor_user_id: i64::MAX,
+            action: "ban".to_string(),
+            reason,
+            status: "started".to_string(),
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn pending_listing_is_bounded_and_paginated() {
+        let operations = (0..PENDING_PAGE_SIZE)
+            .map(|index| operation(i64::MAX - index, Some("<&>\"😀 ".repeat(100))))
+            .collect();
+        let text = render_pending(&PendingPage {
+            operations,
+            total: PENDING_PAGE_SIZE * 2,
+            page: 1,
+        });
+        assert!(text.contains(&format!("#{}", i64::MAX)));
+        assert!(text.contains("страница 1 из 2"));
+        assert!(text.contains("/channelops 2 — следующая"));
+        assert!(text.contains('…'));
+        let escaped = crate::telegram::html::Html::text(&text).into_string();
+        assert!(
+            escaped.encode_utf16().count() <= 4096,
+            "{}",
+            escaped.encode_utf16().count()
+        );
+
+        let text = render_pending(&PendingPage {
+            operations: vec![operation(1, None)],
+            total: PENDING_PAGE_SIZE + 1,
+            page: 2,
+        });
+        assert!(text.contains("страница 2 из 2"));
+        assert!(text.contains("/channelops 1 — предыдущая"));
+        assert!(!text.contains("/channelops 3"));
+    }
+
+    #[test]
+    fn pending_listing_handles_empty_and_out_of_range_pages() {
+        assert_eq!(
+            render_pending(&PendingPage {
+                operations: Vec::new(),
+                total: 0,
+                page: 1,
+            }),
+            "Незавершённых операций с каналами нет."
+        );
+        let text = render_pending(&PendingPage {
+            operations: Vec::new(),
+            total: PENDING_PAGE_SIZE,
+            page: 3,
+        });
+        assert!(text.contains("На странице 3 незавершённых операций нет"));
+        assert!(text.contains("доступны страницы 1..=1"));
+    }
+
+    #[test]
+    fn reason_preview_strips_html_specials_and_truncates() {
+        let preview = reason_preview(&format!("{}😀", "<&>\" причина ".repeat(200)));
+        assert!(!preview.contains(['<', '>', '&', '"']));
+        assert!(preview.ends_with('…'));
+        assert_eq!(reason_preview("  обычная\nпричина  "), "обычная причина");
     }
 }

@@ -603,20 +603,17 @@ async fn assert_contacts(pool: &PgPool) {
         .unwrap();
 }
 
-/// Off-topic + ID/profile context может вызвать existing captcha без promo verdict.
-/// Правка темы поста отзывает основание и предотвращает бан по старой капче.
+/// «Приму» + уверенный оффтоп вызывает existing captcha без promo verdict.
+/// Имя, аватар и ID-risk не обязательны; правка темы поста отзывает основание.
 async fn assert_offtopic_combination_handoff(pool: &PgPool, bot: &Bot, stub: &TelegramStub) {
     reset(pool,stub).await;
     let mut c=config();c.community.moderation.decision.chat_topic=Some("Программирование на Rust".into());
     let key=c.community.moderation.risk_profile.clone();
-    c.community.risk_profiles.get_mut(&key).unwrap().telegram_id=Some(serde_json::from_value(json!({
-        "floor":0.9,"ceil":1.0,"k":1.0,"midpoint_billion":8.0,"version":"synthetic-high-id"})).unwrap());
+    c.community.risk_profiles.get_mut(&key).unwrap().telegram_id=None;
     c.discussion_chat_id=CHAT_ID;c.source_channel_id=CHAT_ID-1;c.community.first_comment.routes.clear();
     c.community.moderation.decision.post_topics.push(serde_json::from_value(json!({
         "discussion_chat_id":CHAT_ID,"post_message_id":499,"topic":"Rust borrowing"})).unwrap());
-    let previous:Option<Option<String>>=query_scalar("select first_name from telegram_user_profiles where telegram_user_id=$1")
-        .bind(USER_ID).fetch_optional(pool).await.unwrap();
-    query("insert into telegram_user_profiles (telegram_user_id,first_name,profile_photo_file_id,profile_photo_file_unique_id) values ($1,'Катюша','synthetic-avatar','synthetic-avatar-unique') on conflict(telegram_user_id) do update set first_name=excluded.first_name")
+    query("delete from telegram_user_profiles where telegram_user_id=$1")
         .bind(USER_ID).execute(pool).await.unwrap();
     query("insert into telegram_messages(chat_id,message_id,source_channel_id,is_automatic_forward,text) values ($1,499,$2,true,'Rust ownership and borrowing')")
         .bind(CHAT_ID).bind(c.source_channel_id).execute(pool).await.unwrap();
@@ -629,6 +626,10 @@ async fn assert_offtopic_combination_handoff(pool: &PgPool, bot: &Bot, stub: &Te
     assert_eq!(a.captcha_verdict(),tg_ai_bot_teloxide::features::decision_audit::client::ShadowVerdict::NoSignal);
     let job=completed(pool,&c,&a).await;
     assert_eq!(job.input_json["topic_context"]["post_topic"],"Rust borrowing");
+    assert_eq!(job.input_json["text_signals"]["priimu_bait"],true);
+    assert_eq!(job.input_json["profile_signals"]["feminine_first_name_pattern"],false);
+    assert_eq!(job.input_json["profile_signals"]["avatar_observable"],false);
+    assert_eq!(job.input_json["profile_signals"]["telegram_id_spam_probability"],Value::Null);
     assert!(actions::process_next(bot,pool,&c).await.unwrap());
     let (verdict,reason,metrics):(String,String,Value)=sqlx::query_as("select shadow_verdict,action_error_kind,metrics_json from moderation_decision_jobs where id=$1")
         .bind(job.id).fetch_one(pool).await.unwrap();
@@ -645,8 +646,4 @@ async fn assert_offtopic_combination_handoff(pool: &PgPool, bot: &Bot, stub: &Te
     assert_eq!(status(pool).await,"overridden");
     assert!(!stub.banned.load(Ordering::SeqCst));
     reset(pool,stub).await;
-    match previous {
-        Some(name)=>{query("update telegram_user_profiles set first_name=$2 where telegram_user_id=$1").bind(USER_ID).bind(name).execute(pool).await.unwrap();}
-        None=>{query("delete from telegram_user_profiles where telegram_user_id=$1").bind(USER_ID).execute(pool).await.unwrap();}
-    }
 }
