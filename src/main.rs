@@ -52,7 +52,6 @@ use features::voice::pipeline::{maybe_transcribe_voice, process_next_voice_job};
 use llm::genai_transport::GenAiTransport;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
-use telegram::commands::Command;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -248,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
 
     let handler = telegram::router::build(telegram::router::Routes {
         command: dptree::entry()
-            .filter_command::<Command>()
+            .filter_map(telegram::router::parse_bot_command)
             .endpoint(handle_command),
         message: dptree::endpoint(handle_message),
         reaction: Update::filter_message_reaction_updated()
