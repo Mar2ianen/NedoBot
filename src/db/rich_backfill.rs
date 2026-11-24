@@ -2,7 +2,6 @@
 use crate::telegram::entities::{message_has_links, message_text};
 use crate::telegram::export_rich;
 use sqlx::PgPool;
-use teloxide::types::Message;
 
 const PAGE_SIZE: i64 = 200;
 
@@ -57,7 +56,7 @@ fn stored_rich_text(
     message_id: i32,
 ) -> Option<(String, bool)> {
     if raw.get("message_id").is_some() || raw.get("chat").is_some() {
-        let message: Message = serde_json::from_value(raw.clone()).ok()?;
+        let message = crate::telegram::entities::deserialize_stored_message(raw.clone()).ok()?;
         // Не переносим текст из повреждённого native payload чужого чата/сообщения.
         if message.chat.id.0 != chat_id || message.id.0 != message_id {
             return None;

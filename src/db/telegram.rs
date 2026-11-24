@@ -405,7 +405,7 @@ pub async fn save_edited_telegram_message(
 ) -> anyhow::Result<MessagePersistenceOutcome> {
     let old = load_message_snapshot(pool, msg.chat.id.0, msg.id.0).await?;
     let new_text = message_text(msg);
-    let new_raw_json = serde_json::to_value(msg)?;
+    let new_raw_json = crate::telegram::entities::serialize_stored_message(msg)?;
     let changed = old.as_ref().is_none_or(|old| {
         old.text.as_deref() != new_text.as_deref() || old.raw_json != new_raw_json
     });
@@ -426,7 +426,8 @@ pub async fn save_edited_telegram_message(
     }
 
     if let Some(old) = old.as_ref()
-        && let Ok(old_message) = serde_json::from_value::<Message>(old.raw_json.clone())
+        && let Ok(old_message) =
+            crate::telegram::entities::deserialize_stored_message(old.raw_json.clone())
     {
         let old_had_references =
             !teloxide_url::adapter::extract_from_message(&old_message).is_empty();

@@ -1,6 +1,80 @@
-use super::rich_content::{project, rich_message};
+use super::rich_content::{project, project_blocks, rich_message};
 use std::borrow::Cow;
-use teloxide::types::{Message, MessageEntityKind, MessageId, MessageOrigin};
+use teloxide::types::{Message, MessageEntityKind, MessageId, MessageOrigin, RichBlock};
+
+/// Persist both Bot API 10.4 and 10.5 expandable-quote fields. RC1 readers
+/// require `text` and ignore the newer `blocks`; RC2 readers use `blocks`.
+pub fn serialize_stored_message(message: &Message) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(message)?;
+    add_legacy_expandable_quote_text(&mut value)?;
+    Ok(value)
+}
+
+pub fn serialize_stored_messages(messages: &[Message]) -> anyhow::Result<serde_json::Value> {
+    messages
+        .iter()
+        .map(serialize_stored_message)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(serde_json::Value::Array)
+}
+
+/// Upgrade stored Bot API 10.4 expandable quotes before deserializing with RC2.
+/// Keeping `text` in dual-format rows also allows rolling back to the RC1 binary.
+pub fn deserialize_stored_message(mut value: serde_json::Value) -> serde_json::Result<Message> {
+    add_expandable_quote_blocks(&mut value);
+    serde_json::from_value(value)
+}
+
+fn add_legacy_expandable_quote_text(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.get("type").and_then(serde_json::Value::as_str)
+                    == Some("expandable_blockquote")
+                    && !object.contains_key("text")
+                {
+                    let blocks = object
+                        .get("blocks")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("expandable quote has no blocks"))?;
+                    let blocks: Vec<RichBlock> = serde_json::from_value(blocks)?;
+                    object.insert(
+                        "text".to_owned(),
+                        serde_json::Value::String(project_blocks(&blocks).text),
+                    );
+                }
+                pending.extend(object.values_mut());
+            }
+            serde_json::Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn add_expandable_quote_blocks(value: &mut serde_json::Value) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.get("type").and_then(serde_json::Value::as_str)
+                    == Some("expandable_blockquote")
+                    && !object.contains_key("blocks")
+                    && let Some(text) = object.get("text").cloned()
+                {
+                    object.insert(
+                        "blocks".to_owned(),
+                        serde_json::json!([{"type": "paragraph", "text": text}]),
+                    );
+                }
+                pending.extend(object.values_mut());
+            }
+            serde_json::Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TelegramMessageRef {
@@ -59,7 +133,7 @@ pub struct TelegramMessageProjection {
 }
 
 impl TelegramMessageProjection {
-    pub fn from_message(message: &Message) -> serde_json::Result<Self> {
+    pub fn from_message(message: &Message) -> anyhow::Result<Self> {
         let (source_channel_id, source_message_id) = forwarded_channel_post(message)
             .map(|(chat_id, message_id)| (Some(chat_id), Some(message_id.0)))
             .unwrap_or((None, None));
@@ -77,7 +151,7 @@ impl TelegramMessageProjection {
             sender_chat_id: message.sender_chat.as_ref().map(|chat| chat.id.0),
             via_bot_id: message.via_bot.as_ref().map(|bot| bot.id.0 as i64),
             text: message_text(message).map(Cow::into_owned),
-            raw_json: serde_json::to_value(message)?,
+            raw_json: serialize_stored_message(message)?,
             has_photo: message.photo().is_some(),
             has_video: message.video().is_some(),
             has_document: message.document().is_some(),
@@ -185,7 +259,8 @@ mod tests {
     #[cfg(any(feature = "ask", feature = "moderation"))]
     use super::utf16_range;
     use super::{
-        MessageRevision, TelegramMessageProjection, message_has_links, message_url_targets,
+        MessageRevision, TelegramMessageProjection, deserialize_stored_message, message_has_links,
+        message_text, message_url_targets, serialize_stored_messages,
     };
     use teloxide::types::Message;
 
@@ -292,5 +367,75 @@ mod tests {
         );
         assert_eq!(targets[0].label.as_deref(), Some("open"));
         assert_eq!(targets[0].span, Some(4..8));
+    }
+
+    #[test]
+    fn stored_rich_quotes_round_trip_both_rc1_and_rc2_wire_fields() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 10,
+            "date": 1_700_000_000,
+            "chat": {"id": -10042, "type": "supergroup"},
+            "rich_message": {"blocks": [{
+                "type": "expandable_blockquote",
+                "blocks": [
+                    {"type": "paragraph", "text": "Цитата"},
+                    {"type": "paragraph", "text": {"type": "url", "url": "https://example.org/hidden", "text": "ссылка"}}
+                ],
+                "credit": "источник"
+            }]}
+        }))
+        .unwrap();
+
+        let projection = TelegramMessageProjection::from_message(&message).unwrap();
+        let stored = projection.raw_json;
+        assert_eq!(
+            serialize_stored_messages(std::slice::from_ref(&message)).unwrap()[0],
+            stored
+        );
+        let quote = stored.pointer("/rich_message/blocks/0").unwrap();
+        assert_eq!(quote["text"], "Цитата\nссылка");
+        assert_eq!(quote["blocks"][0]["text"], "Цитата");
+        assert_eq!(quote["credit"], "источник");
+        assert!(
+            quote.get("blocks").is_some(),
+            "RC2 readers require the blocks field"
+        );
+        assert!(
+            quote.get("text").is_some(),
+            "RC1 rollback readers require the legacy text field"
+        );
+
+        let restored = deserialize_stored_message(stored).unwrap();
+        assert_eq!(
+            message_text(&restored).as_deref(),
+            Some("Цитата\nссылка\n\nисточник")
+        );
+        assert_eq!(
+            message_url_targets(&restored)
+                .iter()
+                .map(|found| found.value.as_str())
+                .collect::<Vec<_>>(),
+            ["https://example.org/hidden"]
+        );
+    }
+
+    #[test]
+    fn stored_rc1_expandable_quote_is_upgraded_for_rc2_deserialization() {
+        let old_payload = serde_json::json!({
+            "message_id": 11,
+            "date": 1_700_000_000,
+            "chat": {"id": -10042, "type": "supergroup"},
+            "rich_message": {"blocks": [{
+                "type": "expandable_blockquote",
+                "text": {"type": "bold", "text": "Старая цитата"},
+                "credit": "старый источник"
+            }]}
+        });
+
+        let restored = deserialize_stored_message(old_payload).unwrap();
+        assert_eq!(
+            message_text(&restored).as_deref(),
+            Some("Старая цитата\n\nстарый источник")
+        );
     }
 }

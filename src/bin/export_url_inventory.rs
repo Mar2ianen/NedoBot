@@ -272,13 +272,14 @@ async fn export(pool: &PgPool, chat_id: i64, output: &str, show_paths: bool) -> 
                 entry.display_target = target;
                 entry.identity_sha256 = fingerprint;
             }
-            let message: Message = match serde_json::from_value(raw_json) {
-                Ok(message) => message,
-                Err(_) => {
-                    unreadable += 1;
-                    continue;
-                }
-            };
+            let message: Message =
+                match tg_ai_bot_teloxide::telegram::entities::deserialize_stored_message(raw_json) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        unreadable += 1;
+                        continue;
+                    }
+                };
             for found in teloxide_url::adapter::extract_from_message(&message) {
                 let kind = match found.kind {
                     Kind::Url => "url",

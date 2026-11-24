@@ -244,7 +244,7 @@ async fn fetch_personal_channel_messages(
     let messages = bot.get_user_personal_chat_messages(user_id, 5).await?;
     // Старые строки в personal_channel_raw_json сохраняют raw API envelope.
     // Новые refresh-ы записывают именно typed result без искусственного Telegram envelope.
-    let raw_json = serde_json::to_value(&messages)?;
+    let raw_json = crate::telegram::entities::serialize_stored_messages(&messages)?;
 
     Ok(build_personal_channel_data(messages, raw_json))
 }

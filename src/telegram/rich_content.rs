@@ -23,8 +23,12 @@ pub fn rich_message(message: &Message) -> Option<&RichMessage> {
 }
 
 pub(super) fn project(message: &RichMessage) -> RichProjection {
+    project_blocks(&message.blocks)
+}
+
+pub(super) fn project_blocks(blocks: &[RichBlock]) -> RichProjection {
     let mut projection = RichProjection::default();
-    projection.blocks(&message.blocks);
+    projection.blocks(blocks);
     projection.text = projection.text.trim().to_owned();
     projection
 }
