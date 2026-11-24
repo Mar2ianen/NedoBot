@@ -31,37 +31,65 @@ async fn telegram_api(
 ) -> Json<Value> {
     let method = uri.path().rsplit('/').next().unwrap().to_lowercase();
     stub.calls.lock().unwrap().push(method.clone());
-    assert_eq!(payload["chat_id"], CHAT_ID);
     let user = json!({"id": USER_ID, "is_bot": false, "first_name": "Fixture"});
     let result = match method.as_str() {
+        "getme" => json!({
+            "id": 9001, "is_bot": true, "first_name": "Fixture bot",
+            "can_join_groups": true, "can_read_all_group_messages": true,
+            "supports_inline_queries": false, "needs_inline_query_location": false,
+            "can_connect_to_business": false, "supports_guest_queries": false,
+            "supports_join_request_queries": false, "has_topics_enabled": false,
+            "allows_users_to_create_topics": false, "has_topic_sidebar": false,
+            "can_manage_bots": false, "has_main_web_app": false
+        }),
         "getchatmember" => {
-            assert_eq!(payload["user_id"], USER_ID);
-            match stub.member.lock().unwrap().as_str() {
-                "restricted" => json!({
-                    "status": "restricted", "user": user, "is_member": true,
-                    "until_date": 0, "can_send_messages": false,
-                    "can_send_audios": false, "can_send_documents": false,
-                    "can_send_photos": false, "can_send_videos": false,
-                    "can_send_video_notes": false, "can_send_voice_notes": false,
-                    "can_send_other_messages": false, "can_add_web_page_previews": false,
-                    "can_send_polls": false, "can_change_info": false,
-                    "can_invite_users": false, "can_pin_messages": false,
-                    "can_manage_topics": false, "can_react_to_messages": false,
-                    "can_edit_tag": false
-                }),
-                "banned" => json!({"status": "kicked", "until_date": 0, "user": user}),
-                "creator" => json!({"status": "creator", "is_anonymous": false, "user": user}),
-                _ => json!({"status": "member", "user": user}),
+            assert_eq!(payload["chat_id"], CHAT_ID);
+            if payload["user_id"] == 9001 {
+                json!({
+                    "status": "administrator",
+                    "user": {"id": 9001, "is_bot": true, "first_name": "Fixture bot"},
+                    "can_be_edited": false, "is_anonymous": false,
+                    "can_manage_chat": true, "can_delete_messages": true,
+                    "can_manage_video_chats": false, "can_restrict_members": true,
+                    "can_promote_members": false, "can_change_info": false,
+                    "can_invite_users": false, "can_post_stories": false,
+                    "can_edit_stories": false, "can_delete_stories": false,
+                    "can_post_messages": false, "can_edit_messages": false,
+                    "can_pin_messages": false, "can_manage_topics": false
+                })
+            } else {
+                assert_eq!(payload["user_id"], USER_ID);
+                match stub.member.lock().unwrap().as_str() {
+                    "restricted" => json!({
+                        "status": "restricted", "user": user, "is_member": true,
+                        "until_date": 0, "can_send_messages": false,
+                        "can_send_audios": false, "can_send_documents": false,
+                        "can_send_photos": false, "can_send_videos": false,
+                        "can_send_video_notes": false, "can_send_voice_notes": false,
+                        "can_send_other_messages": false, "can_add_web_page_previews": false,
+                        "can_send_polls": false, "can_change_info": false,
+                        "can_invite_users": false, "can_pin_messages": false,
+                        "can_manage_topics": false, "can_react_to_messages": false,
+                        "can_edit_tag": false
+                    }),
+                    "banned" => json!({"status": "kicked", "until_date": 0, "user": user}),
+                    "creator" => json!({"status": "creator", "is_anonymous": false, "user": user}),
+                    _ => json!({"status": "member", "user": user}),
+                }
             }
         }
-        "getchat" => json!({
-            "id": CHAT_ID, "type": "supergroup", "title": "Fixture",
-            "accent_color_id": 0, "max_reaction_count": 1,
-            "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false,
-                "unique_gifts": false, "premium_subscription": false},
-            "permissions": {"can_send_messages": true}
-        }),
+        "getchat" => {
+            assert_eq!(payload["chat_id"], CHAT_ID);
+            json!({
+                "id": CHAT_ID, "type": "supergroup", "title": "Fixture",
+                "accent_color_id": 0, "max_reaction_count": 1,
+                "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false,
+                    "unique_gifts": false, "premium_subscription": false},
+                "permissions": {"can_send_messages": true}
+            })
+        }
         "restrictchatmember" => {
+            assert_eq!(payload["chat_id"], CHAT_ID);
             assert_eq!(payload["user_id"], USER_ID);
             assert!(
                 payload["permissions"]
@@ -75,13 +103,17 @@ async fn telegram_api(
             json!(true)
         }
         "deletemessages" => {
+            assert_eq!(payload["chat_id"], CHAT_ID);
             assert_eq!(payload["message_ids"], json!([801]));
             json!(true)
         }
-        "sendmessage" => json!({
-            "message_id": 900, "ephemeral_message_id": 901, "date": 1_700_000_000,
-            "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "captcha"
-        }),
+        "sendmessage" => {
+            assert_eq!(payload["chat_id"], CHAT_ID);
+            json!({
+                "message_id": 900, "ephemeral_message_id": 901, "date": 1_700_000_000,
+                "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "captcha"
+            })
+        }
         _ => panic!("unexpected Telegram method: {method}"),
     };
     Json(json!({"ok": true, "result": result}))
