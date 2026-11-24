@@ -53,7 +53,8 @@ jobs:
           name: quality-summary-${{ github.sha }}
           path: |
             target/quality/executed-tests.tsv
-            mutants.out/*.txt
+            target/mutants/**/*.txt
+            target/router-order-mutation.log
           if-no-files-found: warn
           retention-days: 14
 
