@@ -61,6 +61,12 @@ jobs:
       - name: Run tests
         run: python3 scripts/run_cargo_test_checked.py cargo test --workspace --all-targets --locked
 
+      - name: Verify RC1 to RC2 stored-message rollback compatibility
+        run: cargo test --manifest-path testing/rc1-compat/Cargo.toml --locked
+
+      - name: Compile isolated bounded fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+
       - name: Check supported default and feature-disabled config matrix
         run: sh scripts/test_feature_matrix.sh
 

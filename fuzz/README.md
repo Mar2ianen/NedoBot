@@ -1,8 +1,9 @@
 # Bounded coverage-guided fuzzing
 
 This is an independent cargo-fuzz workspace, never a production dependency.
-Generate and review its Cargo.lock before the first run. Keep the teloxide-url
-pin in sync with the root workspace (including after antispam #9 merges).
+Its `Cargo.lock` is separate from the production workspace and should be reviewed
+when dependencies change. Keep the teloxide-url pin in sync with the root
+workspace.
 
 Run in a disposable environment without production tokens or database access:
 ```sh
