@@ -852,8 +852,12 @@ async fn preflight_bot_capabilities(
         };
         let is_admin = member.as_ref().is_some_and(ChatMemberKind::is_privileged);
         let is_present = member.as_ref().is_some_and(ChatMemberKind::is_present);
-        let can_delete = member.as_ref().is_some_and(ChatMemberKind::can_delete_messages);
-        let can_restrict = member.as_ref().is_some_and(ChatMemberKind::can_restrict_members);
+        let can_delete = member
+            .as_ref()
+            .is_some_and(ChatMemberKind::can_delete_messages);
+        let can_restrict = member
+            .as_ref()
+            .is_some_and(ChatMemberKind::can_restrict_members);
         if requires_delete && !can_delete {
             anyhow::bail!(
                 "moderation message deletion is enabled for chat {chat_id}, but can_delete_messages is unavailable or unverified"
@@ -894,7 +898,11 @@ async fn preflight_bot_capabilities(
         snapshots.push((chat_id, group, channel, ingest, is_present, is_admin));
     }
 
-    if privacy_patch_required(policy, me.can_read_all_group_messages, non_admin_ingest_group) {
+    if privacy_patch_required(
+        policy,
+        me.can_read_all_group_messages,
+        non_admin_ingest_group,
+    ) {
         let expected_id = me.id;
         bot.set_my_settings()
             .can_read_all_group_messages(true)
