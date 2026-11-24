@@ -13,8 +13,5 @@ fn nested_blob_url_has_opaque_origin() {
 #[test]
 fn ordinary_blob_url_preserves_https_origin() {
     let blob = Url::parse("blob:https://example.com/id").expect("valid blob URL");
-    assert_eq!(
-        blob.origin().ascii_serialization(),
-        "https://example.com"
-    );
+    assert_eq!(blob.origin().ascii_serialization(), "https://example.com");
 }
