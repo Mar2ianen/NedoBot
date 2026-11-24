@@ -30,6 +30,10 @@ run_mutations() {
         echo "mutation area $name failed; see target/mutants/$name" >&2
         exit "$status"
     fi
+    if [ ! -s "target/mutants/$name/caught.txt" ]; then
+        echo "mutation area $name caught no mutants; see target/mutants/$name" >&2
+        exit 1
+    fi
     echo "mutation area $name passed"
 }
 
