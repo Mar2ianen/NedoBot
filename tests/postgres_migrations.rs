@@ -8020,6 +8020,33 @@ async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
         expected_bottom
     );
 
+    let top_report = tg_ai_bot_teloxide::features::stats::service::top_messages_report_data(
+        pool, CHAT_ID, 3,
+    )
+    .await
+    .expect("top report projection must succeed");
+    assert_eq!(
+        top_report
+            .users
+            .iter()
+            .map(|row| (row.user.user_id, row.activity.messages))
+            .collect::<Vec<_>>(),
+        expected_top
+    );
+    let bottom_report = tg_ai_bot_teloxide::features::stats::service::bottom_messages_report_data(
+        pool, CHAT_ID, 3,
+    )
+    .await
+    .expect("bottom report projection must succeed");
+    assert_eq!(
+        bottom_report
+            .users
+            .iter()
+            .map(|row| (row.user.user_id, row.activity.messages))
+            .collect::<Vec<_>>(),
+        expected_bottom
+    );
+
     let top_ids = stats_repo::top_message_user_ids(pool, CHAT_ID, 2)
         .await
         .expect("top message user IDs must preserve the same tie rule");
@@ -8029,6 +8056,51 @@ async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
             .iter()
             .map(|row| row.0)
             .collect::<Vec<_>>()
+    );
+
+    query(
+        "insert into telegram_messages (chat_id, message_id, user_id, source_channel_id, text) values ($1, 900099, 30004, -1001575496091, 'channel post')",
+    )
+    .bind(CHAT_ID)
+    .execute(pool)
+    .await
+    .expect("channel post fixture must insert");
+    for (message_id, count) in [
+        (900_000_i32, 0_i64),
+        (900_001, 9),
+        (900_010, 9),
+        (900_011, 4),
+        (900_020, 1),
+        (900_099, 99),
+    ] {
+        query(
+            "insert into telegram_message_reaction_counts (chat_id, message_id, reactions, total_count, raw_json, event_at) values ($1, $2, '[]', $3, '{}', now())",
+        )
+        .bind(CHAT_ID)
+        .bind(message_id)
+        .bind(count)
+        .execute(pool)
+        .await
+        .expect("reaction count fixture must insert");
+    }
+    let reacted = tg_ai_bot_teloxide::features::stats::service::top_reacted_report_data(
+        pool, CHAT_ID, 20,
+    )
+    .await
+    .expect("top reaction report projection must succeed");
+    assert_eq!(
+        reacted
+            .messages
+            .iter()
+            .map(|row| (row.message_id, row.user.user_id, row.total_count))
+            .collect::<Vec<_>>(),
+        vec![
+            (900_010, 30_001, 9),
+            (900_001, 30_003, 9),
+            (900_011, 30_001, 4),
+            (900_020, 30_002, 1),
+        ],
+        "positive human message counts must be ranked with deterministic tie breaking"
     );
 }
 
