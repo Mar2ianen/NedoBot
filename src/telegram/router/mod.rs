@@ -25,6 +25,7 @@ pub struct Routes {
     #[cfg(feature = "moderation")]
     pub callback: Handler,
     pub chat_member: Handler,
+    pub my_chat_member: Handler,
 }
 
 /// Build the production update graph. Keep this order aligned with the route
@@ -36,7 +37,7 @@ pub fn build(routes: Routes) -> Handler {
     let handler = messages::append_edited(handler, routes.edited_message);
     #[cfg(feature = "moderation")]
     let handler = callbacks::append(handler, routes.callback);
-    members::append(handler, routes.chat_member)
+    members::append(handler, routes.chat_member).branch(routes.my_chat_member)
 }
 
 #[cfg(test)]
@@ -113,6 +114,11 @@ mod tests {
         Ok(())
     }
 
+    async fn my_chat_member(_update: ChatMemberUpdated, calls: RouteCalls) -> ResponseResult<()> {
+        record(&calls, "my_chat_member");
+        Ok(())
+    }
+
     fn production_handler() -> Handler {
         build(Routes {
             command: dptree::entry()
@@ -126,6 +132,7 @@ mod tests {
             #[cfg(feature = "moderation")]
             callback: Update::filter_callback_query().endpoint(callback),
             chat_member: Update::filter_chat_member().endpoint(chat_member),
+            my_chat_member: Update::filter_my_chat_member().endpoint(my_chat_member),
         })
     }
 
@@ -277,9 +284,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actual_router_builder_has_no_side_effects_for_unsupported_updates() {
+    async fn actual_router_builder_routes_bot_membership_separately() {
         let calls = RouteCalls(Arc::new(Mutex::new(Vec::new())));
-        let unsupported = update(
+        let membership = update(
             "my_chat_member",
             serde_json::json!({
                 "chat":{"id":-1001000000001_i64,"type":"supergroup"},
@@ -287,6 +294,23 @@ mod tests {
                 "date":1700000000,
                 "old_chat_member":{"status":"left","user":{"id":900000001,"is_bot":true,"first_name":"Synthetic bot"}},
                 "new_chat_member":{"status":"member","user":{"id":900000001,"is_bot":true,"first_name":"Synthetic bot"}}
+            }),
+        );
+        let outcome = dispatch(membership, &calls).await;
+        assert!(matches!(outcome, ControlFlow::Break(Ok(()))));
+        assert_eq!(*calls.0.lock().unwrap(), ["my_chat_member"]);
+    }
+
+    #[tokio::test]
+    async fn actual_router_builder_has_no_side_effects_for_unsupported_updates() {
+        let calls = RouteCalls(Arc::new(Mutex::new(Vec::new())));
+        let unsupported = update(
+            "inline_query",
+            serde_json::json!({
+                "id": "synthetic-query",
+                "from": {"id": 900000002, "is_bot": false, "first_name": "Synthetic user"},
+                "query": "unsupported",
+                "offset": ""
             }),
         );
         let outcome = dispatch(unsupported, &calls).await;
