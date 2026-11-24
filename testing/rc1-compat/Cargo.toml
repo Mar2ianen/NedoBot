@@ -1,0 +1,11 @@
+[workspace]
+[package]
+name = "nedobot-rc1-compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tg_ai_bot_teloxide = { path = "../..", default-features = false }
+teloxide-core = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "84c3bc444676c94b29d4983cfc62621a974a818e", default-features = false }
+serde_json = "1"
