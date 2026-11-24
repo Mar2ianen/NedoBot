@@ -26,7 +26,7 @@ src/telegram/command_handler.rs      — dispatch команд и Telegram-adapt
 src/telegram/render.rs               — send_html, Rich Message helpers, escape_html
 src/telegram/html.rs                 — Html builder (text/bold/code/link/custom_emoji/expandable_blockquote)
 src/telegram/entities.rs             — forwarded_channel_post, message_text, custom_emoji_ids, message_has_links
-src/telegram/custom_emoji.rs         — /emojiids diagnostic command
+src/telegram/custom_emoji.rs         — /emoji_ids diagnostic command
 src/llm/mod.rs                       — модуль LLM
 src/llm/types.rs                     — typed generation, attempt, transport error и output types
 src/llm/service.rs                   — generation через выбранный route/profile и output validation
@@ -83,7 +83,7 @@ migrations/                            — sqlx compile-time миграции
 | `/help` | Меню команд |
 | `/ping` | Проверка живости |
 | `/db` | Проверка подключения к БД |
-| `/emojiids` | Показать custom_emoji_id из сообщения |
+| `/emoji_ids` | Показать custom_emoji_id из сообщения |
 | `/format_test <text>` | Тест рендера первого комментария |
 | `/memory` | Последние заметки памяти |
 | `/ask <вопрос>` | Агентный поиск по истории чата и публичному read-model |
@@ -100,6 +100,12 @@ migrations/                            — sqlx compile-time миграции
 | `/bottommsg [-r\|-p] [-e]` | 20 самых молчаливых |
 | `/userstats <id\|username> [-r\|-p] [-e]` | Карточка пользователя |
 | `/userstatus <id\|username> [-r\|-p] [-e]` | Alias /userstats |
+| `/transcribe` | Расшифровать voice, audio или кружок в reply |
+| `/forget` | Забыть личную память диалога |
+| `/notspam` | Пометить сообщение как не спам (reviewer) |
+| `/mute`, `/ban`, `/warn` | Санкции модерации |
+| `/unmute`, `/unban`, `/unwarn` | Снять санкции |
+| `/warns`, `/modlog`, `/undo` | История и отмена действий модерации |
 
 `-r` = rich HTML (дефолт), `-p` = plain text, `-e` = ответ только автору команды в группе. Reply на сообщение работает как implicit target для `/userstats`.
 
@@ -109,7 +115,7 @@ migrations/                            — sqlx compile-time миграции
 
 **LLM routing**: `LLM_PROFILES_PATH` необязателен и задаёт deployment-копию provider/model/task route topology; без него используется репозиторный example-файл. Каждый runtime-вызов передаёт явный route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`); provider/model env overrides и hard-coded fallback chains удалены.
 
-**Thinking budget**: для Gemini 3.x бот использует `thinkingLevel=low` и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `runtime.gemini_thinking_budget` добавляется к `runtime.llm_max_tokens` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
+**Thinking budget**: для Gemini 3.x и новее бот использует `thinkingLevel` из профиля модели и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `runtime.gemini_thinking_budget` добавляется к `runtime.llm_max_tokens` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
 
 **Proxy**: `LLM_PROXY_URL` — SOCKS5/HTTP proxy только для LLM запросов, не для Telegram polling.
 
@@ -261,7 +267,7 @@ Machine-specific local workflow notes не являются частью реп�
 
 #### Провайдеры и внешние API
 - **Не добавлять брендовые LLM-клиенты и ветки router-а** для OpenAI-compatible API: Groq, Cerebras, OpenRouter, Alibaba Model Studio/Qwen и аналогичные endpoint-ы должны быть profiles одного транспорта.
-- Для OpenAI-compatible Chat Completions использовать уже подключённый crate `async-openai` с `OpenAIConfig::with_api_base()` и `with_api_key()`. **Не писать новый клиент на `reqwest`** и не копировать `OpenAiCompatClient`.
+- Для OpenAI-compatible Chat Completions использовать уже подключённый crate `genai` и существующую конфигурацию провайдера. **Не писать новый клиент на `reqwest`** и не копировать `OpenAiCompatClient`.
 - Отдельный native client допустим только для действительно другого протокола (`Gemini GenerateContent`, `Ollama /api/chat`, ASR multipart и т. п.).
 - URL endpoint-а, имя env-переменной ключа, default model и capabilities должны быть в provider profile/config, а не в `match provider` или в коде. Секреты не хранить в TOML/profile и не логировать.
 - Возможности модели (`supports_images`, structured-output mode, timeout) задавать конфигурацией profile; не выводить их из названия модели эвристиками для новых провайдеров.
