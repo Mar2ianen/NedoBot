@@ -684,7 +684,9 @@ async fn generated_post_comment_claims_reject_stale_and_duplicate_delivery() {
             );
         }
         assert_eq!(
-            mark_post_comment_delivery_unknown(&pool, &claim).await.unwrap(),
+            mark_post_comment_delivery_unknown(&pool, &claim)
+                .await
+                .unwrap(),
             CasResult::Applied
         );
         let (status, attempts, sent): (String, i32, bool) = sqlx::query_as(
@@ -706,7 +708,6 @@ async fn generated_post_comment_claims_reject_stale_and_duplicate_delivery() {
             .unwrap();
     }
 }
-
 
 #[test]
 fn moderation_reference_model_preserves_veto_ownership_and_uncertainty() {
