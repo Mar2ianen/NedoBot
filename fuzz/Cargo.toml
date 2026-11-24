@@ -1,0 +1,37 @@
+[workspace]
+[package]
+name = "nedobot-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tg_ai_bot_teloxide = { path = "..", default-features = false }
+nedobot-qr = { path = "../crates/nedobot-qr" }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "3166c9c39f79724b8e4e760e7a5afdd5daeb78be", default-features = false }
+
+[[bin]]
+name = "stored_message"
+path = "fuzz_targets/stored_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qr_image"
+path = "fuzz_targets/qr_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_parse"
+path = "fuzz_targets/url_parse.rs"
+test = false
+doc = false
+bench = false
