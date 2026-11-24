@@ -193,12 +193,8 @@ fn generated_qr_transforms_preserve_independently_encoded_payload() {
                         light
                     }])
                 });
-                let qr = imageops::resize(
-                    &qr,
-                    33 * scale,
-                    33 * scale,
-                    imageops::FilterType::Nearest,
-                );
+                let qr =
+                    imageops::resize(&qr, 33 * scale, 33 * scale, imageops::FilterType::Nearest);
                 let qr = match rotation {
                     0 => qr,
                     1 => imageops::rotate90(&qr),
@@ -210,9 +206,7 @@ fn generated_qr_transforms_preserve_independently_encoded_payload() {
                 Ok(())
             },
         )
-        .unwrap_or_else(|error| {
-            panic!("case_id=qr-known-payload seed={seed}: {error}")
-        });
+        .unwrap_or_else(|error| panic!("case_id=qr-known-payload seed={seed}: {error}"));
 }
 
 fn encode_png(image: impl Into<DynamicImage>) -> Vec<u8> {
