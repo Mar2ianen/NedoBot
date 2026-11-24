@@ -636,7 +636,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 ```text
 /ping
 /db
-/emojiids
+/emoji_ids
 /format_test <текст поста>
 /memory
 /ask <вопрос>
@@ -784,7 +784,7 @@ Rendering policy:
 - если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет Rich Message с закрытым `<details>`; rich-формат поддерживает до 32 768 символов;
 - если Rich API отклоняет сообщение или rich-лимит превышен, `runtime.voice_send_full_file=true` включает fallback `preview + voice-transcript.txt`.
 
-Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
+Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Отсутствие timestamp в заголовках глав закреплено тестами; см. [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
 
 `video_note` Telegram не сопровождает MIME-типом, поэтому pipeline задаёт `video/mp4` сам. Groq принимает MP4 напрямую: отдельный `ffmpeg` и постоянное хранение кружков не нужны. Временный файл удаляется сразу после завершения ASR-запроса.
 
@@ -1020,7 +1020,7 @@ ryzen_custom_emoji_id = "5444875271163364561"
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
 - Voice ASR работает в двойном режиме Gemini primary + Groq shadow; local Whisper/Ollama audio не подключены.
-- Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
+- Cleanup provider/model для voice сохраняются в отдельных DB-полях `cleanup_provider` и `cleanup_model`.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; статические настройки меняются в `[runtime]` profile TOML и требуют рестарта сервиса. DB-backed dynamic policy — отдельный следующий этап.
 
@@ -1032,7 +1032,7 @@ System prompt вшит из `prompts/ask.md`; журнал выпущенных 
 
 `chat.count_messages` возвращает число сообщений с `unit=messages`. `chat.count_word_occurrences` возвращает число неперекрывающихся вхождений точного слова/фразы и matching_messages, `unit=word_occurrences`. Runtime требует предварительный поиск с теми же фильтрами; count без query разрешён для structural count. Результаты count сохраняются при сокращении контекста. Native tool pairs удаляются целиком, per-turn previews ограничены, provider-specific continuation ID не используется с полной историей. После action timeout повтор начинается со следующего совместимого profile. `ask_runs.provider/model` отражают реально ответивший profile; `step_count` включает model turns без tools.
 
-У `routes.ask` есть Gemini vision fallback, независимый от текстовых profiles. `probe_ask_route [--image]` проверяет native tool call без Telegram/БД. `backfill_rich_messages <chat-id> [--apply]` восстанавливает старые rich-тексты; без `--apply` делает dry run. См. [аудит](ASK_AUDIT_2026-10-06.md) и [выкладку](DEPLOYMENT.md).
+Vision в `routes.ask` обслуживают совместимые профили текущего route; отдельного Gemini vision fallback нет. `probe_ask_route [--image]` проверяет native tool call без Telegram/БД. `backfill_rich_messages <chat-id> [--apply]` восстанавливает старые rich-тексты; без `--apply` делает dry run. См. [аудит](ASK_AUDIT_2026-10-06.md) и [выкладку](DEPLOYMENT.md).
 
 Legacy ASR profiles не включают comparative shadow автоматически. Для Gemini primary видео-кружки используют Groq media fallback и настроенный `voice_asr_shadow_model`, даже при выключенном comparative shadow; Groq key обязателен. ASR errors очищаются от URL, Gemini request chain ограничена 420 секундами, cleanup — 10 секундами; смена job phase продлевает lease.
 
