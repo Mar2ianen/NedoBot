@@ -43,7 +43,6 @@ pub fn parse_bot_command(
     super::commands::Command::parse(text, username).ok()
 }
 
-
 /// Fully typed endpoint set for the dispatcher tree.
 pub struct Routes {
     pub command: Handler,
@@ -150,9 +149,7 @@ mod tests {
 
     fn production_handler() -> Handler {
         build(Routes {
-            command: dptree::entry()
-                .filter_map(parse_bot_command)
-                .endpoint(command),
+            command: dptree::filter_map(parse_bot_command).endpoint(command),
             message: dptree::endpoint(message),
             reaction: Update::filter_message_reaction_updated().endpoint(reaction),
             reaction_count: Update::filter_message_reaction_count_updated()
