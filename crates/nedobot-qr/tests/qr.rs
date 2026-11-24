@@ -87,10 +87,7 @@ fn rejects_oversized_or_corrupt() {
 
 #[test]
 fn generated_valid_pngs_keep_qr_scan_output_bounded_and_deterministic() {
-    let seed = std::env::var("NEDOBOT_PROPTEST_SEED")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0x14_01_02_03_04_05_06_07);
+    let seed = property_seed();
     let dimensions = (1_u32..=128, 1_u32..=128);
     let strategy = dimensions.prop_flat_map(|(width, height)| {
         prop::collection::vec(any::<u8>(), (width * height) as usize)
@@ -126,6 +123,95 @@ fn generated_valid_pngs_keep_qr_scan_output_bounded_and_deterministic() {
                 std::env::var("NEDOBOT_TEST_SHA")
                     .unwrap_or_else(|_| "local-unpinned".to_owned())
             )
+        });
+}
+
+fn property_seed() -> u64 {
+    match std::env::var("NEDOBOT_PROPTEST_SEED") {
+        Ok(value) => value.parse().expect("invalid property seed"),
+        Err(std::env::VarError::NotPresent) => 0x14_01_02_03_04_05_06_07,
+        Err(error) => panic!("invalid property seed: {error}"),
+    }
+}
+
+// Generated independently with Python qrcode (version 2, ECC M, border 4).
+// The expected payload is the encoder input, never the decoder's own output.
+const KNOWN_QR: &str = "\
+000000000000000000000000000000000\n\
+000000000000000000000000000000000\n\
+000000000000000000000000000000000\n\
+000000000000000000000000000000000\n\
+000011111110111111011011111110000\n\
+000010000010011010101010000010000\n\
+000010111010011010000010111010000\n\
+000010111010101011101010111010000\n\
+000010111010111001111010111010000\n\
+000010000010101010000010000010000\n\
+000011111110101010101011111110000\n\
+000000000000101110100000000000000\n\
+000010001011111100110111110010000\n\
+000010101101111010110100110100000\n\
+000011011010101111110111011000000\n\
+000011101101110100110101001100000\n\
+000011101111011100000111011110000\n\
+000011110001100011011000100100000\n\
+000000001011100110011101111000000\n\
+000000010101000100110001101100000\n\
+000011100011111010011111111000000\n\
+000000000000110001001000100000000\n\
+000011111110110001001010100000000\n\
+000010000010011010001000111110000\n\
+000010111010111101101111111110000\n\
+000010111010001010100111001110000\n\
+000010111010000111111110010100000\n\
+000010000010001101000011111100000\n\
+000011111110110011010110001110000\n\
+000000000000000000000000000000000\n\
+000000000000000000000000000000000\n\
+000000000000000000000000000000000\n\
+000000000000000000000000000000000";
+
+#[test]
+fn generated_qr_transforms_preserve_independently_encoded_payload() {
+    let seed = property_seed();
+    let mut runner = TestRunner::new(Config {
+        cases: 64,
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..Config::default()
+    });
+    runner
+        .run(
+            &(4_u32..=8, 0_u8..4, 0_u8..=40, 210_u8..=255),
+            |(scale, rotation, dark, light)| {
+                let bits: Vec<_> = KNOWN_QR.lines().flat_map(str::bytes).collect();
+                prop_assert_eq!(bits.len(), 33 * 33);
+                let qr = image::GrayImage::from_fn(33, 33, |x, y| {
+                    image::Luma([if bits[(y * 33 + x) as usize] == b'1' {
+                        dark
+                    } else {
+                        light
+                    }])
+                });
+                let qr = imageops::resize(
+                    &qr,
+                    33 * scale,
+                    33 * scale,
+                    imageops::FilterType::Nearest,
+                );
+                let qr = match rotation {
+                    0 => qr,
+                    1 => imageops::rotate90(&qr),
+                    2 => imageops::rotate180(&qr),
+                    _ => imageops::rotate270(&qr),
+                };
+                let payloads = scan_image(&encode_png(DynamicImage::ImageLuma8(qr))).unwrap();
+                prop_assert_eq!(payloads, vec![b"https://example.org/qr".to_vec()]);
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("case_id=qr-known-payload seed={seed}: {error}")
         });
 }
 
