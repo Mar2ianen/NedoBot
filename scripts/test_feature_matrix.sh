@@ -5,5 +5,5 @@ feature_gate_test=config::tests::manual_moderation_requires_global_and_chat_gate
 
 cargo check --lib --locked
 cargo check --no-default-features --lib --locked
-cargo test --lib "$feature_gate_test" --locked -- --exact
-cargo test --no-default-features --lib "$feature_gate_test" --locked -- --exact
+python3 scripts/run_cargo_test_checked.py cargo test --lib "$feature_gate_test" --locked -- --exact
+python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --lib "$feature_gate_test" --locked -- --exact
