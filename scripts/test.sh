@@ -20,6 +20,7 @@ run_test() {
 }
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations -- --ignored
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::fast_audit_ack_fences_revisions_and_reclaims -- --ignored --exact
