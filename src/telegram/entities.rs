@@ -25,54 +25,127 @@ pub fn deserialize_stored_message(mut value: serde_json::Value) -> serde_json::R
     serde_json::from_value(value)
 }
 
-fn add_legacy_expandable_quote_text(value: &mut serde_json::Value) -> anyhow::Result<()> {
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            serde_json::Value::Object(object) => {
-                if object.get("type").and_then(serde_json::Value::as_str)
-                    == Some("expandable_blockquote")
-                    && !object.contains_key("text")
-                {
-                    let blocks = object
-                        .get("blocks")
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("expandable quote has no blocks"))?;
-                    let blocks: Vec<RichBlock> = serde_json::from_value(blocks)?;
-                    object.insert(
-                        "text".to_owned(),
-                        serde_json::to_value(legacy_quote_text(&blocks))?,
-                    );
+// Only visit typed Message and RichMessage containers. Unknown rich blocks and
+// inline objects are opaque, including any fields named "type" or "blocks".
+fn visit_stored_quotes<E>(
+    root: &mut serde_json::Value,
+    mut visit: impl FnMut(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), E>,
+) -> Result<(), E> {
+    use serde_json::Value;
+
+    enum Node {
+        Message,
+        RichMessage,
+        Blocks,
+        ListItems,
+        NestedMessage(&'static str),
+    }
+
+    let mut pending = vec![(root, Node::Message)];
+    while let Some((value, node)) = pending.pop() {
+        match node {
+            Node::Message => {
+                if let Some(object) = value.as_object_mut() {
+                    for (key, child) in object {
+                        let node = match key.as_str() {
+                            "rich_message" => Node::RichMessage,
+                            "reply_to_message" | "pinned_message" => Node::Message,
+                            "giveaway_completed" => Node::NestedMessage("giveaway_message"),
+                            "suggested_post_approved"
+                            | "suggested_post_approval_failed"
+                            | "suggested_post_declined"
+                            | "suggested_post_paid"
+                            | "suggested_post_refunded" => {
+                                Node::NestedMessage("suggested_post_message")
+                            }
+                            _ => continue,
+                        };
+                        pending.push((child, node));
+                    }
                 }
-                pending.extend(object.values_mut());
             }
-            serde_json::Value::Array(items) => pending.extend(items),
-            _ => {}
+            Node::NestedMessage(field) => {
+                if let Some(message) = value.get_mut(field) {
+                    pending.push((message, Node::Message));
+                }
+            }
+            Node::RichMessage => {
+                if let Some(blocks) = value.get_mut("blocks") {
+                    pending.push((blocks, Node::Blocks));
+                }
+            }
+            Node::Blocks => {
+                let Some(blocks) = value.as_array_mut() else {
+                    continue;
+                };
+                for block in blocks {
+                    let Some(object) = block.as_object_mut() else {
+                        continue;
+                    };
+                    let node = match object.get("type").and_then(Value::as_str) {
+                        Some("expandable_blockquote") => {
+                            visit(object)?;
+                            Some(("blocks", Node::Blocks))
+                        }
+                        Some("blockquote" | "collage" | "slideshow" | "details") => {
+                            Some(("blocks", Node::Blocks))
+                        }
+                        Some("list") => Some(("items", Node::ListItems)),
+                        _ => None,
+                    };
+                    if let Some((field, node)) = node
+                        && let Some(child) = object.get_mut(field)
+                    {
+                        pending.push((child, node));
+                    }
+                }
+            }
+            Node::ListItems => {
+                if let Some(items) = value.as_array_mut() {
+                    for item in items {
+                        if let Some(blocks) = item.get_mut("blocks") {
+                            pending.push((blocks, Node::Blocks));
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn add_expandable_quote_blocks(value: &mut serde_json::Value) {
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            serde_json::Value::Object(object) => {
-                if object.get("type").and_then(serde_json::Value::as_str)
-                    == Some("expandable_blockquote")
-                    && !object.contains_key("blocks")
-                    && let Some(text) = object.get("text").cloned()
-                {
-                    object.insert(
-                        "blocks".to_owned(),
-                        serde_json::json!([{"type": "paragraph", "text": text}]),
-                    );
-                }
-                pending.extend(object.values_mut());
-            }
-            serde_json::Value::Array(items) => pending.extend(items),
-            _ => {}
+fn add_legacy_expandable_quote_text(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    visit_stored_quotes(value, |object| {
+        if !object.contains_key("text") {
+            let blocks = object
+                .get("blocks")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("expandable quote has no blocks"))?;
+            let blocks: Vec<RichBlock> = serde_json::from_value(blocks)?;
+            object.insert(
+                "text".to_owned(),
+                serde_json::to_value(legacy_quote_text(&blocks))?,
+            );
         }
+        Ok(())
+    })
+}
+
+fn add_expandable_quote_blocks(value: &mut serde_json::Value) {
+    let result: Result<(), std::convert::Infallible> = visit_stored_quotes(value, |object| {
+        if !object.contains_key("blocks")
+            && let Some(text) = object.get("text").cloned()
+        {
+            object.insert(
+                "blocks".to_owned(),
+                serde_json::json!([{"type": "paragraph", "text": text}]),
+            );
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => {}
+        Err(never) => match never {},
     }
 }
 
@@ -426,6 +499,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["https://example.org/hidden"]
         );
+    }
+
+    #[test]
+    fn stored_quote_normalization_preserves_opaque_blocks_and_nested_replies() {
+        let opaque = serde_json::json!({
+            "type": "future_block",
+            "payload": {
+                "type": "expandable_blockquote",
+                "text": "opaque",
+                "nested": {"type": "expandable_blockquote", "data": "opaque"}
+            }
+        });
+        let mut raw = serde_json::json!({
+            "message_id": 12,
+            "date": 1_700_000_000,
+            "chat": {"id": -10042, "type": "supergroup"},
+            "rich_message": {"blocks": [opaque.clone()]},
+            "reply_to_message": {
+                "message_id": 11,
+                "date": 1_700_000_000,
+                "chat": {"id": -10042, "type": "supergroup"},
+                "rich_message": {"blocks": [{
+                    "type": "expandable_blockquote",
+                    "text": "Legacy"
+                }]}
+            }
+        });
+        super::add_expandable_quote_blocks(&mut raw);
+        let once = raw.clone();
+        super::add_expandable_quote_blocks(&mut raw);
+        assert_eq!(raw, once);
+        assert_eq!(raw["rich_message"]["blocks"][0], opaque);
+        let message = deserialize_stored_message(raw).unwrap();
+        let mut stored = super::serialize_stored_message(&message).unwrap();
+        assert_eq!(stored["rich_message"]["blocks"][0], opaque);
+        assert_eq!(
+            stored["reply_to_message"]["rich_message"]["blocks"][0]["text"],
+            serde_json::json!(["Legacy"])
+        );
+        let once = stored.clone();
+        super::add_legacy_expandable_quote_text(&mut stored).unwrap();
+        assert_eq!(stored, once);
     }
 
     #[test]
