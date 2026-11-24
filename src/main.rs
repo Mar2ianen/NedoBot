@@ -97,7 +97,12 @@ async fn main() -> anyhow::Result<()> {
         || config.community.ask.gateway.reply_to_bot_enabled
     {
         let username = me.username_opt().filter(|name| !name.is_empty());
-        if config.community.ask.gateway.mention_enabled && username.is_none() {
+        let has_alias = me
+            .active_usernames
+            .iter()
+            .flatten()
+            .any(|name| !name.is_empty());
+        if config.community.ask.gateway.mention_enabled && username.is_none() && !has_alias {
             anyhow::bail!(
                 "ask.gateway.mention_enabled requires a Telegram bot username from getMe"
             );
@@ -482,6 +487,7 @@ async fn handle_message(
     msg: Message,
     state: AppState,
     profile_refresh_queue: ProfileRefreshQueue,
+    #[cfg(feature = "ask")] me: BotFullInfo,
 ) -> ResponseResult<()> {
     let private_gateway_allowed = msg.chat.is_private()
         && state.config.community.ask.gateway.private_messages_enabled
@@ -520,9 +526,13 @@ async fn handle_message(
         let chat_gateway_allowed = state.config.ask_enabled
             && managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ask);
         if (chat_gateway_allowed || private_gateway_allowed)
-            && let Some(question) = features::ask::gateway::invocation_question(
+            && let Some(question) = features::ask::gateway::invocation_question_with_aliases(
                 &msg,
-                state.telegram_bot_identity.as_ref(),
+                state
+                    .telegram_bot_identity
+                    .as_ref()
+                    .filter(|identity| identity.user_id == me.id.0 as i64),
+                me.active_usernames.as_deref().unwrap_or_default(),
                 gateway.mention_enabled,
                 gateway.reply_to_bot_enabled,
                 private_gateway_allowed && gateway.private_messages_enabled,
