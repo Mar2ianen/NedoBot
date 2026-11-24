@@ -131,11 +131,12 @@ pub fn invocation_question(
         Vec::new()
     };
     let replied_to_bot = reply_enabled
-        && identity.is_some()
-        && message
-            .reply_to_message()
-            .and_then(|reply| reply.from.as_ref())
-            .is_some_and(|author| author.id.0 as i64 == identity.unwrap().user_id && author.is_bot);
+        && identity.is_some_and(|identity| {
+            message
+                .reply_to_message()
+                .and_then(|reply| reply.from.as_ref())
+                .is_some_and(|author| author.id.0 as i64 == identity.user_id && author.is_bot)
+        });
 
     if mention_ranges.is_empty() && !replied_to_bot {
         return None;
