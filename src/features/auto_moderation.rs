@@ -148,6 +148,12 @@ pub async fn maybe_enforce_audit(
             );
             return Ok(());
         }
+        crate::telegram::capabilities::require_chat_right(
+            bot,
+            ChatId(job.chat_id),
+            crate::telegram::capabilities::RequiredChatRight::DeleteAndRestrict,
+        )
+        .await?;
         let result = crate::features::risk_captcha::apply_risk_captcha(
             bot,
             pool,
@@ -208,7 +214,15 @@ pub async fn maybe_enforce_audit(
     }
     match action {
         AutoAction::None => Ok(()),
-        AutoAction::DeleteMessages => delete_first_message(bot, pool, job).await,
+        AutoAction::DeleteMessages => {
+            crate::telegram::capabilities::require_chat_right(
+                bot,
+                ChatId(job.chat_id),
+                crate::telegram::capabilities::RequiredChatRight::DeleteMessages,
+            )
+            .await?;
+            delete_first_message(bot, pool, job).await
+        }
         AutoAction::Ban => {
             if latest_label_is_not_spam(pool, job.chat_id, job.telegram_user_id).await? {
                 tracing::info!(
@@ -218,6 +232,12 @@ pub async fn maybe_enforce_audit(
                 );
                 return Ok(());
             }
+            crate::telegram::capabilities::require_chat_right(
+                bot,
+                ChatId(job.chat_id),
+                crate::telegram::capabilities::RequiredChatRight::DeleteAndRestrict,
+            )
+            .await?;
             ban_spammer(bot, pool, config, job, score, &policy, &auto_ban_evidence).await
         }
     }
