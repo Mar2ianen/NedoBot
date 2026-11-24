@@ -1,6 +1,6 @@
 use crate::features::stats::document::Section;
 use crate::features::stats::render_html::{
-    human_comment_preview, message_preview, message_url, reacted_author_link,
+    human_comment_preview, message_preview, message_url, user_or_message_link,
 };
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{
@@ -404,7 +404,7 @@ pub fn top_reacted(
             ]);
             vec![
                 (index + 1).to_string(),
-                reacted_author_link(
+                user_or_message_link(
                     &row.username,
                     &row.user.display_name,
                     discussion_chat_id,
