@@ -15,6 +15,35 @@ mod reactions;
 
 pub type Handler = UpdateHandler<RequestError>;
 
+/// Parse commands using only names returned for the authenticated bot. An
+/// absent username does not prevent unaddressed commands or panic the router.
+pub fn parse_bot_command(
+    message: teloxide::types::Message,
+    me: teloxide::types::Me,
+) -> Option<super::commands::Command> {
+    use teloxide::utils::command::BotCommands;
+
+    let text = message.text().or_else(|| message.caption())?;
+    let word = text.split_whitespace().next()?;
+    let username = match word.split_once('@') {
+        None => "",
+        Some((_, addressed)) => {
+            if addressed.is_empty()
+                || !me
+                    .username_opt()
+                    .into_iter()
+                    .chain(me.active_usernames.iter().flatten().map(String::as_str))
+                    .any(|name| name.eq_ignore_ascii_case(addressed))
+            {
+                return None;
+            }
+            addressed
+        }
+    };
+    super::commands::Command::parse(text, username).ok()
+}
+
+
 /// Fully typed endpoint set for the dispatcher tree.
 pub struct Routes {
     pub command: Handler,
@@ -48,7 +77,7 @@ mod tests {
     #[cfg(feature = "moderation")]
     use teloxide::types::CallbackQuery;
     use teloxide::{
-        dispatching::{HandlerExt, UpdateFilterExt},
+        dispatching::UpdateFilterExt,
         dptree,
         prelude::{Message, ResponseResult},
         types::{
@@ -58,7 +87,7 @@ mod tests {
 
     use crate::telegram::commands::Command;
 
-    use super::{Handler, Routes, build};
+    use super::{Handler, Routes, build, parse_bot_command};
 
     #[derive(Clone)]
     struct RouteCalls(Arc<Mutex<Vec<&'static str>>>);
@@ -122,7 +151,7 @@ mod tests {
     fn production_handler() -> Handler {
         build(Routes {
             command: dptree::entry()
-                .filter_command::<Command>()
+                .filter_map(parse_bot_command)
                 .endpoint(command),
             message: dptree::endpoint(message),
             reaction: Update::filter_message_reaction_updated().endpoint(reaction),
@@ -182,6 +211,22 @@ mod tests {
         production_handler()
             .dispatch(dptree::deps![update, test_me(), calls.clone()])
             .await
+    }
+
+    #[test]
+    fn addressed_commands_accept_active_aliases_without_requiring_primary_username() {
+        let mut me = test_me();
+        me.user.username = None;
+        me.active_usernames = Some(vec!["Alias_Bot".to_owned()]);
+        for (text, accepted) in [
+            ("/ping", true),
+            ("/ping@alias_bot", true),
+            ("/ping@Other_Bot", false),
+            ("/ping@", false),
+        ] {
+            let message = serde_json::from_value(message_value(text)).unwrap();
+            assert_eq!(parse_bot_command(message, me.clone()).is_some(), accepted);
+        }
     }
 
     #[tokio::test]
