@@ -852,6 +852,10 @@ async fn preflight_bot_capabilities(
             .get_chat(ChatId(chat_id))
             .await
             .map_err(|_| anyhow::anyhow!("managed chat {chat_id} preflight failed"))?;
+        anyhow::ensure!(
+            chat.id.0 == chat_id,
+            "managed chat {chat_id} returned a different identity"
+        );
         let requires_delete = config.chat_allows(chat_id, |chat| {
             chat.moderation_delete_target_message || chat.moderation_delete_command_message
         });
@@ -884,8 +888,8 @@ async fn preflight_bot_capabilities(
             || ephemeral_or_greetings;
         let member = if needs_member {
             match bot.get_chat_member(ChatId(chat_id), me.id).await {
-                Ok(member) => Some(member.kind),
-                Err(_) => {
+                Ok(member) if member.user.id == me.id => Some(member.kind),
+                Ok(_) | Err(_) => {
                     tracing::warn!(chat_id, "cannot verify Telegram bot membership");
                     None
                 }
