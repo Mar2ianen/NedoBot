@@ -814,7 +814,9 @@ async fn reconcile_group_privacy(
     let deadline = std::time::Duration::from_secs(20);
     tokio::time::timeout(
         deadline,
-        bot.set_my_settings().can_read_all_group_messages(true).send(),
+        bot.set_my_settings()
+            .can_read_all_group_messages(true)
+            .send(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Telegram privacy update timed out; state is unknown"))?
@@ -1122,11 +1124,7 @@ mod tests {
             ignore_update: bool,
         }
 
-        async fn api(
-            State(stub): State<Arc<Mutex<Stub>>>,
-            uri: Uri,
-            body: Bytes,
-        ) -> Json<Value> {
+        async fn api(State(stub): State<Arc<Mutex<Stub>>>, uri: Uri, body: Bytes) -> Json<Value> {
             let method = uri.path().rsplit('/').next().unwrap().to_ascii_lowercase();
             let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
             let mut stub = stub.lock().unwrap();
