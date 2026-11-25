@@ -35,24 +35,36 @@ Separate production instances should show their **own** health, keyed internally
 
 ## 3. User-facing contract and authorization
 
-- **/ping**: compact public view, for current managed chats and allowed private messages. No user-input-driven probes. Show overall verdict, uptime, build, DB, worker backlog summary and agent/MCP as generic states only. Message length target: 6-10 lines; hard cap under Telegram's HTML message limit.
-- **/ping full**: expanded view **only for configured owner_telegram_id in a private chat**. Show individual queues, last success/failure ages, slots, MCP components, freshness of probes and sanitized error categories. Do not treat a chat admin, group sender_chat, or /ask permission as sufficient authorization.
-- **/ping probe**: owner-only private chat, explicit rate-limited on-demand read-only checks with a bounded deadline; optional future phase. No model inference or mutating tool calls. Other arguments produce concise help; no probing.
-- **/status** is already used for chat statistics. Do not repurpose it. Retain **/db** as compatibility alias or existing separate probe.
-- Escaped HTML via existing Telegram render helpers; format Unknown/Disabled separately. No credential/host/IP/DSN/SQL/instance scope/username/user_id/question/tool arguments/prompt/stacktrace in public output. Full view shows only safe categorical error_kind.
+**Every /ping sends one real Telegram message immediately, then updates that same message as fresh observations arrive.** This applies to private chats **and** groups. Never use the native ephemeral Telegram draft for /ping.
 
-Example **illustrative** public output (not measured):
+- **/ping**: emit the first *real* message immediately using the latest cached snapshot, with explicit CHECKING on refreshable components; do not wait for DB, MCP, or other probes before the first send. Once delivered and its message_id is known, kick or join the shared, bounded cheap health refresh and stream edits to that message. No user-input-driven heavy MCP or LLM probes. Show overall verdict, uptime, build, DB, worker backlog summary and agent/MCP as generic states only.
+- **/ping full**: identical real-message-first / edit-in-place protocol, but expanded detail **only for configured owner_telegram_id in a private chat**: individual queues, last success/failure ages, slots, MCP components, freshness and sanitized error categories. A chat admin, sender_chat, and /ask permission do not grant full diagnostics.
+- **/ping probe**: owner-only private chat; same initial real message + edits; opt-in rate-limited active read-only probes with a global deadline. No model inference or mutating tool calls. Other arguments return concise help, without probes.
+- **/status** already provides chat statistics; do not repurpose it. Retain **/db** as an existing compatibility command.
+- Render with escaped HTML and typed states; enforce message-size cap. No credential, host/IP, DSN, SQL, scope, username/user ID, question, tool arguments, prompt or stacktrace in public output. Full view exposes only safe error categories.
+
+An illustrative public message immediately after /ping (sample values, **not actual production data**):
+
+    NedoBot 0.12.0 · 45560c79
+    Health: CHECKING · uptime 04:32
+    PostgreSQL: CHECKING (last OK 17 s ago)
+    Workers: 15 active, 1 slow (cached)
+    Queues: refreshing…
+    Agent: idle · MCP(chat): last OK 21 min ago
+    Public MCP HTTP: UNKNOWN (no fresh monitor)
+
+Then the **same message** is edited (no second message):
 
     NedoBot 0.12.0 · 45560c79
     Health: DEGRADED · uptime 04:32
-    PostgreSQL: OK (cached, 17 s)
-    Telegram: OK (last delivery)
+    PostgreSQL: OK · 8 ms
     Workers: 15 active, 1 slow
     Queues: embeddings 32 ready (oldest 14 min)
     Agent: idle · MCP(chat): last OK 21 min ago
-    Public MCP HTTP: UNKNOWN (no fresh probe)
+    Public MCP HTTP: UNKNOWN (no fresh monitor)
+    Checked: 0.7s · completed
 
-Example **illustrative** owner-only /ping full excerpt:
+An illustrative owner-only /ping full excerpt:
 
     /ask: active=1/4, finished(1h)=8, failed(1h)=1
     MCP chat stdio: init OK, tools/list OK, call errors(1h)=0
@@ -63,9 +75,8 @@ Example **illustrative** owner-only /ping full excerpt:
     voice: ready=0, delivery_unknown(24h)=1
     decision audit: ready=2, oldest_ready=40s
     Worker qr_evidence: idle, last_poll=3s, failures=0
-    Collectors: sampled 17 s ago; max age=60s
 
-All examples must be labelled as samples in tests/docs; never insert synthetic numbers into real output.
+No example numbers may be hardcoded into runtime output. Rendering must distinguish fresh, cached, stale, disabled, and timed-out observations.
 
 ## 4. Typed health model
 
@@ -171,80 +182,75 @@ Thresholds are starting points; avoid cross-feature uniform limits. Keep 2-3 sam
 
 ## 6.1. Strict deadlines and fail-closed behavior (required)
 
-**Invariant: if a check fails to answer before its deadline, it is not successful.** No retry loop, no implicit extension, no hanging request, no invented positive "pong". A health check must be time-bounded even when its dependencies are unhealthy.
+**Invariant:** a check that fails to answer before its deadline is not successful. Never block the **first** real Telegram message on any probe, never interpret timeout as Healthy, and never create a second message as a fallback after an ambiguous send.
 
-| Operation | Suggested hard wall-clock deadline | Timeout outcome |
+| Operation | Suggested hard wall-clock deadline | Outcome |
 | --- | --- | --- |
-| /ping or /ping full snapshot assembly (before Telegram send) | 250 ms | Render last safe snapshot, mark collector/status stale or Unknown; do not run probes synchronously |
-| DB collector sample | 1 s for SELECT 1; 3 s total for a queue batch | Record timed-out check; cancel work and retain last sample with its age |
-| Public MCP HTTP/background canary | 3 s end-to-end | TimedOut / Unavailable after hysteresis; never claim Healthy |
-| Owner-only /ping probe | 5 s **global** budget, individual probes <=2 s | Stop all unfinished probes on deadline, report TIMEOUT for each |
-| Outbound Telegram send | Explicit bounded request timeout (e.g. 5 s), configurable with transport policy | Log safe category, **do not automatically resend** after ambiguous timeout |
+| Initial /ping message composition (memory/cache only) | 100 ms | Still attempt to send a minimal safe initial message |
+| Initial real Telegram send | 2 s request timeout (operational default) | Record unknown delivery if ambiguous; stop edits without a confirmed message_id; do not resend |
+| /ping cheap refresh after initial send | 5 s overall, shared/singleflight | Finish with available data, mark pending checks TIMEOUT, edit same message |
+| DB collector sample | 1 s for SELECT 1; 3 s for queue batch | Report TIMEOUT in this run, retain previous sample with age |
+| Public MCP HTTP/background canary | 3 s | Record timeout; global degradation only per policy/hysteresis |
+| /ping probe owner-only | 5 s global probe deadline, individual sub-deadlines <=2 s | Stop unfinished checks, final edit contains TIMEOUT rows |
+| Each edit / final edit | Bounded request timeout (e.g. 2 s), rate-limited | On failure retain the previously delivered real message; no new message |
 
-These numbers are initial defaults and need measurement in staging/production. Always use **one global deadline** for the entire explicit probe, with per-probe sub-deadlines (timeout_at and min(per_probe, remaining_budget)); do not sum full independent timeouts serially. Background collectors also have overall limits and are singleflight; if a prior collection is still active, skip the next tick rather than pile up tasks.
+These are initial budgets to tune using production telemetry. The global check deadline and UI request deadlines are **different concerns**: after probes time out, permit a bounded final edit attempt; it must not restart probes or push the check deadline forward. Enforce one global deadline with per-component sub-deadlines (timeout_at and remaining-budget minimum). Skipped samples must be marked stale/Unknown.
 
-The simple /ping remains purely cached and should not wait on PostgreSQL, MCP, LLM or HTTP. For /ping probe, use cancellation-safe code, read-only operations only and a concurrency limit of one. If the deadline fires, drop/cancel pending futures and kill child MCP processes through existing kill_on_drop ownership; a blocking decoder or uncooperative external call must not block response. Never hold a PgPool connection across a network probe.
+Never have each /ping independently start a full database report: **one shared refresh task**, singleflight, cache TTL/rate-limit, and fan-out of its snapshots to each active message. Additional /ping calls get their own real message immediately, then subscribe to an existing refresh or receive cached results. Do not queue arbitrary numbers of refresh requests.
 
-**Telegram delivery is a separate failure domain:** if outgoing Telegram API is unreachable, the bot may be unable to send even "TIMEOUT". There is no truthful in-chat fallback. The handler exits after its bounded send attempt, records an internal failure metric and relies on an out-of-band external monitor for detection. A timed-out send may have been delivered; avoid automatic retries that duplicate messages. Avoid editing a possibly-undelivered message to fake a successful check.
+For owner-only active MCP checks, stop/cancel unfinished futures, kill the scoped MCP child on cancellation using existing kill_on_drop ownership, and avoid holding PgPool connections during external probes. If the bot cannot contact Telegram at all, it cannot deliver a report; out-of-band monitoring must detect that. A send timeout can be an ambiguous delivery, and retrying a POST risks duplicate messages; no speculative resend.
 
-For periodic probes, distinguish TimedOut (reason/code) from Unknown (no or stale observation). TimedOut should contribute to the owning component's failure streak and only become global Unavailable according to the configured criticality/hysteresis. If the cached collector is too stale, public /ping explicitly reports Unknown/stale rather than recycling its old green status.
+Status after deadline must not remain CHECKING forever if the final edit reaches Telegram. If the final edit cannot be delivered, emit a separate internal metric/log event (sanitized) so external monitoring knows the visible message might be stale. Do not mark probe success from a queued DraftSink update.
 
-**Required tests:** a never-resolving DB future, stuck MCP initialize, hanging HTTP canary, Telegram send timeout, cancellation/drop of subprocess, a still-running previous collector, and 100 concurrent /ping calls. Assert strict elapsed upper bounds using paused Tokio time, zero duplicate sends, bounded fanout, no leaked child/process and no green verdict on timeout.
+**Required tests:** never-resolving database future, MCP initialization hang, HTTP hang, initial-send timeout/unknown delivery with zero follow-up sends, Telegram edit timeout, shared collector already active, 100 simultaneous /ping callers, late data after global timeout, and correct final message_id reuse.
 
-## 6.2. Progressive probe rendering through teloxide Drafter (recommended)
+## 6.2. Real-message-first progressive editing with teloxide Drafter (required)
 
-The repository already uses the fork's drafter, not a new dependency:
+### Verified current fork behavior
 
-- src/telegram/command_handler.rs: run_ask_command uses Drafter::snapshots, DraftSink::update, and Drafter::finish.
-- src/telegram/ask_drafter.rs: AskDrafterBackend selects NativeRichBackend in private chats and RichEditInPlaceBackend in groups. Native drafts are temporary and require a final committed message.
-- src/state.rs: AppState.drafter_limiter shares the InProcessRateLimiter.
-- Cargo.toml pins fork rev ce840d82daf47c3e9b9ee16fb05d62fbe0c24727 with drafter and rich-text features.
-- Fork's drafter::DraftConfig defaults: coalesce_window 75ms, min_update_interval 1s, request_timeout 8s, terminal_timeout 30s. These defaults **exceed** the proposed 5s /ping probe deadline and must be overridden (or separately bounded) for this short workflow.
-- The fork supports Drafter observer/metrics hooks, including PreviewTimeout, OperationDeadlineExceeded, FinalError and FinalSuccess, without needing to capture user text.
+- NedoBot uses Drafter::snapshots / DraftSink::update / Drafter::finish in src/telegram/command_handler.rs and a shared AppState.drafter_limiter.
+- src/telegram/ask_drafter.rs uses NativeRichBackend only for private /ask; RichEditInPlaceBackend is used for /ask groups.
+- The pinned teloxide fork (rev ce840d82daf47c3e9b9ee16fb05d62fbe0c24727, crates/teloxide/src/drafter/telegram.rs) has the exact behavior needed:
+  - RichEditInPlaceBackend::update with message_id=None **sends a real rich message**, stores the returned message_id;
+  - subsequent updates **edit** the existing message via edit_rich_text;
+  - finish **edits the same message** if message_id is known;
+  - EditAbortPolicy::KeepPreview retains the existing message on cancellation.
+- Fork defaults: DraftConfig coalesce_window=75ms, min_update_interval=1s, request_timeout=8s, terminal_timeout=30s. Set /ping-specific bounded values; never inherit defaults that violate the health deadline.
 
-**Routing / intent:**
+### Correct lifecycle
 
-1. /ping: return one immediate cached snapshot; do not create a drafter or issue probes.
-2. /ping full: return a detailed cached snapshot (owner DM only); no probe side effects.
-3. /ping probe: owner DM only; start a bounded asynchronous read-only set of checks and stream one latest-wins *rendered snapshot* via the existing drafter mechanism. Keep probes concurrent; one probe's failure must not stop the others. Progress frames update rows as their independent probes settle. Finish by committing a permanent final report with elapsed times and definitive TIMEOUT statuses.
-4. If progressive health is later enabled in groups, select edit-in-place backend and expose only the sanitized public rows; never show owner-only data to a group. No native drafts for groups.
+1. Authorize command and select **public or owner-only** renderer before doing any work.
+2. Build the initial frame from local registry and cached samples, plus CHECKING placeholders; do not await DB/MCP/HTTP.
+3. Create a **RichEditInPlaceBackend for every chat kind** (including DMs) with reply_parameters and EditAbortPolicy::KeepPreview. No NativeRichBackend for /ping.
+4. Create Drafter::snapshots using the shared rate limiter and a /ping-specific config; queue first frame with DraftSink::update, **immediately flush with a bounded timeout** to send a real message. Set a tiny valid coalesce_window (e.g. 1ms). The initial network send is async, so "immediately" means no dependency checks before it, not zero network latency.
+5. Only after first send is acknowledged and the backend has a known message_id, start or subscribe to a shared bounded refresh. If the initial send fails/has unknown delivery, **stop**; do not call finish on a backend with unknown message_id because that may send a duplicate new message.
+6. As individual cheap checks complete, produce typed ProbeProgress events in one aggregator, regenerate the **entire** message, and issue DraftSink::update. Out-of-order or stale events must not roll back terminal states. Drafter coalesces latest-wins updates and applies the shared rate limiter. There is no promise that every intermediate frame will be visible.
+7. On completion/deadline, label unresolved checks TIMEOUT and call Drafter::finish exactly once to **edit** that existing message with the final state. If edit fails, record diagnostic failure and leave the real message as-is; never send a replacement.
 
-**Illustrative state transitions (not actual measurements):**
+### Limits and safety
 
-    Starting health probes
-    PostgreSQL: CHECKING
-    Agent chat MCP: CHECKING
-    Public RMCP HTTP: CHECKING
+- The **first send is mandatory** for every /ping; a cached snapshot is immediately visible as a real reply even if every probe hangs.
+- A plain /ping may refresh the cheap DB and queue snapshot through shared singleflight collector, not launch MCP subprocesses or billable external service calls. Show last measured MCP state and its age. /ping probe adds explicitly authorized active checks; /ping full only broadens visibility.
+- Do not clone /ask's private-chat native-draft behavior or its DeletePreviewBestEffort abort policy. KeepPreview prevents removal of a real status message.
+- RichEditInPlaceBackend currently has **no public way to attach an already sent message_id**: avoid a separate manual Bot::send_message followed by creating a fresh Drafter; that combination would risk a second message. Let the first Drafter update perform the real send and obtain the message_id.
+- The backend itself handles send->edit transition. Keep /ping's code feature-independent of AskDrafterBackend (currently behind feature=ask); use RichEditInPlaceBackend directly so --no-default-features can compile.
+- Initial send, edit/finalization and probe deadlines must be tested independently. Do not let a stuck Telegram send launch new work indefinitely. Do not attempt a second send when an API timeout makes delivery ambiguous.
+- Use a bounded update interval (default initial recommendation ~1s) and cap total edit volume. Do not leak owner-only diagnostics to group messages. Renderers escape HTML and keep all frames within Telegram limits.
+- Optional DrafterObserver / DrafterMetricsCollector events can report preview/finish latency and safe error classes, without logging payloads.
 
-    PostgreSQL: OK (8 ms)
-    Agent chat MCP: CHECKING
-    Public RMCP HTTP: CHECKING
+### Additional acceptance tests
 
-    PostgreSQL: OK (8 ms)
-    Agent chat MCP: OK (94 ms)
-    Public RMCP HTTP: TIMEOUT (3 s)
-    Result: DEGRADED (probe finished)
-
-**Implementation details:**
-
-- Use one typed ProbeProgress event per completed probe and a single aggregator/render task. Every frame is derived from the same HealthSnapshot with monotonic per-probe terminal states. Do not allow late results to overwrite a timed-out result after the global deadline.
-- The draft transport uses latest-wins coalescing and a shared per-bot rate limiter. Do not send every fast phase transition individually: Drafter itself throttles frames. Show at most meaningful changes, plus a guaranteed final commit attempt.
-- A DraftSink update is a local enqueue, **not proof Telegram rendered the frame**. Never consider UI delivery to be probe success.
-- Avoid blocking on a preliminary drafter.flush(): the existing /ask path calls flush, but this could consume the short probe budget. If needed, cap it independently within the overall deadline. Start all checks immediately, concurrently with draft preview delivery.
-- Use a /ping-specific DraftConfig: terminal_timeout <= 5s, bounded request_timeout, min_update_interval around 1s, coalescing and retries consistent with the probe wall time. Avoid default terminal_timeout=30s and repeated previews for a short probe.
-- Deadlines belong to **probes, not the UI**. A failed or delayed Telegram draft must never keep DB/MCP probes alive beyond the 5s probe deadline. Bound final Telegram delivery separately (up to 5s); if delivery fails or is ambiguous, record a safe category and do not automatically duplicate a final message.
-- For native drafts, finalization sends the permanent message; for edit-backend, finalization edits the existing preview in place. On cancellation or error, use backend cleanup semantics; do not delete a useful completed health report.
-- The AskDrafterBackend module is currently behind #[cfg(feature = "ask")]. Prefer extracting the transport-neutral backend selector into a reusable Telegram module (or a small independent health-specific backend) so /ping compiles under --no-default-features without requiring /ask. Do not import /ask lifecycle/audit policy into health commands.
-- Do not use actual probe results to grant capabilities. Read-only scope is fixed by validated instance config, the owner check happens **before** any probes/drafts, and the public renderer never includes diagnostics that only the owner should see.
-- If the user presses a Telegram Stop button or the task is cancelled, stop probe work, do not mark unfinished checks healthy, and do not issue a second speculative final send.
-- Optional: attach the fork's DrafterMetricsCollector to collect preview/finish failures, with fixed metric labels; never retain preview contents.
-
-**Extra tests:** mock native and edit backends, last-write-wins coalescing, intermediate events arriving out of order, late success after timeout, failed preview followed by successful final, hung preview with bounded finish, group disclosure protections, owner DM authorization, cancellation cleanup and disabled /ask compilation.
+- DM and group both send **one real first message**, not native drafts; every subsequent event uses the **same message_id** via editMessageRichText.
+- First frame appears before any mocked DB/MCP future can resolve; delayed/hanging probes do not delay it.
+- First send timeout/ambiguous delivery **never** triggers finish/send fallback. Refuse edits without a confirmed message_id.
+- Update coalescing and out-of-order events preserve the latest monotonic state; 100 simultaneous requests do not produce 100 expensive refreshes.
+- Completion and global deadline both trigger one final **edit**, not a second message.
+- Cancellation leaves the real message (KeepPreview), owner/group permissions hold across every frame, and --no-default-features builds.
 
 ## 7. Implementation steps (small, reviewable PRs)
 
-1. **P1 model/registry:** health model; process uptime/build; register active workers; poll counters/heartbeats; deterministic rendering; /ping and /ping full auth. Keep old /db working. No schema migrations.
-2. **P2 cheap collector:** DB SELECT 1 and cached four existing queue projections; build snapshot with age/timeout; no per-command DB fanout. Add windowed counters and instance scope.
+1. **P1 model/registry + actual-message-first UI:** health model; process uptime/build; worker heartbeat; /ping, /ping full owner auth; RichEditInPlaceBackend first update sends a real message, subsequent updates edit the same ID. Preserve /db. No schema migrations.
+2. **P2 cheap collector + progressive edits:** DB SELECT 1 and cached four existing queue projections; singleflight fresh refresh after the initial send, stream typed result events into Drafter updates, enforce deadline and one final edit. Add windowed counters and instance scope.
 3. **P3 /ask and MCP:** instrument ask slots, lifecycle, active requests; MCP child init/list/call durations/errors; LLM attempts; error and delivery windows. Keep child lifecycle unchanged.
 4. **P4 extended queues:** QR/shadow, voice, moderation, captcha, profiles, report delivery. Verify each query/index and feature gate.
 5. **P5 public MCP monitor:** separate isolated HTTP canary or dedicated monitor interface; public /ping exposes only sanitized aggregate. Optional owner-only explicit probe.
@@ -256,20 +262,20 @@ Do not implement all queues in one patch; preserve release gates and rollback-fr
 
 - Command parsing: /ping, /ping full, /ping probe, /ping@Bot full, unknown arguments; /status day/week/month unchanged; /db unchanged; compile with default and --no-default-features.
 - Permissions: owner in private chat sees full; stranger/private and owner/group do **not** receive full diagnostics; sender_chat/forwarded authors cannot impersonate owner; HTML escaping for all rendered fields.
-- No-traffic startup: no fake Healthy or failure for /ask/MCP/LLM; Disabled feature gates; stale sample becomes Unknown.
+- No-traffic startup: first real message delivered immediately; no fake Healthy or failure for /ask/MCP/LLM; Disabled feature gates; stale sample becomes Unknown.
 - Health model: deterministic verdict precedence, toggled criticality, hysteresis, partial collector failure, no unchecked conversion of cumulative counters into per-hour values.
 - Worker fixtures: Processed/Idle/Failed transitions, long in-flight work, stuck poll, restart reset, unexpected exit, graceful drain, no heartbeat from disabled worker.
 - PostgreSQL integration: query returns verified scoped results, empty and delayed queues, expired leases, retry_wait in future, SQL timeout, lost DB, sampler limited parallelism. Ensure /ping still renders cached degraded state if DB unavailable.
 - MCP tests using fake RMCP child/server: init success, tools/list incomplete, tool timeout, absent required tool, spawn failure, no requests, shutdown, distinct public HTTP failure; ensure no child spawn on public /ping.
-- Load test: 100 concurrent public /ping calls do not launch extra DB queries/processes; bound allocations/response bytes; no secrets, tokens, raw user text or internal error messages appear in either rendering or logs.
+- Load test: 100 concurrent public /ping calls each get one real response (and edits to its own ID), but share at most one DB refresh; no extra subprocesses, bounded allocations/response bytes, no secrets, tokens, raw user text or internal errors in rendering or logs.
 - Delivery observability: 'delivery_unknown' distinguished from provider failure; no probing mutates user/chat state.
 - Rollout: compile/test and SQL integration first, then feature-enabled canary; compare snapshot to CLI job_lifecycle_report; verify one production process and public MCP separately. Roll back by reverting feature/handler, no DB migration needed in first phases.
 
 ## 9. Key decisions
 
-- Use **/ping**, not /status.
+- Use **/ping**, not /status. Every /ping sends a real Telegram message first and then edits that same message with fresher data; never use ephemeral native draft and never send a final duplicate.
 - Public view cheap and safe; detailed view owner-only DM.
-- Snapshot based on existing AppState and worker supervision, not heavyweight synchronous /ping work.
+- Initial snapshot based on existing AppState and worker supervision; fresh cheap checks run only after the initial send using bounded singleflight collection, never heavyweight synchronous work before the first reply.
 - Agent chat-DB MCP, search/GitHub MCP, and public RMCP HTTP are **three different monitoring subjects**.
 - No operations that incur LLM/ASR costs, no SQL or tools supplied by Telegram users.
 - Stale, disabled, idle, and failed are distinct concepts.
