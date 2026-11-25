@@ -26,6 +26,20 @@ BINARIES=(
     probe_ask_route
 )
 
+link_or_copy() {
+    local source="${1:?missing source}"
+    local destination="${2:?missing destination}"
+
+    # Release stage, /opt and /var/backups normally share a filesystem on VPS.
+    # A hard link avoids a second copy of large binaries; atomic rename below
+    # leaves the old inode intact for rollback. Fall back across filesystems.
+    if [[ -f "$source" && ! -L "$source" ]] \
+        && ln -- "$source" "$destination" 2>/dev/null; then
+        return
+    fi
+    cp -pL -- "$source" "$destination"
+}
+
 if [[ "${1:-}" == --list-binaries ]]; then
     printf '%s\n' "${BINARIES[@]}"
     exit
@@ -131,7 +145,7 @@ if [[ "${2:-}" == --backup ]]; then
         test -x "$dest_dir/tg_ai_bot_teloxide"
         for binary in "${BINARIES[@]}"; do
             if [[ -e "$dest_dir/$binary" || -L "$dest_dir/$binary" ]]; then
-                cp -pL -- "$dest_dir/$binary" "$backup/$instance/$binary"
+                link_or_copy "$dest_dir/$binary" "$backup/$instance/$binary"
                 cmp --silent -- "$dest_dir/$binary" "$backup/$instance/$binary"
             else
                 printf '%s\n' "$instance/$binary" >> "$backup/ABSENT"
@@ -157,7 +171,7 @@ for dest_dir in "${DEST_DIRS[@]}"; do
     temp_dir="$(mktemp -d "$dest_dir/.release.XXXXXXXX")"
     TEMP_DIRS+=("$temp_dir")
     for binary in "${BINARIES[@]}"; do
-        install -m 0755 "${STAGE_DIR}/${binary}" "$temp_dir/$binary"
+        link_or_copy "${STAGE_DIR}/${binary}" "$temp_dir/$binary"
     done
 done
 for index in "${!DEST_DIRS[@]}"; do
