@@ -195,7 +195,7 @@ class ReleaseInstall(unittest.TestCase):
         for required in (
             "trap rollback_on_failure EXIT",
             'install_release_binaries.sh" --restore "$backup_dir"',
-            "set_privacy_mode_observe.sh",
+            'bash "$stage_dir/dist/set_privacy_mode_observe.sh"',
             "assert_database_at_expected_migration tg_ai_bot",
             "assert_database_at_expected_migration tg_ai_bot_pvo",
             '[ "$migration_state" != "$expected_migration_version:false" ]',

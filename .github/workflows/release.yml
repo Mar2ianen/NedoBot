@@ -266,7 +266,7 @@ jobs:
           ( cd "$backup_dir" && sha256sum --strict --check --status SHA256SUMS )
 
           for instance in tg-ai-bot-teloxide nedobot-pvo; do
-            bash "$stage_dir/set_privacy_mode_observe.sh" "/opt/$instance/.env"
+            bash "$stage_dir/dist/set_privacy_mode_observe.sh" "/opt/$instance/.env"
             policy_value="$(systemd-run --quiet --wait --pipe --collect \
               --property="EnvironmentFile=/opt/$instance/.env" \
               /usr/bin/env | awk -F= '$1 == "NEDOBOT_PRIVACY_MODE_POLICY" {print $2}')"
