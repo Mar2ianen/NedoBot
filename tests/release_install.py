@@ -199,6 +199,7 @@ class ReleaseInstall(unittest.TestCase):
             "assert_database_at_expected_migration tg_ai_bot",
             "assert_database_at_expected_migration tg_ai_bot_pvo",
             '[ "$migration_state" != "$expected_migration_version:false" ]',
+            'journalctl --quiet -u "$unit"',
             "assert_privacy_policy tg-ai-bot-teloxide",
             "assert_privacy_policy nedobot-pvo",
             "deployment_complete=true",

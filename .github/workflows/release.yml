@@ -316,7 +316,7 @@ jobs:
 
           journal_has_errors() {
             unit="$1"
-            error_lines="$(journalctl -u "$unit" --since "$deploy_started_at" --no-pager -p err -o cat)"
+            error_lines="$(journalctl --quiet -u "$unit" --since "$deploy_started_at" --no-pager -p err -o cat)"
             journal_status=$?
             if [ "$journal_status" -ne 0 ]; then
               return 2
@@ -324,7 +324,7 @@ jobs:
             if [ -n "$error_lines" ]; then
               return 0
             fi
-            log_lines="$(journalctl -u "$unit" --since "$deploy_started_at" --no-pager -o cat)"
+            log_lines="$(journalctl --quiet -u "$unit" --since "$deploy_started_at" --no-pager -o cat)"
             journal_status=$?
             if [ "$journal_status" -ne 0 ]; then
               return 2
