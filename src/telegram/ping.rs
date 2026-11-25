@@ -100,6 +100,24 @@ pub async fn handle(
     }
     let send_ms = crate::features::health::milliseconds(started_send.elapsed());
 
+    // Persist the command only after acknowledging the real Telegram reply;
+    // a broken database must never prevent /ping itself from answering.
+    if crate::features::ingest::is_managed_chat(&state.config, msg.chat.id.0) {
+        let recorded_message = msg.clone();
+        let pool = state.pool.clone();
+        let config = state.config.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::features::ingest::ingest_message(&pool, &recorded_message, &config),
+            ).await;
+            if let Ok(Err(_)) | Err(_) = result {
+                tracing::warn!("best-effort /ping ingestion failed or timed out");
+            }
+        });
+    }
+    let diagnostics_started = Instant::now();
+
     // The initial message was delivered before a single probe started.
     let mut changes = health.subscribe();
     health.refresh(state.pool.clone(), state.config.clone());
@@ -133,7 +151,11 @@ pub async fn handle(
     }
 
     let final_snapshot = health.snapshot();
-    let final_text = render(&final_snapshot, state, mode, true, Some(send_ms));
+    let mut final_text = render(&final_snapshot, state, mode, true, Some(send_ms));
+    final_text.push_str(&format!(
+        "\nДиагностика: {} мс",
+        crate::features::health::milliseconds(diagnostics_started.elapsed())
+    ));
     match tokio::time::timeout(Duration::from_secs(2), drafter.finish(rich(final_text))).await {
         Ok(Ok(_)) => {}
         Ok(Err(_)) | Err(_) => {
@@ -307,12 +329,22 @@ fn render(
             HealthStatus::Degraded | HealthStatus::Unavailable | HealthStatus::TimedOut
         )
     });
-    let overall = if snapshot.busy && !final_frame {
+    let missing_core = ["postgres", "queues"].iter().any(|id| !snapshot.checks.contains_key(id));
+    let stale_core = ["postgres", "queues"].iter().any(|id| snapshot.checks.get(id).is_some_and(|sample| {
+        sample.status == HealthStatus::Unknown
+            || (sample.status == HealthStatus::Healthy && sample.observed_at.elapsed() > Duration::from_secs(120))
+    }));
+    let timed_out_core = final_frame && ["postgres", "queues"].iter().any(|id| {
+        snapshot.checks.get(id).is_some_and(|sample| sample.status == HealthStatus::Checking)
+    });
+    let overall = if !final_frame && (snapshot.busy || missing_core) {
         "CHECKING"
-    } else if has_error {
+    } else if has_error || timed_out_core {
         "UNAVAILABLE"
-    } else if has_warning {
+    } else if has_warning || (final_frame && snapshot.busy) {
         "DEGRADED"
+    } else if missing_core || stale_core {
+        "UNKNOWN"
     } else {
         "OK / наблюдаемые компоненты"
     };

@@ -88,6 +88,7 @@ pub struct HealthRegistry {
     checks: Mutex<BTreeMap<&'static str, CheckSample>>,
     workers: Mutex<BTreeMap<&'static str, WorkerSample>>,
     collecting: AtomicBool,
+    last_refresh: Mutex<Option<Instant>>,
     mcp_collecting: AtomicBool,
     revision: AtomicU64,
     changes: watch::Sender<u64>,
@@ -109,6 +110,7 @@ impl HealthRegistry {
             checks: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeMap::new()),
             collecting: AtomicBool::new(false),
+            last_refresh: Mutex::new(None),
             mcp_collecting: AtomicBool::new(false),
             revision: AtomicU64::new(0),
             changes,
@@ -238,6 +240,11 @@ impl HealthRegistry {
     }
 
     pub fn refresh(self: &Arc<Self>, pool: PgPool, config: Arc<Config>) {
+        // Avoid a new burst of SQL for every /ping, even after the last sample finished.
+        if self.last_refresh.lock().unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
+            return;
+        }
         if self.collecting.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -247,6 +254,7 @@ impl HealthRegistry {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             this.refresh_inner(pool, config).await;
+            *this.last_refresh.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             this.collecting.store(false, Ordering::Release);
             this.notify();
         });
