@@ -47,13 +47,13 @@ pub async fn handle(
         } else {
             "Использование: /ping, /ping full или /ping probe."
         };
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
+        let send = async {
             bot.send_message(text)
                 .chat_id(msg.chat.id)
-                .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply()),
-        )
-        .await;
+                .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
+                .await
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), send).await;
         return Ok(());
     };
 
