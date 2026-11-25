@@ -3,3 +3,7 @@ our_spam.txt
 our_ham.txt
 inter_ham.txt
 __pycache__/
+# Приватные разборы свежего экспорта: только локально.
+export_deleted.py
+export_reactions.py
+auto_label.py
