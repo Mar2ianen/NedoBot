@@ -782,12 +782,8 @@ mod tests {
         data.top_words = vec![("<word&>".into(), 17)];
         let strings = StatsStrings::russian();
         let rich = user_stats(Some(&data), None, -1001, &strings);
-        let html = crate::features::stats::render_html::user_stats(
-            Some(&data),
-            None,
-            -1001,
-            &strings,
-        );
+        let html =
+            crate::features::stats::render_html::user_stats(Some(&data), None, -1001, &strings);
         for expected in [
             "2026-11-24 12:34",
             "&lt;tag&amp;&gt;",

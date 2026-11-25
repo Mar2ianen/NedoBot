@@ -749,7 +749,11 @@ mod tests {
         let pages = top_reacted_pages(&data, chat_id, &strings);
         let rich = crate::features::stats::render_rich::top_reacted(&data, chat_id, &strings);
         assert!(pages.len() > 1);
-        assert!(pages.iter().all(|page| crate::telegram::html::is_safe_len(page)));
+        assert!(
+            pages
+                .iter()
+                .all(|page| crate::telegram::html::is_safe_len(page))
+        );
         for row in &data.messages {
             let link = message_url(chat_id, row.message_id);
             let author = user_or_message_link(

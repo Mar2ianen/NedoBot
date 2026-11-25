@@ -115,7 +115,11 @@ pub async fn send_top_reacted(
         .map_err(stats_error("failed to build top reacted report"))?;
     let reports = match render {
         StatsRender::Html => render_html::top_reacted_pages(&data, stats_scope_chat_id, strings),
-        StatsRender::Rich => vec![render_rich::top_reacted(&data, stats_scope_chat_id, strings)],
+        StatsRender::Rich => vec![render_rich::top_reacted(
+            &data,
+            stats_scope_chat_id,
+            strings,
+        )],
     };
     for report in reports {
         send_stats_report(bot, chat_id, report, render, audience).await?;

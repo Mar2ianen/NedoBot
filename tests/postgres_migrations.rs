@@ -8160,11 +8160,10 @@ async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
         expected_bottom
     );
 
-    let top_report = tg_ai_bot_teloxide::features::stats::service::top_messages_report_data(
-        pool, CHAT_ID, 3,
-    )
-    .await
-    .expect("top report projection must succeed");
+    let top_report =
+        tg_ai_bot_teloxide::features::stats::service::top_messages_report_data(pool, CHAT_ID, 3)
+            .await
+            .expect("top report projection must succeed");
     assert_eq!(
         top_report
             .users
@@ -8173,11 +8172,10 @@ async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
             .collect::<Vec<_>>(),
         expected_top
     );
-    let bottom_report = tg_ai_bot_teloxide::features::stats::service::bottom_messages_report_data(
-        pool, CHAT_ID, 3,
-    )
-    .await
-    .expect("bottom report projection must succeed");
+    let bottom_report =
+        tg_ai_bot_teloxide::features::stats::service::bottom_messages_report_data(pool, CHAT_ID, 3)
+            .await
+            .expect("bottom report projection must succeed");
     assert_eq!(
         bottom_report
             .users
@@ -8223,11 +8221,10 @@ async fn assert_stats_rank_ties_follow_the_reference_order(pool: &PgPool) {
         .await
         .expect("reaction count fixture must insert");
     }
-    let reacted = tg_ai_bot_teloxide::features::stats::service::top_reacted_report_data(
-        pool, CHAT_ID, 20,
-    )
-    .await
-    .expect("top reaction report projection must succeed");
+    let reacted =
+        tg_ai_bot_teloxide::features::stats::service::top_reacted_report_data(pool, CHAT_ID, 20)
+            .await
+            .expect("top reaction report projection must succeed");
     assert_eq!(
         reacted
             .messages
