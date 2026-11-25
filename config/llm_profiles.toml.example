@@ -592,6 +592,7 @@ max_corpus_examples = 5000
 
 # Нативный Decisions API; не является generative route и не выдаёт санкции.
 [moderation.decision]
+# chat_topic = "Явная тема сообщества, заданная владельцем"
 # shadow — только наблюдения; score_captcha — общие метрики и ephemeral captcha.
 mode = "shadow"
 score_weight = 90
@@ -610,6 +611,12 @@ max_calls_per_hour = 30
 max_pending_jobs = 100
 max_input_chars = 2000
 chat_policy = "Тематика и разрешения чата неизвестны. Не предполагай запрета предложений работы."
+
+# Необязательная ручная тема проверенного исходного поста (IDs заменить своими).
+# [[moderation.decision.post_topics]]
+# discussion_chat_id = -1000000000001
+# post_message_id = 42
+# topic = "Rust: владение и заимствование"
 
 [manual_moderation]
 enabled = false
@@ -654,6 +661,13 @@ ceil = 1.0
 k = 3.20435
 midpoint_billion = 8.45919
 version = "4pl-prod-2026-09-21"
+
+# Опциональный формат сдвига по дате, не рекомендация параметров для production.
+# Без секции используется прежняя фиксированная 4PL. Slope — только после оценки.
+# [risk_profiles.ru_general_v1.telegram_id_time]
+# reference_date = "2026-09-21"
+# midpoint_billion_per_day = 0.0
+# version = "reviewed-time-model-v1"
 
 [agent_profiles.nedonews_default]
 identity = "NedoBot"

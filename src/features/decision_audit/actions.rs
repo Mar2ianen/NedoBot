@@ -145,8 +145,12 @@ async fn apply(bot: &Bot, pool: &PgPool, c: &Config, a: &Action) -> anyhow::Resu
         return finish(pool, a, DecisionActionStatus::Skipped, "source_missing").await;
     };
     let contacts = contacts::extract(pool, a.job.chat_id, a.job.user_id, &text, &entities).await?;
-    let contribution =
-        scoring::contribution(&assessment, &contacts, &c.community.moderation.decision);
+    let contribution = scoring::contribution_with_context(
+        &assessment,
+        &contacts,
+        &c.community.moderation.decision,
+        &a.job.input_json,
+    );
     let Some(total) = materialize(pool, c, a, &contribution).await? else {
         return finish(pool, a, DecisionActionStatus::Skipped, "stale_metrics").await;
     };

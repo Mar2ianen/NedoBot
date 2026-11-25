@@ -8,6 +8,7 @@ use tg_ai_bot_teloxide::{
     features::{
         decision_audit::{
             client::{DecisionClient, POLICY_VERSION, QUESTIONS},
+            diagnostics,
             service::configuration_hash,
         },
         new_user_audit::{
@@ -105,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
               'text',m.text,'created_at',m.created_at,'edited_at',m.edited_at,'deleted_by_bot_at',m.deleted_by_bot_at,
               'message_count',u.message_count,'age_seconds',extract(epoch from now()-u.first_seen_at)::bigint,'member_status',u.member_status,
               'risk_score',a.risk_score,'risk_signals',jsonb_build_object('baseline',a.risk_baseline_signals,'first_message',a.risk_first_message_signals,'avatar',a.risk_avatar_signals,'external',a.risk_external_signals),
+              'id_profile_context',jsonb_build_object('model_version',a.telegram_id_model_version,'spam_probability',a.telegram_user_id_spam_probability,'is_recent_id',a.telegram_user_id_is_recent,'feminine_first_name_pattern',a.first_name_feminine_pattern,'baseline_score',a.risk_baseline_score,'decision_score',a.risk_decision_score),
               'audit',(select to_jsonb(j)-'input_json' from new_user_audit_jobs j where j.chat_id=m.chat_id and j.telegram_user_id=m.user_id and j.created_at>=m.created_at order by created_at,id limit 1),
               'captcha',(select jsonb_build_object('status',c.status,'setup_error_kind',c.setup_error_kind,'created_at',c.created_at,'updated_at',c.updated_at) from telegram_risk_captcha_challenges c where c.chat_id=m.chat_id and c.telegram_user_id=m.user_id),
               'observations',(select to_jsonb(o) from moderation_text_observations o where o.instance_id=$3 and o.chat_id=m.chat_id and o.message_id=m.message_id),
@@ -124,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
                 let first = &a["assessment_json"]["first_message_assessment"];
                 let recognized =
                     first["offtopic_promo"] == true || first["direct_dm_offer"] == true;
-                let stage = if !row["deleted_by_bot_at"].is_null() {
+                let legacy_audit_stage = if !row["deleted_by_bot_at"].is_null() {
                     MissedStage::NoConfirmedMiss
                 } else if a["status"] == "failed" || a["materialization_status"] == "failed" {
                     MissedStage::Failed
@@ -141,9 +143,29 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     MissedStage::Classification
                 };
+                let latest = diagnostics::latest_job(&row["decisions"]);
+                let stage = diagnostics::stage(latest);
                 json!({"instance":config.community.instance.id,"message_id":message,"stage":stage,
+                    "legacy_audit_stage":legacy_audit_stage,"decision_job_id":latest.map(|job|&job["id"]),
+                    "decision_stage_note":"stage описывает последнюю persisted Decision job по ID; все предыдущие snapshots сохранены в persisted.decisions. not_enqueued означает отсутствие job, а не доказанную причину skip.",
                     "historical_gate_note":"Текущее состояние не доказывает историческую причину policy gate; сверять журнал по job ID. Отсутствие санкции не доказывает ошибку классификации.",
-                    "current_policy":{"enforce":config.community.moderation.enforce_enabled,"review_delivery":config.community.moderation.review_delivery_enabled,"captcha":config.community.moderation.captcha_enabled},"local_trace":local,"persisted":row})
+                    "current_policy":{"enforce":config.community.moderation.enforce_enabled,"review_delivery":config.community.moderation.review_delivery_enabled,"captcha":config.community.moderation.captcha_enabled,
+                        "captcha_dry_run":config.community.moderation.captcha_dry_run,"captcha_threshold":config.community.moderation.captcha_threshold},
+                    "decision_policy":{"enabled":config.community.moderation.decision.enabled,
+                        "configuration_hash":configuration_hash(&config),
+                        "moderation_enabled":config.community.moderation.enabled,
+                        "external_processing_allowed":config.community.moderation.decision.external_processing_allowed,
+                        "eligible_for_chat":tg_ai_bot_teloxide::features::decision_audit::repo::enabled_for_chat(&config,chat),
+                        "mode":config.community.moderation.decision.mode,
+                        "avatar_enabled":config.community.moderation.decision.avatar_enabled,
+                        "initial_texts":config.community.moderation.decision.initial_texts,
+                        "max_pending_jobs":config.community.moderation.decision.max_pending_jobs,
+                        "max_calls_per_hour":config.community.moderation.decision.max_calls_per_hour,
+                        "score_weight":config.community.moderation.decision.score_weight,
+                        "external_contact_weight":config.community.moderation.decision.external_contact_weight,
+                        "captcha_max_message_age_sec":config.community.moderation.decision.captcha_max_message_age_sec,
+                        "ban_on_failure":config.community.moderation.decision.ban_on_failure},
+                    "local_trace":local,"persisted":row})
             } else {
                 json!({"stage":MissedStage::NotIngested,"message_id":message})
             };
@@ -181,8 +203,9 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             }
             println!(
-                "observed {} recent author messages; only shadow queue, no sanctions",
-                messages.len()
+                "observed {} recent author messages; configured Decision mode: {:?}",
+                messages.len(),
+                config.community.moderation.decision.mode
             );
         }
         "compare" => {

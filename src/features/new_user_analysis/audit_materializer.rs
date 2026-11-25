@@ -155,6 +155,7 @@ pub(super) async fn save_audit_in_transaction(
             "review_threshold": config.review_threshold,
         },
         "risk_profile": config.risk_profile,
+        "profile_context_version": profile_context::PROFILE_CONTEXT_VERSION,
         "risk_profile_version": config.risk_profile_version,
         "telegram_id_model_version": config.telegram_id_model_version,
         "telegram_id_model": config.telegram_id_model.as_ref().map(|model| json!({

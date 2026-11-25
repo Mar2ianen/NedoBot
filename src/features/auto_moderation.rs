@@ -53,6 +53,9 @@ pub async fn maybe_enforce_audit(
     job: &NewUserAuditJob,
     score: i32,
 ) -> anyhow::Result<()> {
+    if crate::telegram::identity::is_channel_sender_proxy(job.telegram_user_id) {
+        return Ok(());
+    }
     if crate::features::new_user_audit::local_cascade::blocks_enforcement(
         job.assessment_json.as_ref(),
     ) {

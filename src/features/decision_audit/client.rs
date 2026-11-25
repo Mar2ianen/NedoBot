@@ -7,8 +7,52 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 pub const QUESTIONS: &str = include_str!("questions.json");
-pub const POLICY_VERSION: &str = "decision-score-v2";
+pub const POLICY_VERSION: &str = "decision-score-v4";
 const MAX_RESPONSE_BYTES: usize = 256 * 1_024;
+
+/// Только содержательные поля уходят провайдеру. IDs provenance и mode/hash — private.
+fn external_input(input: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in [
+        "author_message",
+        "chat_policy",
+        "topic_context",
+        "profile_signals",
+        "text_signals",
+        "structural_features",
+        "external_contacts",
+    ] {
+        if let Some(value) = input.get(key) {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    let mut out = Value::Object(out);
+    for (field, keys) in [
+        (
+            "profile_signals",
+            &[
+                "version",
+                "feminine_first_name_pattern",
+                "avatar_observable",
+                "telegram_id_spam_probability",
+                "telegram_id_model_version",
+                "evaluated_on_utc",
+                "observed_message_count",
+            ][..],
+        ),
+        ("topic_context", &["chat_topic", "post_topic"][..]),
+        ("text_signals", &["short_invitation"][..]),
+    ] {
+        if let Some(source) = input.get(field) {
+            out[field] = Value::Object(
+                keys.iter()
+                    .filter_map(|key| source.get(*key).map(|v| ((*key).into(), v.clone())))
+                    .collect(),
+            );
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -53,6 +97,29 @@ pub enum ShadowVerdict {
 }
 
 impl DecisionAssessment {
+    /// Отдельное «приму» + уверенный оффтоп относительно известной темы.
+    /// Имя, аватар и ID-risk — дополнительные признаки, не условия этого пути.
+    pub fn off_topic_context_candidate(&self, input: &Value) -> bool {
+        let topic = &input["topic_context"];
+        let has_topic = ["chat_topic", "post_topic"]
+            .iter()
+            .any(|key| topic[*key].as_str().is_some_and(|s| !s.trim().is_empty()));
+        self.captcha_verdict() == ShadowVerdict::NoSignal
+            && has_topic
+            && input["text_signals"]["priimu_bait"] == true
+            && input["profile_signals"]["observed_message_count"]
+                .as_i64()
+                .is_some_and(|n| (1..=5).contains(&n))
+            && matches!(self.answers.get("offtopic_message"),Some(Answer::Noul{noul,confidence}) if *noul>=0.9 && *confidence>=0.8)
+    }
+
+    pub fn captcha_verdict_for_input(&self, input: &Value) -> ShadowVerdict {
+        if self.off_topic_context_candidate(input) {
+            ShadowVerdict::ReviewCandidate
+        } else {
+            self.captcha_verdict()
+        }
+    }
     pub fn validate(&self) -> Result<(), Failure> {
         let questions: BTreeMap<String, Value> =
             serde_json::from_str(QUESTIONS).map_err(|_| Failure::InvalidResponse)?;
@@ -256,7 +323,8 @@ impl DecisionClient {
     ) -> Result<(DecisionAssessment, u64), Failure> {
         let questions: Value =
             serde_json::from_str(QUESTIONS).map_err(|_| Failure::Configuration)?;
-        let text = serde_json::to_string(input).map_err(|_| Failure::Configuration)?;
+        let text =
+            serde_json::to_string(&external_input(input)).map_err(|_| Failure::Configuration)?;
         let input = if let Some(data) = avatar {
             json!([{"type":"text","text":format!("{text}\n")},{"type":"image","data":data,"mime_type":"image/jpeg","resolution":"low"}])
         } else {
@@ -451,5 +519,130 @@ mod tests {
             Failure::Timeout
         );
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod topic_context_tests {
+    use super::*;
+    fn context() -> Value {
+        json!({"topic_context":{"chat_topic":"Rust","post_topic":null},
+          "profile_signals":{"observed_message_count":1},
+          "text_signals":{"priimu_bait":true,"short_invitation":false}})
+    }
+    fn off_topic() -> DecisionAssessment {
+        let mut a: DecisionAssessment = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/decision_response.json"
+        ))
+        .unwrap();
+        a.answers.insert(
+            "offtopic_message".into(),
+            Answer::Noul {
+                noul: 0.95,
+                confidence: 0.95,
+            },
+        );
+        a
+    }
+    #[test]
+    fn priimu_offtopic_captcha_needs_topic_and_newcomer_but_not_profile() {
+        let a = off_topic();
+        let input = context();
+        assert_eq!(a.captcha_verdict(), ShadowVerdict::NoSignal);
+        assert_eq!(
+            a.captcha_verdict_for_input(&input),
+            ShadowVerdict::ReviewCandidate
+        );
+        for (path, value) in [
+            ("/topic_context/chat_topic", Value::Null),
+            ("/profile_signals/observed_message_count", json!(0)),
+            ("/profile_signals/observed_message_count", json!(6)),
+            ("/text_signals/priimu_bait", json!(false)),
+            ("/text_signals/priimu_bait", Value::Null),
+        ] {
+            let mut invalid = input.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                a.captcha_verdict_for_input(&invalid),
+                ShadowVerdict::NoSignal,
+                "{path}"
+            );
+        }
+        let mut post_topic = input.clone();
+        post_topic["topic_context"]["chat_topic"] = Value::Null;
+        post_topic["topic_context"]["post_topic"] = json!("Ownership");
+        assert_eq!(
+            a.captcha_verdict_for_input(&post_topic),
+            ShadowVerdict::ReviewCandidate
+        );
+        // Старая ветка «имя+аватар разрешают оффтоп» удалена.
+        let mut profile_only = input.clone();
+        profile_only["text_signals"]["priimu_bait"] = json!(false);
+        profile_only["text_signals"]["short_invitation"] = json!(true);
+        profile_only["profile_signals"]["feminine_first_name_pattern"] = json!(true);
+        profile_only["profile_signals"]["avatar_observable"] = json!(true);
+        profile_only["profile_signals"]["telegram_id_spam_probability"] = json!(0.99);
+        profile_only["profile_signals"]["telegram_id_model_version"] = json!("synthetic");
+        assert_eq!(
+            a.captcha_verdict_for_input(&profile_only),
+            ShadowVerdict::NoSignal
+        );
+        // Дополнительные признаки не мешают и не обязательны.
+        let mut with_profile = input.clone();
+        with_profile["profile_signals"]["feminine_first_name_pattern"] = json!(true);
+        with_profile["profile_signals"]["avatar_observable"] = json!(true);
+        with_profile["profile_signals"]["telegram_id_spam_probability"] = json!(0.99);
+        with_profile["profile_signals"]["telegram_id_model_version"] = json!("synthetic");
+        assert_eq!(
+            a.captcha_verdict_for_input(&with_profile),
+            ShadowVerdict::ReviewCandidate
+        );
+        for (noul, confidence) in [(0.899, 0.95), (0.95, 0.799)] {
+            let mut weak = off_topic();
+            weak.answers
+                .insert("offtopic_message".into(), Answer::Noul { noul, confidence });
+            assert_eq!(
+                weak.captcha_verdict_for_input(&input),
+                ShadowVerdict::NoSignal,
+                "{noul}/{confidence}"
+            );
+        }
+        let on_topic: DecisionAssessment = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/decision_response.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            on_topic.captcha_verdict_for_input(&input),
+            ShadowVerdict::NoSignal
+        );
+        let mut quoted = off_topic();
+        quoted.answers.insert(
+            "quoted_or_discussed_spam".into(),
+            Answer::Noul {
+                noul: 0.2,
+                confidence: 0.8,
+            },
+        );
+        assert_eq!(
+            quoted.captcha_verdict_for_input(&input),
+            ShadowVerdict::Abstain
+        );
+    }
+    #[test]
+    fn outbound_topic_context_excludes_internal_identity_and_provenance() {
+        let input = json!({"author_message":"fixture","topic_context":{"chat_topic":"Rust","post_topic":"Ownership","message_id":12345},
+            "profile_signals":{"telegram_id_spam_probability":0.9,"first_name":"private-name","user_id":54321},
+            "_post_context":{"message_id":12345,"source_channel_id":54321},"configuration_hash":"private-hash","score_captcha":true});
+        let external = external_input(&input);
+        assert_eq!(external["topic_context"]["post_topic"], "Ownership");
+        for secret in [
+            "12345",
+            "54321",
+            "private-name",
+            "private-hash",
+            "score_captcha",
+        ] {
+            assert!(!external.to_string().contains(secret));
+        }
     }
 }

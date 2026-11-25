@@ -1568,6 +1568,15 @@ fn validate_community_config(
         );
     }
     community.moderation.decision.validate()?;
+    for topic in &community.moderation.decision.post_topics {
+        anyhow::ensure!(
+            community
+                .chats
+                .values()
+                .any(|c| c.id == topic.discussion_chat_id && c.ingest && c.moderation),
+            "decision post topic must target a configured moderation chat"
+        );
+    }
     if community.moderation.decision.enabled {
         anyhow::ensure!(
             cfg!(feature = "moderation") && community.moderation.enabled,
@@ -1721,6 +1730,18 @@ fn validate_risk_profile(name: &str, profile: &RiskProfile) -> anyhow::Result<()
     }
     if let Some(model) = &profile.telegram_id {
         validate_telegram_id_model(name, model)?;
+    }
+    if let Some(time) = &profile.telegram_id_time {
+        anyhow::ensure!(
+            profile.telegram_id.is_some(),
+            "risk profile {name:?} time adjustment requires telegram_id"
+        );
+        anyhow::ensure!(
+            time.midpoint_billion_per_day.is_finite()
+                && (0.0..=0.01).contains(&time.midpoint_billion_per_day)
+                && !time.version.trim().is_empty(),
+            "risk profile {name:?} has invalid telegram_id_time"
+        );
     }
     Ok(())
 }
@@ -1886,6 +1907,7 @@ mod tests {
                 old_user_message_threshold: 5,
                 review_threshold: 70,
                 telegram_id: None,
+                telegram_id_time: None,
             },
         );
         let error = validate_community_config(&community, &registry)
@@ -2864,5 +2886,44 @@ models = ["primary", "fallback"]
         let error = config.validate_runtime_secrets().unwrap_err().to_string();
 
         assert!(error.contains("spam_reputation.sqlite_path must be an absolute path"));
+    }
+}
+
+#[cfg(test)]
+mod telegram_id_time_tests {
+    use super::*;
+
+    #[test]
+    fn temporal_id_settings_require_a_model_and_valid_forward_drift() {
+        let base = r#"version="synthetic"
+[telegram_id]
+floor=0.0
+ceil=1.0
+k=2.0
+midpoint_billion=8.0
+version="synthetic-id"
+"#;
+        for (drift, valid) in [
+            ("0.001", true),
+            ("0.0", true),
+            ("-0.001", false),
+            ("0.02", false),
+            ("nan", false),
+        ] {
+            let source = format!(
+                "{base}\n[telegram_id_time]\nreference_date=\"2026-01-01\"\nmidpoint_billion_per_day={drift}\nversion=\"synthetic-time\"\n"
+            );
+            let profile: RiskProfile = toml::from_str(&source).unwrap();
+            assert_eq!(
+                validate_risk_profile("synthetic", &profile).is_ok(),
+                valid,
+                "{drift}"
+            );
+        }
+        let missing:RiskProfile=toml::from_str("[telegram_id_time]\nreference_date=\"2026-01-01\"\nmidpoint_billion_per_day=0.001\nversion=\"synthetic\"").unwrap();
+        assert!(validate_risk_profile("synthetic", &missing).is_err());
+        let fixed: RiskProfile = toml::from_str(base).unwrap();
+        assert!(fixed.telegram_id_time.is_none());
+        assert!(validate_risk_profile("synthetic", &fixed).is_ok());
     }
 }

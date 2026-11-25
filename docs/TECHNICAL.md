@@ -1097,3 +1097,7 @@ Decision может участвовать в общей метрике с ephem
 ### Worker supervision
 
 Long-lived workers регистрируются в общем `WorkerSupervisor`. Если такой worker неожиданно завершается или паникует, supervisor сигналит остановку оставшимся workers, ждёт ограниченный drain и возвращает ошибку из процесса. Systemd `Restart=on-failure` поднимает процесс заново; PostgreSQL leases восстанавливают durable jobs. Ошибка worker не маскируется как обычный здоровый Telegram poller. При штатном завершении dispatcher supervisor только останавливает и drain-ит workers.
+
+Ручные `/ban` и `/unban` по reply на комментарий канала используют отдельный
+channel target и журнал. Формат, ограничения и recovery:
+[MANUAL_CHANNEL_MODERATION.md](MANUAL_CHANNEL_MODERATION.md).

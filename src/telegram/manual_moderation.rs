@@ -41,7 +41,7 @@ struct BatchContext<'a> {
 /// verified against the Bot API for this command's chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorizedActor {
-    user_id: UserId,
+    pub(super) user_id: UserId,
 }
 
 pub async fn handle(
@@ -75,6 +75,63 @@ pub async fn handle(
         return Ok(());
     };
     let actor_id = actor.user_id.0 as i64;
+    match super::manual_sender_chat::target(msg, &parsed) {
+        Ok(Some((action, sender))) => {
+            if !matches!(
+                manual_moderation::find_batch(&state.pool, msg.chat.id.0, msg.id.0).await,
+                Ok(None)
+            ) {
+                send_reply(bot,msg,state,"Эта команда уже зарегистрирована для пользователя; отправь новую команду канала.").await?;
+                return Ok(());
+            }
+
+            if !state
+                .config
+                .chat_allows(msg.chat.id.0, |chat| chat.ingest && chat.moderation)
+            {
+                send_reply(bot, msg, state, "Модерация этого чата не включена.").await?;
+                return Ok(());
+            }
+            let result = super::manual_sender_chat::execute(
+                bot,
+                &state.pool,
+                msg,
+                actor.user_id,
+                action,
+                &sender,
+                parsed.reason.as_deref(),
+            )
+            .await;
+            let text = match result {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::error!(%error, "manual channel moderation failed");
+                    "Не удалось завершить команду канала. Проверь журнал и ограничения Telegram; повтор автоматически не выполняется.".into()
+                }
+            };
+            send_reply(bot, msg, state, &text).await?;
+            return Ok(());
+        }
+        Err(error) => {
+            send_reply(bot, msg, state, &error.to_string()).await?;
+            return Ok(());
+        }
+        Ok(None) => {
+            match manual_moderation::sender_chat::command_exists(
+                &state.pool,
+                msg.chat.id.0,
+                msg.id.0,
+            )
+            .await
+            {
+                Ok(false) => {}
+                _ => {
+                    send_reply(bot,msg,state,"Команда канала не может быть изменена на пользовательскую; отправь новую команду.").await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
 
     if matches!(kind, CommandKind::Warns | CommandKind::Modlog) {
         let targets = match resolve_target_ids(&state.pool, msg, &parsed).await {
@@ -442,7 +499,7 @@ async fn delete_configured_messages(
     }
 }
 
-async fn authorize_actor(
+pub(super) async fn authorize_actor(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     chat_id: ChatId,
     actor_id: UserId,
@@ -535,6 +592,10 @@ async fn resolve_target_requests(
                 .map_err(|_| anyhow::anyhow!("цель должна быть Telegram ID или @username"))?;
             Target::numeric(user_id)
         };
+        anyhow::ensure!(
+            !crate::telegram::identity::is_channel_sender_proxy(target.user_id),
+            "Это технический отправитель канала. Используй /ban или /unban по reply на комментарий канала."
+        );
         if target.user_id <= 0 {
             anyhow::bail!("Telegram ID должен быть положительным");
         }
@@ -1494,7 +1555,7 @@ fn format_action(action: &ActionRecord) -> String {
     )
 }
 
-async fn send_reply(
+pub(super) async fn send_reply(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     msg: &Message,
     state: &AppState,
@@ -1536,6 +1597,7 @@ mod tests {
         effects: Mutex<Vec<(String, i64)>>,
         username: Mutex<Option<String>>,
         api_error: Mutex<bool>,
+        ack_false: Mutex<bool>,
     }
 
     async fn member_api(State(stub): State<Arc<MemberStub>>, uri: Uri, body: Bytes) -> Json<Value> {
@@ -1565,6 +1627,22 @@ mod tests {
                 "chat":{"id":payload["chat_id"],"type":"supergroup","title":"Fixture"},
                 "text":payload["text"]}}),
             );
+        }
+        if matches!(method.as_str(), "banchatsenderchat" | "unbanchatsenderchat") {
+            assert!(payload.get("user_id").is_none());
+            stub.effects
+                .lock()
+                .unwrap()
+                .push((method, payload["sender_chat_id"].as_i64().unwrap()));
+            if *stub.api_error.lock().unwrap() {
+                return Json(
+                    json!({"ok":false,"error_code":400,"description":"synthetic ambiguous effect"}),
+                );
+            }
+            if *stub.ack_false.lock().unwrap() {
+                return Json(json!({"ok":true,"result":false}));
+            }
+            return Json(json!({"ok":true,"result":true}));
         }
         let user_id = payload["user_id"].as_i64().expect("user id");
         if matches!(method.as_str(), "banchatmember" | "restrictchatmember") {
@@ -1598,6 +1676,545 @@ mod tests {
             .parse_mode(teloxide::types::ParseMode::Html)
     }
 
+    async fn assert_manual_channel_path(pool: &PgPool) {
+        use crate::features::manual_moderation::sender_chat::{self, Action, Request, Reservation};
+        let mut config = crate::config::test_config();
+        let chat_id = -1_009_900_000_101i64;
+        let sender_id = -1_009_900_000_102i64;
+        let chat = config.community.chats.get_mut("main").unwrap();
+        chat.id = chat_id;
+        chat.ingest = true;
+        chat.moderation = true;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        let state = AppState::new(pool.clone(), config);
+        let stub = Arc::new(MemberStub::default());
+        let bot = fake_member_bot(stub.clone()).await;
+        let base = (Utc::now().timestamp_micros().unsigned_abs() % 500_000_000) as i32;
+        let message = |id, actor, sender, auto_forward| -> Message {
+            serde_json::from_value(json!({"message_id":id,"date":1700000000,
+              "chat":{"id":chat_id,"type":"supergroup","title":"Synthetic"},
+              "from":{"id":actor,"is_bot":false,"first_name":"Actor"},"text":"synthetic command",
+              "reply_to_message":{"message_id":1,"date":1700000000,
+                "chat":{"id":chat_id,"type":"supergroup","title":"Synthetic"},
+                "sender_chat":{"id":sender,"type":"channel","title":"Synthetic"},
+                "is_automatic_forward":auto_forward,"text":"Synthetic channel comment"}}))
+            .unwrap()
+        };
+        let ban = message(base, 9002, sender_id, false);
+        handle(&bot, &ban, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        handle(&bot, &ban, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap().as_slice(),
+            &[("banchatsenderchat".into(), sender_id)]
+        );
+        handle(
+            &bot,
+            &message(base + 1, 9002, sender_id, false),
+            &state,
+            CommandKind::Unban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap()[1],
+            ("unbanchatsenderchat".into(), sender_id)
+        );
+        for (offset, actor, sender, auto_forward, args) in [
+            (2, 9003, sender_id, false, ""),
+            (3, 9002, sender_id, true, ""),
+            (4, 9002, chat_id, false, ""),
+            (5, 9002, sender_id, false, "1h"),
+            (0, 9002, sender_id - 1, false, ""),
+        ] {
+            handle(
+                &bot,
+                &message(base + offset, actor, sender, auto_forward),
+                &state,
+                CommandKind::Ban,
+                args,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(stub.effects.lock().unwrap().len(), 2);
+        *stub.api_error.lock().unwrap() = true;
+        let uncertain = message(base + 6, 9002, sender_id, false);
+        handle(&bot, &uncertain, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        handle(&bot, &uncertain, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        handle(
+            &bot,
+            &message(base + 7, 9002, sender_id, false),
+            &state,
+            CommandKind::Unban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(stub.effects.lock().unwrap().len(), 3);
+        assert!(
+            stub.replies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("не подтвердил"))
+        );
+        // Два конкурентных claims и crash сразу после durable reserve.
+        let a = Request {
+            chat_id,
+            command_message_id: base + 8,
+            sender_chat_id: sender_id - 5,
+            actor_user_id: 9002,
+            action: Action::Ban,
+            reason: None,
+        };
+        let b = Request {
+            command_message_id: base + 9,
+            action: Action::Unban,
+            ..a
+        };
+        let (x, y) = tokio::join!(
+            sender_chat::reserve(pool, &a),
+            sender_chat::reserve(pool, &b)
+        );
+        let results = [x.unwrap(), y.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Reservation::Started(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Reservation::Busy(_)))
+                .count(),
+            1
+        );
+        let id = results
+            .iter()
+            .find_map(|r| {
+                if let Reservation::Started(id) = r {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let c = Request {
+            command_message_id: base + 10,
+            sender_chat_id: sender_id - 6,
+            ..a
+        };
+        let (channel, user) = tokio::join!(
+            sender_chat::reserve(pool, &c),
+            manual_moderation::create_batch(pool, chat_id, 9002, base + 10, "ban")
+        );
+        assert_ne!(
+            channel.is_ok(),
+            user.is_ok(),
+            "one command cannot reserve both target types"
+        );
+        assert!(
+            resolve_target_requests(
+                pool,
+                chat_id,
+                &[crate::telegram::identity::CHANNEL_SENDER_PROXY_ID.to_string()],
+                None
+            )
+            .await
+            .is_err()
+        );
+        sender_chat::finish(pool, id, false).await.unwrap();
+        assert!(matches!(
+            sender_chat::reserve(pool, &a).await.unwrap(),
+            Reservation::Uncertain(_) | Reservation::Busy(_)
+        ));
+        let readable: bool = sqlx::query_scalar(
+            "select has_table_privilege('nedobot_mcp_ro','manual_sender_chat_operations','SELECT')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(!readable);
+        sqlx::query("delete from manual_moderation_batches where chat_id=$1")
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from manual_sender_chat_operations where chat_id=$1")
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_channel_reconciliation(pool: &PgPool) {
+        use crate::features::manual_moderation::sender_chat::{
+            self, Action, ReconcileOutcome, Request, Reservation, Resolution,
+        };
+        let mut config = crate::config::test_config();
+        let chat_id = -1_009_900_000_201i64;
+        let first_channel = -1_009_900_000_202i64;
+        let second_channel = -1_009_900_000_203i64;
+        let third_channel = -1_009_900_000_204i64;
+        let chat = config.community.chats.get_mut("main").unwrap();
+        chat.id = chat_id;
+        chat.ingest = true;
+        chat.moderation = true;
+        config.chat_registry = crate::community::ChatRegistry::new(&config.community).unwrap();
+        let state = AppState::new(pool.clone(), config);
+        let stub = Arc::new(MemberStub::default());
+        let bot = fake_member_bot(stub.clone()).await;
+        let base = (Utc::now().timestamp_micros().unsigned_abs() % 400_000_000) as i32;
+        let message = |id: i32, sender: i64, reply_from: Option<i64>| -> Message {
+            let mut reply = json!({
+                "message_id": 1,
+                "date": 1700000000,
+                "chat": {"id": chat_id, "type": "supergroup", "title": "Synthetic"},
+                "sender_chat": {"id": sender, "type": "channel", "title": "Одинаковый канал"},
+                "is_automatic_forward": false,
+                "text": "Synthetic channel comment"
+            });
+            if let Some(reply_from) = reply_from {
+                reply["from"] = json!({
+                    "id": reply_from,
+                    "is_bot": true,
+                    "first_name": "Channel"
+                });
+            }
+            serde_json::from_value(json!({
+                "message_id": id,
+                "date": 1700000000,
+                "chat": {"id": chat_id, "type": "supergroup", "title": "Synthetic"},
+                "from": {"id": 9002, "is_bot": false, "first_name": "Actor"},
+                "text": "synthetic command",
+                "reply_to_message": reply
+            }))
+            .unwrap()
+        };
+
+        // Одинаковый title не объединяет каналы: identity — только sender_chat.id.
+        handle(
+            &bot,
+            &message(base, first_channel, None),
+            &state,
+            CommandKind::Ban,
+            "",
+        )
+        .await
+        .unwrap();
+        handle(
+            &bot,
+            &message(base + 1, second_channel, None),
+            &state,
+            CommandKind::Ban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap().as_slice(),
+            &[
+                ("banchatsenderchat".into(), first_channel),
+                ("banchatsenderchat".into(), second_channel),
+            ]
+        );
+
+        // Технический Channel_Bot в from не подменяет identity канала.
+        handle(
+            &bot,
+            &message(base + 2, third_channel, Some(136817688)),
+            &state,
+            CommandKind::Ban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stub.effects.lock().unwrap().as_slice(),
+            &[
+                ("banchatsenderchat".into(), first_channel),
+                ("banchatsenderchat".into(), second_channel),
+                ("banchatsenderchat".into(), third_channel),
+            ]
+        );
+
+        // Неопределённый исход можно подтвердить вручную без Telegram-вызова.
+        *stub.api_error.lock().unwrap() = true;
+        let uncertain = message(base + 3, first_channel, None);
+        handle(&bot, &uncertain, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        assert_eq!(stub.effects.lock().unwrap().len(), 4);
+        let operation_id: i64 = sqlx::query_scalar(
+            "select id from manual_sender_chat_operations where chat_id=$1 and sender_chat_id=$2 and status='unknown' order by id desc limit 1",
+        )
+        .bind(chat_id)
+        .bind(first_channel)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 4, first_channel, None),
+            &state,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(
+            stub.replies.lock().unwrap().iter().any(|value| {
+                let text = value.as_str().unwrap_or("");
+                text.contains(&format!("#{operation_id}"))
+                    && text.contains(&first_channel.to_string())
+            }),
+            "replies={:?}",
+            stub.replies.lock().unwrap()
+        );
+
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 5, first_channel, None),
+            &state,
+            &format!("{operation_id} not_applied -- проверил Telegram"),
+        )
+        .await
+        .unwrap();
+        let reconciled: (String, i64, String, Option<String>) = sqlx::query_as(
+            "select status,reconciled_by,resolution,reconciliation_note from manual_sender_chat_operations where id=$1",
+        )
+        .bind(operation_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(reconciled.0, "failed");
+        assert_eq!(reconciled.1, 9002);
+        assert_eq!(reconciled.2, "not_applied");
+        assert_eq!(reconciled.3.as_deref(), Some("проверил Telegram"));
+        assert_eq!(
+            stub.effects.lock().unwrap().len(),
+            4,
+            "reconciliation must not call Telegram"
+        );
+        assert_eq!(
+            sender_chat::reconcile(pool, chat_id, operation_id, 9002, Resolution::Applied, None)
+                .await
+                .unwrap(),
+            ReconcileOutcome::AlreadyResolved {
+                status: "failed".to_string()
+            }
+        );
+
+        // Повтор того же update не выполняет API-вызов после подтверждения.
+        handle(&bot, &uncertain, &state, CommandKind::Ban, "")
+            .await
+            .unwrap();
+        assert_eq!(stub.effects.lock().unwrap().len(), 4);
+        assert!(stub.replies.lock().unwrap().iter().any(|value| {
+            value
+                .as_str()
+                .unwrap_or("")
+                .contains("подтверждена как невыполненная")
+        }));
+
+        // Новая команда той же цели снова разрешена.
+        *stub.api_error.lock().unwrap() = false;
+        handle(
+            &bot,
+            &message(base + 6, first_channel, None),
+            &state,
+            CommandKind::Ban,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(stub.effects.lock().unwrap().len(), 5);
+
+        // Bot API false — не подтверждение успеха, операция остаётся unknown.
+        *stub.ack_false.lock().unwrap() = true;
+        handle(
+            &bot,
+            &message(base + 7, second_channel, None),
+            &state,
+            CommandKind::Ban,
+            "",
+        )
+        .await
+        .unwrap();
+        *stub.ack_false.lock().unwrap() = false;
+        let status: String = sqlx::query_scalar(
+            "select status from manual_sender_chat_operations where chat_id=$1 and sender_chat_id=$2 order by id desc limit 1",
+        )
+        .bind(chat_id)
+        .bind(second_channel)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "unknown");
+        assert!(
+            stub.replies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str().unwrap_or("").contains("не подтвердил"))
+        );
+        let operation_id: i64 = sqlx::query_scalar(
+            "select id from manual_sender_chat_operations where chat_id=$1 and sender_chat_id=$2 and status='unknown' order by id desc limit 1",
+        )
+        .bind(chat_id)
+        .bind(second_channel)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 8, second_channel, None),
+            &state,
+            &format!("{operation_id} applied -- бан действительно стоит"),
+        )
+        .await
+        .unwrap();
+        let status: String =
+            sqlx::query_scalar("select status from manual_sender_chat_operations where id=$1")
+                .bind(operation_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "succeeded");
+
+        // Crash сразу после reserve: started подтверждается только после grace.
+        let request = Request {
+            chat_id,
+            command_message_id: base + 9,
+            sender_chat_id: third_channel,
+            actor_user_id: 9002,
+            action: Action::Unban,
+            reason: None,
+        };
+        let Reservation::Started(started_id) = sender_chat::reserve(pool, &request).await.unwrap()
+        else {
+            panic!("fresh channel operation must start");
+        };
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 10, third_channel, None),
+            &state,
+            &format!("{started_id} applied"),
+        )
+        .await
+        .unwrap();
+        let status: String =
+            sqlx::query_scalar("select status from manual_sender_chat_operations where id=$1")
+                .bind(started_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "started");
+        assert!(stub.replies.lock().unwrap().iter().any(|value| {
+            value
+                .as_str()
+                .unwrap_or("")
+                .contains("ещё может выполняться")
+        }));
+        sqlx::query(
+            "update manual_sender_chat_operations set created_at=now()-interval '3 minutes' where id=$1",
+        )
+        .bind(started_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::telegram::manual_sender_chat::handle_reconcile(
+            &bot,
+            &message(base + 11, third_channel, None),
+            &state,
+            &format!("{started_id} applied -- разбан выполнен"),
+        )
+        .await
+        .unwrap();
+        let resolved: (String, String) = sqlx::query_as(
+            "select status,resolution from manual_sender_chat_operations where id=$1",
+        )
+        .bind(started_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(resolved.0, "succeeded");
+        assert_eq!(resolved.1, "applied");
+        assert_eq!(
+            sender_chat::reserve(pool, &request).await.unwrap(),
+            Reservation::Succeeded
+        );
+        assert_eq!(
+            sender_chat::reconcile(pool, chat_id, 999_999_999, 9002, Resolution::Applied, None)
+                .await
+                .unwrap(),
+            ReconcileOutcome::NotFound
+        );
+
+        // 50 записей с длинными причинами не помещаются в одно сообщение:
+        // список обязан оставаться постраничным и ограниченным по длине.
+        let pagination_channel = -1_009_900_000_300i64;
+        for index in 0..50 {
+            sqlx::query(
+                "insert into manual_sender_chat_operations(chat_id,command_message_id,sender_chat_id,actor_user_id,action,reason,status)
+                 values($1,$2,$3,$4,'ban',$5,'unknown')",
+            )
+            .bind(chat_id)
+            .bind(base + 20 + index)
+            .bind(pagination_channel - i64::from(index))
+            .bind(9002_i64)
+            .bind("длинная причина ".repeat(100))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let replies_before = stub.replies.lock().unwrap().len();
+        for (offset, args) in [(40, ""), (41, "7"), (42, "8")] {
+            crate::telegram::manual_sender_chat::handle_reconcile(
+                &bot,
+                &message(base + offset, pagination_channel, None),
+                &state,
+                args,
+            )
+            .await
+            .unwrap();
+        }
+        let (page1, page7, page8) = {
+            let replies = stub.replies.lock().unwrap();
+            (
+                replies[replies_before].as_str().unwrap().to_string(),
+                replies[replies_before + 1].as_str().unwrap().to_string(),
+                replies[replies_before + 2].as_str().unwrap().to_string(),
+            )
+        };
+        assert!(page1.contains("страница 1 из 7"), "{page1}");
+        assert!(page1.contains("/channelops 2 — следующая"), "{page1}");
+        assert!(page7.contains("страница 7 из 7"), "{page7}");
+        assert!(page7.contains("/channelops 6 — предыдущая"), "{page7}");
+        assert!(!page7.contains("следующая"), "{page7}");
+        assert!(page8.contains("На странице 8 незавершённых операций нет"));
+        assert!(page8.contains("доступны страницы 1..=7"));
+        for page in [&page1, &page7, &page8] {
+            assert!(page.encode_utf16().count() <= 4096);
+        }
+
+        sqlx::query("delete from manual_sender_chat_operations where chat_id=$1")
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     fn parsed_ban(username: &str) -> ParsedCommand {
         parse_command(CommandKind::Ban, username).expect("synthetic ban command")
     }
@@ -1609,6 +2226,8 @@ mod tests {
             .expect("TEST_DATABASE_URL must point to the disposable test database");
         let pool = PgPool::connect(&database_url).await.unwrap();
         crate::db::migrate(&pool).await.unwrap();
+        assert_manual_channel_path(&pool).await;
+        assert_channel_reconciliation(&pool).await;
         let suffix = (Utc::now().timestamp_micros().unsigned_abs() % 900_000_000) as i64;
         let chat_id = -1_008_970_032_163;
         let user_id = 9_320_000_000_000 + suffix;
