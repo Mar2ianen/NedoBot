@@ -191,6 +191,56 @@ For periodic probes, distinguish TimedOut (reason/code) from Unknown (no or stal
 
 **Required tests:** a never-resolving DB future, stuck MCP initialize, hanging HTTP canary, Telegram send timeout, cancellation/drop of subprocess, a still-running previous collector, and 100 concurrent /ping calls. Assert strict elapsed upper bounds using paused Tokio time, zero duplicate sends, bounded fanout, no leaked child/process and no green verdict on timeout.
 
+## 6.2. Progressive probe rendering through teloxide Drafter (recommended)
+
+The repository already uses the fork's drafter, not a new dependency:
+
+- src/telegram/command_handler.rs: run_ask_command uses Drafter::snapshots, DraftSink::update, and Drafter::finish.
+- src/telegram/ask_drafter.rs: AskDrafterBackend selects NativeRichBackend in private chats and RichEditInPlaceBackend in groups. Native drafts are temporary and require a final committed message.
+- src/state.rs: AppState.drafter_limiter shares the InProcessRateLimiter.
+- Cargo.toml pins fork rev ce840d82daf47c3e9b9ee16fb05d62fbe0c24727 with drafter and rich-text features.
+- Fork's drafter::DraftConfig defaults: coalesce_window 75ms, min_update_interval 1s, request_timeout 8s, terminal_timeout 30s. These defaults **exceed** the proposed 5s /ping probe deadline and must be overridden (or separately bounded) for this short workflow.
+- The fork supports Drafter observer/metrics hooks, including PreviewTimeout, OperationDeadlineExceeded, FinalError and FinalSuccess, without needing to capture user text.
+
+**Routing / intent:**
+
+1. /ping: return one immediate cached snapshot; do not create a drafter or issue probes.
+2. /ping full: return a detailed cached snapshot (owner DM only); no probe side effects.
+3. /ping probe: owner DM only; start a bounded asynchronous read-only set of checks and stream one latest-wins *rendered snapshot* via the existing drafter mechanism. Keep probes concurrent; one probe's failure must not stop the others. Progress frames update rows as their independent probes settle. Finish by committing a permanent final report with elapsed times and definitive TIMEOUT statuses.
+4. If progressive health is later enabled in groups, select edit-in-place backend and expose only the sanitized public rows; never show owner-only data to a group. No native drafts for groups.
+
+**Illustrative state transitions (not actual measurements):**
+
+    Starting health probes
+    PostgreSQL: CHECKING
+    Agent chat MCP: CHECKING
+    Public RMCP HTTP: CHECKING
+
+    PostgreSQL: OK (8 ms)
+    Agent chat MCP: CHECKING
+    Public RMCP HTTP: CHECKING
+
+    PostgreSQL: OK (8 ms)
+    Agent chat MCP: OK (94 ms)
+    Public RMCP HTTP: TIMEOUT (3 s)
+    Result: DEGRADED (probe finished)
+
+**Implementation details:**
+
+- Use one typed ProbeProgress event per completed probe and a single aggregator/render task. Every frame is derived from the same HealthSnapshot with monotonic per-probe terminal states. Do not allow late results to overwrite a timed-out result after the global deadline.
+- The draft transport uses latest-wins coalescing and a shared per-bot rate limiter. Do not send every fast phase transition individually: Drafter itself throttles frames. Show at most meaningful changes, plus a guaranteed final commit attempt.
+- A DraftSink update is a local enqueue, **not proof Telegram rendered the frame**. Never consider UI delivery to be probe success.
+- Avoid blocking on a preliminary drafter.flush(): the existing /ask path calls flush, but this could consume the short probe budget. If needed, cap it independently within the overall deadline. Start all checks immediately, concurrently with draft preview delivery.
+- Use a /ping-specific DraftConfig: terminal_timeout <= 5s, bounded request_timeout, min_update_interval around 1s, coalescing and retries consistent with the probe wall time. Avoid default terminal_timeout=30s and repeated previews for a short probe.
+- Deadlines belong to **probes, not the UI**. A failed or delayed Telegram draft must never keep DB/MCP probes alive beyond the 5s probe deadline. Bound final Telegram delivery separately (up to 5s); if delivery fails or is ambiguous, record a safe category and do not automatically duplicate a final message.
+- For native drafts, finalization sends the permanent message; for edit-backend, finalization edits the existing preview in place. On cancellation or error, use backend cleanup semantics; do not delete a useful completed health report.
+- The AskDrafterBackend module is currently behind #[cfg(feature = "ask")]. Prefer extracting the transport-neutral backend selector into a reusable Telegram module (or a small independent health-specific backend) so /ping compiles under --no-default-features without requiring /ask. Do not import /ask lifecycle/audit policy into health commands.
+- Do not use actual probe results to grant capabilities. Read-only scope is fixed by validated instance config, the owner check happens **before** any probes/drafts, and the public renderer never includes diagnostics that only the owner should see.
+- If the user presses a Telegram Stop button or the task is cancelled, stop probe work, do not mark unfinished checks healthy, and do not issue a second speculative final send.
+- Optional: attach the fork's DrafterMetricsCollector to collect preview/finish failures, with fixed metric labels; never retain preview contents.
+
+**Extra tests:** mock native and edit backends, last-write-wins coalescing, intermediate events arriving out of order, late success after timeout, failed preview followed by successful final, hung preview with bounded finish, group disclosure protections, owner DM authorization, cancellation cleanup and disabled /ask compilation.
+
 ## 7. Implementation steps (small, reviewable PRs)
 
 1. **P1 model/registry:** health model; process uptime/build; register active workers; poll counters/heartbeats; deterministic rendering; /ping and /ping full auth. Keep old /db working. No schema migrations.
