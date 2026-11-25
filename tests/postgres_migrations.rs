@@ -78,7 +78,7 @@ use tg_ai_bot_teloxide::{
         voice::{
             repo::{
                 VoiceJobPhase, VoiceTransition, claim_next_voice_job, claim_voice_job,
-                create_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_phase,
+                enqueue_voice_job, mark_voice_job_delivery_unknown, mark_voice_job_phase,
                 mark_voice_job_retry_or_failed, recover_expired_voice_deliveries,
                 save_progress_message,
             },
@@ -542,10 +542,34 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_size: Some(1_024),
         mime_type: Some("audio/ogg".to_owned()),
     };
-    let job_id = create_voice_job(pool, &media)
+    let job_id = enqueue_voice_job(pool, &media)
         .await
         .expect("voice job must be created")
         .expect("new voice job must return its id");
+    assert_eq!(
+        enqueue_voice_job(pool, &media)
+            .await
+            .expect("duplicate voice enqueue must succeed"),
+        None,
+        "duplicate update must leave the existing job to the worker"
+    );
+    let duplicate_count: i64 = query_scalar(
+        "select count(*) from voice_transcription_jobs where chat_id = $1 and message_id = $2",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .expect("voice duplicate count must be readable");
+    assert_eq!(duplicate_count, 1);
+    let queued_state: (String, i32, Option<i32>, bool) = query_as(
+        "select status, attempts, progress_message_id, lease_expires_at is null from voice_transcription_jobs where id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("new voice job must remain unclaimed until the worker runs");
+    assert_eq!(queued_state, ("pending".to_owned(), 0, None, true));
 
     let (first_result, second_result) =
         tokio::join!(claim_voice_job(pool, job_id), claim_voice_job(pool, job_id));
@@ -636,7 +660,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("unknown-unique-{suffix}")),
         ..media.clone()
     };
-    let unknown_id = create_voice_job(pool, &unknown_media)
+    let unknown_id = enqueue_voice_job(pool, &unknown_media)
         .await
         .expect("delivery-unknown voice job must be created")
         .expect("delivery-unknown voice job id must be returned");
@@ -669,6 +693,13 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
             .is_none(),
         "an unknown Telegram outcome must never be retried automatically"
     );
+    assert_eq!(
+        enqueue_voice_job(pool, &unknown_media)
+            .await
+            .expect("terminal duplicate voice enqueue must succeed"),
+        None,
+        "delivery_unknown is terminal and cannot silently create another job"
+    );
 
     let active_delivery_media = VoiceMedia {
         message_id: message_id + 4,
@@ -676,7 +707,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("active-delivery-unique-{suffix}")),
         ..media.clone()
     };
-    let active_delivery_id = create_voice_job(pool, &active_delivery_media)
+    let active_delivery_id = enqueue_voice_job(pool, &active_delivery_media)
         .await
         .expect("active-delivery voice job must be created")
         .expect("active-delivery voice job id must be returned");
@@ -710,7 +741,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("expired-delivery-unique-{suffix}")),
         ..media.clone()
     };
-    let expired_delivery_id = create_voice_job(pool, &expired_delivery_media)
+    let expired_delivery_id = enqueue_voice_job(pool, &expired_delivery_media)
         .await
         .expect("expired-delivery voice job must be created")
         .expect("expired-delivery voice job id must be returned");
@@ -757,7 +788,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("terminal-unique-{suffix}")),
         ..media.clone()
     };
-    let terminal_id = create_voice_job(pool, &terminal_media)
+    let terminal_id = enqueue_voice_job(pool, &terminal_media)
         .await
         .expect("terminal voice job must be created")
         .expect("terminal voice job id must be returned");
@@ -788,7 +819,7 @@ async fn assert_voice_transcription_job_lifecycle(pool: &PgPool) {
         file_unique_id: Some(format!("sent-unique-{suffix}")),
         ..media
     };
-    let sent_id = create_voice_job(pool, &sent_media)
+    let sent_id = enqueue_voice_job(pool, &sent_media)
         .await
         .expect("sent voice job must be created")
         .expect("sent voice job id must be returned");
