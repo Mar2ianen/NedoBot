@@ -1,5 +1,7 @@
 use crate::features::stats::document::Section;
-use crate::features::stats::render_html::{human_comment_preview, message_preview, message_url};
+use crate::features::stats::render_html::{
+    human_comment_preview, message_preview, message_url, user_or_message_link,
+};
 use crate::features::stats::strings::StatsStrings;
 use crate::features::stats::types::{
     ChatStatsReportData, TopMessagesReportData, TopReactedReportData, TopWordReportData,
@@ -404,7 +406,6 @@ pub fn top_reacted(
                 (index + 1).to_string(),
                 user_or_message_link(
                     &row.username,
-                    row.user.user_id,
                     &row.user.display_name,
                     discussion_chat_id,
                     row.message_id,
@@ -471,6 +472,10 @@ pub fn user_stats(
             data.membership_context,
             strings,
         )),
+    ]);
+    profile_rows.push(vec![
+        strings.status_updated.into(),
+        escape_html(data.observed_at.as_deref().unwrap_or(strings.no_timestamp)),
     ]);
     if let Some(tag) = data
         .written_tag
@@ -644,23 +649,6 @@ fn user_link(username: &Option<String>, user_id: i64, display_name: &str) -> Str
         .unwrap_or_else(|| format!("tg://user?id={user_id}"));
     Html::link(display_name, url).into_string()
 }
-fn user_or_message_link(
-    username: &Option<String>,
-    user_id: i64,
-    display_name: &str,
-    chat_id: i64,
-    message_id: i32,
-) -> String {
-    if username
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.trim_start_matches('@').is_empty())
-    {
-        user_link(username, user_id, display_name)
-    } else {
-        Html::link(display_name, message_url(chat_id, message_id)).into_string()
-    }
-}
 fn linked_message(
     chat_id: i64,
     date_label: &str,
@@ -788,6 +776,23 @@ mod tests {
 
         assert!(report.contains("Артём"));
         assert!(!report.contains("<img"));
+        data.observed_at = Some("2026-11-24 12:34".into());
+        data.written_tag = Some("<tag&>".into());
+        data.bio = Some("<bio&>".into());
+        data.top_words = vec![("<word&>".into(), 17)];
+        let strings = StatsStrings::russian();
+        let rich = user_stats(Some(&data), None, -1001, &strings);
+        let html =
+            crate::features::stats::render_html::user_stats(Some(&data), None, -1001, &strings);
+        for expected in [
+            "2026-11-24 12:34",
+            "&lt;tag&amp;&gt;",
+            "&lt;bio&amp;&gt;",
+            "&lt;word&amp;&gt; (17)",
+        ] {
+            assert!(rich.contains(expected), "Rich lost {expected}");
+            assert!(html.contains(expected), "HTML lost {expected}");
+        }
         data.user.status = Some("left".into());
         data.user.is_present = Some(false);
         for (context, expected) in [

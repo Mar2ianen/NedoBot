@@ -636,7 +636,7 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 ```text
 /ping
 /db
-/emojiids
+/emoji_ids
 /format_test <текст поста>
 /memory
 /ask <вопрос>
@@ -784,7 +784,7 @@ Rendering policy:
 - если HTML длиннее `SAFE_TEXT_LIMIT=3900`, бот отправляет Rich Message с закрытым `<details>`; rich-формат поддерживает до 32 768 символов;
 - если Rich API отклоняет сообщение или rich-лимит превышен, `runtime.voice_send_full_file=true` включает fallback `preview + voice-transcript.txt`.
 
-Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Это ближайший фикс в [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
+Текущий важный нюанс: `TranscriptChapter.start_sec` уже хранится, но `render.rs` пока не выводит timestamp рядом с заголовком главы. Отсутствие timestamp в заголовках глав закреплено тестами; см. [REFACTOR_NEXT.md](REFACTOR_NEXT.md).
 
 `video_note` Telegram не сопровождает MIME-типом, поэтому pipeline задаёт `video/mp4` сам. Groq принимает MP4 напрямую: отдельный `ffmpeg` и постоянное хранение кружков не нужны. Временный файл удаляется сразу после завершения ASR-запроса.
 
@@ -917,7 +917,32 @@ cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.
 - live Bot API `raw_json` не затирается экспортным JSON при конфликте, импорт только дополняет отсутствующие поля и флаги;
 - forwarded channel messages и automatic channel posts различаются: `sender_chat_id` заполняется только для реального `from_id/actor_id=channel...`, а `source_channel_id` может хранить как auto-forward source, так и forwarded source.
 
-Перед импортом на VPS лучше сделать backup:
+Для дополнения **только отсутствующих** счётчиков реакций без переимпорта
+сообщений/профилей используйте отдельный режим:
+
+```bash
+cargo run --bin import_telegram_export -- "/path/to/result.json" \
+  --reaction-gaps-only --snapshot-at "2026-10-04T14:44:22Z" --dry-run
+# После проверки candidates/existing/missing_messages повторить без --dry-run.
+```
+
+`--snapshot-at` — явное время наблюдения экспорта в RFC3339, не время создания
+сообщения и не известное время каждой реакции. Режим сверяет chat id с экспортом,
+добавляет счётчики только для существующих в БД сообщений, сохраняет typed
+emoji/custom emoji/paid реакции и не обновляет имеющиеся строки даже при гонке
+с polling. Все партии одной транзакцией. В `raw_json` сохраняются source
+`telegram_export_counts_snapshot`, SHA256 файла и `event_time_known=false`.
+Если у custom emoji отсутствует `document_id`, его количество входит в total
+и сохраняется отдельно как `unidentified_custom_emoji_count` в `raw_json`;
+в typed список не добавляется вымышленный ID и сентимент не угадывается.
+Персональные reaction events из снимка не создаются: `recent` не является полной
+историей. Восстановленные totals доступны отчётам, читающим count-таблицу; отчёты
+по event history не получают вымышленных исторических реакций.
+
+Обычный полный импорт выше имеет другую семантику: обновляет счётчики и импортирует
+доступные `recent` записи. Не использовать его вместо gap-only для этой операции.
+
+Пример backup перед полным импортом:
 
 ```bash
 ssh vps-153 "podman exec tg-ai-bot-postgres pg_dump -U tg_ai_bot -d tg_ai_bot -Fc -f /tmp/tg_ai_bot_before_export_import.dump"
@@ -1020,7 +1045,7 @@ ryzen_custom_emoji_id = "5444875271163364561"
 - Статусы пользователей известны по последнему `chat_member` update или по будущим снимкам; если Telegram не присылал событие, статус будет `unknown`.
 - Если LLM provider вернёт ошибку/subscription limit, задача может остаться без комментария до ручного вмешательства.
 - Voice ASR работает в двойном режиме Gemini primary + Groq shadow; local Whisper/Ollama audio не подключены.
-- Cleanup provider/model для voice пока не сохраняются в отдельные DB-поля, хотя поля в таблице уже есть.
+- Cleanup provider/model для voice сохраняются в отдельных DB-полях `cleanup_provider` и `cleanup_model`.
 - Join-конверсия по отдельной invite-ссылке пока не считается автоматически.
 - Админки пока нет; статические настройки меняются в `[runtime]` profile TOML и требуют рестарта сервиса. DB-backed dynamic policy — отдельный следующий этап.
 
@@ -1032,7 +1057,7 @@ System prompt вшит из `prompts/ask.md`; журнал выпущенных 
 
 `chat.count_messages` возвращает число сообщений с `unit=messages`. `chat.count_word_occurrences` возвращает число неперекрывающихся вхождений точного слова/фразы и matching_messages, `unit=word_occurrences`. Runtime требует предварительный поиск с теми же фильтрами; count без query разрешён для structural count. Результаты count сохраняются при сокращении контекста. Native tool pairs удаляются целиком, per-turn previews ограничены, provider-specific continuation ID не используется с полной историей. После action timeout повтор начинается со следующего совместимого profile. `ask_runs.provider/model` отражают реально ответивший profile; `step_count` включает model turns без tools.
 
-У `routes.ask` есть Gemini vision fallback, независимый от текстовых profiles. `probe_ask_route [--image]` проверяет native tool call без Telegram/БД. `backfill_rich_messages <chat-id> [--apply]` восстанавливает старые rich-тексты; без `--apply` делает dry run. См. [аудит](ASK_AUDIT_2026-10-06.md) и [выкладку](DEPLOYMENT.md).
+Vision в `routes.ask` обслуживают совместимые профили текущего route; отдельного Gemini vision fallback нет. `probe_ask_route [--image]` проверяет native tool call без Telegram/БД. `backfill_rich_messages <chat-id> [--apply]` восстанавливает старые rich-тексты; без `--apply` делает dry run. См. [аудит](ASK_AUDIT_2026-10-06.md) и [выкладку](DEPLOYMENT.md).
 
 Legacy ASR profiles не включают comparative shadow автоматически. Для Gemini primary видео-кружки используют Groq media fallback и настроенный `voice_asr_shadow_model`, даже при выключенном comparative shadow; Groq key обязателен. ASR errors очищаются от URL, Gemini request chain ограничена 420 секундами, cleanup — 10 секундами; смена job phase продлевает lease.
 
@@ -1049,12 +1074,13 @@ review-only assessment не даёт права на бан, удаление и
 для отключения reasoning описаны в [Cloudflare runbook](CLOUDFLARE_GEMMA.md).
 Полный multimodal audit проверяется probe_new_user_audit без Telegram/БД.
 
-### Антиспам: Decision shadow
+### Антиспам: Decision shadow и score captcha
 
 Нативный Gemini Decisions API настраивается отдельно в `[moderation.decision]`:
 явные `enabled`, `external_processing_allowed`, `avatar_enabled`, endpoint/model,
-имя env-переменной ключа и bounded бюджеты. Новый shadow не меняет generative
-routes и не даёт права на санкции. Транспорт, версии, диагностика, evaluation CLI
+имя env-переменной ключа и bounded бюджеты. Режим shadow не меняет generative
+routes и не даёт права на санкции. Opt-in `score_captcha` связывает общую метрику
+с ephemeral captcha; production включён только в ПВО, NedoNews остаётся в shadow. Транспорт, версии, диагностика, evaluation CLI
 и migration-aware rollback описаны в [ANTISPAM_V2.md](ANTISPAM_V2.md).
 
 Decision может участвовать в общей метрике с ephemeral captcha: [контракт,

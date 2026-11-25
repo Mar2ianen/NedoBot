@@ -350,38 +350,100 @@ fn ranked_users(data: &TopMessagesReportData, title: &str, strings: &StatsString
     report
 }
 
+pub(super) fn user_or_message_link(
+    username: &Option<String>,
+    display_name: &str,
+    chat_id: i64,
+    message_id: i32,
+) -> String {
+    let url = username
+        .as_deref()
+        .map(str::trim)
+        .map(|value| value.trim_start_matches('@'))
+        .filter(|value| !value.is_empty())
+        .map(|username| format!("https://t.me/{username}"))
+        .unwrap_or_else(|| message_url(chat_id, message_id));
+    Html::link(display_name, url).into_string()
+}
+
+fn top_reacted_header(strings: &StatsStrings) -> String {
+    format!(
+        "<b>{}</b>\n{}\n",
+        strings.top_reacted_messages, strings.latest_snapshot
+    )
+}
+
+fn top_reacted_row(
+    index: usize,
+    row: &super::types::TopReactedMessage,
+    discussion_chat_id: i64,
+    strings: &StatsStrings,
+) -> String {
+    let author_link = user_or_message_link(
+        &row.username,
+        &row.user.display_name,
+        discussion_chat_id,
+        row.message_id,
+    );
+    let message_link = Html::link(
+        strings.message_link_label,
+        message_url(discussion_chat_id, row.message_id),
+    )
+    .into_string();
+    format!(
+        "\n{}. <b>{}</b> - {}: {} ({})",
+        index + 1,
+        row.total_count,
+        author_link,
+        Html::text(truncate_text(
+            &message_preview(row.text.as_deref(), row.media, strings),
+            120
+        ))
+        .into_string(),
+        message_link,
+    )
+}
+
 pub fn top_reacted(
     data: &TopReactedReportData,
     discussion_chat_id: i64,
     strings: &StatsStrings,
 ) -> String {
-    let mut report = format!(
-        "<b>{}</b>\n{}\n",
-        strings.top_reacted_messages, strings.latest_snapshot
-    );
+    let mut report = top_reacted_header(strings);
     if data.messages.is_empty() {
         report.push_str(&format!("\n{}", strings.no_data));
-        return report;
     }
     for (index, row) in data.messages.iter().enumerate() {
-        let author_link = Html::link(
-            &row.user.display_name,
-            message_url(discussion_chat_id, row.message_id),
-        )
-        .into_string();
-        report.push_str(&format!(
-            "\n{}. <b>{}</b> - {}: {}",
-            index + 1,
-            row.total_count,
-            author_link,
-            Html::text(truncate_text(
-                &message_preview(row.text.as_deref(), row.media, strings),
-                64
-            ))
-            .into_string(),
-        ));
+        report.push_str(&top_reacted_row(index, row, discussion_chat_id, strings));
     }
     report
+}
+
+/// Split only between complete ranked rows, preserving rank and both links.
+pub fn top_reacted_pages(
+    data: &TopReactedReportData,
+    discussion_chat_id: i64,
+    strings: &StatsStrings,
+) -> Vec<String> {
+    let header = top_reacted_header(strings);
+    let report = top_reacted(data, discussion_chat_id, strings);
+    if crate::telegram::html::is_safe_len(&report) {
+        return vec![report];
+    }
+
+    let mut pages = Vec::new();
+    let mut page = header.clone();
+    for (index, row) in data.messages.iter().enumerate() {
+        let row = top_reacted_row(index, row, discussion_chat_id, strings);
+        if page != header
+            && page.chars().count() + row.chars().count() > crate::telegram::html::SAFE_TEXT_LIMIT
+        {
+            pages.push(std::mem::replace(&mut page, header.clone()));
+        }
+        page.push_str(&row);
+    }
+    pages.push(page);
+    pages
 }
 
 pub fn user_stats(
@@ -399,8 +461,8 @@ pub fn user_stats(
             None => strings.user_target_hint.to_string(),
         };
     };
-    let head = Section {
-        title: Some(strings.user_stats_title),
+    let mut head = Section {
+        title: None,
         rows: vec![
             Kv {
                 label: strings.status_updated,
@@ -442,6 +504,41 @@ pub fn user_stats(
             },
         ],
     };
+    if let Some(tag) = data
+        .written_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        head.rows.push(Kv {
+            label: strings.tag_row,
+            value: escape_html(tag),
+        });
+    }
+    if let Some(bio) = data
+        .bio
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        head.rows.push(Kv {
+            label: "Bio",
+            value: escape_html(bio),
+        });
+    }
+    let top_words = if data.top_words.is_empty() {
+        strings.no_timestamp.to_string()
+    } else {
+        data.top_words
+            .iter()
+            .map(|(word, count)| format!("{} ({count})", escape_html(word)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    head.rows.push(Kv {
+        label: strings.frequent_words,
+        value: top_words,
+    });
     let activity = Section {
         title: None,
         rows: vec![
@@ -623,6 +720,54 @@ mod tests {
                     ..Default::default()
                 },
             }],
+        }
+    }
+
+    #[test]
+    fn top_reactions_preserve_links_and_ranks_across_pages() {
+        let strings = StatsStrings::russian();
+        let chat_id = -1001234567890;
+        let data = TopReactedReportData {
+            messages: (1..=20)
+                .map(|id| super::super::types::TopReactedMessage {
+                    message_id: id,
+                    user: UserPresentation {
+                        user_id: i64::from(id),
+                        display_name: format!("<author {id}>"),
+                        is_bot: false,
+                        status: None,
+                        is_admin: false,
+                        is_present: None,
+                    },
+                    username: (id % 2 == 0).then(|| format!("author_{id}")),
+                    text: Some("&".repeat(120)),
+                    media: MessageMediaPreview::default(),
+                    total_count: 21 - i64::from(id),
+                })
+                .collect(),
+        };
+        let pages = top_reacted_pages(&data, chat_id, &strings);
+        let rich = crate::features::stats::render_rich::top_reacted(&data, chat_id, &strings);
+        assert!(pages.len() > 1);
+        assert!(
+            pages
+                .iter()
+                .all(|page| crate::telegram::html::is_safe_len(page))
+        );
+        for row in &data.messages {
+            let link = message_url(chat_id, row.message_id);
+            let author = user_or_message_link(
+                &row.username,
+                &row.user.display_name,
+                chat_id,
+                row.message_id,
+            );
+            let matching: Vec<_> = pages.iter().filter(|page| page.contains(&author)).collect();
+            assert_eq!(matching.len(), 1);
+            assert!(matching[0].contains(&format!("href=\"{link}\"")));
+            assert!(matching[0].contains(&format!("\n{}. <b>", row.message_id)));
+            assert!(rich.contains(&author));
+            assert!(rich.contains(&format!("href=\"{link}\"")));
         }
     }
 

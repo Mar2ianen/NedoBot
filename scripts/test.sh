@@ -20,15 +20,13 @@ run_test() {
 }
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations -- --ignored
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::user_profiles::enrichment::tests::fast_audit_ack_fences_revisions_and_reclaims -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::qr_url::tests::qr_worker_persists_fresh_alias_relation_and_rejects_superseded_media -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib telegram::manual_moderation::tests::username_sanctions_require_live_ownership_and_resume_preserves_provenance -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::voice::pipeline::tests::voice_partial_delivery_is_persisted_and_never_replayed_after_restart -- --ignored --exact
-TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations post_comment_claim_skips_a_locked_oldest_ready_job -- --ignored --exact
-TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations concurrent_duplicate_post_comment_events_create_one_semantic_job -- --ignored --exact
-TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations captcha_wrong_answers_are_atomic_with_one_database_connection -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib db::url_evidence::tests::database_evidence_is_redacted_replaceable_and_backfillable -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::new_user_analysis::tests::url_shadow_observations_are_separate_and_private -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --lib features::new_user_analysis::tests::url_shadow_lock_serializes_same_user_without_blocking_other_users -- --ignored --exact

@@ -1,14 +1,29 @@
 # AGENTS.md
 
-Инструкции для AI-ассистентов, работающих с проектом NedoBot.
+Инструкции для AI-ассистентов, работающих с проектом NedoBot. Правила ниже обязательны; примеры путей и обзор потоков — навигация, а не замена проверке актуального кода.
+
+## Перед началом задачи
+
+- Определи целевую ветку, точный HEAD, область изменений и состояние worktree. Не перезаписывай чужие изменения, не смешивай независимые PR и не считай состояние другой ветки состоянием текущей.
+- Открой ближайшие нормативные документы по таблице. Не считай существующий код автоматически корректным образцом и не правь исторические документы как описание текущего состояния.
+- Если документация и код расходятся, установи назначение документа (контракт, описание runtime, changelog или исторический аудит), затем определи дефект. Не меняй нормативный контракт только ради прохождения тестов.
+
+| Область | Что прочитать до правки |
+|---|---|
+| Любой нетривиальный Rust-код | [CODE_STYLE](docs/CODE_STYLE.md), [ARCHITECTURE](docs/ARCHITECTURE.md), [TEST_QUALITY](docs/TEST_QUALITY.md) |
+| Карточки, статистика, репорты, Rich/HTML/fallback | [CARD_STYLE](docs/CARD_STYLE.md), соответствующий renderer и delivery adapter |
+| Конфигурация, features, provider routing | [TECHNICAL](docs/TECHNICAL.md), [COMMUNITY_CONFIG](docs/COMMUNITY_CONFIG.md), `Cargo.toml`, `config/llm_profiles.toml.example` |
+| URL/QR/антиспам, public MCP, Ask memory | [TEST_QUALITY](docs/TEST_QUALITY.md), [TECHNICAL](docs/TECHNICAL.md), scope/policy соответствующего feature |
+| Тесты и release | [DEVELOPMENT](docs/DEVELOPMENT.md), [TEST_QUALITY](docs/TEST_QUALITY.md), текущие CI и scripts |
+| Изменения зависимостей | [SECURITY_DEPENDENCIES](docs/SECURITY_DEPENDENCIES.md), `Cargo.toml`, `Cargo.lock`, upstream advisory/API |
 
 ## Проект
 
 Rust-бот для сообществ NedoNews и PVO. Один release binary использует раздельные runtime-конфигурации и PostgreSQL базы; функции включаются compile-time features и per-instance config.
 
-- **Стек**: Rust 2024 edition, fork teloxide 0.21.0-rc.1 / teloxide-core 0.17.0-rc.1 (Bot API 10.4), sqlx 0.9 (PostgreSQL), reqwest 0.13
-- **LLM-провайдеры**: Gemini (основной), Groq, Cerebras, OpenRouter, Ollama, OpenAI-compatible
-- **ASR**: Groq Whisper
+- **Стек**: Rust 2024 edition, pinned fork teloxide (версия и rev — `Cargo.toml`/`Cargo.lock` текущей ветки), SQLx 0.9 (PostgreSQL; SQLite для spam reputation), reqwest 0.13, `genai`, `rmcp`. Не переносить wire/API предположения между RC без проверки.
+- **LLM-провайдеры**: Gemini, Groq, Cerebras, OpenRouter, Ollama, OpenAI-compatible; primary/fallback определяются отдельно для каждого route, единого основного провайдера нет.
+- **ASR**: Gemini и Groq; primary/shadow определяются runtime profile и media capabilities.
 - **Бот**: `@nedostraj_bot`, чат `-1001932061163`, канал `-1001575496091`
 
 ## Структура
@@ -26,7 +41,7 @@ src/telegram/command_handler.rs      — dispatch команд и Telegram-adapt
 src/telegram/render.rs               — send_html, Rich Message helpers, escape_html
 src/telegram/html.rs                 — Html builder (text/bold/code/link/custom_emoji/expandable_blockquote)
 src/telegram/entities.rs             — forwarded_channel_post, message_text, custom_emoji_ids, message_has_links
-src/telegram/custom_emoji.rs         — /emojiids diagnostic command
+src/telegram/custom_emoji.rs         — /emoji_ids diagnostic command
 src/llm/mod.rs                       — модуль LLM
 src/llm/types.rs                     — typed generation, attempt, transport error и output types
 src/llm/service.rs                   — generation через выбранный route/profile и output validation
@@ -46,7 +61,7 @@ src/features/stats/types.rs            — StatsPeriod (Day/Week/Month), StatsRe
 src/features/stats/report.rs           — /stats_day, /stats_week, /stats_month, /topmsg, /bottommsg, /topreact, /userstats, /userstatus
 src/features/voice/pipeline.rs         — maybe_transcribe_voice → download → ASR → cleanup → render → send
 src/features/voice/download.rs          — validate_media (duration/filesize), download_voice_file (tempfile)
-src/features/voice/asr.rs               — Groq /audio/transcriptions multipart
+src/features/voice/asr.rs               — Gemini/Groq ASR, primary/shadow и media fallback
 src/features/voice/cleanup.rs           — LLM cleanup: prompt → generate → parse JSON → normalize_terms
 src/features/voice/render.rs            — plain text / chapters / preview+file
 src/features/voice/types.rs             — VoiceMedia, AsrTranscript, CleanTranscript, TranscriptChapter
@@ -83,7 +98,7 @@ migrations/                            — sqlx compile-time миграции
 | `/help` | Меню команд |
 | `/ping` | Проверка живости |
 | `/db` | Проверка подключения к БД |
-| `/emojiids` | Показать custom_emoji_id из сообщения |
+| `/emoji_ids` | Показать custom_emoji_id из сообщения |
 | `/format_test <text>` | Тест рендера первого комментария |
 | `/memory` | Последние заметки памяти |
 | `/ask <вопрос>` | Агентный поиск по истории чата и публичному read-model |
@@ -100,8 +115,14 @@ migrations/                            — sqlx compile-time миграции
 | `/bottommsg [-r\|-p] [-e]` | 20 самых молчаливых |
 | `/userstats <id\|username> [-r\|-p] [-e]` | Карточка пользователя |
 | `/userstatus <id\|username> [-r\|-p] [-e]` | Alias /userstats |
+| `/transcribe` | Расшифровать voice, audio или кружок в reply |
+| `/forget` | Забыть личную память диалога |
+| `/notspam` | Пометить сообщение как не спам (reviewer) |
+| `/mute`, `/ban`, `/warn` | Санкции модерации |
+| `/unmute`, `/unban`, `/unwarn` | Снять санкции |
+| `/warns`, `/modlog`, `/undo` | История и отмена действий модерации |
 
-`-r` = rich HTML (дефолт), `-p` = plain text, `-e` = ответ только автору команды в группе. Reply на сообщение работает как implicit target для `/userstats`.
+`-r` = Rich (дефолт), `-p` = обычный Telegram HTML, `-e` = ephemeral ответ только автору команды в группе при разрешённой policy. Plain text — отдельный fallback доставки. Reply на сообщение работает как implicit target для `/userstats`.
 
 ## Конфигурация
 
@@ -109,7 +130,7 @@ migrations/                            — sqlx compile-time миграции
 
 **LLM routing**: `LLM_PROFILES_PATH` необязателен и задаёт deployment-копию provider/model/task route topology; без него используется репозиторный example-файл. Каждый runtime-вызов передаёт явный route (`first_comment`, `memory`, `voice_cleanup`, `search_extract`, `new_user_audit` или `ask`); provider/model env overrides и hard-coded fallback chains удалены.
 
-**Thinking budget**: для Gemini 3.x бот использует `thinkingLevel=low` и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `runtime.gemini_thinking_budget` добавляется к `runtime.llm_max_tokens` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
+**Thinking budget**: для Gemini 3.x и новее бот использует `thinkingLevel` из профиля модели и не передаёт `temperature` или числовой thinking budget. Для старых Gemini-моделей `runtime.gemini_thinking_budget` добавляется к `runtime.llm_max_tokens` в `maxOutputTokens` (thinking + answer). Output validator отдельно контролирует длину финального комментария.
 
 **Proxy**: `LLM_PROXY_URL` — SOCKS5/HTTP proxy только для LLM запросов, не для Telegram polling.
 
@@ -119,6 +140,11 @@ migrations/                            — sqlx compile-time миграции
 - Перед изменением карточек, статистики, рейтингов или сообщений модерации **обязательно прочитать [docs/CARD_STYLE.md](docs/CARD_STYLE.md)** и выбрать соответствующий образец. Контракт обязателен для Rich, HTML и текстового fallback.
 - Не добавлять дублирующие заголовки и декоративные подписи. `/topword` выводит только ранжированный список без заголовка, повторения слова, периода и шапки колонок.
 - Сохранять кликабельные имена и проверенные источники, одинаковые данные между форматами, экранирование и безопасную доставку. Изменение стиля требует обновления контракта и примера «до / после» в том же PR.
+- Один DTO/use case → разные presentation paths; общий field/identity/link contract важнее совпадения HTML-строк. Не брать Rich HTML как универсальный HTML: `<table>`, `<details>` и typed blocks не являются обычным Telegram ParseMode. Отдельно проверять реально выбранный fallback, а не только оба renderer при прямом вызове.
+- Новое поле проходит цепочку repo/service → DTO → Rich → HTML → plain/file fallback по применимости. Проверить 0/unknown/absent, escaped Unicode, scope и links; при недоступном аватаре или профиле текст не пропадает.
+- Для новых карточек — один предметный заголовок (или ни одного по образцу), до четырёх основных колонок без обоснования расширения, вторичные данные в details. Никаких декоративных footer/emoji ради унификации. Не менять смысл метрик или порядок при адаптации к экрану.
+- У длинного результата заранее определить стратегию: целые строки/блоки, страницы или файл; считать длину штатным helper после экранирования. Не резать готовую разметку. При multi-send проверить частичную доставку: уже подтверждённые части не повторять, unknown не трактовать как rejection, audience/thread/reply сохраняются.
+- В PR приложить безопасный пример **фактического** output каждого затронутого формата, по возможности rendered fixture. При изменении стиля — before/after и причина; при исправлении отклонения от существующего контракта не переписывать контракт под дефект.
 
 ### Разметка антиспама и Decision
 
@@ -142,8 +168,8 @@ migrations/                            — sqlx compile-time миграции
   Контекст и проверки: `docs/DECISION_SHORT_BAIT_HANDOFF_2026-11-20.md`.
 
 ### SQL — безопасность
-- **Все** запросы через `sqlx::query_as()` / `sqlx::query()` с позиционными биндингами `$1, $2, ...`.
-- Единственное исключение: `StatsPeriod::start_sql()` возвращает `&'static str` и встраивается через `format!` — это безопасно, но pattern нужно сохранять (только static str).
+- Запросы через штатные `sqlx::query*` / `QueryBuilder` с позиционными bind-параметрами `$1, $2, ...`; не собирать SQL конкатенацией внешних значений.
+- Dynamic SQL допускается только для проверенных статических фрагментов/идентификаторов из закрытого allowlist. `AssertSqlSafe` не является санитайзером: перед его использованием доказать происхождение каждого фрагмента; все значения передавать через bind. Для статистики использовать общий `ReportWindow`, population filter и aggregate helpers из `stats::repo`.
 - `new_user_analysis.rs` использует `QueryBuilder` с динамическими именами колонок из `&'static [&'static str]` — безопасно, но хрупко. Не заменять на строки из переменных.
 - **Никогда не подставлять пользовательский ввод (username, text, id) через `format!` в SQL.**
 
@@ -163,7 +189,7 @@ migrations/                            — sqlx compile-time миграции
 - **Не логировать** response bodies от внешних API при ошибках. Raw body и URL с секретами не должны попадать в ошибки.
 - Telegram API вызывается через typed методы teloxide fork-а; application code не должен собирать token-bearing URLs или дублировать Telegram payload/response модели.
 
-### Telegram Bot API 10.4
+### Telegram Bot API — контракт pinned fork
 - `Bot::send_rich_message` / `InputRichMessage` используются в production для rich stats, `/ask` и длинных расшифровок голосовых; при ошибке доступен безопасный HTML/file fallback.
 - `Bot::get_user_personal_chat_messages` используется в profile refresh.
 - `chatFullInfo` поля (`emoji_status_custom_emoji_id`, `profile_accent_color_id`) — используются.
@@ -177,20 +203,20 @@ migrations/                            — sqlx compile-time миграции
 4. `build_llm_prompt`: system prompt + tech_rag + memory notes + recent comments + post text
 5. `generate_text_checked`: task route → model fallback chain → output validator (`validate_comment_output`)
 6. `build_comment_html`: strip_links → normalize_ai_markers → escape → CHAT_LINK replacement → custom_emoji
-7. `send_html_reply` → `mark_post_comment_sent` → `insert_llm_generation` → owner preview
+7. Durable claim/revision fence → `begin_post_comment_delivery` → typed Telegram effect → `finalize_post_comment_sent` либо подтверждённый rejection/`delivery_unknown`. При unknown не повторять send автоматически; сохранять audit и operator reconciliation.
 8. `enqueue_post_history`: отдельная job → LLM JSON summary → RuBERT embedding → `post_history_entries`; retry с геометрическим backoff до terminal `failed`
 
 ### Голосовые
 1. `maybe_transcribe_voice`: check enabled + auto + right chat + not bot + not command + not auto-forward
 2. `VoiceMedia::from_message` → `create_voice_job` (dedup) → `validate_media` (duration/filesize/video_note)
 3. Download → tempfile (auto-delete via TempPath)
-4. ASR: Groq multipart → parse response
+4. ASR: `transcribe_audio_with_shadow` → primary transcript / optional comparative shadow; media fallback и provider errors по контракту ASR.
 5. Cleanup: LLM → parse JSON/Plain → `normalize_terms` (groq, Gemma, etc.)
 6. Render: short text / chapters / preview + file
 7. Send → save result
 
 ### Статистика
-- `/stats_day|week|month` / `/status`: `StatsPeriod::start_sql()` → aggregate queries → HTML/Rich report
+- `/stats_day|week|month` / `/status`: `stats::repo::report_window` → единый `ReportWindow` для scoped aggregate queries → общий DTO → HTML/Rich report.
 - `/topmsg`: top users by messages, exclude 777000/bots/channel posts
 - `/topreact`: top messages by reaction counts with links
 - `/userstats`: resolve target (numeric id → username lookup) → profile + chat_user + totals → rich HTML
@@ -205,7 +231,7 @@ cargo test
 
 Все зарегистрированные в `WorkerSupervisor` задачи являются long-lived workers. Неожиданное завершение worker должно завершать процесс ошибкой после bounded drain, чтобы systemd мог перезапустить сервис. Не превращайте panic/return такого worker в только запись в журнал.
 
-Test fixtures: каждая тестовая модуль определяет `fn config() -> Config`. При добавлении поля в `Config` — обновить все test configs (антипаттерн AP2, планируется общий helper).
+Test fixtures: для unit-тестов crate переиспользовать `crate::config::test_config()` и точечно переопределять нужные поля. Для integration tests использовать shared fixture в `tests/support`, если она подходит; `#[cfg(test)]` helper библиотеки не доступен внешнему integration crate. Не копировать полный `Config`. Изменения Config должны сохранять feature-gated defaults и startup validation.
 
 ## Промпты
 
@@ -258,19 +284,19 @@ Machine-specific local workflow notes не являются частью реп�
 - `match` на enum-вариантах с Guard-ами (`if condition`) — разбивать на отдельные функции, если ветки > 10 строк.
 
 ### Хардкод и магические числа
-- Chat ID `777000` (Telegram service user) — OK, один раз в `stats/report.rs`. Не размазывать.
+- Telegram service user `777000` — использовать `stats::repo::TELEGRAM_SERVICE_USER_ID` там, где применим общий фильтр human activity; не дублировать литерал в новом коде.
 - `SAFE_TEXT_LIMIT = 3900`, `TELEGRAM_TEXT_LIMIT = 4096` — константы в `telegram/html.rs`.
 - Timeout-ы (`45s`, `60s`, `120s`) — вынести в `const` или config, если повторяются.
 - Хардкод статических URL (`https://api.groq.com/openai/v1/audio/transcriptions`) — OK в пределах одного модуля, не дублировать.
 
 ### Функции
-- Одна функция — одна обязанность. Если функция > 60 строк, подумать о разделении.
+- Одна функция — одна ответственность. 60 строк — сигнал для review, не hard limit; выделять семантические этапы с проверяемыми контрактами, а не нарезать линейную композицию по LOC.
 - `pipeline.rs` — координация (call A, then B, then C). Логику каждого шага — в отдельном модуле.
 - Не выносить бизнес-логику в `main.rs`, `command_handler.rs` или `render.rs`. Они — wiring, не вычисления.
-- Публичные функции с `#[allow(dead_code)]` — OK для заделов, но комментировать зачем и когда планируется использование.
+- Не добавлять мёртвый production-код «на будущее». Для необходимого временного `#[allow(dead_code)]`/`#[allow(unused_imports)]` — минимальная область, конкретная причина и условие удаления; не заглушать предупреждения ради зелёного CI.
 
 ### Тесты
-- Test fixtures `fn config()` дублируются. Не плодить новые — добавить в существующий модуль или вынести в общий helper (планируется).
+- Переиспользовать общий `crate::config::test_config()` в unit-тестах; существующие дубликаты мигрировать при релевантных изменениях, без массовой косметической правки.
 - Тесты называются описательно: `gemini_comments_fallback_to_flash_lite_then_gemma_31b`, не `test_1`.
 
 ### Ошибки
@@ -282,7 +308,7 @@ Machine-specific local workflow notes не являются частью реп�
 
 #### Провайдеры и внешние API
 - **Не добавлять брендовые LLM-клиенты и ветки router-а** для OpenAI-compatible API: Groq, Cerebras, OpenRouter, Alibaba Model Studio/Qwen и аналогичные endpoint-ы должны быть profiles одного транспорта.
-- Для OpenAI-compatible Chat Completions использовать уже подключённый crate `async-openai` с `OpenAIConfig::with_api_base()` и `with_api_key()`. **Не писать новый клиент на `reqwest`** и не копировать `OpenAiCompatClient`.
+- Для OpenAI-compatible Chat Completions использовать уже подключённый crate `genai` и существующую конфигурацию провайдера. **Не писать новый клиент на `reqwest`** и не копировать `OpenAiCompatClient`.
 - Отдельный native client допустим только для действительно другого протокола (`Gemini GenerateContent`, `Ollama /api/chat`, ASR multipart и т. п.).
 - URL endpoint-а, имя env-переменной ключа, default model и capabilities должны быть в provider profile/config, а не в `match provider` или в коде. Секреты не хранить в TOML/profile и не логировать.
 - Возможности модели (`supports_images`, structured-output mode, timeout) задавать конфигурацией profile; не выводить их из названия модели эвристиками для новых провайдеров.
@@ -341,18 +367,18 @@ docs: update TECHNICAL.md with voice pipeline details
 
 ### Правила
 - Один коммит — одна логическая единица изменения. Не смешивать фичу с рефакторингом в одном коммите.
-- Перед коммитом: `cargo fmt && cargo test`.
+- Перед коммитом Rust-изменений — проверки по `docs/DEVELOPMENT.md` и `docs/TEST_QUALITY.md`; для docs-only достаточно проверить ссылки, структуру и diff, если код/схемы/генераторы не менялись. Не представлять неподтверждённые checks как пройденные.
 - Если меняем промпт — отдельный коммит с описанием что и почему.
 - Если меняем SQL-миграцию — отдельный коммит. Проверить backward compatibility.
 - Если меняем Config (новые поля) — обновить struct + from_env + все test fixtures + техническую документацию и tracked config template, если он добавлен в репозиторий.
 - Commit message тело (если нужно): описать контекст, мотивацию, что пробовалось. Не dump diff.
 
-## Bot API 10.4 — typed fork methods
+## Bot API — typed fork methods
 
-Fork teloxide 0.21.0-rc.1 / teloxide-core 0.17.0-rc.1 предоставляет typed методы для используемых расширений Bot API. Не добавлять для них raw HTTP-обёртки или самодельные wire-модели.
+Pinned fork teloxide предоставляет typed методы для используемых расширений Bot API. Версии и доступные wire-типы проверяются по lockfile и исходникам соответствующей ревизии. Не добавлять для них raw HTTP-обёртки или самодельные wire-модели.
 
 ### `get_user_personal_chat_messages`
-**Где:** `src/features/user_profiles/service.rs:224-232`
+**Где:** `src/features/user_profiles/service.rs`
 
 Возвращает последние сообщения из личного канала пользователя. Используется для:
 - детектирования adult-спама (promo DM bait, personal channel promotion);
@@ -360,12 +386,12 @@ Fork teloxide 0.21.0-rc.1 / teloxide-core 0.17.0-rc.1 предоставляет
 - обработки `USER_PERSONAL_CHANNEL_MISSING` как definitive-ошибки отсутствия канала.
 
 ### `send_rich_message`
-**Где:** `src/telegram/render.rs:36-80`
+**Где:** `src/telegram/render.rs`, `src/telegram/service_messages.rs`
 
 Используется для rich-отчётов статистики, `/ask` и длинных расшифровок голосовых. Локальный renderer отвечает только за application-level лимит `32_768` символов, reply-параметры и безопасный fallback.
 
 ### `ChatFullInfo`
-**Где:** `src/features/user_profiles/service.rs:179-181`
+**Где:** `src/features/user_profiles/service.rs`
 
 ```rust
 chat.emoji_status_custom_emoji_id
@@ -378,13 +404,13 @@ Typed-модель teloxide предоставляет эти поля для с
 
 1. **Не коммитить `.env`**, токены, экспорты Telegram, дампы БД.
 2. **Изменять промпты аккуратно** — они определяют поведение бота в проде. Правка промпта = redeploy.
-3. **SQL-миграции**: новый файл в `migrations/` с timestamp prefix. После добавления — `touch src/db/mod.rs` для sqlx recompile.
-4. **Новые Config-поля**: добавить в struct, `from_env()`, все test `fn config()`, документацию и tracked config template, если он существует.
+3. **SQL-миграции**: новый additive файл в `migrations/` с timestamp prefix. Проверить обнаружение миграции SQLx и clean/upgrade path на disposable PG; при необходимости инициировать rebuild.
+4. **Новые Config-поля**: обновить typed config, parsing/validation, shared fixtures, документацию и tracked runtime/profile template; проверить disabled feature и неверные значения.
 5. **Новые команды**: зарегистрировать `Command` в `commands.rs`, а transport adapter держать тонким и делегировать отдельному feature/use-case модулю. Не добавлять новую бизнес-логику в общий `command_handler.rs`; поддерживать общие справку/документацию. См. `docs/CODE_STYLE.md`.
 6. **Новые LLM-провайдеры**: добавить provider/model profile и route selection в `config/llm_profiles.toml.example`; не добавлять provider match в service code.
 7. **Не ломать backward compatibility**: бот работает в проде, старые записи в БД. Миграции только additive.
 8. **Comment density**: код хорошо документирован. Писать комментарии по делу, не_water.
-9. **Russian** — код, комментарии, промпты, документация на русском. Git commit messages на английском (imperative).
+9. **Язык** — identifiers, API и типы сохраняют принятую английскую терминологию Rust; пользовательский вывод по `StatsStrings`/locale, русская документация и промпты по существующему стилю файла. Git commit messages на английском (imperative).
 10. **Проверять перед правками**: для нетривиального изменения использовать зафиксированные команды CI (`cargo fmt --all -- --check`, locked workspace check/test и Clippy); PostgreSQL проверки запускать только на disposable локальных БД через `scripts/test.sh`. Смотреть `docs/TEST_QUALITY.md`; число тестов не заменяет проверку инвариантов.
 
 <!-- NEDOBOT_REFACTOR_GUIDANCE_BEGIN -->
@@ -422,4 +448,13 @@ Typed-модель teloxide предоставляет эти поля для с
 - Перед перемещением code path добавить characterization tests. Отдельный PR — отдельное смысловое изменение. Рефактор не меняет visible behavior, score, санкции, URL shadow или outbound fallback. Обнаруженный баг исправлять отдельным `fix` PR.
 - SQL migrations **только новые additive файлы**; не менять уже применённые и не включать prod data в тесты. Сохранять fencing, write order, `not_spam`, privacy scopes, authority boundaries и exact provider routing.
 - Short-form video import / Shorts / TikTok — **не реализовывать**, использовать только как hypothetical design test: новый модуль не должен требовать правок Ask, Voice или URL audit.
+### Доказательства и privacy review
+
+- Ревью: разделять подтверждённый дефект (точный ref, code path, нарушенный контракт, counterexample) и гипотезу/технический долг. LOC, число inline tests, отсутствие прямого вызова, historical changelog и workspace membership сами по себе не доказывают дефект.
+- Test plan привязать к реальному инварианту, не к форме реализации. В PR указывать команды, exit codes, passed/failed/ignored и причины пропуска; при недоступном tooling — явно написать not run, не придумывать coverage, fuzz/mutation score или результат CI.
+- Для security/permission paths проверять матрицу public/private/ephemeral, managed/foreign chat и instance, роли и opt-in, reply target и feature gates. Fail closed; при ошибке API/рендера/LLM не расширять audience, scope, доступ к истории или допустимые инструменты.
+- Недоверенные Telegram/LLM/MCP/URL данные не являются инструкциями для agent/runtime. Scope, авторизация, проверка аргументов и provenance enforced кодом до выдачи данных/эффекта, не только prompt. Не логировать скрытые targets, query, raw body, private memory и secrets; hash не равен анонимизации.
+- Dependency/advisory: проверять actual locked package, affected range, класс advisory, patched version и dependency path по upstream. Обновлять lockfile штатным Cargo и тестировать; exception только узкий, с доказанной границей воздействия, причиной, условием удаления и отдельным review. Не выдавать устранение одного advisory за зелёный полный audit.
+- PR не равен релизу: пользовательские изменения готовят для changelog по `docs/DEVELOPMENT.md`, дату выпуска фиксируют только при фактическом deploy. Не менять production, не merge и не deploy без отдельной авторизации.
+
 <!-- NEDOBOT_REFACTOR_GUIDANCE_END -->

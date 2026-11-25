@@ -26,3 +26,8 @@ system library is upgraded under a separately approved infrastructure change.
 Recheck `cargo tree -i libsqlite3-sys -e features`, linked SQLite mode/version,
 and `cargo deny check advisories` when that becomes possible. No other advisory
 is ignored here.
+
+## URL and Chrono advisories (2026-11-24)
+
+- [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html): `url` before 2.5.9 can overflow the stack in `Url::origin()` on nested `blob:` URLs. The manifest requires 2.5.9 or newer and the lockfile selects 2.5.9 with `form_urlencoded` 1.2.3. Both checksums and dependency requirements were taken from the crates.io index. Validate with `cargo check --workspace --all-targets --locked`, URL regressions and the dependency audit before merging.
+- [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html): `chrono` is unmaintained; there is no fixed version. Inventory direct usage and upstream dependencies with `cargo tree -i chrono -e features` before planning a migration to `jiff` or `time`. Preserve database timestamp semantics and timezone behavior. Do not silently suppress the advisory or claim that the URL update alone clears the audit.
