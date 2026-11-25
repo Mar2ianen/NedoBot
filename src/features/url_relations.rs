@@ -676,7 +676,7 @@ fn is_bot_candidate(username: &str) -> bool {
 }
 
 fn relation_targets(raw_json: Value, text: Option<&str>) -> Vec<Found> {
-    serde_json::from_value::<teloxide::types::Message>(raw_json)
+    crate::telegram::entities::deserialize_stored_message(raw_json)
         .ok()
         .map(|message| teloxide_url::adapter::extract_from_message(&message))
         .unwrap_or_else(|| text.map(find_urls).unwrap_or_default())

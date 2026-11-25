@@ -74,12 +74,12 @@ pub fn render_report(card: &ReportCard) -> InputRichMessage {
 
     blocks.push(InputRichBlock::ExpandableBlockquote(
         InputRichBlockExpandableBlockQuotation {
-            text: plain(truncate(
+            blocks: vec![InputRichBlock::Paragraph(paragraph([plain(truncate(
                 card.target_text
                     .as_deref()
                     .unwrap_or("сообщение без текста"),
                 1_500,
-            )),
+            ))]))],
             credit: Some(plain("исходное сообщение")),
         },
     ));
@@ -688,6 +688,30 @@ mod tests {
     #[test]
     fn renders_rich_blocks_and_moderation_keyboard() {
         let rendered = render_report(&card());
+        let serialized = serde_json::to_value(&rendered).expect("serialize rich report");
+        let quote = serialized["blocks"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|block| block["type"] == "expandable_blockquote")
+            })
+            .expect("report includes expandable quote");
+        assert!(quote.get("blocks").is_some());
+        assert!(
+            quote.get("text").is_none(),
+            "RC2 wire format must not emit legacy quote text"
+        );
+        assert_eq!(
+            quote["blocks"][0]["type"], "paragraph",
+            "the quote text is carried in a paragraph block"
+        );
+        assert_eq!(
+            quote["blocks"][0]["text"],
+            json!([card().target_text.as_deref().unwrap()])
+        );
+        assert_eq!(quote["credit"], "исходное сообщение");
+
         let blocks = rendered.blocks_ref().expect("typed rich blocks");
         assert!(
             blocks

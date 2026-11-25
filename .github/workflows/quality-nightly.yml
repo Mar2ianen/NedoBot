@@ -37,6 +37,7 @@ jobs:
       - name: Replay every selected pure property and regression target with fixed seeds
         env:
           CARGO_BUILD_JOBS: "3"
+          NEDOBOT_RANDOM_STRESS_SEED: "1"
           QUALITY_EXECUTION_MANIFEST: target/quality/executed-tests.tsv
         run: sh scripts/run_quality_nightly.sh
 
@@ -57,7 +58,8 @@ jobs:
           name: quality-summary-${{ github.sha }}
           path: |
             target/quality/executed-tests.tsv
-            mutants.out/*.txt
+            target/mutants/**/*.txt
+            target/router-order-mutation.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -104,8 +106,10 @@ jobs:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
         run: |
           mkdir -p target/quality
-          printf '%s\t%s\n' "$GITHUB_SHA" 'postgres-migrations-lifecycle' >> target/quality/postgres-executed-tests.tsv
           python3 scripts/run_cargo_test_checked.py cargo test --test postgres_migrations --locked -- --ignored
+          printf '%s\t%s\n' "$GITHUB_SHA" 'postgres-migrations-lifecycle' >> target/quality/postgres-executed-tests.tsv
+          python3 scripts/run_cargo_test_checked.py cargo test --test adversarial_harness --locked generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact
+          printf '%s\t%s\n' "$GITHUB_SHA" 'generated-post-comment-fences' >> target/quality/postgres-executed-tests.tsv
       - name: Run stateful URL alias and shadow cases
         env:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test

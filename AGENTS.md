@@ -265,7 +265,9 @@ Machine-specific local workflow notes не являются частью реп�
   `import_telegram_export`, а не задним числом.
 - Deploy, restart и smoke всегда охватывают оба инстанса (см.
   `docs/DEPLOYMENT.md` и workflow `release`). Конфиги правятся вручную с
-  бэкапом и автоматикой не перезаписываются.
+  бэкапом и автоматикой не перезаписываются, кроме явно заданной release
+  policy `NEDOBOT_PRIVACY_MODE_POLICY=observe`: workflow сначала сохраняет оба
+  `.env`, меняет только эту переменную и восстанавливает снимки при rollback.
 
 ### Ветки между deploy
 

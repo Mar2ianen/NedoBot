@@ -7,8 +7,13 @@ printf 'sha\tcase\tseed\ttarget\ttest\tpassed\n' > "$QUALITY_EXECUTION_MANIFEST"
 
 # These selectors are pure or use local fake subprocesses; no database,
 # Telegram API, external URL, model, or private corpus is required.
-cases='utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape fetch-url-ip-literals qr-decoder-resource mcp-youtube-timeout media-writer-boundary'
+cases='seeded-url-property stored-rich-quotes utf16-generator telegram-update seeded-update-replay typed-state-generators reference-models durable-job-state-trace moderation-state-trace voice-media-bounds first-comment-render http-outcomes safe-report minimal-url-trace telegram-route-command-precedence ingress-reference-trace ask-tool-authorization ask-mcp-untrusted-preview mcp-sql-bindings mcp-forged-scope mcp-cursor-roundtrip audit-score-components memory-summary-normalization memory-error-classification agent-compaction-budget report-render-html-escape fetch-url-ip-literals qr-decoder-resource qr-known-payload mcp-youtube-timeout media-writer-boundary'
 seeds='72623859790382856 12345 20261118'
+if [ "${NEDOBOT_RANDOM_STRESS_SEED:-0}" = 1 ]; then
+    random_seed=$(python3 -c 'import secrets; print(secrets.randbits(64))')
+    echo "additional stress seed=$random_seed"
+    seeds="$seeds $random_seed"
+fi
 for seed in $seeds; do
     for case_id in $cases; do
         case "$case_id" in

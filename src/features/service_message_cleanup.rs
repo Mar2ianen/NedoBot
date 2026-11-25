@@ -15,6 +15,21 @@ pub async fn maybe_delete_join_leave_message(
         return;
     }
 
+    if crate::telegram::capabilities::require_chat_right(
+        bot.inner(),
+        msg.chat.id,
+        crate::telegram::capabilities::RequiredChatRight::DeleteMessages,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            chat_id = msg.chat.id.0,
+            "join/leave cleanup skipped: bot deletion right unavailable or unverified"
+        );
+        return;
+    }
+
     match bot.delete_message(msg.chat.id, msg.id).await {
         Ok(_) => tracing::debug!(
             chat_id = msg.chat.id.0,

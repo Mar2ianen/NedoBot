@@ -3,7 +3,7 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     dptree,
     prelude::*,
-    types::{ChatId, ChatMemberKind, ParseMode},
+    types::{BotFullInfo, ChatId, ChatMemberKind, ParseMode},
 };
 
 use tg_ai_bot_teloxide::{config, db, features, llm, state, telegram};
@@ -52,7 +52,6 @@ use features::voice::pipeline::{maybe_transcribe_voice, process_next_voice_job};
 use llm::genai_transport::GenAiTransport;
 use state::AppState;
 use telegram::command_handler::{handle_command, handle_reply_user_stats_command};
-use telegram::commands::Command;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -90,27 +89,31 @@ async fn main() -> anyhow::Result<()> {
     }
     GenAiTransport::cached(config.llm_proxy_url.as_deref())?;
     let bot = Bot::from_env().parse_mode(ParseMode::Html);
+    let me = preflight_bot_capabilities(&bot, &config, PrivacyPolicy::from_env()?).await?;
+    #[cfg(not(feature = "ask"))]
+    let _ = me;
     #[cfg(feature = "ask")]
     let bot_identity = if config.community.ask.gateway.mention_enabled
         || config.community.ask.gateway.reply_to_bot_enabled
     {
-        let me = bot.get_me().await?;
-        if config.community.ask.gateway.mention_enabled && me.username().is_empty() {
+        let username = me.username_opt().filter(|name| !name.is_empty());
+        let has_alias = me
+            .active_usernames
+            .iter()
+            .flatten()
+            .any(|name| !name.is_empty());
+        if config.community.ask.gateway.mention_enabled && username.is_none() && !has_alias {
             anyhow::bail!(
                 "ask.gateway.mention_enabled requires a Telegram bot username from getMe"
             );
         }
         Some(state::TelegramBotIdentity {
             user_id: me.id.0 as i64,
-            username: Some(me.username().to_owned()),
+            username: username.map(str::to_owned),
         })
     } else {
         None
     };
-    preflight_managed_chats(&bot, &config).await?;
-    preflight_moderation_message_deletion(&bot, &config).await?;
-    #[cfg(feature = "moderation")]
-    preflight_risk_captcha_permissions(&bot, &config).await?;
     let pool = build_pool().await?;
     migrate(&pool).await?;
     let mut workers = WorkerSupervisor::new();
@@ -131,15 +134,6 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Err(err) = refresh_known_member_snapshots(&bot, &pool, &config).await {
         tracing::warn!(%err, "failed to refresh member snapshots");
-    }
-    if let Err(err) = warn_if_group_update_permissions_unavailable(&bot, &config).await {
-        tracing::warn!(%err, "failed to check Telegram group privacy and update permissions");
-    }
-    if let Err(err) = warn_if_join_leave_cleanup_unavailable(&bot, &config).await {
-        tracing::warn!(%err, "failed to check join/leave message cleanup availability");
-    }
-    if let Err(err) = warn_if_ephemeral_and_greetings_unavailable(&bot, &config).await {
-        tracing::warn!(%err, "failed to check ephemeral replies and welcome messages availability");
     }
     #[cfg(feature = "spam-sync")]
     let spam_reputation_store = if config.community.spam_reputation.enabled {
@@ -257,9 +251,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_voice_transcription_worker(&mut workers, bot.clone(), state.clone());
 
     let handler = telegram::router::build(telegram::router::Routes {
-        command: dptree::entry()
-            .filter_command::<Command>()
-            .endpoint(handle_command),
+        command: dptree::filter_map(telegram::router::parse_bot_command).endpoint(handle_command),
         message: dptree::endpoint(handle_message),
         reaction: Update::filter_message_reaction_updated()
             .endpoint(telegram::updates::handle_message_reaction),
@@ -270,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         callback: Update::filter_callback_query()
             .endpoint(telegram::callbacks::handle_callback_query),
         chat_member: Update::filter_chat_member().endpoint(telegram::updates::handle_chat_member),
+        my_chat_member: Update::filter_my_chat_member().endpoint(handle_bot_membership_change),
     });
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
@@ -492,6 +485,7 @@ async fn handle_message(
     msg: Message,
     state: AppState,
     profile_refresh_queue: ProfileRefreshQueue,
+    #[cfg(feature = "ask")] me: BotFullInfo,
 ) -> ResponseResult<()> {
     let private_gateway_allowed = msg.chat.is_private()
         && state.config.community.ask.gateway.private_messages_enabled
@@ -530,9 +524,13 @@ async fn handle_message(
         let chat_gateway_allowed = state.config.ask_enabled
             && managed_chat_allows(&state.config, msg.chat.id.0, |chat| chat.ask);
         if (chat_gateway_allowed || private_gateway_allowed)
-            && let Some(question) = features::ask::gateway::invocation_question(
+            && let Some(question) = features::ask::gateway::invocation_question_with_aliases(
                 &msg,
-                state.telegram_bot_identity.as_ref(),
+                state
+                    .telegram_bot_identity
+                    .as_ref()
+                    .filter(|identity| identity.user_id == me.id.0 as i64),
+                me.active_usernames.as_deref().unwrap_or_default(),
                 gateway.mention_enabled,
                 gateway.reply_to_bot_enabled,
                 private_gateway_allowed && gateway.private_messages_enabled,
@@ -728,215 +726,282 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
     Ok(())
 }
 
-async fn warn_if_group_update_permissions_unavailable(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-) -> anyhow::Result<()> {
-    let me = bot.get_me().await?;
-    for chat_id in config.managed_chat_ids().filter(|chat_id| *chat_id < 0) {
-        let member = match bot.get_chat_member(ChatId(chat_id), me.id).await {
-            Ok(member) => member,
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    chat_id,
-                    "could not check bot membership; reaction and chat_member updates may be unavailable"
-                );
-                continue;
-            }
-        };
-        let is_admin = matches!(
-            member.kind,
-            ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
+async fn handle_bot_membership_change(
+    member: ChatMemberUpdated,
+    state: AppState,
+) -> ResponseResult<()> {
+    let chat_id = member.chat.id.0;
+    if !is_managed_chat(&state.config, chat_id) {
+        return Ok(());
+    }
+    let old = &member.old_chat_member.kind;
+    let new = &member.new_chat_member.kind;
+    tracing::info!(
+        chat_id,
+        previous_status = ?old.status(),
+        status = ?new.status(),
+        is_present = new.is_present(),
+        is_admin = new.is_privileged(),
+        can_delete_messages = new.can_delete_messages(),
+        can_restrict_members = new.can_restrict_members(),
+        "Telegram bot membership changed"
+    );
+    if (old.is_present() && !new.is_present())
+        || (old.is_privileged() && !new.is_privileged())
+        || (old.can_delete_messages() && !new.can_delete_messages())
+        || (old.can_restrict_members() && !new.can_restrict_members())
+    {
+        tracing::warn!(
+            chat_id,
+            "Telegram bot lost capabilities; ingestion or moderation may be unavailable"
         );
-        if !is_admin {
-            tracing::warn!(
-                chat_id,
-                status = ?member.kind,
-                "bot is not chat administrator; Telegram will not send message_reaction, message_reaction_count, or chat_member updates"
-            );
-        }
+    }
+    Ok(())
+}
 
-        if config.chat_allows(chat_id, |chat| chat.ingest)
-            && privacy_mode_blocks_group_messages(me.can_read_all_group_messages, is_admin)
-        {
-            tracing::error!(
-                chat_id,
-                "bot cannot read ordinary group messages: disable Group Privacy in BotFather and re-add the bot, or make it a chat administrator; message ingestion, anti-spam context, and channel-post comments will miss updates"
-            );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivacyPolicy {
+    Observe,
+    Reconcile,
+    Strict,
+}
+
+impl PrivacyPolicy {
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("NEDOBOT_PRIVACY_MODE_POLICY") {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Observe),
+            Err(_) => anyhow::bail!("NEDOBOT_PRIVACY_MODE_POLICY must be valid Unicode"),
         }
     }
 
-    Ok(())
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "observe" => Ok(Self::Observe),
+            "reconcile" => Ok(Self::Reconcile),
+            "strict" => Ok(Self::Strict),
+            _ => anyhow::bail!("NEDOBOT_PRIVACY_MODE_POLICY must be observe, reconcile or strict"),
+        }
+    }
 }
 
 fn privacy_mode_blocks_group_messages(privacy_disabled: bool, is_admin: bool) -> bool {
     !privacy_disabled && !is_admin
 }
 
-async fn warn_if_join_leave_cleanup_unavailable(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-) -> anyhow::Result<()> {
-    let chat_ids = config
-        .managed_chat_ids()
-        .filter(|chat_id| config.chat_allows(*chat_id, |chat| chat.delete_join_leave_messages))
-        .collect::<Vec<_>>();
-    if chat_ids.is_empty() {
-        return Ok(());
-    }
-
-    let me = bot.get_me().await?;
-    for chat_id in chat_ids {
-        match bot.get_chat_member(ChatId(chat_id), me.id).await {
-            Ok(member) if member.kind.can_delete_messages() => {}
-            Ok(member) => tracing::warn!(
-                chat_id,
-                status = ?member.kind,
-                "join/leave cleanup is enabled but bot lacks can_delete_messages"
-            ),
-            Err(err) => tracing::warn!(
-                %err,
-                chat_id,
-                "join/leave cleanup is enabled but bot permissions could not be checked"
-            ),
-        }
-    }
-
-    Ok(())
+fn privacy_patch_required(
+    policy: PrivacyPolicy,
+    privacy_disabled: bool,
+    non_admin_ingest_group: bool,
+) -> bool {
+    policy == PrivacyPolicy::Reconcile && !privacy_disabled && non_admin_ingest_group
 }
 
-async fn warn_if_ephemeral_and_greetings_unavailable(
+async fn reconcile_group_privacy(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-) -> anyhow::Result<()> {
-    let chat_ids = config
-        .managed_chat_ids()
-        .filter(|chat_id| {
-            config.chat_by_id(*chat_id).is_some_and(|chat| {
-                chat.config.ephemeral_command_replies
-                    || chat
-                        .config
-                        .welcome_message
-                        .as_deref()
-                        .is_some_and(|message| !message.trim().is_empty())
-                    || chat
-                        .config
-                        .farewell_message
-                        .as_deref()
-                        .is_some_and(|message| !message.trim().is_empty())
-            })
-        })
-        .collect::<Vec<_>>();
-    if chat_ids.is_empty() {
-        return Ok(());
+    mut me: BotFullInfo,
+    policy: PrivacyPolicy,
+    non_admin_ingest_group: bool,
+) -> anyhow::Result<BotFullInfo> {
+    if !privacy_patch_required(
+        policy,
+        me.can_read_all_group_messages,
+        non_admin_ingest_group,
+    ) {
+        return Ok(me);
     }
-
-    let me = bot.get_me().await?;
-    for chat_id in chat_ids {
-        match bot.get_chat_member(ChatId(chat_id), me.id).await {
-            Ok(member)
-                if matches!(
-                    member.kind,
-                    ChatMemberKind::Administrator(_) | ChatMemberKind::Owner(_)
-                ) => {}
-            Ok(member) => tracing::warn!(
-                chat_id,
-                status = ?member.kind,
-                "ephemeral replies and member greetings require the bot to be a chat administrator"
-            ),
-            Err(err) => tracing::warn!(
-                %err,
-                chat_id,
-                "ephemeral replies and member greetings are enabled but bot permissions could not be checked"
-            ),
-        }
-    }
-
-    Ok(())
+    let expected_id = me.id;
+    let deadline = std::time::Duration::from_secs(20);
+    tokio::time::timeout(
+        deadline,
+        bot.set_my_settings()
+            .can_read_all_group_messages(true)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Telegram privacy update timed out; state is unknown"))?
+    .map_err(|_| anyhow::anyhow!("Telegram privacy settings reconciliation failed"))?;
+    me = tokio::time::timeout(deadline, bot.get_me().send())
+        .await
+        .map_err(|_| anyhow::anyhow!("Telegram privacy verification timed out"))?
+        .map_err(|_| anyhow::anyhow!("cannot verify Telegram privacy settings after update"))?;
+    anyhow::ensure!(
+        me.id == expected_id && me.can_read_all_group_messages,
+        "Telegram privacy settings reconciliation was not verified"
+    );
+    tracing::warn!(
+        "Group Privacy disabled via setMySettings; existing groups may require manually removing and re-adding the bot"
+    );
+    Ok(me)
 }
 
-async fn preflight_managed_chats(
+/// One startup snapshot per configured chat. This is diagnostic state, not
+/// authorization for later moderation actions.
+async fn preflight_bot_capabilities(
     bot: &teloxide::adaptors::DefaultParseMode<Bot>,
     config: &Config,
-) -> anyhow::Result<()> {
+    policy: PrivacyPolicy,
+) -> anyhow::Result<BotFullInfo> {
+    let mut me = bot
+        .get_me()
+        .await
+        .map_err(|_| anyhow::anyhow!("cannot verify Telegram bot identity with getMe"))?;
+    let mut non_admin_ingest_group = false;
+    let mut snapshots = Vec::new();
+
     for chat_id in config.managed_chat_ids() {
-        bot.get_chat(ChatId(chat_id))
+        let chat = bot
+            .get_chat(ChatId(chat_id))
             .await
-            .map_err(|error| anyhow::anyhow!("managed chat {chat_id} preflight failed: {error}"))?;
-    }
-    Ok(())
-}
-
-async fn preflight_moderation_message_deletion(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-) -> anyhow::Result<()> {
-    let chat_ids = config
-        .managed_chat_ids()
-        .filter(|chat_id| {
-            config.chat_allows(*chat_id, |chat| {
-                chat.moderation_delete_target_message || chat.moderation_delete_command_message
-            })
-        })
-        .collect::<Vec<_>>();
-    if chat_ids.is_empty() {
-        return Ok(());
-    }
-
-    let bot_id = bot.get_me().await?.id;
-    for chat_id in chat_ids {
-        let member = bot
-            .get_chat_member(ChatId(chat_id), bot_id)
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("cannot verify message deletion permission in chat {chat_id}")
-            })?;
-        if !member.kind.can_delete_messages() {
-            anyhow::bail!(
-                "moderation message deletion is enabled for chat {chat_id}, but the bot lacks can_delete_messages"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "moderation")]
-async fn preflight_risk_captcha_permissions(
-    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
-    config: &Config,
-) -> anyhow::Result<()> {
-    if !config.community.moderation.captcha_enabled || config.community.moderation.captcha_dry_run {
-        return Ok(());
-    }
-    let bot_id = bot.get_me().await?.id;
-    for chat_id in config
-        .managed_chat_ids()
-        .filter(|chat_id| config.chat_allows(*chat_id, |chat| chat.moderation))
-    {
-        let member = bot
-            .get_chat_member(ChatId(chat_id), bot_id)
-            .await
-            .map_err(|_| anyhow::anyhow!("cannot verify captcha permissions in chat {chat_id}"))?;
-        let has_permissions = match member.kind {
-            ChatMemberKind::Owner(_) => true,
-            ChatMemberKind::Administrator(admin) => {
-                admin.can_delete_messages && admin.can_restrict_members
+            .map_err(|_| anyhow::anyhow!("managed chat {chat_id} preflight failed"))?;
+        anyhow::ensure!(
+            chat.id.0 == chat_id,
+            "managed chat {chat_id} returned a different identity"
+        );
+        let requires_delete = config.chat_allows(chat_id, |chat| {
+            chat.moderation_delete_target_message || chat.moderation_delete_command_message
+        });
+        let requires_captcha = cfg!(feature = "moderation")
+            && config.community.moderation.captcha_enabled
+            && !config.community.moderation.captcha_dry_run
+            && config.chat_allows(chat_id, |chat| chat.moderation);
+        let cleanup = config.chat_allows(chat_id, |chat| chat.delete_join_leave_messages);
+        let ephemeral_or_greetings = config.chat_by_id(chat_id).is_some_and(|chat| {
+            chat.config.ephemeral_command_replies
+                || chat
+                    .config
+                    .welcome_message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty())
+                || chat
+                    .config
+                    .farewell_message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty())
+        });
+        let group = chat.is_group_chat();
+        let channel = chat.is_channel();
+        let ingest = config.chat_allows(chat_id, |chat| chat.ingest);
+        let needs_member = group
+            || channel
+            || requires_delete
+            || requires_captcha
+            || cleanup
+            || ephemeral_or_greetings;
+        let member = if needs_member {
+            match bot.get_chat_member(ChatId(chat_id), me.id).await {
+                Ok(member) if member.user.id == me.id => Some(member.kind),
+                Ok(_) | Err(_) => {
+                    tracing::warn!(chat_id, "cannot verify Telegram bot membership");
+                    None
+                }
             }
-            _ => false,
+        } else {
+            None
         };
-        if !has_permissions {
+        let is_admin = member.as_ref().is_some_and(ChatMemberKind::is_privileged);
+        let is_present = member.as_ref().is_some_and(ChatMemberKind::is_present);
+        let can_delete = member
+            .as_ref()
+            .is_some_and(ChatMemberKind::can_delete_messages);
+        let can_restrict = member
+            .as_ref()
+            .is_some_and(ChatMemberKind::can_restrict_members);
+        if requires_delete && !can_delete {
             anyhow::bail!(
-                "moderation.captcha_enabled=true requires the bot to have can_delete_messages and can_restrict_members in chat {chat_id}"
+                "moderation message deletion is enabled for chat {chat_id}, but can_delete_messages is unavailable or unverified"
+            );
+        }
+        if requires_captcha && !(can_delete && can_restrict) {
+            anyhow::bail!(
+                "moderation.captcha_enabled=true requires verified can_delete_messages and can_restrict_members in chat {chat_id}"
+            );
+        }
+        if (group || channel) && !is_admin {
+            tracing::warn!(
+                chat_id,
+                "reaction and chat_member updates require administrator privileges; unavailable or unverified"
+            );
+        }
+        if cleanup && !can_delete {
+            tracing::warn!(
+                chat_id,
+                "join/leave cleanup enabled without verified can_delete_messages"
+            );
+        }
+        if ephemeral_or_greetings && !is_admin {
+            tracing::warn!(
+                chat_id,
+                "ephemeral replies and member greetings require verified administrator privileges"
+            );
+        }
+        if group && ingest && is_present && !is_admin {
+            non_admin_ingest_group = true;
+        }
+        if group && !me.can_join_groups {
+            tracing::warn!(
+                chat_id,
+                "bot cannot be added to groups; re-adding it to apply privacy changes may fail"
+            );
+        }
+        snapshots.push((chat_id, group, channel, ingest, is_present, is_admin));
+    }
+
+    me = reconcile_group_privacy(bot, me, policy, non_admin_ingest_group).await?;
+
+    for (chat_id, group, channel, ingest, is_present, is_admin) in snapshots {
+        if !(ingest && (group || channel)) {
+            continue;
+        }
+        if !is_present {
+            if policy == PrivacyPolicy::Strict {
+                anyhow::bail!("ingestion membership unavailable or unverified in chat {chat_id}");
+            }
+            tracing::error!(chat_id, "ingestion membership unavailable or unverified");
+        } else if group
+            && privacy_mode_blocks_group_messages(me.can_read_all_group_messages, is_admin)
+        {
+            if policy == PrivacyPolicy::Strict {
+                anyhow::bail!("Group Privacy blocks ordinary ingestion in chat {chat_id}");
+            }
+            tracing::error!(
+                chat_id,
+                "Group Privacy blocks ordinary ingestion; disable it and re-add the bot, or grant administrator privileges"
+            );
+        } else if group && !is_admin {
+            tracing::warn!(
+                chat_id,
+                "privacy flag permits group ingestion, but existing chat delivery is not verified"
             );
         }
     }
-    Ok(())
+
+    tracing::info!(
+        privacy_disabled = me.can_read_all_group_messages,
+        can_join_groups = me.can_join_groups,
+        supports_inline_queries = me.supports_inline_queries,
+        needs_inline_query_location = me.needs_inline_query_location,
+        can_connect_to_business = me.can_connect_to_business,
+        supports_guest_queries = me.supports_guest_queries,
+        supports_join_request_queries = me.supports_join_request_queries,
+        has_topics_enabled = me.has_topics_enabled,
+        allows_users_to_create_topics = me.allows_users_to_create_topics,
+        has_topic_sidebar = me.has_topic_sidebar,
+        can_manage_bots = me.can_manage_bots,
+        has_main_web_app = me.has_main_web_app,
+        active_username_count = me.active_usernames.as_ref().map_or(0, Vec::len),
+        "observed Telegram BotFullInfo capabilities"
+    );
+
+    Ok(me)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::privacy_mode_blocks_group_messages;
+    use super::{
+        PrivacyPolicy, privacy_mode_blocks_group_messages, privacy_patch_required,
+        reconcile_group_privacy,
+    };
     use teloxide::types::{Update, UpdateKind};
 
     #[test]
@@ -1013,6 +1078,118 @@ mod tests {
         assert!(message.from.is_some_and(|sender| sender.is_bot));
 
         assert!(matches!(edited.kind, UpdateKind::EditedMessage(_)));
+    }
+
+    #[test]
+    fn privacy_reconciliation_is_explicit_minimal_and_idempotent() {
+        use PrivacyPolicy::{Observe, Reconcile, Strict};
+        for (policy, disabled, needs_ingest, expected) in [
+            (Observe, false, false, false),
+            (Observe, false, true, false),
+            (Observe, true, false, false),
+            (Observe, true, true, false),
+            (Strict, false, false, false),
+            (Strict, false, true, false),
+            (Strict, true, false, false),
+            (Strict, true, true, false),
+            (Reconcile, false, false, false),
+            (Reconcile, false, true, true),
+            (Reconcile, true, false, false),
+            (Reconcile, true, true, false),
+        ] {
+            assert_eq!(
+                privacy_patch_required(policy, disabled, needs_ingest),
+                expected,
+                "policy={policy:?} privacy_disabled={disabled} ingest={needs_ingest}"
+            );
+        }
+        assert_eq!(
+            PrivacyPolicy::parse("observe").unwrap(),
+            PrivacyPolicy::Observe
+        );
+        assert!(PrivacyPolicy::parse("invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn privacy_reconciliation_uses_minimal_patch_and_verifies_real_api_response() {
+        use axum::{Json, Router, body::Bytes, extract::State, http::Uri, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use teloxide::{prelude::*, types::ParseMode};
+
+        #[derive(Default)]
+        struct Stub {
+            calls: Vec<(String, Value)>,
+            privacy_disabled: bool,
+            ignore_update: bool,
+        }
+
+        async fn api(State(stub): State<Arc<Mutex<Stub>>>, uri: Uri, body: Bytes) -> Json<Value> {
+            let method = uri.path().rsplit('/').next().unwrap().to_ascii_lowercase();
+            let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let mut stub = stub.lock().unwrap();
+            stub.calls.push((method.clone(), payload.clone()));
+            match method.as_str() {
+                "getme" => Json(json!({"ok": true, "result": {
+                    "id": 9001, "is_bot": true, "first_name": "Synthetic",
+                    "can_join_groups": true,
+                    "can_read_all_group_messages": stub.privacy_disabled,
+                    "supports_inline_queries": false, "needs_inline_query_location": false,
+                    "can_connect_to_business": false, "supports_guest_queries": false,
+                    "supports_join_request_queries": false, "has_topics_enabled": false,
+                    "allows_users_to_create_topics": false, "has_topic_sidebar": false,
+                    "can_manage_bots": false, "has_main_web_app": false
+                }})),
+                "setmysettings" => {
+                    assert_eq!(payload, json!({"can_read_all_group_messages": true}));
+                    if !stub.ignore_update {
+                        stub.privacy_disabled = true;
+                    }
+                    Json(json!({"ok": true, "result": true}))
+                }
+                _ => panic!("unexpected API method: {method}"),
+            }
+        }
+
+        let stub = Arc::new(Mutex::new(Stub::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().fallback(post(api)).with_state(stub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let bot = Bot::new("fixture-token")
+            .set_api_url(format!("http://{address}/").parse().unwrap())
+            .parse_mode(ParseMode::Html);
+        let me = bot.get_me().await.unwrap();
+        assert!(me.username_opt().is_none());
+        let observed = reconcile_group_privacy(&bot, me, PrivacyPolicy::Observe, true)
+            .await
+            .unwrap();
+        assert!(!observed.can_read_all_group_messages);
+        assert_eq!(stub.lock().unwrap().calls.len(), 1);
+
+        let updated = reconcile_group_privacy(&bot, observed, PrivacyPolicy::Reconcile, true)
+            .await
+            .unwrap();
+        assert!(updated.can_read_all_group_messages);
+        let updated = reconcile_group_privacy(&bot, updated, PrivacyPolicy::Reconcile, true)
+            .await
+            .unwrap();
+        assert!(updated.can_read_all_group_messages);
+        {
+            let mut state = stub.lock().unwrap();
+            let methods: Vec<_> = state.calls.iter().map(|call| call.0.as_str()).collect();
+            assert_eq!(methods, ["getme", "setmysettings", "getme"]);
+            state.privacy_disabled = false;
+            state.ignore_update = true;
+        }
+
+        let me = bot.get_me().await.unwrap();
+        assert!(
+            reconcile_group_privacy(&bot, me, PrivacyPolicy::Reconcile, true)
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[test]

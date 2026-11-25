@@ -1612,7 +1612,11 @@ mod tests {
             return Json(
                 json!({"ok":true,"result":{"id":9001,"is_bot":true,"first_name":"Fake","username":"fixture_bot",
                     "can_join_groups":true,"can_read_all_group_messages":false,
-                    "supports_inline_queries":false,"has_main_web_app":false}}),
+                    "supports_inline_queries":false,"needs_inline_query_location":false,
+                    "can_connect_to_business":false,"supports_guest_queries":false,
+                    "supports_join_request_queries":false,"has_topics_enabled":false,
+                    "allows_users_to_create_topics":false,"has_topic_sidebar":false,
+                    "can_manage_bots":false,"has_main_web_app":false}}),
             );
         }
         let payload: Value = serde_json::from_slice(&body).unwrap();

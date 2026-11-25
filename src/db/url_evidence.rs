@@ -325,7 +325,7 @@ pub async fn replace_qr_evidence_for_job(
         tx.rollback().await?;
         return Ok(None);
     };
-    let message: Message = serde_json::from_value(raw_json)?;
+    let message: Message = crate::telegram::entities::deserialize_stored_message(raw_json)?;
     let current_file_id = qr_media_candidate(&message).map(|candidate| candidate.file_unique_id);
     if current_file_id.as_deref() != Some(job.file_unique_id.as_str()) {
         sqlx::query(
@@ -420,7 +420,7 @@ pub async fn backfill_url_evidence(
     };
     for (message_id, raw_json) in candidates {
         summary.last_message_id = Some(message_id);
-        let Ok(message) = serde_json::from_value::<Message>(raw_json) else {
+        let Ok(message) = crate::telegram::entities::deserialize_stored_message(raw_json) else {
             summary.unreadable += 1;
             continue;
         };

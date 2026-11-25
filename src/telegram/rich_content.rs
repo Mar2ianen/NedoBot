@@ -2,7 +2,7 @@
 //! File IDs, callback data и скрытые thinking-блоки в проекцию не попадают.
 use teloxide::types::{
     MediaKind, Message, MessageKind, RichBlock, RichBlockCaption, RichBlockKind, RichMessage,
-    RichText, RichTextObject,
+    RichText, RichTextButton, RichTextObject,
 };
 
 #[derive(Default)]
@@ -23,10 +23,140 @@ pub fn rich_message(message: &Message) -> Option<&RichMessage> {
 }
 
 pub(super) fn project(message: &RichMessage) -> RichProjection {
+    project_blocks(&message.blocks)
+}
+
+pub(super) fn project_blocks(blocks: &[RichBlock]) -> RichProjection {
     let mut projection = RichProjection::default();
-    projection.blocks(&message.blocks);
+    projection.blocks(blocks);
     projection.text = projection.text.trim().to_owned();
     projection
+}
+
+pub(super) fn legacy_quote_text(blocks: &[RichBlock]) -> RichText {
+    let mut parts = Vec::new();
+    append_legacy_blocks(blocks, &mut parts);
+    RichText::List(parts)
+}
+
+fn append_legacy_blocks(blocks: &[RichBlock], parts: &mut Vec<RichText>) {
+    let mut first = true;
+    for block in blocks {
+        let start = parts.len();
+        append_legacy_block(block, parts);
+        if parts.len() > start {
+            if !first {
+                parts.insert(start, RichText::Text("\n".to_owned()));
+            }
+            first = false;
+        }
+    }
+}
+
+fn append_legacy_block(block: &RichBlock, parts: &mut Vec<RichText>) {
+    let RichBlock::Known(block) = block else {
+        return;
+    };
+    match block.as_ref() {
+        RichBlockKind::Paragraph(value) => parts.push(value.text.clone()),
+        RichBlockKind::Heading(value) => parts.push(value.text.clone()),
+        RichBlockKind::Pre(value) => parts.push(value.text.clone()),
+        RichBlockKind::Footer(value) => parts.push(value.text.clone()),
+        RichBlockKind::MathematicalExpression(value) => {
+            parts.push(RichText::Text(value.expression.clone()));
+        }
+        RichBlockKind::List(value) => {
+            for (index, item) in value.items.iter().enumerate() {
+                if index > 0 {
+                    parts.push(RichText::Text("\n".to_owned()));
+                }
+                if !item.label.is_empty() {
+                    parts.push(RichText::Text(item.label.clone()));
+                    if !item.blocks.is_empty() {
+                        parts.push(RichText::Text(" ".to_owned()));
+                    }
+                }
+                append_legacy_blocks(&item.blocks, parts);
+            }
+        }
+        RichBlockKind::Blockquote(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_credit(&value.credit, parts);
+        }
+        RichBlockKind::ExpandableBlockquote(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_credit(&value.credit, parts);
+        }
+        RichBlockKind::Pullquote(value) => {
+            parts.push(value.text.clone());
+            append_legacy_credit(&value.credit, parts);
+        }
+        RichBlockKind::Collage(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_caption(&value.caption, parts);
+        }
+        RichBlockKind::Slideshow(value) => {
+            append_legacy_blocks(&value.blocks, parts);
+            append_legacy_caption(&value.caption, parts);
+        }
+        RichBlockKind::Table(value) => {
+            for (row_index, row) in value.cells.iter().enumerate() {
+                if row_index > 0 {
+                    parts.push(RichText::Text("\n".to_owned()));
+                }
+                for (index, cell) in row.iter().enumerate() {
+                    if index > 0 {
+                        parts.push(RichText::Text("\t".to_owned()));
+                    }
+                    if let Some(text) = &cell.text {
+                        parts.push(text.clone());
+                    }
+                }
+            }
+            append_legacy_credit(&value.caption, parts);
+        }
+        RichBlockKind::Buttons(value) => {
+            for (index, button) in value.buttons.iter().enumerate() {
+                if index > 0 {
+                    parts.push(RichText::Text("\n".to_owned()));
+                }
+                parts.push(RichText::Object(RichTextObject::Button(RichTextButton {
+                    button: Box::new(button.clone()),
+                })));
+            }
+        }
+        RichBlockKind::Details(value) => {
+            parts.push(value.summary.clone());
+            if !value.blocks.is_empty() {
+                parts.push(RichText::Text("\n".to_owned()));
+            }
+            append_legacy_blocks(&value.blocks, parts);
+        }
+        RichBlockKind::Document(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Map(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Animation(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Audio(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Photo(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Video(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::VoiceNote(value) => append_legacy_caption(&value.caption, parts),
+        RichBlockKind::Divider(_) | RichBlockKind::Anchor(_) | RichBlockKind::Thinking(_) => {}
+    }
+}
+
+fn append_legacy_caption(caption: &Option<RichBlockCaption>, parts: &mut Vec<RichText>) {
+    if let Some(caption) = caption {
+        parts.push(caption.text.clone());
+        append_legacy_credit(&caption.credit, parts);
+    }
+}
+
+fn append_legacy_credit(credit: &Option<RichText>, parts: &mut Vec<RichText>) {
+    if let Some(credit) = credit {
+        if !parts.is_empty() {
+            parts.push(RichText::Text("\n".to_owned()));
+        }
+        parts.push(credit.clone());
+    }
 }
 
 impl RichProjection {
@@ -112,7 +242,7 @@ impl RichProjection {
                     self.credit(&v.credit);
                 }
                 RichBlockKind::ExpandableBlockquote(v) => {
-                    self.inline(&v.text);
+                    self.blocks(&v.blocks);
                     self.credit(&v.credit);
                 }
                 RichBlockKind::Pullquote(v) => {
@@ -180,6 +310,57 @@ mod tests {
             {"type":"paragraph", "text":{"type":"ton_address", "address":"EQsynthetic", "text":"Получатель"}}
         ]})).unwrap();
         assert_eq!(project(&rich).text, "Получатель");
+    }
+
+    #[test]
+    fn legacy_quote_keeps_table_and_details_boundaries_and_button_targets() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks": [
+            {"type": "table", "cells": [[
+                {"text": "A", "align": "left", "valign": "top"},
+                {"text": "B", "align": "left", "valign": "top"}
+            ], [
+                {"text": "C", "align": "left", "valign": "top"},
+                {"text": "D", "align": "left", "valign": "top"}
+            ]]},
+            {"type": "details", "summary": "Summary", "blocks": [
+                {"type": "paragraph", "text": "Body"}
+            ]},
+            {"type": "buttons", "buttons": [
+                {"text": "Open", "url": "https://example.org/a"},
+                {"text": "Next", "url": "https://example.org/b"}
+            ]}
+        ]}))
+        .unwrap();
+        let legacy = legacy_quote_text(&rich.blocks);
+        let mut projection = RichProjection::default();
+        projection.inline(&legacy);
+        assert_eq!(projection.text, "A\tB\nC\tD\nSummary\nBody\nOpen\nNext");
+        assert!(projection.has_links);
+        let wire = serde_json::to_value(legacy).unwrap();
+        let targets: Vec<_> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part.pointer("/button/url").and_then(|url| url.as_str()))
+            .collect();
+        assert_eq!(targets, ["https://example.org/a", "https://example.org/b"]);
+    }
+
+    #[test]
+    fn projects_expandable_quotation_rich_blocks() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks": [
+            {
+                "type": "expandable_blockquote",
+                "blocks": [
+                    {"type": "paragraph", "text": "Цитата"},
+                    {"type": "paragraph", "text": {"type": "bold", "text": "Из блоков"}}
+                ],
+                "credit": "источник"
+            }
+        ]}))
+        .unwrap();
+        let result = project(&rich);
+        assert_eq!(result.text, "Цитата\nИз блоков\n\nисточник");
     }
 
     #[test]

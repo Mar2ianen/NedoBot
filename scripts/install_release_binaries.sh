@@ -31,6 +31,67 @@ if [[ "${1:-}" == --list-binaries ]]; then
     exit
 fi
 
+restore_release() {
+    local backup="${1:?usage: install_release_binaries.sh --restore <verified-backup-dir>}"
+    local release_root="${NEDOBOT_RELEASE_ROOT:-/opt}"
+    local lock_path="${NEDOBOT_RELEASE_LOCK:-/var/lock/nedobot-release.lock}"
+    local -a dest_dirs=(
+        "$release_root/tg-ai-bot-teloxide/target/release"
+        "$release_root/nedobot-pvo/target/release"
+    )
+    local -a temp_dirs=()
+
+    exec 9>"$lock_path"
+    flock 9
+    (
+        cd -- "$backup"
+        sha256sum --strict --check --status SHA256SUMS
+    )
+    test -f "$backup/llm_profiles.toml"
+    test -f "$backup/pvo-llm_profiles.toml"
+    for dest_dir in "${dest_dirs[@]}"; do
+        local instance="${dest_dir#"$release_root"/}"
+        instance="${instance%%/*}"
+        test -f "$backup/$instance/.env"
+        test -d "$dest_dir"
+        temp_dir="$(mktemp -d "$dest_dir/.rollback.XXXXXXXX")"
+        temp_dirs+=("$temp_dir")
+        for binary in "${BINARIES[@]}"; do
+            if [[ -f "$backup/ABSENT" ]] \
+                && grep -Fxq "$instance/$binary" "$backup/ABSENT"; then
+                continue
+            fi
+            test -x "$backup/$instance/$binary"
+            cp -p -- "$backup/$instance/$binary" "$temp_dir/$binary"
+        done
+        cp -p -- "$backup/$instance/.env" "$temp_dir/.env"
+    done
+
+    for index in "${!dest_dirs[@]}"; do
+        local dest_dir="${dest_dirs[$index]}"
+        local instance="${dest_dir#"$release_root"/}"
+        instance="${instance%%/*}"
+        local temp_dir="${temp_dirs[$index]}"
+        for binary in "${BINARIES[@]}"; do
+            if [[ -f "$backup/ABSENT" ]] \
+                && grep -Fxq "$instance/$binary" "$backup/ABSENT"; then
+                rm -f -- "$dest_dir/$binary"
+            else
+                mv -f -- "$temp_dir/$binary" "$dest_dir/$binary"
+            fi
+        done
+        mv -f -- "$temp_dir/.env" "$release_root/$instance/.env"
+        rmdir -- "$temp_dir"
+    done
+    echo "restored binaries and environment files from verified backup: $backup"
+}
+
+if [[ "${1:-}" == --restore ]]; then
+    [[ "$#" -eq 2 ]] || { echo "usage: $0 --restore <verified-backup-dir>" >&2; exit 2; }
+    restore_release "$2"
+    exit
+fi
+
 STAGE_DIR="${1:?usage: install_release_binaries.sh <staged-artifact-dir> [--backup]}"
 RELEASE_ROOT="${NEDOBOT_RELEASE_ROOT:-/opt}"
 LOCK_PATH="${NEDOBOT_RELEASE_LOCK:-/var/lock/nedobot-release.lock}"
@@ -50,6 +111,13 @@ if [[ "${2:-}" == --backup ]]; then
     umask 077
     install -d -m 0700 -- "$backup_root"
     backup="$(mktemp -d "$backup_root/release.XXXXXXXX")"
+    backup_complete=false
+    cleanup_partial_backup() {
+        if [[ -n "${backup:-}" && "$backup_complete" != true ]]; then
+            rm -rf -- "$backup"
+        fi
+    }
+    trap cleanup_partial_backup EXIT
     for profile in llm_profiles.toml pvo-llm_profiles.toml; do
         install -m 0600 -- "$config_root/$profile" "$backup/$profile"
         cmp --silent -- "$config_root/$profile" "$backup/$profile"
@@ -58,6 +126,8 @@ if [[ "${2:-}" == --backup ]]; then
         instance="${dest_dir#"$RELEASE_ROOT"/}"
         instance="${instance%%/*}"
         install -d -m 0700 -- "$backup/$instance"
+        cp -pL -- "$RELEASE_ROOT/$instance/.env" "$backup/$instance/.env"
+        cmp --silent -- "$RELEASE_ROOT/$instance/.env" "$backup/$instance/.env"
         test -x "$dest_dir/tg_ai_bot_teloxide"
         for binary in "${BINARIES[@]}"; do
             if [[ -e "$dest_dir/$binary" || -L "$dest_dir/$binary" ]]; then
@@ -73,6 +143,8 @@ if [[ "${2:-}" == --backup ]]; then
         find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
         sha256sum --check --status SHA256SUMS
     )
+    backup_complete=true
+    trap - EXIT
     echo "verified rollback backup: $backup"
 fi
 TEMP_DIRS=()
