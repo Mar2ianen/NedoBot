@@ -223,6 +223,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
     assert_rich_backfill_and_exact_word_counts(&pool).await;
     assert_retention_keeps_true_first_seen(&pool).await;
     assert_stats_renderers_share_period_data(&pool).await;
+    assert_export_reaction_backfill_is_gap_only(&pool).await;
     assert_stats_rank_ties_follow_the_reference_order(&pool).await;
     assert_user_stats_username_uses_fresh_unique_alias(&pool).await;
     assert_feature_gated_jobs(&pool).await;
@@ -7754,6 +7755,145 @@ async fn assert_first_comment_context_isolated(
     .expect("top-k retrieval must use deterministic tie order");
     assert_eq!(top_one.len(), 1);
     assert_eq!(top_one[0].source_message_id, source_message_id + 3);
+}
+
+async fn assert_export_reaction_backfill_is_gap_only(pool: &PgPool) {
+    use teloxide::types::{CustomEmojiId, ReactionCount, ReactionType};
+    use tg_ai_bot_teloxide::export_reactions::{ReactionSnapshot, backfill_missing_counts};
+
+    const CHAT: i64 = -1009900710001;
+    let observed_at = Utc.with_ymd_and_hms(2026, 10, 4, 15, 0, 0).unwrap();
+    query(
+        "insert into telegram_messages (chat_id, message_id, text) values ($1, 1, 'existing'), ($1, 2, 'gap')",
+    )
+    .bind(CHAT)
+    .execute(pool)
+    .await
+    .unwrap();
+    query(
+        "insert into telegram_message_reaction_counts (chat_id,message_id,reactions,total_count,raw_json,event_at) values ($1,1,'[]',7,'{\"source\":\"live_fixture\"}', $2)",
+    )
+    .bind(CHAT)
+    .bind(observed_at - Duration::days(1))
+    .execute(pool)
+    .await
+    .unwrap();
+    let existing: serde_json::Value = query_scalar(
+        "select to_jsonb(rc) from telegram_message_reaction_counts rc where chat_id = $1 and message_id = 1",
+    )
+    .bind(CHAT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let snapshots = [
+        ReactionSnapshot::new(
+            1,
+            vec![ReactionCount {
+                r#type: ReactionType::Emoji {
+                    emoji: "👍".into()
+                },
+                total_count: 99,
+            }],
+        )
+        .unwrap(),
+        ReactionSnapshot::with_unidentified_custom(
+            2,
+            vec![
+                ReactionCount {
+                    r#type: ReactionType::CustomEmoji {
+                        custom_emoji_id: CustomEmojiId("123456".into()),
+                    },
+                    total_count: 3,
+                },
+                ReactionCount {
+                    r#type: ReactionType::Paid,
+                    total_count: 2,
+                },
+            ],
+            4,
+        )
+        .unwrap(),
+        ReactionSnapshot::new(
+            3,
+            vec![ReactionCount {
+                r#type: ReactionType::Paid,
+                total_count: 1,
+            }],
+        )
+        .unwrap(),
+    ];
+    let hash = "a".repeat(64);
+    let dry = backfill_missing_counts(pool, CHAT, &snapshots, observed_at, &hash, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            dry.candidates,
+            dry.existing,
+            dry.missing_messages,
+            dry.inserted
+        ),
+        (1, 1, 1, 0)
+    );
+    let count: i64 =
+        query_scalar("select count(*) from telegram_message_reaction_counts where chat_id = $1")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    let applied = backfill_missing_counts(pool, CHAT, &snapshots, observed_at, &hash, false)
+        .await
+        .unwrap();
+    assert_eq!(applied.inserted, 1);
+    let replay = backfill_missing_counts(pool, CHAT, &snapshots, observed_at, &hash, false)
+        .await
+        .unwrap();
+    assert_eq!(replay.inserted, 0);
+    let wrong_chat = backfill_missing_counts(pool, CHAT - 1, &snapshots, observed_at, &hash, false)
+        .await
+        .unwrap();
+    assert_eq!(wrong_chat.inserted, 0);
+    let after: serde_json::Value = query_scalar(
+        "select to_jsonb(rc) from telegram_message_reaction_counts rc where chat_id = $1 and message_id = 1",
+    )
+    .bind(CHAT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, existing,
+        "existing count/provenance/timestamps must not change"
+    );
+    let (total, at, raw, reactions): (i64, DateTime<Utc>, serde_json::Value, serde_json::Value) =
+        query_as("select total_count,event_at,raw_json,reactions from telegram_message_reaction_counts where chat_id = $1 and message_id = 2")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(total, 9);
+    assert_eq!(at, observed_at);
+    assert_eq!(raw["event_time_known"], false);
+    assert_eq!(raw["unidentified_custom_emoji_count"], 4);
+    assert_eq!(raw["export_sha256"], hash);
+    assert_eq!(reactions[0]["type"]["custom_emoji_id"], "123456");
+    let events: i64 =
+        query_scalar("select count(*) from telegram_message_reactions where chat_id = $1")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 0, "snapshot must not fabricate reaction events");
+    query("delete from telegram_message_reaction_counts where chat_id = $1")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    query("delete from telegram_messages where chat_id = $1")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn assert_stats_renderers_share_period_data(pool: &PgPool) {

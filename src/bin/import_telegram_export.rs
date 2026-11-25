@@ -3,10 +3,13 @@ use std::{collections::HashMap, fs::File, io::BufReader, path::PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{
     PgPool,
     types::chrono::{DateTime, Utc},
 };
+use teloxide::types::{CustomEmojiId, ReactionCount, ReactionType};
+use tg_ai_bot_teloxide::export_reactions::{ReactionSnapshot, backfill_missing_counts};
 
 #[derive(Debug)]
 struct Args {
@@ -14,6 +17,8 @@ struct Args {
     chat_id: Option<i64>,
     batch_size: usize,
     dry_run: bool,
+    reaction_gaps_only: bool,
+    snapshot_at: Option<DateTime<Utc>>,
     user_aliases: Vec<UserAlias>,
 }
 
@@ -37,7 +42,10 @@ struct ExportMessage {
     id: i32,
     #[serde(rename = "type")]
     message_type: String,
+    // Placeholder type=unsupported имеет только id/type; его не импортируем.
+    #[serde(default)]
     date: String,
+    #[serde(default)]
     date_unixtime: String,
     from: Option<String>,
     from_id: Option<String>,
@@ -75,6 +83,9 @@ struct ExportReaction {
 struct ExportRecentReaction {
     from: Option<String>,
     from_id: Option<String>,
+    // Некоторые версии Desktop не экспортируют дату recent paid реакции.
+    // Counts остаются пригодными, а event без известной даты пропускаем.
+    #[serde(default)]
     date: String,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
@@ -105,14 +116,58 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let args = parse_args()?;
-    let file = File::open(&args.export_path)
-        .with_context(|| format!("failed to open {}", args.export_path.display()))?;
-    let root: ExportRoot = serde_json::from_reader(BufReader::new(file))
-        .with_context(|| format!("failed to parse {}", args.export_path.display()))?;
+    let (root, snapshot_hash): (ExportRoot, Option<String>) = if args.reaction_gaps_only {
+        // Хеш и модель берём из одних байтов, не перечитываем меняющийся файл.
+        let bytes = std::fs::read(&args.export_path)?;
+        let hash = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        (serde_json::from_slice(&bytes)?, Some(hash))
+    } else {
+        let file = File::open(&args.export_path)
+            .with_context(|| format!("failed to open {}", args.export_path.display()))?;
+        let root = serde_json::from_reader(BufReader::new(file))
+            .with_context(|| format!("failed to parse {}", args.export_path.display()))?;
+        (root, None)
+    };
 
     let chat_id = args
         .chat_id
         .unwrap_or_else(|| export_chat_id_to_bot_id(root.id));
+    if args.reaction_gaps_only {
+        anyhow::ensure!(
+            chat_id == export_chat_id_to_bot_id(root.id),
+            "reaction snapshot chat-id does not match export"
+        );
+        let observed_at = args
+            .snapshot_at
+            .context("--reaction-gaps-only requires --snapshot-at RFC3339")?;
+        anyhow::ensure!(
+            root.messages
+                .iter()
+                .filter_map(message_timestamp)
+                .all(|at| at <= observed_at),
+            "snapshot observation time precedes an exported message"
+        );
+        let mut snapshots = Vec::new();
+        for message in &root.messages {
+            if let Some(snapshot) = reaction_snapshot(message)? {
+                snapshots.push(snapshot);
+            }
+        }
+        let hash = snapshot_hash.context("missing snapshot hash")?;
+        let pool = tg_ai_bot_teloxide::db::build_pool().await?;
+        let stats =
+            backfill_missing_counts(&pool, chat_id, &snapshots, observed_at, &hash, args.dry_run)
+                .await?;
+        println!("reaction snapshot: {}", serde_json::to_string(&stats)?);
+        println!(
+            "dry_run={}; messages, profiles and reaction events unchanged",
+            args.dry_run
+        );
+        return Ok(());
+    }
     let bot_user_id = bot_user_id_from_env();
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
 
@@ -159,12 +214,25 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut chat_id = None;
     let mut batch_size = 1000usize;
     let mut dry_run = false;
+    let mut reaction_gaps_only = false;
+    let mut snapshot_at = None;
     let mut user_aliases = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--reaction-gaps-only" => reaction_gaps_only = true,
+            "--snapshot-at" => {
+                let value = args
+                    .next()
+                    .context("--snapshot-at requires RFC3339 timestamp")?;
+                snapshot_at = Some(
+                    DateTime::parse_from_rfc3339(&value)
+                        .context("invalid --snapshot-at")?
+                        .with_timezone(&Utc),
+                );
+            }
             "--user-alias" => {
                 let value = args.next().context("--user-alias requires username:id")?;
                 user_aliases.push(parse_user_alias(&value)?);
@@ -182,7 +250,7 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             "-h" | "--help" => {
                 println!(
-                    "Usage: import_telegram_export <result.json> [--chat-id -100...] [--batch-size 1000] [--user-alias username:id] [--dry-run]"
+                    "Usage: import_telegram_export <result.json> [--chat-id -100...] [--batch-size 1000] [--user-alias username:id] [--dry-run] [--reaction-gaps-only --snapshot-at RFC3339]"
                 );
                 std::process::exit(0);
             }
@@ -197,14 +265,82 @@ fn parse_args() -> anyhow::Result<Args> {
     if !positional.is_empty() {
         bail!("only one result.json path is supported");
     }
+    anyhow::ensure!(
+        snapshot_at.is_none() || reaction_gaps_only,
+        "--snapshot-at requires --reaction-gaps-only"
+    );
+    anyhow::ensure!(
+        !reaction_gaps_only || user_aliases.is_empty(),
+        "reaction-only import cannot update user aliases"
+    );
 
     Ok(Args {
         export_path,
         chat_id,
         batch_size,
         dry_run,
+        reaction_gaps_only,
+        snapshot_at,
         user_aliases,
     })
+}
+
+// Перевод формата Desktop export в существующие typed ReactionCount teloxide.
+// Не теряем custom/paid реакции и не создаём вымышленные per-user events.
+fn reaction_snapshot(message: &ExportMessage) -> anyhow::Result<Option<ReactionSnapshot>> {
+    if message.message_type != "message" {
+        return Ok(None);
+    }
+    let Some(reactions) = message.reactions.as_ref().filter(|items| !items.is_empty()) else {
+        return Ok(None);
+    };
+    let mut counts = Vec::new();
+    let mut unidentified_custom_count = 0i64;
+    for reaction in reactions {
+        anyhow::ensure!(
+            reaction.count > 0,
+            "message {}: non-positive reaction count",
+            message.id
+        );
+        let r#type = match reaction.reaction_type.as_str() {
+            "emoji" => ReactionType::Emoji {
+                emoji: reaction
+                    .emoji
+                    .as_ref()
+                    .filter(|e| !e.trim().is_empty())
+                    .context("emoji reaction without emoji")?
+                    .clone(),
+            },
+            "custom_emoji" if reaction.document_id.as_deref().is_none_or(str::is_empty) => {
+                unidentified_custom_count =
+                    unidentified_custom_count
+                        .checked_add(reaction.count)
+                        .context("unidentified custom reaction total overflow")?;
+                continue;
+            }
+            "custom_emoji" => ReactionType::CustomEmoji {
+                custom_emoji_id: CustomEmojiId(
+                    reaction
+                        .document_id
+                        .as_ref()
+                        .filter(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))
+                        .context("custom reaction without document_id")?
+                        .clone(),
+                ),
+            },
+            "paid" => ReactionType::Paid,
+            _ => bail!("message {}: unsupported export reaction type", message.id),
+        };
+        counts.push(ReactionCount {
+            r#type,
+            total_count: u64::try_from(reaction.count)?,
+        });
+    }
+    Ok(Some(ReactionSnapshot::with_unidentified_custom(
+        message.id,
+        counts,
+        unidentified_custom_count,
+    )?))
 }
 
 fn parse_user_alias(value: &str) -> anyhow::Result<UserAlias> {
@@ -468,7 +604,9 @@ async fn import_reactions(
             for reaction in reactions {
                 let new_reactions = serde_json::json!([reaction_identity(reaction)]);
                 for recent in reaction.recent.iter().flatten() {
-                    let event_at = parse_export_datetime(&recent.date).unwrap_or(message_at);
+                    let Some(event_at) = parse_export_datetime(&recent.date) else {
+                        continue;
+                    };
                     let raw_json = serde_json::json!({
                         "source": "telegram_export_recent",
                         "reaction": reaction,
@@ -824,6 +962,18 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_placeholder_without_dates_is_not_imported() {
+        let message: ExportMessage = serde_json::from_value(serde_json::json!({
+            "id": 42, "type": "unsupported"
+        }))
+        .unwrap();
+        assert!(reaction_snapshot(&message).unwrap().is_none());
+        let (stats, _) = scan_export(&[message], None);
+        assert_eq!(stats.skipped_messages, 1);
+        assert_eq!(stats.imported_messages, 0);
+    }
+
+    #[test]
     fn forwarded_channel_message_is_not_automatic_forward() {
         let message = ExportMessage {
             id: 1,
@@ -902,5 +1052,57 @@ mod tests {
             extra: serde_json::Map::new(),
         }];
         assert!(total_reaction_count(&reactions).is_err());
+    }
+
+    #[test]
+    fn snapshot_preserves_emoji_custom_and_paid_without_recent_events() {
+        let message: ExportMessage = serde_json::from_value(serde_json::json!({
+            "id": 10, "type": "message", "date": "2026-10-04T00:00:00",
+            "date_unixtime": "1791072000", "reactions": [
+                {"type":"emoji", "emoji":"👍", "count":3},
+                {"type":"custom_emoji", "document_id":"123456", "count":2},
+                {"type":"paid", "count":1, "recent":[{"from_id":"user123"}]}
+            ]
+        }))
+        .unwrap();
+        let snapshot = reaction_snapshot(&message).unwrap().unwrap();
+        assert_eq!(snapshot.total_count, 6);
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["reactions"][1]["type"]["custom_emoji_id"], "123456");
+        assert_eq!(json["reactions"][2]["type"]["type"], "paid");
+        assert!(json["reactions"][0].get("recent").is_none());
+    }
+
+    #[test]
+    fn snapshot_rejects_missing_identity_and_negative_counts() {
+        for reaction in [
+            serde_json::json!({"type":"emoji", "count":1}),
+            serde_json::json!({"type":"custom_emoji", "document_id":"abc", "count":1}),
+            serde_json::json!({"type":"emoji", "emoji":"👍", "count":-1}),
+            serde_json::json!({"type":"unknown", "count":1}),
+        ] {
+            let message = serde_json::from_value(serde_json::json!({
+                "id": 10, "type":"message", "date":"2026-10-04T00:00:00",
+                "date_unixtime":"1791072000", "reactions":[reaction]
+            }))
+            .unwrap();
+            assert!(reaction_snapshot(&message).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_unknown_custom_totals_without_fabricating_ids() {
+        let message = serde_json::from_value(serde_json::json!({
+            "id":10, "type":"message", "date":"2026-10-04T00:00:00",
+            "date_unixtime":"1791072000", "reactions":[
+                {"type":"custom_emoji", "document_id":"", "count":3},
+                {"type":"custom_emoji", "count":2}
+            ]
+        }))
+        .unwrap();
+        let snapshot = reaction_snapshot(&message).unwrap().unwrap();
+        assert_eq!(snapshot.total_count, 5);
+        assert_eq!(snapshot.unidentified_custom_count, 5);
+        assert!(snapshot.reactions.is_empty());
     }
 }
