@@ -9,7 +9,7 @@ use teloxide::{
 };
 
 use crate::{
-    features::health::{HealthRegistry, HealthSnapshot, HealthStatus},
+    features::health::{HealthSnapshot, HealthStatus},
     state::AppState,
     telegram::render::escape_html,
 };
@@ -368,6 +368,7 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::health::HealthRegistry;
 
     #[test]
     fn privileged_modes_are_restricted_to_owner_dm() {
