@@ -917,7 +917,32 @@ cargo run --release --bin import_telegram_export -- "/path/to/ChatExport/result.
 - live Bot API `raw_json` не затирается экспортным JSON при конфликте, импорт только дополняет отсутствующие поля и флаги;
 - forwarded channel messages и automatic channel posts различаются: `sender_chat_id` заполняется только для реального `from_id/actor_id=channel...`, а `source_channel_id` может хранить как auto-forward source, так и forwarded source.
 
-Перед импортом на VPS лучше сделать backup:
+Для дополнения **только отсутствующих** счётчиков реакций без переимпорта
+сообщений/профилей используйте отдельный режим:
+
+```bash
+cargo run --bin import_telegram_export -- "/path/to/result.json" \
+  --reaction-gaps-only --snapshot-at "2026-10-04T14:44:22Z" --dry-run
+# После проверки candidates/existing/missing_messages повторить без --dry-run.
+```
+
+`--snapshot-at` — явное время наблюдения экспорта в RFC3339, не время создания
+сообщения и не известное время каждой реакции. Режим сверяет chat id с экспортом,
+добавляет счётчики только для существующих в БД сообщений, сохраняет typed
+emoji/custom emoji/paid реакции и не обновляет имеющиеся строки даже при гонке
+с polling. Все партии одной транзакцией. В `raw_json` сохраняются source
+`telegram_export_counts_snapshot`, SHA256 файла и `event_time_known=false`.
+Если у custom emoji отсутствует `document_id`, его количество входит в total
+и сохраняется отдельно как `unidentified_custom_emoji_count` в `raw_json`;
+в typed список не добавляется вымышленный ID и сентимент не угадывается.
+Персональные reaction events из снимка не создаются: `recent` не является полной
+историей. Восстановленные totals доступны отчётам, читающим count-таблицу; отчёты
+по event history не получают вымышленных исторических реакций.
+
+Обычный полный импорт выше имеет другую семантику: обновляет счётчики и импортирует
+доступные `recent` записи. Не использовать его вместо gap-only для этой операции.
+
+Пример backup перед полным импортом:
 
 ```bash
 ssh vps-153 "podman exec tg-ai-bot-postgres pg_dump -U tg_ai_bot -d tg_ai_bot -Fc -f /tmp/tg_ai_bot_before_export_import.dump"
@@ -1049,12 +1074,13 @@ review-only assessment не даёт права на бан, удаление и
 для отключения reasoning описаны в [Cloudflare runbook](CLOUDFLARE_GEMMA.md).
 Полный multimodal audit проверяется probe_new_user_audit без Telegram/БД.
 
-### Антиспам: Decision shadow
+### Антиспам: Decision shadow и score captcha
 
 Нативный Gemini Decisions API настраивается отдельно в `[moderation.decision]`:
 явные `enabled`, `external_processing_allowed`, `avatar_enabled`, endpoint/model,
-имя env-переменной ключа и bounded бюджеты. Новый shadow не меняет generative
-routes и не даёт права на санкции. Транспорт, версии, диагностика, evaluation CLI
+имя env-переменной ключа и bounded бюджеты. Режим shadow не меняет generative
+routes и не даёт права на санкции. Opt-in `score_captcha` связывает общую метрику
+с ephemeral captcha; production включён только в ПВО, NedoNews остаётся в shadow. Транспорт, версии, диагностика, evaluation CLI
 и migration-aware rollback описаны в [ANTISPAM_V2.md](ANTISPAM_V2.md).
 
 Decision может участвовать в общей метрике с ephemeral captcha: [контракт,

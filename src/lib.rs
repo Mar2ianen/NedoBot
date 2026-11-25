@@ -2,6 +2,7 @@ pub mod community;
 pub mod config;
 pub(crate) mod config_file;
 pub mod db;
+pub mod export_reactions;
 pub mod features;
 pub mod http;
 pub mod llm;
