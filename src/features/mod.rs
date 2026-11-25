@@ -16,6 +16,7 @@ pub mod chat_retrieval;
 pub mod first_comment;
 pub mod ingest;
 pub mod jobs;
+pub mod health;
 #[cfg(feature = "moderation")]
 pub mod labels;
 #[cfg(feature = "manual-moderation")]
