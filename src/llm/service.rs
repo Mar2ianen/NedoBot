@@ -86,7 +86,10 @@ pub async fn generate_chat_audited_checked(
         .llm_profiles
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("LLM_PROFILES_PATH must configure authoritative routes"))?;
-    generate_chat_with_profile_checked(config, profiles, options).await
+    let started = std::time::Instant::now();
+    let result = generate_chat_with_profile_checked(config, profiles, options).await;
+    crate::features::health::observe("llm", result.is_ok(), started.elapsed());
+    result
 }
 
 pub async fn generate_text_checked(
@@ -97,7 +100,10 @@ pub async fn generate_text_checked(
         .llm_profiles
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("LLM_PROFILES_PATH must configure authoritative routes"))?;
-    generate_text_with_profile_checked(config, profiles, options).await
+    let started = std::time::Instant::now();
+    let result = generate_text_with_profile_checked(config, profiles, options).await;
+    crate::features::health::observe("llm", result.is_ok(), started.elapsed());
+    result
 }
 
 async fn generate_text_with_profile_checked(
