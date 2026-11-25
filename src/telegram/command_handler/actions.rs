@@ -360,6 +360,17 @@ pub(super) async fn dispatch(
             )
             .await
         }
+        #[cfg(feature = "manual-moderation")]
+        Command::ChannelOps(args) => {
+            crate::telegram::manual_sender_chat::handle_reconcile(
+                invocation.bot,
+                invocation.message,
+                invocation.state,
+                &args,
+            )
+            .await?;
+            Ok(None)
+        }
         command => Ok(Some(command)),
     }
 }

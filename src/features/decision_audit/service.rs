@@ -10,6 +10,9 @@ use crate::{
             policy::EXTERNAL_ANALYSIS_POLL,
             worker::{PollOutcome, WorkerId, WorkerSpec, WorkerSupervisor, run_poll_worker},
         },
+        new_user_analysis::profile_context::{
+            PROFILE_CONTEXT_VERSION, looks_like_feminine_first_name, telegram_id_model_for_date,
+        },
         new_user_audit::{deterministic, local_cascade::hash_bytes, structure},
         user_profiles::avatar::cache_profile_avatar,
     },
@@ -18,13 +21,17 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::{FromRow, PgPool};
 use teloxide::Bot;
-use teloxide_antispam::preprocess::{PREPROCESSING_VERSION, prepare_text};
+use teloxide_antispam::{
+    preprocess::{PREPROCESSING_VERSION, prepare_text},
+    signals::telegram_id_spam_probability,
+};
 
 #[derive(FromRow)]
 struct Source {
     user_id: i64,
     text: String,
     edited_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
     message_count: i64,
     text_ordinal: i64,
     entities: serde_json::Value,
@@ -32,8 +39,75 @@ struct Source {
     label_id: i64,
     normal_veto: bool,
     trusted: bool,
+    first_name: Option<String>,
     avatar_file_id: Option<String>,
     avatar_unique_id: Option<String>,
+}
+
+const SHORT_BAIT_MAX_CHARS: usize = 80;
+
+/// Bounded versioned Unicode view для коротких эвфемизмов. Длинный текст
+/// не обрезается до bait-префикса и не считается коротким приглашением.
+fn normalized_short_text(text: &str) -> Option<String> {
+    let bounded: String = text.chars().take(structure::MAX_INPUT_CHARS + 1).collect();
+    if bounded.chars().count() > structure::MAX_INPUT_CHARS {
+        return None;
+    }
+    let prepared = prepare_text(&bounded);
+    let normalized = prepared
+        .canonical
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (normalized.chars().count() <= SHORT_BAIT_MAX_CHARS).then_some(normalized)
+}
+
+fn contains_word(normalized: &str, word: &str) -> bool {
+    normalized.split(' ').any(|token| token == word)
+}
+
+fn is_priimu_bait(normalized: &str) -> bool {
+    contains_word(normalized, "приму")
+}
+
+/// Отдельный токен «приму» после bounded Unicode-нормализации. Это только
+/// локальный hint: санкцию по-прежнему разрешает модель и общий threshold.
+fn contains_priimu_bait(text: &str) -> bool {
+    normalized_short_text(text).is_some_and(|normalized| is_priimu_bait(&normalized))
+}
+
+fn short_invitation_normalized(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "приму"
+            | "приму к себе"
+            | "приму мужчину"
+            | "есть время сегодня"
+            | "свободна сегодня"
+            | "жду в гости"
+            | "встречусь"
+            | "встречусь свободна"
+            | "свободна для встреч"
+            | "свободна для встреч есть выезд"
+            | "свободна сейчас встречусь пиши"
+    ) || normalized == "кто в гости"
+        || normalized.ends_with(" кто в гости")
+}
+
+/// Короткие завуалированные приглашения не доказывают спам.
+/// Это лишь повод запросить Decision с доступными сигналами профиля.
+fn short_adult_contact_bait(text: &str) -> bool {
+    normalized_short_text(text).is_some_and(|normalized| short_invitation_normalized(&normalized))
+}
+
+fn short_bait_for_decision(
+    priimu_bait: bool,
+    short_invitation: bool,
+    feminine_name_pattern: bool,
+    avatar_observable: bool,
+) -> bool {
+    priimu_bait || ((feminine_name_pattern || avatar_observable) && short_invitation)
 }
 
 /// SQL-only дешёвая стадия после ingest; не ждёт profile API, LLM или embedding.
@@ -55,7 +129,7 @@ pub async fn observe_message(
         return Ok(());
     }
     let source: Option<Source> = sqlx::query_as(r#"
-        select m.user_id,coalesce(m.text,'') as text,m.edited_at,u.message_count,
+        select m.user_id,coalesce(m.text,'') as text,m.edited_at,m.created_at,u.message_count,
           (select count(*)+1 from (select 1 from telegram_messages earlier
             where earlier.chat_id=m.chat_id and earlier.user_id=m.user_id
               and earlier.message_id<m.message_id and earlier.source_channel_id is null
@@ -65,6 +139,7 @@ pub async fn observe_message(
           extract(epoch from (now()-u.first_seen_at))::bigint as age_seconds,
           coalesce(l.id,0) as label_id,coalesce(l.label='not_spam',false) as normal_veto,
           (coalesce(p.is_bot,false) or coalesce(s.is_admin,false)) as trusted,
+          p.first_name,
           p.profile_photo_file_id as avatar_file_id,p.profile_photo_file_unique_id as avatar_unique_id
         from telegram_messages m join telegram_chat_users u on u.chat_id=m.chat_id and u.telegram_user_id=m.user_id
         left join telegram_user_profiles p on p.telegram_user_id=m.user_id
@@ -76,6 +151,9 @@ pub async fn observe_message(
     let Some(source) = source else {
         return Ok(());
     };
+    if crate::telegram::identity::is_channel_sender_proxy(source.user_id) {
+        return Ok(());
+    }
     let eligible = deterministic::text_stream_eligible(source.message_count, source.age_seconds)
         && !source.normal_veto
         && !source.trusted;
@@ -101,7 +179,22 @@ pub async fn observe_message(
     } else {
         Default::default()
     };
-    let local_candidate = campaign.is_some();
+    // Местный hint не является диагнозом или санкцией: он только возвращает
+    // в очередь Decision короткий текст ПОСЛЕ первых initial_texts сообщений.
+    // ФИО и username не отправляем внешней модели; передаём только boolean.
+    let feminine_name_pattern = looks_like_feminine_first_name(source.first_name.as_deref());
+    let avatar_observable = config.community.moderation.decision.avatar_enabled
+        && source.avatar_file_id.is_some()
+        && source.avatar_unique_id.is_some();
+    let short_invitation = short_adult_contact_bait(&source.text);
+    let priimu_bait = contains_priimu_bait(&source.text);
+    let short_bait_candidate = short_bait_for_decision(
+        priimu_bait,
+        short_invitation,
+        feminine_name_pattern,
+        avatar_observable,
+    );
+    let local_candidate = campaign.is_some() || short_bait_candidate;
     let reason = if source.normal_veto {
         "manual_not_spam"
     } else if source.trusted {
@@ -123,7 +216,8 @@ pub async fn observe_message(
     let features = structure::extract(&source.text);
     let source_hash = hash_bytes(source.text.as_bytes());
     let observation = json!({"structure":features,"normalization":prepare_text(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()).flags,
-        "external_contacts":contacts,"normalization_version":PREPROCESSING_VERSION,"rule":campaign.as_ref().map(|c|&c.rule),"rule_version":deterministic::RULE_VERSION});
+        "external_contacts":contacts,"normalization_version":PREPROCESSING_VERSION,"rule":campaign.as_ref().map(|c|&c.rule),"rule_version":deterministic::RULE_VERSION,
+        "short_bait_candidate":short_bait_candidate});
     sqlx::query("insert into moderation_text_observations (instance_id,chat_id,message_id,user_id,source_hash,eligible,reason,local_candidate,features) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (instance_id,chat_id,message_id) do update set source_hash=excluded.source_hash,eligible=excluded.eligible,reason=excluded.reason,local_candidate=excluded.local_candidate,features=excluded.features,observed_at=now()")
         .bind(&config.community.instance.id).bind(chat_id).bind(message_id).bind(source.user_id).bind(&source_hash)
         .bind(eligible).bind(reason).bind(local_candidate).bind(&observation).execute(pool).await?;
@@ -139,8 +233,23 @@ pub async fn observe_message(
         return Ok(());
     }
     let settings = &config.community.moderation.decision;
+    let post_topic = super::topics::load_post_topic(pool, config, chat_id, message_id).await?;
+    let id_model = config
+        .moderation_risk_profile()
+        .and_then(|profile| telegram_id_model_for_date(profile, source.created_at.date_naive()));
+    let id_probability = id_model
+        .as_ref()
+        .map(|model| telegram_id_spam_probability(source.user_id, model));
     let input = json!({"author_message":crate::features::new_user_analysis::bounded_audit_text_with_limit(Some(&source.text.chars().take(structure::MAX_INPUT_CHARS).collect::<String>()), settings.max_input_chars),
-        "chat_policy":settings.chat_policy,"structural_features":features,"external_contacts":contacts,"score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
+        "chat_policy":settings.chat_policy,"structural_features":features,"external_contacts":contacts,
+        "profile_signals":{"version":PROFILE_CONTEXT_VERSION,
+            "feminine_first_name_pattern":feminine_name_pattern,"avatar_observable":avatar_observable,
+            "telegram_id_spam_probability":id_probability,"telegram_id_model_version":id_model.as_ref().map(|model|&model.version),
+            "evaluated_on_utc":source.created_at.date_naive(),"observed_message_count":source.message_count},
+        "text_signals":{"short_invitation":short_invitation,"priimu_bait":priimu_bait},
+        "topic_context":{"chat_topic":settings.chat_topic,"post_topic":post_topic.as_ref().map(|(text,_)|text)},
+        "_post_context":post_topic.as_ref().map(|(_,snapshot)|snapshot),
+        "score_captcha":settings.mode==crate::config_file::DecisionMode::ScoreCaptcha,
         "configuration_hash":configuration_hash(config)});
     let (avatar_file_id, avatar_unique_id) = match (
         settings.avatar_enabled,
@@ -218,6 +327,10 @@ pub async fn observe_latest_author_message(
 pub fn configuration_hash(config: &Config) -> String {
     let moderation = &config.community.moderation;
     hash_bytes(&serde_json::to_vec(&json!({"decision":moderation.decision,
+        "profile_context_version":PROFILE_CONTEXT_VERSION,
+        "topic_sources":{"primary_chat":config.discussion_chat_id,"primary_channel":config.source_channel_id,
+            "routes":config.community.first_comment.routes.iter().map(|r|(r.source_channel_id,&r.discussion_chat)).collect::<Vec<_>>()},
+        "id_risk_profile":config.moderation_risk_profile().map(|p|json!({"version":p.version,"telegram_id":p.telegram_id.as_ref().map(|m|json!({"floor":m.floor,"ceil":m.ceil,"k":m.k,"midpoint_billion":m.midpoint_billion,"version":m.version})),"telegram_id_time":p.telegram_id_time})),
         "captcha_enabled":moderation.captcha_enabled,"captcha_dry_run":moderation.captcha_dry_run,
         "captcha_threshold":moderation.captcha_threshold,"captcha_ttl_sec":moderation.captcha_ttl_sec}))
         .expect("validated serializable decision configuration"))
@@ -303,4 +416,79 @@ pub async fn process_next(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod short_bait_tests {
+    use super::{contains_priimu_bait, short_adult_contact_bait, short_bait_for_decision};
+
+    #[test]
+    fn short_invitations_reach_decision_candidate_gate() {
+        for sample in [
+            "Приму",
+            "Приму к себе!!!",
+            "Пpиму\u{200b} к себе!!!",
+            "Есть время сегодня?",
+            "Котики, мне скучно, кто в гости?",
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            "Есть время сегодня 💖",
+            "Приму мужчину ❤️",
+            "Встречусь,свободна ❤️🥰",
+            "Свободна для встреч\nЕсть выезд ❤️",
+        ] {
+            assert!(short_adult_contact_bait(sample), "{sample}");
+        }
+    }
+
+    #[test]
+    fn standalone_priimu_is_a_hint_without_profile_context() {
+        for sample in [
+            "Приму",
+            "Приму сегодня",
+            "Приму для встречи",
+            "Пpиму\u{200b} к себе!!!",
+            "Приму PR после тестов",
+        ] {
+            assert!(contains_priimu_bait(sample), "{sample}");
+        }
+        for sample in [
+            "Прuму",
+            "Приём ведётся по записи",
+            "примут заявку",
+            "Хороший день",
+        ] {
+            assert!(!contains_priimu_bait(sample), "{sample}");
+        }
+        assert!(!contains_priimu_bait(&format!(
+            "Приму{}",
+            " ".repeat(20_000)
+        )));
+    }
+
+    #[test]
+    fn profile_context_is_only_needed_for_other_short_invitations() {
+        assert!(short_bait_for_decision(true, false, false, false));
+        assert!(short_bait_for_decision(false, true, true, false));
+        assert!(short_bait_for_decision(false, true, false, true));
+        assert!(!short_bait_for_decision(false, true, false, false));
+        assert!(!short_bait_for_decision(false, false, true, true));
+    }
+
+    #[test]
+    fn unrelated_mentions_do_not_match_short_invitation() {
+        for sample in [
+            "Приём ведётся по записи",
+            "Приму PR после тестов",
+            "Есть время сегодня посмотреть логи?",
+            "Встречусь с командой после работы",
+            "Свободна для встреч с партнёрами по проекту",
+            "Кто в гости к нам приехал на фестиваль? Тут будет длинное обсуждение, а не краткое приглашение.",
+        ] {
+            assert!(!short_adult_contact_bait(sample), "{sample}");
+        }
+        assert!(!short_adult_contact_bait(&format!(
+            "Приму{}",
+            " ".repeat(20_000)
+        )));
+    }
 }

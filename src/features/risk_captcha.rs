@@ -251,6 +251,9 @@ async fn apply_captcha(
     risk_score: i32,
     ttl_seconds: i64,
 ) -> anyhow::Result<CaptchaOutcome> {
+    if crate::telegram::identity::is_channel_sender_proxy(job.telegram_user_id) {
+        return Ok(CaptchaOutcome::Ineligible);
+    }
     let existing = load_user_challenge(pool, job.chat_id, job.telegram_user_id).await?;
     if let Some(challenge) = existing.as_ref() {
         decision_source_valid(bot, pool, challenge).await?;

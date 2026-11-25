@@ -53,6 +53,8 @@ pub(super) fn analysis_config_from_runtime(config: &Config) -> NewUserAnalysisCo
         return NewUserAnalysisConfig::default();
     };
     let profile_name = config.community.moderation.risk_profile.trim();
+    let id_model =
+        profile_context::telegram_id_model_for_date(profile, chrono::Utc::now().date_naive());
     NewUserAnalysisConfig {
         old_user_message_threshold: profile.old_user_message_threshold,
         review_threshold: profile.review_threshold,
@@ -62,11 +64,8 @@ pub(super) fn analysis_config_from_runtime(config: &Config) -> NewUserAnalysisCo
         } else {
             profile.version.clone()
         },
-        telegram_id_model_version: profile
-            .telegram_id
-            .as_ref()
-            .map(|model| model.version.clone()),
-        telegram_id_model: profile.telegram_id.clone(),
+        telegram_id_model_version: id_model.as_ref().map(|model| model.version.clone()),
+        telegram_id_model: id_model,
         ..NewUserAnalysisConfig::default()
     }
 }

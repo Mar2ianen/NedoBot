@@ -33,6 +33,10 @@ mod top_word_tests {
             Command::parse("/ban 123", "nedobot"),
             Ok(Command::Ban(_))
         ));
+        assert!(matches!(
+            Command::parse("/channelops 42 applied", "nedobot"),
+            Ok(Command::ChannelOps(args)) if args == "42 applied"
+        ));
     }
 
     #[cfg(not(feature = "manual-moderation"))]
@@ -112,6 +116,12 @@ pub enum Command {
     #[cfg(feature = "manual-moderation")]
     #[command(description = "отменить последнюю свою команду модерации в этом чате")]
     Undo,
+    #[cfg(feature = "manual-moderation")]
+    #[command(
+        rename = "channelops",
+        description = "показать или подтвердить незавершённые операции с каналами: /channelops [id applied|not_applied]"
+    )]
+    ChannelOps(String),
     #[command(description = "статистика за текущий день с 05:00 МСК; [-r|-p] [-e]")]
     StatsDay(String),
     #[command(description = "статистика за текущую неделю с понедельника 05:00 МСК; [-r|-p] [-e]")]

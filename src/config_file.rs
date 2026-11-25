@@ -90,6 +90,9 @@ pub struct DecisionConfig {
     pub external_processing_allowed: bool,
     pub avatar_enabled: bool,
     pub chat_policy: String,
+    /// Явная тема сообщества для off-topic проверки; None не разрешает догадки.
+    pub chat_topic: Option<String>,
+    pub post_topics: Vec<PostTopicOverride>,
     pub base_url: String,
     pub api_key_env: String,
     pub model: String,
@@ -98,6 +101,14 @@ pub struct DecisionConfig {
     pub max_pending_jobs: i64,
     pub max_input_chars: usize,
 }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostTopicOverride {
+    pub discussion_chat_id: i64,
+    pub post_message_id: i32,
+    pub topic: String,
+}
+
 impl Default for DecisionConfig {
     fn default() -> Self {
         Self {
@@ -116,6 +127,8 @@ impl Default for DecisionConfig {
             chat_policy:
                 "Тематика и разрешения чата неизвестны. Не предполагай запрета предложений работы."
                     .into(),
+            chat_topic: None,
+            post_topics: Vec::new(),
             timeout_sec: 15,
             max_calls_per_hour: 30,
             max_pending_jobs: 100,
@@ -147,6 +160,26 @@ impl DecisionConfig {
                 && (60..=3600).contains(&self.captcha_max_message_age_sec),
             "invalid decision scoring/sampling bounds"
         );
+        anyhow::ensure!(
+            self.chat_topic
+                .as_ref()
+                .is_none_or(|s| (1..=1000).contains(&s.trim().chars().count())),
+            "decision chat_topic must contain 1..1000 characters"
+        );
+        let mut topic_keys = std::collections::BTreeSet::new();
+        anyhow::ensure!(
+            self.post_topics.len() <= 64,
+            "too many decision post topics"
+        );
+        for topic in &self.post_topics {
+            anyhow::ensure!(
+                topic.discussion_chat_id != 0
+                    && topic.post_message_id > 0
+                    && (1..=512).contains(&topic.topic.trim().chars().count())
+                    && topic_keys.insert((topic.discussion_chat_id, topic.post_message_id)),
+                "invalid or duplicate decision post topic"
+            );
+        }
         let url = reqwest::Url::parse(&self.base_url)
             .map_err(|_| anyhow::anyhow!("invalid decision base_url"))?;
         anyhow::ensure!(
@@ -451,6 +484,17 @@ pub struct RiskProfile {
     pub review_threshold: i32,
     #[serde(default)]
     pub telegram_id: Option<TelegramIdRiskModel>,
+    #[serde(default)]
+    pub telegram_id_time: Option<TelegramIdTimeAdjustment>,
+}
+
+/// Проверенный сдвиг ID-границы; отсутствие секции сохраняет фиксированную 4PL.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramIdTimeAdjustment {
+    pub reference_date: chrono::NaiveDate,
+    pub midpoint_billion_per_day: f64,
+    pub version: String,
 }
 
 fn default_stats_locale() -> String {
@@ -812,6 +856,36 @@ mod decision_tests {
         assert!(c.validate().is_err());
         c.captcha_max_message_age_sec = 600;
         c.api_key_env = "GEMINI_API_KEY=secret".into();
+        assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod decision_topic_tests {
+    use super::*;
+    #[test]
+    fn decision_topics_are_optional_bounded_and_unique() {
+        let mut c = DecisionConfig {
+            enabled: true,
+            external_processing_allowed: true,
+            ..Default::default()
+        };
+        assert!(c.chat_topic.is_none());
+        assert!(c.post_topics.is_empty());
+        c.chat_topic = Some("   ".into());
+        assert!(c.validate().is_err());
+        c.chat_topic = Some("Rust".into());
+        assert!(c.validate().is_ok());
+        c.post_topics.push(PostTopicOverride {
+            discussion_chat_id: -1001,
+            post_message_id: 42,
+            topic: "Ownership".into(),
+        });
+        assert!(c.validate().is_ok());
+        c.post_topics.push(c.post_topics[0].clone());
+        assert!(c.validate().is_err());
+        c.post_topics.pop();
+        c.post_topics[0].topic = " ".into();
         assert!(c.validate().is_err());
     }
 }

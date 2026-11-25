@@ -2,7 +2,9 @@
 pub mod actions;
 pub mod client;
 pub mod contacts;
+pub mod diagnostics;
 pub mod evaluation;
 pub mod repo;
 pub mod scoring;
 pub mod service;
+pub(crate) mod topics;

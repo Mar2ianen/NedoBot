@@ -153,6 +153,10 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
     assert!(repo::claim(pool, &c).await.unwrap().is_none());
     c.community.instance.id = "decision_fixture".into();
     assert_first_author_text_sampling(pool, &c).await;
+    assert_short_bait_enqueue_gate(pool, &c).await;
+    assert_temporal_id_context_snapshot(pool, &c).await;
+    assert_post_topic_provenance(pool, &c).await;
+    assert_channel_sender_is_not_a_person(pool, &c).await;
     // Новые таблицы недоступны настоящей MCP роли и не входят в public views.
     let mut tx = pool.begin().await.unwrap();
     query("set local role nedobot_mcp_ro")
@@ -174,6 +178,145 @@ pub async fn assert_decision_shadow(pool: &PgPool) {
         .await
         .unwrap();
     assert_eq!(audits, 0);
+}
+
+/// Контрпример старой ветке: второй короткий текст при initial_texts=1.
+/// Проверяем реальный SQL enqueue, privacy и veto; внешние API не вызываются.
+/// Отдельное «приму» больше не требует имени/аватара, остальные короткие
+/// приглашения сохраняют profile gate.
+async fn assert_short_bait_enqueue_gate(pool: &PgPool, config: &Config) {
+    for (index, (text, name, avatar, avatar_enabled, veto, expected)) in [
+        ("Приму", false, false, false, "none", true),
+        ("Приму", true, false, false, "none", true),
+        ("Приму", false, true, true, "none", true),
+        ("Приму", false, true, false, "none", true),
+        ("Приму PR после тестов", true, true, true, "none", true),
+        ("Прuму", true, false, false, "none", false),
+        ("Пpиму\u{200b} к себе!!!", true, false, false, "none", true),
+        ("Хороший день", true, true, true, "none", false),
+        ("Приму", true, true, true, "admin", false),
+        ("Приму", true, true, true, "bot", false),
+        ("Приму", true, true, true, "normal", false),
+        ("Приму", true, true, true, "old", false),
+        ("Приму", true, true, true, "count", false),
+        ("Приму", true, true, true, "disabled", false),
+        ("Приму", true, true, true, "external", false),
+        (
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            true,
+            false,
+            false,
+            "none",
+            true,
+        ),
+        (
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            false,
+            false,
+            false,
+            "none",
+            false,
+        ),
+        (
+            "\u{200b}Котики, мне скучно, кто в гости? 😘",
+            false,
+            true,
+            false,
+            "none",
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let user = USER + 100 + index as i64;
+        let prior = 1000 + index as i32 * 10;
+        let message = prior + 1;
+        source(pool, user, prior).await;
+        source(pool, user, message).await;
+        query("update telegram_messages set text='Всем привет' where chat_id=$1 and message_id=$2")
+            .bind(CHAT)
+            .bind(prior)
+            .execute(pool)
+            .await
+            .unwrap();
+        query("update telegram_messages set text=$3 where chat_id=$1 and message_id=$2")
+            .bind(CHAT)
+            .bind(message)
+            .bind(text)
+            .execute(pool)
+            .await
+            .unwrap();
+        query("update telegram_chat_users set message_count=$3,first_seen_at=now()-make_interval(secs=>$4::double precision) where chat_id=$1 and telegram_user_id=$2")
+            .bind(CHAT).bind(user).bind(if veto=="count" {11_i64} else {2})
+            .bind(if veto=="old" {259201.0_f64} else {0.0}).execute(pool).await.unwrap();
+        query("insert into telegram_user_profiles (telegram_user_id,first_name,username,is_bot,profile_photo_file_id,profile_photo_file_unique_id) values ($1,$2,'synthetic_private_name',$3,$4,$5)")
+            .bind(user).bind(if name {"Катюша"} else {"Тест"}).bind(veto=="bot")
+            .bind(avatar.then_some("synthetic-file")).bind(avatar.then_some("synthetic-unique"))
+            .execute(pool).await.unwrap();
+        if veto == "admin" {
+            query("insert into telegram_chat_member_snapshots (chat_id,telegram_user_id,status,is_admin) values ($1,$2,'administrator',true)")
+                .bind(CHAT).bind(user).execute(pool).await.unwrap();
+        }
+        if veto == "normal" {
+            record_not_spam(pool, CHAT, user, "fixture", &serde_json::json!({}), None)
+                .await
+                .unwrap();
+        }
+        let mut c = config.clone();
+        c.community.moderation.decision.initial_texts = 1;
+        c.community.moderation.decision.avatar_enabled = avatar_enabled;
+        c.community.moderation.decision.enabled = veto != "disabled";
+        c.community.moderation.decision.external_processing_allowed = veto != "external";
+        observe_message(pool, &c, CHAT, message).await.unwrap();
+        observe_message(pool, &c, CHAT, message).await.unwrap();
+        let jobs: Vec<(i32,i64,Value,Option<String>,String)> = sqlx::query_as("select message_id,user_id,input_json,avatar_file_id,action_status from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=$3")
+            .bind(&c.community.instance.id).bind(CHAT).bind(message).fetch_all(pool).await.unwrap();
+        assert_eq!(
+            jobs.len(),
+            usize::from(expected),
+            "case {index}: {text}, veto={veto}"
+        );
+        if let Some((actual_message, actual_user, input, avatar_file, action)) = jobs.first() {
+            assert_eq!((*actual_message, *actual_user), (message, user));
+            assert_eq!(input["author_message"], text);
+            assert_eq!(
+                input["profile_signals"]["feminine_first_name_pattern"],
+                name
+            );
+            assert_eq!(
+                input["text_signals"]["priimu_bait"],
+                ["Приму", "Приму PR после тестов", "Пpиму\u{200b} к себе!!!"].contains(&text)
+            );
+            assert_eq!(
+                input["text_signals"]["short_invitation"],
+                [
+                    "Приму",
+                    "Пpиму\u{200b} к себе!!!",
+                    "\u{200b}Котики, мне скучно, кто в гости? 😘"
+                ]
+                .contains(&text)
+            );
+            assert_eq!(avatar_file.is_some(), avatar && avatar_enabled);
+            assert_eq!(action, "not_requested");
+            let serialized = input.to_string();
+            for private in [
+                "Катюша",
+                "synthetic_private_name",
+                "synthetic-file",
+                "synthetic-unique",
+            ] {
+                assert!(!serialized.contains(private), "privacy leak: case {index}");
+            }
+        }
+    }
+    let challenges: i64 =
+        query_scalar("select count(*) from telegram_risk_captcha_challenges where chat_id=$1")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(challenges, 0, "enqueue hint не выполняет Telegram actions");
 }
 
 /// Service update не расходует слот первого текста; последующий слабый сигнал
@@ -245,4 +388,168 @@ async fn assert_first_author_text_sampling(pool: &PgPool, config: &Config) {
         calls, 30,
         "enqueue не расходует API-квоту и не выполняет санкции"
     );
+}
+
+/// Числовая вероятность и дата доходят до модели; raw ID/имя остаются локальными.
+async fn assert_temporal_id_context_snapshot(pool: &PgPool, config: &Config) {
+    let user = 1_000_000_000;
+    source(pool, user, 3500).await;
+    query("insert into telegram_user_profiles (telegram_user_id,first_name) values ($1,'Катюша')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut c = config.clone();
+    let key = c.community.moderation.risk_profile.clone();
+    let profile = c.community.risk_profiles.get_mut(&key).unwrap();
+    let today = chrono::Utc::now().date_naive();
+    profile.telegram_id = Some(
+        serde_json::from_value(serde_json::json!({
+        "floor":0.0,"ceil":1.0,"k":2.0,"midpoint_billion":0.9,"version":"synthetic-id"}))
+        .unwrap(),
+    );
+    profile.telegram_id_time=Some(serde_json::from_value(serde_json::json!({
+        "reference_date":today-chrono::Days::new(100),"midpoint_billion_per_day":0.001,"version":"synthetic-time"})).unwrap());
+    observe_message(pool, &c, CHAT, 3500).await.unwrap();
+    let (id,input):(i64,Value)=sqlx::query_as("select id,input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=3500")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert!(
+        (input["profile_signals"]["telegram_id_spam_probability"]
+            .as_f64()
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-12
+    );
+    assert_eq!(
+        input["profile_signals"]["evaluated_on_utc"],
+        today.to_string()
+    );
+    assert_eq!(
+        input["profile_signals"]["feminine_first_name_pattern"],
+        true
+    );
+    assert_eq!(input["profile_signals"]["observed_message_count"], 1);
+    for private in [user.to_string(), "Катюша".into()] {
+        assert!(!input.to_string().contains(&private));
+    }
+    c.community
+        .risk_profiles
+        .get_mut(&key)
+        .unwrap()
+        .telegram_id_time
+        .as_mut()
+        .unwrap()
+        .midpoint_billion_per_day = 0.002;
+    assert!(repo::claim(pool, &c).await.unwrap().is_none());
+    let state: (String, Option<String>) =
+        sqlx::query_as("select status,error_kind from moderation_decision_jobs where id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("stale".into(), Some("obsolete_version".into())));
+}
+
+async fn assert_post_topic_provenance(pool: &PgPool, config: &Config) {
+    let channel = -1_009_913_000;
+    let user = USER + 300;
+    source(pool, user, 4002).await;
+    query("insert into telegram_messages (chat_id,message_id,source_channel_id,is_automatic_forward,text) values ($1,4000,$2,true,'Rust ownership https://example.invalid/private')")
+        .bind(CHAT).bind(channel).execute(pool).await.unwrap();
+    query("insert into telegram_messages (chat_id,message_id,source_channel_id,is_automatic_forward,text) values ($1,4000,$2,true,'PRIVATE_NEIGHBOR')")
+        .bind(CHAT-1).bind(channel).execute(pool).await.unwrap();
+    query("insert into telegram_messages (chat_id,message_id,user_id,reply_to_message_id,text) values ($1,4001,$2,4000,'ORDINARY_PARENT_REPLY')")
+        .bind(CHAT).bind(user+1).execute(pool).await.unwrap();
+    query("update telegram_messages set reply_to_message_id=4001 where chat_id=$1 and message_id=4002")
+        .bind(CHAT).execute(pool).await.unwrap();
+    let mut c = config.clone();
+    c.discussion_chat_id = CHAT;
+    c.source_channel_id = channel;
+    c.community.first_comment.routes.clear();
+    observe_message(pool, &c, CHAT, 4002).await.unwrap();
+    let job:repo::DecisionJob=sqlx::query_as("select * from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        job.input_json["topic_context"]["post_topic"],
+        "Rust ownership [link]"
+    );
+    for forbidden in [
+        "PRIVATE_NEIGHBOR",
+        "ORDINARY_PARENT_REPLY",
+        "example.invalid",
+    ] {
+        assert!(!job.input_json.to_string().contains(forbidden));
+    }
+    assert!(repo::source_is_current(pool, &job).await.unwrap());
+    c.community.moderation.decision.post_topics.push(
+        serde_json::from_value(serde_json::json!({
+        "discussion_chat_id":CHAT,"post_message_id":4000,"topic":"Ручная тема: Rust borrowing"}))
+        .unwrap(),
+    );
+    observe_message(pool, &c, CHAT, 4002).await.unwrap();
+    let overridden:Value=query_scalar("select input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002 order by id desc limit 1")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        overridden["topic_context"]["post_topic"],
+        "Ручная тема: Rust borrowing"
+    );
+    query("update telegram_messages set text='Другая тема' where chat_id=$1 and message_id=4000")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(!repo::source_is_current(pool, &job).await.unwrap());
+    query("delete from telegram_messages where chat_id=$1 and message_id=4000")
+        .bind(CHAT)
+        .execute(pool)
+        .await
+        .unwrap();
+    observe_message(pool, &c, CHAT, 4002).await.unwrap();
+    let newest:Value=query_scalar("select input_json from moderation_decision_jobs where instance_id=$1 and chat_id=$2 and message_id=4002 order by id desc limit 1")
+        .bind(&c.community.instance.id).bind(CHAT).fetch_one(pool).await.unwrap();
+    assert!(newest["topic_context"]["post_topic"].is_null());
+}
+
+// Даже без profile.is_bot технический sender не становится человеком.
+async fn assert_channel_sender_is_not_a_person(pool: &PgPool, config: &Config) {
+    let proxy = tg_ai_bot_teloxide::telegram::identity::CHANNEL_SENDER_PROXY_ID;
+    source(pool, proxy, 5000).await;
+    observe_message(pool, config, CHAT, 5000).await.unwrap();
+    tg_ai_bot_teloxide::features::new_user_analysis::enqueue_new_user_audit_for_profile_refresh(
+        pool, config, CHAT, proxy,
+    )
+    .await
+    .unwrap();
+    let jobs: i64 = query_scalar(
+        "select count(*) from moderation_decision_jobs where chat_id=$1 and user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(proxy)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 0);
+    let audits:i64=query_scalar("select count(*) from telegram_new_user_profile_audits where chat_id=$1 and telegram_user_id=$2")
+        .bind(CHAT).bind(proxy).fetch_one(pool).await.unwrap();
+    assert_eq!(audits, 0);
+    let text: String =
+        query_scalar("select text from telegram_messages where chat_id=$1 and message_id=5000")
+            .bind(CHAT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(text, TEXT);
+    // Та же реплика обычного автора по-прежнему проходит в Decision.
+    source(pool, USER + 5000, 5001).await;
+    observe_message(pool, config, CHAT, 5001).await.unwrap();
+    let count: i64 = query_scalar(
+        "select count(*) from moderation_decision_jobs where chat_id=$1 and user_id=$2",
+    )
+    .bind(CHAT)
+    .bind(USER + 5000)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
 }

@@ -224,8 +224,16 @@ fn command_descriptions(config: &crate::config::Config, chat_id: i64) -> String 
             .lines()
             .filter(|line| {
                 ![
-                    "/mute", "/ban", "/warn", "/unmute", "/unban", "/unwarn", "/warns", "/modlog",
+                    "/mute",
+                    "/ban",
+                    "/warn",
+                    "/unmute",
+                    "/unban",
+                    "/unwarn",
+                    "/warns",
+                    "/modlog",
                     "/undo",
+                    "/channelops",
                 ]
                 .iter()
                 .any(|command| line.trim_start().starts_with(command))
@@ -250,6 +258,7 @@ fn is_manual_moderation_command(command: &Command) -> bool {
             | Command::Warns(_)
             | Command::Modlog(_)
             | Command::Undo
+            | Command::ChannelOps(_)
     )
 }
 
