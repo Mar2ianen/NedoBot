@@ -169,6 +169,28 @@ Thresholds are starting points; avoid cross-feature uniform limits. Keep 2-3 sam
 
 **Budget:** /ping read path should perform zero external/network/SQL operations and finish snapshot render quickly. Background sampling should be bounded and cancellable, no unbounded retry loops, no sampling every worker poll. /ping probe is rate-limited, non-concurrent (singleflight), owner-only and opt-in.
 
+## 6.1. Strict deadlines and fail-closed behavior (required)
+
+**Invariant: if a check fails to answer before its deadline, it is not successful.** No retry loop, no implicit extension, no hanging request, no invented positive "pong". A health check must be time-bounded even when its dependencies are unhealthy.
+
+| Operation | Suggested hard wall-clock deadline | Timeout outcome |
+| --- | --- | --- |
+| /ping or /ping full snapshot assembly (before Telegram send) | 250 ms | Render last safe snapshot, mark collector/status stale or Unknown; do not run probes synchronously |
+| DB collector sample | 1 s for SELECT 1; 3 s total for a queue batch | Record timed-out check; cancel work and retain last sample with its age |
+| Public MCP HTTP/background canary | 3 s end-to-end | TimedOut / Unavailable after hysteresis; never claim Healthy |
+| Owner-only /ping probe | 5 s **global** budget, individual probes <=2 s | Stop all unfinished probes on deadline, report TIMEOUT for each |
+| Outbound Telegram send | Explicit bounded request timeout (e.g. 5 s), configurable with transport policy | Log safe category, **do not automatically resend** after ambiguous timeout |
+
+These numbers are initial defaults and need measurement in staging/production. Always use **one global deadline** for the entire explicit probe, with per-probe sub-deadlines (timeout_at and min(per_probe, remaining_budget)); do not sum full independent timeouts serially. Background collectors also have overall limits and are singleflight; if a prior collection is still active, skip the next tick rather than pile up tasks.
+
+The simple /ping remains purely cached and should not wait on PostgreSQL, MCP, LLM or HTTP. For /ping probe, use cancellation-safe code, read-only operations only and a concurrency limit of one. If the deadline fires, drop/cancel pending futures and kill child MCP processes through existing kill_on_drop ownership; a blocking decoder or uncooperative external call must not block response. Never hold a PgPool connection across a network probe.
+
+**Telegram delivery is a separate failure domain:** if outgoing Telegram API is unreachable, the bot may be unable to send even "TIMEOUT". There is no truthful in-chat fallback. The handler exits after its bounded send attempt, records an internal failure metric and relies on an out-of-band external monitor for detection. A timed-out send may have been delivered; avoid automatic retries that duplicate messages. Avoid editing a possibly-undelivered message to fake a successful check.
+
+For periodic probes, distinguish TimedOut (reason/code) from Unknown (no or stale observation). TimedOut should contribute to the owning component's failure streak and only become global Unavailable according to the configured criticality/hysteresis. If the cached collector is too stale, public /ping explicitly reports Unknown/stale rather than recycling its old green status.
+
+**Required tests:** a never-resolving DB future, stuck MCP initialize, hanging HTTP canary, Telegram send timeout, cancellation/drop of subprocess, a still-running previous collector, and 100 concurrent /ping calls. Assert strict elapsed upper bounds using paused Tokio time, zero duplicate sends, bounded fanout, no leaked child/process and no green verdict on timeout.
+
 ## 7. Implementation steps (small, reviewable PRs)
 
 1. **P1 model/registry:** health model; process uptime/build; register active workers; poll counters/heartbeats; deterministic rendering; /ping and /ping full auth. Keep old /db working. No schema migrations.
