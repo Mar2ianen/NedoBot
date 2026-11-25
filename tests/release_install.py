@@ -82,6 +82,11 @@ class ReleaseInstall(unittest.TestCase):
 
     def test_verified_backup_can_restore_both_previous_installations(self):
         stage = self.stage("candidate")
+        original_inodes = {
+            path: path.stat().st_ino
+            for destination in self.destinations
+            for path in (destination / binary for binary in BINARIES)
+        }
         result = self.invoke(stage, "--backup")
         self.assertEqual(result.returncode, 0, result.stderr)
         backup, = (self.root / "backups").iterdir()
@@ -93,7 +98,12 @@ class ReleaseInstall(unittest.TestCase):
             for binary in BINARIES:
                 installed = destination / binary
                 self.assertEqual(installed.read_bytes(), (stage / binary).read_bytes())
+                self.assertEqual(installed.stat().st_ino, (stage / binary).stat().st_ino)
                 self.assertEqual((backup / instance / binary).read_text(), "old")
+                self.assertEqual(
+                    (backup / instance / binary).stat().st_ino,
+                    original_inodes[destination / binary],
+                )
                 env_file = destination.parent.parent / ".env"
                 self.assertEqual((backup / instance / ".env").read_text(),
                                  f"synthetic {instance}")
@@ -172,6 +182,10 @@ class ReleaseInstall(unittest.TestCase):
 
     def test_release_workflow_shell_syntax_and_sequential_restart_rollback_gates(self):
         workflow = WORKFLOW.read_text()
+        self.assertIn(
+            "dist/set_privacy_mode_observe.sh \"$VPS_USER@$VPS_HOST:$stage/dist/\"",
+            workflow,
+        )
         start = workflow.index("<<'REMOTE'\n") + len("<<'REMOTE'\n")
         end = workflow.index("\n          REMOTE\n", start)
         remote = textwrap.dedent(workflow[start:end])

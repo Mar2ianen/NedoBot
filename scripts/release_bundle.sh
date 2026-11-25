@@ -15,6 +15,7 @@ case "${1:-}" in
             install -m 0755 -- "$source_dir/$binary" "$bundle/$binary"
         done <<< "$names"
         install -m 0755 -- "$installer" "${BASH_SOURCE[0]}" "$bundle/"
+        install -m 0755 -- "$script_dir/set_privacy_mode_observe.sh" "$bundle/"
         ( cd "$bundle" && sha256sum -- * > SHA256SUMS )
         bash "$bundle/release_bundle.sh" verify "$bundle"
         ;;
@@ -22,7 +23,7 @@ case "${1:-}" in
         cd -- "${2:?missing bundle directory}"
         sha256sum --strict --check --status SHA256SUMS
         names="$(bash install_release_binaries.sh --list-binaries)"
-        expected="$(printf '%s\n' "$names" install_release_binaries.sh release_bundle.sh | LC_ALL=C sort)"
+        expected="$(printf '%s\n' "$names" install_release_binaries.sh release_bundle.sh set_privacy_mode_observe.sh | LC_ALL=C sort)"
         measured="$(cut -c 67- SHA256SUMS | LC_ALL=C sort)"
         actual="$(find . -mindepth 1 -maxdepth 1 ! -name SHA256SUMS ! -name BUILD_INFO.txt -printf '%f\n' | LC_ALL=C sort)"
         if [[ "$expected" != "$measured" || "$expected" != "$actual" ]]; then

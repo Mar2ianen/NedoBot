@@ -121,7 +121,7 @@ jobs:
           if ! scp -pr -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
               dist "$VPS_USER@$VPS_HOST:$stage/" \
             || ! scp -p -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
-              scripts/set_privacy_mode_observe.sh "$VPS_USER@$VPS_HOST:$stage/"; then
+              dist/set_privacy_mode_observe.sh "$VPS_USER@$VPS_HOST:$stage/dist/"; then
             ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
               "$VPS_USER@$VPS_HOST" "rm -rf -- '$stage'"
             exit 1
