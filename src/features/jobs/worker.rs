@@ -4,7 +4,11 @@
 //! module only tracks their tasks, signals shutdown, bounds draining, and
 //! centralizes the idle/error polling cadence.
 
-use std::{collections::HashMap, future::Future, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use tokio::{
     sync::watch,
@@ -381,7 +385,15 @@ pub async fn run_fixed_delay_worker<F, Fut>(
         }
         let started = Instant::now();
         let error = operation().await;
-        health::worker_polled(id.as_str(), if error.is_some() { WorkerOutcome::Failed } else { WorkerOutcome::Processed }, started.elapsed());
+        health::worker_polled(
+            id.as_str(),
+            if error.is_some() {
+                WorkerOutcome::Failed
+            } else {
+                WorkerOutcome::Processed
+            },
+            started.elapsed(),
+        );
         if let Some(error_kind) = error {
             tracing::warn!(
                 worker = id.as_str(),

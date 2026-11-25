@@ -8,8 +8,12 @@ mod top_word_tests {
     #[test]
     fn ping_command_accepts_optional_mode() {
         assert!(matches!(Command::parse("/ping", "nedobot"), Ok(Command::Ping(a)) if a.is_empty()));
-        assert!(matches!(Command::parse("/ping full", "nedobot"), Ok(Command::Ping(a)) if a == "full"));
-        assert!(matches!(Command::parse("/ping probe", "nedobot"), Ok(Command::Ping(a)) if a == "probe"));
+        assert!(
+            matches!(Command::parse("/ping full", "nedobot"), Ok(Command::Ping(a)) if a == "full")
+        );
+        assert!(
+            matches!(Command::parse("/ping probe", "nedobot"), Ok(Command::Ping(a)) if a == "probe")
+        );
     }
 
     #[test]

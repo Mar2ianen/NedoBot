@@ -7,8 +7,8 @@ use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::features::health::HealthRegistry;
 use crate::features::ask_metrics::AskDeliveryMetrics;
+use crate::features::health::HealthRegistry;
 #[cfg(feature = "spam-sync")]
 use crate::features::spam_reputation::SpamReputationStore;
 

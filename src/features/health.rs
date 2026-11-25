@@ -136,8 +136,16 @@ impl HealthRegistry {
     pub fn snapshot(&self) -> HealthSnapshot {
         HealthSnapshot {
             uptime: self.started.elapsed(),
-            checks: self.checks.lock().unwrap_or_else(|err| err.into_inner()).clone(),
-            workers: self.workers.lock().unwrap_or_else(|err| err.into_inner()).clone(),
+            checks: self
+                .checks
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone(),
+            workers: self
+                .workers
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone(),
             busy: self.is_busy(),
             revision: self.revision.load(Ordering::Relaxed),
         }
@@ -154,35 +162,53 @@ impl HealthRegistry {
         detail: impl Into<String>,
         elapsed_ms: Option<u64>,
     ) {
-        self.checks.lock().unwrap_or_else(|err| err.into_inner()).insert(
-            name,
-            CheckSample {
-                status,
-                detail: detail.into(),
-                elapsed_ms,
-                observed_at: Instant::now(),
-            },
-        );
+        self.checks
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                name,
+                CheckSample {
+                    status,
+                    detail: detail.into(),
+                    elapsed_ms,
+                    observed_at: Instant::now(),
+                },
+            );
         self.notify();
     }
 
     pub fn observed(&self, name: &'static str, ok: bool, elapsed: Duration) {
         self.set_check(
             name,
-            if ok { HealthStatus::Healthy } else { HealthStatus::Degraded },
-            if ok { "last operation succeeded" } else { "last operation failed" },
+            if ok {
+                HealthStatus::Healthy
+            } else {
+                HealthStatus::Degraded
+            },
+            if ok {
+                "last operation succeeded"
+            } else {
+                "last operation failed"
+            },
             Some(milliseconds(elapsed)),
         );
     }
 
     pub fn register_worker(&self, name: &'static str) {
-        self.workers.lock().unwrap_or_else(|err| err.into_inner())
+        self.workers
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
             .insert(name, WorkerSample::new());
         self.notify();
     }
 
     pub fn exit_worker(&self, name: &'static str) {
-        if let Some(sample) = self.workers.lock().unwrap_or_else(|err| err.into_inner()).get_mut(name) {
+        if let Some(sample) = self
+            .workers
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get_mut(name)
+        {
             sample.stopped = true;
         }
         self.notify();
@@ -234,12 +260,21 @@ impl HealthRegistry {
             let result = tokio::time::timeout(
                 Duration::from_secs(1),
                 sqlx::query_scalar::<_, i64>("select 1::bigint").fetch_one(&p),
-            ).await;
+            )
+            .await;
             let (status, detail) = match result {
-                Ok(Ok(1)) => (HealthStatus::Healthy,
-                    format!("connections={} idle={}", p.size(), p.num_idle())),
-                Ok(Ok(_)) | Ok(Err(_)) => (HealthStatus::Unavailable, "database query failed".to_owned()),
-                Err(_) => (HealthStatus::TimedOut, "database deadline exceeded".to_owned()),
+                Ok(Ok(1)) => (
+                    HealthStatus::Healthy,
+                    format!("connections={} idle={}", p.size(), p.num_idle()),
+                ),
+                Ok(Ok(_)) | Ok(Err(_)) => (
+                    HealthStatus::Unavailable,
+                    "database query failed".to_owned(),
+                ),
+                Err(_) => (
+                    HealthStatus::TimedOut,
+                    "database deadline exceeded".to_owned(),
+                ),
             };
             ("postgres", status, detail, milliseconds(started.elapsed()))
         });
@@ -247,26 +282,47 @@ impl HealthRegistry {
         let p = pool.clone();
         jobs.spawn(async move {
             let started = Instant::now();
-            let result = tokio::time::timeout(
-                Duration::from_secs(3), load_job_lifecycle_report(&p)
-            ).await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), load_job_lifecycle_report(&p)).await;
             let (status, detail) = match result {
                 Ok(Ok(queues)) => {
                     let mut all = Vec::with_capacity(queues.len());
                     let mut degraded = false;
                     for q in queues {
-                        let queued: i64 = q.statuses.iter()
-                            .filter(|row| matches!(row.status.as_str(), "pending" | "retry" | "retry_wait"))
-                            .map(|row| row.jobs).sum();
+                        let queued: i64 = q
+                            .statuses
+                            .iter()
+                            .filter(|row| {
+                                matches!(row.status.as_str(), "pending" | "retry" | "retry_wait")
+                            })
+                            .map(|row| row.jobs)
+                            .sum();
                         let due_age = q.oldest_ready_age_seconds.unwrap_or(0.0).max(0.0);
-                        if q.expired_lease_count > 0 || due_age > 600.0 { degraded = true; }
-                        all.push(format!("{}={} queued oldest_due={}s expired={}",
-                            q.queue, queued, due_age as u64, q.expired_lease_count));
+                        if q.expired_lease_count > 0 || due_age > 600.0 {
+                            degraded = true;
+                        }
+                        all.push(format!(
+                            "{}={} queued oldest_due={}s expired={}",
+                            q.queue, queued, due_age as u64, q.expired_lease_count
+                        ));
                     }
-                    (if degraded { HealthStatus::Degraded } else { HealthStatus::Healthy }, all.join("; "))
+                    (
+                        if degraded {
+                            HealthStatus::Degraded
+                        } else {
+                            HealthStatus::Healthy
+                        },
+                        all.join("; "),
+                    )
                 }
-                Ok(Err(_)) => (HealthStatus::Unavailable, "queue metrics unavailable".to_owned()),
-                Err(_) => (HealthStatus::TimedOut, "queue metrics deadline exceeded".to_owned()),
+                Ok(Err(_)) => (
+                    HealthStatus::Unavailable,
+                    "queue metrics unavailable".to_owned(),
+                ),
+                Err(_) => (
+                    HealthStatus::TimedOut,
+                    "queue metrics deadline exceeded".to_owned(),
+                ),
             };
             ("queues", status, detail, milliseconds(started.elapsed()))
         });
@@ -275,20 +331,35 @@ impl HealthRegistry {
         let chat_id = config.discussion_chat_id;
         jobs.spawn(async move {
             let started = Instant::now();
-            let result = tokio::time::timeout(Duration::from_secs(2),
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
                 sqlx::query_as::<_, (i64, i64, i64)>(
                     "select count(*) filter (where status='completed')::bigint, \
                      count(*) filter (where status='failed')::bigint, \
                      count(*) filter (where status='running')::bigint \
-                     from ask_runs where chat_id=$1 and created_at>now()-interval '1 hour'"
-                ).bind(chat_id).fetch_one(&p)).await;
+                     from ask_runs where chat_id=$1 and created_at>now()-interval '1 hour'",
+                )
+                .bind(chat_id)
+                .fetch_one(&p),
+            )
+            .await;
             let (status, detail) = match result {
                 Ok(Ok((done, failed, running))) => (
-                    if failed > 0 { HealthStatus::Degraded } else { HealthStatus::Healthy },
-                    format!("1h completed={done} failed={failed} recorded_running={running}")
+                    if failed > 0 {
+                        HealthStatus::Degraded
+                    } else {
+                        HealthStatus::Healthy
+                    },
+                    format!("1h completed={done} failed={failed} recorded_running={running}"),
                 ),
-                Ok(Err(_)) => (HealthStatus::Unavailable, "ask metrics query failed".to_owned()),
-                Err(_) => (HealthStatus::TimedOut, "ask metrics deadline exceeded".to_owned()),
+                Ok(Err(_)) => (
+                    HealthStatus::Unavailable,
+                    "ask metrics query failed".to_owned(),
+                ),
+                Err(_) => (
+                    HealthStatus::TimedOut,
+                    "ask metrics deadline exceeded".to_owned(),
+                ),
             };
             ("ask", status, detail, milliseconds(started.elapsed()))
         });
@@ -370,10 +441,19 @@ impl HealthRegistry {
         }
         jobs.abort_all();
         for id in ["postgres", "queues", "ask", "voice", "moderation", "qr"] {
-            let timed_out = self.checks.lock().unwrap_or_else(|err| err.into_inner())
-                .get(id).is_some_and(|c| c.status == HealthStatus::Checking);
+            let timed_out = self
+                .checks
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .get(id)
+                .is_some_and(|c| c.status == HealthStatus::Checking);
             if timed_out {
-                self.set_check(id, HealthStatus::TimedOut, "global refresh deadline exceeded", None);
+                self.set_check(
+                    id,
+                    HealthStatus::TimedOut,
+                    "global refresh deadline exceeded",
+                    None,
+                );
             }
         }
     }
@@ -383,24 +463,44 @@ impl HealthRegistry {
         if self.mcp_collecting.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.set_check("agent_mcp", HealthStatus::Checking, "RMCP initialize + tools/list", None);
+        self.set_check(
+            "agent_mcp",
+            HealthStatus::Checking,
+            "RMCP initialize + tools/list",
+            None,
+        );
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let started = Instant::now();
             let result = tokio::time::timeout(
                 Duration::from_secs(2),
                 crate::features::ask::mcp_client::McpClient::start(&config),
-            ).await;
+            )
+            .await;
             let (status, detail) = match result {
                 Ok(Ok(client)) => {
                     let count = client.tool_names().count();
                     drop(client); // child transport uses kill_on_drop
-                    (HealthStatus::Healthy, format!("initialize/tools/list OK; tools={count}"))
+                    (
+                        HealthStatus::Healthy,
+                        format!("initialize/tools/list OK; tools={count}"),
+                    )
                 }
-                Ok(Err(_)) => (HealthStatus::Unavailable, "RMCP bootstrap failed".to_owned()),
-                Err(_) => (HealthStatus::TimedOut, "RMCP bootstrap deadline exceeded".to_owned()),
+                Ok(Err(_)) => (
+                    HealthStatus::Unavailable,
+                    "RMCP bootstrap failed".to_owned(),
+                ),
+                Err(_) => (
+                    HealthStatus::TimedOut,
+                    "RMCP bootstrap deadline exceeded".to_owned(),
+                ),
             };
-            this.set_check("agent_mcp", status, detail, Some(milliseconds(started.elapsed())));
+            this.set_check(
+                "agent_mcp",
+                status,
+                detail,
+                Some(milliseconds(started.elapsed())),
+            );
             this.mcp_collecting.store(false, Ordering::Release);
             this.notify();
         });
@@ -457,10 +557,20 @@ mod tests {
         let health = HealthRegistry::new();
         health.register_worker("synthetic");
         health.worker_polled("synthetic", WorkerOutcome::Failed, Duration::from_millis(9));
-        health.worker_polled("synthetic", WorkerOutcome::Failed, Duration::from_millis(19));
-        assert_eq!(health.snapshot().workers["synthetic"].consecutive_failures, 2);
+        health.worker_polled(
+            "synthetic",
+            WorkerOutcome::Failed,
+            Duration::from_millis(19),
+        );
+        assert_eq!(
+            health.snapshot().workers["synthetic"].consecutive_failures,
+            2
+        );
         health.worker_polled("synthetic", WorkerOutcome::Idle, Duration::from_millis(1));
-        assert_eq!(health.snapshot().workers["synthetic"].consecutive_failures, 0);
+        assert_eq!(
+            health.snapshot().workers["synthetic"].consecutive_failures,
+            0
+        );
     }
 
     #[test]

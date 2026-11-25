@@ -49,9 +49,11 @@ pub async fn handle(
         };
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
-            bot.send_message(text).chat_id(msg.chat.id)
+            bot.send_message(text)
+                .chat_id(msg.chat.id)
                 .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply()),
-        ).await;
+        )
+        .await;
         return Ok(());
     };
 
@@ -74,9 +76,8 @@ pub async fn handle(
     schedule.retry_max = Duration::from_millis(400);
     schedule.terminal_retry_budget = 0;
 
-    let (drafter, sink) = match Drafter::snapshots(
-        backend, state.drafter_limiter.clone(), schedule,
-    ) {
+    let (drafter, sink) = match Drafter::snapshots(backend, state.drafter_limiter.clone(), schedule)
+    {
         Ok(value) => value,
         Err(_) => {
             tracing::warn!("failed to initialize /ping edit-in-place delivery");
@@ -156,18 +157,21 @@ fn sample_line(
     final_frame: bool,
 ) -> String {
     let Some(sample) = snapshot.checks.get(id) else {
-        return format!("{name}: {}", if final_frame { "UNKNOWN" } else { "CHECKING" });
+        return format!(
+            "{name}: {}",
+            if final_frame { "UNKNOWN" } else { "CHECKING" }
+        );
     };
     let mut status = sample.status;
     if final_frame && status == HealthStatus::Checking {
         status = HealthStatus::TimedOut;
     }
-    if status == HealthStatus::Healthy
-        && sample.observed_at.elapsed() > Duration::from_secs(120)
-    {
+    if status == HealthStatus::Healthy && sample.observed_at.elapsed() > Duration::from_secs(120) {
         status = HealthStatus::Unknown;
     }
-    let latency = sample.elapsed_ms.map_or_else(String::new, |ms| format!(" · {ms} мс"));
+    let latency = sample
+        .elapsed_ms
+        .map_or_else(String::new, |ms| format!(" · {ms} мс"));
     let detail = if full && !sample.detail.is_empty() {
         // Existing error details are fixed, sanitized strings. Escape anyway.
         let safe: String = sample.detail.chars().take(240).collect();
@@ -189,23 +193,51 @@ fn render(
     let mut lines = Vec::with_capacity(48);
     lines.push("<b>NedoBot · /ping</b>".to_owned());
     let secs = snapshot.uptime.as_secs();
-    lines.push(format!("Uptime: {}ч {:02}м {:02}с", secs / 3600, secs / 60 % 60, secs % 60));
+    lines.push(format!(
+        "Uptime: {}ч {:02}м {:02}с",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    ));
     if let Some(ms) = send_ms {
         lines.push(format!("Первый ответ: {ms} мс"));
     }
 
-    lines.push(sample_line("PostgreSQL", "postgres", snapshot, full, final_frame));
-    lines.push(sample_line("Очереди", "queues", snapshot, full, final_frame));
+    lines.push(sample_line(
+        "PostgreSQL",
+        "postgres",
+        snapshot,
+        full,
+        final_frame,
+    ));
+    lines.push(sample_line(
+        "Очереди",
+        "queues",
+        snapshot,
+        full,
+        final_frame,
+    ));
 
     let total = snapshot.workers.len();
     let stopped = snapshot.workers.values().filter(|v| v.stopped).count();
-    let failing = snapshot.workers.values().filter(|v| v.consecutive_failures >= 3).count();
-    lines.push(format!("Workers: {} active / {} registered · errors={failing}",
-        total.saturating_sub(stopped), total));
-    let busy_slots = state.config.ask_max_concurrency
+    let failing = snapshot
+        .workers
+        .values()
+        .filter(|v| v.consecutive_failures >= 3)
+        .count();
+    lines.push(format!(
+        "Workers: {} active / {} registered · errors={failing}",
+        total.saturating_sub(stopped),
+        total
+    ));
+    let busy_slots = state
+        .config
+        .ask_max_concurrency
         .saturating_sub(state.ask_slots.available_permits());
-    lines.push(format!("Agent /ask: {busy_slots}/{} active",
-        state.config.ask_max_concurrency));
+    lines.push(format!(
+        "Agent /ask: {busy_slots}/{} active",
+        state.config.ask_max_concurrency
+    ));
 
     if full {
         for (name, id) in [
@@ -217,38 +249,73 @@ fn render(
             lines.push(sample_line(name, id, snapshot, true, final_frame));
         }
         for (name, sample) in &snapshot.workers {
-            let state = if sample.stopped { "STOPPED" }
-                else if sample.consecutive_failures >= 3 { "DEGRADED" }
-                else if sample.last_poll_at.is_none() { "RUNNING" }
-                else { "OK" };
-            let ms = sample.last_poll_ms.map_or_else(|| "—".to_owned(), |x| format!("{x} мс"));
-            lines.push(format!("{}: {} · poll={} · failures={}",
-                escape_html(name), state, ms, sample.failures));
+            let state = if sample.stopped {
+                "STOPPED"
+            } else if sample.consecutive_failures >= 3 {
+                "DEGRADED"
+            } else if sample.last_poll_at.is_none() {
+                "RUNNING"
+            } else {
+                "OK"
+            };
+            let ms = sample
+                .last_poll_ms
+                .map_or_else(|| "—".to_owned(), |x| format!("{x} мс"));
+            lines.push(format!(
+                "{}: {} · poll={} · failures={}",
+                escape_html(name),
+                state,
+                ms,
+                sample.failures
+            ));
         }
     }
     if state.config.ask_enabled {
-        lines.push(sample_line("Agent MCP", "agent_mcp", snapshot, full, final_frame));
+        lines.push(sample_line(
+            "Agent MCP",
+            "agent_mcp",
+            snapshot,
+            full,
+            final_frame,
+        ));
     } else {
         lines.push("Agent MCP: DISABLED".to_owned());
     }
     if full {
         lines.push(sample_line("LLM", "llm", snapshot, true, final_frame));
-        lines.push(sample_line("Search MCP", "search_mcp", snapshot, true, final_frame));
+        lines.push(sample_line(
+            "Search MCP",
+            "search_mcp",
+            snapshot,
+            true,
+            final_frame,
+        ));
     }
     lines.push("Public MCP HTTP: UNKNOWN (отдельный процесс)".to_owned());
 
-    let has_error = snapshot.workers.values().any(|w| w.stopped || w.consecutive_failures >= 3)
+    let has_error = snapshot
+        .workers
+        .values()
+        .any(|w| w.stopped || w.consecutive_failures >= 3)
         || snapshot.checks.iter().any(|(id, s)| {
             matches!(*id, "postgres" | "queues" | "moderation")
                 && matches!(s.status, HealthStatus::Unavailable | HealthStatus::TimedOut)
         });
-    let has_warning = snapshot.checks.values().any(|s| matches!(
-        s.status, HealthStatus::Degraded | HealthStatus::Unavailable | HealthStatus::TimedOut
-    ));
-    let overall = if snapshot.busy && !final_frame { "CHECKING" }
-        else if has_error { "UNAVAILABLE" }
-        else if has_warning { "DEGRADED" }
-        else { "OK / наблюдаемые компоненты" };
+    let has_warning = snapshot.checks.values().any(|s| {
+        matches!(
+            s.status,
+            HealthStatus::Degraded | HealthStatus::Unavailable | HealthStatus::TimedOut
+        )
+    });
+    let overall = if snapshot.busy && !final_frame {
+        "CHECKING"
+    } else if has_error {
+        "UNAVAILABLE"
+    } else if has_warning {
+        "DEGRADED"
+    } else {
+        "OK / наблюдаемые компоненты"
+    };
     lines.push(format!("<b>Итог: {overall}</b>"));
     if final_frame {
         lines.push("Проверка завершена".to_owned());
