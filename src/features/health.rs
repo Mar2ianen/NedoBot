@@ -241,8 +241,12 @@ impl HealthRegistry {
 
     pub fn refresh(self: &Arc<Self>, pool: PgPool, config: Arc<Config>) {
         // Avoid a new burst of SQL for every /ping, even after the last sample finished.
-        if self.last_refresh.lock().unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
+        if self
+            .last_refresh
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
+        {
             return;
         }
         if self.collecting.swap(true, Ordering::AcqRel) {

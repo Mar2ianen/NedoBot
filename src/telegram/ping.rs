@@ -103,14 +103,15 @@ pub async fn handle(
     // Persist the command only after acknowledging the real Telegram reply;
     // a broken database must never prevent /ping itself from answering.
     if crate::features::ingest::is_managed_chat(&state.config, msg.chat.id.0) {
-        let recorded_message = msg.clone();
+        let recorded_message = (*msg).clone();
         let pool = state.pool.clone();
         let config = state.config.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
                 Duration::from_secs(2),
                 crate::features::ingest::ingest_message(&pool, &recorded_message, &config),
-            ).await;
+            )
+            .await;
             if let Ok(Err(_)) | Err(_) = result {
                 tracing::warn!("best-effort /ping ingestion failed or timed out");
             }
@@ -329,14 +330,23 @@ fn render(
             HealthStatus::Degraded | HealthStatus::Unavailable | HealthStatus::TimedOut
         )
     });
-    let missing_core = ["postgres", "queues"].iter().any(|id| !snapshot.checks.contains_key(id));
-    let stale_core = ["postgres", "queues"].iter().any(|id| snapshot.checks.get(id).is_some_and(|sample| {
-        sample.status == HealthStatus::Unknown
-            || (sample.status == HealthStatus::Healthy && sample.observed_at.elapsed() > Duration::from_secs(120))
-    }));
-    let timed_out_core = final_frame && ["postgres", "queues"].iter().any(|id| {
-        snapshot.checks.get(id).is_some_and(|sample| sample.status == HealthStatus::Checking)
+    let missing_core = ["postgres", "queues"]
+        .iter()
+        .any(|id| !snapshot.checks.contains_key(id));
+    let stale_core = ["postgres", "queues"].iter().any(|id| {
+        snapshot.checks.get(id).is_some_and(|sample| {
+            sample.status == HealthStatus::Unknown
+                || (sample.status == HealthStatus::Healthy
+                    && sample.observed_at.elapsed() > Duration::from_secs(120))
+        })
     });
+    let timed_out_core = final_frame
+        && ["postgres", "queues"].iter().any(|id| {
+            snapshot
+                .checks
+                .get(id)
+                .is_some_and(|sample| sample.status == HealthStatus::Checking)
+        });
     let overall = if !final_frame && (snapshot.busy || missing_core) {
         "CHECKING"
     } else if has_error || timed_out_core {
