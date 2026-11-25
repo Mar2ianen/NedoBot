@@ -53,6 +53,7 @@ impl SearchProvider for McpSearchProvider {
         let timeout_duration = Duration::from_secs(self.config.search_query_timeout_sec);
         match timeout(timeout_duration, search_with_mcp(&self.config, query)).await {
             Ok(Ok(results)) => {
+                crate::features::health::observe("search_mcp", true, started.elapsed());
                 tracing::info!(
                     source = ?query.source,
                     query = %query.text,
@@ -63,6 +64,7 @@ impl SearchProvider for McpSearchProvider {
                 Ok(results)
             }
             Ok(Err(_err)) => {
+                crate::features::health::observe("search_mcp", false, started.elapsed());
                 tracing::warn!(
                     source = ?query.source,
                     latency_ms = started.elapsed().as_millis(),
@@ -71,6 +73,7 @@ impl SearchProvider for McpSearchProvider {
                 Err(anyhow::anyhow!("external search is unavailable"))
             }
             Err(_) => {
+                crate::features::health::observe("search_mcp", false, started.elapsed());
                 tracing::warn!(
                     source = ?query.source,
                     timeout_secs = self.config.search_query_timeout_sec,
