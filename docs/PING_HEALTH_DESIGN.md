@@ -116,7 +116,7 @@ Separate statuses for availability, activity, and completeness of observation. R
 
 ## 5. Data collection design
 
-### A. In-process, no I/O on /ping
+### A. In-process data for initial /ping frame (no I/O before first send)
 
 Create src/features/health/{mod.rs,model.rs,registry.rs,render.rs,collector.rs}. Add Arc<HealthRegistry> to AppState, initialized with process start Instant + build identity. For every active WorkerId record registered_at, last_poll_started_at, last_poll_finished_at, last_success_at, last_error_at, consecutive_errors, processed/idle/failed counts, and current poll state. Register workers according to **actual spawned instances**, not every compile-time WorkerId.
 
@@ -178,7 +178,7 @@ For moderation, higher operational priority belongs to new-user audit, decision 
 
 Thresholds are starting points; avoid cross-feature uniform limits. Keep 2-3 sample hysteresis for global transitions. For queues driven by sporadic input, "no completed jobs" with empty queue is normal. If a probe's cached TTL expires, state becomes Unknown (stale), not Healthy.
 
-**Budget:** /ping read path should perform zero external/network/SQL operations and finish snapshot render quickly. Background sampling should be bounded and cancellable, no unbounded retry loops, no sampling every worker poll. /ping probe is rate-limited, non-concurrent (singleflight), owner-only and opt-in.
+**Budget:** /ping initial-frame preparation should perform zero external/network/SQL operations and finish snapshot rendering quickly. Only after the real message is acknowledged may the shared cheap refresh run and publish further edits. Background sampling should be bounded and cancellable, no unbounded retry loops, no sampling every worker poll. /ping probe is rate-limited, non-concurrent (singleflight), owner-only and opt-in.
 
 ## 6.1. Strict deadlines and fail-closed behavior (required)
 
