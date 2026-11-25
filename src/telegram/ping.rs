@@ -49,7 +49,7 @@ pub async fn handle(
         };
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
-            bot.send_message(msg.chat.id, text)
+            bot.send_message(text).chat_id(msg.chat.id)
                 .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply()),
         ).await;
         return Ok(());
@@ -156,7 +156,7 @@ fn sample_line(
     final_frame: bool,
 ) -> String {
     let Some(sample) = snapshot.checks.get(id) else {
-        return format!("{name}: UNKNOWN");
+        return format!("{name}: {}", if final_frame { "UNKNOWN" } else { "CHECKING" });
     };
     let mut status = sample.status;
     if final_frame && status == HealthStatus::Checking {
