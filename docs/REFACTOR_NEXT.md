@@ -126,7 +126,7 @@ Groq ASR принимает MP4 напрямую, поэтому кружок с
 
 ## Остаточные риски
 
-- `runtime.voice_asr_provider` сейчас фактически поддерживает только `groq`; unknown provider падает ошибкой.
+- `runtime.voice_asr_provider` поддерживает `groq` и `gemini`; unknown provider падает ошибкой.
 - provider/model voice cleanup задаются в `voice_cleanup` profile route; отдельного env-router больше нет.
 - Для `audio` Telegram metadata обычно есть, но если duration/file_size внезапно отсутствуют, файл может дойти до API и упасть там.
 - `render_mode=file` парсится как enum value, но renderer не имеет отдельной ветки для file-only режима; сейчас это не проблема, потому что prompt просит только `short | chapters`.
@@ -145,7 +145,4 @@ Groq ASR принимает MP4 напрямую, поэтому кружок с
 
 ## Следующий порядок работы
 
-1. Cleanup provider/model persistence.
-2. User-facing error policy для ASR/download failures.
-3. Manual `/transcribe` reply command.
-4. Smoke в живом чате на коротком и длинном voice, а также на кружке.
+Первые три задачи выше закрыты. Остаётся smoke в живом чате на коротком и длинном voice, а также на кружке.

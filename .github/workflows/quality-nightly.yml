@@ -10,6 +10,10 @@ on:
         required: false
         default: false
         type: boolean
+      coverage_base:
+        description: Optional Git ref for PostgreSQL diff coverage (default: branch merge-base or parent on main)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -173,6 +177,7 @@ jobs:
           cargo llvm-cov report --json --summary-only --output-path target/quality-coverage/default.json
       - name: Collect disposable PostgreSQL coverage
         env:
+          COVERAGE_BASE: ${{ inputs.coverage_base }}
           PGPASSWORD: tg_ai_bot_dev
         run: |
           psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE ROLE nedobot_mcp_ro NOLOGIN' -c 'GRANT nedobot_mcp_ro TO tg_ai_bot_dev'
@@ -180,6 +185,7 @@ jobs:
           cargo llvm-cov clean --profraw-only
           python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test postgres_migrations -- --ignored
           python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
+          python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --test adversarial_harness generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact
           for name in \
             features::user_profiles::enrichment::tests::saturated_and_closed_queue_preserves_ingested_audit_intents \
             features::user_profiles::enrichment::tests::two_chats_share_profile_fetch_but_keep_both_audits \
@@ -190,8 +196,18 @@ jobs:
             python3 scripts/run_cargo_test_checked.py cargo llvm-cov --no-clean --no-report --locked --lib "$name" -- --ignored --exact
           done
           cargo llvm-cov report --lcov --output-path target/quality-coverage/postgres.lcov
+          if [ -n "$COVERAGE_BASE" ]; then
+            base=$(git rev-parse --verify --end-of-options "$COVERAGE_BASE^{commit}")
+          else
+            base=$(git merge-base HEAD origin/main)
+            if [ "$base" = "$(git rev-parse HEAD)" ]; then
+              base=$(git rev-parse HEAD^)
+            fi
+          fi
+          git merge-base --is-ancestor "$base" HEAD
+          printf '%s\n' "$base" > target/quality-coverage/base.txt
           python3 scripts/report_diff_coverage.py \
-            c3571fed1e30dd2c34d07d48f0a403d164b11aea \
+            "$base" \
             target/quality-coverage/postgres.lcov > target/quality-coverage/postgres-diff.tsv
           git rev-parse HEAD > target/quality-coverage/head.txt
 
