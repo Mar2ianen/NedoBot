@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use genai::chat::Tool as GenAiTool;
 use rmcp::{
@@ -89,6 +89,13 @@ impl McpClient {
     }
 
     pub async fn start_for_scope(config: &Config, scope_chat_id: i64) -> anyhow::Result<Self> {
+        let started = Instant::now();
+        let result = Self::start_for_scope_inner(config, scope_chat_id).await;
+        crate::features::health::observe("agent_mcp", result.is_ok(), started.elapsed());
+        result
+    }
+
+    async fn start_for_scope_inner(config: &Config, scope_chat_id: i64) -> anyhow::Result<Self> {
         let scope = config.mcp_read_scope_for_chat(scope_chat_id)?;
         let command = config
             .ask_db_mcp_command
@@ -198,6 +205,13 @@ impl McpClient {
     }
 
     pub async fn call(&self, tool: &str, arguments: Value) -> anyhow::Result<McpToolResult> {
+        let started = Instant::now();
+        let result = self.call_inner(tool, arguments).await;
+        crate::features::health::observe("mcp_tools", result.is_ok(), started.elapsed());
+        result
+    }
+
+    async fn call_inner(&self, tool: &str, arguments: Value) -> anyhow::Result<McpToolResult> {
         anyhow::ensure!(
             self.has_tool(tool),
             "ask agent requested an unavailable MCP tool"

@@ -68,6 +68,11 @@ pub async fn handle_command(
         tracing::debug!(chat_id = msg.chat.id.0, "ignored command from unknown chat");
         return Ok(());
     }
+    // Health must still reply when PostgreSQL is unavailable: ordinary
+    // command ingestion precedes routing and would otherwise swallow /ping.
+    if let Command::Ping(args) = &cmd {
+        return crate::telegram::ping::handle(&bot, &msg, &state, args).await;
+    }
     #[cfg(feature = "manual-moderation")]
     if is_manual_moderation_command(&cmd)
         && !config.manual_moderation_enabled_for_chat(msg.chat.id.0)

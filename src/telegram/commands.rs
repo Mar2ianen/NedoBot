@@ -6,6 +6,17 @@ mod top_word_tests {
     use teloxide::utils::command::BotCommands;
 
     #[test]
+    fn ping_command_accepts_optional_mode() {
+        assert!(matches!(Command::parse("/ping", "nedobot"), Ok(Command::Ping(a)) if a.is_empty()));
+        assert!(
+            matches!(Command::parse("/ping full", "nedobot"), Ok(Command::Ping(a)) if a == "full")
+        );
+        assert!(
+            matches!(Command::parse("/ping probe", "nedobot"), Ok(Command::Ping(a)) if a == "probe")
+        );
+    }
+
+    #[test]
     fn topword_command_parses_the_word_and_render_flag() {
         assert!(matches!(
             Command::parse("/topword амудятел -p", "nedobot"),
@@ -51,8 +62,8 @@ mod top_word_tests {
 pub enum Command {
     #[command(description = "показать это меню")]
     Help,
-    #[command(description = "проверить, что бот жив")]
-    Ping,
+    #[command(description = "диагностика бота; /ping [full|probe]")]
+    Ping(String),
     #[command(description = "проверить подключение к базе")]
     Db,
     #[command(description = "показать custom_emoji_id из сообщения")]

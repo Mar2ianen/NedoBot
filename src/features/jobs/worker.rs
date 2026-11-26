@@ -4,7 +4,11 @@
 //! module only tracks their tasks, signals shutdown, bounds draining, and
 //! centralizes the idle/error polling cadence.
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use tokio::{
     sync::watch,
@@ -13,6 +17,7 @@ use tokio::{
 };
 
 use super::policy::WorkerPollPolicy;
+use crate::features::health::{self, WorkerOutcome};
 
 pub const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -147,6 +152,7 @@ impl WorkerSupervisor {
         F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        health::worker_registered(id.as_str());
         let shutdown = self.shutdown.subscribe();
         let handle = self.tasks.spawn(async move {
             worker(shutdown).await;
@@ -244,6 +250,7 @@ impl WorkerSupervisor {
     fn record_exit(&mut self, joined: Result<(Id, WorkerId), JoinError>) -> Option<WorkerFailure> {
         let shutting_down = *self.shutdown.borrow();
         let (worker, exit) = self.classify_join(joined);
+        health::worker_exited(worker.as_str());
         match exit {
             WorkerTaskExit::Completed if shutting_down => {
                 tracing::info!(worker = worker.as_str(), "background worker stopped");
@@ -284,7 +291,15 @@ pub async fn run_poll_worker<F, Fut>(
             return;
         }
 
-        let delay_seconds = match poll().await {
+        let poll_started = Instant::now();
+        let outcome = poll().await;
+        let kind = match &outcome {
+            PollOutcome::Processed => WorkerOutcome::Processed,
+            PollOutcome::Idle => WorkerOutcome::Idle,
+            PollOutcome::Failed(_) => WorkerOutcome::Failed,
+        };
+        health::worker_polled(spec.id.as_str(), kind, poll_started.elapsed());
+        let delay_seconds = match outcome {
             PollOutcome::Processed => continue,
             PollOutcome::Idle => spec.poll.idle_seconds(),
             PollOutcome::Failed(error_kind) => {
@@ -339,7 +354,10 @@ pub async fn run_interval_worker<F, Fut>(
                 if *shutdown.borrow() {
                     return;
                 }
-                if let Some(error_kind) = operation().await {
+                let started = Instant::now();
+                let error = operation().await;
+                health::worker_polled(id.as_str(), if error.is_some() { WorkerOutcome::Failed } else { WorkerOutcome::Processed }, started.elapsed());
+                if let Some(error_kind) = error {
                     tracing::warn!(worker = id.as_str(), error_kind, "periodic worker operation failed");
                 }
             }
@@ -365,7 +383,18 @@ pub async fn run_fixed_delay_worker<F, Fut>(
         if *shutdown.borrow() {
             return;
         }
-        if let Some(error_kind) = operation().await {
+        let started = Instant::now();
+        let error = operation().await;
+        health::worker_polled(
+            id.as_str(),
+            if error.is_some() {
+                WorkerOutcome::Failed
+            } else {
+                WorkerOutcome::Processed
+            },
+            started.elapsed(),
+        );
+        if let Some(error_kind) = error {
             tracing::warn!(
                 worker = id.as_str(),
                 error_kind,

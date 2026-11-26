@@ -8,11 +8,13 @@ use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::features::ask_metrics::AskDeliveryMetrics;
+use crate::features::health::HealthRegistry;
 #[cfg(feature = "spam-sync")]
 use crate::features::spam_reputation::SpamReputationStore;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub health: Arc<HealthRegistry>,
     pub pool: PgPool,
     pub config: Arc<Config>,
     pub render_time: Arc<TimeContext>,
@@ -34,6 +36,7 @@ impl AppState {
             .expect("render_timezone must pass Config::validate_runtime_secrets");
         let time_context = Arc::new(time_context);
         Self {
+            health: Arc::new(HealthRegistry::new()),
             pool,
             config: Arc::new(config),
             render_time: Arc::clone(&time_context),
@@ -47,6 +50,11 @@ impl AppState {
             #[cfg(feature = "spam-sync")]
             spam_reputation: None,
         }
+    }
+
+    pub fn with_health(mut self, health: Arc<HealthRegistry>) -> Self {
+        self.health = health;
+        self
     }
 
     pub fn with_telegram_bot_identity(mut self, identity: TelegramBotIdentity) -> Self {

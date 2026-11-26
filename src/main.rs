@@ -116,6 +116,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let pool = build_pool().await?;
     migrate(&pool).await?;
+    let health = Arc::new(features::health::HealthRegistry::new());
+    features::health::HealthRegistry::install_global(Arc::clone(&health));
     let mut workers = WorkerSupervisor::new();
     #[cfg(feature = "moderation")]
     if config.community.moderation.enabled {
@@ -163,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let state = AppState::new(pool, config);
+    let state = AppState::new(pool, config).with_health(health);
     #[cfg(feature = "moderation")]
     if state.config.community.moderation.url_feed_enabled {
         features::url_feeds::spawn_worker(

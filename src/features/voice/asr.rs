@@ -108,7 +108,8 @@ pub async fn transcribe_audio(
     filename: &str,
     mime_type: Option<&str>,
 ) -> anyhow::Result<AsrTranscript> {
-    transcribe_configured_audio(
+    let started = std::time::Instant::now();
+    let result = transcribe_configured_audio(
         config,
         path,
         filename,
@@ -116,7 +117,9 @@ pub async fn transcribe_audio(
         config.voice.asr_provider.trim(),
         &config.voice.asr_model,
     )
-    .await
+    .await;
+    crate::features::health::observe("asr", result.is_ok(), started.elapsed());
+    result
 }
 
 async fn transcribe_configured_audio(

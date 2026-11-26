@@ -14,6 +14,7 @@ pub mod identity;
 #[cfg(feature = "manual-moderation")]
 pub mod manual_moderation;
 pub mod media;
+pub mod ping;
 pub mod render;
 pub mod rich_content;
 pub mod router;

@@ -39,7 +39,7 @@ enum ReadOnlyRoute {
 
 fn route_kind(command: &Command) -> Option<ReadOnlyRoute> {
     match command {
-        Command::Help | Command::Ping | Command::Db | Command::Memory => {
+        Command::Help | Command::Ping(_) | Command::Db | Command::Memory => {
             Some(ReadOnlyRoute::Utility)
         }
         Command::StatsDay(_)
@@ -67,8 +67,8 @@ async fn dispatch_utility(
             let descriptions = command_descriptions(&state.config, msg.chat.id.0);
             send_command_html(bot, msg, state, escape_html(&descriptions)).await?;
         }
-        Command::Ping => {
-            send_command_html(bot, msg, state, "pong").await?;
+        Command::Ping(args) => {
+            crate::telegram::ping::handle(bot, msg, state, &args).await?;
         }
         Command::Db => {
             let row: (i64,) = sqlx::query_as("select 1::bigint")
