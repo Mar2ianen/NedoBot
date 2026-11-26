@@ -348,7 +348,7 @@ impl HealthRegistry {
                 sqlx::query_as::<_, (i64, i64, i64)>(
                     "select count(*) filter (where status='completed')::bigint, \
                      count(*) filter (where status='failed')::bigint, \
-                     count(*) filter (where status='running')::bigint \
+                     count(*) filter (where status='delivery_pending')::bigint \
                      from ask_runs where chat_id=$1 and created_at>now()-interval '1 hour'",
                 )
                 .bind(chat_id)
@@ -356,13 +356,15 @@ impl HealthRegistry {
             )
             .await;
             let (status, detail) = match result {
-                Ok(Ok((done, failed, running))) => (
+                Ok(Ok((done, failed, delivery_pending))) => (
                     if failed > 0 {
                         HealthStatus::Degraded
                     } else {
                         HealthStatus::Healthy
                     },
-                    format!("1h completed={done} failed={failed} recorded_running={running}"),
+                    format!(
+                        "1h completed={done} failed={failed} delivery_pending={delivery_pending}"
+                    ),
                 ),
                 Ok(Err(_)) => (
                     HealthStatus::Unavailable,

@@ -67,14 +67,16 @@ pub async fn handle(
     if let Some(thread_id) = msg.thread_id {
         backend = backend.message_thread_id(thread_id);
     }
-    let mut schedule = DraftConfig::default();
-    schedule.coalesce_window = Duration::from_millis(1);
-    schedule.min_update_interval = Duration::from_millis(650);
-    schedule.request_timeout = Duration::from_secs(2);
-    schedule.terminal_timeout = Duration::from_secs(2);
-    schedule.retry_initial = Duration::from_millis(200);
-    schedule.retry_max = Duration::from_millis(400);
-    schedule.terminal_retry_budget = 0;
+    let schedule = DraftConfig {
+        coalesce_window: Duration::from_millis(1),
+        min_update_interval: Duration::from_millis(650),
+        request_timeout: Duration::from_secs(2),
+        terminal_timeout: Duration::from_secs(2),
+        retry_initial: Duration::from_millis(200),
+        retry_max: Duration::from_millis(400),
+        terminal_retry_budget: 0,
+        ..Default::default()
+    };
 
     let (drafter, sink) = match Drafter::snapshots(backend, state.drafter_limiter.clone(), schedule)
     {
@@ -383,5 +385,25 @@ mod tests {
         let health = HealthRegistry::new();
         let snapshot = health.snapshot();
         assert!(sample_line("DB", "postgres", &snapshot, true, true).contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn public_ping_never_includes_diagnostic_detail() {
+        let mut snapshot = HealthRegistry::new().snapshot();
+        snapshot.checks.insert(
+            "postgres",
+            crate::features::health::CheckSample {
+                status: HealthStatus::Healthy,
+                detail: "dsn=postgres://secret".to_owned(),
+                elapsed_ms: Some(1),
+                observed_at: Instant::now(),
+            },
+        );
+
+        let public = sample_line("PostgreSQL", "postgres", &snapshot, false, true);
+        let owner = sample_line("PostgreSQL", "postgres", &snapshot, true, true);
+
+        assert!(!public.contains("dsn="));
+        assert!(owner.contains("dsn=postgres://secret"));
     }
 }
