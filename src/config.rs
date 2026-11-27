@@ -40,6 +40,7 @@ const DEFAULT_LLM_PROFILES_PATH: &str = "config/llm_profiles.toml.example";
 pub struct Config {
     pub community: CommunityConfig,
     pub chat_registry: ChatRegistry,
+    pub flood_shadow_enabled: bool,
     pub source_channel_id: i64,
     pub discussion_chat_id: i64,
     pub render_timezone: String,
@@ -433,6 +434,7 @@ impl Config {
         let mut config = Self {
             community,
             chat_registry,
+            flood_shadow_enabled: env_bool("FLOOD_SHADOW_ENABLED", false)?,
             source_channel_id,
             discussion_chat_id: primary_chat_id,
             render_timezone: community_timezone,
@@ -770,6 +772,10 @@ impl Config {
             errors.push(
                 "voice transcription is enabled but binary lacks cargo feature voice".to_string(),
             );
+        }
+        if self.flood_shadow_enabled && !cfg!(feature = "flood") {
+            errors
+                .push("FLOOD_SHADOW_ENABLED=true but binary lacks cargo feature flood".to_string());
         }
         if self.new_user_audit_enabled && !cfg!(feature = "moderation") {
             errors.push(
@@ -1379,7 +1385,6 @@ fn require_secret_from_environment(errors: &mut Vec<String>, key: &str, context:
     }
 }
 
-#[cfg(test)]
 fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
     match value {
         "true" | "1" => Ok(true),
@@ -1797,6 +1802,13 @@ fn env_optional(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_bool(key: &str, default: bool) -> anyhow::Result<bool> {
+    match env_optional(key) {
+        None => Ok(default),
+        Some(value) => parse_bool(key, &value),
+    }
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -2122,6 +2134,7 @@ mod tests {
         Config {
             community: test_community_config().0,
             chat_registry: test_community_config().1,
+            flood_shadow_enabled: false,
             source_channel_id: -1001,
             discussion_chat_id: -1002,
             render_timezone: "Europe/Moscow".to_string(),
@@ -2369,6 +2382,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("VOICE_AUTO_TRANSCRIBE"));
+    }
+
+    #[test]
+    fn flood_shadow_runtime_flag_requires_the_opt_in_cargo_feature() {
+        let mut config = config();
+        config.flood_shadow_enabled = true;
+        let error = config.validate_runtime_secrets().unwrap_err().to_string();
+
+        if cfg!(feature = "flood") {
+            assert!(!error.contains("FLOOD_SHADOW_ENABLED=true"));
+        } else {
+            assert!(error.contains("FLOOD_SHADOW_ENABLED=true"));
+        }
     }
 
     #[test]

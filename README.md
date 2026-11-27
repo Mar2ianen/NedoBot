@@ -21,6 +21,8 @@
   ·
   <a href="docs/TECHNICAL.md">Docs</a>
   ·
+  <a href="docs/CONVERSATION_FLOOD_SHADOW.md">Flood shadow</a>
+  ·
   <a href="CHANGELOG.md">Changelog</a>
   ·
   <a href="docs/DEPLOYMENT.md">Deployment</a>

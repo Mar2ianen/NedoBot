@@ -28,6 +28,7 @@ public-mcp = []
 moderation = []
 spam-sync = []
 manual-moderation = []
+flood = ["teloxide-antispam/flood"]
 
 [[bin]]
 name = "chat_db_mcp"
@@ -111,8 +112,8 @@ chrono = "0.4"
 jiff = "0.2"
 dotenvy = "0.15"
 ipnet = "2"
-teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "3166c9c39f79724b8e4e760e7a5afdd5daeb78be", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "3166c9c39f79724b8e4e760e7a5afdd5daeb78be", default-features = false, features = ["teloxide"] }
+teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "d13ef30dd3e761f1f9b7a5de953096ddaa15f10d", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "d13ef30dd3e761f1f9b7a5de953096ddaa15f10d", default-features = false, features = ["teloxide"] }
 teloxide-statistics = { git = "https://github.com/Mar2ianen/teloxide-statistics", rev = "7e2a5859849044121b9e693bc1ed36e7440db139", default-features = false, features = ["sentiment", "engagement", "reputation"] }
 genai = { version = "=0.7.3", default-features = false, features = ["rustls-tls"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "query", "socks"] }
