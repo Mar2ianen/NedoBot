@@ -18,12 +18,11 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes.
+    // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes,
+    // including the explicit retirement of the unused LOLS mirror.
     // Touched with each migration addition because SQLx embeds this directory at compile time.
     // Includes the durable profile refresh intent migration.
-    // `20261127140000` is allowlisted in the bridge release so a rollback to
-    // that source can start after the LOLS table-drop migration has applied.
-    const KNOWN_UNRESOLVED_PRODUCTION_MIGRATIONS: &[i64] = &[20260927120000, 20261127140000];
+    const KNOWN_UNRESOLVED_PRODUCTION_MIGRATIONS: &[i64] = &[20260927120000];
 
     let migration_table_exists: bool =
         sqlx::query_scalar("select to_regclass('public._sqlx_migrations') is not null")
