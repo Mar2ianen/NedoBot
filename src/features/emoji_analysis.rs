@@ -289,6 +289,39 @@ mod tests {
     }
 
     #[test]
+    fn pinned_unicode_golden_fixture_matches_grapheme_and_emoji_counts() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Case {
+            text: String,
+            graphemes: usize,
+            emoji: usize,
+        }
+
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../test-data/unicode/cases.json"))
+                .expect("unicode fixture is valid JSON");
+        for case in fixture.cases {
+            assert_eq!(
+                case.text.graphemes(true).count(),
+                case.graphemes,
+                "grapheme count for {:?}",
+                case.text
+            );
+            assert_eq!(
+                analyze(&case.text, &[]).unwrap().occurrences.len(),
+                case.emoji,
+                "emoji count for {:?}",
+                case.text
+            );
+        }
+    }
+
+    #[test]
     fn density_runs_repeats_whitespace_and_visible_text_are_explicit() {
         let analysis = analyze("😀😀  A", &[]).unwrap();
         assert_eq!(analysis.metrics.unicode_count, 2);

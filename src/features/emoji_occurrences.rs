@@ -10,7 +10,7 @@ use std::ops::Range;
 
 use teloxide::types::{
     Message, MessageEntity, ReactionType, RichBlock, RichBlockKind, RichMessage, RichText,
-    RichTextObject,
+    RichTextObject, TextQuote,
 };
 
 use crate::features::emoji_analysis::{
@@ -402,6 +402,27 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
         .collect()
 }
 
+pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiAnalysisError> {
+    let analysis = emoji_analysis::analyze_telegram_text(&quote.text, &quote.entities)?;
+    Ok(analysis
+        .occurrences
+        .into_iter()
+        .map(|item| EmojiReference {
+            kind: ReferenceKind::Quote,
+            identity: item.identity,
+            fallback: Some(item.fallback),
+        })
+        .collect())
+}
+
+pub fn chat_status_reference(id: Option<&str>) -> Option<EmojiReference> {
+    id.map(|id| EmojiReference {
+        kind: ReferenceKind::ProfileStatus,
+        identity: EmojiIdentity::Custom(id.to_owned()),
+        fallback: None,
+    })
+}
+
 pub fn custom_emoji_reference(
     kind: ReferenceKind,
     id: impl ToString,
@@ -465,5 +486,25 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert!(refs.iter().all(|item| item.kind == ReferenceKind::Reaction));
         assert_eq!(refs[1].fallback, None);
+    }
+
+    #[test]
+    fn quote_entities_and_chat_status_remain_separate_references() {
+        let quote = TextQuote {
+            text: "😀".into(),
+            entities: vec![MessageEntity::custom_emoji("99".into(), 0, 2)],
+            rich_texts: None,
+            position: 0,
+            is_manual: true,
+        };
+        let refs = quote_references(&quote).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, ReferenceKind::Quote);
+        assert_eq!(refs[0].identity, EmojiIdentity::Custom("99".into()));
+        assert_eq!(refs[0].fallback.as_deref(), Some("😀"));
+
+        let status = chat_status_reference(Some("status-id")).unwrap();
+        assert_eq!(status.kind, ReferenceKind::ProfileStatus);
+        assert_eq!(status.identity, EmojiIdentity::Custom("status-id".into()));
     }
 }
