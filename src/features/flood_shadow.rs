@@ -12,7 +12,7 @@ use teloxide_antispam::{
         ConversationMessage, FloodActor, FloodAssessment, FloodMetricKind, MAX_WINDOW_MESSAGES,
         analyze_window,
     },
-    preprocess::{prepare_text, word_tokens},
+    preprocess::{prepare_text, word_sequence},
 };
 
 use crate::telegram::entities::{custom_emoji_ids, deserialize_stored_message, message_text};
@@ -95,22 +95,20 @@ fn project_message(
     message_id: i32,
     event_at: u64,
 ) -> Option<ConversationMessage> {
-    if message.from.as_ref().is_some_and(|user| user.is_bot) {
-        return None;
-    }
-    let actor = message
-        .from
-        .as_ref()
-        .map(|user| FloodActor::User(user.id.0 as i64))
-        .or_else(|| {
-            message
-                .sender_chat
-                .as_ref()
-                .map(|chat| FloodActor::SenderChat(chat.id.0))
-        })?;
+    let actor = if let Some(chat) = &message.sender_chat {
+        FloodActor::SenderChat(chat.id.0)
+    } else {
+        let user = message.from.as_ref()?;
+        if user.is_bot {
+            return None;
+        }
+        FloodActor::User(user.id.0 as i64)
+    };
     let text = message_text(message).unwrap_or_default();
     let prepared = prepare_text(&text);
-    let tokens = word_tokens(&prepared.canonical);
+    // Keep source word order here. The flood core independently derives
+    // trigrams; classifier `word_tokens` intentionally includes bigrams.
+    let tokens = word_sequence(&prepared.canonical);
     let entities = message
         .entities()
         .into_iter()
@@ -224,6 +222,37 @@ mod tests {
         }))
         .expect("synthetic Telegram bot message should deserialize");
         assert!(project_message(&message, 18, 1).is_none());
+    }
+
+    #[test]
+    fn sender_chat_identity_wins_over_legacy_from_user() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 19,
+            "date": 1700000000,
+            "chat": {"id": -1002, "type": "supergroup", "title": "Test"},
+            "from": {"id": 43, "is_bot": true, "first_name": "Compatibility sender"},
+            "sender_chat": {"id": -1003, "type": "channel", "title": "Source"},
+            "text": "channel-authored message"
+        }))
+        .expect("synthetic sender-chat message should deserialize");
+
+        let projected = project_message(&message, 19, 1).unwrap();
+        assert_eq!(projected.actor, FloodActor::SenderChat(-1003));
+    }
+
+    #[test]
+    fn flood_projection_keeps_ordered_words_without_classifier_bigrams() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 20,
+            "date": 1700000000,
+            "chat": {"id": -1002, "type": "supergroup", "title": "Test"},
+            "from": {"id": 42, "is_bot": false, "first_name": "A"},
+            "text": "a b c"
+        }))
+        .expect("synthetic message should deserialize");
+
+        let projected = project_message(&message, 20, 1).unwrap();
+        assert_eq!(projected.tokens, ["a", "b", "c"]);
     }
 
     #[tokio::test]
