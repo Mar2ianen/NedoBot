@@ -676,6 +676,14 @@ ssh vps-153 "podman exec tg-ai-bot-postgres psql -U tg_ai_bot -d tg_ai_bot -P pa
 /ping@nedostraj_bot
 ```
 
+`/ping` сначала отправляет реальное сообщение и обновляет его rich-редакциями.
+Публичный режим показывает PostgreSQL, очереди, workers, занятость agent slots и
+состояние agent MCP без detail-строк. `/ping full` и `/ping probe` доступны только
+владельцу в личном чате: full добавляет очереди ask/voice/moderation/QR, LLM/search
+MCP и worker poll-метрики, probe запускает scoped RMCP bootstrap. Проверки
+ограничены дедлайнами; ошибка БД не блокирует ответ, а неизвестное состояние не
+отображается как OK.
+
 `/stats_day`, `/stats_week` и `/stats_month` показывают имена пользователей как скрытые ссылки на Telegram-профиль, без видимого ID. Рядом выводятся короткие бейджи: `админ`, `в чате`, `не в чате`, `бот` или `статус неизвестен`.
 
 `/userstats` принимает числовой Telegram ID, уже виденный ботом username или reply на сообщение пользователя. Без аргумента команда показывает отправителя. `UserStatsArgs` один раз нормализует command arguments: render-флаги `-r`/`--rich` и `-p`/`--plain` можно поставить до или после target, они не считаются частью username, а команда только с флагом сохраняет reply/sender fallback. Нормализованный target используется и для refresh профиля, и для построения отчёта. В общих отчётах ID намеренно не печатается; для точного SQL-разбора он остаётся в таблицах `telegram_messages`, `telegram_user_profiles` и `telegram_chat_users`.
