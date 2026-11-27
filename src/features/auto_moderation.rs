@@ -22,7 +22,6 @@ const MAX_DELETE_MESSAGES: i64 = 10;
 const AUTO_BAN_EVIDENCE_LABELS: &[&str] = &[
     "local_spammer_identity",
     "shared_spammer_identity",
-    "lols_spammer_identity",
     "tree_personal_channel_adult_funnel",
     "tree_personal_channel_invite_funnel",
 ];

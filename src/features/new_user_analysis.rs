@@ -1216,7 +1216,7 @@ mod tests {
         );
         assert_eq!(
             revision_hash,
-            "b7633f743c32c860735a1304a5ce75d621eb660114a238c1597483404576b761"
+            "8e0f519a2d64ad8af10cbc7e1a07c939e4611753a2582abe3e1c2b698d6d2e11"
         );
         assert_eq!(snapshot["profile"]["username"], "reader_42");
         assert_eq!(
