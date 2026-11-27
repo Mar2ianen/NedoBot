@@ -177,7 +177,7 @@ pub async fn handle_qr_command(
             service_messages::send_html(
                 bot,
                 command.chat.id,
-                "Сообщение изменилось во время сканирования; старый результат скрыт.",
+                "Не удалось подтвердить актуальность медиа; результат скрыт.",
                 audience,
             )
             .await?;
