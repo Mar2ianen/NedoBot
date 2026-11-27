@@ -7,6 +7,85 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+26 ноября 2026 в **16:35:33 UTC / 19:35:33 МСК** установлен
+[deploy-2026-11-26-ping-live-health](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-26-ping-live-health),
+source `3128b52bda71b2cb080df20c587c338f85fb8480` после
+[PR #184](https://github.com/Mar2ianen/NedoBot/pull/184).
+[Release 45858689300](https://github.com/Mar2ianen/NedoBot/actions/runs/45858689300)
+собрал default-feature artifact на Ubuntu 24.04 с glibc ≤ 2.39 и выполнил
+deploy: build 8m56s, deploy 46s. Аннотированный тег указывает на точный merge
+commit; workflow проверил tag, ancestry и `refs/heads/main`. CI финального head
+PR [45847162606](https://github.com/Mar2ianen/NedoBot/actions/runs/45847162606)
+и post-merge main [45850957301](https://github.com/Mar2ianen/NedoBot/actions/runs/45850957301)
+зелёные.
+
+`/ping` теперь сначала отправляет реальное Telegram-сообщение, затем обновляет
+его rich-редакциями с миллисекундными таймингами и строгими дедлайнами.
+Добавлены bounded process-local health registry, PostgreSQL/queue probes,
+worker telemetry, passive LLM/MCP/search/ASR observations и owner-only режимы
+`/ping full` и `/ping probe`. Публичный ответ не содержит detail-строк
+диагностики; при недоступной БД команда всё равно отвечает. Миграций нет.
+
+| Артефакт | SHA-256 |
+| --- | --- |
+| Оба running bots | `ea3a9d8ed6c07df2ca4d5f4e23e70dc8f1e0724effea25a63ca52eb9fe3197bd` |
+| Public MCP | `c522f0b5860a518dcc773d99e4dff15fde897eeeda2a0556d9dd525469f6e64e` |
+| Internal `chat_db_mcp` обоих инстансов | `72d10de71580e3da6a28c1bddb1078cc01d5e35b04e7d248edc848327cb9a9f7` |
+| `migrate` | `966591620c33374a7c036a9a3239af6bb8a28698b8acc79fd743e12f95ba983c` |
+| `validate_instance_config` | `790eb6d5799ade3619fbaffe452af468d61ea5a5b8d0a86876d2fd5961ef8951` |
+
+Обе БД остались на latest `20261122120000`, failed=0; новых migrations нет.
+SSH health после restart: все три units active/running, `NRestarts=0`, running
+exe SHA совпадают с artifact, `NEDOBOT_PRIVACY_MODE_POLICY=observe` в обоих
+`.env`; Rust ERROR, panic и сообщения о missing migration отсутствуют. В журнале
+есть только известные startup warnings и один slow-query 1.37 s, без отказа
+компонентов. Локальный MCP endpoint отвечает 403 на unauthenticated probe,
+публичный — 405 на GET, как и ожидается. Свободно 2.3 GiB на `/`.
+
+Backup текущей выкладки: `/var/backups/nedobot/release.gzCjbjSA` (SHA256SUMS
+проверен); он содержит r4 binaries, оба `.env` и оба TOML-профиля. Профили
+workflow не менял. Для rollback вернуть binaries и `.env` из этого backup и
+перезапустить оба бота и public MCP; схема БД не менялась. Более старые
+завершённые backup-копии после проверки удалены, `release.TMALgaBn` оставлен
+как предыдущая копия.
+
+## Предыдущая выкладка: Bot API 10.5 r4
+
+25 ноября 2026 в **18:42:31 UTC / 21:42:31 МСК** установлен
+[deploy-2026-11-25-bot-api-10-5-r4](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-25-bot-api-10-5-r4),
+source `45560c791b9ded3daff9d6bc67db479c5342fc1c` после
+[PR #182](https://github.com/Mar2ianen/NedoBot/pull/182). Это первая
+завершившаяся установка линии Bot API 10.5: предыдущие попытки r1–r3 не
+завершили установку и выкладкой не считаются.
+[Release 45676379597](https://github.com/Mar2ianen/NedoBot/actions/runs/45676379597)
+собрал default-feature artifact и выполнил deploy.
+
+Линия включает teloxide fork с Bot API 10.5, manual channel moderation,
+проверенные audit followups, reaction snapshot backfill и исправления release
+installer: hard links вместо полных копий, проверенный helper path и health
+gate, дожидающийся фазы `systemd-executor`. Source также содержит ранее слитые
+изменения из #125, #126, #174 и #177, не перечисленные в сообщении тега.
+
+| Артефакт | SHA-256 |
+| --- | --- |
+| Оба running bots | `9a4115a0ced2d5c9869acd7b2fdb59db131385aa9323b0c5455ea1831c555cfe` |
+| Public MCP | `48b8e2d8f4134e214bab4292d1b80d311715e7307ba30389b1e7a65ebc9ced97` |
+| Internal `chat_db_mcp` обоих инстансов | `d27d32195891a630e71138beca2ccaf21f2506e32fd2ec7d4ada34cc64849572` |
+| `migrate` | `b3567421c93614dee7cbe51f856d9fe2bf4508cb8c03e0bcb01a43562ac6a216` |
+| `validate_instance_config` | `c26453a92cdf198f55eb939975cb411682a028b8d9826d4c7c85847190148dc3` |
+
+До rollout обе БД приведены к latest `20261122120000`, failed=0; между 13 и
+25 ноября применены десять additive migrations `20261115120000`–
+`20261122120000`. После restart все три units active/running, `NRestarts=0`,
+running exe SHA совпали с artifact, `NEDOBOT_PRIVACY_MODE_POLICY=observe` в
+обоих `.env`; error-level записей в journal не было.
+
+Workflow сохранил pre-deploy backup `/var/backups/nedobot/release.TMALgaBn`
+(SHA256SUMS проверен). Тот же r4 snapshot после следующего deploy сохранён как
+`release.gzCjbjSA`; для отката на r4 использовать его.
+
+## Предыдущая выкладка: decision score captcha
+
 13 ноября 2026 в **14:55:17 UTC / 17:55:17 МСК** установлен
 [deploy-2026-11-13-decision-score-captcha](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-13-decision-score-captcha),
 source `a0274a48be792661482e85ac3b721cd7420838bb` после
