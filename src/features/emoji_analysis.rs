@@ -125,43 +125,44 @@ pub fn analyze(
         return Err(EmojiAnalysisError::TooManyCustomEmojiSpans);
     }
 
-    let boundaries = Utf16OffsetMap::new(text);
-    let grapheme_boundaries: HashSet<_> = text
-        .grapheme_indices(true)
-        .map(|(byte, _)| byte)
-        .chain(std::iter::once(text.len()))
-        .collect();
-    let mut custom_spans = custom
-        .iter()
-        .map(|item| {
-            if item.id.is_empty() {
-                return Err(EmojiAnalysisError::EmptyCustomEmojiId);
-            }
-            if item.utf16_range.start >= item.utf16_range.end {
-                return Err(EmojiAnalysisError::EmptyCustomEmojiRange);
-            }
-            let byte_range = boundaries
-                .range(
-                    item.utf16_range.start,
-                    item.utf16_range.end - item.utf16_range.start,
-                )
-                .ok_or(EmojiAnalysisError::InvalidUtf16Boundary)?;
-            let byte_start = byte_range.start;
-            let byte_end = byte_range.end;
-            if !grapheme_boundaries.contains(&byte_start)
-                || !grapheme_boundaries.contains(&byte_end)
-            {
-                return Err(EmojiAnalysisError::InvalidGraphemeBoundary);
-            }
-            Ok((byte_start..byte_end, item))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    custom_spans.sort_by_key(|(bytes, _)| bytes.start);
-    if custom_spans
-        .windows(2)
-        .any(|spans| spans[0].0.end > spans[1].0.start)
-    {
-        return Err(EmojiAnalysisError::OverlappingCustomEmojiRanges);
+    let mut custom_spans: Vec<(Range<usize>, &CustomEmojiInput)> = Vec::new();
+    if !custom.is_empty() {
+        let boundaries = Utf16OffsetMap::new(text);
+        let grapheme_boundaries: HashSet<_> = text
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        custom_spans = custom
+            .iter()
+            .map(|item| {
+                if item.id.is_empty() {
+                    return Err(EmojiAnalysisError::EmptyCustomEmojiId);
+                }
+                if item.utf16_range.start >= item.utf16_range.end {
+                    return Err(EmojiAnalysisError::EmptyCustomEmojiRange);
+                }
+                let byte_range = boundaries
+                    .range(
+                        item.utf16_range.start,
+                        item.utf16_range.end - item.utf16_range.start,
+                    )
+                    .ok_or(EmojiAnalysisError::InvalidUtf16Boundary)?;
+                if !grapheme_boundaries.contains(&byte_range.start)
+                    || !grapheme_boundaries.contains(&byte_range.end)
+                {
+                    return Err(EmojiAnalysisError::InvalidGraphemeBoundary);
+                }
+                Ok((byte_range, item))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        custom_spans.sort_by_key(|(bytes, _)| bytes.start);
+        if custom_spans
+            .windows(2)
+            .any(|spans| spans[0].0.end > spans[1].0.start)
+        {
+            return Err(EmojiAnalysisError::OverlappingCustomEmojiRanges);
+        }
     }
 
     let mut result = EmojiAnalysis {
