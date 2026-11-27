@@ -14,6 +14,8 @@ pub mod chat_read_api;
 pub mod chat_retrieval;
 #[cfg(feature = "emoji")]
 pub mod emoji_analysis;
+#[cfg(feature = "emoji")]
+pub mod emoji_occurrences;
 #[cfg(feature = "auto-comment")]
 pub mod first_comment;
 pub mod health;
