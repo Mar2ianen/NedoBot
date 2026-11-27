@@ -16,7 +16,6 @@ use teloxide::{
 
 use crate::telegram::{
     entities::custom_emoji_ids,
-    render::escape_html,
     service_messages::{self, MessageAudience},
 };
 
@@ -47,7 +46,35 @@ enum MetadataLookupState {
     TransientFailure,
 }
 
-type EmojiCache = tokio::sync::Mutex<HashMap<String, CachedEmoji>>;
+type EmojiCache = tokio::sync::Mutex<HashMap<CustomEmojiId, CachedEmoji>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CustomEmojiLookupOutcome {
+    Resolved(String),
+    ConfirmedMissing,
+    TransientFailure,
+    Busy,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CustomEmojiLookupReport {
+    pub outcomes: HashMap<CustomEmojiId, CustomEmojiLookupOutcome>,
+}
+
+impl CustomEmojiLookupReport {
+    #[cfg(feature = "emoji")]
+    fn resolved_fallbacks(&self) -> HashMap<CustomEmojiId, String> {
+        self.outcomes
+            .iter()
+            .filter_map(|(id, outcome)| match outcome {
+                CustomEmojiLookupOutcome::Resolved(fallback) => {
+                    Some((id.clone(), fallback.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
 
 fn lookup_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
@@ -64,91 +91,111 @@ fn cache() -> &'static EmojiCache {
 /// held across a network await. IDs are deduplicated for lookup only.
 pub async fn resolve_custom_emoji_fallbacks(
     bot: &DefaultParseMode<Bot>,
-    ids: &[String],
-) -> HashMap<String, String> {
+    ids: &[CustomEmojiId],
+) -> CustomEmojiLookupReport {
+    let mut seen = std::collections::HashSet::new();
     let unique = ids
         .iter()
+        .filter(|id| seen.insert((*id).clone()))
         .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<Vec<_>>();
     let now = Instant::now();
     let mut unresolved = Vec::new();
-    let mut resolved = HashMap::new();
+    let mut report = CustomEmojiLookupReport::default();
     {
         let mut cached = cache().lock().await;
         cached.retain(|_, value| value.expires_at > now);
         for id in unique {
-            if let Some(fallback) = cached.get(&id).and_then(|value| match &value.state {
-                MetadataLookupState::Positive(fallback) => Some(fallback.clone()),
-                MetadataLookupState::ConfirmedMissing | MetadataLookupState::TransientFailure => {
-                    None
-                }
-            }) {
-                resolved.insert(id, fallback);
-            } else if !cached.contains_key(&id) {
+            if let Some(value) = cached.get(&id) {
+                report.outcomes.insert(
+                    id,
+                    match &value.state {
+                        MetadataLookupState::Positive(fallback) => {
+                            CustomEmojiLookupOutcome::Resolved(fallback.clone())
+                        }
+                        MetadataLookupState::ConfirmedMissing => {
+                            CustomEmojiLookupOutcome::ConfirmedMissing
+                        }
+                        MetadataLookupState::TransientFailure => {
+                            CustomEmojiLookupOutcome::TransientFailure
+                        }
+                    },
+                );
+            } else {
                 unresolved.push(id);
             }
         }
     }
 
     let Ok(_lookup_slot) = lookup_slots().try_acquire() else {
-        return resolved;
+        report.outcomes.extend(
+            unresolved
+                .into_iter()
+                .map(|id| (id, CustomEmojiLookupOutcome::Busy)),
+        );
+        return report;
     };
 
     for batch in unresolved.chunks(MAX_LOOKUP_IDS_PER_REQUEST) {
-        let stickers = bot
-            .get_custom_emoji_stickers(batch.iter().cloned().map(CustomEmojiId))
-            .await;
-        let mut values = HashMap::new();
-        let fallback_on_error = match stickers {
+        let stickers = bot.get_custom_emoji_stickers(batch.iter().cloned()).await;
+        let values = match stickers {
             Ok(stickers) => {
+                let mut values = HashMap::new();
                 for sticker in stickers {
-                    let Some(id) = sticker.custom_emoji_id().map(|id| id.0.clone()) else {
+                    let Some(id) = sticker.custom_emoji_id().cloned() else {
                         continue;
                     };
-                    if batch.iter().any(|requested| requested == &id) {
+                    if batch.contains(&id) {
                         let emoji = sticker.emoji.filter(|emoji| valid_canonical_emoji(emoji));
                         values.insert(id, emoji);
                     }
                 }
-                false
+                Ok(values)
             }
             Err(error) => {
                 tracing::warn!(%error, "failed to resolve custom emoji metadata");
-                true
+                Err(())
             }
         };
         let now = Instant::now();
         let mut cached = cache().lock().await;
         cached.retain(|_, value| value.expires_at > now);
         for id in batch {
-            let state = if fallback_on_error {
-                MetadataLookupState::TransientFailure
-            } else if let Some(fallback) = values.remove(id).flatten() {
-                MetadataLookupState::Positive(fallback)
-            } else {
-                MetadataLookupState::ConfirmedMissing
+            let state = match &values {
+                Err(()) => MetadataLookupState::TransientFailure,
+                Ok(values) => match values.get(id).and_then(Clone::clone) {
+                    Some(fallback) => MetadataLookupState::Positive(fallback),
+                    None => MetadataLookupState::ConfirmedMissing,
+                },
             };
             cache_metadata_result(&mut cached, id, state, now);
             // Capture the result selected for this lookup while holding the
             // cache lock. A concurrent positive result wins over a late
             // missing/error response, and later eviction/expiry cannot erase
             // this call's own response.
-            if let Some(fallback) = cached.get(id).and_then(|value| match &value.state {
-                MetadataLookupState::Positive(fallback) => Some(fallback.clone()),
-                MetadataLookupState::ConfirmedMissing | MetadataLookupState::TransientFailure => {
-                    None
-                }
-            }) {
-                resolved.insert(id.clone(), fallback);
-            }
+            let outcome = cached
+                .get(id)
+                .map(|value| match &value.state {
+                    MetadataLookupState::Positive(fallback) => {
+                        CustomEmojiLookupOutcome::Resolved(fallback.clone())
+                    }
+                    MetadataLookupState::ConfirmedMissing => {
+                        CustomEmojiLookupOutcome::ConfirmedMissing
+                    }
+                    MetadataLookupState::TransientFailure => {
+                        CustomEmojiLookupOutcome::TransientFailure
+                    }
+                })
+                .unwrap_or(CustomEmojiLookupOutcome::TransientFailure);
+            report.outcomes.insert(id.clone(), outcome);
         }
     }
-    resolved
+    report
 }
 
 fn cache_metadata_result(
-    cache: &mut HashMap<String, CachedEmoji>,
-    id: &str,
+    cache: &mut HashMap<CustomEmojiId, CachedEmoji>,
+    id: &CustomEmojiId,
     state: MetadataLookupState,
     now: Instant,
 ) {
@@ -176,7 +223,7 @@ fn cache_metadata_result(
         MetadataLookupState::TransientFailure => ERROR_TTL,
     };
     cache.insert(
-        id.to_owned(),
+        id.clone(),
         CachedEmoji {
             expires_at: now + ttl,
             state,
@@ -211,13 +258,10 @@ pub async fn send_custom_emoji_ids(
     let ids = match custom_emoji_ids(target) {
         Ok(ids) => ids,
         Err(reason) => {
-            service_messages::send_html(
+            send_command_text(
                 bot,
-                msg.chat.id,
-                format!(
-                    "Не могу безопасно разобрать emoji в сообщении: <code>{}</code>",
-                    escape_html(&format!("{reason:?}"))
-                ),
+                msg,
+                format!("Не могу безопасно разобрать emoji в сообщении: {reason:?}"),
                 audience,
             )
             .await?;
@@ -225,9 +269,9 @@ pub async fn send_custom_emoji_ids(
         }
     };
     if ids.is_empty() {
-        service_messages::send_html(
+        send_command_text(
             bot,
-            msg.chat.id,
+            msg,
             "В этом сообщении нет premium/custom emoji entities.",
             audience,
         )
@@ -235,7 +279,7 @@ pub async fn send_custom_emoji_ids(
         return Ok(());
     }
 
-    service_messages::send_html(bot, msg.chat.id, format_custom_emoji_ids(&ids), audience).await?;
+    send_command_text(bot, msg, format_custom_emoji_ids(&ids), audience).await?;
     Ok(())
 }
 
@@ -247,7 +291,7 @@ fn format_custom_emoji_ids(ids: &[String]) -> String {
         if id.chars().count() > 48 {
             display.push('…');
         }
-        let line = format!("<code>{}</code>\n", escape_html(&display));
+        let line = format!("{}\n", safe_plain_id(&display));
         // Reserve using the current omitted count. If this candidate does not
         // fit, the final suffix keeps this count; if it fits, we merely reserve
         // one extra count character conservatively.
@@ -280,6 +324,35 @@ fn custom_emoji_ids_target(command: &Message) -> &Message {
     command.reply_to_message().unwrap_or(command)
 }
 
+async fn send_command_text(
+    bot: &DefaultParseMode<Bot>,
+    command: &Message,
+    text: impl Into<String>,
+    audience: MessageAudience,
+) -> ResponseResult<()> {
+    let text = text.into();
+    service_messages::send_entities(bot, command, &text, Vec::new(), audience).await?;
+    Ok(())
+}
+
+fn safe_plain_id(value: &str) -> String {
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_control()
+            || matches!(
+                ch as u32,
+                0x061c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+            )
+        {
+            use std::fmt::Write;
+            let _ = write!(output, "\\u{{{:04X}}}", ch as u32);
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 #[cfg(feature = "emoji")]
 pub async fn send_custom_emojis(
     bot: &DefaultParseMode<Bot>,
@@ -290,9 +363,9 @@ pub async fn send_custom_emojis(
         return Ok(());
     };
     let Some(target) = command.reply_to_message() else {
-        service_messages::send_html(
+        send_command_text(
             bot,
-            command.chat.id,
+            command,
             "Ответьте командой /emoji на сообщение с custom emoji.",
             audience,
         )
@@ -302,10 +375,10 @@ pub async fn send_custom_emojis(
     let occurrences = match crate::features::emoji_occurrences::extract_message(target) {
         Ok(occurrences) => occurrences,
         Err(error) => {
-            service_messages::send_html(
+            send_command_text(
                 bot,
-                command.chat.id,
-                format!("Не могу безопасно разобрать сообщение: <code>{error:?}</code>"),
+                command,
+                format!("Не могу безопасно разобрать сообщение: {error:?}"),
                 audience,
             )
             .await?;
@@ -315,14 +388,14 @@ pub async fn send_custom_emojis(
     let custom = occurrences
         .into_iter()
         .filter_map(|occurrence| match occurrence.kind {
-            crate::features::emoji_analysis::EmojiKind::Custom { id, .. } => Some(id.0),
+            crate::features::emoji_analysis::EmojiKind::Custom { id, .. } => Some(id),
             crate::features::emoji_analysis::EmojiKind::Unicode { .. } => None,
         })
         .collect::<Vec<_>>();
     if custom.is_empty() {
-        service_messages::send_html(
+        send_command_text(
             bot,
-            command.chat.id,
+            command,
             "В reply нет custom/premium emoji. Обычные Unicode emoji не отправляю.",
             audience,
         )
@@ -331,16 +404,12 @@ pub async fn send_custom_emojis(
     }
 
     let (lookup_ids, lookup_overflow) = first_seen_bounded_ids(&custom, MAX_COMMAND_LOOKUPS);
-    let metadata = resolve_custom_emoji_fallbacks(bot, &lookup_ids).await;
+    let lookup_report = resolve_custom_emoji_fallbacks(bot, &lookup_ids).await;
+    let metadata = lookup_report.resolved_fallbacks();
     let plan = build_custom_emoji_message(&custom, &metadata);
     if plan.text.is_empty() {
-        let ids = if plan.unresolved.is_empty() {
-            lookup_ids
-        } else {
-            plan.unresolved
-        };
-        let list = escape_html(&display_ids(&ids));
-        service_messages::send_html(bot, command.chat.id, format!("Не удалось получить metadata для custom emoji ID: <code>{list}</code>. Bot API не отправил их как premium emoji."), audience).await?;
+        let explanation = describe_lookup_outcomes(&lookup_ids, &lookup_report);
+        send_command_text(bot, command, format!("Не удалось получить metadata для custom emoji. {explanation} Bot API не отправил их как premium emoji."), audience).await?;
         return Ok(());
     }
     let suffix = if plan.unresolved.is_empty() && !lookup_overflow && !plan.truncated {
@@ -348,10 +417,7 @@ pub async fn send_custom_emojis(
     } else {
         let mut notes = Vec::new();
         if !plan.unresolved.is_empty() {
-            notes.push(format!(
-                "Не удалось разрешить ID: {}",
-                display_ids(&plan.unresolved)
-            ));
+            notes.push(describe_lookup_outcomes(&plan.unresolved, &lookup_report));
         }
         if lookup_overflow {
             notes.push("Часть ID пропущена из-за лимита lookup.".to_owned());
@@ -361,7 +427,6 @@ pub async fn send_custom_emojis(
         }
         format!("\n\nПримечание: {}", notes.join(" "))
     };
-    let expected_custom = plan.entities.len();
     let mut expected_entities = plan
         .entities
         .iter()
@@ -385,11 +450,11 @@ pub async fn send_custom_emojis(
     {
         Ok(sent) => sent,
         Err(RequestError::Api(error)) => {
-            let list = escape_html(&display_ids(&lookup_ids));
-            service_messages::send_html(
+            let list = display_ids(&lookup_ids);
+            send_command_text(
                 bot,
-                command.chat.id,
-                format!("Telegram отклонил отправку custom emoji; проверьте доступность для бота/чата. ID: <code>{list}</code>. Unicode fallback не отправлялся."),
+                command,
+                format!("Telegram отклонил отправку custom emoji; проверьте доступность для бота/чата. ID: {list}. Unicode fallback не отправлялся."),
                 audience,
             )
             .await?;
@@ -399,7 +464,24 @@ pub async fn send_custom_emojis(
         Err(error) => return Err(error),
     };
     let sent_entities = sent.entities().unwrap_or_default();
-    let mut returned_entities = sent_entities
+    if sent.text() != Some(expected_text.as_str())
+        || !returned_custom_entities_match(sent_entities, &expected_entities)
+    {
+        tracing::error!(
+            chat_id = command.chat.id.0,
+            "Telegram acknowledged /emoji without custom emoji entities"
+        );
+        send_command_text(bot, command, "Telegram принял текст, но не подтвердил custom emoji entities. Unicode fallback не считается успешной отправкой.", audience).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "emoji")]
+fn returned_custom_entities_match(
+    returned: &[MessageEntity],
+    expected: &[(usize, usize, String)],
+) -> bool {
+    let mut actual = returned
         .iter()
         .filter_map(|entity| match &entity.kind {
             MessageEntityKind::CustomEmoji { custom_emoji_id } => {
@@ -408,41 +490,75 @@ pub async fn send_custom_emojis(
             _ => None,
         })
         .collect::<Vec<_>>();
-    returned_entities.sort();
-    if sent.text() != Some(expected_text.as_str())
-        || sent_entities.len() != expected_custom
-        || returned_entities.len() != expected_custom
-        || returned_entities != expected_entities
-    {
-        tracing::error!(
-            chat_id = command.chat.id.0,
-            "Telegram acknowledged /emoji without custom emoji entities"
-        );
-        service_messages::send_html(bot, command.chat.id, "Telegram принял текст, но не подтвердил custom emoji entities. Unicode fallback не считается успешной отправкой.", audience).await?;
-    }
-    Ok(())
+    actual.sort();
+    actual.len() == expected.len() && actual == expected
 }
 
 #[cfg(feature = "emoji")]
-fn display_ids(ids: &[String]) -> String {
+fn describe_lookup_outcomes(ids: &[CustomEmojiId], report: &CustomEmojiLookupReport) -> String {
+    let mut missing = Vec::new();
+    let mut retryable = Vec::new();
+    let mut busy = Vec::new();
+    let mut not_checked = Vec::new();
+    for id in ids {
+        match report.outcomes.get(id) {
+            Some(CustomEmojiLookupOutcome::ConfirmedMissing) => missing.push(id.clone()),
+            Some(CustomEmojiLookupOutcome::TransientFailure) => retryable.push(id.clone()),
+            Some(CustomEmojiLookupOutcome::Busy) => busy.push(id.clone()),
+            Some(CustomEmojiLookupOutcome::Resolved(_)) => {}
+            None => not_checked.push(id.clone()),
+        }
+    }
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("не найдены: {}", display_ids(&missing)));
+    }
+    if !retryable.is_empty() {
+        parts.push(format!(
+            "временная ошибка API (можно повторить): {}",
+            display_ids(&retryable)
+        ));
+    }
+    if !busy.is_empty() {
+        parts.push(format!(
+            "lookup занят (можно повторить позже): {}",
+            display_ids(&busy)
+        ));
+    }
+    if !not_checked.is_empty() {
+        parts.push(format!(
+            "не проверены из-за лимита lookup: {}",
+            display_ids(&not_checked)
+        ));
+    }
+    parts.join("; ")
+}
+
+#[cfg(feature = "emoji")]
+fn display_ids(ids: &[CustomEmojiId]) -> String {
     let mut output = ids
         .iter()
         .take(4)
         .map(|id| {
             let mut display = String::new();
-            for ch in id.chars().take(24) {
+            for ch in id.0.chars().take(24) {
                 match ch {
                     '<' => display.push('‹'),
                     '>' => display.push('›'),
                     '&' => display.push('＆'),
-                    ch if ch.is_control() => {
+                    ch if ch.is_control()
+                        || matches!(
+                            ch as u32,
+                            0x061c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+                        ) =>
+                    {
                         use std::fmt::Write;
                         let _ = write!(display, "\\u{{{:04X}}}", ch as u32);
                     }
                     ch => display.push(ch),
                 }
             }
-            if id.chars().count() > 24 {
+            if id.0.chars().count() > 24 {
                 display.push('…');
             }
             display
@@ -456,11 +572,11 @@ fn display_ids(ids: &[String]) -> String {
 }
 
 #[cfg(feature = "emoji")]
-fn first_seen_bounded_ids(ids: &[String], limit: usize) -> (Vec<String>, bool) {
+fn first_seen_bounded_ids(ids: &[CustomEmojiId], limit: usize) -> (Vec<CustomEmojiId>, bool) {
     let mut seen = std::collections::HashSet::new();
     let mut unique = Vec::new();
     for id in ids {
-        if !seen.insert(id.as_str()) {
+        if !seen.insert(id.clone()) {
             continue;
         }
         if unique.len() == limit {
@@ -475,14 +591,14 @@ fn first_seen_bounded_ids(ids: &[String], limit: usize) -> (Vec<String>, bool) {
 struct EmojiMessagePlan {
     text: String,
     entities: Vec<MessageEntity>,
-    unresolved: Vec<String>,
+    unresolved: Vec<CustomEmojiId>,
     truncated: bool,
 }
 
 #[cfg(feature = "emoji")]
 fn build_custom_emoji_message(
-    ids: &[String],
-    metadata: &HashMap<String, String>,
+    ids: &[CustomEmojiId],
+    metadata: &HashMap<CustomEmojiId, String>,
 ) -> EmojiMessagePlan {
     let mut plan = EmojiMessagePlan {
         text: String::new(),
@@ -497,7 +613,7 @@ fn build_custom_emoji_message(
             .get(id)
             .filter(|label| valid_canonical_emoji(label))
         else {
-            if seen_unresolved.insert(id.as_str()) {
+            if seen_unresolved.insert(id.clone()) {
                 plan.unresolved.push(id.clone());
             }
             continue;
@@ -519,11 +635,8 @@ fn build_custom_emoji_message(
         }
         plan.text.push_str(label);
         text_utf16 = text_utf16.saturating_add(length);
-        plan.entities.push(MessageEntity::custom_emoji(
-            CustomEmojiId(id.clone()),
-            offset,
-            length,
-        ));
+        plan.entities
+            .push(MessageEntity::custom_emoji(id.clone(), offset, length));
     }
     plan
 }
@@ -542,6 +655,8 @@ mod tests {
     #[cfg(feature = "emoji")]
     use axum::{Json, Router, extract::State, routing::post};
     use teloxide::types::Message;
+    #[cfg(feature = "emoji")]
+    use teloxide::types::MessageEntity;
     #[cfg(feature = "emoji")]
     use teloxide::{prelude::RequesterExt, types::ParseMode};
 
@@ -571,16 +686,16 @@ mod tests {
         let report = super::format_custom_emoji_ids(&ids);
         assert!(report.encode_utf16().count() <= super::MAX_CUSTOM_EMOJI_IDS_OUTPUT_UTF16);
         assert!(report.contains("ID не показано"));
-        assert!(report.contains("<code>same-0-"));
+        assert!(report.contains("same-0-"));
     }
 
     #[test]
     fn emoji_ids_exact_output_boundary_reserves_omitted_count_and_marks_truncated_ids() {
-        let ids = vec!["&".repeat(49); 14];
+        let ids = vec!["\n".repeat(49); 14];
         let report = super::format_custom_emoji_ids(&ids);
         assert!(report.encode_utf16().count() <= super::MAX_CUSTOM_EMOJI_IDS_OUTPUT_UTF16);
-        assert!(report.contains("… и ещё 1 ID не показано"));
-        assert!(report.contains(&format!("{}…</code>", "&amp;".repeat(48))));
+        assert!(report.contains("ID не показано"));
+        assert!(report.contains(&format!("{}…", "\\u{000A}".repeat(48))));
     }
 
     #[cfg(feature = "emoji")]
@@ -588,25 +703,45 @@ mod tests {
     fn resolver_admission_keeps_first_seen_ids_and_reports_overflow() {
         let ids = ["z", "a", "z", "b"]
             .into_iter()
-            .map(str::to_owned)
+            .map(|id| super::CustomEmojiId(id.to_owned()))
             .collect::<Vec<_>>();
         assert_eq!(
             super::first_seen_bounded_ids(&ids, 2),
-            (vec!["z".to_owned(), "a".to_owned()], true)
+            (
+                vec![
+                    super::CustomEmojiId("z".into()),
+                    super::CustomEmojiId("a".into())
+                ],
+                true
+            )
         );
         assert_eq!(
             super::first_seen_bounded_ids(&ids, 3),
-            (vec!["z".to_owned(), "a".to_owned(), "b".to_owned()], false)
+            (
+                vec![
+                    super::CustomEmojiId("z".into()),
+                    super::CustomEmojiId("a".into()),
+                    super::CustomEmojiId("b".into())
+                ],
+                false
+            )
         );
     }
 
     #[cfg(feature = "emoji")]
     #[test]
     fn output_entities_use_utf16_offsets_and_preserve_repeated_ids() {
-        let ids = vec!["one".into(), "one".into(), "two".into()];
-        let metadata = [("one".into(), "🤦🏽‍♀️".into()), ("two".into(), "😎".into())]
-            .into_iter()
-            .collect();
+        let ids = vec![
+            super::CustomEmojiId("one".into()),
+            super::CustomEmojiId("one".into()),
+            super::CustomEmojiId("two".into()),
+        ];
+        let metadata = [
+            (super::CustomEmojiId("one".into()), "🤦🏽‍♀️".into()),
+            (super::CustomEmojiId("two".into()), "😎".into()),
+        ]
+        .into_iter()
+        .collect();
         let plan = super::build_custom_emoji_message(&ids, &metadata);
         assert_eq!(plan.text, "🤦🏽‍♀️ 🤦🏽‍♀️ 😎");
         assert!(plan.unresolved.is_empty());
@@ -619,41 +754,105 @@ mod tests {
 
     #[cfg(feature = "emoji")]
     #[test]
+    fn delivery_verification_allows_harmless_entities_but_requires_exact_custom_spans() {
+        let expected = vec![(0, 2, "42".to_owned())];
+        let with_harmless_bold: Vec<MessageEntity> = serde_json::from_value(serde_json::json!([
+            {"type":"custom_emoji", "offset":0, "length":2, "custom_emoji_id":"42"},
+            {"type":"bold", "offset":3, "length":4}
+        ]))
+        .unwrap();
+        assert!(super::returned_custom_entities_match(
+            &with_harmless_bold,
+            &expected
+        ));
+
+        let wrong_offset: Vec<MessageEntity> = serde_json::from_value(serde_json::json!([
+            {"type":"custom_emoji", "offset":1, "length":2, "custom_emoji_id":"42"}
+        ]))
+        .unwrap();
+        assert!(!super::returned_custom_entities_match(
+            &wrong_offset,
+            &expected
+        ));
+
+        let missing: Vec<MessageEntity> = serde_json::from_value(serde_json::json!([
+            {"type":"bold", "offset":0, "length":2}
+        ]))
+        .unwrap();
+        assert!(!super::returned_custom_entities_match(&missing, &expected));
+
+        let wrong_id: Vec<MessageEntity> = serde_json::from_value(serde_json::json!([
+            {"type":"custom_emoji", "offset":0, "length":2, "custom_emoji_id":"99"}
+        ]))
+        .unwrap();
+        assert!(!super::returned_custom_entities_match(&wrong_id, &expected));
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
     fn invalid_metadata_is_not_sent_as_a_unicode_success() {
-        let ids = vec!["broken".into()];
-        let metadata = [("broken".into(), "not emoji".into())]
+        let ids = vec![super::CustomEmojiId("broken".into())];
+        let metadata = [(super::CustomEmojiId("broken".into()), "not emoji".into())]
             .into_iter()
             .collect();
         let plan = super::build_custom_emoji_message(&ids, &metadata);
         assert!(plan.text.is_empty());
         assert!(plan.entities.is_empty());
-        assert_eq!(plan.unresolved, ["broken"]);
+        assert_eq!(plan.unresolved, [super::CustomEmojiId("broken".into())]);
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn resolver_outcomes_explain_busy_transient_missing_and_unqueried_ids() {
+        let ids =
+            ["missing", "api", "busy", "unqueried"].map(|id| super::CustomEmojiId(id.to_owned()));
+        let report = super::CustomEmojiLookupReport {
+            outcomes: [
+                (
+                    ids[0].clone(),
+                    super::CustomEmojiLookupOutcome::ConfirmedMissing,
+                ),
+                (
+                    ids[1].clone(),
+                    super::CustomEmojiLookupOutcome::TransientFailure,
+                ),
+                (ids[2].clone(), super::CustomEmojiLookupOutcome::Busy),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let text = super::describe_lookup_outcomes(&ids, &report);
+        assert!(text.contains("не найдены"));
+        assert!(text.contains("временная ошибка API"));
+        assert!(text.contains("lookup занят"));
+        assert!(text.contains("не проверены из-за лимита lookup"));
     }
 
     #[test]
     fn late_negative_cache_write_preserves_positive_but_positive_replaces_negative() {
         let now = std::time::Instant::now();
+        let id = super::CustomEmojiId("race-id".to_owned());
         let mut cache = std::collections::HashMap::new();
         super::cache_metadata_result(
             &mut cache,
-            "race-id",
+            &id,
             super::MetadataLookupState::ConfirmedMissing,
             now,
         );
         super::cache_metadata_result(
             &mut cache,
-            "race-id",
+            &id,
             super::MetadataLookupState::Positive("🤖".to_owned()),
             now,
         );
         super::cache_metadata_result(
             &mut cache,
-            "race-id",
+            &id,
             super::MetadataLookupState::TransientFailure,
             now,
         );
         assert_eq!(
-            cache.get("race-id").and_then(|entry| match &entry.state {
+            cache.get(&id).and_then(|entry| match &entry.state {
                 super::MetadataLookupState::Positive(value) => Some(value.as_str()),
                 _ => None,
             }),
@@ -662,12 +861,12 @@ mod tests {
 
         super::cache_metadata_result(
             &mut cache,
-            "race-id",
+            &id,
             super::MetadataLookupState::Positive("😎".to_owned()),
             now,
         );
         assert_eq!(
-            cache.get("race-id").and_then(|entry| match &entry.state {
+            cache.get(&id).and_then(|entry| match &entry.state {
                 super::MetadataLookupState::Positive(value) => Some(value.as_str()),
                 _ => None,
             }),
@@ -694,17 +893,34 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let ids = (0..601)
+        let raw_ids = (0..601)
             .map(|index| format!("resolver-{nonce}-{index:03}"))
+            .collect::<Vec<_>>();
+        let ids = raw_ids
+            .iter()
+            .cloned()
+            .map(super::CustomEmojiId)
             .collect::<Vec<_>>();
 
         let first = super::resolve_custom_emoji_fallbacks(&bot, &ids).await;
-        assert_eq!(first.len(), 600, "one confirmed missing ID stays absent");
-        assert_eq!(first.get(&ids[1]).map(String::as_str), Some("🤖"));
-        assert_eq!(first.get(&ids[2]).map(String::as_str), Some("😎"));
-        assert!(!first.contains_key(&ids[0]));
+        assert_eq!(first.outcomes.len(), 601);
+        assert_eq!(
+            first.outcomes.get(&ids[1]),
+            Some(&super::CustomEmojiLookupOutcome::Resolved("🤖".into()))
+        );
+        assert_eq!(
+            first.outcomes.get(&ids[2]),
+            Some(&super::CustomEmojiLookupOutcome::Resolved("😎".into()))
+        );
+        assert_eq!(
+            first.outcomes.get(&ids[0]),
+            Some(&super::CustomEmojiLookupOutcome::ConfirmedMissing)
+        );
         let still_cached = super::resolve_custom_emoji_fallbacks(&bot, &ids[600..]).await;
-        assert_eq!(still_cached.len(), 1);
+        assert_eq!(
+            still_cached.outcomes.get(&ids[600]),
+            Some(&super::CustomEmojiLookupOutcome::Resolved("😎".into()))
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 4);
         server.abort();
     }

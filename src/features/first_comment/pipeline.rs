@@ -487,10 +487,25 @@ async fn resolve_comment_emoji_fallback(
     config: &Config,
 ) -> Option<String> {
     let requested = crate::features::first_comment::render::pick_comment_emoji(comment, config)?;
-    let resolved =
-        crate::telegram::custom_emoji::resolve_custom_emoji_fallbacks(bot, &[requested.to_owned()])
-            .await;
-    resolved.get(requested).cloned()
+    let requested_id = teloxide::types::CustomEmojiId(requested.to_owned());
+    let report = crate::telegram::custom_emoji::resolve_custom_emoji_fallbacks(
+        bot,
+        std::slice::from_ref(&requested_id),
+    )
+    .await;
+    match report.outcomes.get(&requested_id) {
+        Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::Resolved(fallback)) => {
+            Some(fallback.clone())
+        }
+        Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::TransientFailure)
+        | Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::Busy) => {
+            tracing::debug!("custom emoji metadata lookup was deferred or transiently unavailable");
+            None
+        }
+        Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::ConfirmedMissing) | None => {
+            None
+        }
+    }
 }
 
 async fn deliver_prepared_post_comment(

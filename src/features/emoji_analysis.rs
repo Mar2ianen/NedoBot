@@ -94,6 +94,20 @@ pub enum CustomEmojiProvenance {
     UrlFallback,
 }
 
+impl CustomEmojiProvenance {
+    /// Union two independently observed representations of the same custom
+    /// emoji occurrence. Repeating a URL fallback cannot fabricate native
+    /// entity provenance.
+    pub fn merge(self, other: Self) -> Self {
+        use CustomEmojiProvenance::{Native, NativeWithUrlFallback as Both, UrlFallback as Url};
+        match (self, other) {
+            (Native, Url) | (Url, Native) | (Both, _) | (_, Both) => Both,
+            (Native, Native) => Native,
+            (Url, Url) => Url,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EmojiKind {
     Unicode {
@@ -513,8 +527,8 @@ pub fn analyze_telegram_text(
             fallback.id.0.clone(),
         );
         if let Some(index) = known_spans.get(&key).copied() {
-            let native = &mut custom[index];
-            native.provenance = CustomEmojiProvenance::NativeWithUrlFallback;
+            let matched = &mut custom[index];
+            matched.provenance = matched.provenance.merge(CustomEmojiProvenance::UrlFallback);
         } else {
             if custom.len() >= MAX_CUSTOM_EMOJI_SPANS {
                 return Err(EmojiAnalysisError::TooManyCustomEmojiSpans);
@@ -749,6 +763,44 @@ mod tests {
                 .has_custom_url_fallback()
         );
         assert_eq!(analysis.metrics.custom_count, 1);
+    }
+
+    #[test]
+    fn repeated_url_fallbacks_do_not_fabricate_native_provenance() {
+        let fallback: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"
+        }))
+        .unwrap();
+        let analysis = analyze_telegram_text("😀", &[fallback.clone(), fallback]).unwrap();
+        assert_eq!(analysis.occurrences.len(), 1);
+        assert_eq!(
+            analysis.occurrences[0].kind.encoding(),
+            EmojiEncoding::CustomUrlFallback
+        );
+    }
+
+    #[test]
+    fn native_provenance_survives_repeated_matching_url_fallbacks() {
+        let native = MessageEntity::custom_emoji("42".into(), 0, 2);
+        let fallback: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"
+        }))
+        .unwrap();
+        let analysis = analyze_telegram_text("😀", &[native, fallback.clone(), fallback]).unwrap();
+        assert_eq!(analysis.occurrences.len(), 1);
+        assert_eq!(
+            analysis.occurrences[0].kind.encoding(),
+            EmojiEncoding::NativeCustomWithUrlFallback
+        );
+    }
+
+    #[test]
+    fn provenance_union_is_idempotent_and_symmetric() {
+        use CustomEmojiProvenance::{Native, NativeWithUrlFallback as Both, UrlFallback as Url};
+        assert_eq!(Url.merge(Url), Url);
+        assert_eq!(Native.merge(Url), Both);
+        assert_eq!(Url.merge(Native), Both);
+        assert_eq!(Both.merge(Url), Both);
     }
 
     #[test]

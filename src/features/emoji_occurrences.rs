@@ -3,8 +3,9 @@
 //! Offsets for ordinary text/captions are relative to the Telegram field and
 //! therefore use Telegram's UTF-16 coordinates. Rich text offsets are relative
 //! to the addressed leaf because Bot API rich blocks have no message-wide text
-//! coordinate system. Reply, reaction, quote, and profile-status references are
-//! kept separate from authored body occurrences.
+//! coordinate system. A projected custom-emoji URL label that crosses leaves
+//! includes its source leaf ranges. Reply, reaction, quote, and profile-status
+//! references are kept separate from authored body occurrences.
 
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -25,6 +26,7 @@ const MAX_TRAVERSAL_NODES: usize = 8_192;
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 const MAX_TRAVERSAL_PATH_BYTES: usize = 256 * 1_024;
 const MAX_SINGLE_PATH_BYTES: usize = 4_096;
+const MAX_RICH_URL_LABEL_BYTES: usize = 4_096;
 const MAX_TOTAL_TEXT_BYTES: usize = 256 * 1_024;
 const MAX_TOTAL_OCCURRENCES: usize = 8_192;
 const MAX_TOTAL_CUSTOM_EMOJI: usize = 2_048;
@@ -87,6 +89,24 @@ pub struct EmojiOccurrence {
     pub kind: EmojiKind,
     pub fallback: String,
     pub source: ContentSource,
+    pub path: String,
+    pub coordinate_scope: CoordinateScope,
+    /// Source leaf ranges for a projected URL label that crosses rich leaves.
+    /// Empty for Telegram fields and single-leaf rich occurrences.
+    pub source_ranges: Vec<RichTextSourceRange>,
+    pub utf8_range: Range<usize>,
+    pub utf16_range: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinateScope {
+    TelegramField,
+    RichTextLeaf,
+    RichUrlLabel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RichTextSourceRange {
     pub path: String,
     pub utf8_range: Range<usize>,
     pub utf16_range: Range<usize>,
@@ -159,6 +179,8 @@ fn append_telegram_text(
                 fallback: item.fallback,
                 source,
                 path: path.to_owned(),
+                coordinate_scope: CoordinateScope::TelegramField,
+                source_ranges: Vec::new(),
                 utf8_range: item.utf8_range,
                 utf16_range: item.utf16_range,
             }),
@@ -752,6 +774,8 @@ fn append_leaf(
                 fallback: item.fallback,
                 source: ContentSource::RichMessage,
                 path: path.to_owned(),
+                coordinate_scope: CoordinateScope::RichTextLeaf,
+                source_ranges: Vec::new(),
                 utf8_range: item.utf8_range,
                 utf16_range: item.utf16_range,
             }),
@@ -769,7 +793,13 @@ struct RichLabelEvidence {
     utf16_len: usize,
     native_custom: Vec<CustomEmojiInput>,
     url_fallbacks: Vec<RichUrlFallback>,
-    contains_unknown: bool,
+    segments: Vec<RichLabelSegment>,
+}
+
+struct RichLabelSegment {
+    path: String,
+    utf8_range: Range<usize>,
+    utf16_range: Range<usize>,
 }
 
 struct RichUrlFallback {
@@ -993,7 +1023,17 @@ fn collect_rich_label(
                 evidence,
             )?,
             RichTextObject::Anchor(_) => {}
-            RichTextObject::Unknown(_) => evidence.contains_unknown = true,
+            RichTextObject::Unknown(_) => {
+                // Keep unknown content as an explicit grapheme boundary so
+                // known text on either side cannot form a synthetic emoji.
+                if evidence.text.len().saturating_add('\u{FFFC}'.len_utf8())
+                    > MAX_RICH_URL_LABEL_BYTES
+                {
+                    return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+                }
+                evidence.text.push('\u{FFFC}');
+                evidence.utf16_len = evidence.utf16_len.saturating_add(1);
+            }
         },
     }
     Ok(())
@@ -1001,18 +1041,25 @@ fn collect_rich_label(
 
 fn append_rich_label_text(
     text: &str,
-    _path: &str,
+    path: &str,
     budget: &mut TraversalBudget,
     evidence: &mut RichLabelEvidence,
 ) -> Result<(), EmojiAnalysisError> {
     budget.charge_text(text)?;
-    if evidence.text.len().saturating_add(text.len()) > MAX_SINGLE_PATH_BYTES {
+    if evidence.text.len().saturating_add(text.len()) > MAX_RICH_URL_LABEL_BYTES {
         return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
     }
+    let start_byte = evidence.text.len();
+    let start_utf16 = evidence.utf16_len;
     evidence.text.push_str(text);
     evidence.utf16_len = evidence
         .utf16_len
         .saturating_add(text.encode_utf16().count());
+    evidence.segments.push(RichLabelSegment {
+        path: path.to_owned(),
+        utf8_range: start_byte..evidence.text.len(),
+        utf16_range: start_utf16..evidence.utf16_len,
+    });
     Ok(())
 }
 
@@ -1023,9 +1070,6 @@ fn append_rich_label_evidence(
     budget: &mut TraversalBudget,
 ) -> Result<(), EmojiAnalysisError> {
     for fallback in evidence.url_fallbacks {
-        if evidence.contains_unknown {
-            break;
-        }
         let Some(label) = evidence.text.get(fallback.utf8_range.clone()) else {
             continue;
         };
@@ -1037,7 +1081,7 @@ fn append_rich_label_evidence(
             .iter_mut()
             .find(|native| native.utf16_range == fallback.utf16_range && native.id == fallback.id);
         if let Some(native) = same_native {
-            native.provenance = CustomEmojiProvenance::NativeWithUrlFallback;
+            native.provenance = native.provenance.merge(CustomEmojiProvenance::UrlFallback);
         } else {
             evidence.native_custom.push(CustomEmojiInput {
                 id: fallback.id,
@@ -1053,16 +1097,69 @@ fn append_rich_label_evidence(
         analysis
             .occurrences
             .into_iter()
-            .map(|item| EmojiOccurrence {
-                kind: item.kind,
-                fallback: item.fallback,
-                source: ContentSource::RichMessage,
-                path: path.to_owned(),
-                utf8_range: item.utf8_range,
-                utf16_range: item.utf16_range,
-            }),
+            .map(|item| map_rich_label_occurrence(item, path, &evidence.text, &evidence.segments)),
     );
     Ok(())
+}
+
+fn map_rich_label_occurrence(
+    item: emoji_analysis::EmojiOccurrence,
+    path: &str,
+    text: &str,
+    segments: &[RichLabelSegment],
+) -> EmojiOccurrence {
+    let containing = segments.iter().find(|segment| {
+        segment.utf8_range.start <= item.utf8_range.start
+            && item.utf8_range.end <= segment.utf8_range.end
+    });
+    if let Some(segment) = containing {
+        let byte_start = item.utf8_range.start - segment.utf8_range.start;
+        let byte_end = item.utf8_range.end - segment.utf8_range.start;
+        let prefix_utf16 = text[segment.utf8_range.start..item.utf8_range.start]
+            .encode_utf16()
+            .count();
+        let occurrence_utf16_len = text[item.utf8_range.clone()].encode_utf16().count();
+        let local_utf16_start = item.utf16_range.start - segment.utf16_range.start - prefix_utf16;
+        let local_utf16_end = local_utf16_start + occurrence_utf16_len;
+        return EmojiOccurrence {
+            kind: item.kind,
+            fallback: item.fallback,
+            source: ContentSource::RichMessage,
+            path: segment.path.clone(),
+            coordinate_scope: CoordinateScope::RichTextLeaf,
+            source_ranges: Vec::new(),
+            utf8_range: byte_start..byte_end,
+            utf16_range: local_utf16_start..local_utf16_end,
+        };
+    }
+
+    let source_ranges = segments
+        .iter()
+        .filter_map(|segment| {
+            let start = item.utf8_range.start.max(segment.utf8_range.start);
+            let end = item.utf8_range.end.min(segment.utf8_range.end);
+            if start >= end {
+                return None;
+            }
+            let prefix_utf16 = text[segment.utf8_range.start..start].encode_utf16().count();
+            let range_utf16 = text[start..end].encode_utf16().count();
+            Some(RichTextSourceRange {
+                path: segment.path.clone(),
+                utf8_range: start - segment.utf8_range.start..end - segment.utf8_range.start,
+                utf16_range: prefix_utf16..prefix_utf16 + range_utf16,
+            })
+        })
+        .collect();
+    EmojiOccurrence {
+        kind: item.kind,
+        fallback: item.fallback,
+        source: ContentSource::RichMessage,
+        path: path.to_owned(),
+        coordinate_scope: CoordinateScope::RichUrlLabel,
+        source_ranges,
+        utf8_range: item.utf8_range,
+        utf16_range: item.utf16_range,
+    }
 }
 
 pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
@@ -1352,6 +1449,89 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_nested_url_fallbacks_do_not_fabricate_native_provenance() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=99", "text":[
+                {"type":"url", "url":"tg://emoji?id=42", "text":"😀"},
+                {"type":"url", "url":"tg://emoji?id=42", "text":"😀"}
+            ]}}
+        ]}))
+        .unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|item| {
+            item.kind.identity() == EmojiIdentity::Custom("42".into())
+                && item.kind.encoding() == EmojiEncoding::CustomUrlFallback
+        }));
+    }
+
+    #[test]
+    fn nested_native_and_multiple_matching_urls_merge_provenance_idempotently() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":{
+                "type":"url", "url":"tg://emoji?id=42", "text":{
+                    "type":"custom_emoji", "custom_emoji_id":"42", "alternative_text":"😀"
+                }
+            }}}
+        ]}))
+        .unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].kind.encoding(),
+            EmojiEncoding::NativeCustomWithUrlFallback
+        );
+    }
+
+    #[test]
+    fn rejected_rich_url_label_keeps_leaf_relative_path_and_ranges() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":[
+                "prefix ", {"type":"bold", "text":"😀"}
+            ]}}
+        ]}))
+        .unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].kind.identity(),
+            EmojiIdentity::Unicode("😀".into())
+        );
+        assert!(found[0].path.ends_with(".url.text[1].bold"));
+        assert_eq!(found[0].coordinate_scope, CoordinateScope::RichTextLeaf);
+        assert_eq!(found[0].utf8_range, 0..4);
+        assert_eq!(found[0].utf16_range, 0..2);
+        assert!(found[0].source_ranges.is_empty());
+    }
+
+    #[test]
+    fn cross_leaf_url_fallback_exposes_projected_coordinates_and_source_map() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":[
+                "👩", "‍", "💻"
+            ]}}
+        ]}))
+        .unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind.identity(), EmojiIdentity::Custom("42".into()));
+        assert_eq!(found[0].coordinate_scope, CoordinateScope::RichUrlLabel);
+        assert_eq!(
+            found[0].path,
+            "rich_message.blocks[0].paragraph.text.url.text"
+        );
+        assert_eq!(found[0].utf8_range, 0.."👩‍💻".len());
+        assert_eq!(found[0].source_ranges.len(), 3);
+        assert_eq!(found[0].source_ranges[0].utf8_range, 0.."👩".len());
+        assert_eq!(found[0].source_ranges[1].utf8_range, 0.."‍".len());
+        assert_eq!(found[0].source_ranges[2].utf8_range, 0.."💻".len());
+    }
+
+    #[test]
     fn rich_url_label_nodes_share_the_callers_traversal_budget() {
         let mut label = vec![json!(""); MAX_TRAVERSAL_NODES];
         label.push(json!("😀"));
@@ -1376,6 +1556,21 @@ mod tests {
             EmojiIdentity::Unicode("😀".into())
         );
         assert!(!found[0].kind.encoding().has_custom_url_fallback());
+    }
+
+    #[test]
+    fn unknown_rich_node_is_a_boundary_between_emoji_graphemes() {
+        let value = json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":[
+                "👩", {"type":"future_object", "payload":"unknown"}, "‍💻"
+            ]}}
+        ]});
+        let found = extract_rich_value(value).unwrap();
+        assert!(
+            found
+                .iter()
+                .all(|item| { item.kind.identity() != EmojiIdentity::Custom("42".into()) })
+        );
     }
 
     #[test]

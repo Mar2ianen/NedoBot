@@ -2,8 +2,10 @@
 
 The `emoji` Cargo feature enables deterministic extraction and descriptive
 metrics for Unicode emoji and Telegram custom-emoji entities. It is opt-in and
-is not part of the default release profile. Enabling it adds no worker, API
-request, persistence, command, or moderation policy by itself.
+is not part of the default release profile. The feature itself adds no worker,
+persistence, or moderation policy. When enabled, its `/emoji` command and the
+first-comment custom-emoji renderer can make bounded metadata requests to the
+Bot API when those consumers are invoked.
 
 Unicode recognition is pinned to `emojis = 0.9.1` (Unicode Emoji 18.0) and
 grapheme boundaries to `unicode-segmentation = 1.13.3`. The analyzer recognizes
@@ -22,11 +24,13 @@ using the exact client compatibility URI `tg://emoji?id=<positive decimal
 u64>` is counted as a custom occurrence only when its complete label is one
 recognized Unicode emoji grapheme. IDs are canonicalized as decimal strings;
 the occurrence records `CustomUrlFallback` encoding provenance. A native
-custom-emoji entity at the same span and ID wins and records the fallback as
-additional provenance. Plain text URLs, malformed candidates, invalid spans,
-and non-emoji labels do not become custom occurrences. Validated text/caption
-fallback-only targets are omitted from `message_url_targets` by exact ID, span,
-and label correlation, while raw URL evidence remains available for audit.
+custom-emoji entity at the same span and ID merges with the URL evidence as
+`NativeWithUrlFallback`; duplicate URL-only evidence remains URL-only. Plain
+text URLs, malformed candidates, invalid spans, and non-emoji labels do not
+become custom occurrences. Validated text/caption URL fallback targets,
+including a matching native entity at the same ID and span, are omitted from
+`message_url_targets` by exact ID, span, and label correlation, while raw URL
+evidence remains available for audit.
 RichMessage URL findings stay in URL targets until the adapter exposes a stable
 per-node join key, avoiding suppression based only on a repeated label. This
 is compatibility with a known client format, not a
@@ -42,22 +46,26 @@ feature; reply to a message to have the bot resolve and send premium custom
 emoji entities. Resolution keeps occurrence order and duplicates, limits API
 metadata lookup to the first 200 distinct IDs, and limits the outgoing message
 to 100 entities and 2,800 UTF-16 units before its explanatory suffix. The
-metadata cache is an optimization only: it distinguishes positive, confirmed
-missing, and transient-error entries, while each call retains its own positive
-results even if the bounded cache evicts them.
+resolver returns per-ID outcomes for resolved, confirmed-missing, transient API
+failure, and local lookup-busy states; `/emoji` reports retryable outcomes
+separately from confirmed absence. The bounded metadata cache distinguishes
+positive, confirmed-missing, and transient-error entries, while each call
+retains its own positive results even if the cache evicts them. First-comment
+rendering remains best effort and records deferred/transient lookup at debug
+level.
 
 `/qr` is registered only with `moderation` and still requires the per-instance
 QR evidence setting. It accepts supported, unprotected image replies from the
 same chat only when the stored media snapshot is present and matches both
 message scope and file unique ID before download and again before display. A
-two-slot admission limit bounds concurrent manual downloads; each image and
+two-slot admission limit bounds concurrent manual downloads; the command and
+background worker share one bounded download/decode helper. Each image and
 decode also has independent byte, timeout, and CPU limits. Raw QR payload bytes
 are not logged or persisted by the command. Link-like payloads are displayed
-without previews and with reversible punctuation substitutions (`：` for `:`,
-`․` for `.`, and `＠` for `@`; Unicode dot code points are shown as their
-explicit `[U+....]` escapes). The report includes the mapping. Payload text
-that cannot fit completely is reported as omitted with its byte size rather
-than being shown as a truncated URL.
+as reversible UTF-8 hex without previews, so the report does not create a
+clickable URL or rely on Unicode punctuation substitutions. Payload text that
+cannot fit completely is reported as omitted with its byte size rather than
+being shown as a truncated URL.
 
 The feature matrix runs consumer tests with the combined supported feature
 set, covering command registration, `/emoji` output and metadata resolution,

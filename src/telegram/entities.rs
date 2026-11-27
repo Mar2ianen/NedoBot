@@ -258,17 +258,15 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
         })
 }
 
-#[derive(Debug)]
-pub enum CustomEmojiIdsError {
-    #[cfg(feature = "emoji")]
-    Analysis(crate::features::emoji_analysis::EmojiAnalysisError),
-}
+#[cfg(feature = "emoji")]
+pub type CustomEmojiIdsError = crate::features::emoji_analysis::EmojiAnalysisError;
+#[cfg(not(feature = "emoji"))]
+pub type CustomEmojiIdsError = std::convert::Infallible;
 
 pub fn custom_emoji_ids(msg: &Message) -> Result<Vec<String>, CustomEmojiIdsError> {
     #[cfg(feature = "emoji")]
     {
-        let occurrences = crate::features::emoji_occurrences::extract_message(msg)
-            .map_err(CustomEmojiIdsError::Analysis)?;
+        let occurrences = crate::features::emoji_occurrences::extract_message(msg)?;
         Ok(occurrences
             .into_iter()
             .filter_map(|occurrence| match occurrence.kind {
