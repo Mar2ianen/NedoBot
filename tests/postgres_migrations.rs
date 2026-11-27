@@ -195,6 +195,7 @@ async fn clean_test_database_applies_migrations_and_preserves_comment_job_lifecy
         .await
         .expect("local test database must be reachable");
 
+    assert_lols_mirror_retirement_upgrade(&pool).await;
     assert_clean_database_migrations(&pool).await;
     assert_ingest_disabled_is_noop(&pool).await;
     membership_history::assert_membership_history(&pool).await;
@@ -4900,6 +4901,16 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
         .expect("migration ledger must exist");
     assert!(migration_count > 0, "all migrations must be applied");
 
+    let lols_table: Option<String> =
+        query_scalar("select to_regclass('public.lols_spam_users')::text")
+            .fetch_one(pool)
+            .await
+            .expect("retired LOLS mirror lookup must succeed");
+    assert_eq!(
+        lols_table, None,
+        "the unused LOLS mirror table must be removed"
+    );
+
     let captcha_table: Option<String> =
         query_scalar("select to_regclass('public.telegram_risk_captcha_challenges')::text")
             .fetch_one(pool)
@@ -5033,6 +5044,50 @@ async fn assert_clean_database_migrations(pool: &PgPool) {
     assert_eq!(
         spam_reputation_table.as_deref(),
         Some("shared_spam_reputation")
+    );
+}
+
+async fn assert_lols_mirror_retirement_upgrade(pool: &PgPool) {
+    query(
+        r#"
+        create table lols_spam_users (
+            telegram_user_id bigint primary key,
+            first_seen_at timestamptz not null default now(),
+            last_seen_at timestamptz not null default now()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("legacy LOLS mirror fixture must be created");
+    query("insert into lols_spam_users (telegram_user_id) values (42)")
+        .execute(pool)
+        .await
+        .expect("legacy LOLS row must be stored");
+
+    let migration_row = query("delete from _sqlx_migrations where version = $1")
+        .bind(20261127140000_i64)
+        .execute(pool)
+        .await
+        .expect("retirement migration fixture must be staged");
+    assert_eq!(
+        migration_row.rows_affected(),
+        1,
+        "the retirement migration must already be present before simulating upgrade"
+    );
+
+    tg_ai_bot_teloxide::db::migrate(pool)
+        .await
+        .expect("retirement migration must upgrade a populated legacy mirror");
+
+    let lols_table: Option<String> =
+        query_scalar("select to_regclass('public.lols_spam_users')::text")
+            .fetch_one(pool)
+            .await
+            .expect("retired LOLS mirror lookup must succeed");
+    assert_eq!(
+        lols_table, None,
+        "the upgrade must remove the legacy table and its rows"
     );
 }
 

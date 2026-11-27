@@ -18,7 +18,8 @@ pub async fn build_pool() -> anyhow::Result<PgPool> {
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes.
+    // Keep this macro adjacent to migrations so sqlx recompiles embedded migration changes,
+    // including the explicit retirement of the unused LOLS mirror.
     // Touched with each migration addition because SQLx embeds this directory at compile time.
     // Includes the durable profile refresh intent migration.
     // `20261127140000` is allowlisted in the bridge release so a rollback to
