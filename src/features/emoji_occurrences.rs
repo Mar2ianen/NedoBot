@@ -531,6 +531,7 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
         }));
     } else {
         let analysis = emoji_analysis::analyze_telegram_text(&quote.text, &quote.entities)?;
+        ensure_occurrence_budget(&[], &analysis.occurrences)?;
         references.extend(analysis.occurrences.into_iter().map(|item| EmojiReference {
             kind: ReferenceKind::Quote,
             identity: item.identity,

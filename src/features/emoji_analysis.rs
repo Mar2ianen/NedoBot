@@ -78,12 +78,16 @@ pub struct EmojiMetrics {
     pub custom_count: u32,
     pub animated_count: u32,
     pub unknown_format_count: u32,
+    /// Non-emoji graphemes before default-ignorable filtering.
     pub visible_non_emoji_graphemes: u32,
+    /// Non-emoji graphemes visible to moderation after default-ignorable filtering.
     pub moderation_visible_non_emoji_graphemes: u32,
     pub max_consecutive_run: u32,
     pub max_repeat_count: u32,
     pub unique_count: u32,
+    /// Emoji density over raw non-whitespace graphemes.
     pub density: Option<f64>,
+    /// Emoji density excluding graphemes made only of default-ignorable code points.
     pub moderation_density: Option<f64>,
 }
 
