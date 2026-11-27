@@ -9,8 +9,13 @@ if cargo tree --no-default-features --prefix none | rg -q '^emojis v'; then
     echo "emoji data dependency leaked into the no-default build" >&2
     exit 1
 fi
+if cargo tree --no-default-features --prefix none | rg -q '^icu_segmenter v'; then
+    echo "ICU grapheme segmenter leaked into the no-default build" >&2
+    exit 1
+fi
 cargo check --no-default-features --features emoji --lib --locked
 python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --features emoji --lib features::emoji_ --locked
+python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --features emoji-legacy-differential --lib features::emoji_analysis::tests::unicode_segmentation_17_differential_is_an_explicit_unicode_18_change --locked -- --exact
 python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --lib telegram::commands::top_word_tests --locked
 consumer_features=emoji,moderation,ask,manual-moderation,auto-comment,public-mcp
 python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --features "$consumer_features" --lib telegram:: --locked

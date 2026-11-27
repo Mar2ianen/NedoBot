@@ -237,8 +237,7 @@ fn valid_canonical_emoji(value: &str) -> bool {
     }
     #[cfg(feature = "emoji")]
     {
-        use unicode_segmentation::UnicodeSegmentation;
-        value.graphemes(true).count() == 1 && emojis::get(value).is_some()
+        crate::features::emoji_analysis::is_single_grapheme(value) && emojis::get(value).is_some()
     }
     #[cfg(not(feature = "emoji"))]
     {

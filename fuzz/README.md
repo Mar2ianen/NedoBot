@@ -10,6 +10,7 @@ Run in a disposable environment without production tokens or database access:
 cargo +nightly fuzz run stored_message -- -max_total_time=60 -max_len=65536 -rss_limit_mb=2048 -timeout=10
 cargo +nightly fuzz run qr_image -- -max_total_time=60 -max_len=262144 -rss_limit_mb=2048 -timeout=10
 cargo +nightly fuzz run url_parse -- -max_total_time=60 -max_len=16384 -rss_limit_mb=2048 -timeout=10
+cargo +nightly fuzz run emoji_analysis -- -max_total_time=60 -max_len=1048576 -rss_limit_mb=2048 -timeout=10
 ```
 Seed the image corpus with synthetic QR fixtures, not screenshots of real chats.
 Keep minimized synthetic failures and replay commands. Do not upload private

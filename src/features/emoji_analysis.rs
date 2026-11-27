@@ -8,9 +8,34 @@ use std::{
     ops::Range,
 };
 
+use icu_properties::{CodePointSetData, props::DefaultIgnorableCodePoint};
+use icu_segmenter::{GraphemeClusterSegmenter, GraphemeClusterSegmenterBorrowed};
 use teloxide::types::{CustomEmojiId, MessageEntity, MessageEntityKind, Utf16OffsetMap};
 use teloxide_url::TelegramLink;
-use unicode_segmentation::UnicodeSegmentation;
+
+// ICU4X's V1 constructor does not implement GB9c (Indic conjuncts). The pinned
+// 2.4.0 neo segmenter passes the full Unicode 18 GraphemeBreakTest corpus.
+static GRAPHEME_SEGMENTER: GraphemeClusterSegmenterBorrowed<'static> =
+    GraphemeClusterSegmenter::new_neo();
+
+fn grapheme_indices(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut boundaries = GRAPHEME_SEGMENTER.segment_str(text);
+    let mut start = boundaries.next();
+    std::iter::from_fn(move || {
+        let current_start = start?;
+        let end = boundaries.next()?;
+        start = Some(end);
+        Some((current_start, &text[current_start..end]))
+    })
+}
+
+fn graphemes(text: &str) -> impl Iterator<Item = &str> {
+    grapheme_indices(text).map(|(_, grapheme)| grapheme)
+}
+
+pub(crate) fn is_single_grapheme(text: &str) -> bool {
+    graphemes(text).take(2).count() == 1
+}
 
 /// Unicode emoji data version provided by the pinned recognition dataset.
 pub const UNICODE_EMOJI_VERSION: &str = "18.0";
@@ -18,29 +43,6 @@ pub const UNICODE_EMOJI_VERSION: &str = "18.0";
 pub const MAX_TEXT_BYTES: usize = 1_048_576;
 pub const MAX_CUSTOM_EMOJI_SPANS: usize = 2_048;
 pub const MAX_CUSTOM_EMOJI_ID_BYTES: usize = 256;
-
-// Unicode 18.0.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point.
-// Keep this aligned with UNICODE_EMOJI_VERSION; ZWJ sequences are checked as
-// emoji graphemes before this property is used for moderation visibility.
-const DEFAULT_IGNORABLE_RANGES: &[(u32, u32)] = &[
-    (0x00AD, 0x00AD),
-    (0x034F, 0x034F),
-    (0x061C, 0x061C),
-    (0x115F, 0x1160),
-    (0x17B4, 0x17B5),
-    (0x180B, 0x180F),
-    (0x200B, 0x200F),
-    (0x202A, 0x202E),
-    (0x2060, 0x206F),
-    (0x3164, 0x3164),
-    (0xFE00, 0xFE0F),
-    (0xFEFF, 0xFEFF),
-    (0xFFA0, 0xFFA0),
-    (0xFFF0, 0xFFF8),
-    (0x1BCA0, 0x1BCA3),
-    (0x1D173, 0x1D17A),
-    (0xE0000, 0xE0FFF),
-];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EmojiIdentity {
@@ -123,7 +125,7 @@ pub enum EmojiKind {
 impl EmojiKind {
     pub fn identity(&self) -> EmojiIdentity {
         match self {
-            Self::Unicode { sequence } => EmojiIdentity::Unicode(sequence.clone()),
+            Self::Unicode { sequence } => EmojiIdentity::Unicode(canonical_emoji(sequence)),
             Self::Custom { id, .. } => EmojiIdentity::Custom(id.0.clone()),
         }
     }
@@ -239,8 +241,7 @@ pub fn analyze(
     let mut custom_spans: Vec<(Range<usize>, &CustomEmojiInput)> = Vec::new();
     if !custom.is_empty() {
         let boundaries = Utf16OffsetMap::new(text);
-        let grapheme_boundaries: HashSet<_> = text
-            .grapheme_indices(true)
+        let grapheme_boundaries: HashSet<_> = grapheme_indices(text)
             .map(|(byte, _)| byte)
             .chain(std::iter::once(text.len()))
             .collect();
@@ -333,8 +334,7 @@ pub fn analyze(
         }
 
         let remaining = &text[byte..];
-        let grapheme = remaining
-            .graphemes(true)
+        let grapheme = graphemes(remaining)
             .next()
             .expect("non-empty remainder has a grapheme");
         let byte_end = byte + grapheme.len();
@@ -352,7 +352,7 @@ pub fn analyze(
             if emojis::get(grapheme).is_some() {
                 result.metrics.moderation_unicode_count =
                     result.metrics.moderation_unicode_count.saturating_add(1);
-                let identity = EmojiIdentity::Unicode(grapheme.to_owned());
+                let identity = EmojiIdentity::Unicode(canonical_emoji(grapheme));
                 result.occurrences.push(EmojiOccurrence {
                     kind: EmojiKind::Unicode {
                         sequence: grapheme.to_owned(),
@@ -402,10 +402,7 @@ pub fn analyze(
 }
 
 fn is_default_ignorable(character: char) -> bool {
-    let codepoint = character as u32;
-    DEFAULT_IGNORABLE_RANGES
-        .iter()
-        .any(|&(start, end)| (start..=end).contains(&codepoint))
+    CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(character)
 }
 
 /// Returns the moderation identity for a grapheme. Exact Unicode sequences
@@ -413,8 +410,8 @@ fn is_default_ignorable(character: char) -> bool {
 /// ZWJ, variation selectors, and tags get conservative fallback attempts, but
 /// explicit text presentation (VS15) is never discarded.
 fn moderation_emoji(grapheme: &str) -> Option<String> {
-    if emojis::get(grapheme).is_some() {
-        return Some(grapheme.to_owned());
+    if let Some(emoji) = emojis::get(grapheme) {
+        return Some(emoji.as_str().to_owned());
     }
     if grapheme.contains('\u{FE0E}') {
         return None;
@@ -444,7 +441,16 @@ fn moderation_emoji(grapheme: &str) -> Option<String> {
 }
 
 fn recognized_candidate(candidate: &str) -> Option<String> {
-    (!candidate.is_empty() && emojis::get(candidate).is_some()).then(|| candidate.to_owned())
+    (!candidate.is_empty())
+        .then(|| emojis::get(candidate))
+        .flatten()
+        .map(|emoji| emoji.as_str().to_owned())
+}
+
+fn canonical_emoji(sequence: &str) -> String {
+    emojis::get(sequence)
+        .map(|emoji| emoji.as_str().to_owned())
+        .unwrap_or_else(|| sequence.to_owned())
 }
 
 /// Adapts Telegram text/caption entities into the checked pure analyzer.
@@ -512,7 +518,7 @@ pub fn analyze_telegram_text(
         let Some(label) = text.get(span.clone()) else {
             continue;
         };
-        if label.graphemes(true).count() != 1 || emojis::get(label).is_none() {
+        if !is_single_grapheme(label) || emojis::get(label).is_none() {
             continue;
         }
         let fallback = CustomEmojiInput {
@@ -570,6 +576,193 @@ fn add_moderation_occurrence(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    #[cfg(feature = "emoji-legacy-differential")]
+    use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn icu_segmenter_matches_unicode_18_grapheme_break_test() {
+        let mut cases = 0usize;
+        for line in include_str!("../../test-data/unicode/18.0.0/GraphemeBreakTest.txt").lines() {
+            let body = line.split('#').next().unwrap_or_default().trim();
+            if body.is_empty() {
+                continue;
+            }
+            let mut text = String::new();
+            let mut expected = Vec::new();
+            for token in body.split_whitespace() {
+                match token {
+                    "÷" => expected.push(text.len()),
+                    "×" => {}
+                    codepoint => {
+                        let scalar = u32::from_str_radix(codepoint, 16).unwrap();
+                        text.push(char::from_u32(scalar).expect("corpus contains scalar values"));
+                    }
+                }
+            }
+
+            let actual: Vec<_> = grapheme_indices(&text)
+                .map(|(start, _)| start)
+                .chain([text.len()])
+                .collect();
+            assert_eq!(actual, expected, "ICU segmentation for {body}");
+            cases += 1;
+        }
+        eprintln!("ICU4X 2.4.0 neo conforms to {cases} Unicode 18 GraphemeBreakTest cases");
+        assert!(cases > 800, "the official corpus should not be truncated");
+    }
+
+    #[cfg(feature = "emoji-legacy-differential")]
+    #[test]
+    fn unicode_segmentation_17_differential_is_an_explicit_unicode_18_change() {
+        let mut cases = 0usize;
+        let mut legacy_mismatches = 0usize;
+        let mut legacy_difference_examples = Vec::new();
+        for line in include_str!("../../test-data/unicode/18.0.0/GraphemeBreakTest.txt").lines() {
+            let body = line.split('#').next().unwrap_or_default().trim();
+            if body.is_empty() {
+                continue;
+            }
+            let mut text = String::new();
+            let mut expected = Vec::new();
+            for token in body.split_whitespace() {
+                match token {
+                    "÷" => expected.push(text.len()),
+                    "×" => {}
+                    codepoint => text.push(
+                        char::from_u32(u32::from_str_radix(codepoint, 16).unwrap())
+                            .expect("corpus contains scalar values"),
+                    ),
+                }
+            }
+            let legacy: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(start, _)| start)
+                .chain([text.len()])
+                .collect();
+            if legacy != expected {
+                legacy_mismatches += 1;
+                legacy_difference_examples.push(body.to_owned());
+            }
+            cases += 1;
+        }
+        eprintln!(
+            "unicode-segmentation 1.13.3 differs from Unicode 18 in {legacy_mismatches}/{cases} cases: {legacy_difference_examples:?}"
+        );
+        assert_eq!(
+            legacy_mismatches, 10,
+            "review the pinned unicode-segmentation differential before changing its version"
+        );
+    }
+
+    #[test]
+    fn neo_segmenter_applies_indic_conjunct_rule_missing_from_v1() {
+        let indic_conjunct = "\u{094d}\u{0915}";
+        assert_eq!(
+            GraphemeClusterSegmenter::new()
+                .segment_str(indic_conjunct)
+                .collect::<Vec<_>>(),
+            [0, 3, 6]
+        );
+        assert_eq!(
+            grapheme_indices(indic_conjunct)
+                .map(|(start, _)| start)
+                .chain([indic_conjunct.len()])
+                .collect::<Vec<_>>(),
+            [0, 6]
+        );
+    }
+
+    #[test]
+    fn pinned_emoji_recognizer_covers_unicode_18_fully_qualified_emoji_test() {
+        let mut cases = 0usize;
+        for line in include_str!("../../test-data/unicode/18.0.0/emoji-test.txt").lines() {
+            let data = line.split('#').next().unwrap_or_default().trim();
+            let Some((sequence, status)) = data.split_once(';') else {
+                continue;
+            };
+            if status.trim() != "fully-qualified" {
+                continue;
+            }
+            let sequence: String = sequence
+                .split_whitespace()
+                .map(|point| char::from_u32(u32::from_str_radix(point, 16).unwrap()).unwrap())
+                .collect();
+            assert!(
+                emojis::get(&sequence).is_some(),
+                "pinned `emojis` dataset does not recognize Unicode 18 sequence {sequence:?}"
+            );
+            cases += 1;
+        }
+        assert!(
+            cases > 3000,
+            "the official emoji corpus should not be truncated"
+        );
+    }
+
+    #[test]
+    fn pinned_emoji_recognizer_covers_unicode_18_sequence_corpora() {
+        let mut sequence_cases = 0usize;
+        let mut recognized = 0usize;
+        let mut unsupported_examples = Vec::new();
+        for path_data in [
+            include_str!("../../test-data/unicode/18.0.0/emoji-sequences.txt"),
+            include_str!("../../test-data/unicode/18.0.0/emoji-zwj-sequences.txt"),
+        ] {
+            for line in path_data.lines() {
+                let data = line.split('#').next().unwrap_or_default().trim();
+                let Some((codepoints, sequence_type)) = data.split_once(';') else {
+                    continue;
+                };
+                if sequence_type.trim() == "Emoji_Modifier" {
+                    continue;
+                }
+                let tokens: Vec<_> = codepoints.split_whitespace().collect();
+                if tokens.len() == 1 && tokens[0].contains("..") {
+                    let (start, end) = tokens[0].split_once("..").unwrap();
+                    for point in u32::from_str_radix(start, 16).unwrap()
+                        ..=u32::from_str_radix(end, 16).unwrap()
+                    {
+                        let sequence = char::from_u32(point).unwrap().to_string();
+                        if emojis::get(&sequence).is_some() {
+                            recognized += 1;
+                        } else {
+                            unsupported_examples.push(sequence);
+                        }
+                        sequence_cases += 1;
+                    }
+                    continue;
+                }
+                let sequence: String = tokens
+                    .iter()
+                    .map(|point| char::from_u32(u32::from_str_radix(point, 16).unwrap()).unwrap())
+                    .collect();
+                if emojis::get(&sequence).is_some() {
+                    recognized += 1;
+                } else {
+                    unsupported_examples.push(sequence);
+                }
+                sequence_cases += 1;
+            }
+        }
+        assert!(
+            sequence_cases > 3900,
+            "the official emoji sequence corpora should not be truncated"
+        );
+        eprintln!(
+            "Unicode 18 emoji-sequences and emoji-zwj-sequences: {recognized}/{sequence_cases} sequence forms recognized directly; unsupported sample: {:?}",
+            &unsupported_examples[..unsupported_examples.len().min(12)]
+        );
+        assert_eq!(sequence_cases, 3972, "review corpus version changes");
+        assert_eq!(
+            recognized, 3963,
+            "review missing or newly-recognized emoji forms"
+        );
+        assert_eq!(
+            unsupported_examples,
+            ["🏻", "🏼", "🏽", "🏾", "🏿", "🦰", "🦱", "🦲", "🦳"],
+            "only standalone modifier and hair components are intentionally absent"
+        );
+    }
 
     #[test]
     fn recognizes_flags_skin_tones_keycaps_and_zwj_sequences() {
@@ -580,6 +773,24 @@ mod tests {
                 "expected one occurrence for {sequence}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_emoji_identity_groups_qualification_without_losing_input() {
+        let unqualified = "\u{1f43f}";
+        let canonical = emojis::get(unqualified).unwrap().as_str();
+        assert_ne!(unqualified, canonical);
+
+        let text = format!("{unqualified} {canonical}");
+        let analysis = analyze(&text, &[]).unwrap();
+        assert_eq!(analysis.occurrences.len(), 2);
+        assert_eq!(analysis.occurrences[0].fallback, unqualified);
+        assert_eq!(analysis.occurrences[1].fallback, canonical);
+        assert_eq!(
+            analysis.occurrences[0].kind.identity(),
+            analysis.occurrences[1].kind.identity()
+        );
+        assert_eq!(analysis.metrics.unique_count, 1);
     }
 
     #[test]
@@ -601,7 +812,7 @@ mod tests {
                 .expect("unicode fixture is valid JSON");
         for case in fixture.cases {
             assert_eq!(
-                case.text.graphemes(true).count(),
+                graphemes(&case.text).count(),
                 case.graphemes,
                 "grapheme count for {:?}",
                 case.text
@@ -644,6 +855,47 @@ mod tests {
         let family = analyze("👨‍👩‍👧‍👦", &[]).unwrap();
         assert_eq!(family.metrics.unicode_count, 1);
         assert_eq!(family.metrics.moderation_density, Some(1.0));
+    }
+
+    #[test]
+    fn icu_default_ignorables_match_unicode_18_for_every_scalar_value() {
+        let mut expected = vec![false; 0x11_0000];
+        for line in include_str!("../../test-data/unicode/18.0.0/DerivedCoreProperties.txt").lines()
+        {
+            let data = line.split('#').next().unwrap_or_default().trim();
+            let Some((range, property)) = data.split_once(';') else {
+                continue;
+            };
+            if property.trim() != "Default_Ignorable_Code_Point" {
+                continue;
+            }
+            let (start, end) = match range.trim().split_once("..") {
+                Some((start, end)) => (
+                    u32::from_str_radix(start, 16).unwrap(),
+                    u32::from_str_radix(end, 16).unwrap(),
+                ),
+                None => {
+                    let point = u32::from_str_radix(range.trim(), 16).unwrap();
+                    (point, point)
+                }
+            };
+            expected[start as usize..=end as usize].fill(true);
+        }
+
+        let actual = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+        let mismatches: Vec<_> = expected
+            .iter()
+            .enumerate()
+            .filter_map(|(codepoint, expected)| {
+                char::from_u32(codepoint as u32)
+                    .filter(|character| actual.contains(*character) != *expected)
+                    .map(|_| (codepoint, *expected))
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "ICU4X Default_Ignorable_Code_Point differs from Unicode 18.0 at {mismatches:?}"
+        );
     }
 
     #[test]
@@ -930,7 +1182,7 @@ mod tests {
             selected in 0usize..64,
         ) {
             let text: String = chars.into_iter().collect();
-            let graphemes: Vec<_> = text.grapheme_indices(true).collect();
+            let graphemes: Vec<_> = grapheme_indices(&text).collect();
             let index = selected % graphemes.len();
             let (byte_start, grapheme) = graphemes[index];
             let byte_end = byte_start + grapheme.len();
@@ -973,7 +1225,7 @@ mod tests {
                 .collect();
             let start_byte = oracle_boundaries.iter().find(|(units, _)| *units == offset).map(|(_, byte)| *byte);
             let end_byte = oracle_boundaries.iter().find(|(units, _)| *units == end).map(|(_, byte)| *byte);
-            let grapheme_boundaries: HashSet<_> = text.grapheme_indices(true)
+            let grapheme_boundaries: HashSet<_> = grapheme_indices(&text)
                 .map(|(byte, _)| byte)
                 .chain(std::iter::once(text.len()))
                 .collect();

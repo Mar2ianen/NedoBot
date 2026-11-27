@@ -8,7 +8,6 @@
 //! references are kept separate from authored body occurrences.
 
 use std::ops::Range;
-use unicode_segmentation::UnicodeSegmentation;
 
 use teloxide::types::{
     CustomEmojiId, Message, MessageEntity, ReactionType, RichBlock, RichBlockKind, RichMessage,
@@ -784,7 +783,7 @@ fn append_leaf(
 }
 
 fn is_single_unicode_emoji(label: &str) -> bool {
-    label.graphemes(true).count() == 1 && emojis::get(label).is_some()
+    super::emoji_analysis::is_single_grapheme(label) && emojis::get(label).is_some()
 }
 
 #[derive(Default)]
@@ -1309,8 +1308,10 @@ mod tests {
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
 
-        let mut total_text = TraversalBudget::default();
-        total_text.text_bytes = MAX_TOTAL_TEXT_BYTES - 1;
+        let mut total_text = TraversalBudget {
+            text_bytes: MAX_TOTAL_TEXT_BYTES - 1,
+            ..TraversalBudget::default()
+        };
         assert!(total_text.charge_text("x").is_ok());
         assert_eq!(
             total_text.charge_text("x"),
