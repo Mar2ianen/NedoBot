@@ -404,7 +404,7 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
 
 pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiAnalysisError> {
     let analysis = emoji_analysis::analyze_telegram_text(&quote.text, &quote.entities)?;
-    Ok(analysis
+    let mut references = analysis
         .occurrences
         .into_iter()
         .map(|item| EmojiReference {
@@ -412,7 +412,23 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
             identity: item.identity,
             fallback: Some(item.fallback),
         })
-        .collect())
+        .collect::<Vec<_>>();
+    if let Some(rich_texts) = &quote.rich_texts {
+        let mut occurrences = Vec::new();
+        for (index, text) in rich_texts.iter().enumerate() {
+            append_inline(
+                text,
+                &format!("quote.rich_texts[{index}]"),
+                &mut occurrences,
+            )?;
+        }
+        references.extend(occurrences.into_iter().map(|item| EmojiReference {
+            kind: ReferenceKind::Quote,
+            identity: item.identity,
+            fallback: Some(item.fallback),
+        }));
+    }
+    Ok(references)
 }
 
 pub fn chat_status_reference(id: Option<&str>) -> Option<EmojiReference> {
@@ -502,6 +518,24 @@ mod tests {
         assert_eq!(refs[0].kind, ReferenceKind::Quote);
         assert_eq!(refs[0].identity, EmojiIdentity::Custom("99".into()));
         assert_eq!(refs[0].fallback.as_deref(), Some("😀"));
+
+        let rich_quote = TextQuote {
+            text: String::new(),
+            entities: Vec::new(),
+            rich_texts: Some(vec![RichText::Object(RichTextObject::CustomEmoji(
+                serde_json::from_value(json!({
+                    "type": "custom_emoji",
+                    "custom_emoji_id": "100",
+                    "alternative_text": "✨"
+                }))
+                .unwrap(),
+            ))]),
+            position: 0,
+            is_manual: true,
+        };
+        let rich_refs = quote_references(&rich_quote).unwrap();
+        assert_eq!(rich_refs[0].identity, EmojiIdentity::Custom("100".into()));
+        assert_eq!(rich_refs[0].fallback.as_deref(), Some("✨"));
 
         let status = chat_status_reference(Some("status-id")).unwrap();
         assert_eq!(status.kind, ReferenceKind::ProfileStatus);
