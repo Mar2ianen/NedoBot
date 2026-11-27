@@ -13,7 +13,7 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 tg_ai_bot_teloxide = { path = "..", default-features = false }
 nedobot-qr = { path = "../crates/nedobot-qr" }
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "e06da412e880632bdcb196cb8f79fc0bc80b972c", default-features = false }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "8689bf5836a6881449402303be833f46b4038177", default-features = false }
 
 [[bin]]
 name = "stored_message"

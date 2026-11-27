@@ -7,6 +7,7 @@
 //! kept separate from authored body occurrences.
 
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 use teloxide::types::{
     Message, MessageEntity, ReactionType, RichBlock, RichBlockKind, RichMessage, RichText,
@@ -14,7 +15,7 @@ use teloxide::types::{
 };
 
 use crate::features::emoji_analysis::{
-    self, CustomEmojiInput, EmojiAnalysisError, EmojiFormat, EmojiIdentity,
+    self, CustomEmojiInput, EmojiAnalysisError, EmojiEncoding, EmojiFormat, EmojiIdentity,
 };
 use crate::telegram::rich_content::rich_message;
 
@@ -88,6 +89,8 @@ pub struct EmojiOccurrence {
     pub utf8_range: Range<usize>,
     pub utf16_range: Range<usize>,
     pub format: EmojiFormat,
+    pub encoding: EmojiEncoding,
+    pub has_custom_url_fallback: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +108,8 @@ pub struct EmojiReference {
     pub kind: ReferenceKind,
     pub identity: EmojiIdentity,
     pub fallback: Option<String>,
+    pub encoding: Option<EmojiEncoding>,
+    pub has_custom_url_fallback: bool,
 }
 
 pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
@@ -160,6 +165,8 @@ fn append_telegram_text(
                 utf8_range: item.utf8_range,
                 utf16_range: item.utf16_range,
                 format: item.format,
+                encoding: item.encoding,
+                has_custom_url_fallback: item.has_custom_url_fallback,
             }),
     );
     Ok(())
@@ -602,13 +609,30 @@ fn append_inline(
                 budget,
                 depth + 1,
             )?,
-            RichTextObject::Url(v) => append_inline(
-                &v.text,
-                &format!("{path}.url.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
+            RichTextObject::Url(v) => {
+                let candidate = teloxide_url::parse_telegram_link(&v.url);
+                if let Some(teloxide_url::TelegramLink::CustomEmojiFallback { id }) = candidate
+                    && let Some(label) = bounded_rich_label(&v.text)
+                    && is_single_unicode_emoji(&label)
+                {
+                    append_custom_url_fallback(
+                        &label,
+                        id.to_string(),
+                        &format!("{path}.url.text"),
+                        output,
+                        budget,
+                        depth + 1,
+                    )?;
+                } else {
+                    append_inline(
+                        &v.text,
+                        &format!("{path}.url.text"),
+                        output,
+                        budget,
+                        depth + 1,
+                    )?;
+                }
+            }
             RichTextObject::EmailAddress(v) => append_inline(
                 &v.text,
                 &format!("{path}.email.text"),
@@ -714,6 +738,8 @@ fn append_leaf(
             id,
             utf16_range: 0..text.encode_utf16().count(),
             format: EmojiFormat::Unknown,
+            encoding: EmojiEncoding::NativeCustom,
+            has_custom_url_fallback: false,
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -731,9 +757,107 @@ fn append_leaf(
                 utf8_range: item.utf8_range,
                 utf16_range: item.utf16_range,
                 format: item.format,
+                encoding: item.encoding,
+                has_custom_url_fallback: item.has_custom_url_fallback,
             }),
     );
     Ok(())
+}
+
+fn append_custom_url_fallback(
+    label: &str,
+    id: String,
+    path: &str,
+    output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
+) -> Result<(), EmojiAnalysisError> {
+    let start = output.len();
+    append_leaf(label, Some(id), path, output, budget, depth)?;
+    for occurrence in &mut output[start..] {
+        occurrence.encoding = EmojiEncoding::CustomUrlFallback;
+        occurrence.has_custom_url_fallback = true;
+    }
+    Ok(())
+}
+
+fn is_single_unicode_emoji(label: &str) -> bool {
+    label.graphemes(true).count() == 1 && emojis::get(label).is_some()
+}
+
+fn bounded_rich_label(text: &RichText) -> Option<String> {
+    let mut flattened = String::new();
+    let mut pending = vec![(text, 0usize)];
+    let mut nodes = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        nodes += 1;
+        if nodes > MAX_TRAVERSAL_NODES || depth > MAX_TRAVERSAL_DEPTH {
+            return None;
+        }
+        match node {
+            RichText::Text(value) => {
+                if flattened.len().saturating_add(value.len()) > MAX_SINGLE_PATH_BYTES {
+                    return None;
+                }
+                flattened.push_str(value);
+            }
+            RichText::List(items) => {
+                if nodes
+                    .saturating_add(pending.len())
+                    .saturating_add(items.len())
+                    > MAX_TRAVERSAL_NODES
+                {
+                    return None;
+                }
+                pending.extend(items.iter().rev().map(|item| (item, depth + 1)));
+            }
+            RichText::Object(object) => match object {
+                RichTextObject::Bold(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Italic(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Underline(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Strikethrough(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Spoiler(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::DateTime(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::TextMention(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Subscript(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Superscript(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Marked(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Code(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::CustomEmoji(v) => {
+                    append_bounded_label(&mut flattened, &v.alternative_text)?
+                }
+                RichTextObject::MathematicalExpression(v) => {
+                    append_bounded_label(&mut flattened, &v.expression)?
+                }
+                RichTextObject::Url(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::EmailAddress(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::PhoneNumber(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::BankCardNumber(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::TonAddress(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Mention(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Hashtag(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Cashtag(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::BotCommand(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Button(v) => pending.push((&v.button.text, depth + 1)),
+                RichTextObject::AnchorLink(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Reference(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::ReferenceLink(v) => pending.push((&v.text, depth + 1)),
+                RichTextObject::Anchor(_) | RichTextObject::Unknown(_) => return None,
+            },
+        }
+        if flattened.len() > MAX_SINGLE_PATH_BYTES {
+            return None;
+        }
+    }
+    Some(flattened)
+}
+
+fn append_bounded_label(output: &mut String, text: &str) -> Option<()> {
+    if output.len().saturating_add(text.len()) > MAX_SINGLE_PATH_BYTES {
+        return None;
+    }
+    output.push_str(text);
+    Some(())
 }
 
 pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
@@ -744,11 +868,15 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
                 kind: ReferenceKind::Reaction,
                 identity: EmojiIdentity::Unicode(emoji.clone()),
                 fallback: Some(emoji.clone()),
+                encoding: Some(EmojiEncoding::Unicode),
+                has_custom_url_fallback: false,
             }),
             ReactionType::CustomEmoji { custom_emoji_id } => Some(EmojiReference {
                 kind: ReferenceKind::Reaction,
                 identity: EmojiIdentity::Custom(custom_emoji_id.to_string()),
                 fallback: None,
+                encoding: Some(EmojiEncoding::NativeCustom),
+                has_custom_url_fallback: false,
             }),
             ReactionType::Paid => None,
         })
@@ -774,6 +902,8 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
             kind: ReferenceKind::Quote,
             identity: item.identity,
             fallback: Some(item.fallback),
+            encoding: Some(item.encoding),
+            has_custom_url_fallback: item.has_custom_url_fallback,
         }));
     } else {
         let mut budget = TraversalBudget::default();
@@ -785,6 +915,8 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
             kind: ReferenceKind::Quote,
             identity: item.identity,
             fallback: Some(item.fallback),
+            encoding: Some(item.encoding),
+            has_custom_url_fallback: item.has_custom_url_fallback,
         }));
     }
     Ok(references)
@@ -795,6 +927,8 @@ pub fn chat_status_reference(id: Option<&str>) -> Option<EmojiReference> {
         kind: ReferenceKind::ProfileStatus,
         identity: EmojiIdentity::Custom(id.to_owned()),
         fallback: None,
+        encoding: Some(EmojiEncoding::NativeCustom),
+        has_custom_url_fallback: false,
     })
 }
 
@@ -807,6 +941,8 @@ pub fn custom_emoji_reference(
         kind,
         identity: EmojiIdentity::Custom(id.to_string()),
         fallback,
+        encoding: Some(EmojiEncoding::NativeCustom),
+        has_custom_url_fallback: false,
     }
 }
 
@@ -959,6 +1095,30 @@ mod tests {
     }
 
     #[test]
+    fn rich_custom_emoji_url_requires_one_emoji_label_and_keeps_custom_identity() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":{"type":"bold", "text":"😀"}}}
+        ]})).unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].identity, EmojiIdentity::Custom("42".into()));
+        assert_eq!(found[0].encoding, EmojiEncoding::CustomUrlFallback);
+        assert!(found[0].has_custom_url_fallback);
+        assert_eq!(found[0].fallback, "😀");
+
+        let invalid: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":"not emoji"}}
+        ]})).unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&invalid, &mut found, &mut TraversalBudget::default()).unwrap();
+        assert!(
+            found.is_empty(),
+            "ordinary text labels remain ordinary text"
+        );
+    }
+
+    #[test]
     fn reactions_are_references_and_not_authored_body_occurrences() {
         let refs = reaction_references(&[
             ReactionType::Emoji {
@@ -988,6 +1148,7 @@ mod tests {
         assert_eq!(refs[0].kind, ReferenceKind::Quote);
         assert_eq!(refs[0].identity, EmojiIdentity::Custom("99".into()));
         assert_eq!(refs[0].fallback.as_deref(), Some("😀"));
+        assert_eq!(refs[0].encoding, Some(EmojiEncoding::NativeCustom));
 
         let rich_quote = TextQuote {
             text: "✨".into(),
@@ -1007,6 +1168,31 @@ mod tests {
         assert_eq!(rich_refs.len(), 1, "rich projection must not double count");
         assert_eq!(rich_refs[0].identity, EmojiIdentity::Custom("100".into()));
         assert_eq!(rich_refs[0].fallback.as_deref(), Some("✨"));
+        assert_eq!(rich_refs[0].encoding, Some(EmojiEncoding::NativeCustom));
+
+        let fallback_quote = TextQuote {
+            text: "✨".into(),
+            entities: vec![
+                serde_json::from_value(json!({
+                    "type":"text_link", "offset":0, "length":1, "url":"tg://emoji?id=101"
+                }))
+                .unwrap(),
+            ],
+            rich_texts: None,
+            position: 0,
+            is_manual: true,
+        };
+        let fallback_refs = quote_references(&fallback_quote).unwrap();
+        assert_eq!(fallback_refs.len(), 1);
+        assert_eq!(
+            fallback_refs[0].identity,
+            EmojiIdentity::Custom("101".into())
+        );
+        assert_eq!(
+            fallback_refs[0].encoding,
+            Some(EmojiEncoding::CustomUrlFallback)
+        );
+        assert!(fallback_refs[0].has_custom_url_fallback);
 
         let status = chat_status_reference(Some("status-id")).unwrap();
         assert_eq!(status.kind, ReferenceKind::ProfileStatus);

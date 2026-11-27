@@ -9,6 +9,7 @@ use std::{
 };
 
 use teloxide::types::{MessageEntity, MessageEntityKind, Utf16OffsetMap};
+use teloxide_url::TelegramLink;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Unicode emoji data version provided by the pinned recognition dataset.
@@ -55,12 +56,23 @@ pub enum EmojiFormat {
     Unknown,
 }
 
+/// How a logical emoji was represented in the message. This is independent of
+/// media format and preserves native plus fallback provenance when both occur.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmojiEncoding {
+    Unicode,
+    NativeCustom,
+    CustomUrlFallback,
+}
+
 /// A Telegram custom emoji's UTF-16 range and optional known representation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CustomEmojiInput {
     pub id: String,
     pub utf16_range: Range<usize>,
     pub format: EmojiFormat,
+    pub encoding: EmojiEncoding,
+    pub has_custom_url_fallback: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +82,8 @@ pub struct EmojiOccurrence {
     pub utf8_range: Range<usize>,
     pub utf16_range: Range<usize>,
     pub format: EmojiFormat,
+    pub encoding: EmojiEncoding,
+    pub has_custom_url_fallback: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -193,6 +207,8 @@ pub fn analyze(
                 utf8_range: range.clone(),
                 utf16_range: input.utf16_range.clone(),
                 format: input.format,
+                encoding: input.encoding,
+                has_custom_url_fallback: input.has_custom_url_fallback,
             });
             result.metrics.custom_count = result.metrics.custom_count.saturating_add(1);
             if matches!(
@@ -250,6 +266,8 @@ pub fn analyze(
                     utf8_range: byte..byte_end,
                     utf16_range: utf16..utf16_end,
                     format: EmojiFormat::Unicode,
+                    encoding: EmojiEncoding::Unicode,
+                    has_custom_url_fallback: false,
                 });
                 result.metrics.unicode_count = result.metrics.unicode_count.saturating_add(1);
                 add_occurrence(&mut counts, &mut run, &mut result.metrics, identity);
@@ -354,7 +372,47 @@ pub fn analyze_telegram_text(
                 id: custom_emoji_id.to_string(),
                 utf16_range: entity.offset..end,
                 format: EmojiFormat::Unknown,
+                encoding: EmojiEncoding::NativeCustom,
+                has_custom_url_fallback: false,
             });
+        }
+    }
+    let offsets = Utf16OffsetMap::new(text);
+    for entity in entities {
+        let MessageEntityKind::TextLink { url } = &entity.kind else {
+            continue;
+        };
+        let Some(TelegramLink::CustomEmojiFallback { id }) =
+            teloxide_url::parse_telegram_link(url.as_str())
+        else {
+            continue;
+        };
+        let Some(end) = entity.offset.checked_add(entity.length) else {
+            continue;
+        };
+        let Some(span) = offsets.range(entity.offset, entity.length) else {
+            continue;
+        };
+        let Some(label) = text.get(span.clone()) else {
+            continue;
+        };
+        if label.graphemes(true).count() != 1 || emojis::get(label).is_none() {
+            continue;
+        }
+        let fallback = CustomEmojiInput {
+            id: id.to_string(),
+            utf16_range: entity.offset..end,
+            format: EmojiFormat::Unknown,
+            encoding: EmojiEncoding::CustomUrlFallback,
+            has_custom_url_fallback: true,
+        };
+        if let Some(native) = custom
+            .iter_mut()
+            .find(|item| item.utf16_range == fallback.utf16_range && item.id == fallback.id)
+        {
+            native.has_custom_url_fallback = true;
+        } else {
+            custom.push(fallback);
         }
     }
     analyze(text, &custom)
@@ -509,6 +567,8 @@ mod tests {
                 id: "123".to_owned(),
                 utf16_range: 0..2,
                 format: EmojiFormat::Unknown,
+                encoding: EmojiEncoding::NativeCustom,
+                has_custom_url_fallback: false,
             }],
         )
         .unwrap();
@@ -527,6 +587,69 @@ mod tests {
         assert_eq!(analysis.metrics.custom_count, 1);
         assert_eq!(analysis.metrics.unknown_format_count, 1);
         assert_eq!(analysis.occurrences[0].utf8_range, 0..4);
+        assert_eq!(
+            analysis.occurrences[0].encoding,
+            EmojiEncoding::NativeCustom
+        );
+    }
+
+    #[test]
+    fn addressed_custom_emoji_url_fallback_uses_id_and_validates_full_utf16_label() {
+        let valid: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":1, "length":2, "url":"tg://emoji?id=00042"
+        }))
+        .unwrap();
+        let analysis = analyze_telegram_text("A😀B", &[valid]).unwrap();
+        assert_eq!(analysis.occurrences.len(), 1);
+        assert_eq!(
+            analysis.occurrences[0].identity,
+            EmojiIdentity::Custom("42".into())
+        );
+        assert_eq!(analysis.occurrences[0].utf8_range, 1..5);
+        assert_eq!(analysis.occurrences[0].utf16_range, 1..3);
+        assert_eq!(
+            analysis.occurrences[0].encoding,
+            EmojiEncoding::CustomUrlFallback
+        );
+        assert_eq!(analysis.metrics.unicode_count, 0);
+
+        let non_emoji: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":0, "length":5, "url":"tg://emoji?id=42"
+        }))
+        .unwrap();
+        let invalid = analyze_telegram_text("hello", &[non_emoji]).unwrap();
+        assert!(invalid.occurrences.is_empty());
+        assert_eq!(invalid.metrics.custom_count, 0);
+    }
+
+    #[test]
+    fn native_custom_and_same_id_fallback_deduplicate_preserving_provenance() {
+        let native = MessageEntity::custom_emoji("42".into(), 0, 2);
+        let fallback: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"
+        }))
+        .unwrap();
+        let analysis = analyze_telegram_text("😀", &[native, fallback]).unwrap();
+        assert_eq!(analysis.occurrences.len(), 1);
+        assert_eq!(
+            analysis.occurrences[0].encoding,
+            EmojiEncoding::NativeCustom
+        );
+        assert!(analysis.occurrences[0].has_custom_url_fallback);
+        assert_eq!(analysis.metrics.custom_count, 1);
+    }
+
+    #[test]
+    fn conflicting_native_and_fallback_ids_on_same_span_fail_closed() {
+        let native = MessageEntity::custom_emoji("42".into(), 0, 2);
+        let fallback: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=43"
+        }))
+        .unwrap();
+        assert_eq!(
+            analyze_telegram_text("😀", &[native, fallback]),
+            Err(EmojiAnalysisError::OverlappingCustomEmojiRanges)
+        );
     }
 
     #[test]
@@ -535,6 +658,8 @@ mod tests {
             id: "1".to_owned(),
             utf16_range: 1..2,
             format: EmojiFormat::Static,
+            encoding: EmojiEncoding::NativeCustom,
+            has_custom_url_fallback: false,
         };
         assert_eq!(
             analyze("😀a", &[invalid]),
@@ -545,11 +670,15 @@ mod tests {
                 id: "1".to_owned(),
                 utf16_range: 0..2,
                 format: EmojiFormat::Static,
+                encoding: EmojiEncoding::NativeCustom,
+                has_custom_url_fallback: false,
             },
             CustomEmojiInput {
                 id: "2".to_owned(),
                 utf16_range: 1..3,
                 format: EmojiFormat::Static,
+                encoding: EmojiEncoding::NativeCustom,
+                has_custom_url_fallback: false,
             },
         ];
         assert_eq!(
@@ -561,6 +690,8 @@ mod tests {
             id: "3".to_owned(),
             utf16_range: 0..1,
             format: EmojiFormat::Static,
+            encoding: EmojiEncoding::NativeCustom,
+            has_custom_url_fallback: false,
         }];
         assert_eq!(
             analyze("a\u{301}", &split_grapheme),
@@ -577,11 +708,15 @@ mod tests {
                     id: "animated".to_owned(),
                     utf16_range: 0..1,
                     format: EmojiFormat::AnimatedTgs,
+                    encoding: EmojiEncoding::NativeCustom,
+                    has_custom_url_fallback: false,
                 },
                 CustomEmojiInput {
                     id: "unknown".to_owned(),
                     utf16_range: 1..2,
                     format: EmojiFormat::Unknown,
+                    encoding: EmojiEncoding::NativeCustom,
+                    has_custom_url_fallback: false,
                 },
             ],
         )
@@ -619,6 +754,8 @@ mod tests {
                 id: "property-id".into(),
                 utf16_range: utf16_start..utf16_end,
                 format: EmojiFormat::Static,
+                encoding: EmojiEncoding::NativeCustom,
+                has_custom_url_fallback: false,
             }];
 
             let analysis = analyze(&text, &custom).unwrap();
@@ -643,6 +780,8 @@ mod tests {
                 id: "oracle".into(),
                 utf16_range: offset..end,
                 format: EmojiFormat::Static,
+                encoding: EmojiEncoding::NativeCustom,
+                has_custom_url_fallback: false,
             }];
             let oracle_boundaries: Vec<_> = text.char_indices()
                 .map(|(byte, _)| (text[..byte].encode_utf16().count(), byte))

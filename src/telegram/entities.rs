@@ -259,6 +259,17 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
 }
 
 pub fn custom_emoji_ids(msg: &Message) -> Vec<String> {
+    #[cfg(feature = "emoji")]
+    if let Ok(occurrences) = crate::features::emoji_occurrences::extract_message(msg) {
+        return occurrences
+            .into_iter()
+            .filter_map(|occurrence| match occurrence.identity {
+                crate::features::emoji_analysis::EmojiIdentity::Custom(id) => Some(id),
+                crate::features::emoji_analysis::EmojiIdentity::Unicode(_) => None,
+            })
+            .collect();
+    }
+
     let mut ids: Vec<_> = msg
         .entities()
         .into_iter()
@@ -351,6 +362,57 @@ mod tests {
         assert_eq!(
             MessageRevision::from_message(&message),
             MessageRevision::Original
+        );
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn emoji_ids_include_only_valid_custom_url_fallbacks_when_emoji_feature_is_enabled() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 7,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀 open",
+            "entities": [
+                {"type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=00042"},
+                {"type":"text_link", "offset":3, "length":4, "url":"tg://emoji?id=99"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(super::custom_emoji_ids(&message), ["42"]);
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn only_valid_custom_fallback_targets_are_removed_from_url_targets() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 8,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀 open https://example.org",
+            "entities": [
+                {"type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"},
+                {"type":"text_link", "offset":3, "length":4, "url":"tg://emoji?id=99"},
+                {"type":"url", "offset":8, "length":19}
+            ]
+        }))
+        .unwrap();
+        let targets = message_url_targets(&message);
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.value == "tg://emoji?id=99")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.value == "https://example.org")
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|target| target.value == "tg://emoji?id=42")
         );
     }
 

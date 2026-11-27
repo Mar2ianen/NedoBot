@@ -3012,7 +3012,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=e06da412e880632bdcb196cb8f79fc0bc80b972c#e06da412e880632bdcb196cb8f79fc0bc80b972c"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=8689bf5836a6881449402303be833f46b4038177#8689bf5836a6881449402303be833f46b4038177"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3084,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "teloxide-url"
 version = "0.1.0"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=e06da412e880632bdcb196cb8f79fc0bc80b972c#e06da412e880632bdcb196cb8f79fc0bc80b972c"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=8689bf5836a6881449402303be833f46b4038177#8689bf5836a6881449402303be833f46b4038177"
 dependencies = [
  "linkify",
  "teloxide",
@@ -3567,9 +3567,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "walkdir"
-version = "2.5.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b42e295b7452c4604982280d8586001fcad9b8b201cac67bca9771e7a7475403"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
