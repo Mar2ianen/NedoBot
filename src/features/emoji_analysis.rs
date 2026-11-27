@@ -75,6 +75,8 @@ pub struct EmojiOccurrence {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmojiMetrics {
     pub unicode_count: u32,
+    /// Unicode emoji recognized for moderation after safe ignorable handling.
+    pub moderation_unicode_count: u32,
     pub custom_count: u32,
     pub animated_count: u32,
     pub unknown_format_count: u32,
@@ -83,8 +85,11 @@ pub struct EmojiMetrics {
     /// Non-emoji graphemes visible to moderation after default-ignorable filtering.
     pub moderation_visible_non_emoji_graphemes: u32,
     pub max_consecutive_run: u32,
+    pub moderation_max_consecutive_run: u32,
     pub max_repeat_count: u32,
+    pub moderation_max_repeat_count: u32,
     pub unique_count: u32,
+    pub moderation_unique_count: u32,
     /// Emoji density over raw non-whitespace graphemes.
     pub density: Option<f64>,
     /// Emoji density excluding graphemes made only of default-ignorable code points.
@@ -170,7 +175,9 @@ pub fn analyze(
         metrics: EmojiMetrics::default(),
     };
     let mut counts = HashMap::<EmojiIdentity, u32>::new();
+    let mut moderation_counts = HashMap::<EmojiIdentity, u32>::new();
     let mut run = 0u32;
+    let mut moderation_run = 0u32;
     let mut byte = 0usize;
     let mut utf16 = 0usize;
     let mut custom_index = 0usize;
@@ -204,6 +211,12 @@ pub fn analyze(
                 &mut result.metrics,
                 EmojiIdentity::Custom(input.id.clone()),
             );
+            add_moderation_occurrence(
+                &mut moderation_counts,
+                &mut moderation_run,
+                &mut result.metrics,
+                EmojiIdentity::Custom(input.id.clone()),
+            );
             utf16 = input.utf16_range.end;
             byte = range.end;
             custom_index += 1;
@@ -219,17 +232,34 @@ pub fn analyze(
         let utf16_end = utf16 + grapheme.encode_utf16().count();
         if grapheme.chars().all(char::is_whitespace) {
             run = 0;
-        } else if emojis::get(grapheme).is_some() {
-            let identity = EmojiIdentity::Unicode(grapheme.to_owned());
-            result.occurrences.push(EmojiOccurrence {
-                identity: identity.clone(),
-                fallback: grapheme.to_owned(),
-                utf8_range: byte..byte_end,
-                utf16_range: utf16..utf16_end,
-                format: EmojiFormat::Unicode,
-            });
-            result.metrics.unicode_count = result.metrics.unicode_count.saturating_add(1);
-            add_occurrence(&mut counts, &mut run, &mut result.metrics, identity);
+            moderation_run = 0;
+        } else if let Some(moderation_identity) = moderation_emoji(grapheme) {
+            add_moderation_occurrence(
+                &mut moderation_counts,
+                &mut moderation_run,
+                &mut result.metrics,
+                EmojiIdentity::Unicode(moderation_identity.clone()),
+            );
+            if emojis::get(grapheme).is_some() {
+                result.metrics.moderation_unicode_count =
+                    result.metrics.moderation_unicode_count.saturating_add(1);
+                let identity = EmojiIdentity::Unicode(grapheme.to_owned());
+                result.occurrences.push(EmojiOccurrence {
+                    identity: identity.clone(),
+                    fallback: grapheme.to_owned(),
+                    utf8_range: byte..byte_end,
+                    utf16_range: utf16..utf16_end,
+                    format: EmojiFormat::Unicode,
+                });
+                result.metrics.unicode_count = result.metrics.unicode_count.saturating_add(1);
+                add_occurrence(&mut counts, &mut run, &mut result.metrics, identity);
+            } else {
+                result.metrics.moderation_unicode_count =
+                    result.metrics.moderation_unicode_count.saturating_add(1);
+                run = 0;
+                result.metrics.visible_non_emoji_graphemes =
+                    result.metrics.visible_non_emoji_graphemes.saturating_add(1);
+            }
         } else {
             result.metrics.visible_non_emoji_graphemes =
                 result.metrics.visible_non_emoji_graphemes.saturating_add(1);
@@ -239,6 +269,7 @@ pub fn analyze(
                     .moderation_visible_non_emoji_graphemes
                     .saturating_add(1);
                 run = 0;
+                moderation_run = 0;
             }
         }
         byte = byte_end;
@@ -246,13 +277,17 @@ pub fn analyze(
     }
 
     result.metrics.unique_count = u32::try_from(counts.len()).unwrap_or(u32::MAX);
+    result.metrics.moderation_unique_count =
+        u32::try_from(moderation_counts.len()).unwrap_or(u32::MAX);
     let emoji = u64::from(result.metrics.unicode_count) + u64::from(result.metrics.custom_count);
     let visible = emoji + u64::from(result.metrics.visible_non_emoji_graphemes);
     result.metrics.density = (visible != 0).then(|| emoji as f64 / visible as f64);
+    let moderation_emoji =
+        u64::from(result.metrics.moderation_unicode_count) + u64::from(result.metrics.custom_count);
     let moderation_visible =
-        emoji + u64::from(result.metrics.moderation_visible_non_emoji_graphemes);
+        moderation_emoji + u64::from(result.metrics.moderation_visible_non_emoji_graphemes);
     result.metrics.moderation_density =
-        (moderation_visible != 0).then(|| emoji as f64 / moderation_visible as f64);
+        (moderation_visible != 0).then(|| moderation_emoji as f64 / moderation_visible as f64);
     Ok(result)
 }
 
@@ -261,6 +296,45 @@ fn is_default_ignorable(character: char) -> bool {
     DEFAULT_IGNORABLE_RANGES
         .iter()
         .any(|&(start, end)| (start..=end).contains(&codepoint))
+}
+
+/// Returns the moderation identity for a grapheme. Exact Unicode sequences
+/// always win; only a failed exact lookup permits removing default-ignorables.
+/// ZWJ, variation selectors, and tags get conservative fallback attempts, but
+/// explicit text presentation (VS15) is never discarded.
+fn moderation_emoji(grapheme: &str) -> Option<String> {
+    if emojis::get(grapheme).is_some() {
+        return Some(grapheme.to_owned());
+    }
+    if grapheme.contains('\u{FE0E}') {
+        return None;
+    }
+
+    let without_nonstructural_ignorables: String = grapheme
+        .chars()
+        .filter(|character| {
+            !is_default_ignorable(*character)
+                || matches!(*character as u32, 0x200D | 0xFE00..=0xFE0F | 0xE0020..=0xE007F)
+        })
+        .collect();
+    if let Some(emoji) = recognized_candidate(&without_nonstructural_ignorables) {
+        return Some(emoji);
+    }
+
+    let without_edge_zwj = without_nonstructural_ignorables.trim_matches('\u{200D}');
+    if let Some(emoji) = recognized_candidate(without_edge_zwj) {
+        return Some(emoji);
+    }
+
+    let without_vs16: String = without_nonstructural_ignorables
+        .chars()
+        .filter(|character| *character != '\u{FE0F}')
+        .collect();
+    recognized_candidate(&without_vs16)
+}
+
+fn recognized_candidate(candidate: &str) -> Option<String> {
+    (!candidate.is_empty() && emojis::get(candidate).is_some()).then(|| candidate.to_owned())
 }
 
 /// Adapts Telegram text/caption entities into the checked pure analyzer.
@@ -297,6 +371,19 @@ fn add_occurrence(
     let count = counts.entry(identity).or_default();
     *count = count.saturating_add(1);
     metrics.max_repeat_count = metrics.max_repeat_count.max(*count);
+}
+
+fn add_moderation_occurrence(
+    counts: &mut HashMap<EmojiIdentity, u32>,
+    run: &mut u32,
+    metrics: &mut EmojiMetrics,
+    identity: EmojiIdentity,
+) {
+    *run = run.saturating_add(1);
+    metrics.moderation_max_consecutive_run = metrics.moderation_max_consecutive_run.max(*run);
+    let count = counts.entry(identity).or_default();
+    *count = count.saturating_add(1);
+    metrics.moderation_max_repeat_count = metrics.moderation_max_repeat_count.max(*count);
 }
 
 #[cfg(test)]
@@ -377,6 +464,41 @@ mod tests {
         let family = analyze("👨‍👩‍👧‍👦", &[]).unwrap();
         assert_eq!(family.metrics.unicode_count, 1);
         assert_eq!(family.metrics.moderation_density, Some(1.0));
+    }
+
+    #[test]
+    fn v5_moderation_hardening_fixture_keeps_raw_and_moderation_metrics_separate() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Case {
+            text: String,
+            raw_exact_emoji: Option<usize>,
+            moderation_emoji: u32,
+            moderation_density: Option<f64>,
+        }
+
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../test-data/unicode/moderation-hardening.json"
+        ))
+        .expect("moderation hardening fixture is valid JSON");
+        for case in fixture.cases {
+            let analysis = analyze(&case.text, &[]).unwrap();
+            if let Some(expected) = case.raw_exact_emoji {
+                assert_eq!(analysis.occurrences.len(), expected, "{}", case.text);
+            }
+            assert_eq!(
+                analysis.metrics.moderation_unicode_count, case.moderation_emoji,
+                "{}",
+                case.text
+            );
+            if let Some(expected) = case.moderation_density {
+                assert_eq!(analysis.metrics.moderation_density, Some(expected));
+            }
+        }
     }
 
     #[test]
@@ -555,6 +677,19 @@ mod tests {
                 prop_assert_eq!(&occurrence.utf8_range, &(start_byte.unwrap()..end_byte.unwrap()));
                 prop_assert_eq!(&occurrence.utf16_range, &(offset..end));
             }
+        }
+
+        #[test]
+        fn generated_cgj_contamination_preserves_moderation_emoji_but_not_raw_match(
+            emoji in proptest::sample::select(vec!["😀", "🔥", "🚀"]),
+            cgj_count in 1usize..4,
+        ) {
+            let contaminated = format!("{}{}", emoji, "\u{034F}".repeat(cgj_count));
+            let analysis = analyze(&contaminated, &[]).unwrap();
+            prop_assert!(analysis.occurrences.is_empty());
+            prop_assert_eq!(analysis.metrics.unicode_count, 0);
+            prop_assert_eq!(analysis.metrics.moderation_unicode_count, 1);
+            prop_assert_eq!(analysis.metrics.moderation_density, Some(1.0));
         }
     }
 }

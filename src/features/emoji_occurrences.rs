@@ -21,10 +21,56 @@ use crate::telegram::rich_content::rich_message;
 const MAX_TRAVERSAL_NODES: usize = 8_192;
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 const MAX_TRAVERSAL_PATH_BYTES: usize = 256 * 1_024;
+const MAX_SINGLE_PATH_BYTES: usize = 4_096;
 const MAX_TOTAL_TEXT_BYTES: usize = 256 * 1_024;
-const MAX_SERIALIZED_RICH_BYTES: usize = 512 * 1_024;
 const MAX_TOTAL_OCCURRENCES: usize = 8_192;
 const MAX_TOTAL_CUSTOM_EMOJI: usize = 2_048;
+
+#[derive(Default)]
+struct TraversalBudget {
+    nodes: usize,
+    path_bytes: usize,
+    text_bytes: usize,
+    occurrences: usize,
+    custom_emoji: usize,
+}
+
+impl TraversalBudget {
+    fn visit(&mut self, path: &str, depth: usize) -> Result<(), EmojiAnalysisError> {
+        self.nodes = self.nodes.saturating_add(1);
+        self.path_bytes = self.path_bytes.saturating_add(path.len());
+        if self.nodes > MAX_TRAVERSAL_NODES
+            || depth > MAX_TRAVERSAL_DEPTH
+            || path.len() > MAX_SINGLE_PATH_BYTES
+            || self.path_bytes > MAX_TRAVERSAL_PATH_BYTES
+        {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn charge_text(&mut self, text: &str) -> Result<(), EmojiAnalysisError> {
+        self.text_bytes = self.text_bytes.saturating_add(text.len());
+        if self.text_bytes > MAX_TOTAL_TEXT_BYTES {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn charge_analysis(
+        &mut self,
+        analysis: &emoji_analysis::EmojiAnalysis,
+    ) -> Result<(), EmojiAnalysisError> {
+        self.occurrences = self.occurrences.saturating_add(analysis.occurrences.len());
+        self.custom_emoji = self
+            .custom_emoji
+            .saturating_add(analysis.metrics.custom_count as usize);
+        if self.occurrences > MAX_TOTAL_OCCURRENCES || self.custom_emoji > MAX_TOTAL_CUSTOM_EMOJI {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentSource {
@@ -63,39 +109,29 @@ pub struct EmojiReference {
 
 pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
     let mut result = Vec::new();
-    let mut aggregate_text_bytes = 0usize;
+    let mut budget = TraversalBudget::default();
     if let Some(text) = message.text() {
-        aggregate_text_bytes = text.len();
-        if aggregate_text_bytes > MAX_TOTAL_TEXT_BYTES {
-            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
-        }
         append_telegram_text(
             text,
             message.entities().unwrap_or_default(),
             ContentSource::Text,
             "text",
             &mut result,
+            &mut budget,
         )?;
     } else if let Some(caption) = message.caption() {
-        aggregate_text_bytes = caption.len();
-        if aggregate_text_bytes > MAX_TOTAL_TEXT_BYTES {
-            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
-        }
         append_telegram_text(
             caption,
             message.caption_entities().unwrap_or_default(),
             ContentSource::Caption,
             "caption",
             &mut result,
+            &mut budget,
         )?;
     }
 
     if let Some(rich) = rich_message(message) {
-        let rich_text_bytes = validate_rich_traversal_budget(rich)?;
-        if aggregate_text_bytes.saturating_add(rich_text_bytes) > MAX_TOTAL_TEXT_BYTES {
-            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
-        }
-        append_rich_message(rich, &mut result)?;
+        append_rich_message(rich, &mut result, &mut budget)?;
     }
     Ok(result)
 }
@@ -106,9 +142,12 @@ fn append_telegram_text(
     source: ContentSource,
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, 0)?;
+    budget.charge_text(text)?;
     let analysis = emoji_analysis::analyze_telegram_text(text, entities)?;
-    ensure_occurrence_budget(output, &analysis.occurrences)?;
+    budget.charge_analysis(&analysis)?;
     output.extend(
         analysis
             .occurrences
@@ -129,96 +168,17 @@ fn append_telegram_text(
 fn append_rich_message(
     rich: &RichMessage,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit("rich_message", 0)?;
     for (index, block) in rich.blocks.iter().enumerate() {
-        append_block(block, &format!("rich_message.blocks[{index}]"), output)?;
-    }
-    Ok(())
-}
-
-fn validate_rich_traversal_budget(rich: &RichMessage) -> Result<usize, EmojiAnalysisError> {
-    validate_serialized_budget(rich)
-}
-
-fn validate_serialized_budget(value: &impl serde::Serialize) -> Result<usize, EmojiAnalysisError> {
-    let mut writer = BoundedJsonWriter::default();
-    serde_json::to_writer(&mut writer, value)
-        .map_err(|_| EmojiAnalysisError::RichTraversalLimitExceeded)?;
-    let value: serde_json::Value = serde_json::from_slice(&writer.0)
-        .map_err(|_| EmojiAnalysisError::RichTraversalLimitExceeded)?;
-    validate_value_budget(&value)
-}
-
-#[derive(Default)]
-struct BoundedJsonWriter(Vec<u8>);
-
-impl std::io::Write for BoundedJsonWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.0.len().saturating_add(bytes.len()) > MAX_SERIALIZED_RICH_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "rich message traversal budget exceeded",
-            ));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn validate_value_budget(value: &serde_json::Value) -> Result<usize, EmojiAnalysisError> {
-    let mut pending = vec![(value, 0usize, 0usize)];
-    let (mut nodes, mut path_bytes, mut text_bytes) = (0usize, 0usize, 0usize);
-    while let Some((node, depth, path_len)) = pending.pop() {
-        nodes = nodes.saturating_add(1);
-        path_bytes = path_bytes.saturating_add(path_len);
-        if nodes > MAX_TRAVERSAL_NODES
-            || depth > MAX_TRAVERSAL_DEPTH
-            || path_bytes > MAX_TRAVERSAL_PATH_BYTES
-        {
-            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
-        }
-        match node {
-            serde_json::Value::String(value) => {
-                text_bytes = text_bytes.saturating_add(value.len());
-                if text_bytes > MAX_TOTAL_TEXT_BYTES {
-                    return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                pending.extend(values.iter().map(|value| (value, depth + 1, 8)))
-            }
-            serde_json::Value::Object(values) => pending.extend(
-                values
-                    .iter()
-                    .map(|(key, value)| (value, depth + 1, key.len().saturating_add(1))),
-            ),
-            _ => {}
-        }
-    }
-    Ok(text_bytes)
-}
-
-fn ensure_occurrence_budget(
-    output: &[EmojiOccurrence],
-    additions: &[emoji_analysis::EmojiOccurrence],
-) -> Result<(), EmojiAnalysisError> {
-    if output.len().saturating_add(additions.len()) > MAX_TOTAL_OCCURRENCES {
-        return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
-    }
-    let existing_custom = output
-        .iter()
-        .filter(|item| matches!(item.identity, EmojiIdentity::Custom(_)))
-        .count();
-    let new_custom = additions
-        .iter()
-        .filter(|item| matches!(item.identity, EmojiIdentity::Custom(_)))
-        .count();
-    if existing_custom.saturating_add(new_custom) > MAX_TOTAL_CUSTOM_EMOJI {
-        return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        append_block(
+            block,
+            &format!("rich_message.blocks[{index}]"),
+            output,
+            budget,
+            1,
+        )?;
     }
     Ok(())
 }
@@ -227,110 +187,255 @@ fn append_block(
     block: &RichBlock,
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, depth)?;
     let RichBlock::Known(block) = block else {
         return Ok(());
     };
     match block.as_ref() {
-        RichBlockKind::Paragraph(v) => {
-            append_inline(&v.text, &format!("{path}.paragraph.text"), output)?
-        }
-        RichBlockKind::Heading(v) => {
-            append_inline(&v.text, &format!("{path}.heading.text"), output)?
-        }
-        RichBlockKind::Pre(v) => append_inline(&v.text, &format!("{path}.pre.text"), output)?,
-        RichBlockKind::Footer(v) => append_inline(&v.text, &format!("{path}.footer.text"), output)?,
+        RichBlockKind::Paragraph(v) => append_inline(
+            &v.text,
+            &format!("{path}.paragraph.text"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Heading(v) => append_inline(
+            &v.text,
+            &format!("{path}.heading.text"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Pre(v) => append_inline(
+            &v.text,
+            &format!("{path}.pre.text"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Footer(v) => append_inline(
+            &v.text,
+            &format!("{path}.footer.text"),
+            output,
+            budget,
+            depth + 1,
+        )?,
         RichBlockKind::MathematicalExpression(v) => append_leaf(
             &v.expression,
             None,
             &format!("{path}.math.expression"),
             output,
+            budget,
+            depth + 1,
         )?,
         RichBlockKind::List(v) => {
             for (item_index, item) in v.items.iter().enumerate() {
                 let item_path = format!("{path}.list.items[{item_index}]");
-                append_leaf(&item.label, None, &format!("{item_path}.label"), output)?;
+                budget.visit(&item_path, depth + 1)?;
+                append_leaf(
+                    &item.label,
+                    None,
+                    &format!("{item_path}.label"),
+                    output,
+                    budget,
+                    depth + 1,
+                )?;
                 for (child_index, child) in item.blocks.iter().enumerate() {
-                    append_block(child, &format!("{item_path}.blocks[{child_index}]"), output)?;
+                    append_block(
+                        child,
+                        &format!("{item_path}.blocks[{child_index}]"),
+                        output,
+                        budget,
+                        depth + 1,
+                    )?;
                 }
             }
         }
         RichBlockKind::Blockquote(v) => {
-            append_blocks(&v.blocks, &format!("{path}.blockquote.blocks"), output)?;
-            append_optional_inline(&v.credit, &format!("{path}.blockquote.credit"), output)?;
+            append_blocks(
+                &v.blocks,
+                &format!("{path}.blockquote.blocks"),
+                output,
+                budget,
+                depth + 1,
+            )?;
+            append_optional_inline(
+                &v.credit,
+                &format!("{path}.blockquote.credit"),
+                output,
+                budget,
+                depth + 1,
+            )?;
         }
         RichBlockKind::ExpandableBlockquote(v) => {
             append_blocks(
                 &v.blocks,
                 &format!("{path}.expandable_blockquote.blocks"),
                 output,
+                budget,
+                depth + 1,
             )?;
             append_optional_inline(
                 &v.credit,
                 &format!("{path}.expandable_blockquote.credit"),
                 output,
+                budget,
+                depth + 1,
             )?;
         }
         RichBlockKind::Pullquote(v) => {
-            append_inline(&v.text, &format!("{path}.pullquote.text"), output)?;
-            append_optional_inline(&v.credit, &format!("{path}.pullquote.credit"), output)?;
+            append_inline(
+                &v.text,
+                &format!("{path}.pullquote.text"),
+                output,
+                budget,
+                depth + 1,
+            )?;
+            append_optional_inline(
+                &v.credit,
+                &format!("{path}.pullquote.credit"),
+                output,
+                budget,
+                depth + 1,
+            )?;
         }
         RichBlockKind::Collage(v) => {
-            append_blocks(&v.blocks, &format!("{path}.collage.blocks"), output)?;
-            append_caption(&v.caption, &format!("{path}.collage.caption"), output)?;
+            append_blocks(
+                &v.blocks,
+                &format!("{path}.collage.blocks"),
+                output,
+                budget,
+                depth + 1,
+            )?;
+            append_caption(
+                &v.caption,
+                &format!("{path}.collage.caption"),
+                output,
+                budget,
+                depth + 1,
+            )?;
         }
         RichBlockKind::Slideshow(v) => {
-            append_blocks(&v.blocks, &format!("{path}.slideshow.blocks"), output)?;
-            append_caption(&v.caption, &format!("{path}.slideshow.caption"), output)?;
+            append_blocks(
+                &v.blocks,
+                &format!("{path}.slideshow.blocks"),
+                output,
+                budget,
+                depth + 1,
+            )?;
+            append_caption(
+                &v.caption,
+                &format!("{path}.slideshow.caption"),
+                output,
+                budget,
+                depth + 1,
+            )?;
         }
         RichBlockKind::Table(v) => {
             for (row_index, row) in v.cells.iter().enumerate() {
+                budget.visit(&format!("{path}.table.rows[{row_index}]"), depth + 1)?;
                 for (cell_index, cell) in row.iter().enumerate() {
+                    let cell_path = format!("{path}.table.cells[{row_index}][{cell_index}]");
+                    budget.visit(&cell_path, depth + 2)?;
                     if let Some(text) = &cell.text {
                         append_inline(
                             text,
                             &format!("{path}.table.cells[{row_index}][{cell_index}].text"),
                             output,
+                            budget,
+                            depth + 3,
                         )?;
                     }
                 }
             }
-            append_optional_inline(&v.caption, &format!("{path}.table.caption"), output)?;
+            append_optional_inline(
+                &v.caption,
+                &format!("{path}.table.caption"),
+                output,
+                budget,
+                depth + 1,
+            )?;
         }
         RichBlockKind::Buttons(v) => {
             for (index, button) in v.buttons.iter().enumerate() {
+                budget.visit(&format!("{path}.buttons[{index}]"), depth + 1)?;
                 append_inline(
                     &button.text,
                     &format!("{path}.buttons[{index}].text"),
                     output,
+                    budget,
+                    depth + 1,
                 )?;
             }
         }
         RichBlockKind::Details(v) => {
-            append_inline(&v.summary, &format!("{path}.details.summary"), output)?;
-            append_blocks(&v.blocks, &format!("{path}.details.blocks"), output)?;
+            append_inline(
+                &v.summary,
+                &format!("{path}.details.summary"),
+                output,
+                budget,
+                depth + 1,
+            )?;
+            append_blocks(
+                &v.blocks,
+                &format!("{path}.details.blocks"),
+                output,
+                budget,
+                depth + 1,
+            )?;
         }
-        RichBlockKind::Document(v) => {
-            append_caption(&v.caption, &format!("{path}.document.caption"), output)?
-        }
-        RichBlockKind::Map(v) => {
-            append_caption(&v.caption, &format!("{path}.map.caption"), output)?
-        }
-        RichBlockKind::Animation(v) => {
-            append_caption(&v.caption, &format!("{path}.animation.caption"), output)?
-        }
-        RichBlockKind::Audio(v) => {
-            append_caption(&v.caption, &format!("{path}.audio.caption"), output)?
-        }
-        RichBlockKind::Photo(v) => {
-            append_caption(&v.caption, &format!("{path}.photo.caption"), output)?
-        }
-        RichBlockKind::Video(v) => {
-            append_caption(&v.caption, &format!("{path}.video.caption"), output)?
-        }
-        RichBlockKind::VoiceNote(v) => {
-            append_caption(&v.caption, &format!("{path}.voice_note.caption"), output)?
-        }
+        RichBlockKind::Document(v) => append_caption(
+            &v.caption,
+            &format!("{path}.document.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Map(v) => append_caption(
+            &v.caption,
+            &format!("{path}.map.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Animation(v) => append_caption(
+            &v.caption,
+            &format!("{path}.animation.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Audio(v) => append_caption(
+            &v.caption,
+            &format!("{path}.audio.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Photo(v) => append_caption(
+            &v.caption,
+            &format!("{path}.photo.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::Video(v) => append_caption(
+            &v.caption,
+            &format!("{path}.video.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
+        RichBlockKind::VoiceNote(v) => append_caption(
+            &v.caption,
+            &format!("{path}.voice_note.caption"),
+            output,
+            budget,
+            depth + 1,
+        )?,
         RichBlockKind::Divider(_) | RichBlockKind::Anchor(_) | RichBlockKind::Thinking(_) => {}
     }
     Ok(())
@@ -340,9 +445,18 @@ fn append_blocks(
     blocks: &[RichBlock],
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, depth)?;
     for (index, block) in blocks.iter().enumerate() {
-        append_block(block, &format!("{path}[{index}]"), output)?;
+        append_block(
+            block,
+            &format!("{path}[{index}]"),
+            output,
+            budget,
+            depth + 1,
+        )?;
     }
     Ok(())
 }
@@ -351,10 +465,25 @@ fn append_caption(
     caption: &Option<teloxide::types::RichBlockCaption>,
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, depth)?;
     if let Some(caption) = caption {
-        append_inline(&caption.text, &format!("{path}.text"), output)?;
-        append_optional_inline(&caption.credit, &format!("{path}.credit"), output)?;
+        append_inline(
+            &caption.text,
+            &format!("{path}.text"),
+            output,
+            budget,
+            depth + 1,
+        )?;
+        append_optional_inline(
+            &caption.credit,
+            &format!("{path}.credit"),
+            output,
+            budget,
+            depth + 1,
+        )?;
     }
     Ok(())
 }
@@ -363,9 +492,11 @@ fn append_optional_inline(
     text: &Option<RichText>,
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
     if let Some(text) = text {
-        append_inline(text, path, output)?;
+        append_inline(text, path, output, budget, depth + 1)?;
     }
     Ok(())
 }
@@ -374,86 +505,194 @@ fn append_inline(
     text: &RichText,
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, depth)?;
     match text {
-        RichText::Text(text) => append_leaf(text, None, path, output)?,
+        RichText::Text(text) => append_leaf(text, None, path, output, budget, depth + 1)?,
         RichText::List(items) => {
             for (index, item) in items.iter().enumerate() {
-                append_inline(item, &format!("{path}[{index}]"), output)?;
+                append_inline(item, &format!("{path}[{index}]"), output, budget, depth + 1)?;
             }
         }
         RichText::Object(object) => match object {
-            RichTextObject::Bold(v) => append_inline(&v.text, &format!("{path}.bold"), output)?,
-            RichTextObject::Italic(v) => append_inline(&v.text, &format!("{path}.italic"), output)?,
-            RichTextObject::Underline(v) => {
-                append_inline(&v.text, &format!("{path}.underline"), output)?
+            RichTextObject::Bold(v) => {
+                append_inline(&v.text, &format!("{path}.bold"), output, budget, depth + 1)?
             }
-            RichTextObject::Strikethrough(v) => {
-                append_inline(&v.text, &format!("{path}.strikethrough"), output)?
+            RichTextObject::Italic(v) => append_inline(
+                &v.text,
+                &format!("{path}.italic"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Underline(v) => append_inline(
+                &v.text,
+                &format!("{path}.underline"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Strikethrough(v) => append_inline(
+                &v.text,
+                &format!("{path}.strikethrough"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Spoiler(v) => append_inline(
+                &v.text,
+                &format!("{path}.spoiler"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::DateTime(v) => append_inline(
+                &v.text,
+                &format!("{path}.datetime"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::TextMention(v) => append_inline(
+                &v.text,
+                &format!("{path}.text_mention"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Subscript(v) => append_inline(
+                &v.text,
+                &format!("{path}.subscript"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Superscript(v) => append_inline(
+                &v.text,
+                &format!("{path}.superscript"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Marked(v) => append_inline(
+                &v.text,
+                &format!("{path}.marked"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Code(v) => {
+                append_inline(&v.text, &format!("{path}.code"), output, budget, depth + 1)?
             }
-            RichTextObject::Spoiler(v) => {
-                append_inline(&v.text, &format!("{path}.spoiler"), output)?
-            }
-            RichTextObject::DateTime(v) => {
-                append_inline(&v.text, &format!("{path}.datetime"), output)?
-            }
-            RichTextObject::TextMention(v) => {
-                append_inline(&v.text, &format!("{path}.text_mention"), output)?
-            }
-            RichTextObject::Subscript(v) => {
-                append_inline(&v.text, &format!("{path}.subscript"), output)?
-            }
-            RichTextObject::Superscript(v) => {
-                append_inline(&v.text, &format!("{path}.superscript"), output)?
-            }
-            RichTextObject::Marked(v) => append_inline(&v.text, &format!("{path}.marked"), output)?,
-            RichTextObject::Code(v) => append_inline(&v.text, &format!("{path}.code"), output)?,
             RichTextObject::CustomEmoji(v) => append_leaf(
                 &v.alternative_text,
                 Some(v.custom_emoji_id.to_string()),
                 &format!("{path}.custom_emoji"),
                 output,
+                budget,
+                depth + 1,
             )?,
-            RichTextObject::MathematicalExpression(v) => {
-                append_leaf(&v.expression, None, &format!("{path}.math"), output)?
-            }
-            RichTextObject::Url(v) => append_inline(&v.text, &format!("{path}.url.text"), output)?,
-            RichTextObject::EmailAddress(v) => {
-                append_inline(&v.text, &format!("{path}.email.text"), output)?
-            }
-            RichTextObject::PhoneNumber(v) => {
-                append_inline(&v.text, &format!("{path}.phone.text"), output)?
-            }
-            RichTextObject::BankCardNumber(v) => {
-                append_inline(&v.text, &format!("{path}.bank_card.text"), output)?
-            }
-            RichTextObject::TonAddress(v) => {
-                append_inline(&v.text, &format!("{path}.ton_address.text"), output)?
-            }
-            RichTextObject::Mention(v) => {
-                append_inline(&v.text, &format!("{path}.mention.text"), output)?
-            }
-            RichTextObject::Hashtag(v) => {
-                append_inline(&v.text, &format!("{path}.hashtag.text"), output)?
-            }
-            RichTextObject::Cashtag(v) => {
-                append_inline(&v.text, &format!("{path}.cashtag.text"), output)?
-            }
-            RichTextObject::BotCommand(v) => {
-                append_inline(&v.text, &format!("{path}.bot_command.text"), output)?
-            }
-            RichTextObject::Button(v) => {
-                append_inline(&v.button.text, &format!("{path}.button.text"), output)?
-            }
-            RichTextObject::AnchorLink(v) => {
-                append_inline(&v.text, &format!("{path}.anchor_link.text"), output)?
-            }
-            RichTextObject::Reference(v) => {
-                append_inline(&v.text, &format!("{path}.reference.text"), output)?
-            }
-            RichTextObject::ReferenceLink(v) => {
-                append_inline(&v.text, &format!("{path}.reference_link.text"), output)?
-            }
+            RichTextObject::MathematicalExpression(v) => append_leaf(
+                &v.expression,
+                None,
+                &format!("{path}.math"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Url(v) => append_inline(
+                &v.text,
+                &format!("{path}.url.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::EmailAddress(v) => append_inline(
+                &v.text,
+                &format!("{path}.email.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::PhoneNumber(v) => append_inline(
+                &v.text,
+                &format!("{path}.phone.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::BankCardNumber(v) => append_inline(
+                &v.text,
+                &format!("{path}.bank_card.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::TonAddress(v) => append_inline(
+                &v.text,
+                &format!("{path}.ton_address.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Mention(v) => append_inline(
+                &v.text,
+                &format!("{path}.mention.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Hashtag(v) => append_inline(
+                &v.text,
+                &format!("{path}.hashtag.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Cashtag(v) => append_inline(
+                &v.text,
+                &format!("{path}.cashtag.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::BotCommand(v) => append_inline(
+                &v.text,
+                &format!("{path}.bot_command.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Button(v) => append_inline(
+                &v.button.text,
+                &format!("{path}.button.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::AnchorLink(v) => append_inline(
+                &v.text,
+                &format!("{path}.anchor_link.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::Reference(v) => append_inline(
+                &v.text,
+                &format!("{path}.reference.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
+            RichTextObject::ReferenceLink(v) => append_inline(
+                &v.text,
+                &format!("{path}.reference_link.text"),
+                output,
+                budget,
+                depth + 1,
+            )?,
             RichTextObject::Anchor(_) | RichTextObject::Unknown(_) => {}
         },
     }
@@ -465,7 +704,11 @@ fn append_leaf(
     custom_id: Option<String>,
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, depth)?;
+    budget.charge_text(text)?;
     let custom = custom_id
         .map(|id| CustomEmojiInput {
             id,
@@ -475,7 +718,7 @@ fn append_leaf(
         .into_iter()
         .collect::<Vec<_>>();
     let analysis = emoji_analysis::analyze(text, &custom)?;
-    ensure_occurrence_budget(output, &analysis.occurrences)?;
+    budget.charge_analysis(&analysis)?;
     output.extend(
         analysis
             .occurrences
@@ -515,13 +758,16 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
 pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiAnalysisError> {
     let mut references = Vec::new();
     if let Some(rich_texts) = quote.rich_texts.as_ref().filter(|texts| !texts.is_empty()) {
-        validate_serialized_budget(rich_texts)?;
         let mut occurrences = Vec::new();
+        let mut budget = TraversalBudget::default();
+        budget.visit("quote.rich_texts", 0)?;
         for (index, text) in rich_texts.iter().enumerate() {
             append_inline(
                 text,
                 &format!("quote.rich_texts[{index}]"),
                 &mut occurrences,
+                &mut budget,
+                1,
             )?;
         }
         references.extend(occurrences.into_iter().map(|item| EmojiReference {
@@ -530,8 +776,11 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
             fallback: Some(item.fallback),
         }));
     } else {
+        let mut budget = TraversalBudget::default();
+        budget.visit("quote.text", 0)?;
+        budget.charge_text(&quote.text)?;
         let analysis = emoji_analysis::analyze_telegram_text(&quote.text, &quote.entities)?;
-        ensure_occurrence_budget(&[], &analysis.occurrences)?;
+        budget.charge_analysis(&analysis)?;
         references.extend(analysis.occurrences.into_iter().map(|item| EmojiReference {
             kind: ReferenceKind::Quote,
             identity: item.identity,
@@ -585,85 +834,114 @@ mod tests {
     }
 
     #[test]
-    fn rich_budget_rejects_excess_nodes_depth_paths_and_total_text() {
-        let too_many_nodes = serde_json::Value::Array(vec![json!(null); MAX_TRAVERSAL_NODES]);
+    fn traversal_budget_enforces_exact_boundaries() {
+        let mut depth = TraversalBudget::default();
+        assert!(depth.visit("path", MAX_TRAVERSAL_DEPTH).is_ok());
         assert_eq!(
-            validate_value_budget(&too_many_nodes),
+            depth.visit("path", MAX_TRAVERSAL_DEPTH + 1),
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
 
-        let mut too_deep = json!(null);
-        for _ in 0..=MAX_TRAVERSAL_DEPTH {
-            too_deep = json!([too_deep]);
+        let long_path = "p".repeat(MAX_SINGLE_PATH_BYTES);
+        let mut aggregate_path = TraversalBudget::default();
+        for _ in 0..(MAX_TRAVERSAL_PATH_BYTES / MAX_SINGLE_PATH_BYTES) {
+            assert!(aggregate_path.visit(&long_path, 0).is_ok());
         }
         assert_eq!(
-            validate_value_budget(&too_deep),
+            aggregate_path.visit(&long_path, 0),
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
 
-        let too_much_text = json!("x".repeat(MAX_TOTAL_TEXT_BYTES + 1));
+        let mut nodes = TraversalBudget {
+            nodes: MAX_TRAVERSAL_NODES,
+            ..TraversalBudget::default()
+        };
         assert_eq!(
-            validate_value_budget(&too_much_text),
-            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
-        );
-        assert_eq!(
-            validate_serialized_budget(&"x".repeat(MAX_SERIALIZED_RICH_BYTES + 1)),
+            nodes.visit("path", 0),
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
 
-        let mut too_many_path_bytes = serde_json::Map::new();
-        for index in 0..512 {
-            too_many_path_bytes.insert(format!("{}-{index}", "k".repeat(600)), json!(null));
-        }
+        let exact_path = "p".repeat(MAX_SINGLE_PATH_BYTES);
+        let mut path = TraversalBudget::default();
+        assert!(path.visit(&exact_path, 0).is_ok());
         assert_eq!(
-            validate_value_budget(&serde_json::Value::Object(too_many_path_bytes)),
+            path.visit(&format!("{exact_path}x"), 0),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let mut total_text = TraversalBudget::default();
+        total_text.text_bytes = MAX_TOTAL_TEXT_BYTES - 1;
+        assert!(total_text.charge_text("x").is_ok());
+        assert_eq!(
+            total_text.charge_text("x"),
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
     }
 
     #[test]
-    fn occurrence_budget_counts_across_independent_leaves() {
-        let mut output = vec![fake_occurrence(); MAX_TOTAL_OCCURRENCES];
-        let addition = emoji_analysis::analyze("😀", &[]).unwrap().occurrences;
+    fn typed_rich_traversal_stops_at_depth_nodes_text_and_output_budgets() {
+        let wide = json!({
+            "blocks": vec![json!({"type":"divider"}); MAX_TRAVERSAL_NODES]
+        });
         assert_eq!(
-            ensure_occurrence_budget(&output, &addition),
+            extract_rich_value(wide),
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
-        output.clear();
-        let custom = emoji_analysis::analyze(
-            "x",
-            &[CustomEmojiInput {
-                id: "id".into(),
-                utf16_range: 0..1,
-                format: EmojiFormat::Unknown,
-            }],
-        )
-        .unwrap()
-        .occurrences;
-        output.resize_with(MAX_TOTAL_CUSTOM_EMOJI, fake_custom_occurrence);
+
+        let mut nested_block = json!({"type":"paragraph", "text":"😀"});
+        for _ in 0..(MAX_TRAVERSAL_DEPTH + 2) {
+            nested_block = json!({
+                "type":"details",
+                "summary":"",
+                "blocks":[nested_block]
+            });
+        }
         assert_eq!(
-            ensure_occurrence_budget(&output, &custom),
+            extract_rich_value(json!({"blocks":[nested_block]})),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let too_much_text = json!({
+            "blocks":[{"type":"paragraph", "text": "x".repeat(MAX_TOTAL_TEXT_BYTES + 1)}]
+        });
+        assert_eq!(
+            extract_rich_value(too_much_text),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let too_many_occurrences = json!({
+            "blocks":[{"type":"paragraph", "text": vec!["😀😀😀😀"; 2_500]}]
+        });
+        assert_eq!(
+            extract_rich_value(too_many_occurrences),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let custom_emojis = (0..=MAX_TOTAL_CUSTOM_EMOJI)
+            .map(|id| {
+                json!({
+                    "type":"custom_emoji",
+                    "custom_emoji_id":id.to_string(),
+                "alternative_text":"😀"
+                })
+            })
+            .collect::<Vec<_>>();
+        let too_many_custom_emoji = json!({
+            "blocks":[{"type":"paragraph", "text":custom_emojis}]
+        });
+        assert_eq!(
+            extract_rich_value(too_many_custom_emoji),
             Err(EmojiAnalysisError::RichTraversalLimitExceeded)
         );
     }
 
-    fn fake_occurrence() -> EmojiOccurrence {
-        EmojiOccurrence {
-            identity: EmojiIdentity::Unicode("😀".into()),
-            fallback: "😀".into(),
-            source: ContentSource::Text,
-            path: "text".into(),
-            utf8_range: 0..4,
-            utf16_range: 0..2,
-            format: EmojiFormat::Unicode,
-        }
-    }
-
-    fn fake_custom_occurrence() -> EmojiOccurrence {
-        EmojiOccurrence {
-            identity: EmojiIdentity::Custom("id".into()),
-            ..fake_occurrence()
-        }
+    fn extract_rich_value(
+        value: serde_json::Value,
+    ) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
+        let rich: RichMessage = serde_json::from_value(value).unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default())?;
+        Ok(found)
     }
 
     #[test]
@@ -672,7 +950,7 @@ mod tests {
             {"type":"paragraph", "text":{"type":"bold", "text":["😀", {"type":"custom_emoji", "custom_emoji_id":"99", "alternative_text":"😎"}]}}
         ]})).unwrap();
         let mut found = Vec::new();
-        append_rich_message(&rich, &mut found).unwrap();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].identity, EmojiIdentity::Unicode("😀".into()));
         assert!(found[0].path.contains("paragraph.text.bold"));
