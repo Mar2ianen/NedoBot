@@ -7,6 +7,47 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+27 ноября 2026 в **15:26:59 UTC / 18:26:59 МСК** завершена финальная
+выкладка
+[deploy-2026-11-27-lols-removed](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-27-lols-removed)
+на source `52397bb7274a8e35771e52d97e721df533da268f` после
+[PR #189](https://github.com/Mar2ianen/NedoBot/pull/189); bridge-изменение
+удаления runtime-интеграции вошло через
+[PR #188](https://github.com/Mar2ianen/NedoBot/pull/188). Push-CI финального
+main [46019436841](https://github.com/Mar2ianen/NedoBot/actions/runs/46019436841)
+и release [46023561781](https://github.com/Mar2ianen/NedoBot/actions/runs/46023561781)
+завершились успешно: build 8m18s, deploy 1m13s.
+
+Удалены LOLS runtime-интеграция, hourly sync и её cron. После отдельного
+bridge-релиза
+[`deploy-2026-11-27-lols-no-code`](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-27-lols-no-code)
+(source `82dc196bdc263af0721f85c7764b964c61b722ab`,
+[release 46017565587](https://github.com/Mar2ianen/NedoBot/actions/runs/46017565587))
+применена additive migration `20261127140000`: она удаляет больше не
+используемую `lols_spam_users` в обеих БД. До очистки и удаления таблиц создан
+проверенный backup; `pg_restore --list` успешно прочитал оба архива:
+`/var/backups/nedobot/lols-removal-20261127`.
+
+| Backup до удаления таблиц | SHA-256 |
+| --- | --- |
+| `tg_ai_bot-lols_spam_users.dump` | `f9de1e4f577a3adb9494e194c75e6058038df84abeb0dd2b6180a17eab395c22` |
+| `tg_ai_bot_pvo-lols_spam_users.dump` | `e621f7a0b928c1990e496d9d9b2deb267ca48197107fe457ddb3e62455f2b550` |
+
+| Артефакт | SHA-256 |
+| --- | --- |
+| Оба running bots | `2072893cd4d2b3f71bc6cab5cc0352fa5af7f4612db3da37d2ed56c01decd106` |
+| Public MCP | `2dbd8c02594ced6a4a4fe3bbe86e2fbbbb836e705a1a6562cb0726281a9b26b5` |
+| `migrate` | `45e2876c0d05fc399f86dd550feac55235a3c56d5d4d66d77c6e0cc6da4230cc` |
+
+Проверка после deploy: оба bot unit-а и public MCP active/running,
+`NRestarts=0`; SHA работающих процессов совпадает с release artifact. Обе БД
+на `20261127140000`, failed migrations = 0, таблица отсутствует. LOLS cron
+отсутствует, sync-бинарники удалены; в журналах трёх unit-ов нет ERROR и panic.
+MCP probes: локальный 403, публичный 405. Backup checksum повторно проверен;
+свободно 16 GiB на `/`.
+
+## Предыдущая выкладка: LOLS sync bounded (до удаления зеркала)
+
 27 ноября 2026 в **07:23:54 UTC / 10:23:54 МСК** установлен
 [deploy-2026-11-27-lols-sync-bounded](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-27-lols-sync-bounded),
 source `6c060bf0954f201ce06db8875356e5d650abf8ba` после
