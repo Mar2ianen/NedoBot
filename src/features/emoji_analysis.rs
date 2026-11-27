@@ -322,6 +322,39 @@ mod tests {
             analyze("abc", &overlap),
             Err(EmojiAnalysisError::OverlappingCustomEmojiRanges)
         );
+
+        let split_grapheme = [CustomEmojiInput {
+            id: "3".to_owned(),
+            utf16_range: 0..1,
+            format: EmojiFormat::Static,
+        }];
+        assert_eq!(
+            analyze("a\u{301}", &split_grapheme),
+            Err(EmojiAnalysisError::InvalidGraphemeBoundary)
+        );
+    }
+
+    #[test]
+    fn animated_and_unknown_custom_formats_are_counted_separately() {
+        let analysis = analyze(
+            "xy",
+            &[
+                CustomEmojiInput {
+                    id: "animated".to_owned(),
+                    utf16_range: 0..1,
+                    format: EmojiFormat::AnimatedTgs,
+                },
+                CustomEmojiInput {
+                    id: "unknown".to_owned(),
+                    utf16_range: 1..2,
+                    format: EmojiFormat::Unknown,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(analysis.metrics.custom_count, 2);
+        assert_eq!(analysis.metrics.animated_count, 1);
+        assert_eq!(analysis.metrics.unknown_format_count, 1);
     }
 
     proptest::proptest! {
