@@ -144,11 +144,6 @@ impl SnapshotLoader {
                 where r.telegram_user_id = cu.telegram_user_id
                   and r.source_instance_id <> $3
             ) as shared_spammer_identity,
-            exists (
-                select 1
-                from lols_spam_users l
-                where l.telegram_user_id = cu.telegram_user_id
-            ) as lols_spammer_identity,
             p.first_name,
             p.last_name,
             nullif(trim(concat_ws(' ', p.first_name, p.last_name)), '') as display_name,
@@ -340,7 +335,8 @@ impl SnapshotLoader {
                 username_reuse_spammer_count: row.get("username_reuse_spammer_count"),
                 local_spammer_identity: row.get("local_spammer_identity"),
                 shared_spammer_identity: row.get("shared_spammer_identity"),
-                lols_spammer_identity: row.get("lols_spammer_identity"),
+                // Поле внешнего scorer-крейта оставлено выключенным для этого consumer-а.
+                lols_spammer_identity: false,
                 first_name: row.get("first_name"),
                 last_name: row.get("last_name"),
                 display_name: row.get("display_name"),

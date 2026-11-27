@@ -180,7 +180,6 @@ pub(super) fn project_unified_user_audit_material_revision(
             "profile_photo_unique_id": features.profile_photo_file_unique_id,
             "local_spammer_identity": features.local_spammer_identity,
             "shared_spammer_identity": features.shared_spammer_identity,
-            "lols_spammer_identity": features.lols_spammer_identity,
         },
         "first_message": bounded_audit_text(features.first_message_text.as_deref()),
         "first_message_reply_context": bounded_audit_text(features.first_message_reply_context.as_deref()),
