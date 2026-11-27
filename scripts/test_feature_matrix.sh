@@ -5,5 +5,11 @@ feature_gate_test=config::tests::manual_moderation_requires_global_and_chat_gate
 
 cargo check --lib --locked
 cargo check --no-default-features --lib --locked
+if cargo tree --no-default-features --prefix none | rg -q '^emojis v'; then
+    echo "emoji data dependency leaked into the no-default build" >&2
+    exit 1
+fi
+cargo check --no-default-features --features emoji --lib --locked
+python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --features emoji --lib features::emoji_analysis --locked
 python3 scripts/run_cargo_test_checked.py cargo test --lib "$feature_gate_test" --locked -- --exact
 python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --lib "$feature_gate_test" --locked -- --exact
