@@ -403,17 +403,8 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
 }
 
 pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiAnalysisError> {
-    let analysis = emoji_analysis::analyze_telegram_text(&quote.text, &quote.entities)?;
-    let mut references = analysis
-        .occurrences
-        .into_iter()
-        .map(|item| EmojiReference {
-            kind: ReferenceKind::Quote,
-            identity: item.identity,
-            fallback: Some(item.fallback),
-        })
-        .collect::<Vec<_>>();
-    if let Some(rich_texts) = &quote.rich_texts {
+    let mut references = Vec::new();
+    if let Some(rich_texts) = quote.rich_texts.as_ref().filter(|texts| !texts.is_empty()) {
         let mut occurrences = Vec::new();
         for (index, text) in rich_texts.iter().enumerate() {
             append_inline(
@@ -423,6 +414,13 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
             )?;
         }
         references.extend(occurrences.into_iter().map(|item| EmojiReference {
+            kind: ReferenceKind::Quote,
+            identity: item.identity,
+            fallback: Some(item.fallback),
+        }));
+    } else {
+        let analysis = emoji_analysis::analyze_telegram_text(&quote.text, &quote.entities)?;
+        references.extend(analysis.occurrences.into_iter().map(|item| EmojiReference {
             kind: ReferenceKind::Quote,
             identity: item.identity,
             fallback: Some(item.fallback),
@@ -520,7 +518,7 @@ mod tests {
         assert_eq!(refs[0].fallback.as_deref(), Some("😀"));
 
         let rich_quote = TextQuote {
-            text: String::new(),
+            text: "✨".into(),
             entities: Vec::new(),
             rich_texts: Some(vec![RichText::Object(RichTextObject::CustomEmoji(
                 serde_json::from_value(json!({
@@ -534,6 +532,7 @@ mod tests {
             is_manual: true,
         };
         let rich_refs = quote_references(&rich_quote).unwrap();
+        assert_eq!(rich_refs.len(), 1, "rich projection must not double count");
         assert_eq!(rich_refs[0].identity, EmojiIdentity::Custom("100".into()));
         assert_eq!(rich_refs[0].fallback.as_deref(), Some("✨"));
 
