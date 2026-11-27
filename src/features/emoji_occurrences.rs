@@ -10,13 +10,15 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use teloxide::types::{
-    Message, MessageEntity, ReactionType, RichBlock, RichBlockKind, RichMessage, RichText,
-    RichTextObject, TextQuote,
+    CustomEmojiId, Message, MessageEntity, ReactionType, RichBlock, RichBlockKind, RichMessage,
+    RichText, RichTextObject, TextQuote,
 };
 
 use crate::features::emoji_analysis::{
-    self, CustomEmojiInput, EmojiAnalysisError, EmojiEncoding, EmojiFormat, EmojiIdentity,
+    self, CustomEmojiFormat, CustomEmojiInput, CustomEmojiProvenance, EmojiAnalysisError, EmojiKind,
 };
+#[cfg(test)]
+use crate::features::emoji_analysis::{EmojiEncoding, EmojiIdentity};
 use crate::telegram::rich_content::rich_message;
 
 const MAX_TRAVERSAL_NODES: usize = 8_192;
@@ -82,15 +84,12 @@ pub enum ContentSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmojiOccurrence {
-    pub identity: EmojiIdentity,
+    pub kind: EmojiKind,
     pub fallback: String,
     pub source: ContentSource,
     pub path: String,
     pub utf8_range: Range<usize>,
     pub utf16_range: Range<usize>,
-    pub format: EmojiFormat,
-    pub encoding: EmojiEncoding,
-    pub has_custom_url_fallback: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,10 +105,8 @@ pub enum ReferenceKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmojiReference {
     pub kind: ReferenceKind,
-    pub identity: EmojiIdentity,
+    pub emoji: EmojiKind,
     pub fallback: Option<String>,
-    pub encoding: Option<EmojiEncoding>,
-    pub has_custom_url_fallback: bool,
 }
 
 pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
@@ -158,15 +155,12 @@ fn append_telegram_text(
             .occurrences
             .into_iter()
             .map(|item| EmojiOccurrence {
-                identity: item.identity,
+                kind: item.kind,
                 fallback: item.fallback,
                 source,
                 path: path.to_owned(),
                 utf8_range: item.utf8_range,
                 utf16_range: item.utf16_range,
-                format: item.format,
-                encoding: item.encoding,
-                has_custom_url_fallback: item.has_custom_url_fallback,
             }),
     );
     Ok(())
@@ -593,14 +587,19 @@ fn append_inline(
             RichTextObject::Code(v) => {
                 append_inline(&v.text, &format!("{path}.code"), output, budget, depth + 1)?
             }
-            RichTextObject::CustomEmoji(v) => append_leaf(
-                &v.alternative_text,
-                Some(v.custom_emoji_id.to_string()),
-                &format!("{path}.custom_emoji"),
-                output,
-                budget,
-                depth + 1,
-            )?,
+            RichTextObject::CustomEmoji(v) => {
+                if v.custom_emoji_id.len() > emoji_analysis::MAX_CUSTOM_EMOJI_ID_BYTES {
+                    return Err(EmojiAnalysisError::CustomEmojiIdTooLong);
+                }
+                append_leaf(
+                    &v.alternative_text,
+                    Some(v.custom_emoji_id.to_string()),
+                    &format!("{path}.custom_emoji"),
+                    output,
+                    budget,
+                    depth + 1,
+                )?;
+            }
             RichTextObject::MathematicalExpression(v) => append_leaf(
                 &v.expression,
                 None,
@@ -611,18 +610,18 @@ fn append_inline(
             )?,
             RichTextObject::Url(v) => {
                 let candidate = teloxide_url::parse_telegram_link(&v.url);
-                if let Some(teloxide_url::TelegramLink::CustomEmojiFallback { id }) = candidate
-                    && let Some(label) = bounded_rich_label(&v.text)
-                    && is_single_unicode_emoji(&label)
-                {
-                    append_custom_url_fallback(
-                        &label,
-                        id.to_string(),
-                        &format!("{path}.url.text"),
-                        output,
-                        budget,
-                        depth + 1,
-                    )?;
+                if let Some(teloxide_url::TelegramLink::CustomEmojiFallback { id }) = candidate {
+                    let label_path = format!("{path}.url.text");
+                    let mut evidence = RichLabelEvidence::default();
+                    collect_rich_label(&v.text, &label_path, budget, depth + 1, &mut evidence)?;
+                    if !evidence.text.is_empty() {
+                        evidence.url_fallbacks.push(RichUrlFallback {
+                            id: CustomEmojiId(id.to_string()),
+                            utf8_range: 0..evidence.text.len(),
+                            utf16_range: 0..evidence.utf16_len,
+                        });
+                    }
+                    append_rich_label_evidence(evidence, &label_path, output, budget)?;
                 } else {
                     append_inline(
                         &v.text,
@@ -735,11 +734,10 @@ fn append_leaf(
     budget.charge_text(text)?;
     let custom = custom_id
         .map(|id| CustomEmojiInput {
-            id,
+            id: CustomEmojiId(id),
             utf16_range: 0..text.encode_utf16().count(),
-            format: EmojiFormat::Unknown,
-            encoding: EmojiEncoding::NativeCustom,
-            has_custom_url_fallback: false,
+            format: CustomEmojiFormat::Unknown,
+            provenance: CustomEmojiProvenance::Native,
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -750,34 +748,14 @@ fn append_leaf(
             .occurrences
             .into_iter()
             .map(|item| EmojiOccurrence {
-                identity: item.identity,
+                kind: item.kind,
                 fallback: item.fallback,
                 source: ContentSource::RichMessage,
                 path: path.to_owned(),
                 utf8_range: item.utf8_range,
                 utf16_range: item.utf16_range,
-                format: item.format,
-                encoding: item.encoding,
-                has_custom_url_fallback: item.has_custom_url_fallback,
             }),
     );
-    Ok(())
-}
-
-fn append_custom_url_fallback(
-    label: &str,
-    id: String,
-    path: &str,
-    output: &mut Vec<EmojiOccurrence>,
-    budget: &mut TraversalBudget,
-    depth: usize,
-) -> Result<(), EmojiAnalysisError> {
-    let start = output.len();
-    append_leaf(label, Some(id), path, output, budget, depth)?;
-    for occurrence in &mut output[start..] {
-        occurrence.encoding = EmojiEncoding::CustomUrlFallback;
-        occurrence.has_custom_url_fallback = true;
-    }
     Ok(())
 }
 
@@ -785,79 +763,306 @@ fn is_single_unicode_emoji(label: &str) -> bool {
     label.graphemes(true).count() == 1 && emojis::get(label).is_some()
 }
 
-fn bounded_rich_label(text: &RichText) -> Option<String> {
-    let mut flattened = String::new();
-    let mut pending = vec![(text, 0usize)];
-    let mut nodes = 0usize;
-    while let Some((node, depth)) = pending.pop() {
-        nodes += 1;
-        if nodes > MAX_TRAVERSAL_NODES || depth > MAX_TRAVERSAL_DEPTH {
-            return None;
-        }
-        match node {
-            RichText::Text(value) => {
-                if flattened.len().saturating_add(value.len()) > MAX_SINGLE_PATH_BYTES {
-                    return None;
-                }
-                flattened.push_str(value);
-            }
-            RichText::List(items) => {
-                if nodes
-                    .saturating_add(pending.len())
-                    .saturating_add(items.len())
-                    > MAX_TRAVERSAL_NODES
-                {
-                    return None;
-                }
-                pending.extend(items.iter().rev().map(|item| (item, depth + 1)));
-            }
-            RichText::Object(object) => match object {
-                RichTextObject::Bold(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Italic(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Underline(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Strikethrough(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Spoiler(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::DateTime(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::TextMention(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Subscript(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Superscript(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Marked(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Code(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::CustomEmoji(v) => {
-                    append_bounded_label(&mut flattened, &v.alternative_text)?
-                }
-                RichTextObject::MathematicalExpression(v) => {
-                    append_bounded_label(&mut flattened, &v.expression)?
-                }
-                RichTextObject::Url(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::EmailAddress(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::PhoneNumber(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::BankCardNumber(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::TonAddress(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Mention(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Hashtag(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Cashtag(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::BotCommand(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Button(v) => pending.push((&v.button.text, depth + 1)),
-                RichTextObject::AnchorLink(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Reference(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::ReferenceLink(v) => pending.push((&v.text, depth + 1)),
-                RichTextObject::Anchor(_) | RichTextObject::Unknown(_) => return None,
-            },
-        }
-        if flattened.len() > MAX_SINGLE_PATH_BYTES {
-            return None;
-        }
-    }
-    Some(flattened)
+#[derive(Default)]
+struct RichLabelEvidence {
+    text: String,
+    utf16_len: usize,
+    native_custom: Vec<CustomEmojiInput>,
+    url_fallbacks: Vec<RichUrlFallback>,
+    contains_unknown: bool,
 }
 
-fn append_bounded_label(output: &mut String, text: &str) -> Option<()> {
-    if output.len().saturating_add(text.len()) > MAX_SINGLE_PATH_BYTES {
-        return None;
+struct RichUrlFallback {
+    id: CustomEmojiId,
+    utf8_range: Range<usize>,
+    utf16_range: Range<usize>,
+}
+
+fn collect_rich_label(
+    node: &RichText,
+    path: &str,
+    budget: &mut TraversalBudget,
+    depth: usize,
+    evidence: &mut RichLabelEvidence,
+) -> Result<(), EmojiAnalysisError> {
+    budget.visit(path, depth)?;
+    match node {
+        RichText::Text(text) => append_rich_label_text(text, path, budget, evidence)?,
+        RichText::List(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_rich_label(
+                    item,
+                    &format!("{path}[{index}]"),
+                    budget,
+                    depth + 1,
+                    evidence,
+                )?;
+            }
+        }
+        RichText::Object(object) => match object {
+            RichTextObject::Bold(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.bold"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Italic(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.italic"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Underline(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.underline"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Strikethrough(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.strikethrough"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Spoiler(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.spoiler"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::DateTime(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.datetime"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::TextMention(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.text_mention"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Subscript(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.subscript"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Superscript(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.superscript"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Marked(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.marked"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Code(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.code"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::CustomEmoji(v) => {
+                if v.custom_emoji_id.len() > emoji_analysis::MAX_CUSTOM_EMOJI_ID_BYTES {
+                    return Err(EmojiAnalysisError::CustomEmojiIdTooLong);
+                }
+                let start_utf16 = evidence.utf16_len;
+                append_rich_label_text(&v.alternative_text, path, budget, evidence)?;
+                evidence.native_custom.push(CustomEmojiInput {
+                    id: CustomEmojiId(v.custom_emoji_id.clone()),
+                    utf16_range: start_utf16..evidence.utf16_len,
+                    format: CustomEmojiFormat::Unknown,
+                    provenance: CustomEmojiProvenance::Native,
+                });
+            }
+            RichTextObject::MathematicalExpression(v) => {
+                append_rich_label_text(&v.expression, path, budget, evidence)?
+            }
+            RichTextObject::Url(v) => {
+                let start_utf8 = evidence.text.len();
+                let start_utf16 = evidence.utf16_len;
+                let child_path = format!("{path}.url.text");
+                collect_rich_label(&v.text, &child_path, budget, depth + 1, evidence)?;
+                if let Some(teloxide_url::TelegramLink::CustomEmojiFallback { id }) =
+                    teloxide_url::parse_telegram_link(&v.url)
+                {
+                    evidence.url_fallbacks.push(RichUrlFallback {
+                        id: CustomEmojiId(id.to_string()),
+                        utf8_range: start_utf8..evidence.text.len(),
+                        utf16_range: start_utf16..evidence.utf16_len,
+                    });
+                }
+            }
+            RichTextObject::EmailAddress(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.email.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::PhoneNumber(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.phone.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::BankCardNumber(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.bank_card.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::TonAddress(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.ton_address.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Mention(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.mention.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Hashtag(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.hashtag.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Cashtag(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.cashtag.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::BotCommand(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.bot_command.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Button(v) => collect_rich_label(
+                &v.button.text,
+                &format!("{path}.button.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::AnchorLink(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.anchor_link.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Reference(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.reference.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::ReferenceLink(v) => collect_rich_label(
+                &v.text,
+                &format!("{path}.reference_link.text"),
+                budget,
+                depth + 1,
+                evidence,
+            )?,
+            RichTextObject::Anchor(_) => {}
+            RichTextObject::Unknown(_) => evidence.contains_unknown = true,
+        },
     }
-    output.push_str(text);
-    Some(())
+    Ok(())
+}
+
+fn append_rich_label_text(
+    text: &str,
+    _path: &str,
+    budget: &mut TraversalBudget,
+    evidence: &mut RichLabelEvidence,
+) -> Result<(), EmojiAnalysisError> {
+    budget.charge_text(text)?;
+    if evidence.text.len().saturating_add(text.len()) > MAX_SINGLE_PATH_BYTES {
+        return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+    }
+    evidence.text.push_str(text);
+    evidence.utf16_len = evidence
+        .utf16_len
+        .saturating_add(text.encode_utf16().count());
+    Ok(())
+}
+
+fn append_rich_label_evidence(
+    mut evidence: RichLabelEvidence,
+    path: &str,
+    output: &mut Vec<EmojiOccurrence>,
+    budget: &mut TraversalBudget,
+) -> Result<(), EmojiAnalysisError> {
+    for fallback in evidence.url_fallbacks {
+        if evidence.contains_unknown {
+            break;
+        }
+        let Some(label) = evidence.text.get(fallback.utf8_range.clone()) else {
+            continue;
+        };
+        if !is_single_unicode_emoji(label) {
+            continue;
+        }
+        let same_native = evidence
+            .native_custom
+            .iter_mut()
+            .find(|native| native.utf16_range == fallback.utf16_range && native.id == fallback.id);
+        if let Some(native) = same_native {
+            native.provenance = CustomEmojiProvenance::NativeWithUrlFallback;
+        } else {
+            evidence.native_custom.push(CustomEmojiInput {
+                id: fallback.id,
+                utf16_range: fallback.utf16_range,
+                format: CustomEmojiFormat::Unknown,
+                provenance: CustomEmojiProvenance::UrlFallback,
+            });
+        }
+    }
+    let analysis = emoji_analysis::analyze(&evidence.text, &evidence.native_custom)?;
+    budget.charge_analysis(&analysis)?;
+    output.extend(
+        analysis
+            .occurrences
+            .into_iter()
+            .map(|item| EmojiOccurrence {
+                kind: item.kind,
+                fallback: item.fallback,
+                source: ContentSource::RichMessage,
+                path: path.to_owned(),
+                utf8_range: item.utf8_range,
+                utf16_range: item.utf16_range,
+            }),
+    );
+    Ok(())
 }
 
 pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
@@ -866,17 +1071,19 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
         .filter_map(|reaction| match reaction {
             ReactionType::Emoji { emoji } => Some(EmojiReference {
                 kind: ReferenceKind::Reaction,
-                identity: EmojiIdentity::Unicode(emoji.clone()),
+                emoji: EmojiKind::Unicode {
+                    sequence: emoji.clone(),
+                },
                 fallback: Some(emoji.clone()),
-                encoding: Some(EmojiEncoding::Unicode),
-                has_custom_url_fallback: false,
             }),
             ReactionType::CustomEmoji { custom_emoji_id } => Some(EmojiReference {
                 kind: ReferenceKind::Reaction,
-                identity: EmojiIdentity::Custom(custom_emoji_id.to_string()),
+                emoji: EmojiKind::Custom {
+                    id: custom_emoji_id.clone(),
+                    format: CustomEmojiFormat::Unknown,
+                    provenance: CustomEmojiProvenance::Native,
+                },
                 fallback: None,
-                encoding: Some(EmojiEncoding::NativeCustom),
-                has_custom_url_fallback: false,
             }),
             ReactionType::Paid => None,
         })
@@ -900,10 +1107,8 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
         }
         references.extend(occurrences.into_iter().map(|item| EmojiReference {
             kind: ReferenceKind::Quote,
-            identity: item.identity,
+            emoji: item.kind,
             fallback: Some(item.fallback),
-            encoding: Some(item.encoding),
-            has_custom_url_fallback: item.has_custom_url_fallback,
         }));
     } else {
         let mut budget = TraversalBudget::default();
@@ -913,10 +1118,8 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
         budget.charge_analysis(&analysis)?;
         references.extend(analysis.occurrences.into_iter().map(|item| EmojiReference {
             kind: ReferenceKind::Quote,
-            identity: item.identity,
+            emoji: item.kind,
             fallback: Some(item.fallback),
-            encoding: Some(item.encoding),
-            has_custom_url_fallback: item.has_custom_url_fallback,
         }));
     }
     Ok(references)
@@ -925,10 +1128,12 @@ pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiA
 pub fn chat_status_reference(id: Option<&str>) -> Option<EmojiReference> {
     id.map(|id| EmojiReference {
         kind: ReferenceKind::ProfileStatus,
-        identity: EmojiIdentity::Custom(id.to_owned()),
+        emoji: EmojiKind::Custom {
+            id: CustomEmojiId(id.to_owned()),
+            format: CustomEmojiFormat::Unknown,
+            provenance: CustomEmojiProvenance::Native,
+        },
         fallback: None,
-        encoding: Some(EmojiEncoding::NativeCustom),
-        has_custom_url_fallback: false,
     })
 }
 
@@ -939,10 +1144,12 @@ pub fn custom_emoji_reference(
 ) -> EmojiReference {
     EmojiReference {
         kind,
-        identity: EmojiIdentity::Custom(id.to_string()),
+        emoji: EmojiKind::Custom {
+            id: CustomEmojiId(id.to_string()),
+            format: CustomEmojiFormat::Unknown,
+            provenance: CustomEmojiProvenance::Native,
+        },
         fallback,
-        encoding: Some(EmojiEncoding::NativeCustom),
-        has_custom_url_fallback: false,
     }
 }
 
@@ -963,7 +1170,7 @@ mod tests {
         })).unwrap();
         let found = extract_message(&message).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].identity, EmojiIdentity::Custom("42".into()));
+        assert_eq!(found[0].kind.identity(), EmojiIdentity::Custom("42".into()));
         assert_eq!(found[0].fallback, "😀");
         assert_eq!(found[0].source, ContentSource::Caption);
         assert_eq!(found[0].utf16_range, 2..4);
@@ -1088,9 +1295,12 @@ mod tests {
         let mut found = Vec::new();
         append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].identity, EmojiIdentity::Unicode("😀".into()));
+        assert_eq!(
+            found[0].kind.identity(),
+            EmojiIdentity::Unicode("😀".into())
+        );
         assert!(found[0].path.contains("paragraph.text.bold"));
-        assert_eq!(found[1].identity, EmojiIdentity::Custom("99".into()));
+        assert_eq!(found[1].kind.identity(), EmojiIdentity::Custom("99".into()));
         assert_eq!(found[1].fallback, "😎");
     }
 
@@ -1102,9 +1312,9 @@ mod tests {
         let mut found = Vec::new();
         append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].identity, EmojiIdentity::Custom("42".into()));
-        assert_eq!(found[0].encoding, EmojiEncoding::CustomUrlFallback);
-        assert!(found[0].has_custom_url_fallback);
+        assert_eq!(found[0].kind.identity(), EmojiIdentity::Custom("42".into()));
+        assert_eq!(found[0].kind.encoding(), EmojiEncoding::CustomUrlFallback);
+        assert!(found[0].kind.encoding().has_custom_url_fallback());
         assert_eq!(found[0].fallback, "😀");
 
         let invalid: RichMessage = serde_json::from_value(json!({"blocks":[
@@ -1116,6 +1326,56 @@ mod tests {
             found.is_empty(),
             "ordinary text labels remain ordinary text"
         );
+    }
+
+    #[test]
+    fn rich_url_label_preserves_matching_nested_custom_id_and_rejects_conflicts() {
+        let matching: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":{"type":"custom_emoji", "custom_emoji_id":"42", "alternative_text":"😀"}}}
+        ]})).unwrap();
+        let found = extract_rich_value(serde_json::to_value(matching).unwrap()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind.identity(), EmojiIdentity::Custom("42".into()));
+        assert_eq!(
+            found[0].kind.encoding(),
+            EmojiEncoding::NativeCustomWithUrlFallback
+        );
+        assert!(found[0].kind.encoding().has_custom_url_fallback());
+
+        let conflicting = json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":{"type":"custom_emoji", "custom_emoji_id":"43", "alternative_text":"😀"}}}
+        ]});
+        assert_eq!(
+            extract_rich_value(conflicting),
+            Err(EmojiAnalysisError::OverlappingCustomEmojiRanges)
+        );
+    }
+
+    #[test]
+    fn rich_url_label_nodes_share_the_callers_traversal_budget() {
+        let mut label = vec![json!(""); MAX_TRAVERSAL_NODES];
+        label.push(json!("😀"));
+        let value = json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":label}}
+        ]});
+        assert_eq!(
+            extract_rich_value(value),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn unknown_rich_label_object_prevents_url_fallback_identity() {
+        let value = json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"url", "url":"tg://emoji?id=42", "text":["😀", {"type":"future_object", "payload":"unrecognized"}]}}
+        ]});
+        let found = extract_rich_value(value).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].kind.identity(),
+            EmojiIdentity::Unicode("😀".into())
+        );
+        assert!(!found[0].kind.encoding().has_custom_url_fallback());
     }
 
     #[test]
@@ -1146,9 +1406,9 @@ mod tests {
         let refs = quote_references(&quote).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].kind, ReferenceKind::Quote);
-        assert_eq!(refs[0].identity, EmojiIdentity::Custom("99".into()));
+        assert_eq!(refs[0].emoji.identity(), EmojiIdentity::Custom("99".into()));
         assert_eq!(refs[0].fallback.as_deref(), Some("😀"));
-        assert_eq!(refs[0].encoding, Some(EmojiEncoding::NativeCustom));
+        assert_eq!(refs[0].emoji.encoding(), EmojiEncoding::NativeCustom);
 
         let rich_quote = TextQuote {
             text: "✨".into(),
@@ -1166,9 +1426,12 @@ mod tests {
         };
         let rich_refs = quote_references(&rich_quote).unwrap();
         assert_eq!(rich_refs.len(), 1, "rich projection must not double count");
-        assert_eq!(rich_refs[0].identity, EmojiIdentity::Custom("100".into()));
+        assert_eq!(
+            rich_refs[0].emoji.identity(),
+            EmojiIdentity::Custom("100".into())
+        );
         assert_eq!(rich_refs[0].fallback.as_deref(), Some("✨"));
-        assert_eq!(rich_refs[0].encoding, Some(EmojiEncoding::NativeCustom));
+        assert_eq!(rich_refs[0].emoji.encoding(), EmojiEncoding::NativeCustom);
 
         let fallback_quote = TextQuote {
             text: "✨".into(),
@@ -1185,17 +1448,20 @@ mod tests {
         let fallback_refs = quote_references(&fallback_quote).unwrap();
         assert_eq!(fallback_refs.len(), 1);
         assert_eq!(
-            fallback_refs[0].identity,
+            fallback_refs[0].emoji.identity(),
             EmojiIdentity::Custom("101".into())
         );
         assert_eq!(
-            fallback_refs[0].encoding,
-            Some(EmojiEncoding::CustomUrlFallback)
+            fallback_refs[0].emoji.encoding(),
+            EmojiEncoding::CustomUrlFallback
         );
-        assert!(fallback_refs[0].has_custom_url_fallback);
+        assert!(fallback_refs[0].emoji.encoding().has_custom_url_fallback());
 
         let status = chat_status_reference(Some("status-id")).unwrap();
         assert_eq!(status.kind, ReferenceKind::ProfileStatus);
-        assert_eq!(status.identity, EmojiIdentity::Custom("status-id".into()));
+        assert_eq!(
+            status.emoji.identity(),
+            EmojiIdentity::Custom("status-id".into())
+        );
     }
 }

@@ -19,7 +19,7 @@ pub(crate) fn extract_message_targets(message: &Message) -> Vec<Found> {
     let targets = {
         use std::{collections::HashSet, ops::Range};
 
-        use crate::features::emoji_analysis::{EmojiEncoding, EmojiIdentity};
+        use crate::features::emoji_analysis::EmojiIdentity;
 
         let Ok(occurrences) = crate::features::emoji_occurrences::extract_message(message) else {
             return targets;
@@ -31,7 +31,7 @@ pub(crate) fn extract_message_targets(message: &Message) -> Vec<Found> {
         };
         let mut validated = HashSet::<(u64, Range<usize>, String)>::new();
         for occurrence in occurrences {
-            if occurrence.encoding != EmojiEncoding::CustomUrlFallback {
+            if !occurrence.kind.encoding().has_custom_url_fallback() {
                 continue;
             }
             if occurrence.source != content_source {
@@ -39,7 +39,7 @@ pub(crate) fn extract_message_targets(message: &Message) -> Vec<Found> {
                 // so matching by label alone could suppress a different link.
                 continue;
             }
-            let EmojiIdentity::Custom(id) = occurrence.identity else {
+            let EmojiIdentity::Custom(id) = occurrence.kind.identity() else {
                 continue;
             };
             let Ok(id) = id.parse::<u64>() else {

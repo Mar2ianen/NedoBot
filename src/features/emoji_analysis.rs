@@ -8,7 +8,7 @@ use std::{
     ops::Range,
 };
 
-use teloxide::types::{MessageEntity, MessageEntityKind, Utf16OffsetMap};
+use teloxide::types::{CustomEmojiId, MessageEntity, MessageEntityKind, Utf16OffsetMap};
 use teloxide_url::TelegramLink;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -17,6 +17,7 @@ pub const UNICODE_EMOJI_VERSION: &str = "18.0";
 
 pub const MAX_TEXT_BYTES: usize = 1_048_576;
 pub const MAX_CUSTOM_EMOJI_SPANS: usize = 2_048;
+pub const MAX_CUSTOM_EMOJI_ID_BYTES: usize = 256;
 
 // Unicode 18.0.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point.
 // Keep this aligned with UNICODE_EMOJI_VERSION; ZWJ sequences are checked as
@@ -56,34 +57,104 @@ pub enum EmojiFormat {
     Unknown,
 }
 
+/// Media format of a Telegram custom emoji. Unicode is excluded because it is
+/// represented by `EmojiKind::Unicode`, so a custom occurrence cannot carry
+/// the impossible `format = Unicode` state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustomEmojiFormat {
+    Static,
+    AnimatedTgs,
+    VideoWebm,
+    Unknown,
+}
+
 /// How a logical emoji was represented in the message. This is independent of
 /// media format and preserves native plus fallback provenance when both occur.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmojiEncoding {
     Unicode,
     NativeCustom,
+    NativeCustomWithUrlFallback,
     CustomUrlFallback,
+}
+
+impl EmojiEncoding {
+    pub fn has_custom_url_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::NativeCustomWithUrlFallback | Self::CustomUrlFallback
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustomEmojiProvenance {
+    Native,
+    NativeWithUrlFallback,
+    UrlFallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EmojiKind {
+    Unicode {
+        sequence: String,
+    },
+    Custom {
+        id: CustomEmojiId,
+        format: CustomEmojiFormat,
+        provenance: CustomEmojiProvenance,
+    },
+}
+
+impl EmojiKind {
+    pub fn identity(&self) -> EmojiIdentity {
+        match self {
+            Self::Unicode { sequence } => EmojiIdentity::Unicode(sequence.clone()),
+            Self::Custom { id, .. } => EmojiIdentity::Custom(id.0.clone()),
+        }
+    }
+
+    pub fn format(&self) -> EmojiFormat {
+        match self {
+            Self::Unicode { .. } => EmojiFormat::Unicode,
+            Self::Custom { format, .. } => match format {
+                CustomEmojiFormat::Static => EmojiFormat::Static,
+                CustomEmojiFormat::AnimatedTgs => EmojiFormat::AnimatedTgs,
+                CustomEmojiFormat::VideoWebm => EmojiFormat::VideoWebm,
+                CustomEmojiFormat::Unknown => EmojiFormat::Unknown,
+            },
+        }
+    }
+
+    pub fn encoding(&self) -> EmojiEncoding {
+        match self {
+            Self::Unicode { .. } => EmojiEncoding::Unicode,
+            Self::Custom { provenance, .. } => match provenance {
+                CustomEmojiProvenance::Native => EmojiEncoding::NativeCustom,
+                CustomEmojiProvenance::NativeWithUrlFallback => {
+                    EmojiEncoding::NativeCustomWithUrlFallback
+                }
+                CustomEmojiProvenance::UrlFallback => EmojiEncoding::CustomUrlFallback,
+            },
+        }
+    }
 }
 
 /// A Telegram custom emoji's UTF-16 range and optional known representation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CustomEmojiInput {
-    pub id: String,
+    pub id: CustomEmojiId,
     pub utf16_range: Range<usize>,
-    pub format: EmojiFormat,
-    pub encoding: EmojiEncoding,
-    pub has_custom_url_fallback: bool,
+    pub format: CustomEmojiFormat,
+    pub provenance: CustomEmojiProvenance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmojiOccurrence {
-    pub identity: EmojiIdentity,
+    pub kind: EmojiKind,
     pub fallback: String,
     pub utf8_range: Range<usize>,
     pub utf16_range: Range<usize>,
-    pub format: EmojiFormat,
-    pub encoding: EmojiEncoding,
-    pub has_custom_url_fallback: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -120,6 +191,7 @@ pub struct EmojiAnalysis {
 pub enum EmojiAnalysisError {
     TextTooLong,
     TooManyCustomEmojiSpans,
+    CustomEmojiIdTooLong,
     EmptyCustomEmojiId,
     EmptyCustomEmojiRange,
     InvalidUtf16Boundary,
@@ -143,6 +215,12 @@ pub fn analyze(
     if custom.len() > MAX_CUSTOM_EMOJI_SPANS {
         return Err(EmojiAnalysisError::TooManyCustomEmojiSpans);
     }
+    if custom
+        .iter()
+        .any(|item| item.id.0.len() > MAX_CUSTOM_EMOJI_ID_BYTES)
+    {
+        return Err(EmojiAnalysisError::CustomEmojiIdTooLong);
+    }
 
     let mut custom_spans: Vec<(Range<usize>, &CustomEmojiInput)> = Vec::new();
     if !custom.is_empty() {
@@ -155,7 +233,7 @@ pub fn analyze(
         custom_spans = custom
             .iter()
             .map(|item| {
-                if item.id.is_empty() {
+                if item.id.0.is_empty() {
                     return Err(EmojiAnalysisError::EmptyCustomEmojiId);
                 }
                 if item.utf16_range.start >= item.utf16_range.end {
@@ -202,22 +280,23 @@ pub fn analyze(
         {
             let fallback = text[range.clone()].to_owned();
             result.occurrences.push(EmojiOccurrence {
-                identity: EmojiIdentity::Custom(input.id.clone()),
+                kind: EmojiKind::Custom {
+                    id: input.id.clone(),
+                    format: input.format,
+                    provenance: input.provenance,
+                },
                 fallback,
                 utf8_range: range.clone(),
                 utf16_range: input.utf16_range.clone(),
-                format: input.format,
-                encoding: input.encoding,
-                has_custom_url_fallback: input.has_custom_url_fallback,
             });
             result.metrics.custom_count = result.metrics.custom_count.saturating_add(1);
             if matches!(
                 input.format,
-                EmojiFormat::AnimatedTgs | EmojiFormat::VideoWebm
+                CustomEmojiFormat::AnimatedTgs | CustomEmojiFormat::VideoWebm
             ) {
                 result.metrics.animated_count = result.metrics.animated_count.saturating_add(1);
             }
-            if input.format == EmojiFormat::Unknown {
+            if input.format == CustomEmojiFormat::Unknown {
                 result.metrics.unknown_format_count =
                     result.metrics.unknown_format_count.saturating_add(1);
             }
@@ -225,13 +304,13 @@ pub fn analyze(
                 &mut counts,
                 &mut run,
                 &mut result.metrics,
-                EmojiIdentity::Custom(input.id.clone()),
+                EmojiIdentity::Custom(input.id.0.clone()),
             );
             add_moderation_occurrence(
                 &mut moderation_counts,
                 &mut moderation_run,
                 &mut result.metrics,
-                EmojiIdentity::Custom(input.id.clone()),
+                EmojiIdentity::Custom(input.id.0.clone()),
             );
             utf16 = input.utf16_range.end;
             byte = range.end;
@@ -261,13 +340,12 @@ pub fn analyze(
                     result.metrics.moderation_unicode_count.saturating_add(1);
                 let identity = EmojiIdentity::Unicode(grapheme.to_owned());
                 result.occurrences.push(EmojiOccurrence {
-                    identity: identity.clone(),
+                    kind: EmojiKind::Unicode {
+                        sequence: grapheme.to_owned(),
+                    },
                     fallback: grapheme.to_owned(),
                     utf8_range: byte..byte_end,
                     utf16_range: utf16..utf16_end,
-                    format: EmojiFormat::Unicode,
-                    encoding: EmojiEncoding::Unicode,
-                    has_custom_url_fallback: false,
                 });
                 result.metrics.unicode_count = result.metrics.unicode_count.saturating_add(1);
                 add_occurrence(&mut counts, &mut run, &mut result.metrics, identity);
@@ -361,19 +439,43 @@ pub fn analyze_telegram_text(
     text: &str,
     entities: &[MessageEntity],
 ) -> Result<EmojiAnalysis, EmojiAnalysisError> {
-    let mut custom = Vec::new();
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(EmojiAnalysisError::TextTooLong);
+    }
+    let native_count = entities
+        .iter()
+        .filter(|entity| matches!(&entity.kind, MessageEntityKind::CustomEmoji { .. }))
+        .count();
+    let fallback_candidate_count = entities
+        .iter()
+        .filter(|entity| matches!(&entity.kind, MessageEntityKind::TextLink { .. }))
+        .count();
+    if native_count > MAX_CUSTOM_EMOJI_SPANS
+        || native_count.saturating_add(fallback_candidate_count)
+            > MAX_CUSTOM_EMOJI_SPANS.saturating_mul(2)
+    {
+        return Err(EmojiAnalysisError::TooManyCustomEmojiSpans);
+    }
+
+    let mut custom = Vec::with_capacity(native_count);
+    let mut known_spans = HashMap::<(usize, usize, String), usize>::new();
     for entity in entities {
         if let MessageEntityKind::CustomEmoji { custom_emoji_id } = &entity.kind {
+            if custom_emoji_id.0.len() > MAX_CUSTOM_EMOJI_ID_BYTES {
+                return Err(EmojiAnalysisError::CustomEmojiIdTooLong);
+            }
             let end = entity
                 .offset
                 .checked_add(entity.length)
                 .ok_or(EmojiAnalysisError::InvalidUtf16Boundary)?;
+            let index = custom.len();
+            let id = custom_emoji_id.0.clone();
+            known_spans.insert((entity.offset, end, id.clone()), index);
             custom.push(CustomEmojiInput {
-                id: custom_emoji_id.to_string(),
+                id: custom_emoji_id.clone(),
                 utf16_range: entity.offset..end,
-                format: EmojiFormat::Unknown,
-                encoding: EmojiEncoding::NativeCustom,
-                has_custom_url_fallback: false,
+                format: CustomEmojiFormat::Unknown,
+                provenance: CustomEmojiProvenance::Native,
             });
         }
     }
@@ -400,18 +502,24 @@ pub fn analyze_telegram_text(
             continue;
         }
         let fallback = CustomEmojiInput {
-            id: id.to_string(),
+            id: CustomEmojiId(id.to_string()),
             utf16_range: entity.offset..end,
-            format: EmojiFormat::Unknown,
-            encoding: EmojiEncoding::CustomUrlFallback,
-            has_custom_url_fallback: true,
+            format: CustomEmojiFormat::Unknown,
+            provenance: CustomEmojiProvenance::UrlFallback,
         };
-        if let Some(native) = custom
-            .iter_mut()
-            .find(|item| item.utf16_range == fallback.utf16_range && item.id == fallback.id)
-        {
-            native.has_custom_url_fallback = true;
+        let key = (
+            fallback.utf16_range.start,
+            fallback.utf16_range.end,
+            fallback.id.0.clone(),
+        );
+        if let Some(index) = known_spans.get(&key).copied() {
+            let native = &mut custom[index];
+            native.provenance = CustomEmojiProvenance::NativeWithUrlFallback;
         } else {
+            if custom.len() >= MAX_CUSTOM_EMOJI_SPANS {
+                return Err(EmojiAnalysisError::TooManyCustomEmojiSpans);
+            }
+            known_spans.insert(key, custom.len());
             custom.push(fallback);
         }
     }
@@ -564,11 +672,10 @@ mod tests {
         let analysis = analyze(
             "😀",
             &[CustomEmojiInput {
-                id: "123".to_owned(),
+                id: CustomEmojiId("123".into()),
                 utf16_range: 0..2,
-                format: EmojiFormat::Unknown,
-                encoding: EmojiEncoding::NativeCustom,
-                has_custom_url_fallback: false,
+                format: CustomEmojiFormat::Unknown,
+                provenance: CustomEmojiProvenance::Native,
             }],
         )
         .unwrap();
@@ -588,7 +695,7 @@ mod tests {
         assert_eq!(analysis.metrics.unknown_format_count, 1);
         assert_eq!(analysis.occurrences[0].utf8_range, 0..4);
         assert_eq!(
-            analysis.occurrences[0].encoding,
+            analysis.occurrences[0].kind.encoding(),
             EmojiEncoding::NativeCustom
         );
     }
@@ -602,13 +709,13 @@ mod tests {
         let analysis = analyze_telegram_text("A😀B", &[valid]).unwrap();
         assert_eq!(analysis.occurrences.len(), 1);
         assert_eq!(
-            analysis.occurrences[0].identity,
+            analysis.occurrences[0].kind.identity(),
             EmojiIdentity::Custom("42".into())
         );
         assert_eq!(analysis.occurrences[0].utf8_range, 1..5);
         assert_eq!(analysis.occurrences[0].utf16_range, 1..3);
         assert_eq!(
-            analysis.occurrences[0].encoding,
+            analysis.occurrences[0].kind.encoding(),
             EmojiEncoding::CustomUrlFallback
         );
         assert_eq!(analysis.metrics.unicode_count, 0);
@@ -632,10 +739,15 @@ mod tests {
         let analysis = analyze_telegram_text("😀", &[native, fallback]).unwrap();
         assert_eq!(analysis.occurrences.len(), 1);
         assert_eq!(
-            analysis.occurrences[0].encoding,
-            EmojiEncoding::NativeCustom
+            analysis.occurrences[0].kind.encoding(),
+            EmojiEncoding::NativeCustomWithUrlFallback
         );
-        assert!(analysis.occurrences[0].has_custom_url_fallback);
+        assert!(
+            analysis.occurrences[0]
+                .kind
+                .encoding()
+                .has_custom_url_fallback()
+        );
         assert_eq!(analysis.metrics.custom_count, 1);
     }
 
@@ -653,13 +765,40 @@ mod tests {
     }
 
     #[test]
+    fn telegram_adapter_preflights_text_and_fallback_candidate_counts() {
+        let too_long = "x".repeat(MAX_TEXT_BYTES + 1);
+        assert_eq!(
+            analyze_telegram_text(&too_long, &[]),
+            Err(EmojiAnalysisError::TextTooLong)
+        );
+        let fallback: MessageEntity = serde_json::from_value(serde_json::json!({
+            "type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"
+        }))
+        .unwrap();
+        let too_many = vec![fallback; MAX_CUSTOM_EMOJI_SPANS * 2 + 1];
+        assert_eq!(
+            analyze_telegram_text("😀", &too_many),
+            Err(EmojiAnalysisError::TooManyCustomEmojiSpans)
+        );
+        let long_id = [CustomEmojiInput {
+            id: CustomEmojiId("x".repeat(MAX_CUSTOM_EMOJI_ID_BYTES + 1)),
+            utf16_range: 0..2,
+            format: CustomEmojiFormat::Unknown,
+            provenance: CustomEmojiProvenance::Native,
+        }];
+        assert_eq!(
+            analyze("😀", &long_id),
+            Err(EmojiAnalysisError::CustomEmojiIdTooLong)
+        );
+    }
+
+    #[test]
     fn malformed_and_overlapping_custom_spans_are_rejected() {
         let invalid = CustomEmojiInput {
-            id: "1".to_owned(),
+            id: CustomEmojiId("1".into()),
             utf16_range: 1..2,
-            format: EmojiFormat::Static,
-            encoding: EmojiEncoding::NativeCustom,
-            has_custom_url_fallback: false,
+            format: CustomEmojiFormat::Static,
+            provenance: CustomEmojiProvenance::Native,
         };
         assert_eq!(
             analyze("😀a", &[invalid]),
@@ -667,18 +806,16 @@ mod tests {
         );
         let overlap = [
             CustomEmojiInput {
-                id: "1".to_owned(),
+                id: CustomEmojiId("1".into()),
                 utf16_range: 0..2,
-                format: EmojiFormat::Static,
-                encoding: EmojiEncoding::NativeCustom,
-                has_custom_url_fallback: false,
+                format: CustomEmojiFormat::Static,
+                provenance: CustomEmojiProvenance::Native,
             },
             CustomEmojiInput {
-                id: "2".to_owned(),
+                id: CustomEmojiId("2".into()),
                 utf16_range: 1..3,
-                format: EmojiFormat::Static,
-                encoding: EmojiEncoding::NativeCustom,
-                has_custom_url_fallback: false,
+                format: CustomEmojiFormat::Static,
+                provenance: CustomEmojiProvenance::Native,
             },
         ];
         assert_eq!(
@@ -687,11 +824,10 @@ mod tests {
         );
 
         let split_grapheme = [CustomEmojiInput {
-            id: "3".to_owned(),
+            id: CustomEmojiId("3".into()),
             utf16_range: 0..1,
-            format: EmojiFormat::Static,
-            encoding: EmojiEncoding::NativeCustom,
-            has_custom_url_fallback: false,
+            format: CustomEmojiFormat::Static,
+            provenance: CustomEmojiProvenance::Native,
         }];
         assert_eq!(
             analyze("a\u{301}", &split_grapheme),
@@ -705,18 +841,16 @@ mod tests {
             "xy",
             &[
                 CustomEmojiInput {
-                    id: "animated".to_owned(),
+                    id: CustomEmojiId("animated".into()),
                     utf16_range: 0..1,
-                    format: EmojiFormat::AnimatedTgs,
-                    encoding: EmojiEncoding::NativeCustom,
-                    has_custom_url_fallback: false,
+                    format: CustomEmojiFormat::AnimatedTgs,
+                    provenance: CustomEmojiProvenance::Native,
                 },
                 CustomEmojiInput {
-                    id: "unknown".to_owned(),
+                    id: CustomEmojiId("unknown".into()),
                     utf16_range: 1..2,
-                    format: EmojiFormat::Unknown,
-                    encoding: EmojiEncoding::NativeCustom,
-                    has_custom_url_fallback: false,
+                    format: CustomEmojiFormat::Unknown,
+                    provenance: CustomEmojiProvenance::Native,
                 },
             ],
         )
@@ -751,16 +885,15 @@ mod tests {
             let utf16_start = text[..byte_start].encode_utf16().count();
             let utf16_end = utf16_start + grapheme.encode_utf16().count();
             let custom = [CustomEmojiInput {
-                id: "property-id".into(),
+                id: CustomEmojiId("property-id".into()),
                 utf16_range: utf16_start..utf16_end,
-                format: EmojiFormat::Static,
-                encoding: EmojiEncoding::NativeCustom,
-                has_custom_url_fallback: false,
-            }];
+                format: CustomEmojiFormat::Static,
+                provenance: CustomEmojiProvenance::Native,
+                }];
 
             let analysis = analyze(&text, &custom).unwrap();
             let occurrence = analysis.occurrences.iter().find(|occurrence| {
-                occurrence.identity == EmojiIdentity::Custom("property-id".into())
+                occurrence.kind.identity() == EmojiIdentity::Custom("property-id".into())
             }).unwrap();
             prop_assert_eq!(&occurrence.utf8_range, &(byte_start..byte_end));
             prop_assert_eq!(&occurrence.utf16_range, &(utf16_start..utf16_end));
@@ -777,12 +910,11 @@ mod tests {
             let text: String = chars.into_iter().collect();
             let end = offset + length;
             let input = [CustomEmojiInput {
-                id: "oracle".into(),
+                id: CustomEmojiId("oracle".into()),
                 utf16_range: offset..end,
-                format: EmojiFormat::Static,
-                encoding: EmojiEncoding::NativeCustom,
-                has_custom_url_fallback: false,
-            }];
+                format: CustomEmojiFormat::Static,
+                provenance: CustomEmojiProvenance::Native,
+                }];
             let oracle_boundaries: Vec<_> = text.char_indices()
                 .map(|(byte, _)| (text[..byte].encode_utf16().count(), byte))
                 .chain(std::iter::once((text.encode_utf16().count(), text.len())))
@@ -811,7 +943,7 @@ mod tests {
             } else {
                 let result = actual.unwrap();
                 let occurrence = result.occurrences.iter().find(|item|
-                    item.identity == EmojiIdentity::Custom("oracle".into())
+                    item.kind.identity() == EmojiIdentity::Custom("oracle".into())
                 ).unwrap();
                 prop_assert_eq!(&occurrence.utf8_range, &(start_byte.unwrap()..end_byte.unwrap()));
                 prop_assert_eq!(&occurrence.utf16_range, &(offset..end));

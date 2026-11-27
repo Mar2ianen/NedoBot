@@ -258,16 +258,22 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
         })
 }
 
-pub fn custom_emoji_ids(msg: &Message) -> Result<Vec<String>, String> {
+#[derive(Debug)]
+pub enum CustomEmojiIdsError {
+    #[cfg(feature = "emoji")]
+    Analysis(crate::features::emoji_analysis::EmojiAnalysisError),
+}
+
+pub fn custom_emoji_ids(msg: &Message) -> Result<Vec<String>, CustomEmojiIdsError> {
     #[cfg(feature = "emoji")]
     {
         let occurrences = crate::features::emoji_occurrences::extract_message(msg)
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(CustomEmojiIdsError::Analysis)?;
         Ok(occurrences
             .into_iter()
-            .filter_map(|occurrence| match occurrence.identity {
-                crate::features::emoji_analysis::EmojiIdentity::Custom(id) => Some(id),
-                crate::features::emoji_analysis::EmojiIdentity::Unicode(_) => None,
+            .filter_map(|occurrence| match occurrence.kind {
+                crate::features::emoji_analysis::EmojiKind::Custom { id, .. } => Some(id.0),
+                crate::features::emoji_analysis::EmojiKind::Unicode { .. } => None,
             })
             .collect())
     }
@@ -435,6 +441,23 @@ mod tests {
                 .iter()
                 .any(|target| target.value == "tg://emoji?id=42")
         );
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn native_custom_entity_with_same_id_and_fallback_is_filtered_by_provenance() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 9,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀",
+            "entities": [
+                {"type":"custom_emoji", "offset":0, "length":2, "custom_emoji_id":"42"},
+                {"type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"}
+            ]
+        }))
+        .unwrap();
+        assert!(message_url_targets(&message).is_empty());
     }
 
     #[test]

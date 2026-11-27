@@ -196,8 +196,12 @@ pub async fn send_entities(
         .link_preview_options(disabled_link_preview());
     match audience {
         MessageAudience::Public => {
+            let request = match command.thread_id {
+                Some(thread_id) => request.message_thread_id(thread_id),
+                None => request,
+            };
             request
-                .reply_parameters(ReplyParameters::new(command.id).allow_sending_without_reply())
+                .reply_parameters(ReplyParameters::new(command.id))
                 .await
         }
         MessageAudience::Ephemeral {
@@ -207,8 +211,12 @@ pub async fn send_entities(
             with_ephemeral_parameters(request, receiver_user_id, message_thread_id).await
         }
         MessageAudience::Ephemeral { .. } => {
+            let request = match command.thread_id {
+                Some(thread_id) => request.message_thread_id(thread_id),
+                None => request,
+            };
             request
-                .reply_parameters(ReplyParameters::new(command.id).allow_sending_without_reply())
+                .reply_parameters(ReplyParameters::new(command.id))
                 .await
         }
     }
@@ -454,7 +462,13 @@ mod tests {
             assert_eq!(payload["entities"][0]["type"], "custom_emoji");
             assert_eq!(payload["entities"][0]["custom_emoji_id"], "123");
             assert_eq!(payload["entities"][0]["offset"], 0);
-            assert_eq!(payload["entities"][0]["length"], 6);
+            assert_eq!(payload["entities"][0]["length"], 7);
+            assert_eq!(payload["message_thread_id"], 22);
+            assert!(
+                payload["reply_parameters"]
+                    .get("allow_sending_without_reply")
+                    .is_none()
+            );
             let body = serde_json::json!({
                 "ok": true,
                 "result": {
@@ -462,7 +476,7 @@ mod tests {
                     "date": 1,
                     "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
                     "text": "🤦🏽‍♀️",
-                    "entities": [{"type":"custom_emoji","offset":0,"length":6,"custom_emoji_id":"123"}]
+                    "entities": [{"type":"custom_emoji","offset":0,"length":7,"custom_emoji_id":"123"}]
                 }
             }).to_string();
             write_json_response(&mut stream, "200 OK", &body);
@@ -474,6 +488,7 @@ mod tests {
             "message_id": 9,
             "date": 1,
             "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
+            "message_thread_id": 22,
             "text": "/emoji"
         }))
         .expect("valid command message");
@@ -484,7 +499,7 @@ mod tests {
             vec![MessageEntity::custom_emoji(
                 CustomEmojiId("123".into()),
                 0,
-                6,
+                7,
             )],
             MessageAudience::Public,
         )
