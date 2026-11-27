@@ -1652,7 +1652,7 @@ dependencies = [
  "libfuzzer-sys",
  "nedobot-qr",
  "serde_json",
- "teloxide-url",
+ "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=3166c9c39f79724b8e4e760e7a5afdd5daeb78be)",
  "tg_ai_bot_teloxide",
 ]
 
@@ -3012,7 +3012,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=3166c9c39f79724b8e4e760e7a5afdd5daeb78be#3166c9c39f79724b8e4e760e7a5afdd5daeb78be"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=d13ef30dd3e761f1f9b7a5de953096ddaa15f10d#d13ef30dd3e761f1f9b7a5de953096ddaa15f10d"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3021,7 +3021,7 @@ dependencies = [
  "serde",
  "serde_json",
  "teloxide-statistics",
- "teloxide-url",
+ "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=d13ef30dd3e761f1f9b7a5de953096ddaa15f10d)",
  "tracing",
  "unicode-normalization",
  "unicode-properties",
@@ -3084,7 +3084,16 @@ dependencies = [
 [[package]]
 name = "teloxide-url"
 version = "0.1.0"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=3166c9c39f79724b8e4e760e7a5afdd5daeb78be#3166c9c39f79724b8e4e760e7a5afdd5daeb78be"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=3166c9c39f79724b8e4e760e7a5afdd5daeb78be#d13ef30dd3e761f1f9b7a5de953096ddaa15f10d"
+dependencies = [
+ "linkify",
+ "url",
+]
+
+[[package]]
+name = "teloxide-url"
+version = "0.1.0"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=d13ef30dd3e761f1f9b7a5de953096ddaa15f10d#d13ef30dd3e761f1f9b7a5de953096ddaa15f10d"
 dependencies = [
  "linkify",
  "teloxide",
@@ -3129,7 +3138,7 @@ dependencies = [
  "teloxide",
  "teloxide-antispam",
  "teloxide-statistics",
- "teloxide-url",
+ "teloxide-url 0.1.0 (git+https://github.com/Mar2ianen/teloxide-antispam?rev=d13ef30dd3e761f1f9b7a5de953096ddaa15f10d)",
  "tempfile",
  "tokio",
  "toml",
