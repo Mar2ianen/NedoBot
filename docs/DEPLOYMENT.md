@@ -7,6 +7,49 @@ deploy-YYYY-MM-DD-scope.
 
 ## Последняя фактическая выкладка
 
+27 ноября 2026 в **07:23:54 UTC / 10:23:54 МСК** установлен
+[deploy-2026-11-27-lols-sync-bounded](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-27-lols-sync-bounded),
+source `6c060bf0954f201ce06db8875356e5d650abf8ba` после
+[PR #186](https://github.com/Mar2ianen/NedoBot/pull/186); записи о предыдущих
+выкладках вошли через [PR #185](https://github.com/Mar2ianen/NedoBot/pull/185).
+[Release 45957051204](https://github.com/Mar2ianen/NedoBot/actions/runs/45957051204)
+собрал default-feature artifact на Ubuntu 24.04 с glibc ≤ 2.39 и выполнил
+deploy: build 8m13s, deploy 1m28s. Аннотированный тег указывает на точный
+merge commit; workflow проверил tag, ancestry и `refs/heads/main`. Push-CI
+финального main [45954636281](https://github.com/Mar2ianen/NedoBot/actions/runs/45954636281)
+зелёный.
+
+Исправлен production-инцидент LOLS-зеркала: почасовой `sync_lols_banlist`
+оставлял `DELETE` на несколько суток, блокировал последующие запуски и заполнил
+диск до 100%. Причина — отсутствие статистики temp-таблицы (nested loop вместо
+anti-join) и клиентский `timeout`, не отменявший серверный запрос. Зеркало
+переведено на инкрементальный diff с `ANALYZE`, bounded refresh `last_seen_at`,
+session `statement_timeout`/`lock_timeout`, advisory lock и защитой от
+усечённого banlist. `sync_lols_banlist` теперь входит в release bundle, а не
+остаётся вручную собранным бинарём.
+
+| Артефакт | SHA-256 |
+| --- | --- |
+| Оба running bots | `ea3a9d8ed6c07df2ca4d5f4e23e70dc8f1e0724effea25a63ca52eb9fe3197bd` |
+| Public MCP | `c522f0b5860a518dcc773d99e4dff15fde897eeeda2a0556d9dd525469f6e64e` |
+| Internal `chat_db_mcp` обоих инстансов | `72d10de71580e3da6a28c1bddb1078cc01d5e35b04e7d248edc848327cb9a9f7` |
+| `migrate` | `966591620c33374a7c036a9a3239af6bb8a28698b8acc79fd743e12f95ba983c` |
+| `validate_instance_config` | `790eb6d5799ade3619fbaffe452af468d61ea5a5b8d0a86876d2fd5961ef8951` |
+| `sync_lols_banlist` (оба инстанса) | `a5f5795c2756101d655410ce0d3400cd76072dc264caf63c0d2ecd1aaeb2ab1b` |
+
+Обе БД остались на latest `20261122120000`, failed=0; новых migrations нет.
+SSH health после restart: все три units active/running, `NRestarts=0`, running
+exe SHA совпадают с artifact, Rust ERROR, panic и missing migration отсутствуют.
+MCP probes: локальный 403, публичный 405. Свободно 16 GiB на `/`.
+
+Зеркало восстановлено после выкладки: первый запуск скачал 10 855 995 id и
+вставил их за 1m14s, повторный — за 46s (`inserted=0 removed=0`), таблица 840 MB,
+зависших LOLS-сессий нет. Cron LOLS снова включён; точная cron-команда проверена
+и пишет успех в `lols-sync.log`. Backup релиза:
+`/var/backups/nedobot/release.5OiT47SU`; crontab до инцидента и до
+восстановления сохранён в `/root/root.crontab.pre-lols-incident-20261127` и
+`/root/root.crontab.pre-lols-restore-20261127`.
+
 26 ноября 2026 в **16:35:33 UTC / 19:35:33 МСК** установлен
 [deploy-2026-11-26-ping-live-health](https://github.com/Mar2ianen/NedoBot/tree/deploy-2026-11-26-ping-live-health),
 source `3128b52bda71b2cb080df20c587c338f85fb8480` после
