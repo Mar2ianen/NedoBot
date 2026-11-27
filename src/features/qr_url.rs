@@ -4,7 +4,12 @@ use std::{
     time::Duration,
 };
 
-use teloxide::{net::Download, prelude::*, types::FileId};
+use teloxide::{
+    adaptors::DefaultParseMode,
+    net::Download,
+    prelude::*,
+    types::{FileId, Message},
+};
 
 use crate::{
     db::url_evidence::{
@@ -21,8 +26,349 @@ use crate::{
 };
 
 const QR_SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+const QR_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const QR_COMMAND_MAX_PAYLOADS: usize = 8;
+const QR_COMMAND_MAX_DISPLAY_CHARS: usize = 3_200;
+const QR_COMMAND_CHAT_COOLDOWN: Duration = Duration::from_secs(5);
+const QR_COMMAND_RATE_LIMIT_ENTRIES: usize = 512;
 static QR_SCAN_CPU_SLOT: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+static QR_COMMAND_LAST_REQUEST: LazyLock<
+    tokio::sync::Mutex<std::collections::HashMap<i64, tokio::time::Instant>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QrCommandError {
+    UnsupportedMedia,
+    ProtectedContent,
+    TelegramApi,
+    Download,
+    FileTooLarge,
+    Decode,
+}
+
+async fn decode_message_payloads(
+    bot: &Bot,
+    message: &Message,
+) -> Result<Vec<Vec<u8>>, QrCommandError> {
+    if message.has_protected_content() {
+        return Err(QrCommandError::ProtectedContent);
+    }
+    let candidate = crate::db::url_evidence::qr_media_candidate(message)
+        .ok_or(QrCommandError::UnsupportedMedia)?;
+    let file = bot
+        .get_file(FileId(candidate.file_id))
+        .await
+        .map_err(|_| QrCommandError::TelegramApi)?;
+    if usize::try_from(file.size).unwrap_or(usize::MAX) > nedobot_qr::MAX_COMPRESSED_BYTES {
+        return Err(QrCommandError::FileTooLarge);
+    }
+    let mut writer = LimitedBytesWriter::new(nedobot_qr::MAX_COMPRESSED_BYTES);
+    bot.download_file(&file.path, &mut writer)
+        .await
+        .map_err(|_| QrCommandError::Download)?;
+    run_bounded_qr_decode(writer.into_inner())
+        .await
+        .map_err(|_| QrCommandError::Decode)
+}
+
+pub async fn handle_qr_command(
+    bot: &DefaultParseMode<Bot>,
+    command: &Message,
+    state: &AppState,
+    audience: Option<crate::telegram::service_messages::MessageAudience>,
+) -> ResponseResult<()> {
+    use crate::telegram::service_messages::{self, MessageAudience};
+
+    let Some(audience) = audience else {
+        return Ok(());
+    };
+    if !state.config.community.moderation.qr_evidence_enabled {
+        service_messages::send_html(
+            bot,
+            command.chat.id,
+            "QR-сканирование выключено в настройках этого экземпляра.",
+            audience,
+        )
+        .await?;
+        return Ok(());
+    }
+    let Some(target) = command.reply_to_message() else {
+        service_messages::send_html(
+            bot,
+            command.chat.id,
+            "Ответьте командой /qr на сообщение с изображением.",
+            audience,
+        )
+        .await?;
+        return Ok(());
+    };
+    if !admit_qr_command(command.chat.id.0).await {
+        service_messages::send_html(
+            bot,
+            command.chat.id,
+            "QR-команду можно запускать не чаще одного раза в 5 секунд на чат.",
+            audience,
+        )
+        .await?;
+        return Ok(());
+    }
+    let decoded = tokio::time::timeout(
+        QR_COMMAND_TIMEOUT,
+        decode_message_payloads(bot.inner(), target),
+    )
+    .await;
+    let payloads = match decoded {
+        Err(_) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                "Сканирование QR превысило лимит времени. Повторите позже.",
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(Ok(payloads)) => payloads,
+        Ok(Err(QrCommandError::UnsupportedMedia)) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                "В reply нет поддерживаемого изображения.",
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(Err(QrCommandError::ProtectedContent)) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                "Нельзя сканировать защищённое содержимое.",
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(Err(QrCommandError::FileTooLarge)) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                "Изображение превышает допустимый размер.",
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(Err(error)) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                format!("QR не удалось прочитать ({error:?})."),
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    match qr_media_is_current(&state.pool, target).await {
+        Ok(true) => {}
+        Ok(false) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                "Сообщение изменилось во время сканирования; старый результат скрыт.",
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(_) => {
+            service_messages::send_html(
+                bot,
+                command.chat.id,
+                "Не удалось проверить актуальность сообщения; результат не показан.",
+                audience,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+    let report = format_qr_payload_report(&payloads);
+    // The report is plain text with URL schemes/hosts defanged. Explicit empty
+    // entities and no parse mode prevent interpreting QR content as markup.
+    service_messages::send_entities(bot, command, &report, Vec::new(), audience).await?;
+    if matches!(audience, MessageAudience::Public) {
+        tracing::debug!(
+            chat_id = command.chat.id.0,
+            message_id = target.id.0,
+            "QR command returned bounded raw payload report"
+        );
+    }
+    Ok(())
+}
+
+async fn admit_qr_command(chat_id: i64) -> bool {
+    let now = tokio::time::Instant::now();
+    let mut requests = QR_COMMAND_LAST_REQUEST.lock().await;
+    requests.retain(|_, timestamp| now.duration_since(*timestamp) < Duration::from_secs(600));
+    if let Some(previous) = requests.get(&chat_id)
+        && now.duration_since(*previous) < QR_COMMAND_CHAT_COOLDOWN
+    {
+        return false;
+    }
+    if requests.len() >= QR_COMMAND_RATE_LIMIT_ENTRIES && !requests.contains_key(&chat_id) {
+        return false;
+    }
+    requests.insert(chat_id, now);
+    true
+}
+
+async fn qr_media_is_current(pool: &sqlx::PgPool, snapshot: &Message) -> Result<bool, sqlx::Error> {
+    let Some(snapshot_media) = crate::db::url_evidence::qr_media_candidate(snapshot) else {
+        return Ok(false);
+    };
+    let stored: Option<serde_json::Value> = sqlx::query_scalar(
+        "select raw_json from public.telegram_messages where chat_id = $1 and message_id = $2",
+    )
+    .bind(snapshot.chat.id.0)
+    .bind(snapshot.id.0)
+    .fetch_optional(pool)
+    .await?;
+    is_stored_media_snapshot_current(&snapshot_media.file_unique_id, stored)
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+}
+
+fn is_stored_media_snapshot_current(
+    snapshot_file_unique_id: &str,
+    stored: Option<serde_json::Value>,
+) -> Result<bool, serde_json::Error> {
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    let current: Message = serde_json::from_value(stored)?;
+    Ok(crate::db::url_evidence::qr_media_candidate(&current)
+        .is_some_and(|media| media.file_unique_id == snapshot_file_unique_id))
+}
+
+fn format_qr_payload_report(payloads: &[Vec<u8>]) -> String {
+    if payloads.is_empty() {
+        return "В изображении QR-коды не найдены.".to_owned();
+    }
+    let mut lines = Vec::new();
+    for (index, payload) in payloads.iter().take(QR_COMMAND_MAX_PAYLOADS).enumerate() {
+        let entry = match std::str::from_utf8(payload) {
+            Ok(text) => {
+                let link_like = contains_link_like_text(text);
+                let safe = truncate_qr_field(&sanitize_qr_text(text, link_like), 300);
+                if link_like {
+                    format!(
+                        "QR {} — link-like payload (defanged, preview disabled): {}",
+                        index + 1,
+                        safe
+                    )
+                } else {
+                    format!("QR {} — UTF-8 payload: {}", index + 1, safe)
+                }
+            }
+            Err(_) => {
+                let shown = payload
+                    .iter()
+                    .take(64)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let suffix = if payload.len() > 64 { "…" } else { "" };
+                format!(
+                    "QR {} — binary payload (hex, first 64 bytes): {shown}{suffix}",
+                    index + 1
+                )
+            }
+        };
+        lines.push(entry);
+    }
+    if payloads.len() > QR_COMMAND_MAX_PAYLOADS {
+        lines.push(format!(
+            "Остальные {} QR payloads опущены по лимиту.",
+            payloads.len() - QR_COMMAND_MAX_PAYLOADS
+        ));
+    }
+    let mut report = lines.join("\n");
+    if report.chars().count() > QR_COMMAND_MAX_DISPLAY_CHARS {
+        report = report
+            .chars()
+            .take(QR_COMMAND_MAX_DISPLAY_CHARS - 1)
+            .collect::<String>();
+        report.push('…');
+    }
+    report
+}
+
+fn sanitize_qr_text(text: &str, is_url: bool) -> String {
+    let mut output = String::new();
+    for ch in text.chars() {
+        match ch {
+            '<' => output.push('‹'),
+            '>' => output.push('›'),
+            '&' => output.push('＆'),
+            '.' if is_url => output.push_str("[.]"),
+            ':' if is_url => output.push('：'),
+            '@' if is_url => output.push('＠'),
+            ch if ch.is_control()
+                || matches!(ch as u32, 0x061c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069) =>
+            {
+                use std::fmt::Write;
+                let _ = write!(output, "\\u{{{:04X}}}", ch as u32);
+            }
+            ch => output.push(ch),
+        }
+    }
+    output
+}
+
+fn contains_link_like_text(text: &str) -> bool {
+    if teloxide_url::find_urls(text)
+        .iter()
+        .any(|found| found.kind == teloxide_url::Kind::Url)
+    {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("www.") || lower.contains("://") {
+        return true;
+    }
+    if text.split_whitespace().any(|token| {
+        let Some((scheme, _)) = token.split_once(':') else {
+            return false;
+        };
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '.' | '-'))
+    }) {
+        return true;
+    }
+    text.split_whitespace().any(|token| {
+        token
+            .split_once('@')
+            .is_some_and(|(_, domain)| domain.contains('.') && !domain.starts_with('.'))
+    })
+}
+
+fn truncate_qr_field(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut output = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    output.push('…');
+    output
+}
 
 pub fn spawn_worker(supervisor: &mut WorkerSupervisor, bot: Bot, state: AppState) {
     let shadow_state = state.clone();
@@ -260,7 +606,10 @@ fn qr_urls_from_payloads(payloads: &[Vec<u8>]) -> Vec<String> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use super::{qr_urls_from_payloads, run_bounded_qr_decode_with};
+    use super::{
+        contains_link_like_text, format_qr_payload_report, is_stored_media_snapshot_current,
+        qr_urls_from_payloads, run_bounded_qr_decode_with, sanitize_qr_text,
+    };
 
     #[tokio::test]
     #[ignore = "requires a disposable migrated PostgreSQL database"]
@@ -390,6 +739,70 @@ mod tests {
                 "https://example.org/File?campaign=normal",
             ]
         );
+    }
+
+    #[test]
+    fn qr_command_distinguishes_no_codes_from_non_url_payloads_and_defangs_links() {
+        assert_eq!(
+            format_qr_payload_report(&[]),
+            "В изображении QR-коды не найдены."
+        );
+        let report = format_qr_payload_report(&[
+            "hello <script>\u{202e}".as_bytes().to_vec(),
+            b"HTTPS://Example.COM/A?x=1".to_vec(),
+            b"tg://emoji?id=42".to_vec(),
+            b"mailto:alice@example.org".to_vec(),
+            b"www.example.org/path".to_vec(),
+            b"alice@example.org".to_vec(),
+            vec![0xff, 0x01],
+        ]);
+        assert!(report.contains("UTF-8 payload: hello ‹script›\\u{202E}"));
+        assert!(report.contains(
+            "link-like payload (defanged, preview disabled): HTTPS：//Example[.]COM/A?x=1"
+        ));
+        assert!(report.contains("tg：//emoji?id=42"));
+        assert!(report.contains("mailto：alice＠example[.]org"));
+        assert!(report.contains("www[.]example[.]org/path"));
+        assert!(report.contains("alice＠example[.]org"));
+        assert!(report.contains("binary payload (hex, first 64 bytes): ff01"));
+    }
+
+    #[test]
+    fn absent_stored_qr_message_fails_closed_as_unknown_freshness() {
+        assert!(!is_stored_media_snapshot_current("snapshot", None).unwrap());
+    }
+
+    #[test]
+    fn link_like_detection_covers_schemes_bare_hosts_and_email() {
+        for text in [
+            "tg://emoji?id=7",
+            "mailto:a@example.org",
+            "www.example.org/a",
+            "alice@example.org",
+            "https://example.org",
+        ] {
+            assert!(contains_link_like_text(text), "{text}");
+            let safe = sanitize_qr_text(text, true);
+            assert!(!safe.contains("://"));
+            assert!(!safe.contains('@'));
+            assert!(!safe.contains("example.org"));
+        }
+    }
+
+    #[test]
+    fn qr_report_caps_payload_count_and_total_size() {
+        let payloads = (0..12).map(|_| vec![b'x'; 4096]).collect::<Vec<_>>();
+        let report = format_qr_payload_report(&payloads);
+        assert!(report.chars().count() <= super::QR_COMMAND_MAX_DISPLAY_CHARS);
+        assert!(report.contains("Остальные 4 QR payloads опущены по лимиту."));
+    }
+
+    #[tokio::test]
+    async fn qr_command_rate_limit_is_per_chat_and_bounded() {
+        let chat_id = i64::MIN + 92_774;
+        assert!(super::admit_qr_command(chat_id).await);
+        assert!(!super::admit_qr_command(chat_id).await);
+        assert!(super::admit_qr_command(chat_id + 1).await);
     }
 
     #[tokio::test]

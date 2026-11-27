@@ -258,18 +258,26 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
         })
 }
 
-pub fn custom_emoji_ids(msg: &Message) -> Vec<String> {
+pub fn custom_emoji_ids(msg: &Message) -> Result<Vec<String>, String> {
     #[cfg(feature = "emoji")]
-    if let Ok(occurrences) = crate::features::emoji_occurrences::extract_message(msg) {
-        return occurrences
+    {
+        let occurrences = crate::features::emoji_occurrences::extract_message(msg)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(occurrences
             .into_iter()
             .filter_map(|occurrence| match occurrence.identity {
                 crate::features::emoji_analysis::EmojiIdentity::Custom(id) => Some(id),
                 crate::features::emoji_analysis::EmojiIdentity::Unicode(_) => None,
             })
-            .collect();
+            .collect())
     }
 
+    #[cfg(not(feature = "emoji"))]
+    Ok(legacy_custom_emoji_ids(msg))
+}
+
+#[cfg(not(feature = "emoji"))]
+fn legacy_custom_emoji_ids(msg: &Message) -> Vec<String> {
     let mut ids: Vec<_> = msg
         .entities()
         .into_iter()
@@ -379,7 +387,20 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(super::custom_emoji_ids(&message), ["42"]);
+        assert_eq!(super::custom_emoji_ids(&message).unwrap(), ["42"]);
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn strict_emoji_id_extraction_does_not_downgrade_invalid_ranges_to_legacy_entities() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 7,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀",
+            "entities": [{"type":"custom_emoji", "offset":1, "length":1, "custom_emoji_id":"legacy"}]
+        })).unwrap();
+        assert!(super::custom_emoji_ids(&message).is_err());
     }
 
     #[cfg(feature = "emoji")]

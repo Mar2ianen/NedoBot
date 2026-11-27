@@ -119,6 +119,25 @@ pub async fn handle_command(
         Command::EmojiIds => {
             send_custom_emoji_ids(&bot, &msg, command_audience(&msg, &state)).await?;
         }
+        #[cfg(feature = "emoji")]
+        Command::Emoji => {
+            crate::telegram::custom_emoji::send_custom_emojis(
+                &bot,
+                &msg,
+                command_audience(&msg, &state),
+            )
+            .await?;
+        }
+        #[cfg(feature = "moderation")]
+        Command::Qr => {
+            crate::features::qr_url::handle_qr_command(
+                &bot,
+                &msg,
+                &state,
+                command_audience(&msg, &state),
+            )
+            .await?;
+        }
         #[cfg(feature = "auto-comment")]
         Command::FormatTest(post_text) => {
             if !should_generate_comment(&post_text, config) {

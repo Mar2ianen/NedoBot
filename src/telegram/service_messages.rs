@@ -4,7 +4,8 @@ use teloxide::{
     payloads::{SendMessageSetters, SendRichMessageSetters},
     prelude::{Bot, ChatId, Message, Requester, ResponseResult},
     types::{
-        EphemeralMessageParameters, InputRichMessage, MessageId, ReplyParameters, ThreadId, UserId,
+        EphemeralMessageParameters, InputRichMessage, MessageEntity, MessageId, ReplyParameters,
+        ThreadId, UserId,
     },
 };
 
@@ -174,6 +175,42 @@ pub async fn send_html_reply(
             .await
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Send trusted prebuilt entities without applying the bot's default HTML parse
+/// mode. Public responses reply to the command message; ephemeral responses
+/// preserve receiver and topic scope without creating a public reply.
+pub async fn send_entities(
+    bot: &DefaultParseMode<Bot>,
+    command: &Message,
+    text: &str,
+    entities: Vec<MessageEntity>,
+    audience: MessageAudience,
+) -> ResponseResult<Message> {
+    let request = bot
+        .inner()
+        .send_message(text.to_owned())
+        .chat_id(command.chat.id)
+        .entities(entities)
+        .link_preview_options(disabled_link_preview());
+    match audience {
+        MessageAudience::Public => {
+            request
+                .reply_parameters(ReplyParameters::new(command.id).allow_sending_without_reply())
+                .await
+        }
+        MessageAudience::Ephemeral {
+            receiver_user_id,
+            message_thread_id,
+        } if command.chat.id.0 < 0 => {
+            with_ephemeral_parameters(request, receiver_user_id, message_thread_id).await
+        }
+        MessageAudience::Ephemeral { .. } => {
+            request
+                .reply_parameters(ReplyParameters::new(command.id).allow_sending_without_reply())
+                .await
+        }
     }
 }
 
@@ -377,7 +414,7 @@ mod tests {
         payloads::SendMessageSetters,
         prelude::{Bot, ChatId, Requester, RequesterExt},
         requests::HasPayload,
-        types::{MessageId, ParseMode, ThreadId, UserId},
+        types::{CustomEmojiId, MessageEntity, MessageId, ParseMode, ThreadId, UserId},
     };
 
     #[test]
@@ -402,6 +439,60 @@ mod tests {
                 .and_then(|parameters| parameters.receiver_user_id),
             Some(receiver_user_id)
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_custom_entities_override_default_parse_mode_and_route_as_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Telegram API");
+        let address = listener.local_addr().expect("fake API address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept sendMessage");
+            let payload = read_request_payload(&stream);
+            assert_eq!(payload["text"], "🤦🏽‍♀️");
+            assert!(payload.get("parse_mode").is_none());
+            assert_eq!(payload["reply_parameters"]["message_id"], 9);
+            assert_eq!(payload["entities"][0]["type"], "custom_emoji");
+            assert_eq!(payload["entities"][0]["custom_emoji_id"], "123");
+            assert_eq!(payload["entities"][0]["offset"], 0);
+            assert_eq!(payload["entities"][0]["length"], 6);
+            let body = serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 10,
+                    "date": 1,
+                    "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
+                    "text": "🤦🏽‍♀️",
+                    "entities": [{"type":"custom_emoji","offset":0,"length":6,"custom_emoji_id":"123"}]
+                }
+            }).to_string();
+            write_json_response(&mut stream, "200 OK", &body);
+        });
+        let bot = Bot::new("123456:TEST_TOKEN")
+            .set_api_url(format!("http://{address}/").parse().expect("mock URL"))
+            .parse_mode(ParseMode::Html);
+        let command: teloxide::types::Message = serde_json::from_value(serde_json::json!({
+            "message_id": 9,
+            "date": 1,
+            "chat": {"id": -1001, "type": "supergroup", "title": "Test"},
+            "text": "/emoji"
+        }))
+        .expect("valid command message");
+        let sent = super::send_entities(
+            &bot,
+            &command,
+            "🤦🏽‍♀️",
+            vec![MessageEntity::custom_emoji(
+                CustomEmojiId("123".into()),
+                0,
+                6,
+            )],
+            MessageAudience::Public,
+        )
+        .await
+        .expect("sendMessage should succeed");
+        server.join().expect("mock API server should finish");
+        assert_eq!(sent.id, MessageId(10));
+        assert_eq!(sent.entities().unwrap().len(), 1);
     }
 
     #[test]
