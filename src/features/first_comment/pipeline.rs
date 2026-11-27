@@ -1,3 +1,9 @@
+use std::{
+    collections::HashMap,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+
 use teloxide::{prelude::*, types::MessageId};
 
 use crate::config::Config;
@@ -36,6 +42,8 @@ use crate::telegram::{
     media::download_photo_base64,
     render::send_html,
 };
+
+type CommentEmojiFallbackCache = tokio::sync::Mutex<HashMap<String, (Instant, Option<String>)>>;
 
 pub async fn maybe_comment_post(msg: &Message, state: &AppState) -> anyhow::Result<()> {
     let pool = &state.pool;
@@ -458,12 +466,15 @@ async fn process_post_comment_job(
     }
     let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
-    let final_html = crate::features::first_comment::render::build_comment_html_with_context(
-        &draft.comment,
-        &render_config,
-        &search_context.results,
-        &chat_targets,
-    );
+    let emoji_fallback = resolve_comment_emoji_fallback(bot, &draft.comment, config).await;
+    let final_html =
+        crate::features::first_comment::render::build_comment_html_with_context_and_emoji_fallback(
+            &draft.comment,
+            &render_config,
+            &search_context.results,
+            &chat_targets,
+            emoji_fallback.as_deref(),
+        );
     ensure_comment_html(&final_html, &draft.comment).map_err(|err| {
         CommentFailure::new(CommentErrorKind::InvalidInput, "render", format!("{err:#}"))
     })?;
@@ -476,6 +487,81 @@ async fn process_post_comment_job(
         search_context,
         used_search_result_id,
     })))
+}
+
+async fn resolve_comment_emoji_fallback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    comment: &str,
+    config: &Config,
+) -> Option<String> {
+    let requested = crate::features::first_comment::render::pick_comment_emoji(comment, config)?;
+    static CACHE: OnceLock<CommentEmojiFallbackCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    if let Some((expires, value)) = cache.lock().await.get(requested).cloned()
+        && expires > Instant::now()
+    {
+        return value;
+    }
+    let requested_id = teloxide::types::CustomEmojiId(requested.to_owned());
+    let (fallback, ttl) = match bot.get_custom_emoji_stickers([requested_id]).await {
+        Ok(stickers) => fallback_for_requested_id(
+            requested,
+            stickers
+                .into_iter()
+                .filter_map(|sticker| Some((sticker.custom_emoji_id()?.0.clone(), sticker.emoji))),
+        )
+        .map_or((None, Duration::from_secs(600)), |value| {
+            (Some(value), Duration::from_secs(86_400))
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "failed to resolve first-comment custom emoji fallback");
+            (None, Duration::from_secs(30))
+        }
+    };
+    let mut cache = cache.lock().await;
+    let now = Instant::now();
+    cache.retain(|_, (expires, _)| *expires > now);
+    if cache.len() >= 512 {
+        cache.clear();
+    }
+    cache.insert(requested.to_owned(), (now + ttl, fallback.clone()));
+    fallback
+}
+
+fn fallback_for_requested_id(
+    requested: &str,
+    stickers: impl IntoIterator<Item = (String, Option<String>)>,
+) -> Option<String> {
+    stickers
+        .into_iter()
+        .find(|(id, _)| id == requested)
+        .and_then(|(_, emoji)| emoji)
+        .filter(|emoji| !emoji.is_empty())
+}
+
+#[cfg(test)]
+mod emoji_fallback_tests {
+    use super::fallback_for_requested_id;
+
+    #[test]
+    fn matches_custom_emoji_metadata_by_id_without_assuming_response_order() {
+        let stickers = vec![
+            ("other".to_owned(), Some("❄️".to_owned())),
+            ("requested".to_owned(), Some("🤖".to_owned())),
+        ];
+        assert_eq!(
+            fallback_for_requested_id("requested", stickers),
+            Some("🤖".into())
+        );
+    }
+
+    #[test]
+    fn missing_custom_emoji_metadata_has_no_fallback() {
+        assert_eq!(
+            fallback_for_requested_id("missing", [("other".into(), Some("❄️".into()))]),
+            None
+        );
+    }
 }
 
 async fn deliver_prepared_post_comment(

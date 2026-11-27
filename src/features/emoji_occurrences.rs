@@ -18,6 +18,14 @@ use crate::features::emoji_analysis::{
 };
 use crate::telegram::rich_content::rich_message;
 
+const MAX_TRAVERSAL_NODES: usize = 8_192;
+const MAX_TRAVERSAL_DEPTH: usize = 64;
+const MAX_TRAVERSAL_PATH_BYTES: usize = 256 * 1_024;
+const MAX_TOTAL_TEXT_BYTES: usize = 256 * 1_024;
+const MAX_SERIALIZED_RICH_BYTES: usize = 512 * 1_024;
+const MAX_TOTAL_OCCURRENCES: usize = 8_192;
+const MAX_TOTAL_CUSTOM_EMOJI: usize = 2_048;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentSource {
     Text,
@@ -55,7 +63,12 @@ pub struct EmojiReference {
 
 pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
     let mut result = Vec::new();
+    let mut aggregate_text_bytes = 0usize;
     if let Some(text) = message.text() {
+        aggregate_text_bytes = text.len();
+        if aggregate_text_bytes > MAX_TOTAL_TEXT_BYTES {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
         append_telegram_text(
             text,
             message.entities().unwrap_or_default(),
@@ -64,6 +77,10 @@ pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiA
             &mut result,
         )?;
     } else if let Some(caption) = message.caption() {
+        aggregate_text_bytes = caption.len();
+        if aggregate_text_bytes > MAX_TOTAL_TEXT_BYTES {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
         append_telegram_text(
             caption,
             message.caption_entities().unwrap_or_default(),
@@ -74,6 +91,10 @@ pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiA
     }
 
     if let Some(rich) = rich_message(message) {
+        let rich_text_bytes = validate_rich_traversal_budget(rich)?;
+        if aggregate_text_bytes.saturating_add(rich_text_bytes) > MAX_TOTAL_TEXT_BYTES {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
         append_rich_message(rich, &mut result)?;
     }
     Ok(result)
@@ -87,6 +108,7 @@ fn append_telegram_text(
     output: &mut Vec<EmojiOccurrence>,
 ) -> Result<(), EmojiAnalysisError> {
     let analysis = emoji_analysis::analyze_telegram_text(text, entities)?;
+    ensure_occurrence_budget(output, &analysis.occurrences)?;
     output.extend(
         analysis
             .occurrences
@@ -110,6 +132,93 @@ fn append_rich_message(
 ) -> Result<(), EmojiAnalysisError> {
     for (index, block) in rich.blocks.iter().enumerate() {
         append_block(block, &format!("rich_message.blocks[{index}]"), output)?;
+    }
+    Ok(())
+}
+
+fn validate_rich_traversal_budget(rich: &RichMessage) -> Result<usize, EmojiAnalysisError> {
+    validate_serialized_budget(rich)
+}
+
+fn validate_serialized_budget(value: &impl serde::Serialize) -> Result<usize, EmojiAnalysisError> {
+    let mut writer = BoundedJsonWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| EmojiAnalysisError::RichTraversalLimitExceeded)?;
+    let value: serde_json::Value = serde_json::from_slice(&writer.0)
+        .map_err(|_| EmojiAnalysisError::RichTraversalLimitExceeded)?;
+    validate_value_budget(&value)
+}
+
+#[derive(Default)]
+struct BoundedJsonWriter(Vec<u8>);
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(bytes.len()) > MAX_SERIALIZED_RICH_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "rich message traversal budget exceeded",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_value_budget(value: &serde_json::Value) -> Result<usize, EmojiAnalysisError> {
+    let mut pending = vec![(value, 0usize, 0usize)];
+    let (mut nodes, mut path_bytes, mut text_bytes) = (0usize, 0usize, 0usize);
+    while let Some((node, depth, path_len)) = pending.pop() {
+        nodes = nodes.saturating_add(1);
+        path_bytes = path_bytes.saturating_add(path_len);
+        if nodes > MAX_TRAVERSAL_NODES
+            || depth > MAX_TRAVERSAL_DEPTH
+            || path_bytes > MAX_TRAVERSAL_PATH_BYTES
+        {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
+        match node {
+            serde_json::Value::String(value) => {
+                text_bytes = text_bytes.saturating_add(value.len());
+                if text_bytes > MAX_TOTAL_TEXT_BYTES {
+                    return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1, 8)))
+            }
+            serde_json::Value::Object(values) => pending.extend(
+                values
+                    .iter()
+                    .map(|(key, value)| (value, depth + 1, key.len().saturating_add(1))),
+            ),
+            _ => {}
+        }
+    }
+    Ok(text_bytes)
+}
+
+fn ensure_occurrence_budget(
+    output: &[EmojiOccurrence],
+    additions: &[emoji_analysis::EmojiOccurrence],
+) -> Result<(), EmojiAnalysisError> {
+    if output.len().saturating_add(additions.len()) > MAX_TOTAL_OCCURRENCES {
+        return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+    }
+    let existing_custom = output
+        .iter()
+        .filter(|item| matches!(item.identity, EmojiIdentity::Custom(_)))
+        .count();
+    let new_custom = additions
+        .iter()
+        .filter(|item| matches!(item.identity, EmojiIdentity::Custom(_)))
+        .count();
+    if existing_custom.saturating_add(new_custom) > MAX_TOTAL_CUSTOM_EMOJI {
+        return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
     }
     Ok(())
 }
@@ -366,6 +475,7 @@ fn append_leaf(
         .into_iter()
         .collect::<Vec<_>>();
     let analysis = emoji_analysis::analyze(text, &custom)?;
+    ensure_occurrence_budget(output, &analysis.occurrences)?;
     output.extend(
         analysis
             .occurrences
@@ -405,6 +515,7 @@ pub fn reaction_references(reactions: &[ReactionType]) -> Vec<EmojiReference> {
 pub fn quote_references(quote: &TextQuote) -> Result<Vec<EmojiReference>, EmojiAnalysisError> {
     let mut references = Vec::new();
     if let Some(rich_texts) = quote.rich_texts.as_ref().filter(|texts| !texts.is_empty()) {
+        validate_serialized_budget(rich_texts)?;
         let mut occurrences = Vec::new();
         for (index, text) in rich_texts.iter().enumerate() {
             append_inline(
@@ -470,6 +581,88 @@ mod tests {
         assert_eq!(found[0].fallback, "😀");
         assert_eq!(found[0].source, ContentSource::Caption);
         assert_eq!(found[0].utf16_range, 2..4);
+    }
+
+    #[test]
+    fn rich_budget_rejects_excess_nodes_depth_paths_and_total_text() {
+        let too_many_nodes = serde_json::Value::Array(vec![json!(null); MAX_TRAVERSAL_NODES]);
+        assert_eq!(
+            validate_value_budget(&too_many_nodes),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let mut too_deep = json!(null);
+        for _ in 0..=MAX_TRAVERSAL_DEPTH {
+            too_deep = json!([too_deep]);
+        }
+        assert_eq!(
+            validate_value_budget(&too_deep),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let too_much_text = json!("x".repeat(MAX_TOTAL_TEXT_BYTES + 1));
+        assert_eq!(
+            validate_value_budget(&too_much_text),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+        assert_eq!(
+            validate_serialized_budget(&"x".repeat(MAX_SERIALIZED_RICH_BYTES + 1)),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+
+        let mut too_many_path_bytes = serde_json::Map::new();
+        for index in 0..512 {
+            too_many_path_bytes.insert(format!("{}-{index}", "k".repeat(600)), json!(null));
+        }
+        assert_eq!(
+            validate_value_budget(&serde_json::Value::Object(too_many_path_bytes)),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn occurrence_budget_counts_across_independent_leaves() {
+        let mut output = vec![fake_occurrence(); MAX_TOTAL_OCCURRENCES];
+        let addition = emoji_analysis::analyze("😀", &[]).unwrap().occurrences;
+        assert_eq!(
+            ensure_occurrence_budget(&output, &addition),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+        output.clear();
+        let custom = emoji_analysis::analyze(
+            "x",
+            &[CustomEmojiInput {
+                id: "id".into(),
+                utf16_range: 0..1,
+                format: EmojiFormat::Unknown,
+            }],
+        )
+        .unwrap()
+        .occurrences;
+        output.resize_with(MAX_TOTAL_CUSTOM_EMOJI, fake_custom_occurrence);
+        assert_eq!(
+            ensure_occurrence_budget(&output, &custom),
+            Err(EmojiAnalysisError::RichTraversalLimitExceeded)
+        );
+    }
+
+    fn fake_occurrence() -> EmojiOccurrence {
+        EmojiOccurrence {
+            identity: EmojiIdentity::Unicode("😀".into()),
+            fallback: "😀".into(),
+            source: ContentSource::Text,
+            path: "text".into(),
+            utf8_range: 0..4,
+            utf16_range: 0..2,
+            format: EmojiFormat::Unicode,
+        }
+    }
+
+    fn fake_custom_occurrence() -> EmojiOccurrence {
+        EmojiOccurrence {
+            identity: EmojiIdentity::Custom("id".into()),
+            ..fake_occurrence()
+        }
     }
 
     #[test]

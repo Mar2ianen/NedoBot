@@ -113,8 +113,8 @@ jiff = "0.2"
 dotenvy = "0.15"
 emojis = { version = "=0.9.1", optional = true }
 ipnet = "2"
-teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "3166c9c39f79724b8e4e760e7a5afdd5daeb78be", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "3166c9c39f79724b8e4e760e7a5afdd5daeb78be", default-features = false, features = ["teloxide"] }
+teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "e06da412e880632bdcb196cb8f79fc0bc80b972c", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "e06da412e880632bdcb196cb8f79fc0bc80b972c", default-features = false, features = ["teloxide"] }
 teloxide-statistics = { git = "https://github.com/Mar2ianen/teloxide-statistics", rev = "7e2a5859849044121b9e693bc1ed36e7440db139", default-features = false, features = ["sentiment", "engagement", "reputation"] }
 genai = { version = "=0.7.3", default-features = false, features = ["rustls-tls"] }
 reqwest = { version = "0.13", features = ["json", "multipart", "query", "socks"] }
@@ -123,7 +123,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "sqlite", "chrono", "uuid", "macros", "migrate", "json"] }
-teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "ce840d82daf47c3e9b9ee16fb05d62fbe0c24727", default-features = false, features = ["ctrlc_handler", "rustls-native-roots", "macros", "drafter", "rich-text", "time-rendering"] }
+teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "76591fdf626974fac492f1f8eb411b3e4f4d7601", default-features = false, features = ["ctrlc_handler", "rustls-native-roots", "macros", "drafter", "rich-text", "time-rendering"] }
 tempfile = "3"
 unicode-segmentation = { version = "=1.13.3", optional = true, default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-std", "io-util", "process", "sync", "time", "test-util"] }

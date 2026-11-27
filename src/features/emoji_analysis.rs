@@ -8,7 +8,7 @@ use std::{
     ops::Range,
 };
 
-use teloxide::types::{MessageEntity, MessageEntityKind};
+use teloxide::types::{MessageEntity, MessageEntityKind, Utf16OffsetMap};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Unicode emoji data version provided by the pinned recognition dataset.
@@ -16,6 +16,29 @@ pub const UNICODE_EMOJI_VERSION: &str = "18.0";
 
 pub const MAX_TEXT_BYTES: usize = 1_048_576;
 pub const MAX_CUSTOM_EMOJI_SPANS: usize = 2_048;
+
+// Unicode 18.0.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point.
+// Keep this aligned with UNICODE_EMOJI_VERSION; ZWJ sequences are checked as
+// emoji graphemes before this property is used for moderation visibility.
+const DEFAULT_IGNORABLE_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EmojiIdentity {
@@ -56,10 +79,12 @@ pub struct EmojiMetrics {
     pub animated_count: u32,
     pub unknown_format_count: u32,
     pub visible_non_emoji_graphemes: u32,
+    pub moderation_visible_non_emoji_graphemes: u32,
     pub max_consecutive_run: u32,
     pub max_repeat_count: u32,
     pub unique_count: u32,
     pub density: Option<f64>,
+    pub moderation_density: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +102,7 @@ pub enum EmojiAnalysisError {
     InvalidUtf16Boundary,
     InvalidGraphemeBoundary,
     OverlappingCustomEmojiRanges,
+    RichTraversalLimitExceeded,
 }
 
 /// Extracts exact Unicode emoji graphemes and typed Telegram custom emoji.
@@ -95,7 +121,7 @@ pub fn analyze(
         return Err(EmojiAnalysisError::TooManyCustomEmojiSpans);
     }
 
-    let boundaries = Utf16Boundaries::new(text);
+    let boundaries = Utf16OffsetMap::new(text);
     let grapheme_boundaries: HashSet<_> = text
         .grapheme_indices(true)
         .map(|(byte, _)| byte)
@@ -110,12 +136,14 @@ pub fn analyze(
             if item.utf16_range.start >= item.utf16_range.end {
                 return Err(EmojiAnalysisError::EmptyCustomEmojiRange);
             }
-            let byte_start = boundaries
-                .byte_offset(item.utf16_range.start)
+            let byte_range = boundaries
+                .range(
+                    item.utf16_range.start,
+                    item.utf16_range.end - item.utf16_range.start,
+                )
                 .ok_or(EmojiAnalysisError::InvalidUtf16Boundary)?;
-            let byte_end = boundaries
-                .byte_offset(item.utf16_range.end)
-                .ok_or(EmojiAnalysisError::InvalidUtf16Boundary)?;
+            let byte_start = byte_range.start;
+            let byte_end = byte_range.end;
             if !grapheme_boundaries.contains(&byte_start)
                 || !grapheme_boundaries.contains(&byte_end)
             {
@@ -200,7 +228,13 @@ pub fn analyze(
         } else {
             result.metrics.visible_non_emoji_graphemes =
                 result.metrics.visible_non_emoji_graphemes.saturating_add(1);
-            run = 0;
+            if !grapheme.chars().all(is_default_ignorable) {
+                result.metrics.moderation_visible_non_emoji_graphemes = result
+                    .metrics
+                    .moderation_visible_non_emoji_graphemes
+                    .saturating_add(1);
+                run = 0;
+            }
         }
         byte = byte_end;
         utf16 = utf16_end;
@@ -210,7 +244,18 @@ pub fn analyze(
     let emoji = u64::from(result.metrics.unicode_count) + u64::from(result.metrics.custom_count);
     let visible = emoji + u64::from(result.metrics.visible_non_emoji_graphemes);
     result.metrics.density = (visible != 0).then(|| emoji as f64 / visible as f64);
+    let moderation_visible =
+        emoji + u64::from(result.metrics.moderation_visible_non_emoji_graphemes);
+    result.metrics.moderation_density =
+        (moderation_visible != 0).then(|| emoji as f64 / moderation_visible as f64);
     Ok(result)
+}
+
+fn is_default_ignorable(character: char) -> bool {
+    let codepoint = character as u32;
+    DEFAULT_IGNORABLE_RANGES
+        .iter()
+        .any(|&(start, end)| (start..=end).contains(&codepoint))
 }
 
 /// Adapts Telegram text/caption entities into the checked pure analyzer.
@@ -247,29 +292,6 @@ fn add_occurrence(
     let count = counts.entry(identity).or_default();
     *count = count.saturating_add(1);
     metrics.max_repeat_count = metrics.max_repeat_count.max(*count);
-}
-
-struct Utf16Boundaries(Vec<(usize, usize)>);
-
-impl Utf16Boundaries {
-    fn new(text: &str) -> Self {
-        let mut boundaries = Vec::with_capacity(text.chars().count().saturating_add(1));
-        let (mut utf16, mut utf8) = (0usize, 0usize);
-        for character in text.chars() {
-            boundaries.push((utf16, utf8));
-            utf16 += character.len_utf16();
-            utf8 += character.len_utf8();
-        }
-        boundaries.push((utf16, utf8));
-        Self(boundaries)
-    }
-
-    fn byte_offset(&self, target: usize) -> Option<usize> {
-        self.0
-            .binary_search_by_key(&target, |&(utf16, _)| utf16)
-            .ok()
-            .map(|index| self.0[index].1)
-    }
 }
 
 #[cfg(test)]
@@ -330,8 +352,26 @@ mod tests {
         assert_eq!(analysis.metrics.max_repeat_count, 2);
         assert_eq!(analysis.metrics.unique_count, 1);
         assert_eq!(analysis.metrics.density, Some(2.0 / 3.0));
+        assert_eq!(analysis.metrics.moderation_density, Some(2.0 / 3.0));
         assert_eq!(analyze(" \n\t", &[]).unwrap().metrics.density, None);
         assert_eq!(analyze("", &[]).unwrap().metrics.density, None);
+    }
+
+    #[test]
+    fn default_ignorables_are_raw_but_not_moderation_visible_or_run_breaks() {
+        let analysis = analyze("😀\u{200B}😀\u{200B}A", &[]).unwrap();
+        assert_eq!(analysis.metrics.unicode_count, 2);
+        assert_eq!(analysis.metrics.visible_non_emoji_graphemes, 3);
+        assert_eq!(analysis.metrics.moderation_visible_non_emoji_graphemes, 1);
+        assert_eq!(analysis.metrics.max_consecutive_run, 2);
+        assert_eq!(analysis.metrics.density, Some(2.0 / 5.0));
+        assert_eq!(analysis.metrics.moderation_density, Some(2.0 / 3.0));
+
+        // The family sequence remains a single recognized grapheme, including
+        // its default-ignorable ZWJs and variation selectors.
+        let family = analyze("👨‍👩‍👧‍👦", &[]).unwrap();
+        assert_eq!(family.metrics.unicode_count, 1);
+        assert_eq!(family.metrics.moderation_density, Some(1.0));
     }
 
     #[test]
@@ -433,6 +473,82 @@ mod tests {
                 prop_assert!(text.is_char_boundary(occurrence.utf8_range.start));
                 prop_assert!(text.is_char_boundary(occurrence.utf8_range.end));
                 prop_assert!(occurrence.utf16_range.start < occurrence.utf16_range.end);
+            }
+        }
+
+        #[test]
+        fn generated_valid_custom_ranges_match_independent_utf16_oracle(
+            chars in proptest::collection::vec(any::<char>(), 1..32),
+            selected in 0usize..64,
+        ) {
+            let text: String = chars.into_iter().collect();
+            let graphemes: Vec<_> = text.grapheme_indices(true).collect();
+            let index = selected % graphemes.len();
+            let (byte_start, grapheme) = graphemes[index];
+            let byte_end = byte_start + grapheme.len();
+            let utf16_start = text[..byte_start].encode_utf16().count();
+            let utf16_end = utf16_start + grapheme.encode_utf16().count();
+            let custom = [CustomEmojiInput {
+                id: "property-id".into(),
+                utf16_range: utf16_start..utf16_end,
+                format: EmojiFormat::Static,
+            }];
+
+            let analysis = analyze(&text, &custom).unwrap();
+            let occurrence = analysis.occurrences.iter().find(|occurrence| {
+                occurrence.identity == EmojiIdentity::Custom("property-id".into())
+            }).unwrap();
+            prop_assert_eq!(&occurrence.utf8_range, &(byte_start..byte_end));
+            prop_assert_eq!(&occurrence.utf16_range, &(utf16_start..utf16_end));
+            prop_assert_eq!(&occurrence.fallback, grapheme);
+            prop_assert_eq!(analysis.metrics.custom_count, 1);
+        }
+
+        #[test]
+        fn generated_custom_ranges_match_scalar_and_grapheme_boundary_oracle(
+            chars in proptest::collection::vec(any::<char>(), 0..24),
+            offset in 0usize..80,
+            length in 0usize..24,
+        ) {
+            let text: String = chars.into_iter().collect();
+            let end = offset + length;
+            let input = [CustomEmojiInput {
+                id: "oracle".into(),
+                utf16_range: offset..end,
+                format: EmojiFormat::Static,
+            }];
+            let oracle_boundaries: Vec<_> = text.char_indices()
+                .map(|(byte, _)| (text[..byte].encode_utf16().count(), byte))
+                .chain(std::iter::once((text.encode_utf16().count(), text.len())))
+                .collect();
+            let start_byte = oracle_boundaries.iter().find(|(units, _)| *units == offset).map(|(_, byte)| *byte);
+            let end_byte = oracle_boundaries.iter().find(|(units, _)| *units == end).map(|(_, byte)| *byte);
+            let grapheme_boundaries: HashSet<_> = text.grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain(std::iter::once(text.len()))
+                .collect();
+
+            let expected_error = if offset >= end {
+                Some(EmojiAnalysisError::EmptyCustomEmojiRange)
+            } else if start_byte.is_none() || end_byte.is_none() {
+                Some(EmojiAnalysisError::InvalidUtf16Boundary)
+            } else if !grapheme_boundaries.contains(&start_byte.unwrap())
+                || !grapheme_boundaries.contains(&end_byte.unwrap())
+            {
+                Some(EmojiAnalysisError::InvalidGraphemeBoundary)
+            } else {
+                None
+            };
+            let actual = analyze(&text, &input);
+            if let Some(expected) = expected_error {
+                prop_assert_eq!(actual, Err(expected));
+            } else {
+                let result = actual.unwrap();
+                let occurrence = result.occurrences.iter().find(|item|
+                    item.identity == EmojiIdentity::Custom("oracle".into())
+                ).unwrap();
+                prop_assert_eq!(&occurrence.utf8_range, &(start_byte.unwrap()..end_byte.unwrap()));
+                prop_assert_eq!(&occurrence.utf16_range, &(offset..end));
             }
         }
     }

@@ -307,24 +307,7 @@ pub(crate) fn utf16_range(
     offset: usize,
     length: usize,
 ) -> Option<std::ops::Range<usize>> {
-    if length == 0 {
-        return None;
-    }
-    let end = offset.checked_add(length)?;
-    fn boundary(text: &str, target: usize) -> Option<usize> {
-        let mut units = 0usize;
-        for (byte, character) in text.char_indices() {
-            if units == target {
-                return Some(byte);
-            }
-            units = units.checked_add(character.len_utf16())?;
-            if units > target {
-                return None;
-            }
-        }
-        (units == target).then_some(text.len())
-    }
-    Some(boundary(text, offset)?..boundary(text, end)?)
+    teloxide::types::Utf16OffsetMap::new(text).range(offset, length)
 }
 
 #[cfg(test)]
