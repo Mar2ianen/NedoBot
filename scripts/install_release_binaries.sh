@@ -16,6 +16,7 @@ BINARIES=(
     probe_new_user_audit
     spam_cascade
     spam_decision
+    sync_lols_banlist
     retry_pending_comments
     reconcile_comment_delivery
     backfill_rich_messages

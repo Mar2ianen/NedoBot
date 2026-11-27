@@ -11,7 +11,7 @@ BUNDLE = SCRIPT.with_name("release_bundle.sh")
 PRIVACY_POLICY = SCRIPT.with_name("set_privacy_mode_observe.sh")
 WORKFLOW = SCRIPT.parents[1] / ".github/workflows/release.yml"
 BINARIES = ("tg_ai_bot_teloxide", "nedonews_mcp_http", "chat_db_mcp",
-            "probe_new_user_audit", "spam_cascade", "spam_decision", "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages",
+            "probe_new_user_audit", "spam_cascade", "spam_decision", "sync_lols_banlist", "retry_pending_comments", "reconcile_comment_delivery", "backfill_rich_messages",
             "backfill_post_history_embeddings", "backfill_audit_embeddings",
             "backfill_chat_embeddings",
             "import_telegram_export", "migrate", "provision_mcp_instance_scope",
