@@ -2,7 +2,6 @@ use super::rich_content::{legacy_quote_text, project, rich_message};
 use std::borrow::Cow;
 use teloxide::types::{
     Message, MessageEntityKind, MessageEntityRef, MessageId, MessageOrigin, RichBlock,
-    Utf16OffsetMap,
 };
 
 /// Persist both Bot API 10.4 and 10.5 expandable-quote fields. RC1 readers
@@ -338,7 +337,7 @@ pub(crate) fn utf16_range(
     offset: usize,
     length: usize,
 ) -> Option<std::ops::Range<usize>> {
-    Utf16OffsetMap::new(text).range(offset, length)
+    teloxide::types::Utf16OffsetMap::new(text).range(offset, length)
 }
 
 #[cfg(test)]

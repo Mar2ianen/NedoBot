@@ -2969,7 +2969,7 @@ checksum = "07dd1d452d2c3dc94a4e1c5c3c9a3cc88c2ef5926674b75881e454c4dc3a14c4"
 [[package]]
 name = "teloxide"
 version = "0.21.0-rc.2"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=ce840d82daf47c3e9b9ee16fb05d62fbe0c24727#ce840d82daf47c3e9b9ee16fb05d62fbe0c24727"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=76591fdf626974fac492f1f8eb411b3e4f4d7601#76591fdf626974fac492f1f8eb411b3e4f4d7601"
 dependencies = [
  "bytes",
  "derive_more",
@@ -2994,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "teloxide-antispam"
 version = "0.3.3"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=d13ef30dd3e761f1f9b7a5de953096ddaa15f10d#d13ef30dd3e761f1f9b7a5de953096ddaa15f10d"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=e06da412e880632bdcb196cb8f79fc0bc80b972c#e06da412e880632bdcb196cb8f79fc0bc80b972c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3045,7 +3045,7 @@ dependencies = [
 [[package]]
 name = "teloxide-core"
 version = "0.17.0-rc.2"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=ce840d82daf47c3e9b9ee16fb05d62fbe0c24727#ce840d82daf47c3e9b9ee16fb05d62fbe0c24727"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=76591fdf626974fac492f1f8eb411b3e4f4d7601#76591fdf626974fac492f1f8eb411b3e4f4d7601"
 dependencies = [
  "bitflags",
  "bytes",
@@ -3077,7 +3077,7 @@ dependencies = [
 [[package]]
 name = "teloxide-macros"
 version = "0.11.2-rc.1"
-source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=ce840d82daf47c3e9b9ee16fb05d62fbe0c24727#ce840d82daf47c3e9b9ee16fb05d62fbe0c24727"
+source = "git+https://github.com/Mar2ianen/teloxide-fork?rev=76591fdf626974fac492f1f8eb411b3e4f4d7601#76591fdf626974fac492f1f8eb411b3e4f4d7601"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -3098,7 +3098,7 @@ dependencies = [
 [[package]]
 name = "teloxide-url"
 version = "0.1.0"
-source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=d13ef30dd3e761f1f9b7a5de953096ddaa15f10d#d13ef30dd3e761f1f9b7a5de953096ddaa15f10d"
+source = "git+https://github.com/Mar2ianen/teloxide-antispam?rev=e06da412e880632bdcb196cb8f79fc0bc80b972c#e06da412e880632bdcb196cb8f79fc0bc80b972c"
 dependencies = [
  "linkify",
  "teloxide",
