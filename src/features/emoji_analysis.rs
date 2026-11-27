@@ -8,6 +8,7 @@ use std::{
     ops::Range,
 };
 
+use teloxide::types::{MessageEntity, MessageEntityKind};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Unicode emoji data version provided by the pinned recognition dataset.
@@ -212,6 +213,29 @@ pub fn analyze(
     Ok(result)
 }
 
+/// Adapts Telegram text/caption entities into the checked pure analyzer.
+/// Custom emoji sticker format is `Unknown` until metadata lookup resolves it.
+pub fn analyze_telegram_text(
+    text: &str,
+    entities: &[MessageEntity],
+) -> Result<EmojiAnalysis, EmojiAnalysisError> {
+    let mut custom = Vec::new();
+    for entity in entities {
+        if let MessageEntityKind::CustomEmoji { custom_emoji_id } = &entity.kind {
+            let end = entity
+                .offset
+                .checked_add(entity.length)
+                .ok_or(EmojiAnalysisError::InvalidUtf16Boundary)?;
+            custom.push(CustomEmojiInput {
+                id: custom_emoji_id.to_string(),
+                utf16_range: entity.offset..end,
+                format: EmojiFormat::Unknown,
+            });
+        }
+    }
+    analyze(text, &custom)
+}
+
 fn add_occurrence(
     counts: &mut HashMap<EmojiIdentity, u32>,
     run: &mut u32,
@@ -293,6 +317,16 @@ mod tests {
         assert_eq!(analysis.metrics.unknown_format_count, 1);
         assert_eq!(analysis.occurrences[0].utf8_range, 0..4);
         assert_eq!(analysis.occurrences[0].utf16_range, 0..2);
+    }
+
+    #[test]
+    fn telegram_custom_entity_uses_utf16_range_and_unknown_format() {
+        let entities = [MessageEntity::custom_emoji("123".into(), 0, 2)];
+        let analysis = analyze_telegram_text("😀", &entities).unwrap();
+        assert_eq!(analysis.metrics.unicode_count, 0);
+        assert_eq!(analysis.metrics.custom_count, 1);
+        assert_eq!(analysis.metrics.unknown_format_count, 1);
+        assert_eq!(analysis.occurrences[0].utf8_range, 0..4);
     }
 
     #[test]
