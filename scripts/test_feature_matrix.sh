@@ -10,6 +10,6 @@ if cargo tree --no-default-features --prefix none | rg -q '^emojis v'; then
     exit 1
 fi
 cargo check --no-default-features --features emoji --lib --locked
-python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --features emoji --lib features::emoji_analysis --locked
+python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --features emoji --lib features::emoji_ --locked
 python3 scripts/run_cargo_test_checked.py cargo test --lib "$feature_gate_test" --locked -- --exact
 python3 scripts/run_cargo_test_checked.py cargo test --no-default-features --lib "$feature_gate_test" --locked -- --exact
