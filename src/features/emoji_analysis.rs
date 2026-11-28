@@ -212,6 +212,7 @@ pub enum EmojiAnalysisError {
     EmptyCustomEmojiRange,
     InvalidUtf16Boundary,
     InvalidGraphemeBoundary,
+    InvalidGraphemeSegmentation,
     OverlappingCustomEmojiRanges,
     RichTraversalLimitExceeded,
 }
@@ -336,7 +337,8 @@ pub fn analyze(
         let remaining = &text[byte..];
         let grapheme = graphemes(remaining)
             .next()
-            .expect("non-empty remainder has a grapheme");
+            .filter(|grapheme| !grapheme.is_empty())
+            .ok_or(EmojiAnalysisError::InvalidGraphemeSegmentation)?;
         let byte_end = byte + grapheme.len();
         let utf16_end = utf16 + grapheme.encode_utf16().count();
         if grapheme.chars().all(char::is_whitespace) {
@@ -578,6 +580,23 @@ mod tests {
     use proptest::prelude::*;
     #[cfg(feature = "emoji-legacy-differential")]
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn grapheme_iterator_produces_strictly_advancing_ranges() {
+        for text in ["", "ASCII", "👩🏽‍💻", "क्‍ष", "🏳️‍🌈"] {
+            let mut expected_start = 0;
+            for (start, grapheme) in grapheme_indices(text) {
+                assert_eq!(start, expected_start, "grapheme gap in {text:?}");
+                assert!(!grapheme.is_empty(), "empty grapheme in {text:?}");
+                expected_start += grapheme.len();
+            }
+            assert_eq!(
+                expected_start,
+                text.len(),
+                "incomplete segmentation of {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn icu_segmenter_matches_unicode_18_grapheme_break_test() {
