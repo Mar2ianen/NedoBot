@@ -101,6 +101,10 @@ name = "spam_cascade"
 path = "src/bin/spam_cascade.rs"
 required-features = ["moderation"]
 
+[[example]]
+name = "bench_emoji_analyzer"
+required-features = ["emoji"]
+
 [dependencies]
 agent-runtime = { path = "crates/agent-runtime" }
 nedobot-qr = { path = "crates/nedobot-qr" }
