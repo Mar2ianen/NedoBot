@@ -15,7 +15,7 @@ reqwest = { version = "0.13", default-features = false }
 teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "76591fdf626974fac492f1f8eb411b3e4f4d7601", default-features = false, features = ["rich-text"] }
 tg_ai_bot_teloxide = { path = "..", default-features = false, features = ["emoji"] }
 nedobot-qr = { path = "../crates/nedobot-qr" }
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "8689bf5836a6881449402303be833f46b4038177", default-features = false }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "c1e00f5", default-features = false }
 
 [[bin]]
 name = "stored_message"
