@@ -11,7 +11,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-tg_ai_bot_teloxide = { path = "..", default-features = false }
+reqwest = { version = "0.13", default-features = false }
+teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "76591fdf626974fac492f1f8eb411b3e4f4d7601", default-features = false, features = ["rich-text"] }
+tg_ai_bot_teloxide = { path = "..", default-features = false, features = ["emoji"] }
 nedobot-qr = { path = "../crates/nedobot-qr" }
 teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "c1e00f5", default-features = false }
 
@@ -32,6 +34,13 @@ bench = false
 [[bin]]
 name = "url_parse"
 path = "fuzz_targets/url_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emoji_analysis"
+path = "fuzz_targets/emoji_analysis.rs"
 test = false
 doc = false
 bench = false

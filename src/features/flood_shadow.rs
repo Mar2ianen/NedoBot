@@ -151,7 +151,8 @@ fn project_message(
         // The Telegram adapter currently counts custom emoji entities; native
         // Unicode emoji classification belongs to the shared emoji extraction
         // work and is not approximated here.
-        emoji_count: custom_emoji_ids(message).len().min(u32::MAX as usize) as u32,
+        emoji_count: custom_emoji_ids(message)
+            .map_or(0, |ids| ids.len().min(u32::MAX as usize) as u32),
         mention_count,
         forwarded: message.forward_origin().is_some(),
     })

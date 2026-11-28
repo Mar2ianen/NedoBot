@@ -1,0 +1,59 @@
+{
+  "cases": [
+    {
+      "text": "👨‍👩‍👧‍👦",
+      "graphemes": 1,
+      "emoji": 1
+    },
+    {
+      "text": "🇫🇮",
+      "graphemes": 1,
+      "emoji": 1
+    },
+    {
+      "text": "👍🏽",
+      "graphemes": 1,
+      "emoji": 1
+    },
+    {
+      "text": "1️⃣",
+      "graphemes": 1,
+      "emoji": 1
+    },
+    {
+      "text": "é",
+      "graphemes": 1,
+      "emoji": 0
+    },
+    {
+      "text": "1",
+      "graphemes": 1,
+      "emoji": 0
+    },
+    {
+      "text": "©️",
+      "graphemes": 1,
+      "emoji": 1
+    },
+    {
+      "text": "😀😀",
+      "graphemes": 2,
+      "emoji": 2
+    },
+    {
+      "text": "а😀",
+      "graphemes": 2,
+      "emoji": 1
+    },
+    {
+      "text": "👩‍💻",
+      "graphemes": 1,
+      "emoji": 1
+    },
+    {
+      "text": "❤︎",
+      "graphemes": 1,
+      "emoji": 0
+    }
+  ]
+}

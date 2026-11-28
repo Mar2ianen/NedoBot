@@ -1,0 +1,36 @@
+{
+  "synthetic": true,
+  "note": "Proposed policy oracle. raw spans unchanged; moderation recognition preserves valid emoji and explicit text presentation; test with pinned emoji library.",
+  "cases": [
+    {
+      "text": "😀͏",
+      "raw_exact_emoji": 0,
+      "moderation_emoji": 1,
+      "reason": "CGJ attached to grapheme"
+    },
+    {
+      "text": "😀‍",
+      "raw_exact_emoji": 0,
+      "moderation_emoji": 1,
+      "reason": "dangling ZWJ; only strip after exact lookup fails"
+    },
+    {
+      "text": "😀​😀",
+      "moderation_emoji": 2,
+      "moderation_density": 1.0,
+      "reason": "standalone ignorable"
+    },
+    {
+      "text": "👩‍💻",
+      "raw_exact_emoji": 1,
+      "moderation_emoji": 1,
+      "reason": "valid ZWJ must remain one"
+    },
+    {
+      "text": "❤︎",
+      "raw_exact_emoji": 0,
+      "moderation_emoji": 0,
+      "reason": "explicit text presentation remains text"
+    }
+  ]
+}

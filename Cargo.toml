@@ -28,6 +28,8 @@ public-mcp = []
 moderation = []
 spam-sync = []
 manual-moderation = []
+emoji = ["dep:emojis", "dep:icu_properties", "dep:icu_segmenter"]
+emoji-legacy-differential = ["emoji", "dep:unicode-segmentation"]
 flood = ["teloxide-antispam/flood"]
 
 [[bin]]
@@ -100,6 +102,10 @@ name = "spam_cascade"
 path = "src/bin/spam_cascade.rs"
 required-features = ["moderation"]
 
+[[example]]
+name = "bench_emoji_analyzer"
+required-features = ["emoji"]
+
 [dependencies]
 agent-runtime = { path = "crates/agent-runtime" }
 nedobot-qr = { path = "crates/nedobot-qr" }
@@ -111,6 +117,9 @@ base64 = "0.23"
 chrono = "0.4"
 jiff = "0.2"
 dotenvy = "0.15"
+emojis = { version = "=0.9.1", optional = true }
+icu_properties = { version = "=2.4.0", optional = true, default-features = false, features = ["compiled_data"] }
+icu_segmenter = { version = "=2.4.0", optional = true, default-features = false, features = ["compiled_data", "unstable"] }
 ipnet = "2"
 teloxide-antispam = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "c1e00f5", default-features = false, features = ["scoring", "classifier", "embedding", "cas", "url"] }
 teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "c1e00f5", default-features = false, features = ["teloxide"] }
@@ -124,6 +133,7 @@ sha2 = "0.11"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "sqlite", "chrono", "uuid", "macros", "migrate", "json"] }
 teloxide = { git = "https://github.com/Mar2ianen/teloxide-fork", rev = "76591fdf626974fac492f1f8eb411b3e4f4d7601", default-features = false, features = ["ctrlc_handler", "rustls-native-roots", "macros", "drafter", "rich-text", "time-rendering"] }
 tempfile = "3"
+unicode-segmentation = { version = "=1.13.3", optional = true, default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-std", "io-util", "process", "sync", "time", "test-util"] }
 toml = "1.2"
 tracing = "0.1"

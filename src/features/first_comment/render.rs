@@ -34,6 +34,22 @@ pub fn build_comment_html_with_context(
     search_results: &[SearchResult],
     chat_targets: &[ChatLinkTarget],
 ) -> String {
+    build_comment_html_with_context_and_emoji_fallback(
+        llm_body,
+        config,
+        search_results,
+        chat_targets,
+        None,
+    )
+}
+
+pub fn build_comment_html_with_context_and_emoji_fallback(
+    llm_body: &str,
+    config: &Config,
+    search_results: &[SearchResult],
+    chat_targets: &[ChatLinkTarget],
+    emoji_fallback: Option<&str>,
+) -> String {
     // The model decides the wording; code owns links and custom emoji markup.
     let clean_body = normalize_ai_markers(&strip_links(llm_body))
         .trim()
@@ -45,19 +61,22 @@ pub fn build_comment_html_with_context(
 
     let body = render_link_placeholders(&clean_body, config, search_results, chat_targets);
 
-    match pick_comment_emoji(llm_body, config) {
-        Some(custom_emoji_id) => {
+    match (
+        pick_comment_emoji(llm_body, config),
+        emoji_fallback.filter(|s| !s.is_empty()),
+    ) {
+        (Some(custom_emoji_id), Some(fallback)) => {
             let mut html = Html::empty();
-            html.push(Html::custom_emoji(custom_emoji_id, "😎"));
+            html.push(Html::custom_emoji(custom_emoji_id, fallback));
             html.push(Html::raw_trusted(" "));
             html.push(body);
             html.into_string()
         }
-        None => body.into_string(),
+        _ => body.into_string(),
     }
 }
 
-fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
+pub(crate) fn pick_comment_emoji<'a>(text: &str, config: &'a Config) -> Option<&'a str> {
     let lower = text.to_lowercase();
 
     if lower.contains("radeon") || lower.contains("видеокарт") {
@@ -448,10 +467,25 @@ mod tests {
         let mut config = config();
         config.comment_custom_emoji_id = Some("123456".to_owned());
 
-        let html = build_comment_html("AMD драйвер обновился", &config);
+        let html = build_comment_html_with_context_and_emoji_fallback(
+            "AMD драйвер обновился",
+            &config,
+            &[],
+            &[],
+            Some("🤖"),
+        );
 
-        assert!(html.contains(r#"<tg-emoji emoji-id="123456">😎</tg-emoji>"#));
+        assert!(html.contains(r#"<tg-emoji emoji-id="123456">🤖</tg-emoji>"#));
         assert!(html.ends_with("AMD драйвер обновился"));
+    }
+
+    #[test]
+    fn unresolved_custom_emoji_degrades_to_plain_comment_without_invented_fallback() {
+        let mut config = config();
+        config.comment_custom_emoji_id = Some("123456".to_owned());
+        let html = build_comment_html("AMD драйвер обновился", &config);
+        assert_eq!(html, "AMD драйвер обновился");
+        assert!(!html.contains("tg-emoji"));
     }
 
     #[test]

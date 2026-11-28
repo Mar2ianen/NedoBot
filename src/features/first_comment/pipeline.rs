@@ -458,12 +458,15 @@ async fn process_post_comment_job(
     }
     let used_search_result_id = draft.used_search_result_id.map(|id| id as i32);
     let prompt_for_log = prompt.compact_for_log();
-    let final_html = crate::features::first_comment::render::build_comment_html_with_context(
-        &draft.comment,
-        &render_config,
-        &search_context.results,
-        &chat_targets,
-    );
+    let emoji_fallback = resolve_comment_emoji_fallback(bot, &draft.comment, config).await;
+    let final_html =
+        crate::features::first_comment::render::build_comment_html_with_context_and_emoji_fallback(
+            &draft.comment,
+            &render_config,
+            &search_context.results,
+            &chat_targets,
+            emoji_fallback.as_deref(),
+        );
     ensure_comment_html(&final_html, &draft.comment).map_err(|err| {
         CommentFailure::new(CommentErrorKind::InvalidInput, "render", format!("{err:#}"))
     })?;
@@ -476,6 +479,33 @@ async fn process_post_comment_job(
         search_context,
         used_search_result_id,
     })))
+}
+
+async fn resolve_comment_emoji_fallback(
+    bot: &teloxide::adaptors::DefaultParseMode<Bot>,
+    comment: &str,
+    config: &Config,
+) -> Option<String> {
+    let requested = crate::features::first_comment::render::pick_comment_emoji(comment, config)?;
+    let requested_id = teloxide::types::CustomEmojiId(requested.to_owned());
+    let report = crate::telegram::custom_emoji::resolve_custom_emoji_fallbacks(
+        bot,
+        std::slice::from_ref(&requested_id),
+    )
+    .await;
+    match report.outcomes.get(&requested_id) {
+        Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::Resolved(fallback)) => {
+            Some(fallback.clone())
+        }
+        Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::TransientFailure)
+        | Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::Busy) => {
+            tracing::debug!("custom emoji metadata lookup was deferred or transiently unavailable");
+            None
+        }
+        Some(crate::telegram::custom_emoji::CustomEmojiLookupOutcome::ConfirmedMissing) | None => {
+            None
+        }
+    }
 }
 
 async fn deliver_prepared_post_comment(

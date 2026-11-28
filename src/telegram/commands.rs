@@ -24,6 +24,33 @@ mod top_word_tests {
         ));
     }
 
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn emoji_command_is_registered_with_its_feature() {
+        assert!(matches!(
+            Command::parse("/emoji", "nedobot"),
+            Ok(Command::Emoji)
+        ));
+    }
+
+    #[cfg(not(feature = "emoji"))]
+    #[test]
+    fn emoji_command_is_not_registered_without_its_feature() {
+        assert!(Command::parse("/emoji", "nedobot").is_err());
+    }
+
+    #[cfg(feature = "moderation")]
+    #[test]
+    fn qr_command_is_registered_with_moderation_feature() {
+        assert!(matches!(Command::parse("/qr", "nedobot"), Ok(Command::Qr)));
+    }
+
+    #[cfg(not(feature = "moderation"))]
+    #[test]
+    fn qr_command_is_not_registered_without_moderation_feature() {
+        assert!(Command::parse("/qr", "nedobot").is_err());
+    }
+
     #[cfg(feature = "ask")]
     #[test]
     fn forget_command_has_no_target_argument() {
@@ -68,6 +95,12 @@ pub enum Command {
     Db,
     #[command(description = "показать custom_emoji_id из сообщения")]
     EmojiIds,
+    #[cfg(feature = "emoji")]
+    #[command(description = "показать premium emoji из сообщения reply")]
+    Emoji,
+    #[cfg(feature = "moderation")]
+    #[command(description = "прочитать QR-коды из изображения reply")]
+    Qr,
     #[cfg(feature = "auto-comment")]
     #[command(description = "проверить формат первого комментария")]
     FormatTest(String),

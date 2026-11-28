@@ -11,7 +11,7 @@ on:
         default: false
         type: boolean
       coverage_base:
-        description: Optional Git ref for PostgreSQL diff coverage (default: branch merge-base or parent on main)
+        description: "Optional Git ref for PostgreSQL diff coverage (default: branch merge-base or parent on main)"
         required: false
         type: string
 
@@ -25,7 +25,7 @@ concurrency:
 jobs:
   stress-and-mutation:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -41,10 +41,21 @@ jobs:
           QUALITY_EXECUTION_MANIFEST: target/quality/executed-tests.tsv
         run: sh scripts/run_quality_nightly.sh
 
+      - name: Run bounded coverage-guided fuzz targets
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo +nightly fuzz run stored_message -- -max_total_time=30 -max_len=65536 -rss_limit_mb=2048 -timeout=10
+          cargo +nightly fuzz run qr_image -- -max_total_time=30 -max_len=262144 -rss_limit_mb=2048 -timeout=10
+          cargo +nightly fuzz run url_parse -- -max_total_time=30 -max_len=16384 -rss_limit_mb=2048 -timeout=10
+          cargo +nightly fuzz run emoji_analysis -- -max_total_time=30 -max_len=1048576 -rss_limit_mb=2048 -timeout=10
+
       - name: Install pinned mutation tool
         run: cargo install cargo-mutants --version 27.1.0 --locked
 
-      - name: Run bounded URL, scope, error, worker and router mutation checks
+      - name: Run bounded URL, scope, error, worker, emoji and router mutation checks
         env:
           CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_DEV_DEBUG: "0"
@@ -66,6 +77,8 @@ jobs:
   stateful-postgres:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      RUST_MIN_STACK: "8388608"
     services:
       postgres:
         image: pgvector/pgvector:0.8.2-pg16-bookworm

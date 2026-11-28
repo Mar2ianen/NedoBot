@@ -3,3 +3,6 @@
 
 # SQL-миграции остаются подсвеченными как SQL, но не должны влиять на GitHub language bar.
 *.sql linguist-detectable=false
+
+# Official Unicode corpus files retain their upstream trailing whitespace.
+test-data/unicode/18.0.0/*.txt whitespace=-blank-at-eol

@@ -260,13 +260,6 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
         })
 }
 
-pub fn custom_emoji_ids(msg: &Message) -> Vec<String> {
-    custom_emoji_occurrences(msg)
-        .into_iter()
-        .map(|occurrence| occurrence.custom_emoji_id)
-        .collect()
-}
-
 /// A custom emoji occurrence with its Telegram fallback text, if available.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomEmojiOccurrence {
@@ -274,8 +267,7 @@ pub struct CustomEmojiOccurrence {
     pub fallback: Option<String>,
 }
 
-/// Extracts custom emoji in source order, preserving per-occurrence fallback
-/// text instead of collapsing equal IDs into one registry entry.
+/// Extract custom emoji in source order while preserving each occurrence's fallback text.
 pub fn custom_emoji_occurrences(msg: &Message) -> Vec<CustomEmojiOccurrence> {
     let mut occurrences = Vec::new();
     for (text, entities) in [
@@ -303,6 +295,46 @@ pub fn custom_emoji_occurrences(msg: &Message) -> Vec<CustomEmojiOccurrence> {
         ));
     }
     occurrences
+}
+
+#[cfg(feature = "emoji")]
+pub type CustomEmojiIdsError = crate::features::emoji_analysis::EmojiAnalysisError;
+#[cfg(not(feature = "emoji"))]
+pub type CustomEmojiIdsError = std::convert::Infallible;
+
+pub fn custom_emoji_ids(msg: &Message) -> Result<Vec<String>, CustomEmojiIdsError> {
+    #[cfg(feature = "emoji")]
+    {
+        let occurrences = crate::features::emoji_occurrences::extract_message(msg)?;
+        Ok(occurrences
+            .into_iter()
+            .filter_map(|occurrence| match occurrence.kind {
+                crate::features::emoji_analysis::EmojiKind::Custom { id, .. } => Some(id.0),
+                crate::features::emoji_analysis::EmojiKind::Unicode { .. } => None,
+            })
+            .collect())
+    }
+
+    #[cfg(not(feature = "emoji"))]
+    Ok(legacy_custom_emoji_ids(msg))
+}
+
+#[cfg(not(feature = "emoji"))]
+fn legacy_custom_emoji_ids(msg: &Message) -> Vec<String> {
+    let mut ids: Vec<_> = msg
+        .entities()
+        .into_iter()
+        .flatten()
+        .chain(msg.caption_entities().into_iter().flatten())
+        .filter_map(|entity| match &entity.kind {
+            MessageEntityKind::CustomEmoji { custom_emoji_id } => Some(custom_emoji_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    if let Some(rich) = rich_message(msg) {
+        ids.extend(project(rich).custom_emoji_ids);
+    }
+    ids
 }
 
 pub fn message_has_links(msg: &Message) -> bool {
@@ -345,11 +377,55 @@ mod tests {
     #[cfg(any(feature = "ask", feature = "moderation"))]
     use super::utf16_range;
     use super::{
-        MessageRevision, TelegramMessageProjection, custom_emoji_occurrences,
-        deserialize_stored_message, message_has_links, message_text, message_url_targets,
-        serialize_stored_messages,
+        MessageRevision, TelegramMessageProjection, deserialize_stored_message, message_has_links,
+        message_text, message_url_targets, serialize_stored_messages,
     };
     use teloxide::types::Message;
+
+    #[test]
+    fn custom_emoji_occurrences_keep_entity_and_rich_fallbacks_independently() {
+        let entity_message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 17,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 13, "is_bot": false, "first_name": "Test"},
+            "text": "😀",
+            "entities": [{"type": "custom_emoji", "offset": 0, "length": 2,
+                "custom_emoji_id": "123"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            super::custom_emoji_occurrences(&entity_message),
+            [super::CustomEmojiOccurrence {
+                custom_emoji_id: "123".to_owned(),
+                fallback: Some("😀".to_owned()),
+            }]
+        );
+
+        let rich_message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 18,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "rich_message": {"blocks": [{"type": "paragraph", "text": [
+                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙂"},
+                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙃"}
+            ]}]}
+        }))
+        .unwrap();
+        assert_eq!(
+            super::custom_emoji_occurrences(&rich_message),
+            [
+                super::CustomEmojiOccurrence {
+                    custom_emoji_id: "123".to_owned(),
+                    fallback: Some("🙂".to_owned()),
+                },
+                super::CustomEmojiOccurrence {
+                    custom_emoji_id: "123".to_owned(),
+                    fallback: Some("🙃".to_owned()),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn hidden_text_link_is_a_link_even_when_the_label_is_not() {
@@ -385,49 +461,85 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "emoji")]
     #[test]
-    fn custom_emoji_occurrences_keep_entity_and_rich_fallbacks_independently() {
-        let entity_message: Message = serde_json::from_value(serde_json::json!({
-            "message_id": 17,
+    fn emoji_ids_include_only_valid_custom_url_fallbacks_when_emoji_feature_is_enabled() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 7,
             "date": 1_700_000_000,
             "chat": {"id": 42, "type": "private"},
-            "from": {"id": 13, "is_bot": false, "first_name": "Test"},
-            "text": "😀",
-            "entities": [{"type": "custom_emoji", "offset": 0, "length": 2,
-                "custom_emoji_id": "123"}]
-        }))
-        .unwrap();
-        assert_eq!(
-            custom_emoji_occurrences(&entity_message),
-            [super::CustomEmojiOccurrence {
-                custom_emoji_id: "123".to_owned(),
-                fallback: Some("😀".to_owned()),
-            }]
-        );
-
-        let rich_message: Message = serde_json::from_value(serde_json::json!({
-            "message_id": 18,
-            "date": 1_700_000_000,
-            "chat": {"id": 42, "type": "private"},
-            "rich_message": {"blocks": [{"type": "paragraph", "text": [
-                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙂"},
-                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙃"}
-            ]}]}
-        }))
-        .unwrap();
-        assert_eq!(
-            custom_emoji_occurrences(&rich_message),
-            [
-                super::CustomEmojiOccurrence {
-                    custom_emoji_id: "123".to_owned(),
-                    fallback: Some("🙂".to_owned()),
-                },
-                super::CustomEmojiOccurrence {
-                    custom_emoji_id: "123".to_owned(),
-                    fallback: Some("🙃".to_owned()),
-                },
+            "text": "😀 open",
+            "entities": [
+                {"type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=00042"},
+                {"type":"text_link", "offset":3, "length":4, "url":"tg://emoji?id=99"}
             ]
+        }))
+        .unwrap();
+        assert_eq!(super::custom_emoji_ids(&message).unwrap(), ["42"]);
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn strict_emoji_id_extraction_does_not_downgrade_invalid_ranges_to_legacy_entities() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 7,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀",
+            "entities": [{"type":"custom_emoji", "offset":1, "length":1, "custom_emoji_id":"legacy"}]
+        })).unwrap();
+        assert!(super::custom_emoji_ids(&message).is_err());
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn only_valid_custom_fallback_targets_are_removed_from_url_targets() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 8,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀 open https://example.org",
+            "entities": [
+                {"type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"},
+                {"type":"text_link", "offset":3, "length":4, "url":"tg://emoji?id=99"},
+                {"type":"url", "offset":8, "length":19}
+            ]
+        }))
+        .unwrap();
+        let targets = message_url_targets(&message);
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.value == "tg://emoji?id=99")
         );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.value == "https://example.org")
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|target| target.value == "tg://emoji?id=42")
+        );
+    }
+
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn native_custom_entity_with_same_id_and_fallback_is_filtered_by_provenance() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 9,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "text": "😀",
+            "entities": [
+                {"type":"custom_emoji", "offset":0, "length":2, "custom_emoji_id":"42"},
+                {"type":"text_link", "offset":0, "length":2, "url":"tg://emoji?id=42"}
+            ]
+        }))
+        .unwrap();
+        assert!(message_url_targets(&message).is_empty());
     }
 
     #[test]
