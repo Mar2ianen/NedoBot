@@ -701,6 +701,22 @@ async fn handle_edited_message(msg: Message, state: AppState) -> ResponseResult<
     }
     match save_edited_telegram_message(&state.pool, &msg, &state.config).await {
         Ok(_) => {
+            #[cfg(feature = "flood")]
+            if state.config.flood_shadow_enabled
+                && let Err(error) = features::flood_shadow::observe_chat(
+                    &state.pool,
+                    msg.chat.id.0,
+                    msg.thread_id.as_ref().map(|thread| thread.0.0),
+                )
+                .await
+            {
+                tracing::warn!(
+                    chat_id = msg.chat.id.0,
+                    message_id = msg.id.0,
+                    %error,
+                    "flood shadow observation after edit failed"
+                );
+            }
             #[cfg(feature = "moderation")]
             if state
                 .config

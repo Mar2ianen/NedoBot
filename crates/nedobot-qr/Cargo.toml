@@ -11,4 +11,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [dev-dependencies]
 proptest = "1"
-teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "3166c9c39f79724b8e4e760e7a5afdd5daeb78be" }
+teloxide-url = { git = "https://github.com/Mar2ianen/teloxide-antispam", rev = "c1e00f5" }

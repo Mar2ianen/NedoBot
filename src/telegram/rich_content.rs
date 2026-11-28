@@ -9,6 +9,7 @@ use teloxide::types::{
 pub(super) struct RichProjection {
     pub text: String,
     pub custom_emoji_ids: Vec<String>,
+    pub custom_emoji_occurrences: Vec<(String, String)>,
     pub has_links: bool,
 }
 
@@ -179,6 +180,8 @@ impl RichProjection {
                 RichTextObject::CustomEmoji(v) => {
                     self.text.push_str(&v.alternative_text);
                     self.custom_emoji_ids.push(v.custom_emoji_id.clone());
+                    self.custom_emoji_occurrences
+                        .push((v.custom_emoji_id.clone(), v.alternative_text.clone()));
                 }
                 RichTextObject::MathematicalExpression(v) => self.text.push_str(&v.expression),
                 RichTextObject::Url(v) => {
@@ -380,6 +383,10 @@ mod tests {
             "Ответ\nНайдено 82 сообщения🙂\nКонтекст\nПредыдущий вопрос\n\nАвтор\tТекст"
         );
         assert_eq!(projected.custom_emoji_ids, ["123"]);
+        assert_eq!(
+            projected.custom_emoji_occurrences,
+            [("123".into(), "🙂".into())]
+        );
         assert!(projected.has_links);
         assert!(!projected.text.contains("private"));
         assert!(!projected.text.contains("secret"));

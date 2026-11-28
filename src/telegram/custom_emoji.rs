@@ -1,6 +1,6 @@
 use teloxide::prelude::*;
 
-use crate::telegram::entities::custom_emoji_ids;
+use crate::telegram::entities::{CustomEmojiOccurrence, custom_emoji_occurrences};
 use crate::telegram::{
     render::escape_html,
     service_messages::{self, MessageAudience},
@@ -14,8 +14,8 @@ pub async fn send_custom_emoji_ids(
     let Some(audience) = audience else {
         return Ok(());
     };
-    let ids = custom_emoji_ids(msg);
-    if ids.is_empty() {
+    let occurrences = custom_emoji_occurrences(msg);
+    if occurrences.is_empty() {
         service_messages::send_html(
             bot,
             msg.chat.id,
@@ -26,9 +26,9 @@ pub async fn send_custom_emoji_ids(
         return Ok(());
     }
 
-    let lines = ids
+    let lines = occurrences
         .iter()
-        .map(|id| format!("<code>{}</code>", escape_html(id)))
+        .map(render_occurrence)
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -41,4 +41,45 @@ pub async fn send_custom_emoji_ids(
     .await?;
 
     Ok(())
+}
+
+fn render_occurrence(occurrence: &CustomEmojiOccurrence) -> String {
+    let id = escape_html(&occurrence.custom_emoji_id);
+    match occurrence.fallback.as_deref() {
+        Some(fallback) if !fallback.is_empty() => {
+            format!("{} → <code>{}</code>", escape_html(fallback), id)
+        }
+        _ => format!("<code>{}</code>", id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_fallback_per_occurrence_and_escapes_html() {
+        let rows = [
+            CustomEmojiOccurrence {
+                custom_emoji_id: "123".to_owned(),
+                fallback: Some("<AMD>".to_owned()),
+            },
+            CustomEmojiOccurrence {
+                custom_emoji_id: "123".to_owned(),
+                fallback: Some("🙂".to_owned()),
+            },
+            CustomEmojiOccurrence {
+                custom_emoji_id: "456".to_owned(),
+                fallback: None,
+            },
+        ];
+        assert_eq!(
+            rows.iter().map(render_occurrence).collect::<Vec<_>>(),
+            [
+                "&lt;AMD&gt; → <code>123</code>",
+                "🙂 → <code>123</code>",
+                "<code>456</code>"
+            ]
+        );
+    }
 }

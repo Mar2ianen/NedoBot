@@ -1,6 +1,8 @@
 use super::rich_content::{legacy_quote_text, project, rich_message};
 use std::borrow::Cow;
-use teloxide::types::{Message, MessageEntityKind, MessageId, MessageOrigin, RichBlock};
+use teloxide::types::{
+    Message, MessageEntityKind, MessageEntityRef, MessageId, MessageOrigin, RichBlock,
+};
 
 /// Persist both Bot API 10.4 and 10.5 expandable-quote fields. RC1 readers
 /// require `text` and ignore the newer `blocks`; RC2 readers use `blocks`.
@@ -259,20 +261,48 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
 }
 
 pub fn custom_emoji_ids(msg: &Message) -> Vec<String> {
-    let mut ids: Vec<_> = msg
-        .entities()
+    custom_emoji_occurrences(msg)
         .into_iter()
-        .flatten()
-        .chain(msg.caption_entities().into_iter().flatten())
-        .filter_map(|entity| match &entity.kind {
-            MessageEntityKind::CustomEmoji { custom_emoji_id } => Some(custom_emoji_id.to_string()),
-            _ => None,
-        })
-        .collect();
-    if let Some(rich) = rich_message(msg) {
-        ids.extend(project(rich).custom_emoji_ids);
+        .map(|occurrence| occurrence.custom_emoji_id)
+        .collect()
+}
+
+/// A custom emoji occurrence with its Telegram fallback text, if available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomEmojiOccurrence {
+    pub custom_emoji_id: String,
+    pub fallback: Option<String>,
+}
+
+/// Extracts custom emoji in source order, preserving per-occurrence fallback
+/// text instead of collapsing equal IDs into one registry entry.
+pub fn custom_emoji_occurrences(msg: &Message) -> Vec<CustomEmojiOccurrence> {
+    let mut occurrences = Vec::new();
+    for (text, entities) in [
+        (msg.text(), msg.entities()),
+        (msg.caption(), msg.caption_entities()),
+    ] {
+        let (Some(text), Some(entities)) = (text, entities) else {
+            continue;
+        };
+        for entity in MessageEntityRef::parse(text, entities) {
+            if let MessageEntityKind::CustomEmoji { custom_emoji_id } = entity.kind() {
+                occurrences.push(CustomEmojiOccurrence {
+                    custom_emoji_id: custom_emoji_id.to_string(),
+                    fallback: Some(entity.text().to_owned()),
+                });
+            }
+        }
     }
-    ids
+    if let Some(rich) = rich_message(msg) {
+        occurrences.extend(project(rich).custom_emoji_occurrences.into_iter().map(
+            |(custom_emoji_id, fallback)| CustomEmojiOccurrence {
+                custom_emoji_id,
+                fallback: (!fallback.is_empty()).then_some(fallback),
+            },
+        ));
+    }
+    occurrences
 }
 
 pub fn message_has_links(msg: &Message) -> bool {
@@ -307,24 +337,7 @@ pub(crate) fn utf16_range(
     offset: usize,
     length: usize,
 ) -> Option<std::ops::Range<usize>> {
-    if length == 0 {
-        return None;
-    }
-    let end = offset.checked_add(length)?;
-    fn boundary(text: &str, target: usize) -> Option<usize> {
-        let mut units = 0usize;
-        for (byte, character) in text.char_indices() {
-            if units == target {
-                return Some(byte);
-            }
-            units = units.checked_add(character.len_utf16())?;
-            if units > target {
-                return None;
-            }
-        }
-        (units == target).then_some(text.len())
-    }
-    Some(boundary(text, offset)?..boundary(text, end)?)
+    teloxide::types::Utf16OffsetMap::new(text).range(offset, length)
 }
 
 #[cfg(test)]
@@ -332,8 +345,9 @@ mod tests {
     #[cfg(any(feature = "ask", feature = "moderation"))]
     use super::utf16_range;
     use super::{
-        MessageRevision, TelegramMessageProjection, deserialize_stored_message, message_has_links,
-        message_text, message_url_targets, serialize_stored_messages,
+        MessageRevision, TelegramMessageProjection, custom_emoji_occurrences,
+        deserialize_stored_message, message_has_links, message_text, message_url_targets,
+        serialize_stored_messages,
     };
     use teloxide::types::Message;
 
@@ -368,6 +382,51 @@ mod tests {
         assert_eq!(
             MessageRevision::from_message(&message),
             MessageRevision::Original
+        );
+    }
+
+    #[test]
+    fn custom_emoji_occurrences_keep_entity_and_rich_fallbacks_independently() {
+        let entity_message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 17,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 13, "is_bot": false, "first_name": "Test"},
+            "text": "😀",
+            "entities": [{"type": "custom_emoji", "offset": 0, "length": 2,
+                "custom_emoji_id": "123"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            custom_emoji_occurrences(&entity_message),
+            [super::CustomEmojiOccurrence {
+                custom_emoji_id: "123".to_owned(),
+                fallback: Some("😀".to_owned()),
+            }]
+        );
+
+        let rich_message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 18,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "rich_message": {"blocks": [{"type": "paragraph", "text": [
+                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙂"},
+                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙃"}
+            ]}]}
+        }))
+        .unwrap();
+        assert_eq!(
+            custom_emoji_occurrences(&rich_message),
+            [
+                super::CustomEmojiOccurrence {
+                    custom_emoji_id: "123".to_owned(),
+                    fallback: Some("🙂".to_owned()),
+                },
+                super::CustomEmojiOccurrence {
+                    custom_emoji_id: "123".to_owned(),
+                    fallback: Some("🙃".to_owned()),
+                },
+            ]
         );
     }
 

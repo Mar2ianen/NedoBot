@@ -14,6 +14,8 @@ pub mod chat_read_api;
 pub mod chat_retrieval;
 #[cfg(feature = "auto-comment")]
 pub mod first_comment;
+#[cfg(feature = "flood")]
+pub mod flood_shadow;
 pub mod health;
 pub mod ingest;
 pub mod jobs;
