@@ -47,17 +47,17 @@ run_mutations() {
 
 # Each range has a production counterexample oracle in the lib test suite.
 run_mutations url-policy src/features/search/mcp.rs \
-    120 \
-    'replace is_safe_fetch_url -> bool with (true|false)'
+    'replace is_safe_fetch_url -> bool with (true|false)' \
+    120
 run_mutations mcp-scope src/features/chat_read_api/query.rs \
-    120 \
-    'validate_scope_filters'
+    'validate_scope_filters' \
+    120
 run_mutations memory-classification src/features/memory/service.rs \
-    120 \
-    'classify_error'
+    'classify_error' \
+    120
 run_mutations worker-supervision src/features/jobs/worker.rs \
-    120 \
-    'WorkerSupervisor::record_exit'
+    'WorkerSupervisor::record_exit' \
+    120
 
 # These emoji invariants only compile with the opt-in feature; keep their
 # mutation run isolated from the default workspace feature set.
