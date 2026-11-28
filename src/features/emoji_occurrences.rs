@@ -613,7 +613,6 @@ struct RichLabelEvidence {
 struct RichLabelSegment {
     path: String,
     utf8_range: Range<usize>,
-    utf16_range: Range<usize>,
 }
 
 struct RichUrlFallback {
@@ -866,7 +865,6 @@ fn append_rich_label_text(
         return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
     }
     let start_byte = evidence.text.len();
-    let start_utf16 = evidence.utf16_len;
     evidence.text.push_str(text);
     evidence.utf16_len = evidence
         .utf16_len
@@ -874,7 +872,6 @@ fn append_rich_label_text(
     evidence.segments.push(RichLabelSegment {
         path: path.to_owned(),
         utf8_range: start_byte..evidence.text.len(),
-        utf16_range: start_utf16..evidence.utf16_len,
     });
     Ok(())
 }
@@ -946,7 +943,10 @@ fn map_rich_label_occurrence(
             .encode_utf16()
             .count();
         let occurrence_utf16_len = text[item.utf8_range.clone()].encode_utf16().count();
-        let local_utf16_start = item.utf16_range.start - segment.utf16_range.start - prefix_utf16;
+        // `item.utf16_range` is relative to the flattened projection. The
+        // prefix before this occurrence within the containing leaf is exactly
+        // the leaf-local UTF-16 start.
+        let local_utf16_start = prefix_utf16;
         let local_utf16_end = local_utf16_start + occurrence_utf16_len;
         return EmojiOccurrence {
             kind: item.kind,
@@ -1401,6 +1401,37 @@ mod tests {
                     && range.utf16_range.start < range.utf16_range.end
             })
         }));
+    }
+
+    #[test]
+    fn rich_text_leaf_utf16_offsets_include_prefix_and_multiple_emoji() {
+        let leaf = "abc😀def🚀";
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":{"type":"bold", "text":leaf}}
+        ]}))
+        .unwrap();
+
+        let found = extract_rich_message(&rich).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].fallback, "😀");
+        assert_eq!(found[0].utf8_range, 3..7);
+        assert_eq!(found[0].utf16_range, 3..5);
+        assert_eq!(found[1].fallback, "🚀");
+        assert_eq!(found[1].utf8_range, 10..14);
+        assert_eq!(found[1].utf16_range, 8..10);
+
+        // Differential oracle: compare every reported byte and UTF-16 range
+        // against the source leaf and Rust's independent UTF-16 encoder.
+        for item in &found {
+            assert!(leaf.is_char_boundary(item.utf8_range.start));
+            assert!(leaf.is_char_boundary(item.utf8_range.end));
+            assert_eq!(&leaf[item.utf8_range.clone()], item.fallback);
+            assert_eq!(
+                item.utf16_range,
+                leaf[..item.utf8_range.start].encode_utf16().count()
+                    ..leaf[..item.utf8_range.end].encode_utf16().count()
+            );
+        }
     }
 
     #[test]

@@ -5,8 +5,8 @@ use teloxide::types::{
     CustomEmojiId, MessageEntity, MessageEntityKind, RichMessage,
 };
 use tg_ai_bot_teloxide::features::emoji_analysis::{
-    CustomEmojiFormat, CustomEmojiInput, CustomEmojiProvenance, EmojiAnalysisError, EmojiKind,
-    analyze, analyze_telegram_text, MAX_TEXT_BYTES,
+    CustomEmojiFormat, CustomEmojiInput, CustomEmojiProvenance, EmojiAnalysisError, EmojiIdentity,
+    EmojiKind, analyze, analyze_telegram_text, MAX_TEXT_BYTES,
 };
 use tg_ai_bot_teloxide::features::emoji_occurrences::extract_rich_message;
 
@@ -41,16 +41,15 @@ impl OccurrenceRanges for tg_ai_bot_teloxide::features::emoji_analysis::EmojiOcc
 }
 
 fn id(data: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut value = String::new();
-    for byte in data.iter().take(24) {
-        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    if value.is_empty() { "0".to_owned() } else { value }
+    let value = data
+        .iter()
+        .fold(1_u64, |value, byte| value.wrapping_mul(257).wrapping_add(u64::from(*byte)))
+        .max(1);
+    value.to_string()
 }
 
 fuzz_target!(|data: &[u8]| {
-    let split = data.len().min(MAX_TEXT_BYTES / 2);
+    let split = (data.len() / 2).min(MAX_TEXT_BYTES / 2);
     let text = String::from_utf8_lossy(&data[..split]).into_owned();
     let suffix = &data[split..];
     let emoji_id = id(suffix);
@@ -117,10 +116,11 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Exercise TextLink parsing and native + URL-fallback provenance through
-    // the actual entity adapter, with valid UTF-16 ranges and URL spellings.
-    let linked_text = format!("{text}😀");
-    let offset = text.encode_utf16().count();
+    // A control character forces a grapheme boundary even if arbitrary input
+    // ends in Prepend/Extend/ZWJ. The id is always a positive decimal u64,
+    // which is the URL parser's accepted wire format.
+    let linked_text = format!("{text}\0😀");
+    let offset = text.encode_utf16().count() + 1;
     let link = MessageEntity {
         kind: MessageEntityKind::TextLink {
             url: reqwest::Url::parse(&format!("tg://emoji?id={emoji_id}")).unwrap(),
@@ -128,6 +128,30 @@ fuzz_target!(|data: &[u8]| {
         offset,
         length: 2,
     };
+    let fallback_only = analyze_telegram_text(&linked_text, &[link.clone()])
+        .expect("valid TextLink fallback must analyze");
+    assert_offsets(&linked_text, &fallback_only.occurrences);
+    let fallback_occurrences: Vec<_> = fallback_only
+        .occurrences
+        .iter()
+        .filter(|item| item.kind.identity() == EmojiIdentity::Custom(emoji_id.clone()))
+        .collect();
+    assert_eq!(fallback_occurrences.len(), 1);
+    assert_eq!(fallback_occurrences[0].fallback, "😀");
+    assert_eq!(
+        fallback_occurrences[0].kind.encoding(),
+        tg_ai_bot_teloxide::features::emoji_analysis::EmojiEncoding::CustomUrlFallback
+    );
+    assert!(matches!(
+        fallback_occurrences[0].kind,
+        EmojiKind::Custom {
+            provenance: CustomEmojiProvenance::UrlFallback,
+            ..
+        }
+    ));
+
+    // Also check that a native entity at the same range merges provenance
+    // rather than replacing the custom identity or counting twice.
     let native = MessageEntity {
         kind: MessageEntityKind::CustomEmoji {
             custom_emoji_id: CustomEmojiId(emoji_id.clone()),
@@ -135,54 +159,77 @@ fuzz_target!(|data: &[u8]| {
         offset,
         length: 2,
     };
-    let linked = analyze_telegram_text(&linked_text, &[native, link]);
-    let linked = linked.expect("bounded valid native and TextLink entities must analyze");
+    let linked = analyze_telegram_text(&linked_text, &[native, link])
+        .expect("bounded valid native and TextLink entities must analyze");
     assert_offsets(&linked_text, &linked.occurrences);
-    assert!(linked.occurrences.iter().any(|item| item.fallback == "😀"));
+    let merged: Vec<_> = linked
+        .occurrences
+        .iter()
+        .filter(|item| item.kind.identity() == EmojiIdentity::Custom(emoji_id.clone()))
+        .collect();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].fallback, "😀");
+    assert_eq!(
+        merged[0].kind.encoding(),
+        tg_ai_bot_teloxide::features::emoji_analysis::EmojiEncoding::NativeCustomWithUrlFallback
+    );
+    assert!(matches!(
+        merged[0].kind,
+        EmojiKind::Custom {
+            provenance: CustomEmojiProvenance::NativeWithUrlFallback,
+            ..
+        }
+    ));
 
     // Build a real RichMessage carrying style-split ZWJ/VS16 sequences,
     // ordinary fuzz text, nested custom emoji, and a Telegram URL fallback.
+    // Keep this fragment bounded so every generated object should stay inside
+    // RichMessage traversal budgets, making all errors actionable.
+    let rich_fragment: String = text.chars().take(1_024).collect();
     let rich_text = serde_json::json!({"blocks":[{"type":"paragraph","text":[
         {"type":"bold","text":"👩‍"},
         {"type":"italic","text":"💻"},
-        text,
+        "\0",
+        rich_fragment,
+        "\0",
         {"type":"strikethrough","text":"❤"},
         {"type":"code","text":"️"},
+        "\0",
         {"type":"custom_emoji","custom_emoji_id":emoji_id,"alternative_text":"😀"},
         {"type":"url","url":format!("tg://emoji?id={emoji_id}"),"text":"😀"}
     ]}]});
-    if let Ok(rich) = serde_json::from_value::<RichMessage>(rich_text) {
-        match extract_rich_message(&rich) {
-            Ok(occurrences) => {
-                assert!(occurrences.iter().any(|item| item.fallback == "👩‍💻"));
-                assert!(occurrences.iter().any(|item| item.fallback == "❤️"));
-                for item in &occurrences {
-                    assert_eq!(
-                        item.fallback.encode_utf16().count(),
-                        item.utf16_range.end - item.utf16_range.start
-                    );
-                    if !item.source_ranges.is_empty() {
-                        assert_eq!(
-                            item.source_ranges
-                                .iter()
-                                .map(|range| range.utf8_range.end - range.utf8_range.start)
-                                .sum::<usize>(),
-                            item.fallback.len()
-                        );
-                        assert_eq!(
-                            item.source_ranges
-                                .iter()
-                                .map(|range| range.utf16_range.end - range.utf16_range.start)
-                                .sum::<usize>(),
-                            item.fallback.encode_utf16().count()
-                        );
-                    }
-                }
-            }
-            Err(EmojiAnalysisError::RichTraversalLimitExceeded) => {
-                assert!(text.len() > 4_096, "small structured RichMessage rejected")
-            }
-            Err(error) => panic!("unexpected structured RichMessage error: {error:?}"),
+    let rich = serde_json::from_value::<RichMessage>(rich_text)
+        .expect("structured RichMessage fixture must deserialize");
+    let occurrences = extract_rich_message(&rich)
+        .expect("bounded generated RichMessage must pass traversal limits");
+    assert!(occurrences.iter().any(|item| item.fallback == "👩‍💻"));
+    assert!(occurrences.iter().any(|item| item.fallback == "❤️"));
+    assert!(occurrences.iter().any(|item| {
+        item.kind.identity() == EmojiIdentity::Custom(emoji_id.clone())
+            && item.fallback == "😀"
+            && item.kind.encoding()
+                == tg_ai_bot_teloxide::features::emoji_analysis::EmojiEncoding::CustomUrlFallback
+    }));
+    for item in &occurrences {
+        assert_eq!(
+            item.fallback.encode_utf16().count(),
+            item.utf16_range.end - item.utf16_range.start
+        );
+        if !item.source_ranges.is_empty() {
+            assert_eq!(
+                item.source_ranges
+                    .iter()
+                    .map(|range| range.utf8_range.end - range.utf8_range.start)
+                    .sum::<usize>(),
+                item.fallback.len()
+            );
+            assert_eq!(
+                item.source_ranges
+                    .iter()
+                    .map(|range| range.utf16_range.end - range.utf16_range.start)
+                    .sum::<usize>(),
+                item.fallback.encode_utf16().count()
+            );
         }
     }
 });
