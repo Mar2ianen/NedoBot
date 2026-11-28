@@ -1,10 +1,10 @@
 //! Ordered emoji occurrences from Telegram-authored message content.
 //!
 //! Offsets for ordinary text/captions are relative to the Telegram field and
-//! therefore use Telegram's UTF-16 coordinates. Rich text offsets are relative
-//! to the addressed leaf because Bot API rich blocks have no message-wide text
-//! coordinate system. A projected custom-emoji URL label that crosses leaves
-//! includes its source leaf ranges. Reply, reaction, quote, and profile-status
+//! therefore use Telegram's UTF-16 coordinates. Rich text has no
+//! message-wide coordinate system: single-leaf occurrences use leaf-relative
+//! offsets, while graphemes crossing leaves use projection-relative offsets
+//! and retain each source leaf range. Reply, reaction, quote, and profile-status
 //! references are kept separate from authored body occurrences.
 
 use std::ops::Range;
@@ -90,7 +90,7 @@ pub struct EmojiOccurrence {
     pub source: ContentSource,
     pub path: String,
     pub coordinate_scope: CoordinateScope,
-    /// Source leaf ranges for a projected URL label that crosses rich leaves.
+    /// Source leaf ranges for projected rich occurrences crossing leaves.
     /// Empty for Telegram fields and single-leaf rich occurrences.
     pub source_ranges: Vec<RichTextSourceRange>,
     pub utf8_range: Range<usize>,
@@ -101,6 +101,7 @@ pub struct EmojiOccurrence {
 pub enum CoordinateScope {
     TelegramField,
     RichTextLeaf,
+    RichTextProjection,
     RichUrlLabel,
 }
 
@@ -152,8 +153,24 @@ pub fn extract_message(message: &Message) -> Result<Vec<EmojiOccurrence>, EmojiA
     }
 
     if let Some(rich) = rich_message(message) {
-        append_rich_message(rich, &mut result, &mut budget)?;
+        result.extend(extract_rich_message_with_budget(rich, &mut budget)?);
     }
+    Ok(result)
+}
+
+/// Extract emoji occurrences from a Bot API rich message.
+pub fn extract_rich_message(
+    rich: &RichMessage,
+) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
+    extract_rich_message_with_budget(rich, &mut TraversalBudget::default())
+}
+
+fn extract_rich_message_with_budget(
+    rich: &RichMessage,
+    budget: &mut TraversalBudget,
+) -> Result<Vec<EmojiOccurrence>, EmojiAnalysisError> {
+    let mut result = Vec::new();
+    append_rich_message(rich, &mut result, budget)?;
     Ok(result)
 }
 
@@ -530,217 +547,15 @@ fn append_inline(
     budget: &mut TraversalBudget,
     depth: usize,
 ) -> Result<(), EmojiAnalysisError> {
-    budget.visit(path, depth)?;
-    match text {
-        RichText::Text(text) => append_leaf(text, None, path, output, budget, depth + 1)?,
-        RichText::List(items) => {
-            for (index, item) in items.iter().enumerate() {
-                append_inline(item, &format!("{path}[{index}]"), output, budget, depth + 1)?;
-            }
-        }
-        RichText::Object(object) => match object {
-            RichTextObject::Bold(v) => {
-                append_inline(&v.text, &format!("{path}.bold"), output, budget, depth + 1)?
-            }
-            RichTextObject::Italic(v) => append_inline(
-                &v.text,
-                &format!("{path}.italic"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Underline(v) => append_inline(
-                &v.text,
-                &format!("{path}.underline"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Strikethrough(v) => append_inline(
-                &v.text,
-                &format!("{path}.strikethrough"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Spoiler(v) => append_inline(
-                &v.text,
-                &format!("{path}.spoiler"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::DateTime(v) => append_inline(
-                &v.text,
-                &format!("{path}.datetime"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::TextMention(v) => append_inline(
-                &v.text,
-                &format!("{path}.text_mention"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Subscript(v) => append_inline(
-                &v.text,
-                &format!("{path}.subscript"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Superscript(v) => append_inline(
-                &v.text,
-                &format!("{path}.superscript"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Marked(v) => append_inline(
-                &v.text,
-                &format!("{path}.marked"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Code(v) => {
-                append_inline(&v.text, &format!("{path}.code"), output, budget, depth + 1)?
-            }
-            RichTextObject::CustomEmoji(v) => {
-                if v.custom_emoji_id.len() > emoji_analysis::MAX_CUSTOM_EMOJI_ID_BYTES {
-                    return Err(EmojiAnalysisError::CustomEmojiIdTooLong);
-                }
-                append_leaf(
-                    &v.alternative_text,
-                    Some(v.custom_emoji_id.to_string()),
-                    &format!("{path}.custom_emoji"),
-                    output,
-                    budget,
-                    depth + 1,
-                )?;
-            }
-            RichTextObject::MathematicalExpression(v) => append_leaf(
-                &v.expression,
-                None,
-                &format!("{path}.math"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Url(v) => {
-                let candidate = teloxide_url::parse_telegram_link(&v.url);
-                if let Some(teloxide_url::TelegramLink::CustomEmojiFallback { id }) = candidate {
-                    let label_path = format!("{path}.url.text");
-                    let mut evidence = RichLabelEvidence::default();
-                    collect_rich_label(&v.text, &label_path, budget, depth + 1, &mut evidence)?;
-                    if !evidence.text.is_empty() {
-                        evidence.url_fallbacks.push(RichUrlFallback {
-                            id: CustomEmojiId(id.to_string()),
-                            utf8_range: 0..evidence.text.len(),
-                            utf16_range: 0..evidence.utf16_len,
-                        });
-                    }
-                    append_rich_label_evidence(evidence, &label_path, output, budget)?;
-                } else {
-                    append_inline(
-                        &v.text,
-                        &format!("{path}.url.text"),
-                        output,
-                        budget,
-                        depth + 1,
-                    )?;
-                }
-            }
-            RichTextObject::EmailAddress(v) => append_inline(
-                &v.text,
-                &format!("{path}.email.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::PhoneNumber(v) => append_inline(
-                &v.text,
-                &format!("{path}.phone.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::BankCardNumber(v) => append_inline(
-                &v.text,
-                &format!("{path}.bank_card.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::TonAddress(v) => append_inline(
-                &v.text,
-                &format!("{path}.ton_address.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Mention(v) => append_inline(
-                &v.text,
-                &format!("{path}.mention.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Hashtag(v) => append_inline(
-                &v.text,
-                &format!("{path}.hashtag.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Cashtag(v) => append_inline(
-                &v.text,
-                &format!("{path}.cashtag.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::BotCommand(v) => append_inline(
-                &v.text,
-                &format!("{path}.bot_command.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Button(v) => append_inline(
-                &v.button.text,
-                &format!("{path}.button.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::AnchorLink(v) => append_inline(
-                &v.text,
-                &format!("{path}.anchor_link.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Reference(v) => append_inline(
-                &v.text,
-                &format!("{path}.reference.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::ReferenceLink(v) => append_inline(
-                &v.text,
-                &format!("{path}.reference_link.text"),
-                output,
-                budget,
-                depth + 1,
-            )?,
-            RichTextObject::Anchor(_) | RichTextObject::Unknown(_) => {}
-        },
-    }
-    Ok(())
+    let mut evidence = RichLabelEvidence::default();
+    collect_rich_label(text, path, budget, depth, &mut evidence)?;
+    append_rich_label_evidence(
+        evidence,
+        path,
+        output,
+        budget,
+        CoordinateScope::RichTextProjection,
+    )
 }
 
 fn append_leaf(
@@ -927,6 +742,9 @@ fn collect_rich_label(
                 let start_utf16 = evidence.utf16_len;
                 let child_path = format!("{path}.url.text");
                 collect_rich_label(&v.text, &child_path, budget, depth + 1, evidence)?;
+                if evidence.text.len().saturating_sub(start_utf8) > MAX_RICH_URL_LABEL_BYTES {
+                    return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+                }
                 if let Some(teloxide_url::TelegramLink::CustomEmojiFallback { id }) =
                     teloxide_url::parse_telegram_link(&v.url)
                 {
@@ -1025,8 +843,7 @@ fn collect_rich_label(
             RichTextObject::Unknown(_) => {
                 // Keep unknown content as an explicit grapheme boundary so
                 // known text on either side cannot form a synthetic emoji.
-                if evidence.text.len().saturating_add('\u{FFFC}'.len_utf8())
-                    > MAX_RICH_URL_LABEL_BYTES
+                if evidence.text.len().saturating_add('\u{FFFC}'.len_utf8()) > MAX_TOTAL_TEXT_BYTES
                 {
                     return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
                 }
@@ -1045,7 +862,7 @@ fn append_rich_label_text(
     evidence: &mut RichLabelEvidence,
 ) -> Result<(), EmojiAnalysisError> {
     budget.charge_text(text)?;
-    if evidence.text.len().saturating_add(text.len()) > MAX_RICH_URL_LABEL_BYTES {
+    if evidence.text.len().saturating_add(text.len()) > MAX_TOTAL_TEXT_BYTES {
         return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
     }
     let start_byte = evidence.text.len();
@@ -1067,6 +884,7 @@ fn append_rich_label_evidence(
     path: &str,
     output: &mut Vec<EmojiOccurrence>,
     budget: &mut TraversalBudget,
+    projected_scope: CoordinateScope,
 ) -> Result<(), EmojiAnalysisError> {
     for fallback in evidence.url_fallbacks {
         let Some(label) = evidence.text.get(fallback.utf8_range.clone()) else {
@@ -1090,14 +908,23 @@ fn append_rich_label_evidence(
             });
         }
     }
-    let analysis = emoji_analysis::analyze(&evidence.text, &evidence.native_custom)?;
+    let analysis = match emoji_analysis::analyze(&evidence.text, &evidence.native_custom) {
+        Ok(analysis) => analysis,
+        Err(EmojiAnalysisError::TooManyCustomEmojiSpans) => {
+            return Err(EmojiAnalysisError::RichTraversalLimitExceeded);
+        }
+        Err(error) => return Err(error),
+    };
     budget.charge_analysis(&analysis)?;
-    output.extend(
-        analysis
-            .occurrences
-            .into_iter()
-            .map(|item| map_rich_label_occurrence(item, path, &evidence.text, &evidence.segments)),
-    );
+    output.extend(analysis.occurrences.into_iter().map(|item| {
+        map_rich_label_occurrence(
+            item,
+            path,
+            &evidence.text,
+            &evidence.segments,
+            projected_scope,
+        )
+    }));
     Ok(())
 }
 
@@ -1106,6 +933,7 @@ fn map_rich_label_occurrence(
     path: &str,
     text: &str,
     segments: &[RichLabelSegment],
+    projected_scope: CoordinateScope,
 ) -> EmojiOccurrence {
     let containing = segments.iter().find(|segment| {
         segment.utf8_range.start <= item.utf8_range.start
@@ -1149,12 +977,19 @@ fn map_rich_label_occurrence(
             })
         })
         .collect();
+    let coordinate_scope = if projected_scope == CoordinateScope::RichTextProjection
+        && item.kind.encoding().has_custom_url_fallback()
+    {
+        CoordinateScope::RichUrlLabel
+    } else {
+        projected_scope
+    };
     EmojiOccurrence {
         kind: item.kind,
         fallback: item.fallback,
         source: ContentSource::RichMessage,
         path: path.to_owned(),
-        coordinate_scope: CoordinateScope::RichUrlLabel,
+        coordinate_scope,
         source_ranges,
         utf8_range: item.utf8_range,
         utf16_range: item.utf16_range,
@@ -1521,15 +1356,51 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind.identity(), EmojiIdentity::Custom("42".into()));
         assert_eq!(found[0].coordinate_scope, CoordinateScope::RichUrlLabel);
-        assert_eq!(
-            found[0].path,
-            "rich_message.blocks[0].paragraph.text.url.text"
-        );
+        assert_eq!(found[0].path, "rich_message.blocks[0].paragraph.text");
         assert_eq!(found[0].utf8_range, 0.."👩‍💻".len());
         assert_eq!(found[0].source_ranges.len(), 3);
         assert_eq!(found[0].source_ranges[0].utf8_range, 0.."👩".len());
         assert_eq!(found[0].source_ranges[1].utf8_range, 0.."‍".len());
         assert_eq!(found[0].source_ranges[2].utf8_range, 0.."💻".len());
+        assert_eq!(
+            found[0].source_ranges[0].path,
+            "rich_message.blocks[0].paragraph.text.url.text[0]"
+        );
+    }
+
+    #[test]
+    fn rich_text_projection_joins_emoji_split_by_style_boundaries() {
+        let rich: RichMessage = serde_json::from_value(json!({"blocks":[
+            {"type":"paragraph", "text":[
+                {"type":"bold", "text":"👩‍"},
+                {"type":"italic", "text":"💻"},
+                {"type":"underline", "text":"❤"},
+                {"type":"strikethrough", "text":"️"}
+            ]}
+        ]}))
+        .unwrap();
+        let mut found = Vec::new();
+        append_rich_message(&rich, &mut found, &mut TraversalBudget::default()).unwrap();
+
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].fallback, "👩‍💻");
+        assert_eq!(
+            found[0].coordinate_scope,
+            CoordinateScope::RichTextProjection
+        );
+        assert_eq!(found[0].source_ranges.len(), 2);
+        assert_eq!(found[1].fallback, "❤️");
+        assert_eq!(
+            found[1].coordinate_scope,
+            CoordinateScope::RichTextProjection
+        );
+        assert_eq!(found[1].source_ranges.len(), 2);
+        assert!(found.iter().all(|item| {
+            item.source_ranges.iter().all(|range| {
+                range.utf8_range.start < range.utf8_range.end
+                    && range.utf16_range.start < range.utf16_range.end
+            })
+        }));
     }
 
     #[test]

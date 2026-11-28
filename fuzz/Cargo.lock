@@ -1706,7 +1706,9 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "nedobot-qr",
+ "reqwest",
  "serde_json",
+ "teloxide",
  "teloxide-url",
  "tg_ai_bot_teloxide",
 ]

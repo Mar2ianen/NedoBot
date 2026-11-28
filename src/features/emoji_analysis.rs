@@ -289,6 +289,7 @@ pub fn analyze(
     let mut byte = 0usize;
     let mut utf16 = 0usize;
     let mut custom_index = 0usize;
+    let mut grapheme_iter = grapheme_indices(text).peekable();
 
     while byte < text.len() {
         if let Some((range, input)) = custom_spans.get(custom_index)
@@ -330,15 +331,27 @@ pub fn analyze(
             );
             utf16 = input.utf16_range.end;
             byte = range.end;
+            while grapheme_iter
+                .peek()
+                .is_some_and(|(grapheme_start, _)| *grapheme_start < range.end)
+            {
+                grapheme_iter.next();
+            }
+            if grapheme_iter
+                .peek()
+                .is_some_and(|(grapheme_start, _)| *grapheme_start != range.end)
+            {
+                return Err(EmojiAnalysisError::InvalidGraphemeSegmentation);
+            }
             custom_index += 1;
             continue;
         }
 
-        let remaining = &text[byte..];
-        let grapheme = graphemes(remaining)
+        let (grapheme_start, grapheme) = grapheme_iter
             .next()
-            .filter(|grapheme| !grapheme.is_empty())
+            .filter(|(start, grapheme)| *start == byte && !grapheme.is_empty())
             .ok_or(EmojiAnalysisError::InvalidGraphemeSegmentation)?;
+        debug_assert_eq!(grapheme_start, byte);
         let byte_end = byte + grapheme.len();
         let utf16_end = utf16 + grapheme.encode_utf16().count();
         if grapheme.chars().all(char::is_whitespace) {

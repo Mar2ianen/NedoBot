@@ -124,12 +124,34 @@ count for both implementations. Peak process RSS was 5,412 KiB (old) and
 standalone benchmark binaries were 530,208 and 533,080 bytes; ELF `.text` was
 282,861 and 284,365 bytes, and `.rodata` 49,124 and 36,780 bytes. This is a
 microbenchmark, not a whole-bot performance guarantee. ICU is exact-pinned and
-feature-gated; no end-to-end analyzer benchmark or clean/incremental Cargo
-build-time comparison is available for the full bot. In the same isolated
+feature-gated; no clean/incremental Cargo build-time comparison is available
+for the full bot. In the same isolated
 harness, clean release builds took 1.012 s (old) and 5.475 s (ICU); no-op
 incremental builds took 0.016 s and 0.021 s. Those build times include only
 the small benchmark crate and its segmentation dependency, not NedoBot's
 workspace build.
+
+## End-to-end analyzer benchmark
+
+`examples/bench_emoji_analyzer.rs` runs the complete pure `analyze` path,
+including grapheme segmentation, emoji recognition, UTF-8/UTF-16 ranges,
+metrics, and occurrence allocation. The current bounded single-machine run
+used Rust 1.100.0 and a release build. It reported the median of seven
+samples, each running 1,000 analyses for the first two inputs and 100 analyses
+for the longer input:
+
+| Corpus | Bytes / analysis | Median / 1,000 | Throughput |
+|---|---:|---:|---:|
+| Mixed text and emoji | 32,760 | 1.154 s | 27.1 MiB/s |
+| Emoji-heavy | 136,000 | 1.973 s | 65.7 MiB/s |
+| Long ASCII | 262,136 | 1.744 s | 14.3 MiB/s |
+
+Reproduce with `cargo run --release --example bench_emoji_analyzer
+--no-default-features --features emoji --locked`. These are baseline
+measurements for the complete analyzer on this machine, not a before/after
+comparison or a promise about application-level `/emoji` latency. The analyzer
+now consumes one grapheme iterator for the full input rather than repeatedly
+segmenting each remaining suffix.
 
 ```sh
 cargo test --no-default-features --features emoji --lib features::emoji_analysis --locked
