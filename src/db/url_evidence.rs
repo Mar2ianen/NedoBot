@@ -455,6 +455,7 @@ mod tests {
             source: Source::TelegramEntity,
             span: None,
             label: Some("join".into()),
+            custom_emoji_fallback_id: None,
         };
         let row = encode(&found, 0, None).unwrap();
         assert_eq!(row.host.as_deref(), Some("t.me"));
