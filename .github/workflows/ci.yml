@@ -81,6 +81,19 @@ jobs:
       - name: Check no-default feature set
         run: cargo check --no-default-features --workspace --all-targets --locked
 
+      - name: Check opt-in flood shadow build
+        run: cargo check --no-default-features --features flood --all-targets --locked
+
+      - name: Verify default build does not enable flood core
+        run: |
+          if cargo tree --locked -e features -i teloxide-antispam | grep -F 'feature "flood"'; then
+            echo 'default build unexpectedly enables teloxide-antispam/flood'
+            exit 1
+          fi
+
+      - name: Test Telegram flood shadow projection
+        run: python3 scripts/run_cargo_test_checked.py cargo test --locked --no-default-features --features flood --lib features::flood_shadow
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -126,6 +139,7 @@ jobs:
           TEST_DATABASE_URL: postgres://tg_ai_bot_dev:tg_ai_bot_dev@127.0.0.1:5432/tg_ai_bot_test
           RUST_MIN_STACK: 8388608
         run: |
+          python3 scripts/run_cargo_test_checked.py cargo test --locked --features flood --lib features::flood_shadow::tests::observer_reads_only_the_requested_chat_and_topic -- --ignored --exact
           python3 scripts/run_cargo_test_checked.py cargo test --locked --test postgres_migrations -- --ignored
           python3 scripts/run_cargo_test_checked.py cargo test --locked --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
           python3 scripts/run_cargo_test_checked.py cargo test --locked --test adversarial_harness generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact

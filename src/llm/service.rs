@@ -485,6 +485,7 @@ mod tests {
         Config {
             community: crate::config::test_community_config().0,
             chat_registry: crate::config::test_community_config().1,
+            flood_shadow_enabled: false,
             source_channel_id: -1001,
             discussion_chat_id: -1002,
             render_timezone: "Europe/Moscow".to_string(),

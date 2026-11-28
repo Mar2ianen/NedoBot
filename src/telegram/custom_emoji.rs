@@ -15,7 +15,7 @@ use teloxide::{
 };
 
 use crate::telegram::{
-    entities::custom_emoji_ids,
+    entities::{CustomEmojiOccurrence, custom_emoji_ids, custom_emoji_occurrences},
     service_messages::{self, MessageAudience},
 };
 
@@ -278,10 +278,18 @@ pub async fn send_custom_emoji_ids(
         return Ok(());
     }
 
-    send_command_text(bot, msg, format_custom_emoji_ids(&ids), audience).await?;
+    let occurrences = custom_emoji_occurrences(target);
+    send_command_text(
+        bot,
+        msg,
+        format_custom_emoji_occurrences(&ids, &occurrences),
+        audience,
+    )
+    .await?;
     Ok(())
 }
 
+#[cfg(test)]
 fn format_custom_emoji_ids(ids: &[String]) -> String {
     let mut output = String::from("Нашёл custom_emoji_id:\n");
     let mut shown = 0;
@@ -315,6 +323,64 @@ fn format_custom_emoji_ids(ids: &[String]) -> String {
             output.push('\n');
         }
         output.push_str(&format!("… и ещё {} ID не показано", ids.len() - shown));
+    }
+    output
+}
+
+fn format_custom_emoji_occurrences(
+    ids: &[String],
+    occurrences: &[CustomEmojiOccurrence],
+) -> String {
+    let mut output = String::from("Нашёл custom_emoji_id:\n");
+    let mut source_index = 0;
+    let mut shown = 0;
+    for id in ids {
+        let matched = occurrences
+            .iter()
+            .enumerate()
+            .skip(source_index)
+            .find(|(_, occurrence)| occurrence.custom_emoji_id == *id);
+        let fallback = matched.and_then(|(index, occurrence)| {
+            source_index = index + 1;
+            occurrence.fallback.as_deref()
+        });
+        let id_display = truncate_chars(id, 48);
+        let id_display = safe_plain_id(&id_display);
+        let fallback_display = fallback.map(|value| safe_plain_id(&truncate_chars(value, 48)));
+        let line = match fallback_display.as_deref() {
+            Some(value) if !value.is_empty() => format!("{value} → {id_display}\n"),
+            _ => format!("{id_display}\n"),
+        };
+        let remaining = ids.len().saturating_sub(shown);
+        let reserve = if remaining > 0 {
+            format!("… и ещё {remaining} ID не показано")
+        } else {
+            String::new()
+        };
+        if output.encode_utf16().count()
+            + line.encode_utf16().count()
+            + reserve.encode_utf16().count()
+            > MAX_CUSTOM_EMOJI_IDS_OUTPUT_UTF16
+        {
+            break;
+        }
+        output.push_str(&line);
+        shown += 1;
+    }
+    if shown < ids.len() {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&format!("… и ещё {} ID не показано", ids.len() - shown));
+    }
+    output
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let mut output = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        output.push('…');
     }
     output
 }

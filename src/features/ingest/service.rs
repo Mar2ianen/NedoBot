@@ -63,6 +63,22 @@ pub async fn ingest_message(
         });
     }
     let persistence = save_telegram_message(pool, msg, config).await?;
+    #[cfg(feature = "flood")]
+    if config.flood_shadow_enabled
+        && let Err(error) = crate::features::flood_shadow::observe_chat(
+            pool,
+            msg.chat.id.0,
+            msg.thread_id.as_ref().map(|thread| thread.0.0),
+        )
+        .await
+    {
+        tracing::warn!(
+            chat_id = msg.chat.id.0,
+            message_id = msg.id.0,
+            %error,
+            "flood shadow observation failed"
+        );
+    }
     #[cfg(feature = "moderation")]
     if let Err(_error) = crate::features::decision_audit::service::observe_message(
         pool,

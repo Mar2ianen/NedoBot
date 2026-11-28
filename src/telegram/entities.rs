@@ -1,6 +1,8 @@
 use super::rich_content::{legacy_quote_text, project, rich_message};
 use std::borrow::Cow;
-use teloxide::types::{Message, MessageEntityKind, MessageId, MessageOrigin, RichBlock};
+use teloxide::types::{
+    Message, MessageEntityKind, MessageEntityRef, MessageId, MessageOrigin, RichBlock,
+};
 
 /// Persist both Bot API 10.4 and 10.5 expandable-quote fields. RC1 readers
 /// require `text` and ignore the newer `blocks`; RC2 readers use `blocks`.
@@ -258,6 +260,43 @@ pub fn message_text(msg: &Message) -> Option<Cow<'_, str>> {
         })
 }
 
+/// A custom emoji occurrence with its Telegram fallback text, if available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomEmojiOccurrence {
+    pub custom_emoji_id: String,
+    pub fallback: Option<String>,
+}
+
+/// Extract custom emoji in source order while preserving each occurrence's fallback text.
+pub fn custom_emoji_occurrences(msg: &Message) -> Vec<CustomEmojiOccurrence> {
+    let mut occurrences = Vec::new();
+    for (text, entities) in [
+        (msg.text(), msg.entities()),
+        (msg.caption(), msg.caption_entities()),
+    ] {
+        let (Some(text), Some(entities)) = (text, entities) else {
+            continue;
+        };
+        for entity in MessageEntityRef::parse(text, entities) {
+            if let MessageEntityKind::CustomEmoji { custom_emoji_id } = entity.kind() {
+                occurrences.push(CustomEmojiOccurrence {
+                    custom_emoji_id: custom_emoji_id.to_string(),
+                    fallback: Some(entity.text().to_owned()),
+                });
+            }
+        }
+    }
+    if let Some(rich) = rich_message(msg) {
+        occurrences.extend(project(rich).custom_emoji_occurrences.into_iter().map(
+            |(custom_emoji_id, fallback)| CustomEmojiOccurrence {
+                custom_emoji_id,
+                fallback: (!fallback.is_empty()).then_some(fallback),
+            },
+        ));
+    }
+    occurrences
+}
+
 #[cfg(feature = "emoji")]
 pub type CustomEmojiIdsError = crate::features::emoji_analysis::EmojiAnalysisError;
 #[cfg(not(feature = "emoji"))]
@@ -342,6 +381,51 @@ mod tests {
         message_text, message_url_targets, serialize_stored_messages,
     };
     use teloxide::types::Message;
+
+    #[test]
+    fn custom_emoji_occurrences_keep_entity_and_rich_fallbacks_independently() {
+        let entity_message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 17,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "from": {"id": 13, "is_bot": false, "first_name": "Test"},
+            "text": "😀",
+            "entities": [{"type": "custom_emoji", "offset": 0, "length": 2,
+                "custom_emoji_id": "123"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            super::custom_emoji_occurrences(&entity_message),
+            [super::CustomEmojiOccurrence {
+                custom_emoji_id: "123".to_owned(),
+                fallback: Some("😀".to_owned()),
+            }]
+        );
+
+        let rich_message: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 18,
+            "date": 1_700_000_000,
+            "chat": {"id": 42, "type": "private"},
+            "rich_message": {"blocks": [{"type": "paragraph", "text": [
+                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙂"},
+                {"type": "custom_emoji", "custom_emoji_id": "123", "alternative_text": "🙃"}
+            ]}]}
+        }))
+        .unwrap();
+        assert_eq!(
+            super::custom_emoji_occurrences(&rich_message),
+            [
+                super::CustomEmojiOccurrence {
+                    custom_emoji_id: "123".to_owned(),
+                    fallback: Some("🙂".to_owned()),
+                },
+                super::CustomEmojiOccurrence {
+                    custom_emoji_id: "123".to_owned(),
+                    fallback: Some("🙃".to_owned()),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn hidden_text_link_is_a_link_even_when_the_label_is_not() {

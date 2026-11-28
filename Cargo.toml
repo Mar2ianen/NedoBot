@@ -30,6 +30,7 @@ spam-sync = []
 manual-moderation = []
 emoji = ["dep:emojis", "dep:icu_properties", "dep:icu_segmenter"]
 emoji-legacy-differential = ["emoji", "dep:unicode-segmentation"]
+flood = ["teloxide-antispam/flood"]
 
 [[bin]]
 name = "chat_db_mcp"

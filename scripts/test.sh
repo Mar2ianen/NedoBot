@@ -18,6 +18,7 @@ python3 scripts/run_cargo_test_checked.py cargo test --workspace --all-targets -
 run_test() {
     python3 scripts/run_cargo_test_checked.py cargo test --locked "$@"
 }
+TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --features flood --lib features::flood_shadow::tests::observer_reads_only_the_requested_chat_and_topic -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test postgres_migrations -- --ignored
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness post_comment_sql_matches_reference_lease_and_delivery_trace -- --ignored --exact
 TEST_DATABASE_URL="$TEST_DATABASE_URL" run_test --test adversarial_harness generated_post_comment_claims_reject_stale_and_duplicate_delivery -- --ignored --exact
